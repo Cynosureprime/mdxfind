@@ -544,18 +544,19 @@ Even in the no-solve case (pure load + compute, no output), mdxfind is 12x faste
 
 Note: hashcat's primary strength is GPU acceleration. With a modern GPU, hashcat's MD5 hash *rate* far exceeds any CPU. But for large hash collections (millions to hundreds of millions of hashes), the bottleneck shifts from hash computation to hash *lookup* — and mdxfind's compact table architecture handles this efficiently regardless of hash count.
 
-#### Hash loading time
+#### Scaling to large hash collections
 
-Loading 29M MD5 hashes into the compact table takes approximately 2 seconds across all platforms:
+The compact table scales efficiently to very large hash counts. Tested with NTLM hashes from the HIBP dataset:
 
-| System | Hash load time |
-|--------|---------------:|
-| M1 | 1.5s |
-| i9-9900K | 2.0s |
-| Xeon E5-2697v4 | 2.9s |
-| POWER8 | 2.9s |
+| Hashes | i9-9900K (16 cores) | Xeon E5-2697v4 (72 cores) | Compact table stats |
+|-------:|--------------------:|--------------------------:|---------------------|
+| 29M | 2.0s load | 2.9s load | 0 overflow |
+| 100M | 10.5s load, 19.3s total | 11.3s load, 13.4s total | 1,291 overflow |
+| 2.05B | -- | 270s load, 4m 30s total | 417,321 overflow |
 
-This scales roughly linearly — loading 100M hashes takes ~7 seconds, 500M hashes takes ~35 seconds.
+"Total" includes loading hashes + processing a 29M-word wordlist. At 100M hashes, the wordlist processing adds ~9 seconds on the i9 and ~2 seconds on the 72-core Xeon. At 2 billion hashes, the load dominates — the 29M wordlist adds virtually nothing.
+
+The compact table maintains excellent efficiency at scale: only 417K overflow entries out of 2.05 billion (0.02%), at 47.8% load factor with 4.3 billion slots. This is a dataset that would require ~150 GB in a flat hash table; mdxfind handles it on a server with standard memory.
 
 ## Building
 
