@@ -8,6 +8,12 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+/* Windows stat() overflows on files > 2GB; use 64-bit version */
+#ifdef _WIN32
+#define stat _stat64
+#define fstat _fstat64
+#endif
+
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -142,9 +148,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.213 2026/03/23 17:48:54 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.214 2026/03/23 21:27:07 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.214  2026/03/23 21:27:07  dlr
+ * Fix Windows stat overflow on files > 2GB: use _stat64 on _WIN32
+ *
  * Revision 1.213  2026/03/23 17:48:54  dlr
  * Runtime SSE2/SSSE3 dispatch for get32(), remove SSSE3 requirement. Add HasSSSE3 global, SHA1 C fallback for SSE2-only CPUs.
  *
