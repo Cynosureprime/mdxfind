@@ -1,0 +1,7 @@
+.git
+.claude
+deps
+*.o
+*.a
+mdxfind
+mdsplit
