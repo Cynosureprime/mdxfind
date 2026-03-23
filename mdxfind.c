@@ -88,8 +88,16 @@
 
 #include "mdxfind.h"
 
-/* arc4random_buf fallback for glibc < 2.36 */
-#if defined(__linux__) && !defined(__GLIBC_PREREQ)
+/* arc4random_buf fallback for glibc < 2.36 and Windows */
+#if defined(_WIN32)
+static void arc4random_buf(void *buf, size_t nbytes) {
+    static int seeded;
+    unsigned char *p = buf;
+    size_t i;
+    if (!seeded) { srand((unsigned)time(NULL) ^ (unsigned)getpid()); seeded = 1; }
+    for (i = 0; i < nbytes; i++) p[i] = rand() & 0xFF;
+}
+#elif defined(__linux__) && !defined(__GLIBC_PREREQ)
 #define NEED_ARC4RANDOM_COMPAT 1
 #elif defined(__linux__) && defined(__GLIBC_PREREQ)
 #if !__GLIBC_PREREQ(2, 36)
@@ -131,9 +139,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.210 2026/03/23 06:53:38 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.211 2026/03/23 13:15:25 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.211  2026/03/23 13:15:25  dlr
+ * arc4random_buf: add Windows fallback (rand-based), fix for cross-platform release
+ *
  * Revision 1.210  2026/03/23 06:53:38  dlr
  * Replace OpenSSL SHA-0 with built-in implementation; remove phantom sph_sha0.h include
  *
