@@ -531,8 +531,6 @@ mdxfind requires the following static libraries (all built automatically by `mak
 
 **sphlib BMW strict aliasing bug (GCC 12+)**: sphlib's `bmw.c` contains strict aliasing violations that cause GCC to generate incorrect code for BMW-224 and BMW-256 at `-O2` and above. Apple clang is unaffected. The `make deps` target applies the workaround (`-fno-strict-aliasing`). See [sphlib#3](https://github.com/pornin/sphlib/issues/3).
 
-**OpenCL (macOS only)**: The macOS build links `-framework OpenCL` for optional GPU acceleration. This framework is included in macOS by default.
-
 ### Supported Platforms
 
 The Makefile detects the build platform automatically. Tested on:

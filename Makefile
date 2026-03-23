@@ -32,7 +32,7 @@ endif
 ifeq ($(UNAME_S),Darwin)
   OSOPT = -DMACOSX
   ICONV = /opt/local/lib/libiconv.a
-  LDEXTRA = -framework OpenCL
+  LDEXTRA =
   INCEXTRA = -I/opt/local/include
 else ifeq ($(UNAME_S),FreeBSD)
   OSOPT =
