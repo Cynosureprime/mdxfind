@@ -11,14 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     automake \
     libtool \
     perl \
-    yasm \
+    nasm \
     zlib1g-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/mdxfind
 COPY . .
-RUN make deps && make all
+RUN find . -name '*.o' -delete && find . -name '*.a' -delete && \
+    make deps && make all
 
 # RUNTIME LAYER
 # Minimal image containing only the built binaries.

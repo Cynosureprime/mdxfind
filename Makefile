@@ -112,10 +112,16 @@ gosthash/gosthash.o: gosthash/gosthash.c gosthash/gosthash.h
 	$(CC) $(CFLAGS) -c -o gosthash/gosthash.o gosthash/gosthash.c
 
 sha1_block.o: sha1_block.s
+ifeq ($(UNAME_S),Darwin)
 	yasm -DINTEL_SHA1_UPDATE_DEFAULT_DISPATCH=_sha1_step \
 	     -DINTEL_SHA1_SINGLEBLOCK=1 \
 	     -DINTEL_SHA1_UPDATE_FUNCNAME=_sha1_update_intel \
 	     -f macho64 -o sha1_block.o sha1_block.s
+else
+	nasm -DINTEL_SHA1_UPDATE_DEFAULT_DISPATCH=sha1_step \
+	     -DINTEL_SHA1_SINGLEBLOCK=1 \
+	     -f elf64 -o sha1_block.o sha1_block.s
+endif
 
 sha1_shani.o: sha1_shani.c
 	$(CC) -O3 -msha -msse4.1 -c sha1_shani.c
