@@ -6,7 +6,30 @@ Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://j
 
 ## History
 
-<!-- Add history text here -->
+MDXfind was created as a result of frustration.  I renewed my interest in hashes after being absent for more than a quarter
+of a century, and found it quite enjoyable as a pastime, but I quickly grew frustrated with the tools available.
+Around 2011 or so, I started working with John, and later hashcat (and a host of other programs), and in 2011, on one
+of the forums of the time, I encountered a file of 50 Million "MD5" hashes.  Well, no tools of the day could process that
+easily, and worse, I found that though all of the hashes were 32-hex, not all of them were MD5.  Some were MD5x2, and
+there were even more at higher counts.  So, I created a quick program to test for "MD5x" iterations of MD5 — thus the
+name MDXfind.  And find them, I did: MD5x01 through MD5x99.  And it kept going.  MD5x200.  MD5x1000.  MD5x1000000!
+But that was just the start, and there were hundreds of different algorithms, mixed into that "MD5" list.  In 2013,
+the first early versions of MDXfind appeared.  They were trivial, but I continued to work on it over the years, adding
+more and more algorithms, and improving the speed.  Processing 500M hashes was no longer a problem.  Sometime around
+June of 2013, I found that hashcat was dropping or mangling passwords with control characters in them (like 0x0a, or
+0x0d), and I wanted to fix that, so I created the `$HEX[]` encoding.  This was memorialized on the Hashcat forum, where I
+laid out the reasoning for it, and later, most programs adopted it.
+
+But for various reasons, MDXfind was just a personal project, and could not be released in source form.  Those reasons
+have now ceased to exist, so here it is.  It was not created from the ground up to be a perfect, ideal codebase — it was
+written in my spare time, and with ideas that occurred to me as I encountered issues.  It has been quite resilient, and
+thanks to the efforts of the [CynosurePrime](https://github.com/Cynosureprime) team, and others (in particular [@tychotithonus](https://github.com/tychotithonus)), mdxfind has had a home
+and a small group of people giving feedback.  Thank you to each of you.
+
+Likewise mdsplit was born out of absolute frustration, dealing with large lists.  It gives a way to split out "solved"
+hashes from an unsolved list, and runs orders of magnitude faster than trying to do this in other applications.  Now,
+with [hashpipe](https://github.com/Cynosureprime/hashpipe), mdsplit, [rling](https://github.com/Cynosureprime/rling), and mdxfind — you can finally really deal with vast quantities of hash lists, and
+process them effectively.  Enjoy!
 
 ## Overview
 
