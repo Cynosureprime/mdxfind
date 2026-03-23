@@ -116,6 +116,9 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 
 
 
+#ifndef NOTINTEL
+extern int HasSSSE3;
+#endif
 #ifdef ARM
 int Neon;
 #if ARM < 8
@@ -139,9 +142,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.212 2026/03/23 13:42:03 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.213 2026/03/23 17:48:54 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.213  2026/03/23 17:48:54  dlr
+ * Runtime SSE2/SSSE3 dispatch for get32(), remove SSSE3 requirement. Add HasSSSE3 global, SHA1 C fallback for SSE2-only CPUs.
+ *
  * Revision 1.212  2026/03/23 13:42:03  dlr
  * Move SHA-0 to mymd5.c (extern decl only), add Windows arc4random_buf fallback, suppress read() warning with (void) cast, remove phantom sph_sha0.h include
  *
@@ -2530,7 +2536,8 @@ static void gen_userid() {
   Numsalts += num;
 }
 
-static int get32(char *iline, unsigned char *dest, int len);
+static int get32_init(char *iline, unsigned char *dest, int len);
+static int (*get32)(char *iline, unsigned char *dest, int len) = get32_init;
 
 
 
@@ -2643,56 +2650,112 @@ static int geti64(char *iline, unsigned char *dest, int len) {
 }
 
 
-#ifdef SPARC
-#define SMALL32 1
-#endif
-#ifdef AIX
-#define SMALL32 1
-#endif
-#if defined(ARM) && ARM < 7
-#define SMALL32 1
-#endif
+/*
+ * get32: hex string to binary conversion — runtime dispatched.
+ * Three Intel paths: SSSE3 (pshufb), SSE2 (comparisons), scalar (trhex[]).
+ * ARM paths: AArch64 NEON, ARM7 NEON, scalar.
+ */
 
-#ifdef SMALL32
-static int get32(char *iline, unsigned char *dest, int len) {
-  unsigned char c,c1,c2, *line = (unsigned char *)iline;
-  int cnt;
-
-  cnt = 0;
-  while ((c=*line++)) {
-     c1 = trhex[c];
-     c2 = trhex[*line++];
-     if (c1 > 15 || c2 >15)
-      break;
+/* Scalar implementation — works everywhere */
+static int get32_scalar(char *iline, unsigned char *dest, int len) {
+  unsigned char c1, c2, *line = (unsigned char *)iline;
+  int cnt = 0;
+  while (cnt < len) {
+     c1 = trhex[line[0]];
+     c2 = trhex[line[1]];
+     if (c1 > 15 || c2 > 15) break;
+     *dest++ = (c1 << 4) | c2;
+     line += 2;
      cnt++;
-     *dest++ = (c1<<4) + c2;
   }
-  return(cnt);
+  return (cnt);
 }
-
-#else /* !SMALL32: Intel SSSE3 or ARM NEON */
-
-#if defined(ARM) && ARM >= 7
-#include <arm_neon.h>
-#endif
 
 #ifndef NOTINTEL
-static void print128(char *s,__m128i val)
-{
-   unsigned char *v = (unsigned char *)&val;
-   int x;
-   fprintf(stderr,"%s",s);
-   for(x=0; x<16; x++) fprintf(stderr,"%02x",v[x]);
-   fprintf(stderr,"\n");
-}
-#endif
-
-static int get32(char *iline, unsigned char *dest, int len) {
+/* SSE2 implementation — comparison-based, no pshufb needed.
+ * Processes 16 hex chars → 8 bytes per iteration. */
+static int get32_sse2(char *iline, unsigned char *dest, int len) {
   unsigned char c1, c2, *line = (unsigned char *)iline;
   int cnt = 0;
 
-#ifndef NOTINTEL
-  /* Improved SSSE3: pshufb LUT nibble conversion + two-LUT Mula validation */
+  const __m128i ch_0 = _mm_set1_epi8('0');
+  const __m128i ch_9 = _mm_set1_epi8('9');
+  const __m128i ch_A = _mm_set1_epi8('A');
+  const __m128i ch_F = _mm_set1_epi8('F');
+  const __m128i ch_a = _mm_set1_epi8('a');
+  const __m128i ch_f = _mm_set1_epi8('f');
+  const __m128i off_digit = _mm_set1_epi8('0');
+  const __m128i off_upper = _mm_set1_epi8('A' - 10);
+  const __m128i off_lower = _mm_set1_epi8('a' - 10);
+  const __m128i lomask = _mm_set1_epi8(0x0F);
+
+  while (cnt + 8 <= len) {
+      __m128i input = _mm_loadu_si128((const __m128i *)line);
+
+      /* Classify each byte: digit, uppercase, lowercase */
+      __m128i ge_0 = _mm_cmpgt_epi8(input, _mm_sub_epi8(ch_0, _mm_set1_epi8(1)));
+      __m128i le_9 = _mm_cmpgt_epi8(_mm_add_epi8(ch_9, _mm_set1_epi8(1)), input);
+      __m128i is_digit = _mm_and_si128(ge_0, le_9);
+
+      __m128i ge_A = _mm_cmpgt_epi8(input, _mm_sub_epi8(ch_A, _mm_set1_epi8(1)));
+      __m128i le_F = _mm_cmpgt_epi8(_mm_add_epi8(ch_F, _mm_set1_epi8(1)), input);
+      __m128i is_upper = _mm_and_si128(ge_A, le_F);
+
+      __m128i ge_a = _mm_cmpgt_epi8(input, _mm_sub_epi8(ch_a, _mm_set1_epi8(1)));
+      __m128i le_f = _mm_cmpgt_epi8(_mm_add_epi8(ch_f, _mm_set1_epi8(1)), input);
+      __m128i is_lower = _mm_and_si128(ge_a, le_f);
+
+      /* Check validity: every byte must match one class */
+      __m128i is_valid = _mm_or_si128(is_digit, _mm_or_si128(is_upper, is_lower));
+      int inv_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(is_valid, _mm_setzero_si128()));
+
+      /* Compute nibble values: subtract class-specific offset using masks */
+      __m128i nibbles = _mm_or_si128(
+          _mm_and_si128(is_digit, _mm_sub_epi8(input, off_digit)),
+          _mm_or_si128(
+              _mm_and_si128(is_upper, _mm_sub_epi8(input, off_upper)),
+              _mm_and_si128(is_lower, _mm_sub_epi8(input, off_lower))));
+
+      /* Pack pairs: (hi_nibble << 4) | lo_nibble, then extract even bytes */
+      __m128i packed = _mm_or_si128(
+          _mm_and_si128(_mm_slli_epi16(nibbles, 4), _mm_set1_epi16(0x00F0)),
+          _mm_srli_epi16(_mm_and_si128(nibbles, _mm_set1_epi16(0x0F00)), 8));
+      /* Extract even bytes (0,2,4,6,8,10,12,14) via shift+pack */
+      packed = _mm_and_si128(packed, _mm_set1_epi16(0x00FF));
+      packed = _mm_packus_epi16(packed, _mm_setzero_si128());
+
+      if (inv_mask == 0) {
+          _mm_storel_epi64((__m128i *)dest, packed);
+          cnt += 8; dest += 8; line += 16;
+      } else {
+          int valid_bytes = __builtin_ctz(inv_mask) / 2;
+          uint64_t r;
+          _mm_storel_epi64((__m128i *)&r, packed);
+          memcpy(dest, &r, valid_bytes);
+          cnt += valid_bytes;
+          dest += valid_bytes;
+          line += valid_bytes * 2;
+          break;
+      }
+  }
+  /* Scalar tail */
+  while (cnt < len) {
+     c1 = trhex[line[0]];
+     c2 = trhex[line[1]];
+     if (c1 > 15 || c2 > 15) break;
+     *dest++ = (c1 << 4) | c2;
+     line += 2;
+     cnt++;
+  }
+  return (cnt);
+}
+
+/* SSSE3 implementation — pshufb LUT, fastest on Intel Core 2+ */
+__attribute__((target("ssse3")))
+static int get32_ssse3(char *iline, unsigned char *dest, int len) {
+  unsigned char c1, c2, *line = (unsigned char *)iline;
+  int cnt = 0;
+
   const __m128i sub_lut = _mm_setr_epi8(
       0, 0, 0, 0x30, 0x37, 0, 0x57, 0,  0, 0, 0, 0, 0, 0, 0, 0);
   const __m128i hi_valid = _mm_setr_epi8(
@@ -2738,11 +2801,30 @@ static int get32(char *iline, unsigned char *dest, int len) {
           break;
       }
   }
+  /* Scalar tail */
+  while (cnt < len) {
+     c1 = trhex[line[0]];
+     c2 = trhex[line[1]];
+     if (c1 > 15 || c2 > 15) break;
+     *dest++ = (c1 << 4) | c2;
+     line += 2;
+     cnt++;
+  }
+  return (cnt);
+}
 #endif /* !NOTINTEL */
 
+#if defined(ARM) && ARM >= 7
+#include <arm_neon.h>
+#endif
+
 #if defined(ARM) && defined(__aarch64__)
-  /* AArch64 NEON: 128-bit, vqtbl1q_u8 (full pshufb equivalent)
-   * Processes 16 hex chars → 8 output bytes per iteration */
+/* AArch64 NEON: 128-bit, vqtbl1q_u8 (full pshufb equivalent)
+ * Processes 16 hex chars → 8 output bytes per iteration */
+static int get32_neon64(char *iline, unsigned char *dest, int len) {
+  unsigned char c1, c2, *line = (unsigned char *)iline;
+  int cnt = 0;
+
   {
     const uint8x16_t sub_lut = {0,0,0,0x30,0x37,0,0x57,0, 0,0,0,0,0,0,0,0};
     const uint8x16_t hi_valid = {0,0,0,1,2,0,4,0, 0,0,0,0,0,0,0,0};
@@ -2754,40 +2836,24 @@ static int get32(char *iline, unsigned char *dest, int len) {
       uint8x16_t hi = vandq_u8(vshrq_n_u8(input, 4), lomask);
       uint8x16_t lo = vandq_u8(input, lomask);
 
-      /* Validate: hi_valid[hi] & lo_valid[lo] must be nonzero for each byte */
       uint8x16_t vcheck = vandq_u8(vqtbl1q_u8(hi_valid, hi),
                                     vqtbl1q_u8(lo_valid, lo));
-      /* Quick reject: OR all 16 bytes — if any is zero, we have invalid chars */
       uint8x16_t vzero = vceqq_u8(vcheck, vdupq_n_u8(0));
       uint64_t reject = vgetq_lane_u64(vreinterpretq_u64_u8(vzero), 0) |
                          vgetq_lane_u64(vreinterpretq_u64_u8(vzero), 1);
 
-      /* Convert: subtract per-class offset to get 0-15 nibble values */
       uint8x16_t nibbles = vsubq_u8(input, vqtbl1q_u8(sub_lut, hi));
-
-      /* Pack pairs of nibbles: high<<4 | low, then compact even bytes */
-      uint8x16_t hi_nib = vshlq_n_u8(nibbles, 4);  /* odd positions (will be masked) */
-      /* Reinterpret as 16-bit: each pair is [hi_char, lo_char] in memory (LE).
-       * We want (hi_char_value << 4) | lo_char_value per 16-bit lane.
-       * hi_nib has the shifted values in even bytes, nibbles has values in odd bytes.
-       * Use VSRI to shift-right-insert: hi_nib[even] | nibbles[odd] >> 0 */
-      /* Simpler: treat as u16 lanes, shift and OR */
       {
         uint16x8_t wide = vreinterpretq_u16_u8(nibbles);
-        /* In LE memory: byte[0]=hi_char_nibble, byte[1]=lo_char_nibble per u16 lane.
-         * Result byte = (byte[0] << 4) | byte[1] = ((u16 & 0x0F) << 4) | ((u16>>8) & 0x0F) */
         uint16x8_t packed = vorrq_u16(vshlq_n_u16(vandq_u16(wide, vdupq_n_u16(0x000F)), 4),
                                        vshrq_n_u16(wide, 8));
-        /* packed: result byte in low byte of each u16 lane. Extract with UZP/TBL. */
         uint8x8x2_t uzp = vuzp_u8(vget_low_u8(vreinterpretq_u8_u16(packed)),
                                     vget_high_u8(vreinterpretq_u8_u16(packed)));
-        /* uzp.val[0] has even-indexed bytes = our 8 result bytes */
 
         if (reject == 0) {
           vst1_u8(dest, uzp.val[0]);
           cnt += 8; dest += 8; line += 16;
         } else {
-          /* Find first invalid pair: scan vzero for first nonzero byte */
           uint8_t vzbuf[16];
           int valid_bytes, k;
           vst1q_u8(vzbuf, vzero);
@@ -2809,9 +2875,25 @@ static int get32(char *iline, unsigned char *dest, int len) {
       }
     }
   }
+
+  /* Scalar tail */
+  while (cnt < len) {
+     c1 = trhex[line[0]];
+     c2 = trhex[line[1]];
+     if (c1 > 15 || c2 > 15) break;
+     *dest++ = (c1 << 4) | c2;
+     line += 2;
+     cnt++;
+  }
+  return (cnt);
+}
 #elif defined(ARM) && ARM >= 7
-  /* ARM7/ARM8 32-bit NEON: 64-bit D-registers, vtbl2_u8 for table lookup
-   * Processes 8 hex chars → 4 output bytes per iteration */
+/* ARM7/ARM8 32-bit NEON: 64-bit D-registers, vtbl2_u8 for table lookup
+ * Processes 8 hex chars → 4 output bytes per iteration */
+static int get32_neon32(char *iline, unsigned char *dest, int len) {
+  unsigned char c1, c2, *line = (unsigned char *)iline;
+  int cnt = 0;
+
   if (Neon) {
     const uint8x8_t sub_lut_lo = {0,0,0,0x30,0x37,0,0x57,0};
     const uint8x8_t sub_lut_hi = {0,0,0,0,0,0,0,0};
@@ -2829,20 +2911,16 @@ static int get32(char *iline, unsigned char *dest, int len) {
       uint8x8_t hi = vand_u8(vshr_n_u8(input, 4), lomask);
       uint8x8_t lo = vand_u8(input, lomask);
 
-      /* Validate */
       uint8x8_t vcheck = vand_u8(vtbl2_u8(hiv_tbl, hi), vtbl2_u8(lov_tbl, lo));
       uint64_t check64;
       vst1_u8((uint8_t *)&check64, vceq_u8(vcheck, vdup_n_u8(0)));
 
-      /* Convert nibbles */
       uint8x8_t nibbles = vsub_u8(input, vtbl2_u8(sub_tbl, hi));
 
-      /* Pack: treat as u16, combine pairs */
       {
         uint16x4_t wide = vreinterpret_u16_u8(nibbles);
         uint16x4_t packed = vorr_u16(vshl_n_u16(vand_u16(wide, vdup_n_u16(0x000F)), 4),
                                       vshr_n_u16(wide, 8));
-        /* Result bytes in low byte of each u16. Extract bytes 0,2,4,6 → 0,1,2,3 */
         uint8x8_t pbytes = vreinterpret_u8_u16(packed);
         uint8_t rbuf[8];
         vst1_u8(rbuf, pbytes);
@@ -2852,7 +2930,6 @@ static int get32(char *iline, unsigned char *dest, int len) {
           dest[2] = rbuf[4]; dest[3] = rbuf[6];
           cnt += 4; dest += 4; line += 8;
         } else {
-          /* Find first invalid pair */
           uint8_t vzbuf[8];
           int valid_bytes = 0, k;
           vst1_u8(vzbuf, vceq_u8(vcheck, vdup_n_u8(0)));
@@ -2870,7 +2947,6 @@ static int get32(char *iline, unsigned char *dest, int len) {
       }
     }
   }
-#endif /* ARM NEON */
 
   /* Scalar tail */
   while (cnt < len) {
@@ -2883,8 +2959,24 @@ static int get32(char *iline, unsigned char *dest, int len) {
   }
   return (cnt);
 }
+#endif /* ARM NEON */
 
-#endif /* SMALL32 */
+/* Lazy-init dispatcher — called once, then replaced by the best implementation */
+static int get32_init(char *iline, unsigned char *dest, int len) {
+#ifndef NOTINTEL
+  if (HasSSSE3)
+    get32 = get32_ssse3;
+  else
+    get32 = get32_sse2;
+#elif defined(ARM) && defined(__aarch64__)
+  get32 = get32_neon64;
+#elif defined(ARM) && ARM >= 7
+  get32 = Neon ? get32_neon32 : get32_scalar;
+#else
+  get32 = get32_scalar;
+#endif
+  return get32(iline, dest, len);
+}
 
 
 /*
@@ -37248,15 +37340,10 @@ int main(int argc, char **argv) {
   getcpuinfo();
 
 #ifndef NOTINTEL
-  {
-    unsigned int eax, ebx, ecx, edx;
-    eax = ebx = ecx = edx = 0;
-    __cpuid(1, eax, ebx, ecx, edx);
-    if (!(ecx & bit_SSSE3)) {
-      fprintf(stderr, "Error: this build requires a CPU with SSSE3 support (Intel Core 2 or later)\n");
-      exit(1);
-    }
-  }
+  if (HasSSSE3)
+    fprintf(stderr, "SSSE3 hex conversion enabled\n");
+  else
+    fprintf(stderr, "SSE2 hex conversion enabled\n");
 #endif
 #if defined(ARM) && ARM >= 8 && defined(__aarch64__)
   { extern void arm_ce_detect(void); arm_ce_detect(); }

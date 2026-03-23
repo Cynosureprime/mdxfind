@@ -1,5 +1,8 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.24  2026/03/23 17:49:01  dlr
+ * Add getentropy/explicit_bzero portability shims for old glibc, SHA1 SSE2 fallback via sha1_step
+ *
  * Revision 1.23  2026/03/23 13:42:11  dlr
  * Add SHA-0 implementation (moved from mdxfind.c). Block-oriented, handles arbitrary length input with single 64-byte working buffer.
  *
@@ -88,6 +91,33 @@ static __inline int my_cpuid_count(unsigned int l, unsigned int s,
 #else
 #define bswap_32(x) __builtin_bswap32(x)
 #define bswap_64(x) __builtin_bswap64(x)
+#endif
+
+/*
+ * Portability shims for older glibc (< 2.25) and cross-compiled targets.
+ * getentropy: used by OpenSSL 1.1.1 CSPRNG (weak ref, needs local definition)
+ * explicit_bzero: used by argon2 secure_wipe_memory
+ */
+#include <unistd.h>
+#include <fcntl.h>
+/*
+ * Always provide getentropy/explicit_bzero on Linux/FreeBSD so binaries
+ * built on newer glibc can run on older glibc.  The local definitions
+ * override the weak references from libcrypto.a/argon2.a at link time.
+ * macOS and Windows have their own mechanisms.
+ */
+#if !defined(__APPLE__) && !defined(_WIN32)
+int getentropy(void *buf, size_t buflen) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -1;
+    ssize_t n = read(fd, buf, buflen);
+    close(fd);
+    return (n == (ssize_t)buflen) ? 0 : -1;
+}
+void explicit_bzero(void *s, size_t n) {
+    memset(s, 0, n);
+    __asm__ __volatile__("" : : "r"(s) : "memory");
+}
 #endif
 
 #include "mdxfind.h"
@@ -1728,7 +1758,11 @@ static void (*sha1_block_fn)(uint32_t *, uint32_t *) = sha1_block_init;
 
 static void sha1_block_init(uint32_t *hash, uint32_t *block) {
     unsigned int eax, ebx, ecx, edx;
-    sha1_block_fn = sha1_update_intel;   /* default: existing SSSE3/sha1_step asm dispatch */
+    sha1_block_fn = (void (*)(uint32_t *, uint32_t *))sha1_step; /* safe C fallback for SSE2-only CPUs */
+    eax = ebx = ecx = edx = 0;
+    __cpuid(1, eax, ebx, ecx, edx);
+    if (ecx & bit_SSSE3)
+        sha1_block_fn = sha1_update_intel;   /* SSSE3 assembly */
     if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) && (ebx & (1u << 29)))
         sha1_block_fn = (void (*)(uint32_t *, uint32_t *))sha1_compress_shani;
     sha1_block_fn(hash, block);

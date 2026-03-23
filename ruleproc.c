@@ -32,6 +32,7 @@ extern int Neon;
 #include <xmmintrin.h>
 #include <cpuid.h>
 int IntelSSE;
+int HasSSSE3;
 #endif
 
 #include "mdxfind.h"
@@ -39,9 +40,12 @@ int IntelSSE;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.11 2025/11/28 18:24:48 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.12 2026/03/23 17:48:54 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.12  2026/03/23 17:48:54  dlr
+ * Runtime SSE2/SSSE3 dispatch for get32(), remove SSSE3 requirement. Add HasSSSE3 global, SHA1 C fallback for SSE2-only CPUs.
+ *
  * Revision 1.11  2025/11/28 18:24:48  dlr
  * replace local memory copy with memcpy, will revisit.
  * Add control-b rule for base64 conversion
@@ -144,10 +148,12 @@ static inline int lfastcmp(void *dest, void *src, int len) {
 void getcpuinfo() {
     int a,b,c,d;
 #ifndef NOTINTEL
-    IntelSSE = a = b = c = d = 0;
+    IntelSSE = HasSSSE3 = a = b = c = d = 0;
     __cpuid(1,a,b,c,d);
     if (c & bit_SSE3)
 	IntelSSE = 30;
+    if (c & bit_SSSE3)
+	HasSSSE3 = 1;
     if (c & bit_SSE4_1)
     	IntelSSE = 41;
     if (c & bit_SSE4_2)
