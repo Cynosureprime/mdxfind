@@ -31,7 +31,9 @@ mdxfind -z -h '^MD5$' -f /dev/null rockyou.txt | cut -d' ' -f2 | cut -d: -f1 > t
 
 ### Salted MD5 test files
 
-Each line is `hash:salt` format, where the hash is MD5(original\_hash + salt) and the salt is a random 3-character string from the standard `3-salt` file.
+Each line is `hash:salt` format, where the hash is MD5(original\_MD5\_hash + salt) and the salt is a random 3-character string. This creates a double-hash-plus-salt scheme: solving requires computing MD5(candidate), appending the salt, then computing MD5 again — effectively MD5(MD5($pass) + $salt). This is internal type e31 (MD5SALT with MD5 pre-hash).
+
+This is a significantly harder benchmark than plain MD5, and to our knowledge only mdxfind can solve this type natively.
 
 | File | Hashes | Solvable | Description |
 |------|--------|----------|-------------|
