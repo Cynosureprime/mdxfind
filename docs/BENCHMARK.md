@@ -90,6 +90,38 @@ time mdxfind -M e31 -F sm-salt10.txt rockyou.txt > /dev/null
 
 Report: CPU model, OS, thread count, wall-clock time, and hashes found for each test file.
 
+## Standard Benchmark Results
+
+### Unsalted MD5 — testfull (14.3M hashes, rockyou.txt wordlist)
+
+| Machine | CPU | Clock | Test | Found | Time | Rate |
+|---------|-----|-------|------|-------|------|------|
+| dev1 | Apple M1 | 3.2 GHz | testfull (14.3M) | 14,341,564 | 3.0s | 4.7M/s |
+| dev1 | Apple M1 | 3.2 GHz | test50 (14.3M) | 7,169,180 | 2.0s | 7.1M/s |
+| dev1 | Apple M1 | 3.2 GHz | test10 (14.3M) | 1,434,116 | 1.0s | 14.2M/s |
+| ubpower8 | POWER8 | 3.4 GHz | testfull (14.3M) | 14,341,564 | 29.0s | 0.5M/s |
+| ubpower8 | POWER8 | 3.4 GHz | test50 (14.3M) | 7,169,180 | 14.0s | 1.0M/s |
+| ubpower8 | POWER8 | 3.4 GHz | test10 (14.3M) | 1,434,116 | 3.0s | 4.8M/s |
+
+### Unsalted MD5 — small test (1M hashes, rockyou.txt wordlist)
+
+| Machine | CPU | Clock | Test | Found | Time | Rate |
+|---------|-----|-------|------|-------|------|------|
+| firefly | AArch64 (RK3399) | 2.0 GHz | sm-testfull (1M) | 1,000,000 | 3.0s | 4.8M/s |
+| firefly | AArch64 (RK3399) | 2.0 GHz | sm-test50 (1M) | 500,583 | 3.0s | 4.8M/s |
+| firefly | AArch64 (RK3399) | 2.0 GHz | sm-test10 (1M) | 100,203 | 3.0s | 4.8M/s |
+| pi3 | ARMv7 (BCM2837) | 1.2 GHz | sm-testfull (1M) | 1,000,000 | 7.0s | 2.0M/s |
+| pi3 | ARMv7 (BCM2837) | 1.2 GHz | sm-test50 (1M) | 500,583 | 6.0s | 2.4M/s |
+| pi3 | ARMv7 (BCM2837) | 1.2 GHz | sm-test10 (1M) | 100,203 | 6.0s | 2.4M/s |
+| pi1a | ARMv6 (BCM2835) | 700 MHz | sm-testfull (1M) | 1,000,000 | 87.0s | 0.16M/s |
+| pi1a | ARMv6 (BCM2835) | 700 MHz | sm-test50 (1M) | 500,583 | 76.0s | 0.19M/s |
+| pi1a | ARMv6 (BCM2835) | 700 MHz | sm-test10 (1M) | 100,203 | 69.0s | 0.21M/s |
+
+**Notes:**
+- The M1 processes the full 14.3M hash set in 3 seconds — dominated by hash loading time, not computation.
+- Lower solvability (test10) runs faster because fewer hash matches trigger output processing.
+- The ARMv6 Pi 1 is ~30x slower than the M1 but still functional for smaller hash sets.
+
 ## Community Benchmarks
 
 ### mdxfind vs hashcat vs john — 2.5M MD5 hashes
