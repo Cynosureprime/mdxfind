@@ -148,9 +148,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.217 2026/03/24 04:28:02 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.218 2026/03/24 18:53:28 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.218  2026/03/24 18:53:28  dlr
+ * Fix salt snapshot compaction bug: pre-loop swap could drop tail entries, losing count=1 salted hashes
+ *
  * Revision 1.217  2026/03/24 04:28:02  dlr
  * Fix prmd5REV/prmd5UCREV: LUT conversion reversed nibble order within bytes
  *
@@ -19034,11 +19037,7 @@ MD5SALTstart:
               { int si;
               d = mdbuf + len;
               for (si = 0; si < nsalts_job; si++) {
-		while (!Printall && *saltsnap[si].PV == 0 && nsalts_job) {
-		  saltsnap[si] = saltsnap[--nsalts_job];
-		}
-		if (nsalts_job == 0) break;
-		if (*saltsnap[si].PV == 0) continue;
+		if (!Printall && *saltsnap[si].PV == 0) continue;
                 s1 = saltsnap[si].salt;
                 saltlen = saltsnap[si].saltlen;
                 fastcopy(d, s1, saltlen);
