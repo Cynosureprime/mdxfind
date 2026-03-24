@@ -10,6 +10,30 @@ See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types
 
 Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://judy.sourceforge.net/) for compressed hash lookup, and [hashpipe](https://github.com/Cynosureprime/hashpipe) for hash verification.
 
+### When to use mdxfind
+
+- **Mixed hash types** — you have a pile of hashes and don't know (or don't care) what types they are
+- **Large hash collections** — 100M+ hashes, where O(1) Judy array lookups shine
+- **Quick triage** — rapidly cull common passwords from a massive hashlist before using other tools
+- **Arbitrary iteration** — try thousands of iteration counts in a single run
+- **Unknown algorithms** — let mdxfind try 994+ types simultaneously and tell you what matched
+- **CPU-friendly algorithms** — bcrypt, PBKDF2, scrypt, and other algorithms that don't benefit from GPU acceleration
+- **Salted hashes without known types** — mdxfind can try many salted algorithms with auto-generated salt combinations
+
+### When NOT to use mdxfind
+
+- Mask/brute-force attacks on GPU-friendly algorithms — use hashcat
+- Distributed cracking clusters — hashcat + hashtopolis is better suited
+- Single known hash type with a small hash list — hashcat's GPU speed wins here
+
+### Antivirus note
+
+Some antivirus vendors occasionally flag mdxfind as a coin miner due to its hashing features. This is a false positive — mdxfind does not mine cryptocurrency.
+
+## Acknowledgments
+
+Many thanks to [@tychotithonus](https://github.com/tychotithonus) for years of hosting mdxfind at [techsolvency.com](https://www.techsolvency.com/pub/bin/mdxfind/), maintaining the changelog, generating metadata, and writing comprehensive documentation that helped countless users get started with mdxfind. The previous distribution site remains available as an archive.
+
 ## History
 
 MDXfind was created as a result of frustration.  I renewed my interest in hashes after being absent for more than a quarter

@@ -471,6 +471,78 @@ mdxfind -r best64.rule -Z -f hashes.txt wordlist.txt
 
 This helps identify the most effective rules for your target hash lists, so you can build optimized rule files for future sessions.
 
+## Test Vector Generation ($TESTVEC[])
+
+`$TESTVEC[bytes x count]` creates repeating byte patterns as candidate passwords, up to 2,000,000 bytes. This is useful for algorithm validation, FIPS compliance testing, and regression testing.
+
+```bash
+# Single NUL byte
+echo '$TESTVEC[00 x 1]' | mdxfind -h '^SHA1$' -z -f /dev/null stdin 2>/dev/null
+SHA1x01 5ba93c9db0cff93f52b521d7420e43f6eda2784f:$TESTVEC[00 x 1]
+
+# FIPS 140-2 test: byte 0x61 ('a') repeated 1 million times
+echo '$TESTVEC[61 x 1000000]' | mdxfind -h '^SHA1$' -z -f /dev/null stdin 2>/dev/null
+SHA1x01 34aa973cd4c4daa4f61eeb2bdbad27316534016f:$TESTVEC[61 x 1000000]
+
+# Multiple bytes repeated
+echo '$TESTVEC[41 42 43 x 100]' | mdxfind -h '^MD5$' -z -f /dev/null stdin 2>/dev/null
+```
+
+## Understanding the Status Line
+
+During a run, mdxfind periodically displays a progress line on stderr:
+
+```
+Working on mybigwordlist w=62, line 2771, Found=2809, 0.54Mh/s, 184.73c/s
+```
+
+| Field | Meaning |
+|-------|---------|
+| `w=62` | Work units queued — how "busy" mdxfind is. Low values mean disk I/O is the bottleneck; high values mean the algorithms are the bottleneck. |
+| `line 2771` | Current line number in the current wordlist file. |
+| `Found=2809` | Running count of hashes solved so far. |
+| `0.54Mh/s` | Hash operations per second (millions). Each candidate may produce multiple hash operations across different algorithm types. |
+| `184.73c/s` | Candidates per second — useful for slow algorithms like bcrypt. |
+
+The `w=` value is particularly informative: for fast algorithms like MD5, it stays low (mdxfind outpaces disk I/O). For expensive algorithms like bcrypt or PBKDF2, it climbs high as the disk fills the queue faster than the algorithms can consume it.
+
+The `line` number can be used with `-w` to resume an interrupted run: note the line number, subtract a few thousand for safety margin, and use `-w` on the next run.
+
+## Piping mdxfind Output to mdsplit
+
+mdxfind output can be piped directly to mdsplit for real-time organization of results:
+
+```bash
+# Crack and organize in one pipeline
+cat *.txt | mdxfind -h ALL wordlist.txt | mdsplit *.txt
+
+# With tee to keep a copy of raw results
+cat *.txt | mdxfind -h ALL wordlist.txt | tee -a session.res | mdsplit *.txt
+```
+
+mdsplit also accepts result files via `-f`:
+
+```bash
+# Process previously saved results
+mdsplit -f session.res *.txt
+
+# If results lack hash-type prefixes (e.g., hashcat potfile), specify a default type
+mdsplit -t MD5 -f hashcat.potfile *.txt
+```
+
+## Windows Notes
+
+On the Windows command line, use double quotes instead of single quotes for regex:
+
+```cmd
+mdxfind -h "^MD5$" -f hashes.txt wordlist.txt
+mdxfind -h "ALL" -h "!salt,!user" -f hashes.txt wordlist.txt
+```
+
+## Antivirus False Positives
+
+Some antivirus vendors on VirusTotal occasionally flag mdxfind as a coin miner, due to its hashing features. This is a false positive — mdxfind does not mine cryptocurrency. It is a hash-cracking tool for security research.
+
 ## Rule-Based Password Mutations (-r and -R switches)
 
 mdxfind has built-in support for hashcat/JtR-compatible rules, applied directly during hash search. This is far more efficient than generating candidates externally and piping them in, because mdxfind applies the rules inside its inner loop and avoids I/O overhead. See [RULES.md](RULES.md) for the complete rule reference.
