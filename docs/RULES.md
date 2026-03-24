@@ -4,7 +4,7 @@ mdxfind (via `-r` and `-R`) and [procrule](https://github.com/Cynosureprime/proc
 
 Rules are written one per line in a rule file. Each rule is a sequence of operations applied left to right. Multiple operations can be combined on a single line to create complex transformations.
 
-Positions are encoded as `0`–`9` for positions 0–9 and `A`–`Z` for positions 10–35.
+Positions are encoded as `0`–`9` for positions 0–9, `A`–`Z` for positions 10–35, and `a`–`z` for positions 36–61. This allows rules to address characters up to position 61 in very long passwords.
 
 ## Case Rules
 
