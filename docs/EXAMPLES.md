@@ -109,3 +109,105 @@ MD5x01 d8e8fca2dc0f896fd7cb4cb0031ba249:$HEX[746573740a]
 ```
 
 mdxfind fully understands the hex format, and will happily use this as a candidate password. There are no limitations on the characters which can appear in a `$HEX[]` representation — strings of NULs, UTF-8, UTF-16, and UTF-32 can all be used.
+
+## Appending Characters (-n switch)
+
+The `-n` switch appends characters to every candidate password. This is one of the most powerful features for finding passwords with common suffixes like year numbers, PINs, or short character sequences.
+
+### Appending digits
+
+`-n 2` appends all 2-digit numbers (00-99) to each candidate:
+
+```
+mdxfind -n 2 -f hashes.txt wordlist.txt
+```
+
+If your wordlist contains "test", mdxfind will try: test00, test01, test02, ... test99.
+
+`-n 3` appends all 3-digit numbers (000-999), and so on up to `-n 16`.
+
+### Appending hex digits
+
+Add an `x` suffix to use hexadecimal digits (0-9, a-f):
+
+```
+mdxfind -n 3x -f hashes.txt wordlist.txt
+```
+
+This tries 000 through fff (4096 combinations) appended to each candidate. Use `X` for uppercase hex (0-9, A-F).
+
+### Appending with masks
+
+For more control, use mask syntax with character classes:
+
+```
+mdxfind -n '?l?d' -f hashes.txt wordlist.txt
+```
+
+This appends one lowercase letter followed by one digit (260 combinations: a0, a1, ... z9).
+
+Available mask character classes:
+
+| Class | Meaning | Count |
+|-------|---------|-------|
+| `?d` | Digits (0-9) | 10 |
+| `?l` | Lowercase letters (a-z) | 26 |
+| `?u` | Uppercase letters (A-Z) | 26 |
+| `?s` | Special characters | 33 |
+| `?a` | All printable ASCII | 95 |
+| `?b` | All bytes (0x00-0xff) | 256 |
+| `[...]` | Custom character set | varies |
+
+Custom character sets use bracket notation:
+
+```
+# Append two hex digits (custom set)
+mdxfind -n '?[0-9a-f]?[0-9a-f]' -f hashes.txt wordlist.txt
+
+# Append a year from 2000-2029
+mdxfind -n '20?[0-2]?d' -f hashes.txt wordlist.txt
+```
+
+### Multiplier effect
+
+The `-n` switch multiplies your wordlist by the number of combinations. A wordlist of 10 million words with `-n 2` becomes 1 billion candidates (10M x 100). With `-n 3`, it becomes 10 billion. Choose carefully — `-n 4` on a large wordlist may take a very long time.
+
+| Switch | Combinations | 10M wordlist becomes |
+|--------|-------------|---------------------|
+| `-n 1` | 10 | 100M |
+| `-n 2` | 100 | 1B |
+| `-n 3` | 1,000 | 10B |
+| `-n 4` | 10,000 | 100B |
+| `-n 2x` | 256 | 2.56B |
+| `-n 3x` | 4,096 | 40.96B |
+| `-n '?l?d'` | 260 | 2.6B |
+| `-n '?d?d?d?d'` | 10,000 | 100B |
+
+## Prepending Characters (-N switch)
+
+The `-N` switch prepends characters to every candidate password, using mask syntax:
+
+```
+mdxfind -N '?d?d' -f hashes.txt wordlist.txt
+```
+
+If your wordlist contains "test", mdxfind will try: 00test, 01test, 02test, ... 99test.
+
+The mask syntax for `-N` is the same as for `-n`. This is useful for passwords where users prefix with digits or short codes:
+
+```
+# Prepend 1-3 digits
+mdxfind -N '?d' -f hashes.txt wordlist.txt
+mdxfind -N '?d?d' -f hashes.txt wordlist.txt
+mdxfind -N '?d?d?d' -f hashes.txt wordlist.txt
+```
+
+### Combining -n and -N
+
+You can use both switches together to try modifications on both ends:
+
+```
+mdxfind -N '?d' -n '?d?d' -f hashes.txt wordlist.txt
+```
+
+This prepends one digit and appends two digits to each candidate, for 10 x 100 = 1,000 combinations per word.

@@ -65,13 +65,19 @@ mdxfind -f hashes.txt wordlist.txt
 
 ### Working on multiple lists simultaneously
 
-A major strength of mdxfind is its ability to search across many hash lists at once. Simply concatenate all your `.txt` files:
+A major strength of mdxfind is its ability to search across many hash lists at once. By default, mdxfind reads hashes from stdin, so you can concatenate all your `.txt` files and pipe them in:
 
 ```bash
-cat *.txt | mdxfind -f - wordlist.txt
+cat *.txt | mdxfind wordlist.txt
 ```
 
-Or use multiple `-f` flags or shell globbing — mdxfind handles millions of hashes efficiently using Judy arrays for compressed storage.
+Or use `-f` to load hashes from a file, which frees up stdin for other uses:
+
+```bash
+mdxfind -f hashes.txt wordlist.txt
+```
+
+mdxfind handles millions of hashes efficiently using Judy arrays for compressed storage.
 
 In practice, a typical session looks like:
 
