@@ -2,13 +2,13 @@
 
 ## Standard Benchmark Test Set
 
-A reproducible benchmark suite is available for download from [www.mdxfind.com](http://www.mdxfind.com):
+A reproducible benchmark suite is available for download from [www.mdxfind.com](https://www.mdxfind.com):
 
 | File | Contents | Size |
 |------|----------|------|
-| [rockyou.txt.gz](http://www.mdxfind.com/rockyou.txt.gz) | Rockyou wordlist (14.3M passwords) | 49MB |
-| [mdxfind-benchmark-full.zip](http://www.mdxfind.com/mdxfind-benchmark-full.zip) | Full hash test files (14.3M hashes each, unsalted + salted) | 1.7GB |
-| [mdxfind-benchmark-small.zip](http://www.mdxfind.com/mdxfind-benchmark-small.zip) | Small hash test files (1M hashes each, unsalted + salted) | 122MB |
+| [rockyou.txt.gz](https://www.mdxfind.com/rockyou.txt.gz) | Rockyou wordlist (14.3M passwords) | 49MB |
+| [mdxfind-benchmark-full.zip](https://www.mdxfind.com/mdxfind-benchmark-full.zip) | Full hash test files (14.3M hashes each, unsalted + salted) | 1.7GB |
+| [mdxfind-benchmark-small.zip](https://www.mdxfind.com/mdxfind-benchmark-small.zip) | Small hash test files (1M hashes each, unsalted + salted) | 122MB |
 
 ### Test files
 
@@ -33,7 +33,24 @@ mdxfind -z -h '^MD5$' -f /dev/null rockyou.txt | cut -d' ' -f2 | cut -d: -f1 > t
 
 Each line is `hash:salt` format, where the hash is MD5(original\_MD5\_hash + salt) and the salt is a random 3-character string. This creates a double-hash-plus-salt scheme: solving requires computing MD5(candidate), appending the salt, then computing MD5 again — effectively MD5(MD5($pass) + $salt). This is internal type e31 (MD5SALT with MD5 pre-hash).
 
-This is a significantly harder benchmark than plain MD5, and to our knowledge only mdxfind can solve this type natively.
+This creates two classes of solvable hashes within each salted file:
+
+- **Non-reversed entries** (from the non-reversed hashes in the source test file): solvable as **MD5SALT (e31)** — standard MD5(MD5($pass) + $salt)
+- **Reversed entries** (from the reversed hashes): solvable as **MD5revMD5SALT (e541)** — MD5(reverse(MD5($pass)) + $salt)
+
+The standard salted benchmark uses e31 (MD5SALT) only, for fair comparison with other tools:
+
+```bash
+mdxfind -M e31 -F saltfull.txt rockyou.txt
+```
+
+However, mdxfind can solve *both* types in a single run by adding e541:
+
+```bash
+mdxfind -M e31,e541 -F saltfull.txt rockyou.txt
+```
+
+To our knowledge, no other tool supports the reversed-MD5-salted variant (e541).
 
 | File | Hashes | Solvable | Description |
 |------|--------|----------|-------------|
