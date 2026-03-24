@@ -212,6 +212,235 @@ mdxfind -N '?d' -n '?d?d' -f hashes.txt wordlist.txt
 
 This prepends one digit and appends two digits to each candidate, for 10 x 100 = 1,000 combinations per word.
 
+## Selecting Hash Types (-h and -m switches)
+
+### By name with regex (-h)
+
+The `-h` switch selects hash types using regular expressions (case-insensitive). Multiple types can be comma-separated, and `-h` can be used multiple times:
+
+```bash
+# All MD5 variants
+mdxfind -h MD5 -f hashes.txt wordlist.txt
+
+# Only exact MD5 (no variants)
+mdxfind -h ^MD5$ -f hashes.txt wordlist.txt
+
+# MD5 and SHA1
+mdxfind -h MD5,SHA1 -f hashes.txt wordlist.txt
+
+# All salted types
+mdxfind -h SALT -f hashes.txt wordlist.txt
+
+# Everything except salted and user types
+mdxfind -h ALL -h '!salt,!user' -f hashes.txt wordlist.txt
+```
+
+### By hashcat mode or internal index (-m)
+
+The `-m` switch selects by hashcat mode number or mdxfind's internal type index:
+
+```bash
+# hashcat mode 0 (MD5)
+mdxfind -m 0 -f hashes.txt wordlist.txt
+
+# hashcat modes 0 and 100 (MD5 + SHA1)
+mdxfind -m 0,100 -f hashes.txt wordlist.txt
+
+# Internal types e1 through e10 (MD5 through SHA256)
+mdxfind -m e1-e10 -f hashes.txt wordlist.txt
+
+# Mix hashcat and internal: MD5 + NTLM
+mdxfind -m e1,1000 -f hashes.txt wordlist.txt
+```
+
+Use `-h` with no other arguments to display the full list of supported types with their hashcat mode mappings.
+
+## Salt Files (-s switch)
+
+The `-s` switch loads salts from a file. This is essential when you have salted hashes but the salt is not embedded in the hash line. mdxfind will try every salt against every hash for the selected salted algorithms:
+
+```bash
+# Extract salts from hash:salt format (characters 34 onward)
+cut -c 34- salted_hashes.txt > salts.txt
+
+# Run with salts
+mdxfind -s salts.txt -h "^MD5SALT$" -f salted_hashes.txt wordlist.txt
+```
+
+You can use `-s` multiple times. A special form generates numeric salts:
+
+```bash
+# Generate 2-digit salts (00-99)
+mdxfind -s 2-salt -f hashes.txt wordlist.txt
+
+# Generate 3-digit salts (000-999)
+mdxfind -s 3-salt -f hashes.txt wordlist.txt
+
+# Generate 6-digit salts (000000-999999)
+mdxfind -s 6-salt -f hashes.txt wordlist.txt
+```
+
+## Loading Hashes with Embedded Salts (-F and -M switches)
+
+When hashes have salts embedded in the line (e.g., `hash:salt`), use `-F` to load them directly and `-M` to specify the hash type:
+
+```bash
+# Load salted hashes from stdin, type MD5SALT (internal e31)
+cat salted/*.txt | mdxfind -M e31 -F stdin wordlist.txt
+
+# Load from a file
+mdxfind -M e31 -F salted_hashes.txt wordlist.txt
+```
+
+## Username/Userid Files (-u switch)
+
+Some hash types incorporate a username into the hash computation (e.g., Oracle, MSCACHE). Load usernames from a file:
+
+```bash
+mdxfind -u users.txt -h USER -f hashes.txt wordlist.txt
+```
+
+## Suffix Files (-k switch)
+
+The `-k` switch reads literal strings from a file and appends each one to every candidate word. Unlike `-n` (which generates digit/mask combinations), `-k` uses arbitrary strings — domain names, common suffixes, year strings, etc.:
+
+```bash
+# suffixes.txt contains: @gmail.com, @yahoo.com, 2024, 2025, !!, ...
+mdxfind -k suffixes.txt -f hashes.txt wordlist.txt
+```
+
+Each line in the suffix file is appended to each word, so a 10-line suffix file multiplies your wordlist by 10.
+
+## Email Address Munging (-a switch)
+
+The `-a` switch performs intelligent email-style mutations on candidate words. For each word containing an `@` sign:
+
+1. The domain portion is identified and preserved
+2. The username portion has all `.` separators stripped
+3. All possible positions for inserting `.` between characters are tried
+
+This is useful because email providers (especially Gmail) treat dots in usernames as optional — `john.doe@gmail.com`, `johndoe@gmail.com`, and `j.o.h.n.d.o.e@gmail.com` all deliver to the same mailbox. Some sites store the user-entered version as a "password" or identifier.
+
+```bash
+mdxfind -a -f hashes.txt email_wordlist.txt
+```
+
+Words without an `@` sign are skipped by the munging (but still hashed normally).
+
+## Unicode Expansion (-b switch)
+
+The `-b` switch expands each word into UTF-16LE encoding (best effort), which is required for hash types like NTLM that operate on Unicode input:
+
+```bash
+mdxfind -b -h NTLM -f ntlm_hashes.txt wordlist.txt
+```
+
+## XML Entity Replacement (-c switch)
+
+The `-c` switch replaces special characters (`<`, `>`, `&`, etc.) with their XML entity equivalents (`&lt;`, `&gt;`, `&amp;`). Useful for web application hashes where the password was HTML-encoded before hashing:
+
+```bash
+mdxfind -c -f hashes.txt wordlist.txt
+```
+
+## De-duplication (-d switch)
+
+The `-d` switch attempts to de-duplicate candidate passwords across wordlists. If the same word appears in multiple files (or multiple times in one file), it is only hashed once:
+
+```bash
+mdxfind -d -f hashes.txt wordlist1.txt wordlist2.txt wordlist3.txt
+```
+
+This saves time when using overlapping wordlists but uses additional memory for tracking.
+
+## Extended Truncation Search (-e switch)
+
+By default, mdxfind matches shorter input hashes against common boundaries of longer computed hashes (e.g., the first 32 characters of a SHA-1 hex output). The `-e` switch extends this to check every byte boundary:
+
+```bash
+mdxfind -e -f hashes.txt wordlist.txt
+```
+
+This is slower but finds hashes that were truncated at unusual positions.
+
+## CR/LF Variations (-l switch)
+
+The `-l` switch tries each candidate with various line-ending characters appended — NUL, CR (`\r`), LF (`\n`), and CR/LF (`\r\n`). Results containing unprintable characters are shown in `$HEX[]` format:
+
+```bash
+mdxfind -l -f hashes.txt wordlist.txt
+```
+
+This catches cases where a password was hashed with a trailing newline or other control character still attached.
+
+## Thread Count (-t switch)
+
+Control the number of worker threads:
+
+```bash
+# Use 4 threads
+mdxfind -t 4 -f hashes.txt wordlist.txt
+
+# Use 1 thread (useful for debugging or low-memory systems)
+mdxfind -t 1 -f hashes.txt wordlist.txt
+```
+
+By default, mdxfind uses all available CPU cores.
+
+## Skip Lines (-w switch)
+
+Skip a number of lines from the beginning of the first wordlist. Useful for resuming an interrupted session:
+
+```bash
+# Skip the first 5 million lines
+mdxfind -w 5000000 -f hashes.txt large_wordlist.txt
+```
+
+## Directory Recursion (-y switch)
+
+Treat wordlist arguments as directories and recurse into them:
+
+```bash
+mdxfind -y -f hashes.txt /path/to/wordlist_directory/
+```
+
+## Print Source (-p switch)
+
+Print the source filename for each found password. Useful when processing multiple wordlists to know which file contained the winning candidate:
+
+```bash
+mdxfind -p -f hashes.txt wordlist1.txt wordlist2.txt wordlist3.txt
+```
+
+## Preserve Salts (-v switch)
+
+Normally, when a salted hash is solved, the matching salt is removed from consideration to avoid redundant work. The `-v` switch disables this behavior, keeping all salts active throughout the run. This is important when:
+
+- Salts are reused across multiple hashes in the input
+- The salt count may be inaccurate due to combined salt files or earlier processing errors
+
+```bash
+mdxfind -v -s salts.txt -h SALT -f hashes.txt wordlist.txt
+```
+
+## Debug Output (-z switch)
+
+Enable debug mode to see detailed information about hash matching:
+
+```bash
+mdxfind -z -f hashes.txt wordlist.txt
+```
+
+## Rule Hit Histogram (-Z switch)
+
+After a run with rules, print a histogram showing which rules produced the most matches:
+
+```bash
+mdxfind -r best64.rule -Z -f hashes.txt wordlist.txt
+```
+
+This helps identify the most effective rules for your target hash lists, so you can build optimized rule files for future sessions.
+
 ## Rule-Based Password Mutations (-r and -R switches)
 
 mdxfind has built-in support for hashcat/JtR-compatible rules, applied directly during hash search. This is far more efficient than generating candidates externally and piping them in, because mdxfind applies the rules inside its inner loop and avoids I/O overhead. See [RULES.md](RULES.md) for the complete rule reference.
