@@ -99,6 +99,70 @@ uint32_t *metal_md5salt_probe_salts(
     int hexlen,
     int *nhits_out);
 
+/* Load overflow hash entries into GPU buffer for binary search fallback.
+ * keys:     sorted array of uint64_t keys (first 8 bytes of each hash)
+ * hashes:   packed hash data (variable length per entry)
+ * offsets:  byte offset into hashes for each entry
+ * lengths:  byte length of each hash entry
+ * count:    number of overflow entries
+ * Returns 0 on success. */
+int metal_md5salt_set_overflow(
+    const uint64_t *keys,
+    const unsigned char *hashes,
+    const uint32_t *offsets,
+    const uint16_t *lengths,
+    int count);
+
+/* Set maximum iteration count for GPU dispatch. Default 1.
+ * Each iteration computes MD5(hex(previous_result)) and probes the compact table. */
+void metal_md5salt_set_max_iter(int max_iter);
+
+/* Dispatch a batch of pre-hashed words against all pre-loaded salts.
+ * hexhashes:   packed hex hashes, 256 bytes per word (only hexlens[i] used)
+ * hexlens:     length of each hex hash (cast from int* to uint16_t* by caller)
+ * num_words:   number of words in this batch
+ * nhits_out:   receives total number of hits (may exceed 32768)
+ *
+ * Salts must be pre-loaded via metal_md5salt_set_salts().
+ * GPU computes MD5(hexhash + salt) for each (word, salt) pair, probes compact table.
+ * Returns pointer to hit buffer in shared GPU/CPU memory (zero-copy).
+ * Each hit is 6 uint32s: {word_idx, salt_idx, hash[0], hash[1], hash[2], hash[3]}.
+ * At most 32768 hits stored; if *nhits_out > 32768, caller must process stored
+ * hits, remove matched salts, and re-dispatch.
+ * Pointer valid until next call. */
+uint32_t *metal_md5salt_dispatch_batch(
+    const char *hexhashes,
+    const uint16_t *hexlens,
+    int num_words,
+    int *nhits_out);
+
+/* Set maximum iteration count for GPU dispatch. Default 1.
+ * Each iteration computes MD5(hex(previous_result)) and probes the compact table.
+ * When max_iter > 1, uses a separate kernel that doesn't affect the fast path. */
+void metal_md5salt_set_max_iter(int max_iter);
+
+/* Set the current op type for GPU kernel selection.
+ * Used to select specialized kernels (e.g., sub8-24 = op 542). */
+void metal_md5salt_set_op(int op);
+
+/* ---- Double-buffer slot API ---- */
+
+/* Initialize double-buffer dispatch slots. Call once from gpujob_init.
+ * max_salt_count/max_salt_bytes: maximum across all active hash types. */
+int metal_md5salt_init_slots(int max_salt_count, int max_salt_bytes);
+
+/* Submit a batch to a slot. Copies all data into pre-allocated GPU buffers.
+ * Returns immediately — GPU processes asynchronously. */
+int metal_md5salt_submit_slot(int slot,
+    const char *hexhashes, const uint16_t *hexlens, int num_words,
+    const char *salts, const uint32_t *salt_offsets,
+    const uint16_t *salt_lens, int num_salts);
+
+/* Wait for slot dispatch to complete. Returns pointer to hit buffer.
+ * Each hit: 6 uint32s {word_idx, salt_idx, hash[0..3]}.
+ * Pointer valid until next submit_slot on same slot. */
+uint32_t *metal_md5salt_wait_slot(int slot, int *nhits_out);
+
 #ifdef __cplusplus
 }
 #endif

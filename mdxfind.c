@@ -122,6 +122,7 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 
 #if defined(__APPLE__) && defined(METAL_GPU)
 #include "metal_md5salt.h"
+#include "gpujob.h"
 #endif
 
 
@@ -151,9 +152,36 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.225 2026/03/25 13:33:57 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.234 2026/03/27 17:56:55 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.234  2026/03/27 17:56:55  dlr
+ * Remove Maxiter==1 restriction from GPU eligibility check — iteration now handled by GPU iter kernel.
+ *
+ * Revision 1.233  2026/03/26 13:25:57  dlr
+ * Add GPU support for e541 (MD5revMD5SALT), MD5UCSALT, MD5sub8-24SALT. Per-op M[] packing: reversed hex, uppercase hex, substring. Gate GPU on supported op types.
+ *
+ * Revision 1.232  2026/03/26 05:16:34  dlr
+ * Decode $HEX[] salts in build_salt_snapshot. Fix comfort message lps/hps. Fix stats timing after join_all. Remove overflow debug dump. Pre-pack M[0..7] with hexlut_lc.
+ *
+ * Revision 1.231  2026/03/26 02:26:23  dlr
+ * Pre-pack MD5 hex into M[0..7] words on CPU using hexlut_lc. GPU reads 8 uint32 words directly, skips hex encode. 26% faster (604M vs 445M h/s on M1).
+ *
+ * Revision 1.230  2026/03/26 02:02:23  dlr
+ * Fix stats timing: move time(&end) after join_all() so GPU processing time is included in hashing seconds and hash rate.
+ *
+ * Revision 1.229  2026/03/26 01:42:16  dlr
+ * Pass binary hash (16 bytes) to GPU instead of hex ASCII (32 bytes). GPU hex-encodes internally. Halves per-word GPU transfer.
+ *
+ * Revision 1.228  2026/03/25 23:11:05  dlr
+ * Move Hashchain to mdxfind.h. Overflow hash dump for debug. Fix ReportStats typos (mutl1, space in <=).
+ *
+ * Revision 1.227  2026/03/25 15:23:54  dlr
+ * gpujob working: 1000/1000 at 1.17GH/s. Fix shutdown order (before join_all), fix hexlen uint16_t, fix extern pointer types, lazy salt init, make FreeWaiting/build_salt_snapshot non-static.
+ *
+ * Revision 1.226  2026/03/25 15:02:52  dlr
+ * gpujob architecture: dedicated GPU worker thread with JOBG batch queue. Compiles and links. -G flag. Needs debugging.
+ *
  * Revision 1.225  2026/03/25 13:33:57  dlr
  * Fix gen_salts() overwriting -F/-s loaded salts: skip generation when SaltArray already populated.
  *
@@ -1467,6 +1495,9 @@ static void blake2b_hash(unsigned char *out, size_t outlen,
 }
 
 int NoMarkSalt, Hexkey, Rotatehash, Unicode, Dedupe, XMLchar, Email, Printall;
+#if defined(__APPLE__) && defined(METAL_GPU)
+int NoMetal;
+#endif
 
 
 int Debug, DoHistogram;
@@ -1506,11 +1537,7 @@ static unsigned char *inhash1, *inhash2, *inhashbuf, *inhashstart;
 static int inhash, inhashcnt;
 
 
-struct Hashchain {
-  struct Hashchain *next;
-  unsigned short int flags, len;
-  unsigned char hash[1];
-};
+/* struct Hashchain is in mdxfind.h */
 #ifdef __MACH__
 #include <mach/clock.h>
 #include <mach/mach.h>
@@ -6269,7 +6296,7 @@ static inline int mask_expand(unsigned long long index, char *buf) {
 
 struct job *FreeHead, **FreeTail;
 struct job *WorkHead, **WorkTail;
-static lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;
+lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;
 static lock *ReadBuf0, *ReadBuf1, *HashWaiting;
 static lock *ServerState;
 unsigned long long Tothash, Totfound, Totrules;
@@ -7954,7 +7981,7 @@ release(FreeWaiting);
     job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], hash, job->pass);
 }
 
-static int build_salt_snapshot(struct saltentry *snap, char *pool,
+int build_salt_snapshot(struct saltentry *snap, char *pool,
                                Pvoid_t judy, char *keybuf, int printall) {
     Word_t *lpv;
     int n = 0;
@@ -7964,7 +7991,14 @@ static int build_salt_snapshot(struct saltentry *snap, char *pool,
     while (lpv) {
         if (printall || *lpv > 0) {
             int slen = mystrlen(keybuf);
-            memcpy(p, keybuf, slen + 1);
+            if (slen > 5 && strncmp(keybuf, "$HEX[", 5) == 0) {
+                int hexlen = slen - 6;
+                if (hexlen < 0) hexlen = 0;
+                slen = get32(keybuf + 5, (unsigned char *)p, hexlen / 2 + 1);
+                p[slen] = 0;
+            } else {
+                memcpy(p, keybuf, slen + 1);
+            }
             snap[n].salt = p;
             snap[n].PV = lpv;
             snap[n].saltlen = slen;
@@ -8129,6 +8163,9 @@ SSEBUF[15]=_mm_setzero_si128();
 #endif
 rhash_con = NULL;
 argon2_ws = NULL;
+#if defined(__APPLE__) && defined(METAL_GPU)
+struct jobg *my_jobg = NULL;
+#endif
 
 while (1) {
   possess(WorkWaiting);
@@ -8139,6 +8176,12 @@ while (1) {
     exit(1);
   }
   if (job->op == JOB_DONE) {
+#if defined(__APPLE__) && defined(METAL_GPU)
+    if (my_jobg && my_jobg->count > 0) {
+      gpujob_submit(my_jobg);
+      my_jobg = NULL;
+    }
+#endif
     release(WorkWaiting);
     return;
   }
@@ -8296,26 +8339,6 @@ while (1) {
     snap_valid = 1;
     if (!nsalts_job) Typedone[job->op] = 1;
   }
-
-#if defined(__APPLE__) && defined(METAL_GPU)
-  /* GPU state — allocated once per job, freed at end */
-  static __thread int gpu_thread_id = 0;
-  static volatile int gpu_claimed = 0;
-  int gpu_active = 0;
-  if (metal_md5salt_available() && Maxiter == 1 &&
-      !Rotatehash && !Printall && nsalts_job >= 100 &&
-      job->op == JOB_MD5SALT) {
-    /* Only one thread uses GPU — first to claim wins */
-    if (!gpu_thread_id && __sync_bool_compare_and_swap(&gpu_claimed, 0, 1))
-      gpu_thread_id = 1;
-    gpu_active = gpu_thread_id;
-  }
-  char *gpu_salts = NULL;
-  uint32_t *gpu_soff = NULL;
-  uint16_t *gpu_slen = NULL;
-  int gpu_nsalts = 0;
-  int gpu_repack_needed = 0;
-#endif /* __APPLE__ && METAL_GPU */
 
   for (curline = job->startline; numline < job->numline; curline++, numline++, lineproc++) {
 
@@ -19080,90 +19103,76 @@ MD5SALTstart:
               { int si, compact_ctr = 0;
               d = mdbuf + len;
 #if defined(__APPLE__) && defined(METAL_GPU)
-              /* GPU salt loop: pass pre-computed 32-char hex hash + all salts to GPU.
-               * GPU computes MD5(hex32 + salt) for each salt and probes compact table.
-               * CPU verifies hits via checkhashkey with proper PV_DEC/compaction. */
-              if (gpu_active && nsalts_job >= 100) {
-                /* Pack salts if needed (first call or after compaction) */
-                if (!gpu_salts || gpu_repack_needed) {
-                  /* Allocate once at max size, reuse thereafter */
-                  if (!gpu_salts) {
-                    size_t max_salt_bytes = 0;
-                    for (si = 0; si < nsalts_job; si++)
-                      max_salt_bytes += saltsnap[si].saltlen;
-                    gpu_salts = malloc(max_salt_bytes + 16);
-                    gpu_soff = malloc(nsalts_job * sizeof(uint32_t));
-                    gpu_slen = malloc(nsalts_job * sizeof(uint16_t));
-                  }
-                  gpu_nsalts = 0;
-                  uint32_t gsp = 0;
-                  for (si = 0; si < nsalts_job; si++) {
-                    if (!Printall && *saltsnap[si].PV == 0) continue;
-                    gpu_soff[gpu_nsalts] = gsp;
-                    gpu_slen[gpu_nsalts] = saltsnap[si].saltlen;
-                    memcpy(gpu_salts + gsp, saltsnap[si].salt, saltsnap[si].saltlen);
-                    gsp += saltsnap[si].saltlen;
-                    gpu_nsalts++;
-                  }
-                  gpu_repack_needed = 0;
-                  metal_md5salt_set_salts(gpu_salts, gpu_soff, gpu_slen, gpu_nsalts);
+              /* GPU path: pack this word's hex hash into a JOBG batch.
+               * gpujob() thread handles the actual GPU dispatch. */
+              if (gpujob_available() && !Rotatehash && !Printall &&
+                  nsalts_job >= 100 &&
+                  (job->op == JOB_MD5SALT || job->op == JOB_MD5revMD5SALT ||
+                   job->op == JOB_MD5UCSALT || job->op == JOB_MD5sub8_24SALT)) {
+                if (!my_jobg) {
+                  my_jobg = gpujob_get_free();
+                  my_jobg->op = job->op;
+                  my_jobg->filename = job->filename;
+                  my_jobg->flags = job->flags;
+                  my_jobg->doneprint = job->doneprint;
                 }
-
-                /* Dispatch all salts; loop if hit buffer overflows (>32K hits) */
-                #define GPU_MAX_RETURN 32768
-                int nhits;
-                do {
-                  uint32_t *hits = metal_md5salt_probe_salts(mdbuf, len, &nhits);
-                  if (!hits) break;
-                  int stored = nhits > GPU_MAX_RETURN ? GPU_MAX_RETURN : nhits;
-
-                  for (int h = 0; h < stored; h++) {
-                    uint32_t *entry = hits + h * 5;
-                    int sidx = entry[0];
-                    if (sidx >= gpu_nsalts) continue;
-
-                    curin.i[0] = entry[1];
-                    curin.i[1] = entry[2];
-                    curin.i[2] = entry[3];
-                    curin.i[3] = entry[4];
-                    y = 32;
-
-                    int gslen = gpu_slen[sidx];
-                    char *gs = gpu_salts + gpu_soff[sidx];
-                    for (si = 0; si < nsalts_job; si++) {
-                      if (saltsnap[si].saltlen == gslen &&
-                          memcmp(saltsnap[si].salt, gs, gslen) == 0) {
-                        s1 = saltsnap[si].salt;
-                        if (checkhashkey(&curin, y, s1, job)) {
-                          PV_DEC(saltsnap[si].PV);
-                          if (!Printall && *saltsnap[si].PV == 0) {
-                            saltsnap[si] = saltsnap[--nsalts_job]; si--;
-                            gpu_repack_needed = 1;
-                          }
-                        }
-                        break;
-                      }
+                int idx = my_jobg->count;
+                /* Pre-pack hex hash into M[] words for GPU, per algorithm */
+                { uint32_t *mw = (uint32_t *)my_jobg->hexhash[idx];
+                  unsigned char *hb = curin.h;
+                  const char *lut;
+                  switch (job->op) {
+                  case JOB_MD5UCSALT:
+                    lut = hexlut_uc;
+                    for (int mi = 0; mi < 8; mi++) {
+                      unsigned short h0 = *(unsigned short *)&lut[hb[mi*2] * 2];
+                      unsigned short h1 = *(unsigned short *)&lut[hb[mi*2+1] * 2];
+                      mw[mi] = h0 | ((uint32_t)h1 << 16);
                     }
-                  }
-
-                  /* If overflow, repack and re-dispatch same word */
-                  if (nhits > GPU_MAX_RETURN) {
-                    gpu_nsalts = 0;
-                    uint32_t gsp = 0;
-                    for (si = 0; si < nsalts_job; si++) {
-                      if (!Printall && *saltsnap[si].PV == 0) continue;
-                      gpu_soff[gpu_nsalts] = gsp;
-                      gpu_slen[gpu_nsalts] = saltsnap[si].saltlen;
-                      memcpy(gpu_salts + gsp, saltsnap[si].salt, saltsnap[si].saltlen);
-                      gsp += saltsnap[si].saltlen;
-                      gpu_nsalts++;
+                    my_jobg->hexlen[idx] = 32;
+                    break;
+                  case JOB_MD5revMD5SALT:
+                    /* Use prmd5REV to produce reversed hex, then pack into M words */
+                    { char revbuf[36];
+                      prmd5REV(hb, revbuf, 32);
+                      for (int mi = 0; mi < 8; mi++)
+                        mw[mi] = *(uint32_t *)&revbuf[mi * 4];
                     }
-                    gpu_repack_needed = 0;
-                    metal_md5salt_set_salts(gpu_salts, gpu_soff, gpu_slen, gpu_nsalts);
+                    my_jobg->hexlen[idx] = 32;
+                    break;
+                  case JOB_MD5sub8_24SALT:
+                    /* Chars 8-23 of hex = bytes 4-11 of binary, 16 hex chars = 4 M words */
+                    for (int mi = 0; mi < 4; mi++) {
+                      unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2] * 2];
+                      unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2+1] * 2];
+                      mw[mi] = h0 | ((uint32_t)h1 << 16);
+                    }
+                    mw[4] = mw[5] = mw[6] = mw[7] = 0;
+                    my_jobg->hexlen[idx] = 16;
+                    break;
+                  default: /* JOB_MD5SALT */
+                    for (int mi = 0; mi < 8; mi++) {
+                      unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
+                      unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
+                      mw[mi] = h0 | ((uint32_t)h1 << 16);
+                    }
+                    my_jobg->hexlen[idx] = 32;
+                    break;
                   }
-                } while (nhits > GPU_MAX_RETURN);
-                hashcnt += gpu_nsalts;
-                if (!nsalts_job) Typedone[job->op] = 1;
+                }
+                my_jobg->passoff[idx] = my_jobg->passbuf_pos;
+                memcpy(&my_jobg->passbuf[my_jobg->passbuf_pos], job->pass, job->clen);
+                my_jobg->passlen[idx] = job->clen;
+                my_jobg->clen[idx] = job->clen;
+                my_jobg->ruleindex[idx] = job->Ruleindex;
+                my_jobg->passbuf_pos += job->clen;
+                my_jobg->count++;
+                if (my_jobg->count >= GPUBATCH_MAX ||
+                    my_jobg->passbuf_pos + 4096 > GPUBATCH_PASS) {
+                  gpujob_submit(my_jobg);
+                  my_jobg = NULL;
+                }
+                hashcnt += nsalts_job;
               } else
 #endif /* __APPLE__ && METAL_GPU */
               {
@@ -32594,6 +32603,13 @@ HAV256_5_start:
         } while (curkey);
       } while (((job->flags & JOBFLAG_NUMBERS) && (++number_iter < (job->MaskCount ? job->MaskCount : Iter_Count[job->digits]))) || currule || (Email && emailcur < emailpow));
     }
+#if defined(__APPLE__) && defined(METAL_GPU)
+    /* Flush partial GPU batch at end of job */
+    if (my_jobg && my_jobg->count > 0) {
+      gpujob_submit(my_jobg);
+      my_jobg = NULL;
+    }
+#endif
     if (job->outlen) { fwrite(job->outbuf,job->outlen,1,stdout); fflush(stdout);}
     if (job->readbuf == Readbuf) {
       possess(ReadBuf0);
@@ -33030,7 +33046,7 @@ void build_compact_table(void) {
             overflow_count, bt);
   }
 #if defined(__APPLE__) && defined(METAL_GPU)
-  if (!getenv("MDX_NO_METAL") && metal_md5salt_init() == 0) {
+  if (!NoMetal && metal_md5salt_init() == 0) {
     if (CompactFP && HashDataBuf && HashDataOff && HashDataLen && CompactSize > 0) {
       metal_md5salt_set_compact_table(CompactFP, CompactIdx,
           CompactSize, CompactMask,
@@ -33046,8 +33062,8 @@ void build_compact_table(void) {
 
 MDXALIGN void ReportStats(void *dummy) {
   int x;
-  double stime,wtime, lps;
-  char *mult;
+  double stime,wtime, lps, hps;
+  char *mult, *mult1;
   unsigned long long lastline;
 
   stime = (double) starthash.tv_sec + (double) (starthash.tv_nsec) / 1000000000.0;
@@ -33065,6 +33081,7 @@ MDXALIGN void ReportStats(void *dummy) {
     }
   wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
   wtime -= stime;
+  if (wtime <= 0.0) wtime = 1;
   if (Totrules) {
     lps = (double)(Totrules - lastline)/15.0;
     lastline = Totrules;
@@ -33072,6 +33089,26 @@ MDXALIGN void ReportStats(void *dummy) {
     lps = (double)((TotLines - lastline))/15.0;
     lastline = TotLines;
   }
+  hps = (double) Tothash/ wtime;
+  if (hps < 0.0) hps = 0.0;
+  mult1 = "";
+  if (hps > 1000.0) {
+    mult1 = "K";
+    hps /= 1000.0;
+  }
+  if (hps > 1000.0) {
+    mult1 = "M";
+    hps /= 1000.0;
+  }
+  if (hps > 1000.0) {
+    mult1 = "G";
+    hps /= 1000.0;
+  }
+  if (hps > 1000.0) {
+    mult1 = "T";
+    hps /= 1000.0;
+}
+
   if (lps < 0.0) lps = 0.0;
   mult = "";
   if (lps > 1000.0) {
@@ -33091,9 +33128,7 @@ MDXALIGN void ReportStats(void *dummy) {
     lps /= 1000.0;
   }
      
-  if (wtime <= 0)
-    wtime = 1.0;
-  fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2fMh/s, %.2f%sc/s\n", Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound,(double) Tothash/1000000.0 / wtime,lps,mult);
+  fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n", Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound,hps, mult1,lps,mult);
   fflush(stdout);
   }
 }
@@ -37653,7 +37688,7 @@ int main(int argc, char **argv) {
   inhashcnt = 0;
   current_utc_time(&starthash);
 
-  while ((ch = getopt(argc, argv, "?abcdelpvVyzZf:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:N:R:M:S:U:P:X:")) != -1) {
+  while ((ch = getopt(argc, argv, "?abcdelpvVyzZGf:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:N:R:M:S:U:P:X:")) != -1) {
     switch (ch) {
       case 'X':
         s = optarg;
@@ -37781,6 +37816,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Rule Histogram enabled\n");
         DoHistogram = 1;
         break;
+#if defined(__APPLE__) && defined(METAL_GPU)
+      case 'G':
+        fprintf(stderr, "Metal GPU disabled\n");
+        NoMetal = 1;
+        break;
+#endif
 
       case 'q':
         Maxniter = atoi(optarg);
@@ -41782,6 +41823,10 @@ usage:
 
   Curfile = "<Unknown>";
   LowSkip = Lowline = 0;
+#if defined(__APPLE__) && defined(METAL_GPU)
+  if (metal_md5salt_available())
+    gpujob_init(maxt + 16);
+#endif
   launch(ReportStats, NULL);
   for (y = 0; y < argc; y++) {
     doneprint = 0;
@@ -41926,8 +41971,6 @@ reprocess:
   FreeHead = job->next;
   job->next = NULL;
   twist(FreeWaiting, BY, -1);
-  current_utc_time(&current);
-  time(&end);
   if (ThreadCount) {
     possess(WorkWaiting);
     job->op = JOB_DONE;
@@ -41937,9 +41980,14 @@ reprocess:
     possess(HashWaiting);
     twist(HashWaiting, TO, 1);
 
+#if defined(__APPLE__) && defined(METAL_GPU)
+    gpujob_shutdown(); /* must be before join_all — gpujob needs JOB_DONE to exit */
+#endif
     x = join_all();
     fprintf(stderr, "\nDone - %d threads caught\n", x - 1);
   }
+  current_utc_time(&current);
+  time(&end);
   start = end - start;
   fprintf(stderr, "%s lines processed in %llu seconds\n", commify(Totallines), (unsigned long long) start);
   if (Totrules)

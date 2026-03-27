@@ -1,5 +1,8 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.25  2026/03/26 19:58:36  dlr
+ * Skip sha1_block.s SSSE3 assembly on Windows — uses System V ABI (rdi/rsi), crashes on Win64 (rcx/rdx). Use SHA-NI intrinsics or C sha1_step fallback only.
+ *
  * Revision 1.24  2026/03/23 17:49:01  dlr
  * Add getentropy/explicit_bzero portability shims for old glibc, SHA1 SSE2 fallback via sha1_step
  *
@@ -1749,8 +1752,22 @@ void sha1_step(uint32_t * H, const uint32_t *inputu) {
   H[3] += b;
   H[4] += c;
 }
-#ifdef MDX_BIT32
+#if defined(MDX_BIT32)
 #define SHAUP sha1_step
+#elif defined(_WIN32)
+/* Windows: sha1_block.s uses System V ABI (rdi/rsi), not Win64 (rcx/rdx).
+ * Use SHA-NI intrinsics (C, compiler handles ABI) or C fallback only. */
+static void sha1_block_init(uint32_t *hash, uint32_t *block);
+static void (*sha1_block_fn)(uint32_t *, uint32_t *) = sha1_block_init;
+
+static void sha1_block_init(uint32_t *hash, uint32_t *block) {
+    unsigned int eax, ebx, ecx, edx;
+    sha1_block_fn = (void (*)(uint32_t *, uint32_t *))sha1_step;
+    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) && (ebx & (1u << 29)))
+        sha1_block_fn = (void (*)(uint32_t *, uint32_t *))sha1_compress_shani;
+    sha1_block_fn(hash, block);
+}
+#define SHAUP sha1_block_fn
 #else
 /* Runtime dispatch: SHA-NI > SSSE3 assembly > C fallback */
 static void sha1_block_init(uint32_t *hash, uint32_t *block);

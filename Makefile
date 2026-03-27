@@ -34,6 +34,10 @@ ifeq ($(UNAME_S),Darwin)
   ICONV = /opt/local/lib/libiconv.a
   LDEXTRA =
   INCEXTRA = -I/opt/local/include
+  # Metal GPU acceleration on macOS (Apple Silicon and x86_64 with discrete/integrated GPU)
+  METAL_GPU = 1
+  OSOPT += -DMETAL_GPU=1
+  LDEXTRA += -framework Metal -framework Foundation
 else ifeq ($(UNAME_S),FreeBSD)
   OSOPT =
   ICONV = /usr/local/lib/libiconv.a
@@ -71,6 +75,11 @@ MDSPLIT_OBJS = mdsplit.o
 # sha1_block.s requires yasm and is x86_64-only
 ifeq ($(UNAME_M),x86_64)
   MDXFIND_OBJS += sha1_block.o sha1_shani.o
+endif
+
+# Metal GPU objects (macOS only)
+ifdef METAL_GPU
+  MDXFIND_OBJS += metal_md5salt.o gpujob.o
 endif
 
 # argon2 fill-block selection: SSE on x86_64, portable ref elsewhere
@@ -125,6 +134,19 @@ endif
 
 sha1_shani.o: sha1_shani.c
 	$(CC) -O3 -msha -msse4.1 -c sha1_shani.c
+
+# Metal GPU source files (Objective-C++)
+ifdef METAL_GPU
+metal_md5salt.o: metal_md5salt.m metal_md5salt.h gpujob.h
+	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c metal_md5salt.m
+
+gpujob.o: gpujob.m gpujob.h metal_md5salt.h mdxfind.h
+ifeq ($(UNAME_M),x86_64)
+	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -include emmintrin.h -c gpujob.m
+else
+	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpujob.m
+endif
+endif
 
 mdsplit.o: mdsplit.c
 	$(CC) $(CFLAGS) -c mdsplit.c

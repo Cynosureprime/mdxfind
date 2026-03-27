@@ -1,5 +1,8 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.11  2026/03/25 23:11:05  dlr
+ * Move Hashchain struct to header
+ *
  * Revision 1.10  2026/03/23 02:51:54  dlr
  * Replace -n digit hack with mask-based hybrid attack: -n "?l?d" append, -N prepend, ?[0-9a-f] custom classes
  *
@@ -71,6 +74,12 @@ union HashU {
 #ifdef POWERPC
     vector unsigned int x[16];
 #endif
+};
+
+struct Hashchain {
+    struct Hashchain *next;
+    unsigned short int flags, len;
+    unsigned char hash[1];
 };
 
 #ifdef ARM
