@@ -124,6 +124,7 @@ Expected finds: sm-testfull=1,000,000, sm-test50=500,583, sm-test10=100,203.
 | dev1 | Apple M1 Metal (8 cores) | 3.2 GHz | 1,000,000 | 569s | 783B | 1.38G/s |
 | mmt | 2x Xeon E5-2697 v4 (72T) | 2.3 GHz | 1,000,000 | 1916s | 960B | 501M/s |
 | dev3 | Apple M2 Max (12 cores) | 3.5 GHz | 1,000,000 | 4532s | 352B | 77.7M/s |
+| dev1 | Apple M1 (8 cores) | 3.2 GHz | 1,000,000 | 8403s | 352B | 41.9M/s |
 | ubpower8 | POWER8 (80T) | 3.4 GHz | 1,000,000 | 12483s | 961B | 77.0M/s |
 
 The salted benchmark is dramatically more expensive than unsalted because each candidate must be tested against every unique salt. With 1M unique salts and 14.3M passwords, this requires hundreds of billions of hash computations.
