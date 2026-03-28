@@ -169,6 +169,9 @@ endif
 endif
 
 # OpenCL GPU source files (Linux, FreeBSD)
+mdxocl/md5salt_kernel_str.h: mdxocl/md5salt.cl
+	python3 -c 'import sys; s=open("mdxocl/md5salt.cl").read(); f=open("mdxocl/md5salt_kernel_str.h","w"); f.write("/* Auto-generated from md5salt.cl -- do not edit */\n"); f.write("static const char md5salt_kernel_str[] =\n"); [f.write("    \""+l.replace(chr(92),chr(92)+chr(92)).replace(chr(34),chr(92)+chr(34))+"\\n\"\n") for l in s.split(chr(10))]; f.write(";\n")'
+
 ifdef OPENCL_GPU
 mdxocl/opencl_md5salt.o: mdxocl/opencl_md5salt.c mdxocl/opencl_md5salt.h mdxocl/md5salt_kernel_str.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Imdxocl $(INCEXTRA) -O3 -pthread -c mdxocl/opencl_md5salt.c -o mdxocl/opencl_md5salt.o
