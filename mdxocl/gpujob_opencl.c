@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include "mdxfind.h"
+#include "job_types.h"
 #include "gpujob.h"
 #include "opencl_md5salt.h"
 #include "yarn.h"
@@ -26,6 +27,7 @@ extern atomic_ullong *Totalfound[];
 extern atomic_ullong *RuleCnt;
 extern lock *FreeWaiting;
 extern unsigned long long Tothash, Totfound;
+extern int checkhash(union HashU *curin, int len, int x, struct job *job);
 extern int checkhashkey(union HashU *curin, int len, char *key, struct job *job);
 extern int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job);
 extern int build_salt_snapshot(void *snap, char *pool,
@@ -239,32 +241,40 @@ void gpujob(void *arg) {
             load_overflow(my_slot);
         }
 
+        int op_cat = gpu_op_category(g->op);
+
         /* Rebuild salt snapshot on op change or periodically to pick up PV changes */
-        batch_count++;
-        if (g->op != current_op || (batch_count >= 100 && nsalts_packed > 0)) {
-            if (g->op != current_op) {
-                current_op = g->op;
-                opencl_md5salt_set_op(g->op);
+        if (op_cat == GPU_CAT_SALTED) {
+            batch_count++;
+            if (g->op != current_op || (batch_count >= 100 && nsalts_packed > 0)) {
+                if (g->op != current_op) {
+                    current_op = g->op;
+                    opencl_md5salt_set_op(g->op);
+                }
+                batch_count = 0;
+                tsalt[0] = 0;
+                nsalts = build_salt_snapshot(saltsnap, saltpool,
+                                Typesalt[g->op], tsalt, Printall);
+                if (nsalts > 0)
+                    nsalts_packed = gpu_pack_salts(saltsnap, nsalts,
+                                                   salts_packed, soff, slen, pack_map);
+                else
+                    nsalts_packed = 0;
+                if (nsalts_packed > 0)
+                    opencl_md5salt_set_salts(my_slot, salts_packed, soff, slen, nsalts_packed);
+                else
+                    Typedone[g->op] = 1;
             }
-            batch_count = 0;
-            tsalt[0] = 0;
-            nsalts = build_salt_snapshot(saltsnap, saltpool,
-                            Typesalt[g->op], tsalt, Printall);
-            if (nsalts > 0)
-                nsalts_packed = gpu_pack_salts(saltsnap, nsalts,
-                                               salts_packed, soff, slen, pack_map);
-            else
-                nsalts_packed = 0;
-            if (nsalts_packed > 0)
-                opencl_md5salt_set_salts(my_slot, salts_packed, soff, slen, nsalts_packed);
-            else
-                Typedone[g->op] = 1;
+        } else if (g->op != current_op) {
+            current_op = g->op;
+            opencl_md5salt_set_op(g->op);
         }
 
         int nhits = 0;
         uint32_t *hits = NULL;
 
-        if (g->count == 0 || nsalts_packed == 0) goto return_jobg;
+        if (g->count == 0) goto return_jobg;
+        if (op_cat == GPU_CAT_SALTED && nsalts_packed == 0) goto return_jobg;
 
         synthetic_job.op = g->op;
         synthetic_job.flags = g->flags;
@@ -280,16 +290,16 @@ void gpujob(void *arg) {
 
         if (hits && nhits > 0) {
             int stored = nhits > GPU_MAX_RETURN ? GPU_MAX_RETURN : nhits;
-            int hit_stride = (Maxiter > 1) ? 7 : 6;
+            int hit_stride = (Maxiter > 1 || op_cat == GPU_CAT_ITER) ? 7 : 6;
 
             for (int h = 0; h < stored; h++) {
                 uint32_t *entry = hits + h * hit_stride;
                 int widx = entry[0];
                 int sidx = entry[1];
-                if (widx >= g->count || sidx >= nsalts_packed) continue;
+                if (widx >= g->count) continue;
 
                 int iter_num;
-                if (Maxiter > 1) {
+                if (hit_stride == 7) {
                     iter_num = entry[2];
                     curin.i[0] = entry[3];
                     curin.i[1] = entry[4];
@@ -311,21 +321,31 @@ void gpujob(void *arg) {
                 synthetic_job.pass = synthetic_job.line;
                 synthetic_job.Ruleindex = g->ruleindex[widx];
 
-                int snap_idx = pack_map[sidx];
-                char *s1 = saltsnap[snap_idx].salt;
-                int saltlen = saltsnap[snap_idx].saltlen;
-
-                if (iter_num <= 1) {
-                    if (checkhashkey(&curin, 32, s1, &synthetic_job))
-                        PV_DEC(saltsnap[snap_idx].PV);
+                if (op_cat == GPU_CAT_ITER) {
+                    /* Bare iteration: no salt, use checkhash */
+                    checkhash(&curin, 32, iter_num, &synthetic_job);
                 } else {
-                    if (checkhashsalt(&curin, 32, s1, saltlen, iter_num, &synthetic_job))
-                        PV_DEC(saltsnap[snap_idx].PV);
+                    /* Salted: use checkhashkey/checkhashsalt with salt lookup */
+                    if (sidx >= nsalts_packed) continue;
+                    int snap_idx = pack_map[sidx];
+                    char *s1 = saltsnap[snap_idx].salt;
+                    int saltlen = saltsnap[snap_idx].saltlen;
+
+                    if (iter_num <= 1) {
+                        if (checkhashkey(&curin, 32, s1, &synthetic_job))
+                            PV_DEC(saltsnap[snap_idx].PV);
+                    } else {
+                        if (checkhashsalt(&curin, 32, s1, saltlen, iter_num, &synthetic_job))
+                            PV_DEC(saltsnap[snap_idx].PV);
+                    }
                 }
             }
         }
 
-        hashcnt += (uint64_t)g->count * nsalts_packed * Maxiter;
+        if (op_cat == GPU_CAT_ITER)
+            hashcnt += (uint64_t)g->count * (Maxiter - 1);
+        else
+            hashcnt += (uint64_t)g->count * nsalts_packed * Maxiter;
 
         if (synthetic_job.outlen > 0) {
             fwrite(outbuf, synthetic_job.outlen, 1, stdout);
@@ -523,6 +543,28 @@ void gpujob_submit(struct jobg *g) {
 
 int gpujob_available(void) {
     return _gpujob_ready;
+}
+
+int gpu_op_category(int op) {
+    switch (op) {
+    /* Salted MD5 variants -- GPU iterates over salts */
+    case JOB_MD5SALT:
+    case JOB_MD5UCSALT:
+    case JOB_MD5revMD5SALT:
+    case JOB_MD5sub8_24SALT:
+        return GPU_CAT_SALTED;
+    /* Bare MD5 iterated -- disabled pending larger batch sizes
+    case JOB_MD5:
+    case JOB_MD5UC:
+        return GPU_CAT_ITER;
+    */
+    default:
+        return GPU_CAT_NONE;
+    }
+}
+
+int is_gpu_op(int op) {
+    return gpu_op_category(op) != GPU_CAT_NONE;
 }
 
 #endif /* OPENCL_GPU */

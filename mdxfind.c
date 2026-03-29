@@ -132,6 +132,7 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 #elif defined(OPENCL_GPU)
 #include "opencl_md5salt.h"
 #endif
+#define NO_JOB_TYPES 1
 #include "gpujob.h"
 #endif
 
@@ -162,9 +163,13 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.239 2026/03/29 03:05:31 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.240 2026/03/29 07:08:02 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.240  2026/03/29 07:08:02  dlr
+ * Extract gpu_try_pack() from inline procjob code. Add is_gpu_op/gpu_op_category
+ * infrastructure. GPU_CAT_ITER kernel ready but disabled pending batch size tuning.
+ *
  * Revision 1.239  2026/03/29 03:05:31  dlr
  * OpenCL: support up to 64 GPU devices. 12x RTX 4090: 328 GH/s, 14s wall time.
  *
@@ -8066,6 +8071,105 @@ static inline void lm_des_key(const unsigned char *raw7, DES_key_schedule *ks)
     { int i; for (i = 0; i < 8; i++) key[i] = (key[i] << 1) & 0xfe; }
     DES_set_key_unchecked(&key, ks);
 }
+
+#ifdef GPU_ENABLED
+/*
+ * gpu_try_pack — Pack one word into a GPU batch (JOBG).
+ *
+ * For GPU_CAT_SALTED: packs hex(MD5(password)) for salted dispatch.
+ * For GPU_CAT_ITER: packs hex(MD5(password)) for bare iteration dispatch.
+ *
+ * Returns 1 if word was consumed by GPU (caller should skip CPU path).
+ * Returns 0 if GPU not applicable (caller does CPU processing).
+ *
+ * my_jobg is a per-thread pointer maintained across calls.
+ * Submits the batch when full and sets *my_jobg = NULL.
+ */
+static int gpu_try_pack(struct jobg **pjobg, struct job *job,
+                        union HashU *curin, int nsalts_job)
+{
+    int cat = gpu_op_category(job->op);
+    if (cat == GPU_CAT_NONE) return 0;
+    if (!gpujob_available()) return 0;
+    if (Rotatehash || Printall) return 0;
+
+    /* Salted types need enough salts to justify GPU dispatch */
+    if (cat == GPU_CAT_SALTED && nsalts_job < 100) return 0;
+
+    /* Iteration types need Maxiter > 1 to benefit from GPU */
+    if (cat == GPU_CAT_ITER && Maxiter <= 1) return 0;
+
+    struct jobg *g = *pjobg;
+    if (!g) {
+        g = gpujob_get_free(job->filename, job->startline);
+        g->op = job->op;
+        g->filename = job->filename;
+        g->flags = job->flags;
+        g->doneprint = job->doneprint;
+        g->line_num = job->startline;
+        *pjobg = g;
+    }
+
+    int idx = g->count;
+    unsigned char *hb = curin->h;
+    uint32_t *mw = (uint32_t *)g->hexhash[idx];
+
+    /* Pack hex hash into M[] words, per algorithm */
+    switch (job->op) {
+    case JOB_MD5UCSALT:
+    case JOB_MD5UC:
+        for (int mi = 0; mi < 8; mi++) {
+            unsigned short h0 = *(unsigned short *)&hexlut_uc[hb[mi*2] * 2];
+            unsigned short h1 = *(unsigned short *)&hexlut_uc[hb[mi*2+1] * 2];
+            mw[mi] = h0 | ((uint32_t)h1 << 16);
+        }
+        g->hexlen[idx] = 32;
+        break;
+    case JOB_MD5revMD5SALT:
+        { char revbuf[36];
+          prmd5REV(hb, revbuf, 32);
+          for (int mi = 0; mi < 8; mi++)
+              mw[mi] = *(uint32_t *)&revbuf[mi * 4];
+        }
+        g->hexlen[idx] = 32;
+        break;
+    case JOB_MD5sub8_24SALT:
+        for (int mi = 0; mi < 4; mi++) {
+            unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2] * 2];
+            unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2+1] * 2];
+            mw[mi] = h0 | ((uint32_t)h1 << 16);
+        }
+        mw[4] = mw[5] = mw[6] = mw[7] = 0;
+        g->hexlen[idx] = 16;
+        break;
+    default: /* JOB_MD5SALT, JOB_MD5 — lowercase hex */
+        for (int mi = 0; mi < 8; mi++) {
+            unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
+            unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
+            mw[mi] = h0 | ((uint32_t)h1 << 16);
+        }
+        g->hexlen[idx] = 32;
+        break;
+    }
+
+    /* Pack password data for hit verification */
+    g->passoff[idx] = g->passbuf_pos;
+    memcpy(&g->passbuf[g->passbuf_pos], job->pass, job->clen);
+    g->passlen[idx] = job->clen;
+    g->clen[idx] = job->clen;
+    g->ruleindex[idx] = job->Ruleindex;
+    g->passbuf_pos += job->clen;
+    g->count++;
+
+    /* Submit when full */
+    if (g->count >= GPUBATCH_MAX ||
+        g->passbuf_pos + 4096 > GPUBATCH_PASS) {
+        gpujob_submit(g);
+        *pjobg = NULL;
+    }
+    return 1;
+}
+#endif /* GPU_ENABLED */
 
 MDXALIGN void procjob(void *dummy) {
 struct job *job;
@@ -19134,76 +19238,7 @@ MD5SALTstart:
               { int si, compact_ctr = 0;
               d = mdbuf + len;
 #ifdef GPU_ENABLED
-              /* GPU path: pack this word's hex hash into a JOBG batch.
-               * gpujob() thread handles the actual GPU dispatch. */
-              if (gpujob_available() && !Rotatehash && !Printall &&
-                  nsalts_job >= 100 &&
-                  (job->op == JOB_MD5SALT || job->op == JOB_MD5revMD5SALT ||
-                   job->op == JOB_MD5UCSALT || job->op == JOB_MD5sub8_24SALT)) {
-                if (!my_jobg) {
-                  my_jobg = gpujob_get_free(job->filename, job->startline);
-                  my_jobg->op = job->op;
-                  my_jobg->filename = job->filename;
-                  my_jobg->flags = job->flags;
-                  my_jobg->doneprint = job->doneprint;
-                  my_jobg->line_num = job->startline;
-                }
-                int idx = my_jobg->count;
-                /* Pre-pack hex hash into M[] words for GPU, per algorithm */
-                { uint32_t *mw = (uint32_t *)my_jobg->hexhash[idx];
-                  unsigned char *hb = curin.h;
-                  const char *lut;
-                  switch (job->op) {
-                  case JOB_MD5UCSALT:
-                    lut = hexlut_uc;
-                    for (int mi = 0; mi < 8; mi++) {
-                      unsigned short h0 = *(unsigned short *)&lut[hb[mi*2] * 2];
-                      unsigned short h1 = *(unsigned short *)&lut[hb[mi*2+1] * 2];
-                      mw[mi] = h0 | ((uint32_t)h1 << 16);
-                    }
-                    my_jobg->hexlen[idx] = 32;
-                    break;
-                  case JOB_MD5revMD5SALT:
-                    /* Use prmd5REV to produce reversed hex, then pack into M words */
-                    { char revbuf[36];
-                      prmd5REV(hb, revbuf, 32);
-                      for (int mi = 0; mi < 8; mi++)
-                        mw[mi] = *(uint32_t *)&revbuf[mi * 4];
-                    }
-                    my_jobg->hexlen[idx] = 32;
-                    break;
-                  case JOB_MD5sub8_24SALT:
-                    /* Chars 8-23 of hex = bytes 4-11 of binary, 16 hex chars = 4 M words */
-                    for (int mi = 0; mi < 4; mi++) {
-                      unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2] * 2];
-                      unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2+1] * 2];
-                      mw[mi] = h0 | ((uint32_t)h1 << 16);
-                    }
-                    mw[4] = mw[5] = mw[6] = mw[7] = 0;
-                    my_jobg->hexlen[idx] = 16;
-                    break;
-                  default: /* JOB_MD5SALT */
-                    for (int mi = 0; mi < 8; mi++) {
-                      unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
-                      unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
-                      mw[mi] = h0 | ((uint32_t)h1 << 16);
-                    }
-                    my_jobg->hexlen[idx] = 32;
-                    break;
-                  }
-                }
-                my_jobg->passoff[idx] = my_jobg->passbuf_pos;
-                memcpy(&my_jobg->passbuf[my_jobg->passbuf_pos], job->pass, job->clen);
-                my_jobg->passlen[idx] = job->clen;
-                my_jobg->clen[idx] = job->clen;
-                my_jobg->ruleindex[idx] = job->Ruleindex;
-                my_jobg->passbuf_pos += job->clen;
-                my_jobg->count++;
-                if (my_jobg->count >= GPUBATCH_MAX ||
-                    my_jobg->passbuf_pos + 4096 > GPUBATCH_PASS) {
-                  gpujob_submit(my_jobg);
-                  my_jobg = NULL;
-                }
+              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job)) {
                 hashcnt += nsalts_job;
               } else
 #endif /* GPU_ENABLED */
@@ -19257,74 +19292,7 @@ MD5SALTstart:
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
-              /* GPU path (Intel): pack into JOBG and skip SSE salt loop */
-              if (gpujob_available() && !Rotatehash && !Printall &&
-                  nsalts_job >= 100 &&
-                  (job->op == JOB_MD5SALT || job->op == JOB_MD5revMD5SALT ||
-                   job->op == JOB_MD5UCSALT || job->op == JOB_MD5sub8_24SALT)) {
-                if (!my_jobg) {
-                  my_jobg = gpujob_get_free(job->filename, job->startline);
-                  my_jobg->op = job->op;
-                  my_jobg->filename = job->filename;
-                  my_jobg->flags = job->flags;
-                  my_jobg->doneprint = job->doneprint;
-                  my_jobg->line_num = job->startline;
-                }
-                { int idx = my_jobg->count;
-                /* Pre-pack hex hash into M[] words, same as NOTINTEL path */
-                { uint32_t *mw = (uint32_t *)my_jobg->hexhash[idx];
-                  unsigned char *hb = curin.h;
-                  const char *lut;
-                  switch (job->op) {
-                  case JOB_MD5UCSALT:
-                    lut = hexlut_uc;
-                    for (int mi = 0; mi < 8; mi++) {
-                      unsigned short h0 = *(unsigned short *)&lut[hb[mi*2] * 2];
-                      unsigned short h1 = *(unsigned short *)&lut[hb[mi*2+1] * 2];
-                      mw[mi] = h0 | ((uint32_t)h1 << 16);
-                    }
-                    my_jobg->hexlen[idx] = 32;
-                    break;
-                  case JOB_MD5revMD5SALT:
-                    { char revbuf[36];
-                      prmd5REV(hb, revbuf, 32);
-                      for (int mi = 0; mi < 8; mi++)
-                        mw[mi] = *(uint32_t *)&revbuf[mi * 4];
-                    }
-                    my_jobg->hexlen[idx] = 32;
-                    break;
-                  case JOB_MD5sub8_24SALT:
-                    for (int mi = 0; mi < 4; mi++) {
-                      unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2] * 2];
-                      unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2+1] * 2];
-                      mw[mi] = h0 | ((uint32_t)h1 << 16);
-                    }
-                    mw[4] = mw[5] = mw[6] = mw[7] = 0;
-                    my_jobg->hexlen[idx] = 16;
-                    break;
-                  default: /* JOB_MD5SALT */
-                    for (int mi = 0; mi < 8; mi++) {
-                      unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
-                      unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
-                      mw[mi] = h0 | ((uint32_t)h1 << 16);
-                    }
-                    my_jobg->hexlen[idx] = 32;
-                    break;
-                  }
-                }
-                my_jobg->passoff[idx] = my_jobg->passbuf_pos;
-                memcpy(&my_jobg->passbuf[my_jobg->passbuf_pos], job->pass, job->clen);
-                my_jobg->passlen[idx] = job->clen;
-                my_jobg->clen[idx] = job->clen;
-                my_jobg->ruleindex[idx] = job->Ruleindex;
-                my_jobg->passbuf_pos += job->clen;
-                my_jobg->count++;
-                }
-                if (my_jobg->count >= GPUBATCH_MAX ||
-                    my_jobg->passbuf_pos + MAXLINE > GPUBATCH_PASS) {
-                  gpujob_submit(my_jobg);
-                  my_jobg = NULL;
-                }
+              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job)) {
                 hashcnt += nsalts_job;
                 break;
               }
@@ -32694,6 +32662,23 @@ HAV256_5_start:
                         }
                       }
                       prfound(job, mdbuf);
+                      /* Also emit Magento v2 formats for argon2id */
+                      if (a2type == 2) {
+                        /* hexhash:asciisalt:version
+                         * mghex reuses linebuf2+512 (past a2salthex)
+                         * a2salt (newbuf) already has raw salt bytes */
+                        char *mghex = linebuf2 + 512;
+                        prmd5(curin.h, mghex, a2hashlen * 2);
+                        mghex[a2hashlen * 2] = 0;
+                        int mgsl = a2saltlen > 16 ? 16 : a2saltlen;
+                        snprintf(mdbuf, MAXLINE, "%s:%.*s:2",
+                                 mghex, mgsl, (char *)a2salt);
+                        prfound(job, mdbuf);
+                        snprintf(mdbuf, MAXLINE, "%s:%.*s:3_%d_%d_%lld",
+                                 mghex, mgsl, (char *)a2salt,
+                                 a2hashlen, a2t, (long long)a2m * 1024);
+                        prfound(job, mdbuf);
+                      }
                     }
                   }
                   if (!nsalts_job) Typedone[job->op] = 1;
@@ -36737,6 +36722,83 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                       continue;
                     }
                   }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    /* ARGON2 Magento v2 format: HEXHASH:SALT:{2|3[_HASHLEN_ITER_MEMBYTES]}
+     * Always argon2id, version 19, parallelism 1.
+     * Salt = first 16 chars of salt field, used as raw ASCII bytes.
+     * JudyJ key = standard $argon2id$... string, Typesalt = same format as above */
+    if (lf[JOB_ARGON2] && len > 66 && inhashbuf) {
+      /* Check for even-length hex hash followed by colon */
+      int hexlen = 0;
+      { char *fc = memchr(line, ':', len);
+        if (fc) hexlen = fc - line;
+      }
+      if (hexlen >= 2 && hexlen <= 256 && (hexlen & 1) == 0 && line[hexlen] == ':') {
+        int hexok = 1;
+        for (x = 0; x < hexlen; x++)
+          if (!isxdigit((unsigned char)line[x])) { hexok = 0; break; }
+        if (hexok) {
+          /* Find second colon: salt field */
+          char *saltstart = line + hexlen + 1;
+          char *colon2 = memchr(saltstart, ':', len - hexlen - 1);
+          if (colon2) {
+            char *verfield = colon2 + 1;
+            int verlen = len - (verfield - line);
+            if (verlen >= 1 && (verfield[0] == '2' || verfield[0] == '3') &&
+                (verlen == 1 || verfield[1] == '_')) {
+              /* Parse parameters */
+              int mg_hashlen = hexlen / 2;
+              int mg_t = 2, mg_m = 65536;  /* defaults */
+              int mg_valid = 1;
+              if (verlen > 1 && verfield[1] == '_') {
+                int ph = 0, pt = 0;
+                long long pm = 0;
+                if (sscanf(verfield + 2, "%d_%d_%lld", &ph, &pt, &pm) == 3 &&
+                    ph == mg_hashlen && pt >= 1 && pm >= 8192) {
+                  mg_t = pt;
+                  mg_m = (int)(pm / 1024);  /* bytes to KiB */
+                } else mg_valid = 0;
+              }
+              if (mg_valid) {
+                /* Salt: first 16 chars of salt field, as raw ASCII */
+                int sflen = colon2 - saltstart;
+                int saltlen = (sflen > 16) ? 16 : sflen;
+                if (saltlen >= 1) {
+                  /* Build Typesalt in salttmp: "2:19:m:t:1:saltlen:salthex:hashlen"
+                   * Layout: [0..63] salthex, [64..319] tskey, [320..447] hashbin,
+                   *         [448..511] b64salt, [512..703] b64hash, [704..] judykey */
+                  char *salthex = salttmp;
+                  prmd5((unsigned char *)saltstart, salthex, saltlen * 2);
+                  snprintf(salttmp + 64, 256, "2:19:%d:%d:1:%d:%s:%d",
+                           mg_m, mg_t, saltlen, salthex, mg_hashlen);
+                  JSLI(PV, Typesalt[JOB_ARGON2], (unsigned char *)(salttmp + 64));
+                  if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ARGON2]++; }
+                  /* Build JudyJ key: standard $argon2id$ format
+                   * Decode hex hash to binary, then base64-encode salt and hash */
+                  unsigned char *hashbin = (unsigned char *)salttmp + 320;
+                  int hblen = hexlen / 2;
+                  get32(line, hashbin, hblen);
+                  char *b64salt = salttmp + 448, *b64hash = salttmp + 512;
+                  int b64slen = b64_encode((char *)saltstart, b64salt, saltlen);
+                  while (b64slen > 0 && b64salt[b64slen-1] == '=') b64slen--;
+                  b64salt[b64slen] = 0;
+                  int b64hlen = b64_encode((char *)hashbin, b64hash, hblen);
+                  while (b64hlen > 0 && b64hash[b64hlen-1] == '=') b64hlen--;
+                  b64hash[b64hlen] = 0;
+                  snprintf(salttmp + 704, MAXLINE - 704, "$argon2id$v=19$m=%d,t=%d,p=1$%s$%s",
+                           mg_m, mg_t, b64salt, b64hash);
+                  JSLI(PV, JudyJ[JOB_ARGON2], (unsigned char *)(salttmp + 704));
+                  Foundcnt[JOB_ARGON2]++;
+                  { size_t needed = (size_t)mg_m * 1024;
+                    if (needed > Argon2_maxmem) Argon2_maxmem = needed;
+                  }
+                  continue;
                 }
               }
             }

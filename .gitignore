@@ -5,6 +5,7 @@
 /mdsplit
 .claude/
 RCS/
+job_types.h
 
 # make deps build artifacts
 deps/

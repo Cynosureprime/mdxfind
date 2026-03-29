@@ -116,7 +116,7 @@ endif
 
 all: mdxfind mdsplit getpass
 
-mdxfind.o: mdxfind.c mdxfind.h
+mdxfind.o: mdxfind.c mdxfind.h job_types.h
 	$(CC) $(CFLAGS) -c mdxfind.c
 
 ruleproc.o: ruleproc.c mdxfind.h
@@ -160,13 +160,17 @@ ifdef METAL_GPU
 metal_md5salt.o: metal_md5salt.m metal_md5salt.h gpujob.h
 	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c metal_md5salt.m
 
-gpujob.o: gpujob.m gpujob.h metal_md5salt.h mdxfind.h
+gpujob.o: gpujob.m gpujob.h job_types.h metal_md5salt.h mdxfind.h
 ifeq ($(UNAME_M),x86_64)
 	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -include emmintrin.h -c gpujob.m
 else
 	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpujob.m
 endif
 endif
+
+# Auto-generated JOB_ type constants for GPU headers
+job_types.h: mdxfind.c
+	(echo '/* Auto-generated from mdxfind.c -- do not edit */'; echo '#ifndef NO_JOB_TYPES'; grep '^#define JOB_' mdxfind.c; echo '#endif') > job_types.h
 
 # OpenCL GPU source files (Linux, FreeBSD)
 mdxocl/md5salt_kernel_str.h: mdxocl/md5salt.cl
@@ -176,7 +180,7 @@ ifdef OPENCL_GPU
 mdxocl/opencl_md5salt.o: mdxocl/opencl_md5salt.c mdxocl/opencl_md5salt.h mdxocl/md5salt_kernel_str.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Imdxocl $(INCEXTRA) -O3 -pthread -c mdxocl/opencl_md5salt.c -o mdxocl/opencl_md5salt.o
 
-mdxocl/gpujob_opencl.o: mdxocl/gpujob_opencl.c mdxocl/opencl_md5salt.h gpujob.h mdxfind.h
+mdxocl/gpujob_opencl.o: mdxocl/gpujob_opencl.c mdxocl/opencl_md5salt.h gpujob.h job_types.h mdxfind.h
 	$(CC) -DOPENCL_GPU=1 -I. -Imdxocl $(INCEXTRA) -O3 -pthread -c mdxocl/gpujob_opencl.c -o mdxocl/gpujob_opencl.o
 endif
 

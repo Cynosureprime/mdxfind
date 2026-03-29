@@ -9,12 +9,15 @@
 
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
+#include "opencl_dynload.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
 #include "opencl_md5salt.h"
+#include "job_types.h"
+#include "gpujob.h"
 
 /* ---- Multi-GPU device state ---- */
 #define MAX_GPU_DEVICES 64
@@ -27,6 +30,8 @@ struct gpu_device {
     cl_kernel         kern_batch;
     cl_kernel         kern_iter;
     cl_kernel         kern_sub8;
+    cl_kernel         kern_md5_iter_lc;
+    cl_kernel         kern_md5_iter_uc;
     char              name[256];
 
     /* Compact table (read-only, uploaded once) */
@@ -478,6 +483,10 @@ static const char *kernel_source_embedded_unused =
 
 /* ---- List GPU devices and exit (called early from option parsing) ---- */
 void opencl_md5salt_list_devices(void) {
+    if (opencl_dynload_init() != 0) {
+        fprintf(stderr, "  OpenCL library not found.\n");
+        exit(0);
+    }
     cl_platform_id plats[8];
     cl_uint nplat = 0;
     cl_int err = clGetPlatformIDs(8, plats, &nplat);
@@ -552,13 +561,17 @@ static int init_device(int di, cl_device_id dev_id, const char *kernel_source) {
     d->kern_batch = clCreateKernel(d->prog, "md5salt_batch", &err);
     d->kern_sub8  = clCreateKernel(d->prog, "md5salt_sub8_24", &err);
     d->kern_iter  = clCreateKernel(d->prog, "md5salt_iter", &err);
+    d->kern_md5_iter_lc = clCreateKernel(d->prog, "md5_iter_lc", &err);
+    d->kern_md5_iter_uc = clCreateKernel(d->prog, "md5_iter_uc", &err);
 
     /* Register kernels by op type for this device */
     memset(&dev_kerns[di], 0, sizeof(dev_kerns[di]));
-    kern_register(di, 31, d->kern_batch);    /* JOB_MD5SALT */
-    kern_register(di, 350, d->kern_batch);   /* JOB_MD5UCSALT */
-    kern_register(di, 541, d->kern_batch);   /* JOB_MD5revMD5SALT */
-    kern_register(di, 542, d->kern_sub8);    /* JOB_MD5sub8_24SALT */
+    kern_register(di, JOB_MD5SALT, d->kern_batch);
+    kern_register(di, JOB_MD5UCSALT, d->kern_batch);
+    kern_register(di, JOB_MD5revMD5SALT, d->kern_batch);
+    kern_register(di, JOB_MD5sub8_24SALT, d->kern_sub8);
+    kern_register(di, JOB_MD5, d->kern_md5_iter_lc);
+    kern_register(di, JOB_MD5UC, d->kern_md5_iter_uc);
 
     /* Per-device dispatch buffers */
     d->b_hits = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
@@ -584,6 +597,8 @@ static int init_device(int di, cl_device_id dev_id, const char *kernel_source) {
 /* ---- Public API ---- */
 
 int opencl_md5salt_init(void) {
+    if (opencl_dynload_init() != 0) return -1;
+
     cl_uint nplat = 0;
     cl_platform_id plats[8];
     cl_int err;
@@ -783,14 +798,17 @@ uint32_t *opencl_md5salt_dispatch_batch(int dev_idx,
     *nhits_out = 0;
     if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs || num_words <= 0) return NULL;
     struct gpu_device *d = &gpu_devs[dev_idx];
-    if (d->salts_count <= 0) return NULL;
-
     /* Look up kernel for current op */
     int op = _gpu_op;
+    int cat = gpu_op_category(op);
     struct gpu_kern *gk = (op >= 0 && op < MAX_GPU_KERNELS) ? &dev_kerns[dev_idx].kerns[op] : NULL;
     if (!gk || !gk->kernel) return NULL;
 
-    cl_kernel kern = (_max_iter > 1 && d->kern_iter) ? d->kern_iter : gk->kernel;
+    /* Salted types need salts uploaded; iteration types do not */
+    if (cat == GPU_CAT_SALTED && d->salts_count <= 0) return NULL;
+
+    /* For salted iteration, use the salt-iter kernel; otherwise use the registered kernel */
+    cl_kernel kern = (cat == GPU_CAT_SALTED && _max_iter > 1 && d->kern_iter) ? d->kern_iter : gk->kernel;
     cl_int err;
 
     /* Upload words */
@@ -814,7 +832,8 @@ uint32_t *opencl_md5salt_dispatch_batch(int dev_idx,
     params.hash_data_count = _hash_data_count;
     params.max_hits = GPU_MAX_HITS;
     params.overflow_count = _overflow_count;
-    params.max_iter = _max_iter;
+    /* For iteration types, CPU did iter 1; GPU does the remaining */
+    params.max_iter = (cat == GPU_CAT_ITER) ? (_max_iter - 1) : _max_iter;
     clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
 
     /* Zero hit counter */
@@ -846,7 +865,9 @@ uint32_t *opencl_md5salt_dispatch_batch(int dev_idx,
 
     /* Dispatch with autotune */
     size_t local = kern_get_local_size(gk);
-    size_t global = (size_t)num_words * d->salts_count;
+    size_t global = (cat == GPU_CAT_SALTED)
+        ? (size_t)num_words * d->salts_count
+        : (size_t)num_words;
     global = ((global + local - 1) / local) * local;
 
     struct timespec t0, t1;

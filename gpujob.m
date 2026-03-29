@@ -23,6 +23,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include "mdxfind.h"
+#include "job_types.h"
 #include "gpujob.h"
 #include "metal_md5salt.h"
 
@@ -553,6 +554,27 @@ void gpujob_submit(struct jobg *g) {
 
 int gpujob_available(void) {
     return _gpujob_ready;
+}
+
+int gpu_op_category(int op) {
+    switch (op) {
+    case JOB_MD5SALT:
+    case JOB_MD5UCSALT:
+    case JOB_MD5revMD5SALT:
+    case JOB_MD5sub8_24SALT:
+        return GPU_CAT_SALTED;
+    /* Bare MD5 iterated -- disabled pending larger batch sizes
+    case JOB_MD5:
+    case JOB_MD5UC:
+        return GPU_CAT_ITER;
+    */
+    default:
+        return GPU_CAT_NONE;
+    }
+}
+
+int is_gpu_op(int op) {
+    return gpu_op_category(op) != GPU_CAT_NONE;
 }
 
 #endif /* __APPLE__ && METAL_GPU */

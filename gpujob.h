@@ -24,6 +24,17 @@ extern "C" {
 #define GPUBATCH_MAX   512
 #define GPUBATCH_PASS  (GPUBATCH_MAX * 256)  /* ~128KB password buffer */
 
+/* GPU algorithm categories */
+#define GPU_CAT_NONE     0   /* not GPU-capable */
+#define GPU_CAT_SALTED   1   /* salted: GPU does MD5(hex_hash + salt) per salt */
+#define GPU_CAT_ITER     2   /* unsalted iterated: GPU does MD5(hex) iterations */
+
+/* Returns GPU category for an op code, or GPU_CAT_NONE */
+int gpu_op_category(int op);
+
+/* Returns 1 if op has any GPU support */
+int is_gpu_op(int op);
+
 struct jobg {
     struct jobg *next;
     int          op;                        /* JOB_MD5SALT etc. */
