@@ -120,11 +120,13 @@ Expected finds: sm-testfull=1,000,000, sm-test50=500,583, sm-test10=100,203.
 
 | Machine | CPU/GPU | Clock | Found | Time | Hash calcs | Rate |
 |---------|---------|-------|-------|------|-----------|------|
+| -- | 12x NVIDIA RTX 4090 OpenCL (64 cores) | -- | 1,000,000 | 14s | 1,981B | 328G/s |
 | ioblade | 5-GPU OpenCL (2x AMD gfx1201 + RTX 4070 Ti + RTX 3080 + AMD iGPU) | -- | 1,000,000 | 31s | 1,831B | 62.9G/s |
 | dev3 | Apple M2 Max Metal (12 cores) | 3.5 GHz | 1,000,000 | 133s | 790B | 5.92G/s |
 | dev1 | Apple M1 Metal (8 cores) | 3.2 GHz | 1,000,000 | 569s | 783B | 1.38G/s |
 | fpga | NVIDIA GTX 1080 OpenCL | -- | 1,000,000 | 728s | 1,703B | 2.34G/s |
 | hpi7 | NVIDIA GTX 960 OpenCL | -- | 1,000,000 | 988s | 1,019B | 1.03G/s |
+| -- | 12x NVIDIA RTX 4090 hashcat 7.1 (Pure Kernel) | -- | 1,000,000 | 996s | 8,461B | 14.3G/s |
 | mmt | 2x Xeon E5-2697 v4 (72T) | 2.3 GHz | 1,000,000 | 1916s | 960B | 501M/s |
 | fpga | NVIDIA GTX 1080 hashcat (Pure Kernel) | -- | 1,000,000 | 4404s | -- | 175.9M/s |
 | dev3 | Apple M2 Max CPU (12 cores) | 3.5 GHz | 1,000,000 | 4532s | 352B | 77.7M/s |
