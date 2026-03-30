@@ -345,9 +345,7 @@ void gpujob(void *arg) {
                     }
                 }
             }
-            if (skipped)
-                fprintf(stderr, "GPU[%d]: %d/%d hits skipped (stale)\n",
-                        my_slot, skipped, stored);
+            (void)skipped;
         }
 
         if (op_cat == GPU_CAT_ITER)
