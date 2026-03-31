@@ -29,6 +29,8 @@ extern volatile int MDXpause, MDXpaused_count;
 extern int hybrid_check(const unsigned char *, int, int *, unsigned short **);
 extern void md5crypt_b64encode(const unsigned char *, char *);
 extern void prfound(struct job *, char *);
+extern void mymd5(char *, int, unsigned char *);
+extern void mysha256(char *, int, unsigned char *);
 extern void snapshot_attach_hashsalt(struct saltentry *, int, Pvoid_t);
 extern Pvoid_t *Typehashsalt;
 extern char Typedone[];
