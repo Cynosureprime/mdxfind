@@ -495,6 +495,7 @@ dep-pcre:
 	fi; \
 	echo "  verified $$GOT"; \
 	cd $(DEPDIR)/pcre && \
+	autoreconf -i && \
 	./configure --enable-static --disable-shared --disable-cpp && \
 	$(MAKE); \
 	cp $(DEPDIR)/pcre/.libs/libpcre.a $(TOPDIR)/; \
