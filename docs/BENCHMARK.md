@@ -141,16 +141,16 @@ Expected finds: sm-testfull=1,000,000, sm-test50=500,583, sm-test10=100,203.
 |---------|---------|-------|-------|------|-----------|------|
 | -- | 12x NVIDIA RTX 4090 OpenCL (64 cores) | -- | 1,000,000 | 14s | 1,981B | 328G/s |
 | ioblade | 5-GPU OpenCL (2x AMD gfx1201 + RTX 4070 Ti + RTX 3080 + AMD iGPU) | -- | 1,000,000 | 31s | 1,831B | 62.9G/s |
-| dev3 | Apple M2 Max Metal (12 cores) | 3.5 GHz | 1,000,000 | 133s | 790B | 5.92G/s |
-| dev1 | Apple M1 Metal (8 cores) | 3.2 GHz | 1,000,000 | 569s | 783B | 1.38G/s |
-| fpga | NVIDIA GTX 1080 OpenCL | -- | 1,000,000 | 728s | 1,703B | 2.34G/s |
-| hpi7 | NVIDIA GTX 960 OpenCL | -- | 1,000,000 | 988s | 1,019B | 1.03G/s |
+| dev3 | Apple M2 Max Metal (12 cores) | 3.5 GHz | 1,000,000 | 262s | 697B | 2.65G/s |
+| fpga | NVIDIA GTX 1080 OpenCL | -- | 1,000,000 | 376s | 353B | 940M/s |
+| hpi7 | NVIDIA GTX 960 OpenCL | -- | 1,000,000 | 902s | 353B | 391M/s |
 | -- | 12x NVIDIA RTX 4090 hashcat 7.1 (Pure Kernel) | -- | 1,000,000 | 996s | 8,461B | 14.3G/s |
-| mmt | 2x Xeon E5-2697 v4 (72T) | 2.3 GHz | 1,000,000 | 1916s | 960B | 501M/s |
+| dev1 | Apple M1 Metal (8 cores) | 3.2 GHz | 1,000,000 | 1035s | 695B | 672M/s |
 | gp2 | AMD Radeon HD 7950 (Tahiti) OpenCL | -- | 1,000,000 | 1516s | 2,503B | 1.65G/s |
-| gp | NVIDIA Tesla M2070 OpenCL | -- | 1,000,000 | 4730s | 2,818B | 595.7M/s |
+| mmt | 2x Xeon E5-2697 v4 (72T) | 2.3 GHz | 1,000,000 | 1916s | 960B | 501M/s |
 | fpga | NVIDIA GTX 1080 hashcat (Pure Kernel) | -- | 1,000,000 | 4404s | -- | 175.9M/s |
 | dev3 | Apple M2 Max CPU (12 cores) | 3.5 GHz | 1,000,000 | 4532s | 352B | 77.7M/s |
+| gp | NVIDIA Tesla M2070 OpenCL | -- | 1,000,000 | 4730s | 2,818B | 595.7M/s |
 | dev1 | Apple M1 CPU (8 cores) | 3.2 GHz | 1,000,000 | 8403s | 352B | 41.9M/s |
 | ubpower8 | POWER8 (80T) | 3.4 GHz | 1,000,000 | 12483s | 961B | 77.0M/s |
 
@@ -165,16 +165,18 @@ Algorithm: `md5(md5($salt).md5($pass))` — compound salted type requiring three
 | hpi7 | NVIDIA GTX 960 OpenCL | -- | 1,000,000 | 5513s | 3,597B | 652.6M/s |
 | hpi7 | NVIDIA GTX 960 hashcat 6.2.6 (Pure Kernel) | -- | 1,000,000 | 9962s | -- | 76.4M/s |
 
-### PHPBB3/phpass (e455, mode 400) — sm-salt400 (100K hashes, rockyou.txt wordlist)
+### PHPBB3/phpass (e455, mode 400) — sm-salt400 (100K hashes, 100K passwords)
 
-Algorithm: iterated MD5 with per-hash salt and variable iteration count (512-2048 rounds). Due to the high per-hash computational cost, this benchmark uses 100,000 hashes rather than 1M.
+Algorithm: iterated MD5 with per-hash salt and variable iteration count (512-2048 rounds). Due to the high per-hash computational cost, this benchmark uses 100,000 hashes and the first 100,000 passwords from rockyou.txt rather than the full 14.3M wordlist.
 
 | Machine | CPU/GPU | Clock | Found | Time | Hash calcs | Rate |
 |---------|---------|-------|-------|------|-----------|------|
-| fpga | NVIDIA GTX 1080 OpenCL | -- | 100,000 | 191s | 3,082B | 16.8G/s |
-| hpi7 | NVIDIA GTX 960 OpenCL | -- | 100,000 | 810s | 2,723B | 3.37G/s |
-| fpga | NVIDIA GTX 1080 hashcat 6.2.6 (Pure Kernel) | -- | 100,000 | 1409s | -- | 8.10M/s |
-| hpi7 | NVIDIA GTX 960 hashcat 6.2.6 (Pure Kernel) | -- | 100,000 | 1837s | -- | 5.39M/s |
+| fpga | NVIDIA GTX 1080 OpenCL + CPU | -- | 100,000 | 180s | 2,676B | 14.9G/s |
+| dev3 | Apple M2 Max Metal + CPU | 3.5 GHz | 100,000 | 304s | 2,795B | 9.20G/s |
+| fpga | NVIDIA GTX 1080 hashcat 6.2.6 (Pure Kernel) | -- | 100,000 | 578s | -- | 5.98M/s |
+| hpi7 | NVIDIA GTX 960 OpenCL + CPU | -- | 100,000 | 738s | 2,675B | 3.63G/s |
+| dev1 | Apple M1 Metal + CPU | 3.2 GHz | 100,000 | 1196s | 2,792B | 2.33G/s |
+| hpi7 | NVIDIA GTX 960 hashcat 6.2.6 (Pure Kernel) | -- | 100,000 | 1863s | -- | 2.31M/s |
 
 The salted benchmark is dramatically more expensive than unsalted because each candidate must be tested against every unique salt. With 1M unique salts and 14.3M passwords, this requires hundreds of billions of hash computations.
 
