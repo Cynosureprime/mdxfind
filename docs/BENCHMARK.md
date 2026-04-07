@@ -201,6 +201,29 @@ hashcat -a 0 -m 400 -o /dev/null --potfile-disable sm-salt400.txt sm-salt400.pas
 | dev1 | Apple M1 Metal + CPU | 3.2 GHz | 100,000 | 1196s | 2,792B | 2.33G/s |
 | hpi7 | NVIDIA GTX 960 hashcat 6.2.6 (Pure Kernel) | -- | 100,000 | 1863s | -- | 2.31M/s |
 
+### DESCRYPT (e500, mode 1500) — sm-salt1500 (1M hashes, 4096 salts, 1M passwords)
+
+Algorithm: traditional DES `crypt()` with 12-bit salt and 8-character maximum password length.
+
+```bash
+mdxfind -M 1500 -F bench/sm-salt1500.txt bench/sm-salt1500.pass > /dev/null
+hashcat -a 0 -m 1500 -o /dev/null --potfile-disable sm-salt1500.txt sm-salt1500.pass
+```
+
+| Machine | CPU/GPU | Clock | Found | Time | Hash calcs | Rate |
+|---------|---------|-------|-------|------|-----------|------|
+| mmt | NVIDIA RTX 4070 Ti SUPER OpenCL + CPU | -- | 1,000,000 | 11s | 4B | 425M/s |
+| fpga | NVIDIA GTX 1080 OpenCL + CPU | -- | 1,000,000 | 26s | 4B | 170M/s |
+| dev3 | Apple M2 Max Metal + CPU | 3.5 GHz | 1,000,000 | 54s | 4B | 75.9M/s |
+| fpga | NVIDIA GTX 1080 hashcat 6.2.6 (Pure Kernel) | -- | 1,000,000 | 84s | -- | 34.0M/s |
+| hpi7 | NVIDIA GTX 960 OpenCL + CPU | -- | 1,000,000 | 103s | 4B | 40.4M/s |
+| mmt | NVIDIA RTX 4070 Ti SUPER hashcat 6.2.6 (Pure Kernel) | -- | 1,000,000 | 135s | -- | 126.6M/s |
+| dev1 | Apple M1 Metal + CPU | 3.2 GHz | 1,000,000 | 141s | 4B | 29.0M/s |
+| hpi7 | NVIDIA GTX 960 hashcat 6.2.6 (Pure Kernel) | -- | 1,000,000 | 221s | -- | 4.36M/s |
+| fpga | AMD Ryzen 7 1800X CPU (16T) | 3.6 GHz | 1,000,000 | 1378s | 4B | 2.97M/s |
+| dev3 | Apple M2 Max CPU (12 cores) | 3.5 GHz | 1,000,000 | 1849s | 4B | 2.21M/s |
+| hpi7 | Intel Xeon E3-1230 v5 CPU (8T) | 3.4 GHz | 1,000,000 | 2390s | 4B | 1.71M/s |
+
 The salted benchmark is dramatically more expensive than unsalted because each candidate must be tested against every unique salt. With 1M unique salts and 14.3M passwords, this requires hundreds of billions of hash computations.
 
 **Notes:**
