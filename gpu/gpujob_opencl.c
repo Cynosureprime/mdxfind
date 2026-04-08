@@ -20,6 +20,9 @@
 #include <unistd.h>
 #endif
 #include <stdatomic.h>
+#ifndef NOTINTEL
+#include <emmintrin.h>
+#endif
 #include "mdxfind.h"
 #include "job_types.h"
 #include "gpujob.h"
