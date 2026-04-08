@@ -13,6 +13,13 @@
 
 #include <stdint.h>
 
+/* Kernel family IDs for gpu_opencl_compile_families() bitmask */
+enum {
+    FAM_MD5SALT, FAM_MD5SALTPASS, FAM_MD5ITER, FAM_PHPBB3,
+    FAM_MD5CRYPT, FAM_MD5_MD5SALTMD5PASS, FAM_SHA1, FAM_SHA256,
+    FAM_MD5MASK, FAM_DESCRYPT, FAM_MD5UNSALTED, FAM_COUNT
+};
+
 /* Forward declarations for mdxfind types */
 struct job;
 union HashU;
@@ -20,6 +27,9 @@ union HashU;
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Checked malloc: zeroes memory, exits on failure */
+void *malloc_lock(size_t size, const char *reason);
 
 #define GPUBATCH_MAX   512
 #define GPUBATCH_PASS  (GPUBATCH_MAX * 256)  /* ~128KB password buffer */
@@ -29,6 +39,8 @@ extern "C" {
 #define GPU_CAT_SALTED   1   /* salted: GPU does MD5(hex_hash + salt) per salt */
 #define GPU_CAT_ITER     2   /* unsalted iterated: GPU does MD5(hex) iterations */
 #define GPU_CAT_SALTPASS 3   /* salted: GPU does MD5(salt + raw_password) per salt */
+#define GPU_CAT_MASK     4   /* unsalted + mask: GPU generates mask candidates */
+#define GPU_CAT_UNSALTED 5   /* unsalted pre-padded: GPU fills masks into M[] */
 
 #define GPU_MAX_PASSLEN  55  /* max password length for GPU (single MD5 block with salt) */
 
@@ -40,26 +52,31 @@ int is_gpu_op(int op);
 
 struct jobg {
     struct jobg *next;
+    char        *filename;
+    int         *doneprint;
+    int          flags;
     int          op;                        /* JOB_MD5SALT etc. */
     int          count;                     /* entries filled (0..GPUBATCH_MAX) */
+    int          max_count;                 /* max entries for this batch (stride-dependent) */
     uint32_t     passbuf_pos;               /* fill cursor into passbuf */
+    uint32_t     word_stride;               /* bytes per word slot (64, 128, 256) */
+    unsigned int line_num;              /* starting line number for priority ordering */
 
-    /* Pre-computed hex hashes: sized for any algorithm */
-    char         hexhash[GPUBATCH_MAX][256];
+    /* Word data: 256KB contiguous for unsalted 64-byte stride (4096 words).
+     * Legacy accesses first half as passbuf, second half as hexhash[]. */
+    union {
+        char     raw[GPUBATCH_PASS + GPUBATCH_MAX * 256]; /* 256KB contiguous */
+        struct { char passbuf[GPUBATCH_PASS]; char hexhash[GPUBATCH_MAX][256]; };
+    };
     uint16_t     hexlen[GPUBATCH_MAX];
 
     /* Password data for checkhashkey output */
-    char         passbuf[GPUBATCH_PASS];
     uint32_t     passoff[GPUBATCH_MAX];
     uint16_t     passlen[GPUBATCH_MAX];
 
     /* Job context for checkhashkey */
     int          clen[GPUBATCH_MAX];
     int          ruleindex[GPUBATCH_MAX];
-    char        *filename;
-    int          flags;
-    int         *doneprint;
-    unsigned int line_num;              /* starting line number for priority ordering */
 };
 
 /* Initialize GPU work queue, allocate JOBG structs, launch gpujob thread.
@@ -75,6 +92,10 @@ void gpujob_shutdown(void);
  * lines in the file get GPU buffers first. Pass NULL filename for
  * shutdown sentinels (bypasses scheduling). */
 struct jobg *gpujob_get_free(char *filename, unsigned int startline);
+
+/* Non-blocking: returns NULL immediately if no free buffer.
+ * Used by hybrid types where CPU fallback is preferred over waiting. */
+struct jobg *gpujob_try_get_free(void);
 
 /* Submit a filled JOBG to the GPU work queue. */
 void gpujob_submit(struct jobg *g);

@@ -98,6 +98,19 @@
 
 #include "mdxfind.h"
 
+const struct Benchrates { int idx; long long rate; } bench_rates[] = {
+#include "bench_rates.h"
+,{INT_MAX,0}
+};
+
+struct  Linehints {
+	long long rate;
+	volatile long long hashes_accum;  /* per-algorithm hash counter for EMA feedback */
+	unsigned int lineswanted, gpu;
+	unsigned int curline, numline;
+} *linehints;
+int linehints_count;  /* number of entries in linehints[] (highest op + 1) */
+
 /* arc4random_buf fallback for glibc < 2.36 and Windows */
 #if defined(_WIN32)
 static void arc4random_buf(void *buf, size_t nbytes) {
@@ -118,7 +131,7 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 #include <fcntl.h>
 static void arc4random_buf(void *buf, size_t nbytes) {
     int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) { (void)read(fd, buf, nbytes); close(fd); }
+    if (fd >= 0) { if(read(fd, buf, nbytes)) {} close(fd); }
 }
 #endif
 
@@ -167,9 +180,83 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.249 2026/03/31 04:12:53 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.271 2026/04/08 03:54:18 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.271  2026/04/08 03:54:18  dlr
+ * *** empty log message ***
+ *
+ * Revision 1.270  2026/04/08 01:15:57  dlr
+ * *** empty log message ***
+ *
+ * Revision 1.269  2026/04/06 15:00:04  dlr
+ * Eliminate packed Userid buffer: convert all 10 procjob dispatch cases (MSCACHE, HMAC-*, SMF, MANGOS, SKYPE, JUNIPERSSG, MD5AM/AM2, SHA1-HMAC-MD5, MD5-MD5puSHA1MD5pup, SHA1-SALTSHA1U16) from packed string iteration to JSLF/JSLN on Judy arrays with PV_DEC. Remove gen_userid packed buffer, build_userid_buf, Userid global. Fix TypeOpts for 432/433/855/856/857. Convert -U loading to always use Judy.
+ *
+ * Revision 1.268  2026/04/06 06:36:30  dlr
+ * Fix Intel SSE e31 same dropped partial SIMD batch bug: post-loop flush matching ARM fix
+ *
+ * Revision 1.267  2026/04/06 06:34:54  dlr
+ * Fix NEON e31 dropped partial SIMD batch: post-loop flush catches batches orphaned when last salt(s) have PV==0 from other threads. Matches Intel per-word compaction pattern.
+ *
+ * Revision 1.266  2026/04/06 05:03:03  dlr
+ * Remove debug fprintf from build_salt_snapshot
+ *
+ * Revision 1.265  2026/04/06 04:54:40  dlr
+ * Redesign -h ALL: prefix-based allowlist from real-world 50m combo analysis (GOST/HAV/MD/SHA/RMD/SNE/SQL5/TIGER/WRL/PANAMA/RIPEMD/SMF families). Guard Typesalt against non-Judy pointers (alignment check). All Typeuser now uses UseridJudy. NEON SSEBUF zero-clear after short-salt flush.
+ *
+ * Revision 1.264  2026/04/05 17:38:07  dlr
+ * Remove iteration-aware salt chunking from Metal dispatch — single dispatch for all salts like OpenCL. Non-blocking gpu_try_pack for PHPBB3 hybrid, lineswanted floor 512, dispatch debug removed.
+ *
+ * Revision 1.263  2026/04/05 15:58:29  dlr
+ * PHPBB3 hybrid CPU+GPU: NEON 4-wide procsaltbb for ARM SIMD, rate-based lineswanted (not GPU-only) for e455, GPU assists while CPU processes concurrently — 3x speedup on M1
+ *
+ * Revision 1.262  2026/04/05 03:55:50  dlr
+ * Fix curline reset between chunks, MAXCHUNK=50MB on Apple Silicon, OPENCL_GPU guard for shutdown call
+ *
+ * Revision 1.261  2026/04/05 01:35:32  dlr
+ * Fix exit segfault: remove gpu_atexit, call gpu_opencl_shutdown explicitly after join_all instead of via atexit — NVIDIA driver teardown race
+ *
+ * Revision 1.260  2026/04/05 00:28:17  dlr
+ * sig_gpu_exit: use _exit(1) instead of exit(1) to avoid atexit handlers triggering GPU shutdown while still active
+ *
+ * Revision 1.259  2026/04/04 22:24:47  dlr
+ * Metal compile_families: deferred per-family compilation matching OpenCL, use shared FAM_* enum
+ *
+ * Revision 1.258  2026/04/04 21:48:16  dlr
+ * NEON 4-wide MD5SALT: mymd5salt_pre/post/salt2 for ARM, short+long salt batching, AArch64 Neon auto-detect, Metal salt chunking cleanup, remove GPU hashcnt double-counting
+ *
+ * Revision 1.257  2026/04/04 18:53:45  dlr
+ * Per-algorithm dispatch with linehints: rate-based lineswanted from bench_rates.h, EMA feedback in ReportStats, per-algorithm curline tracking, GPU lineswanted=UINT_MAX for ordering, Lowline from min(curline), struct job reorder + fileno + JOBFLAG_GPU, FAM enum moved to gpujob.h
+ *
+ * Revision 1.256  2026/04/04 04:10:36  dlr
+ * Separate -n/-N mask buffers: parse_mask_into, mask_expand_into, simultaneous prepend+append support, dual mask index decomposition
+ *
+ * Revision 1.255  2026/04/01 22:42:03  dlr
+ * GPU per-family kernel split, PHPBB3 GPU kernel+Metal, e367 Metal probe fix, atexit cleanup, scoped gpu_batch_lines, salt rebuild every 10 batches, phpbb3 kernel loop optimization, md5_block Metal fix
+ *
+ * Revision 1.254  2026/03/31 21:41:14  dlr
+ * GPU mask mode (GPU_CAT_MASK) for MD5 with -n/-N. Procjob gate suppresses CPU mask
+ * expansion when GPU handles it. Host reconstructs candidate from mask_idx via divmod.
+ * Mask chunked at 4M combinations per dispatch. gpu_opencl_set_mask uploads descriptor.
+ *
+ * Revision 1.253  2026/03/31 20:09:53  dlr
+ * Salt refresh on hits (OpenCL+Metal). PHPBB3 phpass_b64decode loader.
+ * GPU_CAT_MASK definition. md5_mask_batch kernel (not yet wired to host dispatch).
+ *
+ * Revision 1.252  2026/03/31 15:22:44  dlr
+ * Add PHPBB3 (e455) GPU kernel. Compact table loading with phpass base64 decode.
+ * 32K-iteration single-block MD5 kernel. CPU fallback for passwords >39 bytes.
+ * checkhashbb handles hit output. [GPU] marker added.
+ *
+ * Revision 1.251  2026/03/31 08:15:27  dlr
+ * Merge ubpower8 Typehashsalt: build_hashsalt_snapshot replaces snapshot_attach_hashsalt.
+ * Struct saltentry gains hashlen field. Typehashsalt populated in main() salt walk with
+ * struct saltentry per salt (persistent allocation). Add SHA1DRU (e404) 1M-iteration GPU kernel.
+ * Fix struct size mismatch between mdxfind.c and gpujob.
+ *
+ * Revision 1.250  2026/03/31 07:43:11  dlr
+ * Add SHA1SALTPASS (e385) and SHA1PASSSALT (e405) GPU support. [GPU] markers.
+ *
  * Revision 1.249  2026/03/31 04:12:53  dlr
  * Add [GPU] markers for SHA256SALTPASS, SHA256PASSSALT, MD5CRYPT, MD5_MD5SALTMD5PASS in -h output
  *
@@ -1319,6 +1406,12 @@ extern void procsaltbb(__m128i *SSEBUF, struct job *job, int pcnt, char *sbuf[],
 extern void init_md5sse(char *cur, int len, void *dest);
 
 extern void mymd5salt(void *dest, void *hash);
+extern void mymd5salt_pre(unsigned char *dest, SVAL *state);
+extern void mymd5salt_post(unsigned char *dest, SVAL *state, SVAL *hash);
+extern void mymd5salt2(void *dest, void *hash);
+#if ARM > 6
+extern void procsaltbb(uint32x4_t *SSEBUF, struct job *job, int pcnt, char *sbuf[], int myiter);
+#endif
 
 #endif
 
@@ -1587,7 +1680,7 @@ struct RuleHist {
 };
 
 
-char *Userid, *MD5_user;
+char *MD5_user;
 char *combo_pepper;
 Pvoid_t *Typesalt;
 Pvoid_t *Typehashsalt; /* parallel Judy: same key as Typesalt, value = ptr to precomputed hash of salt */
@@ -1598,6 +1691,7 @@ struct saltentry {
     Word_t *PV;      /* cached PV pointer — stable for Judy lifetime */
     int saltlen;     /* cached strlen */
     char *hashsalt;  /* precomputed hex(MD5(salt)) from Typehashsalt, or NULL */
+    int hashlen;     /* length of hashsalt string (typically 32) */
 };
 char **Typesalt2;
 void **Typeuser;
@@ -1808,6 +1902,30 @@ void md5crypt_b64encode(const unsigned char *in, char *out) {
       out[j++] = phpitoa64[v & 0x3f];
     }
     out[j] = 0;
+}
+
+/* Decode phpass base64 (22 chars) to 16 binary bytes.
+ * Sequential bytes, LSB-first: 3 bytes → 4 chars, final 1 byte → 2 chars.
+ * Used by PHPBB3, WordPress, Drupal <7. Returns 0 on success, -1 on error. */
+static int phpass_b64decode(const char *b64str, unsigned char *out) {
+    init_phpatoi64();
+    const char *p = b64str;
+    int j = 0;
+    while (j < 16) {
+        int c0 = phpatoi64[(unsigned char)*p++]; if (c0 < 0) return -1;
+        int c1 = phpatoi64[(unsigned char)*p++]; if (c1 < 0) return -1;
+        unsigned int v = c0 | (c1 << 6);
+        out[j++] = v & 0xff;
+        if (j >= 16) break;
+        int c2 = phpatoi64[(unsigned char)*p++]; if (c2 < 0) return -1;
+        v |= (c2 << 12);
+        out[j++] = (v >> 8) & 0xff;
+        if (j >= 16) break;
+        int c3 = phpatoi64[(unsigned char)*p++]; if (c3 < 0) return -1;
+        v |= (c3 << 18);
+        out[j++] = (v >> 16) & 0xff;
+    }
+    return 0;
 }
 
 /* Encode 16-byte MD5 digest to 30-char Juniper NetScreen format.
@@ -2700,36 +2818,12 @@ char *mysql3(char *pass, int len, char *outbuf) {
 
 
 static void gen_userid() {
-  int x, y, tot, num;
-  char *cur;
+  int x, num;
 
-  if (Userid)
+  if (UseridJudy)
     return;
-  tot = 6 * 10001 + 1000 * 4 + 9000 * 6;
   num = 0;
 
-  Userid = malloc_lock(tot, "gen_userid");
-  cur = Userid;
-  for (x = 0; x < 999; x++) {
-    y = sprintf(cur, "%d-", x);
-    cur += y + 1;
-    y = sprintf(cur, "%d", x);
-    cur += y + 1;
-    num += 2;
-  }
-  for (x = 1000; x < 10000; x++) {
-    y = sprintf(cur, "%d-", x);
-    cur += y + 1;
-    y = sprintf(cur, "%d", x);
-    cur += y + 1;
-    num += 2;
-  }
-  *cur++ = 0;
-  if ((cur - Userid) > tot) {
-    fprintf(stderr, "Corrupted memory in gen-userid (%d,%ld)\n", tot, (cur - Userid));
-    exit(1);
-  }
-  /* Also build UseridJudy from the same generated userids */
   { Word_t *UPV;
     char ubuf[16];
     for (x = 0; x < 999; x++) {
@@ -2739,6 +2833,7 @@ static void gen_userid() {
       sprintf(ubuf, "%d", x);
       JSLI(UPV, UseridJudy, (unsigned char *)ubuf);
       if (UPV) *UPV = 1000000;
+      num += 2;
     }
     for (x = 1000; x < 10000; x++) {
       sprintf(ubuf, "%d-", x);
@@ -2747,6 +2842,7 @@ static void gen_userid() {
       sprintf(ubuf, "%d", x);
       JSLI(UPV, UseridJudy, (unsigned char *)ubuf);
       if (UPV) *UPV = 1000000;
+      num += 2;
     }
   }
   fprintf(stderr, "Generated %d Userids\n", num);
@@ -2757,45 +2853,6 @@ static int get32_init(char *iline, unsigned char *dest, int len);
 static int (*get32)(char *iline, unsigned char *dest, int len) = get32_init;
 
 
-
-/* Build Userid format buffer from a Judy string array.
- * Format: [string][NUL]...[NUL][NUL] (double-NUL terminated).
- * Skips empty lines. Returns malloc'd buffer or NULL. */
-static char *build_userid_buf(Pvoid_t JArray) {
-  char line[MAXLINE + 16];
-  Word_t *PV, RC;
-  long memsize = 0;
-  int cnt = 0;
-  char *buf, *s;
-
-  line[0] = 0;
-  JSLF(PV, JArray, (unsigned char *)line);
-  while (PV) {
-    int x = mystrlen(line);
-    if (x > 0 && x < 80) {
-      cnt++;
-      memsize += x + 1;
-    }
-    JSLN(PV, JArray, (unsigned char *)line);
-  }
-  if (!cnt) return NULL;
-
-  buf = malloc_lock(memsize + 4, "build_userid_buf");
-  s = buf;
-  line[0] = 0;
-  JSLF(PV, JArray, (unsigned char *)line);
-  while (PV) {
-    int x = mystrlen(line);
-    if (x > 0 && x < 80) {
-      strcpy(s, line);
-      s += x + 1;
-    }
-    JSLN(PV, JArray, (unsigned char *)line);
-  }
-  *s++ = 0;
-  *s = 0;
-  return buf;
-}
 
 
 unsigned char i64hex[] = {
@@ -5690,8 +5747,8 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [429] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* POMELO */
     [430] = TYPEOPT_NEEDSF,  /* STREEBOG-32 */
     [431] = TYPEOPT_NEEDSF,  /* STREEBOG-64 */
-    [432] = TYPEOPT_NEEDSF,  /* MD5AM */
-    [433] = TYPEOPT_NEEDSF,  /* MD5AM2 */
+    [432] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY,  /* MD5AM */
+    [433] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY,  /* MD5AM2 */
     [434] = TYPEOPT_NEEDSF,  /* MD5SWAP */
     [435] = TYPEOPT_NEEDSF,  /* MD5SPECAM */
     [436] = TYPEOPT_NEEDSF,  /* SHA1HESK */
@@ -6113,9 +6170,9 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [852] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MSSQL2012 */
     [853] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MACOSX */
     [854] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MACOSX7 */
-    [855] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER,  /* POSTGRESQL */
-    [856] = TYPEOPT_NEEDSJ,  /* JUNIPERSSG */
-    [857] = TYPEOPT_NEEDSF,  /* SKYPE */
+    [855] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY,  /* POSTGRESQL */
+    [856] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY,  /* JUNIPERSSG */
+    [857] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY,  /* SKYPE */
     [858] = TYPEOPT_NEEDSJ,  /* PEOPLESOFT */
     [859] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* EPISERVER */
     [860] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* HMAILSERVER */
@@ -6279,11 +6336,19 @@ struct MaskPos   { int classid; unsigned char literal; };
 
 struct MaskClass MaskClasses[MASK_MAX_CLASSES];
 int              MaskNextCustom = MASK_CUSTOM_0;
-struct MaskPos   MaskPattern[MAX_MASK_POS];
+struct MaskPos   MaskPattern[MAX_MASK_POS];  /* legacy: used by single -n or -N */
 int              MaskLen;
 int              MaskPrepend;
 unsigned long long MaskTotal;
 unsigned long long MaskChunkSize;
+
+/* Separate prepend/append patterns for simultaneous -N/-n */
+struct MaskPos   MaskAppendPattern[MAX_MASK_POS];
+int              MaskAppendLen;
+unsigned long long MaskAppendTotal = 1;
+struct MaskPos   MaskPrependPattern[MAX_MASK_POS];
+int              MaskPrependLen;
+unsigned long long MaskPrependTotal = 1;
 
 static void mask_init_classes(void) {
     int i;
@@ -6374,11 +6439,12 @@ static int parse_char_class(const char *p, struct MaskClass *mc) {
     return (int)(p - start);
 }
 
-/* Parse mask string into MaskPattern[]. Returns 0 on success, -1 on error. */
-static int parse_mask(const char *s) {
-    MaskLen = 0;
-    MaskTotal = 1;
-    while (*s && MaskLen < MAX_MASK_POS) {
+/* Parse mask string into a target pattern array. Returns 0 on success, -1 on error. */
+static int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out,
+                           unsigned long long *total_out) {
+    int plen = 0;
+    unsigned long long total = 1;
+    while (*s && plen < MAX_MASK_POS) {
         if (*s == '?') {
             s++;
             int classid = -1;
@@ -6392,9 +6458,9 @@ static int parse_mask(const char *s) {
                 case 'h': classid = MASK_CLASS_h; s++; break;
                 case 'H': classid = MASK_CLASS_H; s++; break;
                 case '?': /* literal ? */
-                    MaskPattern[MaskLen].classid = MASK_LITERAL;
-                    MaskPattern[MaskLen].literal = '?';
-                    MaskLen++;
+                    pattern[plen].classid = MASK_LITERAL;
+                    pattern[plen].literal = '?';
+                    plen++;
                     s++;
                     continue;
                 case '[': /* custom class */
@@ -6414,33 +6480,48 @@ static int parse_mask(const char *s) {
                     fprintf(stderr, "Unknown mask class ?%c\n", *s);
                     return -1;
             }
-            MaskPattern[MaskLen].classid = classid;
-            MaskTotal *= MaskClasses[classid].count;
+            pattern[plen].classid = classid;
+            total *= MaskClasses[classid].count;
         } else {
-            MaskPattern[MaskLen].classid = MASK_LITERAL;
-            MaskPattern[MaskLen].literal = *s++;
+            pattern[plen].classid = MASK_LITERAL;
+            pattern[plen].literal = *s++;
         }
-        MaskLen++;
+        plen++;
     }
-    if (MaskLen == 0) {
+    if (plen == 0) {
         fprintf(stderr, "Empty mask pattern\n");
         return -1;
     }
+    *len_out = plen;
+    *total_out = total;
     return 0;
 }
 
-static inline int mask_expand(unsigned long long index, char *buf) {
+/* Legacy wrapper for code that still uses the global MaskPattern */
+static int parse_mask(const char *s) {
+    return parse_mask_into(s, MaskPattern, &MaskLen, &MaskTotal);
+}
+
+/* Expand a mask pattern at a given index into buf. Returns pattern length. */
+static inline int mask_expand_into(unsigned long long index,
+                                   const struct MaskPos *pattern, int patlen,
+                                   char *buf) {
     int i;
-    for (i = MaskLen - 1; i >= 0; i--) {
-        if (MaskPattern[i].classid == MASK_LITERAL)
-            buf[i] = MaskPattern[i].literal;
+    for (i = patlen - 1; i >= 0; i--) {
+        if (pattern[i].classid == MASK_LITERAL)
+            buf[i] = pattern[i].literal;
         else {
-            struct MaskClass *mc = &MaskClasses[MaskPattern[i].classid];
+            struct MaskClass *mc = &MaskClasses[pattern[i].classid];
             buf[i] = mc->chars[index % mc->count];
             index /= mc->count;
         }
     }
-    return MaskLen;
+    return patlen;
+}
+
+/* Legacy wrapper */
+static inline int mask_expand(unsigned long long index, char *buf) {
+    return mask_expand_into(index, MaskPattern, MaskLen, buf);
 }
 
 struct job *FreeHead, **FreeTail;
@@ -6456,6 +6537,9 @@ volatile int MDXpause = 0;
 volatile int MDXpaused_count = 0;
 volatile unsigned int MDXlowest_line = 0xFFFFFFFF;
 volatile char *MDXlowest_file = NULL;
+#ifdef GPU_ENABLED
+static void sig_gpu_exit(int sig) { (void)sig; _exit(1); }
+#endif
 #ifndef _WIN32
 static void sig_pause(int sig) { (void)sig; MDXpause = 1; }
 static void sig_resume(int sig) { (void)sig; MDXpause = 0; }
@@ -8171,6 +8255,7 @@ int build_salt_snapshot(struct saltentry *snap, char *pool,
     Word_t *lpv;
     int n = 0;
     char *p = pool;
+    if (!judy) return 0;
     keybuf[0] = 0;
     JSLF(lpv, judy, (unsigned char *)keybuf);
     while (lpv) {
@@ -8196,17 +8281,32 @@ int build_salt_snapshot(struct saltentry *snap, char *pool,
     return n;
 }
 
-/* Populate hashsalt pointers in snapshot from Typehashsalt[job] Judy.
- * Called after build_salt_snapshot for types that precompute MD5(salt). */
-void snapshot_attach_hashsalt(struct saltentry *snap, int nsalts,
-                              Pvoid_t hashsalt_judy) {
-    if (!hashsalt_judy) return;
-    for (int i = 0; i < nsalts; i++) {
-        Word_t *hpv;
-        JSLG(hpv, hashsalt_judy, (unsigned char *)snap[i].salt);
-        if (hpv && *hpv)
-            snap[i].hashsalt = (char *)(void *)*hpv;
+/* Walk Typehashsalt Judy — each value is a struct saltentry* with precomputed
+ * hashsalt. Builds snapshot directly from the stored structs. */
+int build_hashsalt_snapshot(struct saltentry *snap, char *pool,
+                               Pvoid_t judy, char *keybuf, int printall) {
+    Word_t *lpv;
+    struct saltentry *se;
+    int n = 0;
+    char *p = pool;
+    keybuf[0] = 0;
+    JSLF(lpv, judy, (unsigned char *)keybuf);
+    while (lpv) {
+        se = (struct saltentry *)*lpv;
+        if (printall || *(se->PV) > 0) {
+            snap[n].salt = se->salt;
+            snap[n].PV = se->PV;
+            snap[n].saltlen = se->saltlen;
+            snap[n].hashsalt = se->hashsalt;
+            snap[n].hashlen = se->hashlen;
+            memcpy(p, se->hashsalt, se->hashlen);
+            p[se->hashlen] = 0;
+            p += se->hashlen + 1;
+            n++;
+        }
+        JSLN(lpv, judy, (unsigned char *)keybuf);
     }
+    return n;
 }
 
 #ifdef MDX_BIT32
@@ -8236,6 +8336,67 @@ static inline void lm_des_key(const unsigned char *raw7, DES_key_schedule *ks)
 }
 
 #ifdef GPU_ENABLED
+
+int gpu_try_pack_unsalted(struct jobg **pjobg, struct job *job, int appendlen, int prependlen, char *pass, int len)
+{
+    struct jobg *g = *pjobg;
+    if (job->op != JOB_MD5) {
+       return(0);
+    }
+
+    if (!g) {
+	g = gpujob_try_get_free();
+	if (!g) return 0;  /* GPU busy, fall through to CPU */
+        g->op = job->op;
+        g->filename = job->filename;
+        g->flags = job->flags;
+        g->doneprint = job->doneprint;
+        g->line_num = job->startline;
+	g->count = 0;
+	g->word_stride = 64;
+	g->max_count = 4096;
+        *pjobg = g;
+    }
+
+    int idx = g->count;
+    union HashU *h = (union HashU *)(g->raw + (idx * g->word_stride));
+    char *slot = (char *)h;
+#ifdef INTEL
+    h->x[0] = _mm_setzero_si128(); h->x[1] = _mm_setzero_si128();
+    h->x[2] = _mm_setzero_si128(); h->x[3] = _mm_setzero_si128();
+#elif ARM > 6
+    h->x[0] = vdupq_n_u32(0); h->x[1] = vdupq_n_u32(0);
+    h->x[2] = vdupq_n_u32(0); h->x[3] = vdupq_n_u32(0);
+#else
+    memset(slot, 0, 64);
+#endif
+
+    /* Place password at prepend offset, leaving gaps for GPU mask fill */
+    memcpy(slot + prependlen, pass, len);
+    slot[prependlen + len + appendlen] = (char)0x80;
+    ((uint32_t *)slot)[14] = (prependlen + len + appendlen) * 8;
+
+    /* Password metadata: only pack if within array bounds (GPUBATCH_MAX).
+     * For unsalted batches with >512 words, hit handler reconstructs from M[] block. */
+    if (idx < GPUBATCH_MAX) {
+        g->passoff[idx] = idx * g->word_stride;
+        g->passlen[idx] = len;
+        g->clen[idx] = len;
+        g->ruleindex[idx] = job->Ruleindex;
+        g->hexlen[idx] = prependlen + len + appendlen;
+    }
+
+gpu_pack_done:
+    g->count++;
+
+    /* Submit when batch limit reached */
+    if (g->count >= 4096) {
+        gpujob_submit(g);
+        *pjobg = NULL;
+    }
+    return 1;
+}
+
 /*
  * gpu_try_pack — Pack one word into a GPU batch (JOBG).
  *
@@ -8249,7 +8410,7 @@ static inline void lm_des_key(const unsigned char *raw7, DES_key_schedule *ks)
  * Submits the batch when full and sets *my_jobg = NULL.
  */
 static int gpu_try_pack(struct jobg **pjobg, struct job *job,
-                        union HashU *curin, int nsalts_job)
+                        union HashU *curin, int nsalts_job, int nonblock)
 {
     if (MDXpause) {
       __sync_fetch_and_add(&MDXpaused_count, 1);
@@ -8261,8 +8422,8 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
     if (!gpujob_available()) return 0;
     if (Rotatehash || Printall) return 0;
 
-    /* Salted types need enough salts to justify GPU dispatch */
-    if ((cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS) && nsalts_job < 100) return 0;
+    /* Salted types need at least one salt for GPU dispatch */
+    if ((cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS) && nsalts_job < 1) return 0;
 
     /* Salt+password types: password must fit in GPU limit */
     if (cat == GPU_CAT_SALTPASS && (job->clen > GPU_MAX_PASSLEN || job->clen <= 0 || !job->pass)) return 0;
@@ -8270,9 +8431,21 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
     /* Iteration types need Maxiter > 1 to benefit from GPU */
     if (cat == GPU_CAT_ITER && Maxiter <= 1) return 0;
 
+    /* Mask mode: need masks configured, password must fit */
+    if (cat == GPU_CAT_MASK) {
+        extern uint64_t gpu_mask_total;
+        if (gpu_mask_total == 0) return 0;
+        if (job->clen <= 0 || !job->pass) return 0;
+    }
+
     struct jobg *g = *pjobg;
     if (!g) {
-        g = gpujob_get_free(job->filename, job->startline);
+        if (nonblock) {
+            g = gpujob_try_get_free();
+            if (!g) return 0;  /* GPU busy, fall through to CPU */
+        } else {
+            g = gpujob_get_free(job->filename, job->startline);
+        }
         g->op = job->op;
         g->filename = job->filename;
         g->flags = job->flags;
@@ -8283,8 +8456,8 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
 
     int idx = g->count;
 
-    /* GPU_CAT_SALTPASS: pack raw password bytes (kernel does salt + password) */
-    if (cat == GPU_CAT_SALTPASS) {
+    /* GPU_CAT_SALTPASS / GPU_CAT_MASK: pack raw password bytes */
+    if (cat == GPU_CAT_SALTPASS || cat == GPU_CAT_MASK) {
         memcpy(g->hexhash[idx], job->pass, job->clen);
         g->hexlen[idx] = job->clen;
         goto gpu_pack_done;
@@ -8320,6 +8493,17 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
         }
         mw[4] = mw[5] = mw[6] = mw[7] = 0;
         g->hexlen[idx] = 16;
+        break;
+    case JOB_SHA1DRU:
+        /* Pack hex(SHA1(pass)) [40 bytes] + raw password [plen bytes] */
+        for (int mi = 0; mi < 10; mi++) {
+            unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
+            unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
+            mw[mi] = h0 | ((uint32_t)h1 << 16);
+        }
+        /* Raw password after the 40 hex bytes */
+        memcpy((char *)mw + 40, job->pass, job->clen);
+        g->hexlen[idx] = 40 + job->clen; /* kernel derives plen = hexlen - 40 */
         break;
     default: /* JOB_MD5SALT, JOB_MD5 — lowercase hex */
         for (int mi = 0; mi < 8; mi++) {
@@ -8656,8 +8840,16 @@ while (1) {
   snap_valid = 0;
   nsalts_job = 0;
   if (saltsnap && Typesalt[job->op] && !Typedone[job->op]) {
-    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                    Typesalt[job->op], tsalt, Printall);
+    if (Typehashsalt[job->op] && (job->op == JOB_MD5_MD5SALTMD5PASS ||
+        job->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
+        job->op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
+        job->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS)) {
+      nsalts_job = build_hashsalt_snapshot(saltsnap, saltpool,
+                      Typehashsalt[job->op], tsalt, Printall);
+    } else {
+      nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                      Typesalt[job->op], tsalt, Printall);
+    }
     snap_valid = 1;
     if (!nsalts_job) Typedone[job->op] = 1;
   }
@@ -8673,6 +8865,88 @@ while (1) {
     }
   }
 
+#ifdef GPU_ENABLED
+  /* GPU pre-scan: for unsalted mask types, scan all words and pack GPU-eligible
+   * ones into batches using blocking dispatch. A bitmap tracks which lines were
+   * GPU-handled so the main loop can skip them. */
+  unsigned char *gpu_done = NULL;
+  if (gpujob_available() && job->op == JOB_MD5 &&
+      (MaskAppendLen > 0 || MaskPrependLen > 0) && !Rules && !Email) {
+    extern uint64_t gpu_mask_total;
+    if (gpu_mask_total > 0) {
+      static __thread unsigned char *gpu_done_buf = NULL;
+      static __thread int gpu_done_size = 0;
+      int nbytes = (job->numline + 7) / 8;
+      if (nbytes > gpu_done_size) {
+        if (gpu_done_buf) free(gpu_done_buf);
+        gpu_done_buf = (unsigned char *)malloc_lock(nbytes, "gpu_done");
+        gpu_done_size = nbytes;
+      }
+      gpu_done = gpu_done_buf;
+      memset(gpu_done, 0, nbytes);
+      int applen = MaskAppendLen, prelen = MaskPrependLen;
+
+      for (unsigned int gl = 0; gl < job->numline; gl++) {
+        char *s = &job->readbuf[job->readindex[job->startline + gl].offset];
+        int slen = job->readindex[job->startline + gl].len;
+        if (slen + applen + prelen >= 55) continue;
+
+        /* Get or allocate GPU batch buffer (blocking) */
+        struct jobg *g = my_jobg;
+        if (!g) {
+          g = gpujob_get_free(job->filename, job->startline);
+          g->op = job->op;
+          g->filename = job->filename;
+          g->flags = job->flags;
+          g->doneprint = job->doneprint;
+          g->line_num = job->startline;
+          g->count = 0;
+          g->word_stride = 64;
+          g->max_count = 4096;
+          my_jobg = g;
+        }
+
+        int idx = g->count;
+        union HashU *h = (union HashU *)(g->raw + (idx * 64));
+        char *slot = (char *)h;
+#ifdef INTEL
+        h->x[0] = _mm_setzero_si128(); h->x[1] = _mm_setzero_si128();
+        h->x[2] = _mm_setzero_si128(); h->x[3] = _mm_setzero_si128();
+#elif ARM > 6
+        h->x[0] = vdupq_n_u32(0); h->x[1] = vdupq_n_u32(0);
+        h->x[2] = vdupq_n_u32(0); h->x[3] = vdupq_n_u32(0);
+#else
+        memset(slot, 0, 64);
+#endif
+        memcpy(slot + prelen, s, slen);
+        slot[prelen + slen + applen] = (char)0x80;
+        ((uint32_t *)slot)[14] = (prelen + slen + applen) * 8;
+
+        if (idx < GPUBATCH_MAX) {
+          g->passoff[idx] = idx * 64;
+          g->passlen[idx] = slen;
+          g->clen[idx] = slen;
+          g->ruleindex[idx] = 0;
+          g->hexlen[idx] = prelen + slen + applen;
+        }
+
+        g->count++;
+        gpu_done[gl >> 3] |= (1 << (gl & 7));
+
+        if (g->count >= 4096) {
+          gpujob_submit(g);
+          my_jobg = NULL;
+        }
+      }
+      /* Flush partial batch */
+      if (my_jobg && my_jobg->count > 0) {
+        gpujob_submit(my_jobg);
+        my_jobg = NULL;
+      }
+    }
+  }
+#endif
+
   for (curline = job->startline; numline < job->numline; curline++, numline++, lineproc++) {
 
     if (ltime.tv_sec != current.tv_sec) {
@@ -8682,7 +8956,11 @@ while (1) {
       }
       possess(FreeWaiting);
       if (lineproc) TotLines += lineproc;
-      if (hashcnt) Tothash += hashcnt;
+      if (hashcnt) {
+        Tothash += hashcnt;
+        if (linehints && job->op < linehints_count)
+          __sync_fetch_and_add(&linehints[job->op].hashes_accum, hashcnt);
+      }
       if (found) Totfound += found;
       if (rulecnt) Totrules += rulecnt;
       lineproc = hashcnt = rulecnt = found = 0;
@@ -8713,6 +8991,14 @@ while (1) {
     s = &job->readbuf[job->readindex[curline].offset];
     d = job->line;
     len = job->readindex[curline].len;
+#ifdef GPU_ENABLED
+    /* Skip words already dispatched to GPU in the pre-scan phase */
+    if (gpu_done) {
+      unsigned int gi = numline;
+      if (gpu_done[gi >> 3] & (1 << (gi & 7)))
+        continue;
+    }
+#endif
     Lfstate = 0;
 
     cur = job->line;
@@ -8763,7 +9049,7 @@ while (1) {
       emailpow = 1 << emaillen;
     }
 
-if ((job->flags & JOBFLAG_PREPEND) && job->MaskCount && !currule) {
+if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && !currule) {
   memcpy(job->prefix, job->line, orig_len);
   job->prefix[orig_len] = 0;
 }
@@ -8771,8 +9057,8 @@ if ((job->flags & JOBFLAG_PREPEND) && job->MaskCount && !currule) {
 do {
 cur = job->line;
 len = orig_len;
-/* For mask prepend without rules, restore the original word each iteration */
-if ((job->flags & JOBFLAG_PREPEND) && job->MaskCount && !currule && number_iter > 0) {
+/* For mask with prepend, restore the original word each iteration */
+if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && !currule && number_iter > 0) {
   memcpy(job->line, job->prefix, orig_len);
   job->line[orig_len] = 0;
 }
@@ -8815,18 +9101,59 @@ if (job->flags & JOBFLAG_NUMBERS) {
 		   (int) ((job->Numbers >> 8) & 0xff),
 		   (int) ((job->Numbers) & 0xff));
   else if (job->MaskCount) {
-    char maskbuf[MAX_MASK_POS + 1];
-    int mlen = mask_expand(job->MaskIndex, maskbuf);
-    if (job->flags & JOBFLAG_PREPEND) {
-      /* Save word, then build [mask][word] in job->line */
-      memcpy(job->prefix, job->line, len);
-      job->prefix[len] = 0;
-      memcpy(job->line, maskbuf, mlen);
-      memcpy(&job->line[mlen], job->prefix, len);
-    } else {
-      memcpy(&job->line[len], maskbuf, mlen);
+#ifdef GPU_ENABLED
+    /* Unsalted pre-padded path: pack base word at MaskIndex==0 only.
+     * GPU kernel expands all mask combinations from the pre-padded M[].
+     * Suppress remaining mask iterations by advancing number_iter to the loop limit. */
+    { extern uint64_t gpu_mask_total;
+    if (gpu_mask_total > 0 && job->MaskIndex == 0 && (len+MaskAppendLen+MaskPrependLen) < 55 &&
+        gpu_try_pack_unsalted(&my_jobg,job,MaskAppendLen,MaskPrependLen,job->line,len)) {
+      number_iter = (int)(job->MaskCount ? job->MaskCount : Iter_Count[job->digits]) - 1;
+      Lfstate = 0;
+      continue;
+    } }
+    /* GPU mask mode (legacy): send base word once, GPU generates all mask candidates.
+     * Suppress remaining mask iterations by advancing number_iter to the loop limit. */
+    if (job->MaskIndex == 0 && gpu_op_category(job->op) == GPU_CAT_MASK &&
+        gpu_try_pack(&my_jobg, job, NULL, 0, 1)) {
+      number_iter = (int)(job->MaskCount ? job->MaskCount : Iter_Count[job->digits]) - 1;
+      Lfstate = 0;
+      continue;
     }
-    len += mlen;
+#endif
+    if (MaskPrependLen > 0 && MaskAppendLen > 0) {
+      /* Dual mask: decompose combined index into prepend and append indices */
+      unsigned long long idx = job->MaskIndex;
+      unsigned long long append_idx = idx % MaskAppendTotal;
+      unsigned long long prepend_idx = idx / MaskAppendTotal;
+      char prebuf[MAX_MASK_POS], appbuf[MAX_MASK_POS];
+      int prelen = mask_expand_into(prepend_idx, MaskPrependPattern, MaskPrependLen, prebuf);
+      int applen = mask_expand_into(append_idx, MaskAppendPattern, MaskAppendLen, appbuf);
+      /* Build [prepend][word][append] using prefix as temp */
+      memcpy(job->prefix, job->line, len);
+      memcpy(job->line, prebuf, prelen);
+      memcpy(job->line + prelen, job->prefix, len);
+      memcpy(job->line + prelen + len, appbuf, applen);
+      len += prelen + applen;
+    } else if (MaskPrependLen > 0) {
+      /* Prepend only */
+      char maskbuf[MAX_MASK_POS + 1];
+      int mlen = mask_expand_into(job->MaskIndex, MaskPrependPattern, MaskPrependLen, maskbuf);
+      memcpy(job->prefix, job->line, len);
+      memcpy(job->line, maskbuf, mlen);
+      memcpy(job->line + mlen, job->prefix, len);
+      len += mlen;
+    } else {
+      /* Append only (or legacy single mask) */
+      char maskbuf[MAX_MASK_POS + 1];
+      int mlen;
+      if (MaskAppendLen > 0)
+        mlen = mask_expand_into(job->MaskIndex, MaskAppendPattern, MaskAppendLen, maskbuf);
+      else
+        mlen = mask_expand(job->MaskIndex, maskbuf);
+      memcpy(&job->line[len], maskbuf, mlen);
+      len += mlen;
+    }
     job->line[len] = 0;
   } else
     len += sprintf(&job->line[len], NumbersFmt, job->digits, job->Numbers);
@@ -9042,6 +9369,7 @@ do {
     }
     if (len > MAXLINE)
       currule = NULL;
+
 
 /*     printf("Starting job %d (%s) %llx\n",job->op,Types[job->op],job->outbuf);  */
     switch (job->op) {
@@ -10628,8 +10956,8 @@ release(FreeWaiting);
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job)) {
-                  hashcnt += (long long)nsalts_job * 1002;
+                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
                   break;
                 }
 #endif
@@ -11085,6 +11413,21 @@ crypt_done: ;
                     if (!nsalts_job) { Typedone[job->op] = 1; break; }
                   }
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
+#ifdef GPU_ENABLED
+                  if (job->op == JOB_PHPBB3 && job->clen <= 39 &&
+                      gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 1)) {
+                    /* hashcnt accounted by gpujob thread */
+                    /* compact out found salts so GPU workload shrinks */
+                    { int si;
+                    for (si = nsalts_job - 1; si >= 0; si--) {
+                      if (!Printall && *saltsnap[si].PV == 0)
+                        saltsnap[si] = saltsnap[--nsalts_job];
+                    }
+                    if (!nsalts_job) Typedone[job->op] = 1;
+                    }
+                    break;
+                  }
+#endif
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       s1 = saltsnap[si].salt;
@@ -11155,6 +11498,102 @@ nextbb:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
+#ifdef GPU_ENABLED
+                if (job->op == JOB_PHPBB3 && job->clen <= 39 &&
+                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 1)) {
+                  /* hashcnt accounted by gpujob thread */
+                  break;
+                }
+#endif
+#if ARM > 6
+                /* NEON 4-wide PHPBB3: batch 4 salts with same iteration count */
+                if (len < 40) {
+                  int si, pcnt = 0, myiter = 0;
+                  char *sbuf[4], sbufcopy[4 * 64];
+                  Word_t *pvbuf[4];
+                  SVAL *R;
+                  cur[len] = 0x80;
+                  cur[len + 1] = cur[len + 2] = cur[len + 3] = cur[len + 4] = 0;
+                  init_md5sse((unsigned char *)(cur - 16), len + 16 + 1, (unsigned char *)SSEBUF);
+                  { uint32x4_t lenval = vdupq_n_u32((len + 16) << 3);
+                    SSEBUF[14] = lenval; }
+                  R = (SVAL *) SSEBUF;
+                  for (si = 0; si < nsalts_job; si++) {
+                    s1 = saltsnap[si].salt;
+                    i = i64hex[s1[3] & 0xff];
+                    if (i < 7 || i > 30) continue;
+                    saltlen = saltsnap[si].saltlen - 4;
+                    i = 1 << i;
+                    memmove(cur - saltlen, s1 + 4, saltlen);
+                    mymd5(cur - saltlen, len + saltlen, curin.h);
+                    hashcnt += 1 + i;
+                    if (myiter && myiter != i && pcnt) {
+                      procsaltbb(SSEBUF, job, pcnt, sbuf, myiter);
+                      for (y = 0; y < pcnt; y++) {
+                        if ((unsigned char)sbuf[y][3] == 0xfe && NoMarkSalt == 0)
+                          PV_DEC(pvbuf[y]);
+                      }
+                      pcnt = 0; myiter = 0;
+                    }
+                    if (myiter == 0) myiter = i;
+                    strncpy(sbufcopy + pcnt * 64, saltsnap[si].salt, 63);
+                    sbufcopy[pcnt * 64 + 63] = 0;
+                    sbuf[pcnt] = sbufcopy + pcnt * 64;
+                    pvbuf[pcnt] = saltsnap[si].PV;
+                    R[0].words[pcnt] = curin.i[0];
+                    R[1].words[pcnt] = curin.i[1];
+                    R[2].words[pcnt] = curin.i[2];
+                    R[3].words[pcnt] = curin.i[3];
+                    pcnt++;
+                    if (pcnt == 4) {
+                      procsaltbb(SSEBUF, job, pcnt, sbuf, myiter);
+                      for (y = 0; y < pcnt; y++) {
+                        if ((unsigned char)sbuf[y][3] == 0xfe && NoMarkSalt == 0)
+                          PV_DEC(pvbuf[y]);
+                      }
+                      pcnt = 0; myiter = 0;
+                    }
+                  }
+                  if (pcnt) {
+                    procsaltbb(SSEBUF, job, pcnt, sbuf, myiter);
+                    for (y = 0; y < pcnt; y++) {
+                      if ((unsigned char)sbuf[y][3] == 0xfe && NoMarkSalt == 0)
+                        PV_DEC(pvbuf[y]);
+                    }
+                  }
+                  /* Compact out found salts */
+                  for (si = nsalts_job - 1; si >= 0; si--) {
+                    if (!Printall && *saltsnap[si].PV == 0)
+                      saltsnap[si] = saltsnap[--nsalts_job];
+                  }
+                  if (!nsalts_job) Typedone[job->op] = 1;
+                } else {
+                  /* Password too long for NEON batching — scalar fallback */
+                  curin.i[4] = curin.i[5] = 0;
+                  { int si;
+                  for (si = 0; si < nsalts_job; si++) {
+                    s1 = saltsnap[si].salt;
+                    i = i64hex[s1[3] & 0xff];
+                    if (i < 7 || i > 30) continue;
+                    saltlen = saltsnap[si].saltlen - 4;
+                    i = 1 << i;
+                    memmove(cur - saltlen, s1 + 4, saltlen);
+                    mymd5(cur - saltlen, len + saltlen, curin.h);
+                    hashcnt += 1 + i;
+                    for (x = 0; x < i; x++) {
+                      memmove(cur - 16, curin.h, 16);
+                      mymd5(cur - 16, 16 + len, curin.h);
+                    }
+                    if (checkhashbb(&curin, 32, s1, job) && NoMarkSalt == 0)
+                      PV_DEC(saltsnap[si].PV);
+                    if (!Printall && *saltsnap[si].PV == 0) {
+                      saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                    }
+                  }
+                  if (!nsalts_job) Typedone[job->op] = 1;
+                  }
+                }
+#else
                 curin.i[4] = curin.i[5] = 0;
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
@@ -11179,6 +11618,7 @@ nextbb:
                 }
                 if (!nsalts_job) Typedone[job->op] = 1;
                 }
+#endif
                 break;
 
               case JOB_BCRYPTSHA512:
@@ -11740,6 +12180,12 @@ sha512salt_s:
                   break;
                 hashcnt++;
                 mysha1((char *)cur, len, curin.h);
+#ifdef GPU_ENABLED
+                if (gpu_try_pack(&my_jobg, job, &curin, 0, 0)) {
+                  hashcnt += 1000000;
+                  break;
+                }
+#endif
                 memmove(linebuf + 40, cur, len);
 
                 for (x = 1; x < 1000001; x++) {
@@ -11828,6 +12274,13 @@ sha1passsalt:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
+#ifdef GPU_ENABLED
+                if (job->op == JOB_SHA1PASSSALT && Maxiter <= 1 &&
+                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
+                  break;
+                }
+#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -11855,27 +12308,29 @@ sha1passsalt:
                 break;
 
               case JOB_SHA1_HMAC_MD5:
-                keys = Typeuser[job->op]; if (!keys) keys = Userid;
                 if (len > MAXLINE)
                   break;
-                if (!keys)
-                  keys = "\0\0";
-                do {
-                  MHASH td;
-                  if (Hexkey) {
-                    y = *keys++;
-                  } else {
-                    y = mystrlen(keys);
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      MHASH td;
+                      y = mystrlen(tsalt);
+                      td = mhash_hmac_init(MHASH_MD5, tsalt, y, mhash_get_hash_pblock(MHASH_MD5));
+                      mhash(td, cur, len);
+                      mhash_hmac_deinit(td, curin.h);
+                      hashcnt += 2;
+		      prmd5(curin.h, mdbuf, 32);
+		      mysha1(mdbuf,32,curin.h);
+                      if (checkhashkey(&curin, 40, tsalt, job))
+                        PV_DEC(PV);
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  td = mhash_hmac_init(MHASH_MD5, keys, y, mhash_get_hash_pblock(MHASH_MD5));
-                  mhash(td, cur, len);
-                  mhash_hmac_deinit(td, curin.h);
-                  hashcnt += 2;
-		  prmd5(curin.h, mdbuf, 32);
-		  mysha1(mdbuf,32,curin.h);
-                  checkhashkey(&curin, 40, keys, job);
-                  keys += y + 1;
-                } while (*keys);
+                }
                 break;
 
               case JOB_SHA1MD5SHA1PASSSALT:
@@ -12024,6 +12479,13 @@ sha1saltpass:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
+#ifdef GPU_ENABLED
+                if ((job->op == JOB_SHA1SALTPASS) && Maxiter <= 1 &&
+                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
+                  break;
+                }
+#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -12504,11 +12966,8 @@ sha1saltpass:
                 goto MDstart;
 
               case JOB_MSCACHE:
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
                 if (len > MAXLINE)
                   break;
-                if (!csalt)
-                  csalt = "Administrator\x00\0";
 		if (Unicode == 0) {
 		  ic_inleft = len;
 		  icin = cur;
@@ -12524,38 +12983,43 @@ sha1saltpass:
 		}
 
                 memmove(linebuf, md5buf.h, 16);
-                do {
-                  s1 = csalt;
-                  d = newbuf;
-                  i = 0;
-                  while (*csalt) {
-                    *d++ = *csalt++;
-                    i++;
-                  }
-                  saltlen = i;
-                  csalt++;
-		  ic_inleft = i;
-		  icin = newbuf;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE*2;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft != MAXLINE*2) {
-		    unsigned short *dest;
-                    dest = (unsigned short *) wline;
- 		    i = (MAXLINE*2) - ic_outleft;
-                    for (x = 0; x < i; x++) {
-                      wchar_t ht;
-                      ht = dest[x];
-                      if (iswupper(ht)) ht = towlower(ht);
-		      dest[x] = ht;
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      s1 = tsalt;
+                      d = newbuf;
+                      i = saltlen = mystrlen(tsalt);
+                      memcpy(newbuf, tsalt, i);
+		      ic_inleft = i;
+		      icin = newbuf;
+		      icout = (char *)wline;
+		      ic_outleft = MAXLINE*2;
+		      x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
+		      if (ic_outleft != MAXLINE*2) {
+		        unsigned short *dest;
+                        dest = (unsigned short *) wline;
+ 		        i = (MAXLINE*2) - ic_outleft;
+                        for (x = 0; x < i; x++) {
+                          wchar_t ht;
+                          ht = dest[x];
+                          if (iswupper(ht)) ht = towlower(ht);
+		          dest[x] = ht;
+                        }
+                      } else {
+                        memmove(wline, newbuf, i);
+                      }
+                      memmove(linebuf + 16, wline, i);
+                      MD4(linebuf, 16 + i, curin.h);
+                      if (checkhashsalt(&curin, 32, s1, saltlen, 1, job))
+                        PV_DEC(PV);
                     }
-                  } else {
-                    memmove(wline, newbuf, i);
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  memmove(linebuf + 16, wline, i);
-                  MD4(linebuf, 16 + i, curin.h);
-                  checkhashsalt(&curin, 32, s1, saltlen, 1, job);
-                } while (*csalt);
+                }
                 break;
 
 	      case JOB_MD4UTF16revBASE64x:
@@ -13443,8 +13907,8 @@ md4utf16:
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
                 if (job->op == JOB_MD5SALTPASS &&
-                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job)) {
-                  hashcnt += nsalts_job;
+                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
                   break;
                 }
 #endif
@@ -13488,31 +13952,37 @@ md4utf16:
 
 
               case JOB_MD5_MD5puSHA1MD5pup:
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
                 if (len > MAXLINE)
                   break;
-                if (!csalt)
-                  csalt = "1\x00\x00";
                 fastcopy(linebuf, cur, len);
-                while (*csalt) {
-                  i = saltlen = mystrlen(csalt);
-                  s1 = csalt;
-                  csalt += i + 1;
-                  s = linebuf + len;
-                  memmove(s, s1, i);
-                  mymd5(linebuf, len + i, md5buf.h);
-                  prmd5(md5buf.h, linebuf2, 32);
-                  fastcopy(linebuf2 + 32, cur, len);
-                  mysha1((char *)linebuf2, 32 + len, md5buf.h);
-                  prmd5(md5buf.h, linebuf2 + 32, 40);
-                  mymd5(linebuf2, 32 + 40, md5buf.h);
-                  for (x = 1; x <= Maxiter; x++) {
-                    hashcnt++;
-                    checkhashsalt(&md5buf, 32, s1, saltlen, x, job);
-                    if (x < Maxiter) {
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      i = saltlen = mystrlen(tsalt);
+                      s1 = tsalt;
+                      s = linebuf + len;
+                      memmove(s, s1, i);
+                      mymd5(linebuf, len + i, md5buf.h);
                       prmd5(md5buf.h, linebuf2, 32);
-                      mymd5(linebuf2, 32, md5buf.h);
+                      fastcopy(linebuf2 + 32, cur, len);
+                      mysha1((char *)linebuf2, 32 + len, md5buf.h);
+                      prmd5(md5buf.h, linebuf2 + 32, 40);
+                      mymd5(linebuf2, 32 + 40, md5buf.h);
+                      for (x = 1; x <= Maxiter; x++) {
+                        hashcnt++;
+                        if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job))
+                          PV_DEC(PV);
+                        if (x < Maxiter) {
+                          prmd5(md5buf.h, linebuf2, 32);
+                          mymd5(linebuf2, 32, md5buf.h);
+                        }
+                      }
                     }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
                 }
                 break;
@@ -14224,8 +14694,8 @@ sha1_truncsalt:
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job)) {
-                  hashcnt += nsalts_job;
+                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
                   break;
                 }
 #endif
@@ -14552,10 +15022,8 @@ morepep:
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
-                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
-                  snapshot_attach_hashsalt(saltsnap, nsalts_job,
-                                  Typehashsalt[job->op]);
+                  nsalts_job = build_hashsalt_snapshot(saltsnap, saltpool,
+                                  Typehashsalt[job->op], tsalt, Printall);
                   snap_valid = 1;
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
@@ -14564,8 +15032,8 @@ morepep:
                 prmd5(md5buf.h, linebuf + 32, 32);
 #ifdef GPU_ENABLED
                 if (job->op == JOB_MD5_MD5SALTMD5PASS && Maxiter <= 1 &&
-                    gpu_try_pack(&my_jobg, job, &md5buf, nsalts_job)) {
-                  hashcnt += nsalts_job;
+                    gpu_try_pack(&my_jobg, job, &md5buf, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
                   break;
                 }
 #endif
@@ -15135,9 +15603,6 @@ morepep:
               case JOB_MANGOS:
                 if (len > MAXLINE)
                   break;
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
-                if (!csalt)
-                  csalt = "Admin\0\0";
                 y = len;
 		for (x=0; x < len; x++) {
 		  if (islower(cur[x]))
@@ -15146,64 +15611,72 @@ morepep:
 		    linebuf[MAXLINE+1+x] = cur[x];
 		}
 		linebuf[MAXLINE] = ':';
-		cur = linebuf+MAXLINE;
-                do {
-                  i = 0;
-                  len = y;
-                  d = linebuf + MAXLINE;
-                  s1 = s = csalt;
-                  while (*s) {
-                    i++;
-                    s++;
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      i = mystrlen(tsalt);
+                      len = y;
+                      d = linebuf + MAXLINE;
+                      s1 = tsalt;
+                      cur = d -= i;
+                      len += i;
+                      { const char *sp = tsalt;
+                        while (*sp) {
+                          if (islower(*sp))
+                            *d++ = toupper(*sp);
+                          else
+                            *d++ = *sp;
+                          sp++;
+                        }
+                      }
+                      mysha1(cur, len+1, curin.h);
+                      hashcnt++;
+                      if (checkhashkey(&curin, 40, s1, job))
+                        PV_DEC(PV);
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  cur = d -= i;
-                  len += i;
-                  while (*csalt) {
-                    if (islower(*csalt))
-                      *d++ = toupper(*csalt);
-                    else
-                      *d++ = *csalt;
-                    csalt++;
-                  }
-                  csalt++;
-
-                  mysha1(cur, len+1, curin.h);
-                  hashcnt++;
-                  checkhashkey(&curin, 40, s1, job);
-                } while (*csalt);
+                }
                 break;
 
               case JOB_SMF:
                 if (len > MAXLINE)
                   break;
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
-                if (!csalt)
-                  csalt = "Admin\0\0";
                 y = len;
-                do {
-                  i = 0;
-                  len = y;
-                  d = job->line;
-                  s1 = s = csalt;
-                  while (*s) {
-                    i++;
-                    s++;
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      i = mystrlen(tsalt);
+                      len = y;
+                      d = job->line;
+                      s1 = tsalt;
+                      cur = d -= i;
+                      len += i;
+                      { const char *sp = tsalt;
+                        while (*sp) {
+                          if (isupper(*sp))
+                            *d++ = tolower(*sp);
+                          else
+                            *d++ = *sp;
+                          sp++;
+                        }
+                      }
+                      mysha1(cur, len, curin.h);
+                      hashcnt++;
+                      if (checkhashkey(&curin, 40, s1, job))
+                        PV_DEC(PV);
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  cur = d -= i;
-                  len += i;
-                  while (*csalt) {
-                    if (isupper(*csalt))
-                      *d++ = tolower(*csalt);
-                    else
-                      *d++ = *csalt;
-                    csalt++;
-                  }
-                  csalt++;
-
-                  mysha1(cur, len, curin.h);
-                  hashcnt++;
-                  checkhashkey(&curin, 40, s1, job);
-                } while (*csalt);
+                }
                 break;
 
               case JOB_MD5USERnulPASS:
@@ -15500,23 +15973,27 @@ sha11saltmd5:
               case JOB_SKYPE:
                 if (len > MAXLINE)
                   break;
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
-                if (!csalt)
-                  csalt = "user\0\0";
-                do {
-                  i = 0;
-                  s1 = s = csalt;
-                  while (*s++) i++;
-                  saltlen = i;
-                  csalt += i + 1;
-                  /* build: username + "\nskyper\n" + password */
-                  memmove(linebuf, s1, i);
-                  memmove(linebuf + i, "\nskyper\n", 8);
-                  memmove(linebuf + i + 8, cur, len);
-                  mymd5(linebuf, i + 8 + len, curin.h);
-                  hashcnt++;
-                  checkhashkey(&curin, 32, s1, job);
-                } while (*csalt);
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      i = mystrlen(tsalt);
+                      saltlen = i;
+                      s1 = tsalt;
+                      memmove(linebuf, s1, i);
+                      memmove(linebuf + i, "\nskyper\n", 8);
+                      memmove(linebuf + i + 8, cur, len);
+                      mymd5(linebuf, i + 8 + len, curin.h);
+                      hashcnt++;
+                      if (checkhashkey(&curin, 32, s1, job))
+                        PV_DEC(PV);
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                  }
+                }
                 break;
 
               case JOB_PEOPLESOFT:
@@ -15737,15 +16214,16 @@ sha11saltmd5:
               case JOB_JUNIPERSSG:
                 if (len > MAXLINE)
                   break;
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
-                if (!csalt)
-                  csalt = "user\0\0";
-                do {
-                  i = 0;
-                  s1 = s = csalt;
-                  while (*s++) i++;
-                  saltlen = i;
-                  csalt += i + 1;
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      i = mystrlen(tsalt);
+                      saltlen = i;
+                      s1 = tsalt;
                   /* build: username + ":Administration Tools:" + password */
                   memmove(linebuf, s1, i);
                   memmove(linebuf + i, ":Administration Tools:", 22);
@@ -15789,7 +16267,10 @@ sha11saltmd5:
                         job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", Types[job->op], linebuf2, s1, job->pass);
                     }
                   }
-                } while (*csalt);
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                  }
+                }
                 break;
 
               case JOB_CISCOPIX:
@@ -19623,12 +20104,172 @@ MD5SALTstart:
               { int si, compact_ctr = 0;
               d = mdbuf + len;
 #ifdef GPU_ENABLED
-              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job)) {
-                hashcnt += nsalts_job;
+              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job, 0)) {
+                /* hashcnt accounted by gpujob thread */
               } else
 #endif /* GPU_ENABLED */
               {
-              /* CPU salt loop (original) */
+#if ARM > 6
+              /* NEON 4-wide salt loop — same pattern as Intel SSE */
+              init_md5sse(cur, len, SSEBUF);
+              done2 = 0;
+              maxsaltlen = 0;
+              {
+                int pcnt, pcnt2;
+                uint32_t *d32x2, *dd32x2;
+                char *sbuf[4], *sbuf2[4];
+                int slen4[4], slen2[4];
+                PWord_t pvbuf[4], pvbuf2[4];
+                SVAL prestate[4];
+
+                d32 = (uint32_t *) SSEBUF;
+                X = (SVAL *) SSEBUF;
+                R = (SVAL *) hashes;
+                d32x2 = (uint32_t *) SSEBUF3;
+                dd32x2 = &d32x2[(len/4) * 4];
+                if (len >= 32)
+                  mymd5salt_pre((unsigned char *)SSEBUF, prestate);
+
+                pcnt = 0;
+                pcnt2 = 0;
+                for (si = 0; si < nsalts_job; si++) {
+                  if (MDXpause) {
+                    __sync_fetch_and_add(&MDXpaused_count, 1);
+                    while (MDXpause) sleep(2);
+                    __sync_fetch_and_sub(&MDXpaused_count, 1);
+                  }
+                  if (!Printall && *saltsnap[si].PV == 0) continue;
+                  if (saltsnap[si].saltlen > 80) continue;
+                  i = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  if (i < 24) {
+                    /* Short salt: pack into SSEBUF lanes */
+                    X[14].words[pcnt] = (len + i) << 3;
+                    s1[i] = 0x80;
+                    sbuf[pcnt] = saltsnap[si].salt;
+                    slen4[pcnt] = i;
+                    pvbuf[pcnt] = saltsnap[si].PV;
+                    i++;
+                    for (j = 0; (i - j) > 4; j += 4)
+                      X[(len/4) + j / 4].words[pcnt] = *((uint32_t *)(&s1[j]));
+                    X[(len/4) + j / 4].words[pcnt] = (*((uint32_t *)(&s1[j]))) & lastmask[i - j];
+                    for (j = (len/4)+1 + j / 4; j <= 13; j++)
+                      X[j].words[pcnt] = 0;
+                    i--;
+                    s1[i] = 0;
+                    pcnt++;
+                  } else {
+                    /* Long salt: pack into SSEBUF3 for two-block MD5 */
+                    uint32x4_t *p, r1;
+                    if (!done2) {
+                      r1 = vdupq_n_u32(0);
+                      p = (uint32x4_t *) SSEBUF3;
+                      for (j = 0; j < 32; j++)
+                        p[j] = r1;
+                      init_md5sse(cur, 32, SSEBUF3);
+                      p[14] = r1;
+                      p[15] = r1;
+                      done2 = 1;
+                    }
+                    s1[i] = 0x80;
+                    sbuf2[pcnt2] = saltsnap[si].salt;
+                    slen2[pcnt2] = i;
+                    pvbuf2[pcnt2] = saltsnap[si].PV;
+                    i++;
+                    for (j = 0; (i - j) > 4; j += 4)
+                      dd32x2[j + pcnt2] = *((uint32_t *)(&s1[j]));
+                    dd32x2[j + pcnt2] = (*((uint32_t *)(&s1[j]))) & lastmask[i - j];
+                    j += 4;
+                    if (i > maxsaltlen)
+                      maxsaltlen = i;
+                    for (; j < (maxsaltlen + 4); j += 4)
+                      dd32x2[j + pcnt2] = 0;
+                    i--;
+                    d32x2[30 * 4 + pcnt2] = (len + i) << 3;
+                    s1[i] = 0;
+                    pcnt2++;
+                  }
+                  /* Flush short-salt batch */
+                  if (pcnt == 4 || (si >= nsalts_job - 1 && pcnt)) {
+                    if (len >= 32)
+                      mymd5salt_post((unsigned char *)SSEBUF, prestate, (SVAL *)hashes);
+                    else
+                      mymd5salt(SSEBUF, hashes);
+                    hashcnt += pcnt;
+                    for (i = 0; i < pcnt; i++) {
+                      curin.i[0] = R[0].words[i];
+                      curin.i[1] = R[1].words[i];
+                      curin.i[2] = R[2].words[i];
+                      curin.i[3] = R[3].words[i];
+                      if ((hash_exists(curin.h, 32) || Printall)
+                          && checkhashkey(&curin, 32, sbuf[i], job)) {
+                        PV_DEC(pvbuf[i]);
+                      }
+                    }
+                    /* Clear leftover salt data from SSEBUF lanes */
+                    { uint32x4_t zv = vdupq_n_u32(0);
+                      for (j = len/4; j <= 13; j++)
+                        X[j].sse = zv;
+                    }
+                    pcnt = 0;
+                  }
+                  /* Flush long-salt batch */
+                  if (pcnt2 == 4 || (si >= nsalts_job - 1 && pcnt2)) {
+                    mymd5salt2(SSEBUF3, hashes);
+                    f32 = (uint32_t *) hashes;
+                    hashcnt += pcnt2;
+                    for (i = 0; i < pcnt2; i++) {
+                      curin.i[0] = f32[i];
+                      curin.i[1] = f32[4 + i];
+                      curin.i[2] = f32[8 + i];
+                      curin.i[3] = f32[12 + i];
+                      if ((hash_exists(curin.h, 32) || Printall)
+                          && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                        PV_DEC(pvbuf2[i]);
+                      }
+                    }
+                    pcnt2 = 0;
+                  }
+                }
+                /* Post-loop flush: catch partial batches when last salt(s)
+                 * had PV==0, causing continue to skip in-loop flush. */
+                if (pcnt) {
+                  if (len >= 32)
+                    mymd5salt_post((unsigned char *)SSEBUF, prestate, (SVAL *)hashes);
+                  else
+                    mymd5salt(SSEBUF, hashes);
+                  hashcnt += pcnt;
+                  for (i = 0; i < pcnt; i++) {
+                    curin.i[0] = R[0].words[i];
+                    curin.i[1] = R[1].words[i];
+                    curin.i[2] = R[2].words[i];
+                    curin.i[3] = R[3].words[i];
+                    if ((hash_exists(curin.h, 32) || Printall)
+                        && checkhashkey(&curin, 32, sbuf[i], job)) {
+                      PV_DEC(pvbuf[i]);
+                    }
+                  }
+                  pcnt = 0;
+                }
+                if (pcnt2) {
+                  mymd5salt2(SSEBUF3, hashes);
+                  f32 = (uint32_t *) hashes;
+                  hashcnt += pcnt2;
+                  for (i = 0; i < pcnt2; i++) {
+                    curin.i[0] = f32[i];
+                    curin.i[1] = f32[4 + i];
+                    curin.i[2] = f32[8 + i];
+                    curin.i[3] = f32[12 + i];
+                    if ((hash_exists(curin.h, 32) || Printall)
+                        && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                      PV_DEC(pvbuf2[i]);
+                    }
+                  }
+                  pcnt2 = 0;
+                }
+              }
+#else
+              /* Scalar CPU salt loop (non-NEON ARM) */
               for (si = 0; si < nsalts_job; si++) {
                 if (MDXpause) {
                   __sync_fetch_and_add(&MDXpaused_count, 1);
@@ -19659,6 +20300,7 @@ MD5SALTstart:
                   }
                 }
               }
+#endif
               }
               /* Periodic compaction: sweep out PV=0 entries from other threads */
               if (!Printall && ++compact_ctr >= 64) {
@@ -19682,8 +20324,8 @@ MD5SALTstart:
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
-              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job)) {
-                hashcnt += nsalts_job;
+              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job, 0)) {
+                /* hashcnt accounted by gpujob thread */
                 break;
               }
 #endif /* GPU_ENABLED */
@@ -19856,6 +20498,59 @@ MD5SALTstart:
                       }
                       pcnt2 = 0;
                     }
+                  }
+                  /* Post-loop flush: catch partial batches when last salt(s)
+                   * had PV==0, causing continue to skip in-loop flush. */
+                  if (pcnt) {
+                    if (len >= 32)
+                      mymd5salt_post((unsigned char *)SSEBUF, prestate, (SVAL *)hashes);
+                    else
+                      mymd5salt(SSEBUF, hashes);
+                    f32 = (uint32_t *) hashes;
+                    for (x = 1; x <= Maxiter; x++) {
+                      hashcnt += pcnt;
+                      for (i = 0; i < pcnt; i++) {
+                        curin.i[0] = R[0].words[i];
+                        curin.i[1] = R[1].words[i];
+                        curin.i[2] = R[2].words[i];
+                        curin.i[3] = R[3].words[i];
+                        if (x == 1) {
+                          if ((hash_exists(curin.h, 32) || Printall)
+                              && checkhashkey(&curin, 32, sbuf[i], job)) {
+                            PV_DEC(pvbuf[i]);
+                          }
+                        } else {
+                          if (checkhashsalt(&curin, 32, sbuf[i], slen[i], x, job)) {
+                            PV_DEC(pvbuf[i]);
+                          }
+                        }
+                      }
+                    }
+                    pcnt = 0;
+                  }
+                  if (pcnt2) {
+                    mymd5salt2(SSEBUF3, hashes);
+                    f32 = (uint32_t *) hashes;
+                    for (x = 1; x <= Maxiter; x++) {
+                      hashcnt += pcnt2;
+                      for (i = 0; i < pcnt2; i++) {
+                        curin.i[0] = f32[i];
+                        curin.i[1] = f32[4 + i];
+                        curin.i[2] = f32[8 + i];
+                        curin.i[3] = f32[12 + i];
+                        if (x == 1) {
+                          if ((hash_exists(curin.h, 32) || Printall)
+                              && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                            PV_DEC(pvbuf2[i]);
+                          }
+                        } else {
+                          if (checkhashsalt(&curin, 32, sbuf2[i], slen2[i], x, job)) {
+                            PV_DEC(pvbuf2[i]);
+                          }
+                        }
+                      }
+                    }
+                    pcnt2 = 0;
                   }
                   /* Post-word compaction: remove solved entries */
                   for (si = nsalts_job - 1; si >= 0; si--) {
@@ -20633,6 +21328,7 @@ nextsalt1:
                 for (x = 0; x < len; x++)
                   if (cur[x] == 0)
                     len = x;
+                job->clen = len;  /* GPU needs null-truncated length */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                   Typesalt[job->op], tsalt, Printall);
@@ -20640,6 +21336,11 @@ nextsalt1:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
+#ifdef GPU_ENABLED
+                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 1)) {
+                  break;
+                }
+#endif
                 Word_t *HPV;
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
@@ -21931,146 +22632,119 @@ MD_SHA_start:
               case JOB_MD5AM2:
                 if (len > MAXLINE / 2)
                   break;
-                csalt = Typeuser[job->op]; if (!csalt) csalt = Userid;
-                if (!csalt)
-                  Typeuser[job->op] = csalt = memndup("admin\0\0\0", 8);
-                ljob[3].op = ljob[2].op = ljob[1].op = ljob[0].op = job->op;
-                ljob[3].filename = ljob[2].filename = ljob[1].filename = ljob[0].filename = job->filename;
-                ljob[3].doneprint = ljob[2].doneprint = ljob[1].doneprint = ljob[0].doneprint = job->doneprint;
-		ljob[3].outbuf = job->outbuf;
-		ljob[3].found= job->found;
-                ljob[0].pass = ljob[0].line;
-                ljob[0].pass[-1] = ljob[0].pass[-2] = ':';
-                ljob[0].clen = ljob[0].len = len;
-		ljob[0].outbuf = job->outbuf;
-		ljob[0].found= job->found;
-                ljob[1].pass = ljob[1].line;
-                ljob[1].pass[-1] = ljob[1].pass[-2] = ':';
-                ljob[1].clen = ljob[1].len = len;
-		ljob[1].outbuf = job->outbuf;
-		ljob[1].found= job->found;
-                ljob[2].pass = ljob[2].line;
-                ljob[2].pass[-1] = ljob[2].pass[-2] = ':';
-                ljob[2].clen = ljob[2].len = len;
-		ljob[2].outbuf = job->outbuf;
-		ljob[2].found= job->found;
-                ljob[3].pass = ljob[3].line;
-                ljob[3].pass[-1] = ljob[3].pass[-2] = ':';
-                ljob[3].clen = ljob[3].len = len;
-		ljob[3].outbuf = job->outbuf;
-		ljob[3].found= job->found;
-                for (x = 0; x < len; x++) {
-                  char c;
-                  c = cur[x];
-                  if (c >= 'A' && c <= 'Z')
-                    c += 0x20;
-                  ljob[0].pass[x] = ljob[1].pass[x] =
-                  ljob[2].pass[x] = ljob[3].pass[x] = c;
-                }
-
-                ljobi = 0;
-#ifndef NOTINTEL
-                SSEBUF[15] = _mm_setzero_si128();
-                d32 = (uint32_t *) SSEBUF;
-                f32 = (uint32_t *) hashes;
-#endif
-                while (*csalt) {
-
-                  s = csalt;
-                  while (*csalt)
-                    csalt++;
-                  csalt++;
-
-                  if ((*s & 0xff) != 0xfe) {
-                    sbuf[ljobi] = s;
-                    slen[ljobi] = i;
-                    d = ljob[ljobi].pass - 2;
-                    i = 0;
-                    while (*s && *s != ':') {
-                      s++;
-                      i++;
-                    }
-                    s -= i;
-                    d -= i;
-                    acthash[ljobi] = d;
-                    actlen[ljobi] = i + len + 2;
-                    switch (job->op) {
-                      default:
-                      case JOB_MD5AM:
-                        while (*s && *s != ':')
-                          *d++ = *s++;
-                        break;
-
-                      case JOB_MD5AM2:
-                        while (*s && *s != ':')
-                          *d++ = *s++;
-                        if (*s) {
-                          d = ljob[ljobi].pass + len;
-                          i = 0;
-                          while (*s) {
-                            *d++ = *s++;
-                            i++;
-                          }
-                          s = ":73@^bhhs&#@&^@8@*$";
-                          while (*s)
-                            *d++ = *s++;
-                          actlen[ljobi] += i + 19;
-                        }
-                        break;
-                    }
-                    ljobi++;
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  Word_t *pvbuf_am[4];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  for (x = 0; x < 4; x++) {
+                    ljob[x].op = job->op;
+                    ljob[x].filename = job->filename;
+                    ljob[x].doneprint = job->doneprint;
+                    ljob[x].outbuf = job->outbuf;
+                    ljob[x].found = job->found;
+                    ljob[x].pass = ljob[x].line;
+                    ljob[x].pass[-1] = ljob[x].pass[-2] = ':';
+                    ljob[x].clen = ljob[x].len = len;
                   }
-                  if (ljobi >= 4 || *csalt == 0) {
+                  for (x = 0; x < len; x++) {
+                    char c = cur[x];
+                    if (c >= 'A' && c <= 'Z') c += 0x20;
+                    ljob[0].pass[x] = ljob[1].pass[x] =
+                    ljob[2].pass[x] = ljob[3].pass[x] = c;
+                  }
+                  ljobi = 0;
 #ifndef NOTINTEL
-                    __m128i *p, r1;
-                    r1 = _mm_setzero_si128();
-                    p = (__m128i *) SSEBUF;
-                    p[0] = r1;
-                    hashcnt += ljobi;
-                    p[1] = r1; p[2] = r1; p[3] = r1; p[4] = r1;
-                    p[5] = r1; p[6] = r1; p[7] = r1; p[8] = r1;
-                    p[9] = r1; p[10] = r1; p[11] = r1; p[12] = r1;
-                    p[13] = r1;
+                  SSEBUF[15] = _mm_setzero_si128();
+                  d32 = (uint32_t *) SSEBUF;
+                  f32 = (uint32_t *) hashes;
 #endif
-                    for (x = 0; x < ljobi; x++) {
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      s = tsalt;
+                      sbuf[ljobi] = tsalt;
+                      pvbuf_am[ljobi] = PV;
+                      slen[ljobi] = mystrlen(tsalt);
+                      d = ljob[ljobi].pass - 2;
+                      i = 0;
+                      while (*s && *s != ':') { s++; i++; }
+                      s -= i; d -= i;
+                      acthash[ljobi] = d;
+                      actlen[ljobi] = i + len + 2;
+                      switch (job->op) {
+                        default:
+                        case JOB_MD5AM:
+                          while (*s && *s != ':') *d++ = *s++;
+                          break;
+                        case JOB_MD5AM2:
+                          while (*s && *s != ':') *d++ = *s++;
+                          if (*s) {
+                            d = ljob[ljobi].pass + len;
+                            i = 0;
+                            while (*s) { *d++ = *s++; i++; }
+                            s = ":73@^bhhs&#@&^@8@*$";
+                            while (*s) *d++ = *s++;
+                            actlen[ljobi] += i + 19;
+                          }
+                          break;
+                      }
+                      ljobi++;
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    if (ljobi >= 4 || (!PV && ljobi)) {
 #ifndef NOTINTEL
-                      int j;
-                      j = actlen[x];
-                      if (j < 56) {
-                        s = acthash[x];
-                        s[j++] = 0x80;
-                        for (y = 0; (y + 4) <= j; y += 4)
-                          d32[y + x] = *(uint32_t * ) & s[y];
-                        d32[y + x] = (*((uint32_t * )(&s[y]))) & lastmask[j - y];
-                        s[--j] = 0;
-                        d32[14 * 4 + x] = (j) << 3;
-                      } else {
-#endif
-                        mymd5(acthash[x], actlen[x], curin.h);
-			ljob[x].outlen = job->outlen;
-                        if (checkhashkey(&curin, 32, sbuf[x], &ljob[x]) && NoMarkSalt == 0) 
-                          sbuf[x][0] = 0xfe;
-			job->outlen = ljob[x].outlen;
-#ifndef NOTINTEL
+                      { __m128i *p, r1;
+                        r1 = _mm_setzero_si128();
+                        p = (__m128i *) SSEBUF;
+                        p[0] = r1;
+                        hashcnt += ljobi;
+                        p[1] = r1; p[2] = r1; p[3] = r1; p[4] = r1;
+                        p[5] = r1; p[6] = r1; p[7] = r1; p[8] = r1;
+                        p[9] = r1; p[10] = r1; p[11] = r1; p[12] = r1;
+                        p[13] = r1;
                       }
 #endif
-                    }
+                      for (x = 0; x < ljobi; x++) {
 #ifndef NOTINTEL
-                    mymd5salt(SSEBUF, hashes);
-                    for (y = 0; y < ljobi; y++) {
-                      if (ljob[y].len < 56) {
-                        curin.i[0] = f32[y];
-                        curin.i[1] = f32[4 + y];
-                        curin.i[2] = f32[8 + y];
-                        curin.i[3] = f32[12 + y];
-			ljob[y].outlen = job->outlen;
-                        if (checkhashkey(&curin, 32, sbuf[y], &ljob[y]) && NoMarkSalt == 0)
-                          sbuf[y][0] = 0xfe;
-			job->outlen = ljob[y].outlen;
-                      }
-                    }
+                        int j;
+                        j = actlen[x];
+                        if (j < 56) {
+                          s = acthash[x];
+                          s[j++] = 0x80;
+                          for (y = 0; (y + 4) <= j; y += 4)
+                            d32[y + x] = *(uint32_t *) &s[y];
+                          d32[y + x] = (*((uint32_t *)(&s[y]))) & lastmask[j - y];
+                          s[--j] = 0;
+                          d32[14 * 4 + x] = (j) << 3;
+                        } else {
 #endif
-                    ljobi = 0;
+                          mymd5(acthash[x], actlen[x], curin.h);
+                          ljob[x].outlen = job->outlen;
+                          if (checkhashkey(&curin, 32, sbuf[x], &ljob[x]))
+                            PV_DEC(pvbuf_am[x]);
+                          job->outlen = ljob[x].outlen;
+#ifndef NOTINTEL
+                        }
+#endif
+                      }
+#ifndef NOTINTEL
+                      mymd5salt(SSEBUF, hashes);
+                      for (y = 0; y < ljobi; y++) {
+                        if (ljob[y].len < 56) {
+                          curin.i[0] = f32[y];
+                          curin.i[1] = f32[4 + y];
+                          curin.i[2] = f32[8 + y];
+                          curin.i[3] = f32[12 + y];
+                          ljob[y].outlen = job->outlen;
+                          if (checkhashkey(&curin, 32, sbuf[y], &ljob[y]))
+                            PV_DEC(pvbuf_am[y]);
+                          job->outlen = ljob[y].outlen;
+                        }
+                      }
+#endif
+                      ljobi = 0;
+                    }
                   }
                 }
                 break;
@@ -24946,8 +25620,8 @@ sha1sha256:
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job)) {
-                  hashcnt += nsalts_job;
+                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
                   break;
                 }
 #endif
@@ -24992,8 +25666,8 @@ sha1sha256:
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
 #ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job)) {
-                  hashcnt += nsalts_job;
+                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+                  /* hashcnt accounted by gpujob thread */
                   break;
                 }
 #endif
@@ -26820,25 +27494,27 @@ HAV256_5_start:
                 goto HMAC_start;
 
               HMAC_start:
-                keys = Typeuser[job->op]; if (!keys) keys = Userid;
                 if (len > MAXLINE)
                   break;
-                if (!keys)
-                  keys = "\0\0";
-                do {
-                  MHASH td;
-                  if (Hexkey) {
-                    y = *keys++;
-                  } else {
-                    y = mystrlen(keys);
+                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      MHASH td;
+                      y = mystrlen(tsalt);
+                      td = mhash_hmac_init(hmac_type, tsalt, y, mhash_get_hash_pblock(hmac_type));
+                      mhash(td, cur, len);
+                      mhash_hmac_deinit(td, curin.h);
+                      hashcnt++;
+                      if (checkhashkey(&curin, hmac_len, tsalt, job))
+                        PV_DEC(PV);
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  td = mhash_hmac_init(hmac_type, keys, y, mhash_get_hash_pblock(hmac_type));
-                  mhash(td, cur, len);
-                  mhash_hmac_deinit(td, curin.h);
-                  hashcnt++;
-                  checkhashkey(&curin, hmac_len, keys, job);
-                  keys += y + 1;
-                } while (*keys);
+                }
                 break;
 
               case JOB_WERKZEUG_MD5:
@@ -27420,9 +28096,16 @@ HAV256_5_start:
 		  } else {
 		    /* plain hex salt, use Typeuser/Userid/admin */
 		    salthexlen = combinedlen;
-		    ukeys = Typeuser[job->op];
-		    if (!ukeys) ukeys = Userid;
-		    if (!ukeys) ukeys = "admin";
+		    { Pvoid_t uj = (Pvoid_t)Typeuser[job->op];
+		      if (!uj) uj = (Pvoid_t)UseridJudy;
+		      ukeys = "admin";
+		      if (uj) {
+		        tsalt[0] = 0;
+		        Word_t *upv;
+		        JSLF(upv, uj, (unsigned char *)tsalt);
+		        if (upv) ukeys = tsalt;
+		      }
+		    }
 		    ulen = mystrlen(ukeys);
 		    /* hex-encode username for output */
 		    uhexlen = 0;
@@ -33111,8 +33794,11 @@ HAV256_5_start:
       } while (((job->flags & JOBFLAG_NUMBERS) && (++number_iter < (job->MaskCount ? job->MaskCount : Iter_Count[job->digits]))) || currule || (Email && emailcur < emailpow));
     }
 #ifdef GPU_ENABLED
-    /* Flush partial GPU batch at end of job */
-    if (my_jobg && my_jobg->count > 0) {
+    /* Flush partial GPU batch at end of job — but not for mask batches
+     * which accumulate across words until the batch is full or JOB_DONE */
+    if (my_jobg && my_jobg->count > 0 &&
+        gpu_op_category(my_jobg->op) != GPU_CAT_MASK &&
+        my_jobg->word_stride == 0) {
       gpujob_submit(my_jobg);
       my_jobg = NULL;
     }
@@ -33158,7 +33844,11 @@ HAV256_5_start:
       Livesalts[job->op] = nsalts_job;
     possess(FreeWaiting);
     if (lineproc) TotLines += lineproc;
-    if (hashcnt) Tothash += hashcnt;
+    if (hashcnt) {
+      Tothash += hashcnt;
+      if (linehints && job->op > 0 && job->op < linehints_count)
+        __sync_fetch_and_add(&linehints[job->op].hashes_accum, hashcnt);
+    }
     if (found) Totfound += found;
     if (rulecnt) Totrules += rulecnt;
     job->op = 0;
@@ -33558,7 +34248,9 @@ void build_compact_table(void) {
     int gpu_ops[] = { JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT,
                       JOB_MD5SALTPASS, JOB_MD5PASSSALT,
                       JOB_SHA256PASSSALT, JOB_SHA256SALTPASS,
-                      JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS, -1 };
+                      JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS,
+                      JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
+                      JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_DESCRYPT, -1 };
     for (int gi = 0; gpu_ops[gi] >= 0; gi++) {
       Word_t grc;
       J1T(grc, Dohash, gpu_ops[gi]);
@@ -33712,6 +34404,27 @@ MDXALIGN void ReportStats(void *dummy) {
               (int)getpid(), days, hrs, mins, secs);
       pause_state = 0;
       pause_ticks = 0;
+    }
+
+    /* EMA feedback: update per-algorithm CPU rates from accumulated hashes */
+    if (linehints) {
+      unsigned int lowest_line = UINT_MAX;
+      for (x = 0; x < linehints_count; x++) {
+        long long accum = __sync_lock_test_and_set(&linehints[x].hashes_accum, 0);
+        if (accum > 0) {
+          long long measured = accum / 15;  /* hashes/sec over 15s window */
+          long long old = linehints[x].rate;
+          if (old <= 0)
+            linehints[x].rate = measured;
+          else
+            linehints[x].rate = (long long)(0.3 * measured + 0.7 * old);
+        }
+        /* Track lowest curline across active algorithms for progress */
+        if (linehints[x].curline > 0 && linehints[x].curline < lowest_line)
+          lowest_line = linehints[x].curline;
+      }
+      if (lowest_line < UINT_MAX)
+        Lowline = lowest_line;
     }
 
     wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
@@ -35830,6 +36543,42 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
       if (desok) {
         JSLI(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
+        /* Standard DES: decode base64 hash body to (r0,r1), apply IP for
+         * pre-FP form, store in compact table for GPU (kernel skips FP) */
+        if (inhashbuf && len == 13) {
+          static const unsigned char DES_IP[64] = {
+            58,50,42,34,26,18,10,2,60,52,44,36,28,20,12,4,
+            62,54,46,38,30,22,14,6,64,56,48,40,32,24,16,8,
+            57,49,41,33,25,17,9,1,59,51,43,35,27,19,11,3,
+            61,53,45,37,29,21,13,5,63,55,47,39,31,23,15,7
+          };
+          init_phpatoi64();
+          unsigned char *dp = (unsigned char *)line + 2;
+          unsigned int v0 = ((unsigned int)phpatoi64[dp[0]]<<18)|((unsigned int)phpatoi64[dp[1]]<<12)|
+                            ((unsigned int)phpatoi64[dp[2]]<<6)|(unsigned int)phpatoi64[dp[3]];
+          unsigned int v1 = ((unsigned int)phpatoi64[dp[4]]<<18)|((unsigned int)phpatoi64[dp[5]]<<12)|
+                            ((unsigned int)phpatoi64[dp[6]]<<6)|(unsigned int)phpatoi64[dp[7]];
+          unsigned int v2 = ((unsigned int)phpatoi64[dp[8]]<<12)|((unsigned int)phpatoi64[dp[9]]<<6)|
+                            (unsigned int)phpatoi64[dp[10]];
+          unsigned int dr0 = (v0 << 8) | (v1 >> 16);
+          unsigned int dr1 = ((v1 & 0xFFFF) << 16) | (v2 >> 2);
+          /* Apply DES IP to get pre-FP form (matches GPU output) */
+          unsigned int il = 0, ir = 0;
+          for (int di = 0; di < 32; di++) {
+            int db = DES_IP[di] - 1;
+            unsigned int ds = (db < 32) ? dr0 : dr1;
+            if (ds & (1u << (31 - (db % 32)))) il |= (1u << (31 - di));
+          }
+          for (int di = 0; di < 32; di++) {
+            int db = DES_IP[32+di] - 1;
+            unsigned int ds = (db < 32) ? dr0 : dr1;
+            if (ds & (1u << (31 - (db % 32)))) ir |= (1u << (31 - di));
+          }
+          memcpy(inhashbuf + 2, &il, 4);
+          memcpy(inhashbuf + 6, &ir, 4);
+          memset(inhashbuf + 10, 0, 8);
+          commit_compact(16);
+        }
         Foundcnt[JOB_DESCRYPT]++;
         continue;
       }
@@ -36229,11 +36978,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           for (x = 4; x < 12; x++) {
             if (i64hex[line[x] & 0xff] > 63) break;
           }
-          if (x == 12) {
-            JSLI(PV, JudyJ[JOB_PHPBB3], (unsigned char *)line);
-            if (PV) *PV = *PV + 1;
-            Foundcnt[JOB_PHPBB3]++;
-            continue;
+          if (x == 12 && strlen(line + 12) == 22) {
+            /* Decode phpass base64 hash → binary → compact table */
+            unsigned char hashbin[16];
+            if (phpass_b64decode(line + 12, hashbin) == 0 && inhashbuf) {
+              memcpy(inhashbuf + 2, hashbin, 16);
+              commit_compact(16);
+              /* Store "$H$Csalt8chr" prefix (12 chars) in Typesalt */
+              Saltloaded[JOB_PHPBB3] += store_typesalt(JOB_PHPBB3, line, 12);
+              Foundcnt[JOB_PHPBB3]++;
+              continue;
+            }
           }
         }
       }
@@ -38172,23 +38927,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
 	  for (x=0;  x < Dosaltcnt; x++) {
 	     JSLI(PV, Typesalt[Dosalt[x]],(unsigned char *)suffix);
 	     if (PV) { if ((*PV)++ == 0) {Saltloaded[Dosalt[x]]++;} }
-	     /* Precompute MD5(salt) hex for types that use it in the inner loop */
-	     { int dt = Dosalt[x];
-	       if (dt == JOB_MD5_MD5SALTMD5PASS || dt == JOB_SHA1_MD5_MD5SALTMD5PASS ||
-	           dt == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT || dt == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) {
-	         Word_t *HPV;
-	         JSLG(HPV, Typehashsalt[dt], (unsigned char *)suffix);
-	         if (!HPV) {
-	           unsigned char shash[16]; char *shex;
-	           mymd5((char *)suffix, mystrlen(suffix), shash);
-	           shex = (char *)malloc(33);
-	           prmd5(shash, shex, 32);
-	           shex[32] = 0;
-	           JSLI(HPV, Typehashsalt[dt], (unsigned char *)suffix);
-	           if (HPV) *HPV = (Word_t)(void *)shex;
-	         }
-	       }
-	     }
+	     /* Typehashsalt populated in main() after all salts loaded */
           }
 	  for (x=0;  x < Dousercnt; x++) {
 	     JSLI(PV, Typeuser[Douser[x]],(unsigned char *)suffix);
@@ -38233,7 +38972,8 @@ int main(int argc, char **argv) {
   unsigned int offset, mylines, inhex, Doip;
   FILE *fi;
   gzFile input, zfi;
-  int isstdin;
+  int isstdin, isdone;
+  Word_t lsi;
   char line[MAXLINE + 16], last[MAXLINE + 16], *cur, *ofile, *nfile;
   char workline[MAXLINE + 16];
   char *pass, *infilename;
@@ -38253,6 +38993,7 @@ int main(int argc, char **argv) {
   char *readbuf, *Oldkeys;
   struct LineInfo *readindex;
   unsigned int Linecount, Bcryptcnt, DEScryptcnt, ProgressEnccnt;
+  int gpu_batch_lines = 0;
   struct Hashchain *chain, *next, *prev;
   int Recurse = 0;
   double wtime, wcount;
@@ -38277,6 +39018,10 @@ int main(int argc, char **argv) {
 
 
 #if ARM > 6
+#ifdef __aarch64__
+  /* NEON is mandatory on AArch64 (ARMv8+) */
+  Neon = 1;
+#else
   fi = fopen("/proc/cpuinfo","r");
   if (fi) {
     while (fgets(line,MAXLINE,fi)) {
@@ -38287,9 +39032,10 @@ int main(int argc, char **argv) {
       }
     }
     fclose(fi);
-    if (Neon)
-    fprintf(stderr,"ARM Neon SIMD enabled\n");
   }
+#endif
+  if (Neon)
+    fprintf(stderr,"ARM Neon SIMD enabled\n");
 #endif
 
   getcpuinfo();
@@ -38384,7 +39130,10 @@ int main(int argc, char **argv) {
                   x == JOB_MD5revMD5SALT || x == JOB_MD5sub8_24SALT ||
                   x == JOB_MD5SALTPASS || x == JOB_MD5PASSSALT ||
                   x == JOB_SHA256SALTPASS || x == JOB_SHA256PASSSALT ||
-                  x == JOB_MD5CRYPT || x == JOB_MD5_MD5SALTMD5PASS)
+                  x == JOB_MD5CRYPT || x == JOB_MD5_MD5SALTMD5PASS ||
+                  x == JOB_SHA1SALTPASS || x == JOB_SHA1PASSSALT ||
+                  x == JOB_SHA1DRU || x == JOB_PHPBB3 ||
+                  x == JOB_DESCRYPT || x == JOB_MD5)
                 gpu = " [GPU]";
 #endif
               if (hci)
@@ -38755,31 +39504,85 @@ badrule:
         break;
 
       case 'N':
-        MaskPrepend = 1;
-        /* fall through */
-      case 'n':
         mask_init_classes();
         if (strchr(optarg, '?') || strchr(optarg, '[')) {
-          /* Mask mode */
-          if (parse_mask(optarg) < 0)
+          /* Mask prepend mode */
+          if (parse_mask_into(optarg, MaskPrependPattern, &MaskPrependLen,
+                              &MaskPrependTotal) < 0)
             exit(1);
-          Dodigits = MaskLen;
-          /* Set MaskChunkSize to rightmost non-literal class size */
+          /* Also set legacy globals for backward compat */
+          MaskPrepend = 1;
+          memcpy(MaskPattern, MaskPrependPattern, sizeof(MaskPattern));
+          MaskLen = MaskPrependLen;
+          MaskTotal = MaskPrependTotal * MaskAppendTotal;
+          Dodigits = MaskPrependLen + MaskAppendLen;
+          Maxnumbers = MaskTotal;
+          NumbersFmt = NULL;
+          /* MaskChunkSize: rightmost non-literal class in the combined pattern */
           { int ci;
             MaskChunkSize = 1;
-            for (ci = MaskLen - 1; ci >= 0; ci--) {
-              if (MaskPattern[ci].classid != MASK_LITERAL) {
-                MaskChunkSize = MaskClasses[MaskPattern[ci].classid].count;
+            /* Prefer append rightmost, then prepend rightmost */
+            for (ci = MaskAppendLen - 1; ci >= 0; ci--) {
+              if (MaskAppendPattern[ci].classid != MASK_LITERAL) {
+                MaskChunkSize = MaskClasses[MaskAppendPattern[ci].classid].count;
+                goto chunk_done_N;
+              }
+            }
+            for (ci = MaskPrependLen - 1; ci >= 0; ci--) {
+              if (MaskPrependPattern[ci].classid != MASK_LITERAL) {
+                MaskChunkSize = MaskClasses[MaskPrependPattern[ci].classid].count;
                 break;
               }
             }
+          chunk_done_N: ;
           }
+          fprintf(stderr, "Mask prepend: %s (%llu combinations)\n", optarg, MaskPrependTotal);
+        } else {
+          /* Legacy numeric prepend: -N 3 */
+          MaskPrepend = 1;
+          Dodigits = atoi(optarg);
+          if (Dodigits > 16) { fprintf(stderr, "Too many digits\n"); exit(1); }
+          NumbersFmt = "%0*llu";
+          Maxnumbers = 1;
+          for (x = 0; x < Dodigits; x++) Maxnumbers *= 10;
+          MaskLen = 0;
+          MaskPrependLen = 0;
+        }
+        break;
+
+      case 'n':
+        mask_init_classes();
+        if (strchr(optarg, '?') || strchr(optarg, '[')) {
+          /* Mask append mode */
+          if (parse_mask_into(optarg, MaskAppendPattern, &MaskAppendLen,
+                              &MaskAppendTotal) < 0)
+            exit(1);
+          /* Also set legacy globals for backward compat */
+          MaskPrepend = 0;
+          memcpy(MaskPattern, MaskAppendPattern, sizeof(MaskPattern));
+          MaskLen = MaskAppendLen;
+          MaskTotal = MaskPrependTotal * MaskAppendTotal;
+          Dodigits = MaskPrependLen + MaskAppendLen;
           Maxnumbers = MaskTotal;
           NumbersFmt = NULL;
-          if (MaskPrepend)
-            fprintf(stderr, "Mask prepend: %s (%llu combinations)\n", optarg, MaskTotal);
-          else
-            fprintf(stderr, "Mask append: %s (%llu combinations)\n", optarg, MaskTotal);
+          /* MaskChunkSize: rightmost non-literal class */
+          { int ci;
+            MaskChunkSize = 1;
+            for (ci = MaskAppendLen - 1; ci >= 0; ci--) {
+              if (MaskAppendPattern[ci].classid != MASK_LITERAL) {
+                MaskChunkSize = MaskClasses[MaskAppendPattern[ci].classid].count;
+                goto chunk_done_n;
+              }
+            }
+            for (ci = MaskPrependLen - 1; ci >= 0; ci--) {
+              if (MaskPrependPattern[ci].classid != MASK_LITERAL) {
+                MaskChunkSize = MaskClasses[MaskPrependPattern[ci].classid].count;
+                break;
+              }
+            }
+          chunk_done_n: ;
+          }
+          fprintf(stderr, "Mask append: %s (%llu combinations)\n", optarg, MaskAppendTotal);
         } else if (strchr(optarg, 'i')) {
           /* IP mode: unchanged legacy behavior */
           Doip = 1;
@@ -38787,6 +39590,7 @@ badrule:
           Maxnumbers = 0x100000000ll;
           NumbersFmt = "%0*llu";
           MaskLen = 0;
+          MaskAppendLen = 0;
         } else {
           /* Legacy numeric mode: -n 2, -n 3x, -n 4X */
           Dodigits = atoi(optarg);
@@ -38815,6 +39619,7 @@ badrule:
               Maxnumbers *= 10;
           }
           MaskLen = 0; /* not using mask */
+          MaskAppendLen = 0;
         }
         break;
 
@@ -38866,161 +39671,26 @@ badrule:
         tok = strtok(optarg, ",");
         while (tok) {
           if (strcmp(tok, "ALL") == 0) {
+            /* Allowlist based on real-world combo list analysis (50m.types).
+             * Match by prefix (^) or exact name. Exclude anything with SALT. */
+            /* Prefix matches cover families found in real combo lists */
+            static const char *all_prefixes[] = {
+              "GOST", "HAV", "MD2", "MD4", "MD5", "MD6",
+              "PANAMA", "RIPEMD", "RMD",
+              "SHA", "SMF", "SNE", "SQL5",
+              "TIGER", "WRL",
+              NULL
+            };
             for (x = 1; Types[x]; x++) {
-              if (strncmp(Types[x], "HMAC", 4))
-                J1S(RC, Dohash, x);
+              const char *tname = Types[x];
+              /* Check prefix matches */
+              for (int pi = 0; all_prefixes[pi]; pi++) {
+                if (strncmp(tname, all_prefixes[pi], strlen(all_prefixes[pi])) == 0) {
+                  J1S(RC, Dohash, x);
+                  break;
+                }
+              }
             }
-
-            J1U(RC, Dohash, JOB_SHA1_MD5UCMD5UCPASSMD5UCSALT);
-            J1U(RC, Dohash, JOB_SHA1MD5TRUNCSALT);
-            J1U(RC, Dohash, JOB_SHA1MD5_SALTMD5PASS);
-            J1U(RC, Dohash, JOB_SHA1_MD5sub8_24SALT);
-            J1U(RC, Dohash, JOB_SHA1MD51CAPSALT);
-            J1U(RC, Dohash, JOB_SHA1SHA1CAPSALT);
-            J1U(RC, Dohash, JOB_SHA1SHA1UCTRUNC);
-            J1U(RC, Dohash, JOB_SHA1SHA1CAPTRUNC);
-            J1U(RC, Dohash, JOB_SHA1SHA256TRUNCMD5);
-            J1U(RC, Dohash, JOB_SHA1SHA1PASS_TRUNC1SALT);
-            J1U(RC, Dohash, JOB_SHA1SHA1TRUNC);
-            J1U(RC, Dohash, JOB_SHA1SHA256UCTRUNC);
-            J1U(RC, Dohash, JOB_SHA1SHA256TRUNC);
-            J1U(RC, Dohash, JOB_SHA1_SHA512PASSSHA512SALT);
-            J1U(RC, Dohash, JOB_SHA1SHA512TRUNC);
-            J1U(RC, Dohash, JOB_SHA1SHA512TRUNC1SALT);
-            J1U(RC, Dohash, JOB_SHA1WRLTRUNC);
-            J1U(RC, Dohash, JOB_SHA1_MD5SHA1PASSSHA1MD5SALT);
-            J1U(RC, Dohash, JOB_SHA1MD5SALTMD5PASS);
-            J1U(RC, Dohash, JOB_SHA1MD5_PASSMD5SALT);
-            J1U(RC, Dohash, JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS);
-	    J1U(RC, Dohash, JOB_SHA1_MD5PEPPER_MD5SALT);
-            J1U(RC, Dohash, JOB_SHA256SALTPASS);
-            J1U(RC, Dohash, JOB_SHA256RAWSALTPASS);
-            J1U(RC, Dohash, JOB_MD5SHA1SALT);
-            J1U(RC, Dohash, JOB_LEET);
-            J1U(RC, Dohash, JOB_SHA1MD5DSALT);
-            J1U(RC, Dohash, JOB_SHA1MD5MD5DSALT);
-            J1U(RC, Dohash, JOB_MD5_MD5SALT_PASS);
-            J1U(RC, Dohash, JOB_MD5_MD5PASSMD5SALT);
-            J1U(RC, Dohash, JOB_MD5_MD5PASS_SALT);
-            J1U(RC, Dohash, JOB_MD5_SALTMD5SALTPASS);
-            J1U(RC, Dohash, JOB_MD5_SALTMD5PASSSALT);
-            J1U(RC, Dohash, JOB_MD5_SALTSHA1SALTPASS);
-            J1U(RC, Dohash, JOB_MD5_MD5SHA1PASSSHA1MD5SALT);
-            J1U(RC, Dohash, JOB_SHA1SALTSHA1SALTSHA1PASS);
-            J1U(RC, Dohash, JOB_SHA1SALTCX);
-            J1U(RC, Dohash, JOB_SHA1SALTPASSSALT);
-            J1U(RC, Dohash, JOB_SHA1SALTPASS);
-            J1U(RC, Dohash, JOB_SHA1PASSSALT);
-            J1U(RC, Dohash, JOB_MD5SHA1PASSSALT);
-            J1U(RC, Dohash, JOB_SHA1_SALT_SPECIAL);
-            J1U(RC, Dohash, JOB_SHA1_SALT_UTF16_PEPPER);
-            J1U(RC, Dohash, JOB_WRLPASSSALT);
-            J1U(RC, Dohash, JOB_POMELO);
-            J1U(RC, Dohash, JOB_POMELO);
-            J1U(RC, Dohash, JOB_WRLSALTPASS);
-            J1U(RC, Dohash, JOB_SHA512SALTSHA512);
-            J1U(RC, Dohash, JOB_SHA512SALTPASS);
-            J1U(RC, Dohash, JOB_SHA512PASSSALT);
-            J1U(RC, Dohash, JOB_POMELO);
-            J1U(RC, Dohash, JOB_SHA1_8TRACK);
-            J1U(RC, Dohash, JOB_SHA1_CUSTOMUSERSALT);
-            J1U(RC, Dohash, JOB_MD5_MD5SALT_PASS);
-            J1U(RC, Dohash, JOB_MD5_PASS_MD5SALT);
-            J1U(RC, Dohash, JOB_MD5_MD5SALTMD5PASS);
-            J1U(RC, Dohash, JOB_SHA1_MD5_MD5SALTMD5PASS);
-            J1U(RC, Dohash, JOB_SHA1_MD5_MD5SALTMD5PASS_SALT);
-            J1U(RC, Dohash, JOB_MD5_MD5PASSMD5SALT);
-            J1U(RC, Dohash, JOB_MD5HESK);
-            J1U(RC, Dohash, JOB_SHA1HESK);
-            J1U(RC, Dohash, JOB_MD5MD5SALT);
-            J1U(RC, Dohash, JOB_MD5UCSALT);
-            J1U(RC, Dohash, JOB_MD5DSALT);
-            J1U(RC, Dohash, JOB_MD5SALT);
-            J1U(RC, Dohash, JOB_SHA1_MD5SALT);
-            J1U(RC, Dohash, JOB_SHA1_MD5MD5SALT);
-            J1U(RC, Dohash, JOB_SHA1_MD5UC_MD5SALT);
-            J1U(RC, Dohash, JOB_MD5HEXSALT);
-            J1U(RC, Dohash, JOB_SHA1HEXSALT);
-            J1U(RC, Dohash, JOB_SHA256HEXSALT);
-            J1U(RC, Dohash, JOB_GOSTHEXSALT);
-            J1U(RC, Dohash, JOB_HAV128HEXSALT);
-            J1U(RC, Dohash, JOB_MD5USERIDMD5);
-            J1U(RC, Dohash, JOB_MD5USERIDMD5MD5);
-            J1U(RC, Dohash, JOB_ED2000);
-            J1U(RC, Dohash, JOB_AICH);
-            J1U(RC, Dohash, JOB_KECCAK224);
-            J1U(RC, Dohash, JOB_KECCAK256);
-            J1U(RC, Dohash, JOB_KECCAK384);
-            J1U(RC, Dohash, JOB_KECCAK512);
-            J1U(RC, Dohash, JOB_MD6128);
-            J1U(RC, Dohash, JOB_SHA1RAW);
-            J1U(RC, Dohash, JOB_MD5USERnulPASS);
-            J1U(RC, Dohash, JOB_MD5MD5USER);
-            J1U(RC, Dohash, JOB_SHA1MD5USER);
-            J1U(RC, Dohash, JOB_SHA1SHA1USER);
-            J1U(RC, Dohash, JOB_SHA1MD5x);
-            J1U(RC, Dohash, JOB_MD5CAP);
-            J1U(RC, Dohash, JOB_SHA1DRU);
-            J1U(RC, Dohash, JOB_NULL);
-            J1U(RC, Dohash, JOB_GOST2012_32);
-            J1U(RC, Dohash, JOB_GOST2012_64);
-            J1U(RC, Dohash, JOB_MD5AM);
-            J1U(RC, Dohash, JOB_MD5AM2);
-            J1U(RC, Dohash, JOB_MD5SPECAM);
-            J1U(RC, Dohash, JOB_APACHE_SHA);
-            J1U(RC, Dohash, JOB_YAF_SHA1);
-            J1U(RC, Dohash, JOB_MD5CRYPT);
-            J1U(RC, Dohash, JOB_SHA256CRYPT);
-            J1U(RC, Dohash, JOB_SHA512CRYPT);
-            J1U(RC, Dohash, JOB_APR1);
-            J1U(RC, Dohash, JOB_PHPBB3);
-            J1U(RC, Dohash, JOB_PHPBB3MD5);
-            J1U(RC, Dohash, JOB_DESCRYPT);
-            J1U(RC, Dohash, JOB_BCRYPT);
-            J1U(RC, Dohash, JOB_BCRYPTMD5);
-            J1U(RC, Dohash, JOB_BCRYPTSHA1);
-            J1U(RC, Dohash, JOB_BCRYPTSHA512);
-            J1U(RC, Dohash, JOB_MD5DESCRYPT);
-            J1U(RC, Dohash, JOB_MD4DESCRYPT);
-            J1U(RC, Dohash, JOB_SHA1DESCRYPT);
-            J1U(RC, Dohash, JOB_MD4UTF16DESCRYPT);
-            J1U(RC, Dohash, JOB_CISCO8);
-            J1U(RC, Dohash, JOB_CISCO9);
-            J1U(RC, Dohash, JOB_PBKDF2_SHA256);
-            J1U(RC, Dohash, JOB_PBKDF2_SHA512);
-            J1U(RC, Dohash, JOB_PBKDF2_SHA1);
-            J1U(RC, Dohash, JOB_PBKDF2_MD5);
-            J1U(RC, Dohash, JOB_PKCS5S2);
-            J1U(RC, Dohash, JOB_PROGRESSENCODE);
-            J1U(RC, Dohash, JOB_SSHA1BASE64);
-            J1U(RC, Dohash, JOB_SSHA256BASE64);
-            J1U(RC, Dohash, JOB_SSHA512BASE64);
-            J1U(RC, Dohash, JOB_MSSQL2000);
-            J1U(RC, Dohash, JOB_MSSQL2005);
-            J1U(RC, Dohash, JOB_MSSQL2012);
-            J1U(RC, Dohash, JOB_MACOSX);
-            J1U(RC, Dohash, JOB_MACOSX7);
-            J1U(RC, Dohash, JOB_ARUBAOS);
-            J1U(RC, Dohash, JOB_SAMSUNGSHA1);
-            J1U(RC, Dohash, JOB_CISCOISE);
-            J1U(RC, Dohash, JOB_AIXMD5);
-            J1U(RC, Dohash, JOB_AIXSHA1);
-            J1U(RC, Dohash, JOB_AIXSHA256);
-            J1U(RC, Dohash, JOB_AIXSHA512);
-            J1U(RC, Dohash, JOB_IPMI_SHA1);
-            J1U(RC, Dohash, JOB_IPMI_MD5);
-            J1U(RC, Dohash, JOB_KRB5PA23);
-            J1U(RC, Dohash, JOB_MYSQL_SHA256CRYPT);
-            J1U(RC, Dohash, JOB_DRUPAL7);
-            J1U(RC, Dohash, JOB_SYBASE_ASE);
-            J1U(RC, Dohash, JOB_NETSCALER);
-            J1U(RC, Dohash, JOB_NSEC3);
-            J1U(RC, Dohash, JOB_WBB3);
-            J1U(RC, Dohash, JOB_RACF);
-            J1U(RC, Dohash, JOB_DOMINO5);
-            J1U(RC, Dohash, JOB_DOMINO6);
-            J1U(RC, Dohash, JOB_SCRYPT);
-            J1U(RC, Dohash, JOB_ISCSI_CHAP);
 
           } else {
             y = 0;
@@ -39254,8 +39924,7 @@ badrule:
             Word_t ti = 0;
             J1F(RC, Doload, ti);
             while (RC) {
-              if (TypeOpts[ti] & TYPEOPT_USERJUDY) {
-                char tline[MAXLINE + 16];
+              { char tline[MAXLINE + 16];
                 Word_t *TPV;
                 tline[0] = 0;
                 JSLF(PV, TmpUser, (unsigned char *)tline);
@@ -39264,8 +39933,6 @@ badrule:
                   if (TPV) *TPV = 1000000;
                   JSLN(PV, TmpUser, (unsigned char *)tline);
                 }
-              } else {
-                Typeuser[ti] = build_userid_buf(TmpUser);
               }
               J1N(RC, Doload, ti);
             }
@@ -39497,35 +40164,15 @@ badrule:
       }
       JSLN(PV, UserArray, (unsigned char *)line);
     }
-    /* Build packed Userid buffer for unconverted types */
-    s = Userid = malloc_lock(MemSize + 4,"Userid");
-    line[0] = 0;
-    JSLF(PV, UserArray, (unsigned char *)line);
-    y = 0;
-    while (PV) {
-      x = mystrlen(line);
-      if (x > 0 && x < 80) {
-        if (RC) {
-          char *ms, *md;
-          for (ms = line, md = s; *ms; ms++, md++) {
-            c = *ms;
-            if (isupper(c))
-              c = tolower(c);
-            *md = c;
-          }
-          *md = 0;
-        } else {
-          strcpy(s, line);
-        }
-        s += x + 1;
-        y++;
-      }
-      JSLN(PV, UserArray, (unsigned char *)line);
+    /* Count userids in UseridJudy */
+    { int ucnt = 0;
+      char uline[MAXLINE]; uline[0] = 0;
+      Word_t *upv;
+      JSLF(upv, UseridJudy, (unsigned char *)uline);
+      while (upv) { ucnt++; JSLN(upv, UseridJudy, (unsigned char *)uline); }
+      fprintf(stderr, "%d total userids in use\n", ucnt);
+      Numsalts += ucnt;
     }
-    *s++ = 0;
-    *s = 0;
-    fprintf(stderr, "%d total userids in use\n", y);
-    Numsalts += y;
     JSLFA(RC, UserArray);
   }
 
@@ -39670,26 +40317,26 @@ badrule:
 	  if (x || RC) gen_userid();
   J1T(RC, Dohash, JOB_MD5_MD5USERSHA1MD5PASS);
   if (RC) {
-    char *s, *d;
-    if (!Userid)
-      Userid = "Administrator\0\0\0\0";
-    s = Userid;
+    char *d;
+    char uline2[MAXLINE + 16];
+    Pvoid_t uj = (Pvoid_t)UseridJudy;
+    if (!uj) { gen_userid(); uj = (Pvoid_t)UseridJudy; }
+    /* Count userids */
     x = 0;
-    while (*s) {
-      if (*s == 0 && s[1] == 0)
-        break;
-      x++;
-      while (*s++);
-    }
-    MD5_user = malloc_lock(33* (x + 1),"MD5_user");
-    s = Userid;
+    uline2[0] = 0;
+    JSLF(PV, uj, (unsigned char *)uline2);
+    while (PV) { x++; JSLN(PV, uj, (unsigned char *)uline2); }
+    if (!x) x = 1;
+    MD5_user = malloc_lock(33 * (x + 1), "MD5_user");
     d = MD5_user;
-    while (x--) {
-      y = mystrlen(s);
-      mymd5(s, y, curin.h);
+    uline2[0] = 0;
+    JSLF(PV, uj, (unsigned char *)uline2);
+    while (PV) {
+      y = mystrlen(uline2);
+      mymd5(uline2, y, curin.h);
       prmd5(curin.h, d, 32);
       d += 33;
-      s += y + 1;
+      JSLN(PV, uj, (unsigned char *)uline2);
     }
     *d++ = 0;
     *d++ = 0;
@@ -39760,6 +40407,8 @@ usage:
 
     load_hash_file(input, infilename ? infilename : "stdin", NULL);
     gzclose(input);
+  } else {
+    infilename = "previously named files";
   }
 
   RC = 0;
@@ -39776,6 +40425,13 @@ usage:
   twist(HashWaiting, BY, +1);
   x = join_all();
 
+  Minhashlen *= 2;
+  current_utc_time(&current);
+  wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
+  wtime -= (double) starthash.tv_sec + (double) (starthash.tv_nsec) / 1000000000.0;
+  if (wtime <= 0) wtime = 0.0;
+  fprintf(stderr, "Took %.2f seconds to read hashes\n", wtime);
+
   /* Build compact hash table from flat data */
   build_compact_table();
 
@@ -39784,12 +40440,6 @@ usage:
 
 
 
-  Minhashlen *= 2;
-  current_utc_time(&current);
-  wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
-  wtime -= (double) starthash.tv_sec + (double) (starthash.tv_nsec) / 1000000000.0;
-  if (wtime <= 0) wtime = 0.0;
-  fprintf(stderr, "Took %.2f seconds to read hashes\n", wtime);
   fprintf(stderr, "Searching through %s unique hex hashes from %s\n", commify(Insize), infilename);
   Bcryptcnt = 0;
   DEScryptcnt = 0;
@@ -42115,24 +42765,22 @@ usage:
         JSLI(PV, SaltArray, (unsigned char *)"8152001061460743");
       }
     }
-    /* PHPBB3: insert JudyJ[JOB_PHPBB3] entries into Typesalt */
-    /* Also insert into Typesalt[JOB_PHPBB3MD5] since it falls through */
+    /* PHPBB3: loader already populated compact table and Typesalt.
+     * Also populate Typesalt[JOB_PHPBB3MD5] for the fallthrough case. */
     { long phpbb3cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_PHPBB3], (unsigned char *)line);
+      JSLF(PV, Typesalt[JOB_PHPBB3], (unsigned char *)line);
       while (PV) {
-        Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_PHPBB3], (unsigned char *)line);
-        if (SPV && *SPV == 0) *SPV = 1;
         J1T(RC, Dohash, JOB_PHPBB3MD5);
         if (RC) {
+          Word_t *SPV;
           JSLI(SPV, Typesalt[JOB_PHPBB3MD5], (unsigned char *)line);
           if (SPV && *SPV == 0) *SPV = 1;
         }
         phpbb3cnt++;
-        JSLN(PV, JudyJ[JOB_PHPBB3], (unsigned char *)line);
+        JSLN(PV, Typesalt[JOB_PHPBB3], (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_PHPBB3]);
+      Numsalts += phpbb3cnt;
       if (phpbb3cnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = phpbb3cnt;
@@ -42519,7 +43167,7 @@ usage:
     }
     JSLFA(RC, SaltArray);
   }
-  /* Count salts per type for thread-local snapshot arrays */
+  /* Count salts per type; precompute MD5(salt) for Typehashsalt types */
   {
     Word_t ti = 0;
     J1F(RC, Dohash, ti);
@@ -42529,8 +43177,37 @@ usage:
         line[0] = 0;
         JSLF(PV, Typesalt[ti], (unsigned char *)line);
         while (PV) {
-          cnt++;
-          bytes += mystrlen(line) + 1;
+          /* Precompute MD5(salt) for types that need it */
+          if (ti == JOB_MD5_MD5SALTMD5PASS || ti == JOB_SHA1_MD5_MD5SALTMD5PASS ||
+              ti == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT || ti == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) {
+            Word_t *HPV;
+            JSLG(HPV, Typehashsalt[ti], (unsigned char *)line);
+            if (!HPV) {
+              unsigned char shash[16]; char *shex; int lc;
+              struct saltentry *se;
+              se = malloc_lock(sizeof(struct saltentry), "salthash");
+              if (strncmp(line, "$HEX[", 5) == 0) {
+                lc = get32(line + 5, (unsigned char *)workline, MAXLINE);
+                mymd5((char *)workline, lc, shash);
+              } else {
+                mymd5((char *)line, mystrlen(line), shash);
+              }
+              shex = (char *)malloc_lock(33, "salthash");
+              prmd5(shash, shex, 32);
+              shex[32] = 0;
+              se->salt = strdup(line);
+              se->PV = PV;
+              se->saltlen = mystrlen(line);
+              se->hashsalt = shex;
+              se->hashlen = 32;
+              JSLI(HPV, Typehashsalt[ti], (unsigned char *)line);
+              if (HPV) *HPV = (Word_t)se;
+            }
+            cnt++; bytes += 33;
+          } else {
+            cnt++;
+            bytes += mystrlen(line) + 1;
+          }
           JSLN(PV, Typesalt[ti], (unsigned char *)line);
         }
         Typesaltcnt[ti] = cnt;
@@ -42540,15 +43217,12 @@ usage:
       J1N(RC, Dohash, ti);
     }
   }
-  if (Userid || UseridJudy) {
+  if (UseridJudy) {
       Word_t ti = 0;
       J1F(RC, Dohash, ti);
       while (RC) {
           if (ti < JOB_DONE && (TypeOpts[ti] & TYPEOPT_NEEDUSER) && !Typeuser[ti]) {
-              if (TypeOpts[ti] & TYPEOPT_USERJUDY)
-                  Typeuser[ti] = (void *)UseridJudy;
-              else
-                  Typeuser[ti] = Userid;
+              Typeuser[ti] = (void *)UseridJudy;
           }
           J1N(RC, Dohash, ti);
       }
@@ -42602,6 +43276,32 @@ usage:
     argv = dirprocess(&argc, argv);
 	 
 
+
+  lsi = -1;
+  J1L(RC, Dohash,lsi);
+  if (!RC) {
+    fprintf(stderr,"No final hash type found\n");
+    exit(1);
+  }
+  lsi++;
+  linehints_count = (int)lsi;
+  linehints = malloc_lock(sizeof(struct Linehints)*lsi,"linehints");
+  lsi = 0;
+  J1F(RC,Dohash,lsi);
+  x = 0;
+  while (RC) {
+    linehints[lsi].curline = linehints[lsi].numline = 0;
+    linehints[lsi].gpu = 0;
+    for (; bench_rates[x].idx < lsi; x++);
+
+    if (lsi == bench_rates[x].idx) 
+      linehints[lsi].rate = bench_rates[x].rate;
+    else
+      linehints[lsi].rate = 1000000LL;
+    J1N(RC,Dohash,lsi);
+  }
+
+
   current_utc_time(&starthash);
 
 
@@ -42612,17 +43312,125 @@ usage:
     int gpu_avail = 0;
 #if defined(__APPLE__) && defined(METAL_GPU)
     gpu_avail = gpu_metal_available();
+    if (gpu_avail) {
+      /* Mark GPU-capable algorithms and compile needed kernel families */
+      unsigned int fam = 0, finalfam = 0;
+      lsi = 0;
+      J1F(RC, Dohash, lsi);
+      while (RC) {
+	fam = 0;
+	switch ((int)lsi) {
+	  case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:
+	  case JOB_MD5sub8_24SALT: fam = 1u << FAM_MD5SALT; break;
+	  case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam = 1u << FAM_MD5SALTPASS; break;
+	  case JOB_MD5: case JOB_MD5UC: fam = (1u << FAM_MD5SALT) | (1u << FAM_MD5UNSALTED); break;
+	  case JOB_PHPBB3: fam = 1u << FAM_PHPBB3; break;
+	  case JOB_MD5_MD5SALTMD5PASS: fam = 1u << FAM_MD5_MD5SALTMD5PASS; break;
+	  case JOB_SHA256PASSSALT: case JOB_SHA256SALTPASS: fam = 1u << FAM_SHA256; break;
+	  case JOB_DESCRYPT: fam = 1u << FAM_DESCRYPT; break;
+	}
+	if (fam & FAM_MD5SALT) {
+	  linehints[lsi].lineswanted = UINT_MAX;
+	  linehints[lsi].gpu = 1;
+	}
+	finalfam |= fam;
+	J1N(RC, Dohash, lsi);
+      }
+      if (finalfam)
+        gpu_metal_compile_families(finalfam);
+    }
 #elif defined(CUDA_GPU)
     gpu_avail = cuda_md5salt_available();
 #elif defined(OPENCL_GPU)
     gpu_avail = gpu_opencl_available();
 #endif
-    if (gpu_avail) gpujob_init(maxt + 16);
+    if (gpu_avail) {
+      gpujob_init(maxt + 16);
+      gpu_batch_lines = gpujob_batch_max();
+#ifdef OPENCL_GPU
+      /* Compile GPU kernel families for active hash types */
+      { unsigned int fam = 0, finalfam = 0;
+        lsi = 0;
+        J1F(RC, Dohash, lsi);
+        while (RC) {
+	  fam = 0;
+          switch ((int)lsi) {
+            case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:
+            case JOB_MD5sub8_24SALT: fam |= 1u << FAM_MD5SALT; break;
+            case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam |= 1u << FAM_MD5SALTPASS; break;
+            case JOB_MD5: case JOB_MD5UC: fam |= (1u << FAM_MD5ITER) | (1u << FAM_MD5MASK) | (1u << FAM_MD5UNSALTED); break;
+            case JOB_PHPBB3: fam |= 1u << FAM_PHPBB3; break;
+            case JOB_MD5CRYPT: fam |= 1u << FAM_MD5CRYPT; break;
+            case JOB_MD5_MD5SALTMD5PASS: fam |= 1u << FAM_MD5_MD5SALTMD5PASS; break;
+            case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU: fam |= 1u << FAM_SHA1; break;
+            case JOB_SHA256PASSSALT: case JOB_SHA256SALTPASS: fam |= 1u << FAM_SHA256; break;
+            case JOB_DESCRYPT: fam |= 1u << FAM_DESCRYPT; break;
+          }
+	  if (fam & FAM_MD5SALT) {
+	    linehints[lsi].lineswanted = UINT_MAX;
+	    linehints[lsi].gpu = 1;
+	  }
+	  finalfam |= fam;
+          J1N(RC, Dohash, lsi);
+        }
+        if (finalfam) gpu_opencl_compile_families(finalfam);
+      }
+      /* Upload mask descriptor to GPU if mask mode is active */
+      if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpu_opencl_available()) {
+        int gpu_mask_ok = 1;
+        uint8_t pre_desc[MAX_MASK_POS], app_desc[MAX_MASK_POS];
+        int npre = 0, napp = 0;
+
+        /* Build prepend descriptor */
+        for (int mi = 0; mi < MaskPrependLen; mi++) {
+          int cid = MaskPrependPattern[mi].classid;
+          if (cid == MASK_LITERAL) {
+            /* TODO: GPU literal support (Phase 1 of plan) */
+            gpu_mask_ok = 0; break;
+          } else if (cid >= 0 && cid <= 5) {
+            pre_desc[npre++] = (uint8_t)cid;
+          } else {
+            gpu_mask_ok = 0; break;
+          }
+        }
+        /* Build append descriptor */
+        if (gpu_mask_ok) {
+          for (int mi = 0; mi < MaskAppendLen; mi++) {
+            int cid = MaskAppendPattern[mi].classid;
+            if (cid == MASK_LITERAL) {
+              gpu_mask_ok = 0; break;
+            } else if (cid >= 0 && cid <= 5) {
+              app_desc[napp++] = (uint8_t)cid;
+            } else {
+              gpu_mask_ok = 0; break;
+            }
+          }
+        }
+        /* Legacy single-mask fallback (neither prepend nor append pattern set) */
+        if (gpu_mask_ok && npre == 0 && napp == 0 && MaskLen > 0) {
+          for (int mi = 0; mi < MaskLen; mi++) {
+            int cid = MaskPattern[mi].classid;
+            if (cid < 0 || cid > 5) { gpu_mask_ok = 0; break; }
+            if (MaskPrepend)
+              pre_desc[npre++] = (uint8_t)cid;
+            else
+              app_desc[napp++] = (uint8_t)cid;
+          }
+        }
+        if (gpu_mask_ok && (npre > 0 || napp > 0))
+          gpu_opencl_set_mask(pre_desc, npre, app_desc, napp);
+      }
+#endif
+    }
   }
 #endif
 #ifndef _WIN32
   signal(SIGUSR1, sig_pause);
   signal(SIGUSR2, sig_resume);
+#ifdef GPU_ENABLED
+  signal(SIGINT, sig_gpu_exit);
+  signal(SIGTERM, sig_gpu_exit);
+#endif
 #else
   win_pause_init();
 #endif
@@ -42669,44 +43477,54 @@ usage:
       }
       Numbers = 0;
 
-
-      numline = Linecount / (actjobs * maxt);
-      if (numline < maxt) numline = Linecount;
-
-      for (; curline < Linecount; curline += numline) {
+      /* Reset per-type line cursors for this chunk */
+      lsi = 0;
+      J1F(RC, Dohash, lsi);
+      while (RC) {
+	linehints[lsi].curline = 0;
+	J1N(RC, Dohash, lsi);
+      }
+      Lowline = 0;
+      isdone = 0;
+      while (!isdone) {
         Numbers = 0;
-        if (Numsalts) {
-          unsigned int active = 0;
-          Word_t lsi = 0;
-          J1F(RC, Dohash, lsi);
-          while (RC) {
-            if (lsi < JOB_DONE && Livesalts[lsi] > active)
-              active = Livesalts[lsi];
-            J1N(RC, Dohash, lsi);
-          }
-          if (active < 1) active = 1;
-          numline = Linecount / active;
-          if (numline < 50) numline = 50;
-        }
-        if (Bcryptcnt || Email)
-          numline = 1;
-        if ((curline + numline) > Linecount)
-          numline = Linecount - curline;
-        Lowline += numline;
 reprocess:
         NextX = 0;
 
+	isdone = 1;
         J1F(RC, Dohash, NextX);
         while (RC) {
           x = NextX;
-          if (Typedone[x]) { J1N(RC, Dohash, NextX); continue; }
+	  curline = linehints[x].curline;
+          if (Typedone[x] || curline >= Linecount) { 
+	    J1N(RC, Dohash, NextX); 
+	    continue; 
+	  }
+	  if (linehints[x].gpu) {
+	    linehints[x].lineswanted = UINT_MAX;
+	    numline = UINT_MAX;
+	  } else {
+	    linehints[x].lineswanted = linehints[x].rate;
+	    if (Livesalts[x])
+	      linehints[x].lineswanted /= Livesalts[x];
+	    if (MaskTotal > 1)
+	      linehints[x].lineswanted /= MaskTotal;
+	    if (linehints[x].lineswanted < 512)
+	      linehints[x].lineswanted = 512;
+	    numline = linehints[x].lineswanted;
+	    if (Email) numline = 1;
+	  }
+	  if ((curline + numline) > Linecount)
+	    numline = Linecount - curline;
+	  linehints[x].curline += numline;
+	  isdone = 0;
           possess(FreeWaiting);
           wait_for(FreeWaiting, NOT_TO_BE, 0);
           job = FreeHead;
           if (!job) {
             fprintf(stderr, "Job null on freehead!\n");
             exit(1);
-          }
+	  }
           FreeHead = job->next;
           job->next = NULL;
           if (FreeHead == NULL)
@@ -42719,14 +43537,13 @@ reprocess:
             job->flags |= JOBFLAG_NUMBERS;
           if (Doip)
             job->flags |= JOBFLAG_IP;
-          if (MaskPrepend)
+          if (MaskPrepend || MaskPrependLen > 0)
             job->flags |= JOBFLAG_PREPEND;
           job->Numbers = Numbers;
           job->digits = Dodigits;
-          job->MaskIndex = Numbers;  /* Numbers tracks position for mask too */
-          if (MaskLen) {
-            unsigned long long remain = MaskTotal - Numbers;
-            job->MaskCount = remain < MaskChunkSize ? remain : MaskChunkSize;
+          job->MaskIndex = (MaskLen || MaskPrependLen || MaskAppendLen) ? 0 : Numbers;
+          if (MaskLen || MaskPrependLen || MaskAppendLen) {
+            job->MaskCount = MaskTotal;
           } else
             job->MaskCount = 0;
           job->doneprint = &doneprint;
@@ -42752,11 +43569,8 @@ reprocess:
           twist(WorkWaiting, BY, +1);
           J1N(RC, Dohash, NextX);
         }
-        if (Dodigits) {
-          if (MaskLen)
-            Numbers += MaskChunkSize;
-          else
-            Numbers += Iter_Count[Dodigits];
+        if (Dodigits && !(MaskLen || MaskPrependLen || MaskAppendLen)) {
+          Numbers += Iter_Count[Dodigits];
           if (Numbers < Maxnumbers)
             goto reprocess;
         }
@@ -42783,6 +43597,9 @@ reprocess:
     gpujob_shutdown(); /* must be before join_all — gpujob needs JOB_DONE to exit */
 #endif
     x = join_all();
+#ifdef OPENCL_GPU
+    gpu_opencl_shutdown(); /* explicit — atexit races with NVIDIA driver teardown */
+#endif
     fprintf(stderr, "\nDone - %d threads caught\n", x - 1);
   }
   current_utc_time(&current);

@@ -225,6 +225,30 @@ hashcat -a 0 -m 1500 -o /dev/null --potfile-disable sm-salt1500.txt sm-salt1500.
 | dev3 | Apple M2 Max CPU (12 cores) | 3.5 GHz | 1,000,000 | 1849s | 4B | 2.21M/s |
 | hpi7 | Intel Xeon E3-1230 v5 CPU (8T) | 3.4 GHz | 1,000,000 | 2390s | 4B | 1.71M/s |
 
+### MD5 with mask (e1, mode 0) — testfull (14.3M hashes, rockyou.txt + ?d?d mask)
+
+Algorithm: plain MD5 with a 2-digit mask appended to each candidate, expanding the keyspace by 100x. This tests hybrid mask attack performance with a large hash set.
+
+```bash
+mdxfind -M e1 -F testfull.txt -n '?d?d' rockyou.txt > /dev/null
+hashcat --potfile-disable -a 6 -m 0 -o /dev/null testfull.txt rockyou.txt '?d?d'
+```
+
+| Machine | CPU/GPU | Clock | Found | Time | Hash calcs | Rate |
+|---------|---------|-------|-------|------|-----------|------|
+| mmt | NVIDIA RTX 4070 Ti SUPER OpenCL + CPU | -- | 2,933,365 | 6s | 1.4B | 413M/s |
+| fpga | NVIDIA GTX 1080 OpenCL + CPU | -- | 2,933,365 | 7s | 1.4B | 286M/s |
+| hpi7 | NVIDIA GTX 960 OpenCL + CPU | -- | 2,933,365 | 8s | 1.4B | 239M/s |
+| mmt | 2x Xeon E5-2697 v4 (72T) | 2.3 GHz | 2,933,365 | 10s | 1.4B | 159M/s |
+| dev3 | Apple M2 Max Metal + CPU | 3.5 GHz | 2,933,365 | 61s | 1.4B | 24.4M/s |
+| dev1 | Apple M1 Metal + CPU | 3.2 GHz | 2,933,365 | 67s | 1.4B | 21.5M/s |
+| hpi7 | NVIDIA GTX 960 hashcat 6.2.6 (Pure Kernel) | -- | 2,933,365 | 115s | -- | 12.4M/s |
+| fpga | NVIDIA GTX 1080 hashcat 6.2.6 (Pure Kernel) | -- | 2,933,365 | 158s | -- | 9.10M/s |
+| dev3 | Apple M2 Max CPU (12 cores) | 3.5 GHz | 2,933,365 | 163s | 1.4B | 8.87M/s |
+| dev1 | Apple M1 CPU (8 cores) | 3.2 GHz | 2,933,365 | 182s | 1.4B | 7.93M/s |
+| fpga | AMD Ryzen 7 1800X CPU (16T) | 3.6 GHz | 2,933,365 | 222s | 1.4B | 6.49M/s |
+| mmt | NVIDIA RTX 4070 Ti SUPER hashcat 6.2.6 (Pure Kernel) | -- | 2,933,365 | 265s | -- | 5.60M/s |
+
 The salted benchmark is dramatically more expensive than unsalted because each candidate must be tested against every unique salt. With 1M unique salts and 14.3M passwords, this requires hundreds of billions of hash computations.
 
 **Notes:**

@@ -4,6 +4,9 @@
  * Same architecture as gpujob.m (Metal), but uses gpu_opencl.h API.
  * Compiled only on Linux with OPENCL_GPU defined.
  */
+#include <time.h>
+/*
+ */
 
 #if defined(OPENCL_GPU)
 
@@ -29,13 +32,18 @@ extern volatile int MDXpause, MDXpaused_count;
 extern int hybrid_check(const unsigned char *, int, int *, unsigned short **);
 extern void md5crypt_b64encode(const unsigned char *, char *);
 extern void prfound(struct job *, char *);
+extern int checkhashbb(union HashU *, int, char *, struct job *);
 extern void mymd5(char *, int, unsigned char *);
+extern void mysha1(char *, int, unsigned char *);
 extern void mysha256(char *, int, unsigned char *);
-extern void snapshot_attach_hashsalt(struct saltentry *, int, Pvoid_t);
+struct saltentry;
+extern int build_hashsalt_snapshot(struct saltentry *, char *, Pvoid_t, char *, int);
 extern Pvoid_t *Typehashsalt;
 extern char Typedone[];
 extern void **Typesalt;
 extern void *OverflowHash;
+extern Pvoid_t JudyJ[];
+extern char phpitoa64[];
 extern atomic_ullong *Totalfound[];
 extern atomic_ullong *RuleCnt;
 extern lock *FreeWaiting;
@@ -48,6 +56,50 @@ extern int build_salt_snapshot(void *snap, char *pool,
 extern int *Typesaltcnt;
 extern int *Typesaltbytes;
 
+/* Decode phpass iteration count from salt[3] */
+static int phpbb3_iter_count(const char *salt, int saltlen) {
+    static const char itoa64[] = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    if (saltlen < 4) return 2048;
+    char c = salt[3];
+    for (int k = 0; k < 64; k++)
+        if (itoa64[k] == c) return 1 << k;
+    return 2048;
+}
+
+/* Mask charset helpers — must match kernel's charset_size/charset_char */
+static const char *mask_charsets[] = {
+    "0123456789",                                          /* 0: ?d */
+    "abcdefghijklmnopqrstuvwxyz",                          /* 1: ?l */
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",                          /* 2: ?u */
+    " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",                /* 3: ?s */
+    NULL, /* 4: ?a — 0x20..0x7e, built dynamically */
+    NULL  /* 5: ?b — 0x00..0xff, built dynamically */
+};
+static const int mask_csizes[] = { 10, 26, 26, 33, 95, 256 };
+
+/* Reconstruct mask characters from mask_idx into buf.
+ * Returns number of chars written. */
+static int mask_decode(uint32_t mask_idx, const uint8_t *desc, int npos, char *buf) {
+    uint32_t idx = mask_idx;
+    for (int i = npos - 1; i >= 0; i--) {
+        int csid = desc[i];
+        int sz = mask_csizes[csid];
+        int ci = idx % sz;
+        idx /= sz;
+        if (csid == 4)
+            buf[i] = (char)(0x20 + ci);
+        else if (csid == 5)
+            buf[i] = (char)ci;
+        else
+            buf[i] = mask_charsets[csid][ci];
+    }
+    return npos;
+}
+
+extern uint8_t gpu_mask_desc[];
+extern int gpu_mask_n_prepend, gpu_mask_n_append;
+extern uint64_t gpu_mask_total;
+
 #define PV_DEC(pv) { unsigned long _old = *(pv); \
   while (_old > 0) { \
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) break; \
@@ -58,6 +110,7 @@ struct saltentry {
     unsigned long *PV;
     int saltlen;
     char *hashsalt;
+    int hashlen;
 };
 
 /* ---- GPU work queue ---- */
@@ -140,6 +193,43 @@ static void gpu_sched_wake_best(void) {
     }
 }
 
+
+/* Reconstruct 13-char DES crypt string from GPU pre-FP output (l, r) and salt.
+ * Applies FP permutation bit-by-bit, then base64-encodes to crypt format. */
+static void des_reconstruct(uint32_t gl, uint32_t gr, const char *salt, char *out) {
+    static const unsigned char DES_FP[64] = {
+        40, 8,48,16,56,24,64,32,39, 7,47,15,55,23,63,31,
+        38, 6,46,14,54,22,62,30,37, 5,45,13,53,21,61,29,
+        36, 4,44,12,52,20,60,28,35, 3,43,11,51,19,59,27,
+        34, 2,42,10,50,18,58,26,33, 1,41, 9,49,17,57,25
+    };
+    uint32_t il = gl, ir = gr;
+    /* Apply FP to (il, ir) -> (r0, r1) */
+    uint32_t r0 = 0, r1 = 0;
+    for (int i = 0; i < 32; i++) {
+        int b = DES_FP[i] - 1;
+        uint32_t src = (b < 32) ? il : ir;
+        if (src & (1u << (31 - (b % 32)))) r0 |= (1u << (31 - i));
+    }
+    for (int i = 0; i < 32; i++) {
+        int b = DES_FP[32 + i] - 1;
+        uint32_t src = (b < 32) ? il : ir;
+        if (src & (1u << (31 - (b % 32)))) r1 |= (1u << (31 - i));
+    }
+    /* Encode: salt + 11 base64 chars */
+    out[0] = salt[0]; out[1] = salt[1];
+    uint32_t v;
+    v = r0 >> 8;
+    out[2] = phpitoa64[(v>>18)&0x3f]; out[3] = phpitoa64[(v>>12)&0x3f];
+    out[4] = phpitoa64[(v>>6)&0x3f];  out[5] = phpitoa64[v&0x3f];
+    v = (r0 << 16) | ((r1 >> 16) & 0xffff);
+    out[6] = phpitoa64[(v>>18)&0x3f]; out[7] = phpitoa64[(v>>12)&0x3f];
+    out[8] = phpitoa64[(v>>6)&0x3f];  out[9] = phpitoa64[v&0x3f];
+    v = r1 << 2;
+    out[10] = phpitoa64[(v>>12)&0x3f]; out[11] = phpitoa64[(v>>6)&0x3f];
+    out[12] = phpitoa64[v&0x3f];
+    out[13] = 0;
+}
 #define GPU_MAX_RETURN 32768
 #define OUTBUFSIZE (1024 * 1024)
 
@@ -176,10 +266,10 @@ static void load_overflow(int dev_idx) {
         OPV = (Word_t *)JudyLNext(OverflowHash, &okey, NULL);
     }
     if (ocnt > 0) {
-        uint64_t *okeys = (uint64_t *)malloc(ocnt * sizeof(uint64_t));
-        unsigned char *ohashes = (unsigned char *)malloc(obytes + ocnt * 8);
-        uint32_t *ooffsets = (uint32_t *)malloc(ocnt * sizeof(uint32_t));
-        uint16_t *olengths = (uint16_t *)malloc(ocnt * sizeof(uint16_t));
+        uint64_t *okeys = (uint64_t *)malloc_lock(ocnt * sizeof(uint64_t),"load_overflow");
+        unsigned char *ohashes = (unsigned char *)malloc_lock(obytes + ocnt * 8,"load_overflow");
+        uint32_t *ooffsets = (uint32_t *)malloc_lock(ocnt * sizeof(uint32_t),"load_overflow");
+        uint16_t *olengths = (uint16_t *)malloc_lock(ocnt * sizeof(uint16_t),"load_overflow");
         int oi = 0;
         uint32_t opos = 0;
         okey = 0;
@@ -208,26 +298,28 @@ void gpujob(void *arg) {
     int my_slot = (int)(intptr_t)arg;
     union HashU curin;
     struct job synthetic_job;
-    char *outbuf = (char *)malloc(OUTBUFSIZE);
+    char *outbuf = (char *)malloc_lock(OUTBUFSIZE,"gpujob");
     uint64_t hashcnt = 0, found = 0;
     char tsalt[4096];
 
     memset(&synthetic_job, 0, sizeof(synthetic_job));
     synthetic_job.outbuf = outbuf;
 
-    struct saltentry *saltsnap = (struct saltentry *)malloc(
-        _max_salt_count * sizeof(struct saltentry));
-    char *saltpool = (char *)malloc(_max_salt_bytes + 16);
+    struct saltentry *saltsnap = (struct saltentry *)malloc_lock(_max_salt_count * sizeof(struct saltentry),"saltentry");
+    char *saltpool = (char *)malloc_lock(_max_salt_bytes + 16,"saltpool");
     /* Buffer must hold either raw salts OR 32-byte hex hashes per salt */
     size_t sp_size = _max_salt_bytes + 4096;
     if ((size_t)_max_salt_count * 32 + 4096 > sp_size)
         sp_size = (size_t)_max_salt_count * 32 + 4096;
-    char *salts_packed = (char *)malloc(sp_size);
-    uint32_t *soff = (uint32_t *)malloc(_max_salt_count * sizeof(uint32_t));
-    uint16_t *slen = (uint16_t *)malloc(_max_salt_count * sizeof(uint16_t));
-    int *pack_map = (int *)malloc(_max_salt_count * sizeof(int));
+    char *salts_packed = (char *)malloc_lock(sp_size,"salts_packed");
+    char desbuf[16];  /* DES crypt reconstructed string (13 chars + NUL) */
+    uint32_t *soff = (uint32_t *)malloc_lock(_max_salt_count * sizeof(uint32_t),"gpujob");
+    uint16_t *slen = (uint16_t *)malloc_lock(_max_salt_count * sizeof(uint16_t),"gpujob");
+    int *pack_map = (int *)malloc_lock(_max_salt_count * sizeof(int),"gpujob");
     int nsalts = 0;
     int nsalts_packed = 0;
+    int salt_refresh = 0;
+    int salt_hits_pending = 0; /* unused for now, reserved for adaptive refresh */
     int current_op = -1;
     int batch_count = 0;
     int my_overflow_loaded = 0;
@@ -263,26 +355,35 @@ void gpujob(void *arg) {
 
         int op_cat = gpu_op_category(g->op);
 
-        /* Rebuild salt snapshot on op change or periodically to pick up PV changes */
+        /* Rebuild salt snapshot on op change, periodically, or after hits found */
         if (op_cat == GPU_CAT_SALTED || op_cat == GPU_CAT_SALTPASS) {
             batch_count++;
-            if (g->op != current_op || (batch_count >= 100 && nsalts_packed > 0)) {
+            if (g->op != current_op ||
+                (salt_refresh && op_cat == GPU_CAT_SALTPASS) ||
+                (batch_count >= 10 && nsalts_packed > 0)) {
+                salt_refresh = 0;
                 if (g->op != current_op) {
                     current_op = g->op;
                     gpu_opencl_set_op(g->op);
                 }
                 batch_count = 0;
                 tsalt[0] = 0;
-                nsalts = build_salt_snapshot(saltsnap, saltpool,
-                                Typesalt[g->op], tsalt, Printall);
+                { int use_hs = (g->op == JOB_MD5_MD5SALTMD5PASS ||
+                                g->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
+                                g->op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
+                                g->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS);
+                  if (use_hs && Typehashsalt[g->op])
+                    nsalts = build_hashsalt_snapshot(saltsnap, saltpool,
+                                    Typehashsalt[g->op], tsalt, Printall);
+                  else
+                    nsalts = build_salt_snapshot(saltsnap, saltpool,
+                                    Typesalt[g->op], tsalt, Printall);
+                }
                 if (nsalts > 0) {
                     int use_hs = (g->op == JOB_MD5_MD5SALTMD5PASS ||
                                   g->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
                                   g->op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
                                   g->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS);
-                    if (use_hs)
-                        snapshot_attach_hashsalt(saltsnap, nsalts,
-                                        Typehashsalt[g->op]);
                     nsalts_packed = gpu_pack_salts(saltsnap, nsalts,
                                                    salts_packed, soff, slen, pack_map, use_hs);
                 }
@@ -302,7 +403,27 @@ void gpujob(void *arg) {
         uint32_t *hits = NULL;
 
         if (g->count == 0) goto return_jobg;
-        if ((op_cat == GPU_CAT_SALTED || op_cat == GPU_CAT_SALTPASS) && nsalts_packed == 0) goto return_jobg;
+        if ((op_cat == GPU_CAT_SALTED || op_cat == GPU_CAT_SALTPASS) && nsalts_packed == 0) {
+            /* Stale nsalts_packed — force a fresh rebuild before giving up.
+             * Words in this batch were packed when salts were still active. */
+            int nsalts = build_salt_snapshot(saltsnap, saltpool,
+                            Typesalt[g->op], tsalt, Printall);
+            if (nsalts > 0) {
+                nsalts_packed = gpu_pack_salts(saltsnap, nsalts,
+                                               salts_packed, soff, slen, pack_map, 0);
+                if (nsalts_packed > 0)
+                    gpu_opencl_set_salts(my_slot, salts_packed, soff, slen, nsalts_packed);
+            }
+            if (nsalts_packed == 0) {
+                goto return_jobg;
+            }
+        }
+
+        /* Mask mode: set op on first batch */
+        if (op_cat == GPU_CAT_MASK && g->op != current_op) {
+            current_op = g->op;
+            gpu_opencl_set_op(g->op);
+        }
 
         synthetic_job.op = g->op;
         synthetic_job.flags = g->flags;
@@ -311,23 +432,36 @@ void gpujob(void *arg) {
         synthetic_job.found = (unsigned int *)&found;
         synthetic_job.outlen = 0;
 
+        /* Mask overflow retry loop: if GPU hit buffer overflows, process stored hits
+         * then re-dispatch starting from the highest mask_idx seen. */
+        int dispatch_retry;
+        uint32_t max_mask_idx = 0;
+        do {
+        dispatch_retry = 0;
+        max_mask_idx = 0;
         hits = gpu_opencl_dispatch_batch(my_slot,
-            g->hexhash[0], (const uint16_t *)g->hexlen,
+            g->word_stride ? g->raw : g->hexhash[0],
+            (const uint16_t *)g->hexlen,
             g->count, &nhits);
 
         if (hits && nhits > 0) {
+            salt_refresh = 1;
+            salt_hits_pending += nhits;
             int stored = nhits > GPU_MAX_RETURN ? GPU_MAX_RETURN : nhits;
             int is_sha256 = (g->op == JOB_SHA256PASSSALT || g->op == JOB_SHA256SALTPASS);
-            int is_md5crypt = (g->op == JOB_MD5CRYPT);
-            int hit_stride = is_sha256 ? 11
+            int is_sha1 = (g->op == JOB_SHA1PASSSALT || g->op == JOB_SHA1SALTPASS || g->op == JOB_SHA1DRU);
+            int is_md5crypt = (g->op == JOB_MD5CRYPT || g->op == JOB_PHPBB3);
+            int hit_stride = is_sha256 ? 11 : is_sha1 ? 8
                 : is_md5crypt ? 6
                 : (Maxiter > 1 || op_cat == GPU_CAT_ITER || op_cat == GPU_CAT_SALTPASS) ? 7 : 6;
-            int hash_words = is_sha256 ? 8 : 4;
-            int hexlen = is_sha256 ? 64 : 32;
+            int hash_words = is_sha256 ? 8 : is_sha1 ? 5 : 4;
+            int hexlen = is_sha256 ? 64 : is_sha1 ? 40 : 32;
             int overflow = (nhits > GPU_MAX_RETURN);
 
-            /* On overflow, we must retry ALL words on CPU since any word's
-             * hits may have been partially stored. word_hit is not used. */
+            /* If overflow on a mask batch, find the highest mask_idx among stored
+             * hits and resume from there on the next dispatch. Up to num_words
+             * duplicates at the boundary are filtered by checkhash. */
+            uint32_t max_mask_idx = 0;
 
             for (int h = 0; h < stored; h++) {
                 uint32_t *entry = hits + h * hit_stride;
@@ -347,18 +481,60 @@ void gpujob(void *arg) {
                         curin.i[w] = entry[2 + w];
                 }
 
-                char *pass = &g->passbuf[g->passoff[widx]];
-                int plen = g->passlen[widx];
-                memcpy(synthetic_job.line, pass, plen);
-                synthetic_job.line[plen] = 0;
-                synthetic_job.clen = g->clen[widx];
-                synthetic_job.pass = synthetic_job.line;
-                synthetic_job.Ruleindex = g->ruleindex[widx];
-
+                if (op_cat == GPU_CAT_MASK || op_cat == GPU_CAT_UNSALTED) {
+                    /* Mask/unsalted: reconstruct candidate from base word + mask index.
+                     * Skip passoff/passlen arrays which may be smaller than word count. */
+                    synthetic_job.Ruleindex = (widx < GPUBATCH_MAX) ? g->ruleindex[widx] : 0;
+                    uint32_t midx = entry[1];
+                    if (midx > max_mask_idx) max_mask_idx = midx;
+                    char *base_word;
+                    int blen;
+                    if (g->word_stride && widx < 4096) {
+                        /* Unsalted pre-padded: extract base word from M[] block */
+                        char *slot = g->raw + widx * g->word_stride;
+                        int total_len = ((uint32_t *)slot)[14] >> 3; /* bit-length / 8 */
+                        blen = total_len - gpu_mask_n_prepend - gpu_mask_n_append;
+                        base_word = slot + gpu_mask_n_prepend;
+                    } else {
+                        base_word = &g->passbuf[g->passoff[widx]];
+                        blen = g->passlen[widx];
+                    }
+                    uint32_t append_combos = 1;
+                    for (int mi = 0; mi < gpu_mask_n_append; mi++)
+                        append_combos *= mask_csizes[gpu_mask_desc[gpu_mask_n_prepend + mi]];
+                    uint32_t prepend_idx = midx / append_combos;
+                    uint32_t append_idx = midx % append_combos;
+                    char cand[256];
+                    int clen = 0;
+                    if (gpu_mask_n_prepend > 0)
+                        clen += mask_decode(prepend_idx, gpu_mask_desc, gpu_mask_n_prepend, cand);
+                    memcpy(cand + clen, base_word, blen);
+                    clen += blen;
+                    if (gpu_mask_n_append > 0)
+                        clen += mask_decode(append_idx, gpu_mask_desc + gpu_mask_n_prepend,
+                                            gpu_mask_n_append, cand + clen);
+                    cand[clen] = 0;
+                    memcpy(synthetic_job.line, cand, clen + 1);
+                    synthetic_job.clen = clen;
+                    synthetic_job.pass = synthetic_job.line;
+                    checkhash(&curin, hexlen, 1, &synthetic_job);
+                } else {
+                    /* Non-mask path: set up synthetic_job from per-word metadata */
+                    char *pass = &g->passbuf[g->passoff[widx]];
+                    int plen = g->passlen[widx];
+                    memcpy(synthetic_job.line, pass, plen);
+                    synthetic_job.line[plen] = 0;
+                    synthetic_job.clen = g->clen[widx];
+                    synthetic_job.pass = synthetic_job.line;
+                    synthetic_job.Ruleindex = g->ruleindex[widx];
                 if (op_cat == GPU_CAT_ITER) {
                     checkhash(&curin, hexlen, iter_num, &synthetic_job);
-                } else if (is_md5crypt) {
-                    /* MD5CRYPT: verify via hybrid_check, output $1$salt$base64 */
+                } else if (g->op == JOB_PHPBB3) {
+                    if (sidx >= nsalts_packed) continue;
+                    int snap_idx = pack_map[sidx];
+                    if (checkhashbb(&curin, 32, saltsnap[snap_idx].salt, &synthetic_job))
+                        PV_DEC(saltsnap[snap_idx].PV);
+                } else if (g->op == JOB_MD5CRYPT) {
                     if (sidx >= nsalts_packed) continue;
                     int snap_idx = pack_map[sidx];
                     int match_len; unsigned short *match_flags;
@@ -366,13 +542,30 @@ void gpujob(void *arg) {
                     if (hf && *match_flags != (unsigned short)g->op) {
                         *match_flags = g->op;
                         PV_DEC(saltsnap[snap_idx].PV);
-                        /* Reconstruct $1$salt$base64 output */
-                        char *sp = saltsnap[snap_idx].salt; /* "$1$salt$" */
+                        char *sp = saltsnap[snap_idx].salt;
                         int splen = saltsnap[snap_idx].saltlen;
                         char mdbuf[128];
                         memcpy(mdbuf, sp, splen);
                         md5crypt_b64encode(curin.h, mdbuf + splen);
                         prfound(&synthetic_job, mdbuf);
+                    }
+                } else if (g->op == JOB_DESCRYPT) {
+                    if (sidx >= nsalts_packed) continue;
+                    int snap_idx = pack_map[sidx];
+                    char *s1 = saltsnap[snap_idx].salt;
+                    des_reconstruct(curin.i[0], curin.i[1], s1, desbuf);
+                    Word_t *HPV;
+                    JSLG(HPV, JudyJ[JOB_DESCRYPT], (unsigned char *)desbuf);
+                    if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
+                        PV_DEC(saltsnap[snap_idx].PV);
+                        char *pass = &g->passbuf[g->passoff[widx]];
+                        int plen = g->passlen[widx];
+                        int cplen = (plen > 8) ? 8 : plen;
+                        memcpy(synthetic_job.line, pass, cplen);
+                        synthetic_job.line[cplen] = 0;
+                        synthetic_job.pass = synthetic_job.line;
+                        synthetic_job.clen = cplen;
+                        prfound(&synthetic_job, desbuf);
                     }
                 } else {
                     if (sidx >= nsalts_packed) continue;
@@ -388,6 +581,7 @@ void gpujob(void *arg) {
                             PV_DEC(saltsnap[snap_idx].PV);
                     }
                 }
+                } /* end non-mask else */
             }
 
             /* Hit buffer overflow: reprocess words that may have lost hits on CPU.
@@ -421,7 +615,7 @@ void gpujob(void *arg) {
                         case JOB_MD5_MD5SALTMD5PASS:
                             /* Recompute: MD5(hex(MD5(salt)) + hex(MD5(pass))) */
                             { char *hs = saltsnap[snap_idx].hashsalt;
-                              if (!hs) break; /* no precomputed hash — shouldn't happen */
+                              if (!hs) break;
                               memcpy(tmpbuf, hs, 32);
                               memcpy(tmpbuf + 32, g->hexhash[wi], g->hexlen[wi]);
                               mymd5(tmpbuf, 32 + g->hexlen[wi], curin.h);
@@ -429,7 +623,6 @@ void gpujob(void *arg) {
                             memcpy(synthetic_job.line, g->hexhash[wi], g->hexlen[wi]);
                             synthetic_job.line[g->hexlen[wi]] = 0;
                             synthetic_job.pass = synthetic_job.line;
-                            /* Use original salt for output (not the hex hash) */
                             if (checkhashsalt(&curin, 32, saltsnap[snap_idx].salt,
                                     saltsnap[snap_idx].saltlen, 1, &synthetic_job))
                                 PV_DEC(saltsnap[snap_idx].PV);
@@ -478,8 +671,29 @@ void gpujob(void *arg) {
                             if (checkhashsalt(&curin, 64, s1, saltlen, 1, &synthetic_job))
                                 PV_DEC(saltsnap[snap_idx].PV);
                             break;
-                        case JOB_MD5CRYPT: {
-                            /* Full MD5CRYPT compute for overflow retry */
+                        case JOB_SHA1SALTPASS:
+                            pass = &g->passbuf[g->passoff[wi]]; plen = g->passlen[wi];
+                            memcpy(tmpbuf, s1, saltlen);
+                            memcpy(tmpbuf + saltlen, pass, plen);
+                            mysha1(tmpbuf, saltlen + plen, curin.h);
+                            memcpy(synthetic_job.line, pass, plen);
+                            synthetic_job.line[plen] = 0;
+                            synthetic_job.pass = synthetic_job.line;
+                            if (checkhashsalt(&curin, 40, s1, saltlen, 1, &synthetic_job))
+                                PV_DEC(saltsnap[snap_idx].PV);
+                            break;
+                        case JOB_SHA1PASSSALT:
+                            pass = &g->passbuf[g->passoff[wi]]; plen = g->passlen[wi];
+                            memcpy(tmpbuf, pass, plen);
+                            memcpy(tmpbuf + plen, s1, saltlen);
+                            mysha1(tmpbuf, plen + saltlen, curin.h);
+                            memcpy(synthetic_job.line, pass, plen);
+                            synthetic_job.line[plen] = 0;
+                            synthetic_job.pass = synthetic_job.line;
+                            if (checkhashsalt(&curin, 40, s1, saltlen, 1, &synthetic_job))
+                                PV_DEC(saltsnap[snap_idx].PV);
+                            break;
+                        case JOB_MD5CRYPT: {  /* Full MD5CRYPT compute for overflow retry */
                             pass = &g->passbuf[g->passoff[wi]]; plen = g->passlen[wi];
                             /* s1 = "$1$salt$", extract raw salt */
                             char *rawsalt = s1 + 3;
@@ -534,22 +748,66 @@ void gpujob(void *arg) {
                             }
                             break;
                         }
+                        case JOB_DESCRYPT: {
+                            /* Overflow retry: recompute DES for this word+salt on CPU */
+                            pass = &g->passbuf[g->passoff[wi]]; plen = g->passlen[wi];
+                            int cplen = (plen > 8) ? 8 : plen;
+                            /* Use bsd_crypt_des for overflow (desblk allocated once) */
+                            static void *_overflow_desblk;
+                            if (!_overflow_desblk) _overflow_desblk = malloc_lock(102400, "desblk");
+                            if (_overflow_desblk) {
+                                char passz[16], dbuf[64];
+                                memcpy(passz, pass, cplen);
+                                passz[cplen] = 0;
+                                extern char *bsd_crypt_des(char *, char *, char *, void *);
+                                char *crypted = bsd_crypt_des(passz, s1, dbuf, _overflow_desblk);
+                                if (crypted) {
+                                    Word_t *HPV;
+                                    JSLG(HPV, JudyJ[JOB_DESCRYPT], (unsigned char *)dbuf);
+                                    if (HPV && *HPV == 0) {
+                                        *HPV = 1;
+                                        PV_DEC(saltsnap[snap_idx].PV);
+                                        memcpy(synthetic_job.line, pass, cplen);
+                                        synthetic_job.line[cplen] = 0;
+                                        synthetic_job.pass = synthetic_job.line;
+                                        synthetic_job.clen = cplen;
+                                        prfound(&synthetic_job, dbuf);
+                                    }
+                                }
+                            }
+                            break;
+                        }
                         }
                     }
                 }
             }
         }
 
-        if (op_cat == GPU_CAT_ITER)
-            hashcnt += (uint64_t)g->count * (Maxiter - 1);
-        else
-            hashcnt += (uint64_t)g->count * nsalts_packed * Maxiter;
-
         if (synthetic_job.outlen > 0) {
             fwrite(outbuf, synthetic_job.outlen, 1, stdout);
             fflush(stdout);
             synthetic_job.outlen = 0;
         }
+
+        /* Mask overflow retry: resume from the highest mask_idx seen + 1 */
+        if (dispatch_retry) {
+            gpu_opencl_set_mask_resume(max_mask_idx);
+        }
+
+        } while (dispatch_retry);  /* retry mask dispatch on overflow */
+
+        /* Hash count: added once per batch (retries don't add extra computation) */
+        if (op_cat == GPU_CAT_MASK)
+            hashcnt += (uint64_t)g->count * gpu_mask_total;
+        else if (op_cat == GPU_CAT_ITER)
+            hashcnt += (uint64_t)g->count * (Maxiter - 1);
+        else if (g->op == JOB_PHPBB3) {
+            uint64_t total_iter = 0;
+            for (int si = 0; si < nsalts_packed; si++)
+                total_iter += phpbb3_iter_count(salts_packed + soff[si], slen[si]);
+            hashcnt += (uint64_t)g->count * total_iter;
+        } else
+            hashcnt += (uint64_t)g->count * nsalts_packed * Maxiter;
 
         if (hashcnt > 10000000 || found > 0) {
             possess(FreeWaiting);
@@ -627,15 +885,14 @@ int gpujob_init(int num_jobg) {
     release(GPUSchedLock);
     _gpu_waiter_count = num_jobg;  /* at least maxt+1 */
     for (int i = 0; i < _gpu_waiter_count; i++) {
-        struct gpu_waiter *w = (struct gpu_waiter *)calloc(1, sizeof(*w));
+        struct gpu_waiter *w = (struct gpu_waiter *)malloc_lock(sizeof(*w), "gpu_waiter");
         w->wake = new_lock(0);
         w->next = gpu_waiter_pool;
         gpu_waiter_pool = w;
     }
 
     for (int i = 0; i < num_jobg; i++) {
-        struct jobg *g = (struct jobg *)calloc(1, sizeof(struct jobg));
-        if (!g) return -1;
+        struct jobg *g = (struct jobg *)malloc_lock(sizeof(struct jobg), "jobg");
         if (GPUFreeTail) {
             *GPUFreeTail = g;
             GPUFreeTail = &(g->next);
@@ -716,7 +973,7 @@ struct jobg *gpujob_get_free(char *filename, unsigned int startline) {
         /* Different file — wait for current file to finish */
         struct gpu_waiter *w = gpu_waiter_pool;
         if (w) gpu_waiter_pool = w->next;
-        else w = (struct gpu_waiter *)calloc(1, sizeof(*w));
+        else w = (struct gpu_waiter *)malloc_lock(sizeof(*w), "gpu_waiter");
         if (!w->wake) w->wake = new_lock(0);
         w->filename = filename;
         w->startline = startline;
@@ -776,12 +1033,41 @@ void gpujob_submit(struct jobg *g) {
     release(GPUSchedLock);
 }
 
+/* Non-blocking version: returns NULL immediately if no free buffer. */
+struct jobg *gpujob_try_get_free(void) {
+    if (!_gpujob_ready) return NULL;
+    possess(GPUFreeWaiting);
+    if (peek_lock(GPUFreeWaiting) == 0) {
+        release(GPUFreeWaiting);
+        return NULL;
+    }
+    struct jobg *g = GPUFreeHead;
+    GPUFreeHead = g->next;
+    g->next = NULL;
+    if (GPUFreeHead == NULL)
+        GPUFreeTail = &GPUFreeHead;
+    twist(GPUFreeWaiting, BY, -1);
+    g->count = 0;
+    g->passbuf_pos = 0;
+    return g;
+}
+
 int gpujob_available(void) {
     return _gpujob_ready;
 }
 
 int gpujob_batch_max(void) {
     return _gpu_batch_max;
+}
+
+int gpujob_queue_depth(void) {
+    if (!_gpujob_ready) return 0;
+    return (int)peek_lock(GPUWorkWaiting);
+}
+
+int gpujob_free_count(void) {
+    if (!_gpujob_ready) return 0;
+    return (int)peek_lock(GPUFreeWaiting);
 }
 
 int gpu_op_category(int op) {
@@ -797,15 +1083,18 @@ int gpu_op_category(int op) {
     case JOB_MD5PASSSALT:
     case JOB_SHA256SALTPASS:
     case JOB_SHA256PASSSALT:
+    case JOB_SHA1SALTPASS:
+    case JOB_SHA1PASSSALT:
     case JOB_MD5CRYPT:
+    case JOB_PHPBB3:
+    case JOB_DESCRYPT:
         return GPU_CAT_SALTPASS;
     case JOB_MD5_MD5SALTMD5PASS:
         return GPU_CAT_SALTED;
-    /* Bare MD5 iterated -- disabled pending larger batch sizes
-    case JOB_MD5:
-    case JOB_MD5UC:
+    case JOB_SHA1DRU:
         return GPU_CAT_ITER;
-    */
+    case JOB_MD5:
+        return GPU_CAT_MASK;
     default:
         return GPU_CAT_NONE;
     }

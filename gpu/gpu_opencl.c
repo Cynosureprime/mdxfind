@@ -25,7 +25,8 @@
 struct gpu_device {
     cl_context       ctx;
     cl_command_queue  queue;
-    cl_program        prog;
+    cl_program        prog;           /* selftest program (common only) */
+    cl_program        fam_prog[FAM_COUNT]; /* per-family compiled programs */
     cl_device_id      dev;
     cl_kernel         kern_salt_iter; /* special: salted iteration override for Maxiter>1 */
     char              name[256];
@@ -49,6 +50,9 @@ struct gpu_device {
     cl_mem b_hexhashes, b_hexlens, b_params;
     size_t hexhash_cap;
     uint32_t *h_hits;    /* host-side hit buffer */
+
+    /* Mask mode */
+    cl_mem bgpu_mask_desc;  /* mask descriptor: charset IDs per position */
 };
 
 static struct gpu_device gpu_devs[MAX_GPU_DEVICES];
@@ -61,6 +65,7 @@ static uint32_t _hash_data_count = 0;
 static int _overflow_count = 0;
 static int _max_iter = 1;
 static int _gpu_op = 0;
+static uint32_t _mask_resume = 0;  /* mask_start override for overflow retry */
 
 /* ---- Per-kernel autotune state ---- */
 #define TUNE_CANDIDATES 4
@@ -159,6 +164,10 @@ typedef struct {
     uint32_t max_hits;
     uint32_t overflow_count;
     uint32_t max_iter;
+    uint32_t num_masks;
+    uint32_t mask_start;
+    uint32_t n_prepend;
+    uint32_t n_append;
 } OCLParams;
 
 /* ---- Load kernel source from file ---- */
@@ -174,311 +183,32 @@ static char *load_kernel_file(const char *path) {
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-    char *src = (char *)malloc(sz + 1);
+    char *src = (char *)malloc_lock(sz + 1,"load_kernel");
     fread(src, 1, sz, f);
     src[sz] = 0;
     fclose(f);
     return src;
 }
 
-/* ---- Embedded kernel source (auto-generated from gpu_kernels.cl) ---- */
-#include "gpu_kernels_str.h"
-static const char *kernel_source_embedded_unused =
-"typedef struct {\n"
-"    ulong compact_mask;\n"
-"    uint num_words;\n"
-"    uint num_salts;\n"
-"    uint max_probe;\n"
-"    uint hash_data_count;\n"
-"    uint max_hits;\n"
-"    uint overflow_count;\n"
-"    uint max_iter;\n"
-"} OCLParams;\n"
-"\n"
-"__constant uint K[64] = {\n"
-"    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,\n"
-"    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,\n"
-"    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,\n"
-"    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,\n"
-"    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,\n"
-"    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,\n"
-"    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,\n"
-"    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391\n"
-"};\n"
-"__constant uint S[64] = {\n"
-"    7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,\n"
-"    5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,\n"
-"    4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,\n"
-"    6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21\n"
-"};\n"
-"\n"
-"#define FF(a,b,c,d,m,s,k) { a += ((b&c)|(~b&d)) + m + k; a = b + rotate(a,s); }\n"
-"#define GG(a,b,c,d,m,s,k) { a += ((d&b)|(~d&c)) + m + k; a = b + rotate(a,s); }\n"
-"#define HH(a,b,c,d,m,s,k) { a += (b^c^d) + m + k; a = b + rotate(a,s); }\n"
-"#define II(a,b,c,d,m,s,k) { a += (c^(~d|b)) + m + k; a = b + rotate(a,s); }\n"
-"\n"
-"void md5_block(uint *h0, uint *h1, uint *h2, uint *h3, uint *M) {\n"
-"    uint a = *h0, b = *h1, c = *h2, d = *h3;\n"
-"    FF(a,b,c,d,M[0],(uint)7,0xd76aa478u);  FF(d,a,b,c,M[1],(uint)12,0xe8c7b756u);\n"
-"    FF(c,d,a,b,M[2],(uint)17,0x242070dbu);  FF(b,c,d,a,M[3],(uint)22,0xc1bdceeeu);\n"
-"    FF(a,b,c,d,M[4],(uint)7,0xf57c0fafu);   FF(d,a,b,c,M[5],(uint)12,0x4787c62au);\n"
-"    FF(c,d,a,b,M[6],(uint)17,0xa8304613u);  FF(b,c,d,a,M[7],(uint)22,0xfd469501u);\n"
-"    FF(a,b,c,d,M[8],(uint)7,0x698098d8u);   FF(d,a,b,c,M[9],(uint)12,0x8b44f7afu);\n"
-"    FF(c,d,a,b,M[10],(uint)17,0xffff5bb1u); FF(b,c,d,a,M[11],(uint)22,0x895cd7beu);\n"
-"    FF(a,b,c,d,M[12],(uint)7,0x6b901122u);  FF(d,a,b,c,M[13],(uint)12,0xfd987193u);\n"
-"    FF(c,d,a,b,M[14],(uint)17,0xa679438eu); FF(b,c,d,a,M[15],(uint)22,0x49b40821u);\n"
-"    GG(a,b,c,d,M[1],(uint)5,0xf61e2562u);   GG(d,a,b,c,M[6],(uint)9,0xc040b340u);\n"
-"    GG(c,d,a,b,M[11],(uint)14,0x265e5a51u); GG(b,c,d,a,M[0],(uint)20,0xe9b6c7aau);\n"
-"    GG(a,b,c,d,M[5],(uint)5,0xd62f105du);   GG(d,a,b,c,M[10],(uint)9,0x02441453u);\n"
-"    GG(c,d,a,b,M[15],(uint)14,0xd8a1e681u); GG(b,c,d,a,M[4],(uint)20,0xe7d3fbc8u);\n"
-"    GG(a,b,c,d,M[9],(uint)5,0x21e1cde6u);   GG(d,a,b,c,M[14],(uint)9,0xc33707d6u);\n"
-"    GG(c,d,a,b,M[3],(uint)14,0xf4d50d87u);  GG(b,c,d,a,M[8],(uint)20,0x455a14edu);\n"
-"    GG(a,b,c,d,M[13],(uint)5,0xa9e3e905u);  GG(d,a,b,c,M[2],(uint)9,0xfcefa3f8u);\n"
-"    GG(c,d,a,b,M[7],(uint)14,0x676f02d9u);  GG(b,c,d,a,M[12],(uint)20,0x8d2a4c8au);\n"
-"    HH(a,b,c,d,M[5],(uint)4,0xfffa3942u);   HH(d,a,b,c,M[8],(uint)11,0x8771f681u);\n"
-"    HH(c,d,a,b,M[11],(uint)16,0x6d9d6122u); HH(b,c,d,a,M[14],(uint)23,0xfde5380cu);\n"
-"    HH(a,b,c,d,M[1],(uint)4,0xa4beea44u);   HH(d,a,b,c,M[4],(uint)11,0x4bdecfa9u);\n"
-"    HH(c,d,a,b,M[7],(uint)16,0xf6bb4b60u);  HH(b,c,d,a,M[10],(uint)23,0xbebfbc70u);\n"
-"    HH(a,b,c,d,M[13],(uint)4,0x289b7ec6u);  HH(d,a,b,c,M[0],(uint)11,0xeaa127fau);\n"
-"    HH(c,d,a,b,M[3],(uint)16,0xd4ef3085u);  HH(b,c,d,a,M[6],(uint)23,0x04881d05u);\n"
-"    HH(a,b,c,d,M[9],(uint)4,0xd9d4d039u);   HH(d,a,b,c,M[12],(uint)11,0xe6db99e5u);\n"
-"    HH(c,d,a,b,M[15],(uint)16,0x1fa27cf8u); HH(b,c,d,a,M[2],(uint)23,0xc4ac5665u);\n"
-"    II(a,b,c,d,M[0],(uint)6,0xf4292244u);   II(d,a,b,c,M[7],(uint)10,0x432aff97u);\n"
-"    II(c,d,a,b,M[14],(uint)15,0xab9423a7u); II(b,c,d,a,M[5],(uint)21,0xfc93a039u);\n"
-"    II(a,b,c,d,M[12],(uint)6,0x655b59c3u);  II(d,a,b,c,M[3],(uint)10,0x8f0ccc92u);\n"
-"    II(c,d,a,b,M[10],(uint)15,0xffeff47du); II(b,c,d,a,M[1],(uint)21,0x85845dd1u);\n"
-"    II(a,b,c,d,M[8],(uint)6,0x6fa87e4fu);   II(d,a,b,c,M[15],(uint)10,0xfe2ce6e0u);\n"
-"    II(c,d,a,b,M[6],(uint)15,0xa3014314u);  II(b,c,d,a,M[13],(uint)21,0x4e0811a1u);\n"
-"    II(a,b,c,d,M[4],(uint)6,0xf7537e82u);   II(d,a,b,c,M[11],(uint)10,0xbd3af235u);\n"
-"    II(c,d,a,b,M[2],(uint)15,0x2ad7d2bbu);  II(b,c,d,a,M[9],(uint)21,0xeb86d391u);\n"
-"    *h0 += a; *h1 += b; *h2 += c; *h3 += d;\n"
-"}\n"
-"\n"
-"ulong compact_mix(ulong k) {\n"
-"    k ^= k >> 33; k *= 0xff51afd7ed558ccdUL;\n"
-"    k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53UL;\n"
-"    k ^= k >> 33; return k;\n"
-"}\n"
-"\n"
-"int probe_compact(uint hx, uint hy, uint hz, uint hw,\n"
-"    __global const uint *compact_fp, __global const uint *compact_idx,\n"
-"    ulong compact_mask, uint max_probe, uint hash_data_count,\n"
-"    __global const uchar *hash_data_buf, __global const ulong *hash_data_off,\n"
-"    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,\n"
-"    __global const uint *overflow_offsets, uint overflow_count)\n"
-"{\n"
-"    ulong key = ((ulong)hy << 32) | hx;\n"
-"    uint fp = (uint)(key >> 32);\n"
-"    if (fp == 0) fp = 1;\n"
-"    ulong pos = compact_mix(key) & compact_mask;\n"
-"    for (int p = 0; p < (int)max_probe; p++) {\n"
-"        uint cfp = compact_fp[pos];\n"
-"        if (cfp == 0) break;\n"
-"        if (cfp == fp) {\n"
-"            uint idx = compact_idx[pos];\n"
-"            if (idx < hash_data_count) {\n"
-"                ulong off = hash_data_off[idx];\n"
-"                __global const uint *ref = (__global const uint *)(hash_data_buf + off);\n"
-"                if (hx == ref[0] && hy == ref[1] && hz == ref[2] && hw == ref[3])\n"
-"                    return 1;\n"
-"            }\n"
-"        }\n"
-"        pos = (pos + 1) & compact_mask;\n"
-"    }\n"
-"    if (overflow_count > 0) {\n"
-"        int lo = 0, hi = (int)overflow_count - 1;\n"
-"        while (lo <= hi) {\n"
-"            int mid = (lo + hi) / 2;\n"
-"            ulong mkey = overflow_keys[mid];\n"
-"            if (key < mkey) hi = mid - 1;\n"
-"            else if (key > mkey) lo = mid + 1;\n"
-"            else {\n"
-"                uint ooff = overflow_offsets[mid];\n"
-"                __global const uint *oref = (__global const uint *)(overflow_hashes + ooff);\n"
-"                if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3]) return 1;\n"
-"                for (int d = mid-1; d >= 0 && overflow_keys[d] == key; d--) {\n"
-"                    oref = (__global const uint *)(overflow_hashes + overflow_offsets[d]);\n"
-"                    if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3]) return 1;\n"
-"                }\n"
-"                for (int d = mid+1; d < (int)overflow_count && overflow_keys[d] == key; d++) {\n"
-"                    oref = (__global const uint *)(overflow_hashes + overflow_offsets[d]);\n"
-"                    if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3]) return 1;\n"
-"                }\n"
-"                break;\n"
-"            }\n"
-"        }\n"
-"    }\n"
-"    return 0;\n"
-"}\n"
-"\n"
-"__kernel void md5salt_batch(\n"
-"    __global const uchar *hexhashes, __global const ushort *hexlens,\n"
-"    __global const uchar *salts, __global const uint *salt_offsets, __global const ushort *salt_lens,\n"
-"    __global const uint *compact_fp, __global const uint *compact_idx,\n"
-"    __global const OCLParams *params_buf,\n"
-"    __global const uchar *hash_data_buf, __global const ulong *hash_data_off, __global const ushort *hash_data_len,\n"
-"    __global uint *hits, __global volatile uint *hit_count,\n"
-"    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,\n"
-"    __global const uint *overflow_offsets, __global const ushort *overflow_lengths)\n"
-"{\n"
-"    OCLParams params = *params_buf;\n"
-"    uint tid = get_global_id(0);\n"
-"    uint word_idx = tid / params.num_salts;\n"
-"    uint salt_idx = tid % params.num_salts;\n"
-"    if (word_idx >= params.num_words) return;\n"
-"\n"
-"    uint M[16];\n"
-"    uint hoff = word_idx * 256;\n"
-"    __global const uint *mwords = (__global const uint *)(hexhashes + hoff);\n"
-"    for (int i = 0; i < 8; i++) M[i] = mwords[i];\n"
-"\n"
-"    /* Prestate rounds 0-7 */\n"
-"    uint a = 0x67452301, b = 0xEFCDAB89, c = 0x98BADCFE, d = 0x10325476;\n"
-"    for (int i = 0; i < 8; i++) {\n"
-"        uint f = (b & c) | (~b & d);\n"
-"        f = f + a + K[i] + M[i];\n"
-"        a = d; d = c; c = b;\n"
-"        b = b + rotate(f, S[i]);\n"
-"    }\n"
-"\n"
-"    uint soff = salt_offsets[salt_idx];\n"
-"    int slen = salt_lens[salt_idx];\n"
-"    int total_len = 32 + slen;\n"
-"\n"
-"    uint hx, hy, hz, hw;\n"
-"    for (int i = 8; i < 16; i++) M[i] = 0;\n"
-"    uchar *mbytes = (uchar *)M;\n"
-"    for (int i = 0; i < slen; i++)\n"
-"        mbytes[32 + i] = salts[soff + i];\n"
-"    mbytes[total_len] = 0x80;\n"
-"    M[14] = total_len * 8;\n"
-"    /* Use full md5_block (prestate optimization deferred to tuning phase) */\n"
-"    hx = 0x67452301; hy = 0xEFCDAB89; hz = 0x98BADCFE; hw = 0x10325476;\n"
-"    md5_block(&hx, &hy, &hz, &hw, M);\n"
-"\n"
-"    if (probe_compact(hx, hy, hz, hw, compact_fp, compact_idx,\n"
-"                      params.compact_mask, params.max_probe, params.hash_data_count,\n"
-"                      hash_data_buf, hash_data_off,\n"
-"                      overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {\n"
-"        uint slot = atomic_add(hit_count, 1u);\n"
-"        if (slot < params.max_hits) {\n"
-"            uint base = slot * 6;\n"
-"            hits[base] = word_idx; hits[base+1] = salt_idx;\n"
-"            hits[base+2] = hx; hits[base+3] = hy;\n"
-"            hits[base+4] = hz; hits[base+5] = hw;\n"
-"        }\n"
-"    }\n"
-"}\n"
-"\n"
-"__kernel void md5salt_sub8_24(\n"
-"    __global const uchar *hexhashes, __global const ushort *hexlens,\n"
-"    __global const uchar *salts, __global const uint *salt_offsets, __global const ushort *salt_lens,\n"
-"    __global const uint *compact_fp, __global const uint *compact_idx,\n"
-"    __global const OCLParams *params_buf,\n"
-"    __global const uchar *hash_data_buf, __global const ulong *hash_data_off, __global const ushort *hash_data_len,\n"
-"    __global uint *hits, __global volatile uint *hit_count,\n"
-"    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,\n"
-"    __global const uint *overflow_offsets, __global const ushort *overflow_lengths)\n"
-"{\n"
-"    OCLParams params = *params_buf;\n"
-"    uint tid = get_global_id(0);\n"
-"    uint word_idx = tid / params.num_salts;\n"
-"    uint salt_idx = tid % params.num_salts;\n"
-"    if (word_idx >= params.num_words) return;\n"
-"\n"
-"    uint M[16];\n"
-"    __global const uint *mwords = (__global const uint *)(hexhashes + word_idx * 256);\n"
-"    for (int i = 0; i < 4; i++) M[i] = mwords[i];\n"
-"    for (int i = 4; i < 16; i++) M[i] = 0;\n"
-"\n"
-"    uint soff = salt_offsets[salt_idx];\n"
-"    int slen = salt_lens[salt_idx];\n"
-"    int total_len = 16 + slen;\n"
-"    uchar *mbytes = (uchar *)M;\n"
-"    for (int i = 0; i < slen; i++) mbytes[16 + i] = salts[soff + i];\n"
-"    mbytes[total_len] = 0x80;\n"
-"    M[14] = total_len * 8;\n"
-"\n"
-"    uint hx = 0x67452301, hy = 0xEFCDAB89, hz = 0x98BADCFE, hw = 0x10325476;\n"
-"    md5_block(&hx, &hy, &hz, &hw, M);\n"
-"\n"
-"    if (probe_compact(hx, hy, hz, hw, compact_fp, compact_idx,\n"
-"                      params.compact_mask, params.max_probe, params.hash_data_count,\n"
-"                      hash_data_buf, hash_data_off,\n"
-"                      overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {\n"
-"        uint slot = atomic_add(hit_count, 1u);\n"
-"        if (slot < params.max_hits) {\n"
-"            uint base = slot * 6;\n"
-"            hits[base] = word_idx; hits[base+1] = salt_idx;\n"
-"            hits[base+2] = hx; hits[base+3] = hy;\n"
-"            hits[base+4] = hz; hits[base+5] = hw;\n"
-"        }\n"
-"    }\n"
-"}\n"
-"\n"
-"__kernel void md5salt_iter(\n"
-"    __global const uchar *hexhashes, __global const ushort *hexlens,\n"
-"    __global const uchar *salts, __global const uint *salt_offsets, __global const ushort *salt_lens,\n"
-"    __global const uint *compact_fp, __global const uint *compact_idx,\n"
-"    __global const OCLParams *params_buf,\n"
-"    __global const uchar *hash_data_buf, __global const ulong *hash_data_off, __global const ushort *hash_data_len,\n"
-"    __global uint *hits, __global volatile uint *hit_count,\n"
-"    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,\n"
-"    __global const uint *overflow_offsets, __global const ushort *overflow_lengths)\n"
-"{\n"
-"    OCLParams params = *params_buf;\n"
-"    uint tid = get_global_id(0);\n"
-"    uint word_idx = tid / params.num_salts;\n"
-"    uint salt_idx = tid % params.num_salts;\n"
-"    if (word_idx >= params.num_words) return;\n"
-"\n"
-"    uint M[16];\n"
-"    __global const uint *mwords = (__global const uint *)(hexhashes + word_idx * 256);\n"
-"    for (int i = 0; i < 8; i++) M[i] = mwords[i];\n"
-"    for (int i = 8; i < 16; i++) M[i] = 0;\n"
-"\n"
-"    uint soff = salt_offsets[salt_idx];\n"
-"    int slen = salt_lens[salt_idx];\n"
-"    int total_len = 32 + slen;\n"
-"    uchar *mbytes = (uchar *)M;\n"
-"    for (int i = 0; i < slen; i++) mbytes[32 + i] = salts[soff + i];\n"
-"    mbytes[total_len] = 0x80;\n"
-"    M[14] = total_len * 8;\n"
-"\n"
-"    uint hx = 0x67452301, hy = 0xEFCDAB89, hz = 0x98BADCFE, hw = 0x10325476;\n"
-"    md5_block(&hx, &hy, &hz, &hw, M);\n"
-"\n"
-"    for (uint iter = 0; iter < params.max_iter; iter++) {\n"
-"        if (iter > 0) {\n"
-"            uint hwords[4]; hwords[0]=hx; hwords[1]=hy; hwords[2]=hz; hwords[3]=hw;\n"
-"            uchar *hb = (uchar *)hwords;\n"
-"            uint Mi[16];\n"
-"            uchar *mb = (uchar *)Mi;\n"
-"            for (int i = 0; i < 16; i++) {\n"
-"                uchar hi = hb[i] >> 4, lo = hb[i] & 0xf;\n"
-"                mb[i*2]   = hi + (hi < 10 ? '0' : 'a' - 10);\n"
-"                mb[i*2+1] = lo + (lo < 10 ? '0' : 'a' - 10);\n"
-"            }\n"
-"            Mi[8] = 0x80; Mi[9]=0; Mi[10]=0; Mi[11]=0;\n"
-"            Mi[12]=0; Mi[13]=0; Mi[14]=256; Mi[15]=0;\n"
-"            hx = 0x67452301; hy = 0xEFCDAB89; hz = 0x98BADCFE; hw = 0x10325476;\n"
-"            md5_block(&hx, &hy, &hz, &hw, Mi);\n"
-"        }\n"
-"        if (probe_compact(hx, hy, hz, hw, compact_fp, compact_idx,\n"
-"                          params.compact_mask, params.max_probe, params.hash_data_count,\n"
-"                          hash_data_buf, hash_data_off,\n"
-"                          overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {\n"
-"            uint slot = atomic_add(hit_count, 1u);\n"
-"            if (slot < params.max_hits) {\n"
-"                uint base = slot * 7;\n"
-"                hits[base] = word_idx; hits[base+1] = salt_idx;\n"
-"                hits[base+2] = iter + 1;\n"
-"                hits[base+3] = hx; hits[base+4] = hy;\n"
-"                hits[base+5] = hz; hits[base+6] = hw;\n"
-"            }\n"
-"        }\n"
-"    }\n"
+/* ---- Embedded kernel sources (auto-generated from gpu_*.cl via cl2str.py --all) ---- */
+#include "gpu_common_str.h"
+#include "gpu_md5salt_str.h"
+#include "gpu_md5saltpass_str.h"
+#include "gpu_md5iter_str.h"
+#include "gpu_phpbb3_str.h"
+#include "gpu_md5crypt_str.h"
+#include "gpu_md5_md5saltmd5pass_str.h"
+#include "gpu_sha1_str.h"
+#include "gpu_sha256_str.h"
+#include "gpu_md5mask_str.h"
+#include "gpu_descrypt_str.h"
+#include "gpu_md5unsalted_str.h"
+/* Old monolithic kernel source removed — per-family compilation now.
+ * See gpu_common_str.h + gpu_*_str.h
+ *
+ * REMOVED: ~300 lines of inline kernel string (kernel_source_embedded_unused)
 "}\n";
+#endif
 
 /* ---- List GPU devices and exit (called early from option parsing) ---- */
 void gpu_opencl_list_devices(void) {
@@ -532,24 +262,47 @@ static cl_mem dev_buf(struct gpu_device *d, size_t size, cl_mem_flags flags) {
     return clCreateBuffer(d->ctx, flags, size ? size : 4, NULL, &err);
 }
 
-/* Kernel-to-op mapping table. Each entry: kernel function name + list of ops it serves.
- * Adding a new GPU algorithm = one line here + the kernel in gpu_kernels.cl. */
+/* Per-family kernel source (concatenated with gpu_common_str at compile time) */
+static const char *family_source[FAM_COUNT] = {
+    [FAM_MD5SALT]            = gpu_md5salt_str,
+    [FAM_MD5SALTPASS]        = gpu_md5saltpass_str,
+    [FAM_MD5ITER]            = gpu_md5iter_str,
+    [FAM_PHPBB3]             = gpu_phpbb3_str,
+    [FAM_MD5CRYPT]           = gpu_md5crypt_str,
+    [FAM_MD5_MD5SALTMD5PASS] = gpu_md5_md5saltmd5pass_str,
+    [FAM_SHA1]               = gpu_sha1_str,
+    [FAM_SHA256]             = gpu_sha256_str,
+    [FAM_MD5MASK]            = gpu_md5mask_str,
+    [FAM_DESCRYPT]           = gpu_descrypt_str,
+    [FAM_MD5UNSALTED]        = gpu_md5unsalted_str,
+};
+
+/* Kernel-to-op mapping table. Each entry: kernel function name, ops it serves, family.
+ * Adding a new GPU algorithm = one line here + a .cl file in gpu/. */
 static const struct {
     const char *name;
     int ops[8];      /* -1 terminated */
+    int family;
 } kernel_map[] = {
-    {"md5salt_batch",       {JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, -1}},
-    {"md5salt_sub8_24",     {JOB_MD5sub8_24SALT, -1}},
-    {"md5salt_iter",        {-1}},  /* special: salted iteration override */
-    {"md5saltpass_batch",   {JOB_MD5SALTPASS, -1}},
-    {"md5passsalt_batch",   {JOB_MD5PASSSALT, -1}},
-    {"md5_iter_lc",         {JOB_MD5, -1}},
-    {"md5_iter_uc",         {JOB_MD5UC, -1}},
-    {"sha256passsalt_batch", {JOB_SHA256PASSSALT, -1}},
-    {"sha256saltpass_batch", {JOB_SHA256SALTPASS, -1}},
-    {"md5_md5saltmd5pass_batch", {JOB_MD5_MD5SALTMD5PASS, -1}},
-    {"md5crypt_batch",       {JOB_MD5CRYPT, -1}},
-    {NULL, {-1}}
+    {"md5salt_batch",       {JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, -1}, FAM_MD5SALT},
+    {"md5salt_sub8_24",     {JOB_MD5sub8_24SALT, -1}, FAM_MD5SALT},
+    {"md5salt_iter",        {-1}, FAM_MD5SALT},  /* special: salted iteration override */
+    {"md5saltpass_batch",   {JOB_MD5SALTPASS, -1}, FAM_MD5SALTPASS},
+    {"md5passsalt_batch",   {JOB_MD5PASSSALT, -1}, FAM_MD5SALTPASS},
+    {"md5_iter_lc",         {JOB_MD5, -1}, FAM_MD5ITER},
+    {"md5_iter_uc",         {JOB_MD5UC, -1}, FAM_MD5ITER},
+    {"sha256passsalt_batch", {JOB_SHA256PASSSALT, -1}, FAM_SHA256},
+    {"sha256saltpass_batch", {JOB_SHA256SALTPASS, -1}, FAM_SHA256},
+    {"md5_mask_batch",        {JOB_MD5, -1}, FAM_MD5MASK},
+    {"sha1dru_batch",         {JOB_SHA1DRU, -1}, FAM_SHA1},
+    {"sha1passsalt_batch",    {JOB_SHA1PASSSALT, -1}, FAM_SHA1},
+    {"sha1saltpass_batch",   {JOB_SHA1SALTPASS, -1}, FAM_SHA1},
+    {"phpbb3_batch",          {JOB_PHPBB3, -1}, FAM_PHPBB3},
+    {"md5_md5saltmd5pass_batch", {JOB_MD5_MD5SALTMD5PASS, -1}, FAM_MD5_MD5SALTMD5PASS},
+    {"md5crypt_batch",       {JOB_MD5CRYPT, -1}, FAM_MD5CRYPT},
+    {"descrypt_batch",       {JOB_DESCRYPT, -1}, FAM_DESCRYPT},
+    {"md5_unsalted_batch",   {JOB_MD5, -1}, FAM_MD5UNSALTED},
+    {NULL, {-1}, 0}
 };
 #define KERN_ITER_IDX 2  /* index of md5salt_iter in kernel_map (for Maxiter override) */
 
@@ -560,7 +313,7 @@ static void CL_CALLBACK ocl_error_callback(const char *errinfo,
 }
 
 /* Initialize one GPU device */
-static int init_device(int di, cl_device_id dev_id, const char *kernel_source) {
+static int init_device(int di, cl_device_id dev_id) {
     struct gpu_device *d = &gpu_devs[di];
     cl_int err;
 
@@ -573,31 +326,47 @@ static int init_device(int di, cl_device_id dev_id, const char *kernel_source) {
     d->queue = clCreateCommandQueue(d->ctx, dev_id, CL_QUEUE_PROFILING_ENABLE, &err);
     if (!d->queue) return -1;
 
-    d->prog = clCreateProgramWithSource(d->ctx, 1, &kernel_source, NULL, &err);
+    /* Compile common-only program (warms up NVIDIA driver state) */
+    d->prog = clCreateProgramWithSource(d->ctx, 1, (const char *[]){gpu_common_str}, NULL, &err);
     if (!d->prog) return -1;
-
-    const char *build_opts = NULL;
     fprintf(stderr, "OpenCL GPU[%d]: kernel build\n", di);
-    err = clBuildProgram(d->prog, 1, &dev_id, build_opts, NULL, NULL);
-    { char log[4096]; size_t loglen = 0;
-      clGetProgramBuildInfo(d->prog, dev_id, CL_PROGRAM_BUILD_LOG, sizeof(log), log, &loglen);
-      if (err != CL_SUCCESS) {
-          fprintf(stderr, "OpenCL GPU[%d] kernel compile error:\n%s\n", di, log);
-          return -1;
-      }
-      /* Only show build log on error — warnings are suppressed */
+    err = clBuildProgram(d->prog, 1, &dev_id, "-cl-std=CL1.2", NULL, NULL);
+    if (err != CL_SUCCESS) {
+        char log[4096];
+        clGetProgramBuildInfo(d->prog, dev_id, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+        fprintf(stderr, "OpenCL GPU[%d] common kernel compile error:\n%s\n", di, log);
+        return -1;
     }
 
-    /* Create and register all kernels from the kernel_map table */
+    /* Compile only the md5salt family at init (needed for selftest/probe).
+     * Other families are compiled later by gpu_opencl_compile_families(). */
+    memset(d->fam_prog, 0, sizeof(d->fam_prog));
     memset(&dev_kerns[di], 0, sizeof(dev_kerns[di]));
     d->kern_salt_iter = NULL;
-    for (int k = 0; kernel_map[k].name; k++) {
-        cl_kernel kern = clCreateKernel(d->prog, kernel_map[k].name, &err);
-        if (!kern) continue;
-        if (k == KERN_ITER_IDX)
-            d->kern_salt_iter = kern;  /* save salted iteration kernel */
-        for (int j = 0; kernel_map[k].ops[j] >= 0; j++)
-            kern_register(di, kernel_map[k].ops[j], kern);
+    {
+        const char *sources[2] = { gpu_common_str, family_source[FAM_MD5SALT] };
+        d->fam_prog[FAM_MD5SALT] = clCreateProgramWithSource(d->ctx, 2, sources, NULL, &err);
+        if (d->fam_prog[FAM_MD5SALT]) {
+            err = clBuildProgram(d->fam_prog[FAM_MD5SALT], 1, &dev_id, "-cl-std=CL1.2", NULL, NULL);
+            if (err != CL_SUCCESS) {
+                char log[4096];
+                clGetProgramBuildInfo(d->fam_prog[FAM_MD5SALT], dev_id, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+                fprintf(stderr, "OpenCL GPU[%d] md5salt compile error:\n%s\n", di, log);
+                clReleaseProgram(d->fam_prog[FAM_MD5SALT]);
+                d->fam_prog[FAM_MD5SALT] = NULL;
+            }
+        }
+        /* Register md5salt kernels */
+        for (int k = 0; kernel_map[k].name; k++) {
+            if (kernel_map[k].family != FAM_MD5SALT) continue;
+            if (!d->fam_prog[FAM_MD5SALT]) continue;
+            cl_kernel kern = clCreateKernel(d->fam_prog[FAM_MD5SALT], kernel_map[k].name, &err);
+            if (!kern) continue;
+            if (k == KERN_ITER_IDX)
+                d->kern_salt_iter = kern;
+            for (int j = 0; kernel_map[k].ops[j] >= 0; j++)
+                kern_register(di, kernel_map[k].ops[j], kern);
+        }
     }
 
     /* Scale batch size to GPU capability */
@@ -605,10 +374,8 @@ static int init_device(int di, cl_device_id dev_id, const char *kernel_source) {
     clGetDeviceInfo(dev_id, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(compute_units), &compute_units, NULL);
     if (compute_units < 8)
         d->max_batch = compute_units * 8;   /* tiny GPU: 4 CU -> 32 words */
-    else if (compute_units < 32)
-        d->max_batch = compute_units * 16;  /* mid GPU: 16 CU -> 256 words */
     else
-        d->max_batch = GPUBATCH_MAX;        /* big GPU: full 512 */
+        d->max_batch = GPUBATCH_MAX;        /* 8+ CU: full 512 */
     if (d->max_batch < 16) d->max_batch = 16;
     if (d->max_batch > GPUBATCH_MAX) d->max_batch = GPUBATCH_MAX;
     fprintf(stderr, "OpenCL GPU[%d]: %u compute units, batch size %d\n",
@@ -619,7 +386,7 @@ static int init_device(int di, cl_device_id dev_id, const char *kernel_source) {
                                GPU_MAX_HITS * 11 * sizeof(uint32_t), NULL, &err);
     d->b_hit_count = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
                                      sizeof(uint32_t), NULL, &err);
-    d->h_hits = (uint32_t *)malloc(GPU_MAX_HITS * 11 * sizeof(uint32_t));
+    d->h_hits = (uint32_t *)malloc_lock(GPU_MAX_HITS * 11 * sizeof(uint32_t),"device_init");
     d->b_params = dev_buf(d, sizeof(OCLParams), CL_MEM_READ_ONLY);
 
     /* Dummy overflow buffers (replaced when overflow is loaded) */
@@ -647,7 +414,8 @@ static int probe_max_dispatch(int di) {
     struct gpu_device *d = &gpu_devs[di];
     cl_int err;
 
-    cl_kernel test_kern = clCreateKernel(d->prog, "md5salt_batch", &err);
+    cl_kernel test_kern = d->fam_prog[FAM_MD5SALT]
+        ? clCreateKernel(d->fam_prog[FAM_MD5SALT], "md5salt_batch", &err) : NULL;
     if (!test_kern) {
         fprintf(stderr, "OpenCL GPU[%d]: probe kernel not found (err=%d)\n", di, err);
         return 0;
@@ -704,7 +472,7 @@ static int probe_max_dispatch(int di) {
     memset(&params, 0, sizeof(params));
     params.compact_mask = 3;
     params.num_words = 32;
-    params.salt_start = 0;
+    // params.salt_start = 0;
     params.max_probe = 4;
     params.hash_data_count = 1;
     params.max_hits = 256;
@@ -727,9 +495,9 @@ static int probe_max_dispatch(int di) {
 
     /* Build salt buffer: salt[0] = "x", salt[1..max] = "y" */
     int max_salts = 4194304;
-    char *salt_data = (char *)malloc(max_salts);
-    uint32_t *salt_off = (uint32_t *)malloc(max_salts * sizeof(uint32_t));
-    uint16_t *salt_len = (uint16_t *)malloc(max_salts * sizeof(uint16_t));
+    char *salt_data = (char *)malloc_lock(max_salts,"salt_data");
+    uint32_t *salt_off = (uint32_t *)malloc_lock(max_salts * sizeof(uint32_t),"Salt_off");
+    uint16_t *salt_len = (uint16_t *)malloc_lock(max_salts * sizeof(uint16_t),"salt_len");
     salt_data[0] = 'x';
     for (int i = 1; i < max_salts; i++) salt_data[i] = 'y';
     for (int i = 0; i < max_salts; i++) { salt_off[i] = i; salt_len[i] = 1; }
@@ -774,7 +542,7 @@ static int probe_max_dispatch(int di) {
         int nsalts = test_sizes[t];
 
         params.num_salts = nsalts;
-        params.salt_start = 0;
+        // params.salt_start = 0;
         clEnqueueWriteBuffer(d->queue, b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
 
         /* Zero hit counter */
@@ -834,18 +602,7 @@ int gpu_opencl_init(void) {
     clGetPlatformIDs(8, plats, &nplat);
     if (nplat == 0) { fprintf(stderr, "OpenCL: no platforms\n"); return -1; }
 
-    /* Load kernel source */
-#ifdef DEBUG
-    const char *kernel_source = load_kernel_file("gpu_kernels.cl");
-    if (kernel_source) {
-        fprintf(stderr, "OpenCL GPU: loaded kernel from gpu_kernels.cl\n");
-    } else {
-        kernel_source = gpu_kernels_str;
-        fprintf(stderr, "OpenCL GPU: using embedded kernel\n");
-    }
-#else
-    const char *kernel_source = gpu_kernels_str;
-#endif
+    /* Kernel sources are per-family, compiled in init_device */
 
     /* Enumerate all GPU devices across all platforms.
      * -G 0,2,4 or -G 0-2: select specific devices.
@@ -863,8 +620,10 @@ int gpu_opencl_init(void) {
         for (cl_uint d = 0; d < ndev; d++) {
             char dname[256];
             cl_ulong gmem = 0;
+            cl_uint mhz = 0;
             clGetDeviceInfo(devs[d], CL_DEVICE_NAME, sizeof(dname), dname, NULL);
             clGetDeviceInfo(devs[d], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gmem), &gmem, NULL);
+            clGetDeviceInfo(devs[d], CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(mhz), &mhz, NULL);
 
             if (!device_allowed(all_dev_idx)) {
                 fprintf(stderr, "OpenCL GPU[%d]: %s - skipped\n", all_dev_idx, dname);
@@ -873,10 +632,21 @@ int gpu_opencl_init(void) {
             }
 
             if (num_gpu_devs < MAX_GPU_DEVICES) {
-                if (init_device(num_gpu_devs, devs[d], kernel_source) == 0) {
-                    fprintf(stderr, "OpenCL GPU[%d]: %s (%llu MB)\n", all_dev_idx, dname,
-                            (unsigned long long)(gmem / (1024*1024)));
+                if (init_device(num_gpu_devs, devs[d]) == 0) {
+                    fprintf(stderr, "OpenCL GPU[%d]: %s (%llu MB, %u MHz)\n", all_dev_idx, dname,
+                            (unsigned long long)(gmem / (1024*1024)), mhz);
                     int max_disp = probe_max_dispatch(num_gpu_devs);
+                    /* Mali GPUs have a 17-bit salt dimension limit —
+                     * silently drop work items beyond 2^17 salts.
+                     * Probe returns max_good in salts (not work items),
+                     * so convert: limit = max_salts * 32 test words.
+                     * If probe didn't catch it, force the limit. */
+                    if (strstr(dname, "Mali")) {
+                        if (max_disp > 0)
+                            max_disp *= 32;  /* probe result is in salts */
+                        else
+                            max_disp = 4194304;  /* 2^17 * 32 */
+                    }
                     gpu_devs[num_gpu_devs].max_dispatch = max_disp;
                     if (max_disp == 0)
                         fprintf(stderr, "OpenCL GPU[%d]: selftest passed all sizes (no dispatch limit)\n", all_dev_idx);
@@ -900,37 +670,53 @@ int gpu_opencl_init(void) {
     return 0;
 }
 
+/* Compile additional kernel families on demand. Called from main() after
+ * hash types are known. fam_mask is a bitmask of FAM_* values to compile. */
+void gpu_opencl_compile_families(unsigned int fam_mask) {
+    if (!ocl_ready) return;
+    for (int di = 0; di < num_gpu_devs; di++) {
+        struct gpu_device *d = &gpu_devs[di];
+        cl_int err;
+        for (int f = 0; f < FAM_COUNT; f++) {
+            if (d->fam_prog[f]) continue;  /* already compiled */
+            if (!(fam_mask & (1u << f))) continue;  /* not requested */
+            const char *sources[2] = { gpu_common_str, family_source[f] };
+            d->fam_prog[f] = clCreateProgramWithSource(d->ctx, 2, sources, NULL, &err);
+            if (!d->fam_prog[f]) continue;
+            err = clBuildProgram(d->fam_prog[f], 1, &d->dev, "-cl-std=CL1.2", NULL, NULL);
+            if (err != CL_SUCCESS) {
+                char log[4096];
+                clGetProgramBuildInfo(d->fam_prog[f], d->dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+                fprintf(stderr, "OpenCL GPU[%d] family %d compile error:\n%s\n", di, f, log);
+                clReleaseProgram(d->fam_prog[f]);
+                d->fam_prog[f] = NULL;
+                continue;
+            }
+            /* Register kernels from this family */
+            for (int k = 0; kernel_map[k].name; k++) {
+                if (kernel_map[k].family != f) continue;
+                cl_kernel kern = clCreateKernel(d->fam_prog[f], kernel_map[k].name, &err);
+                if (!kern) continue;
+                if (k == KERN_ITER_IDX)
+                    d->kern_salt_iter = kern;
+                for (int j = 0; kernel_map[k].ops[j] >= 0; j++)
+                    kern_register(di, kernel_map[k].ops[j], kern);
+            }
+        }
+    }
+}
+
 void gpu_opencl_shutdown(void) {
     if (!ocl_ready) return;
+    ocl_ready = 0;  /* prevent re-entry */
     for (int i = 0; i < num_gpu_devs; i++) {
         struct gpu_device *d = &gpu_devs[i];
-        if (d->b_compact_fp) clReleaseMemObject(d->b_compact_fp);
-        if (d->b_compact_idx) clReleaseMemObject(d->b_compact_idx);
-        if (d->b_hash_data) clReleaseMemObject(d->b_hash_data);
-        if (d->b_hash_data_off) clReleaseMemObject(d->b_hash_data_off);
-        if (d->b_hash_data_len) clReleaseMemObject(d->b_hash_data_len);
-        if (d->b_salt_data) clReleaseMemObject(d->b_salt_data);
-        if (d->b_salt_off) clReleaseMemObject(d->b_salt_off);
-        if (d->b_salt_len) clReleaseMemObject(d->b_salt_len);
-        if (d->b_hits) clReleaseMemObject(d->b_hits);
-        if (d->b_hit_count) clReleaseMemObject(d->b_hit_count);
-        if (d->b_params) clReleaseMemObject(d->b_params);
-        if (d->b_overflow_keys) clReleaseMemObject(d->b_overflow_keys);
-        if (d->b_overflow_hashes) clReleaseMemObject(d->b_overflow_hashes);
-        if (d->b_overflow_offsets) clReleaseMemObject(d->b_overflow_offsets);
-        if (d->b_overflow_lengths) clReleaseMemObject(d->b_overflow_lengths);
-        if (d->b_hexhashes) clReleaseMemObject(d->b_hexhashes);
-        if (d->b_hexlens) clReleaseMemObject(d->b_hexlens);
-        /* Release all registered kernels */
-        for (int k = 0; k < MAX_GPU_KERNELS; k++)
-            if (dev_kerns[i].kerns[k].kernel) clReleaseKernel(dev_kerns[i].kerns[k].kernel);
-        if (d->kern_salt_iter) clReleaseKernel(d->kern_salt_iter);
-        if (d->prog) clReleaseProgram(d->prog);
-        if (d->queue) clReleaseCommandQueue(d->queue);
-        if (d->ctx) clReleaseContext(d->ctx);
+        if (d->queue) clFinish(d->queue);  /* drain any pending GPU work */
+        /* Skip CL object releases — NVIDIA driver may have already torn
+         * down internal state by this point, causing NULL dereference
+         * inside clReleaseKernel.  Process exit reclaims everything. */
         free(d->h_hits);
     }
-    ocl_ready = 0;
 }
 
 int gpu_opencl_available(void) { return ocl_ready; }
@@ -969,52 +755,27 @@ int gpu_opencl_set_compact_table(int dev_idx,
     _compact_mask = compact_mask;
     _hash_data_count = hash_data_count;
 
-    /* Allocate GPU buffers then upload in chunks */
-#define GPU_CHUNK (1024 * 1024)  /* 1MB upload chunks */
-    d->b_compact_fp = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                     compact_size * sizeof(uint32_t), NULL, &err);
+    /* Allocate + upload in one call (CL_MEM_COPY_HOST_PTR) */
+    d->b_compact_fp = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     compact_size * sizeof(uint32_t), compact_fp, &err);
     if (err != CL_SUCCESS) goto alloc_fail;
-    d->b_compact_idx = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                      compact_size * sizeof(uint32_t), NULL, &err);
+    d->b_compact_idx = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      compact_size * sizeof(uint32_t), compact_idx, &err);
     if (err != CL_SUCCESS) goto alloc_fail;
-    d->b_hash_data = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                    hash_data_buf_size, NULL, &err);
+    d->b_hash_data = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    hash_data_buf_size, hash_data_buf, &err);
     if (err != CL_SUCCESS) goto alloc_fail;
 
-    uint64_t *off64 = (uint64_t *)malloc(hash_data_count * sizeof(uint64_t));
+    uint64_t *off64 = (uint64_t *)malloc_lock(hash_data_count * sizeof(uint64_t),"gpu temp");
     for (size_t i = 0; i < hash_data_count; i++) off64[i] = hash_data_off[i];
-    d->b_hash_data_off = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                        hash_data_count * sizeof(uint64_t), NULL, &err);
+    d->b_hash_data_off = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        hash_data_count * sizeof(uint64_t), off64, &err);
     if (err != CL_SUCCESS) { free(off64); goto alloc_fail; }
 
-    d->b_hash_data_len = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                        hash_data_count * sizeof(uint16_t), NULL, &err);
+    d->b_hash_data_len = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        hash_data_count * sizeof(uint16_t), (void*)hash_data_len, &err);
     if (err != CL_SUCCESS) { free(off64); goto alloc_fail; }
 
-    /* Chunked upload — flush after each chunk for driver reliability */
-    { struct { cl_mem buf; const void *src; size_t size; } uploads[] = {
-        { d->b_compact_fp,    compact_fp,    compact_size * sizeof(uint32_t) },
-        { d->b_compact_idx,   compact_idx,   compact_size * sizeof(uint32_t) },
-        { d->b_hash_data,     hash_data_buf, hash_data_buf_size },
-        { d->b_hash_data_off, off64,         hash_data_count * sizeof(uint64_t) },
-        { d->b_hash_data_len, hash_data_len, hash_data_count * sizeof(uint16_t) },
-        { 0, NULL, 0 }
-      };
-      for (int u = 0; uploads[u].buf; u++) {
-        size_t off = 0;
-        while (off < uploads[u].size) {
-            size_t chunk = uploads[u].size - off;
-            if (chunk > GPU_CHUNK) chunk = GPU_CHUNK;
-            cl_int werr = clEnqueueWriteBuffer(d->queue, uploads[u].buf, CL_TRUE, off,
-                                 chunk, (const char *)uploads[u].src + off, 0, NULL, NULL);
-            if (werr != CL_SUCCESS)
-                fprintf(stderr, "OpenCL GPU[%d]: upload[%d] chunk at off=%zu size=%zu failed: %d\n",
-                        dev_idx, u, off, chunk, werr);
-            off += chunk;
-        }
-        clFinish(d->queue);
-      }
-    }
     free(off64);
 
     fprintf(stderr, "OpenCL GPU[%d]: compact table registered (%llu slots, %u hashes, %zuMB)\n",
@@ -1087,7 +848,41 @@ int gpu_opencl_set_overflow(int dev_idx,
 }
 
 void gpu_opencl_set_max_iter(int max_iter) { _max_iter = (max_iter < 1) ? 1 : max_iter; }
+void gpu_opencl_set_mask_resume(uint32_t start) { _mask_resume = start; }
 void gpu_opencl_set_op(int op) { _gpu_op = op; }
+
+/* Mask mode state — accessed by gpujob for hit reconstruction */
+uint8_t gpu_mask_desc[64];
+int gpu_mask_n_prepend = 0;
+int gpu_mask_n_append = 0;
+uint64_t gpu_mask_total = 0;
+
+static uint32_t mask_charset_size(uint8_t id) {
+    switch (id) { case 0: return 10; case 1: return 26; case 2: return 26;
+                  case 3: return 33; case 4: return 95; case 5: return 256; default: return 10; }
+}
+
+int gpu_opencl_set_mask(const uint8_t *prepend, int npre,
+                        const uint8_t *append, int napp) {
+    gpu_mask_n_prepend = npre;
+    gpu_mask_n_append = napp;
+    if (npre) memcpy(gpu_mask_desc, prepend, npre);
+    if (napp) memcpy(gpu_mask_desc + npre, append, napp);
+    gpu_mask_total = 1;
+    for (int i = 0; i < npre + napp; i++)
+        gpu_mask_total *= mask_charset_size(gpu_mask_desc[i]);
+    /* Upload mask descriptor to all devices */
+    for (int i = 0; i < num_gpu_devs; i++) {
+        struct gpu_device *d = &gpu_devs[i];
+        if (d->bgpu_mask_desc) clReleaseMemObject(d->bgpu_mask_desc);
+        cl_int err;
+        d->bgpu_mask_desc = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                         npre + napp, gpu_mask_desc, &err);
+    }
+    fprintf(stderr, "OpenCL GPU: mask mode: %d prepend + %d append = %llu combinations\n",
+            npre, napp, (unsigned long long)gpu_mask_total);
+    return 0;
+}
 
 uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     const char *hexhashes, const uint16_t *hexlens,
@@ -1110,8 +905,9 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     cl_kernel kern = (cat == GPU_CAT_SALTED && _max_iter > 1 && d->kern_salt_iter) ? d->kern_salt_iter : gk->kernel;
     cl_int err;
 
-    /* Upload words */
-    size_t words_size = (size_t)num_words * 256;
+    /* Upload words — unsalted pre-padded uses 64-byte stride, others 256 */
+    int word_stride = (cat == GPU_CAT_MASK && _gpu_op == JOB_MD5 && num_words > GPUBATCH_MAX) ? 64 : 256;
+    size_t words_size = (size_t)num_words * word_stride;
     if (words_size > d->hexhash_cap) {
         if (d->b_hexhashes) clReleaseMemObject(d->b_hexhashes);
         if (d->b_hexlens) clReleaseMemObject(d->b_hexlens);
@@ -1120,9 +916,12 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         d->hexhash_cap = words_size;
     }
     clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, hexhashes, 0, NULL, NULL);
-    clEnqueueWriteBuffer(d->queue, d->b_hexlens, CL_TRUE, 0, num_words * sizeof(uint16_t), hexlens, 0, NULL, NULL);
+    /* For unsalted pre-padded batches (num_words > GPUBATCH_MAX), hexlens is not
+     * used by the kernel — upload only what's available to keep the buffer valid */
+    size_t hexlens_upload = ((num_words > GPUBATCH_MAX) ? GPUBATCH_MAX : num_words) * sizeof(uint16_t);
+    clEnqueueWriteBuffer(d->queue, d->b_hexlens, CL_TRUE, 0, hexlens_upload, hexlens, 0, NULL, NULL);
 
-    /* Params — base values, salt_start/num_salts updated per chunk for salted types */
+    /* Params */
     OCLParams params;
     params.compact_mask = _compact_mask;
     params.num_words = num_words;
@@ -1133,6 +932,10 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     params.max_hits = GPU_MAX_HITS;
     params.overflow_count = _overflow_count;
     params.max_iter = (cat == GPU_CAT_ITER) ? (_max_iter - 1) : _max_iter;
+    params.num_masks = 0;
+    params.mask_start = 0;
+    params.n_prepend = gpu_mask_n_prepend;
+    params.n_append = gpu_mask_n_append;
 
     /* Zero hit counter */
     uint32_t zero = 0;
@@ -1147,7 +950,10 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         int a = 0;
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hexhashes);
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hexlens);
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_data);
+        if (cat == GPU_CAT_MASK)
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->bgpu_mask_desc);
+        else
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_data);
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_off);
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_len);
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_compact_fp);
@@ -1163,27 +969,43 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_offsets);
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_lengths);
     }
-
-    /* Dispatch — chunk salts in power-of-2 blocks for GPUs with limited work capacity */
+    /* Dispatch — chunk salts/masks in blocks for GPUs with limited work capacity */
     size_t local = kern_get_local_size(gk);
     int is_salted = (cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS);
+    int is_mask = ((cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) && gpu_mask_total > 0);
     int total_salts = is_salted ? d->salts_count : 0;
 
-    /* Chunk salts to stay within the device's max reliable dispatch size.
-     * max_dispatch is determined by probe_max_dispatch() at init time.
-     * If 0, the device passed all tests — no chunking needed. */
     int salt_chunk = total_salts;
     if (d->max_dispatch > 0 && is_salted && num_words > 0) {
         salt_chunk = d->max_dispatch / num_words;
         if (salt_chunk < 1024) salt_chunk = 1024;
     }
-    int num_chunks = is_salted ? (total_salts + salt_chunk - 1) / salt_chunk : 1;
+
+#define MASK_CHUNK 4194304  /* 4M mask combinations per dispatch */
+    uint64_t mask_start_base = is_mask ? _mask_resume : 0;
+    uint64_t mask_total = is_mask ? (gpu_mask_total - mask_start_base) : 0;
+    uint64_t mask_chunk = is_mask ? MASK_CHUNK : 0;
+    if (mask_chunk > mask_total) mask_chunk = mask_total;
+    _mask_resume = 0;  /* consumed — reset for next dispatch */
+
+    int num_chunks;
+    if (is_mask)
+        num_chunks = (int)((mask_total + mask_chunk - 1) / mask_chunk);
+    else if (is_salted)
+        num_chunks = (total_salts + salt_chunk - 1) / salt_chunk;
+    else
+        num_chunks = 1;
 
     struct timespec t0, t1;
     if (!gk->tuned) clock_gettime(CLOCK_MONOTONIC, &t0);
 
     for (int chunk = 0; chunk < num_chunks; chunk++) {
-        if (is_salted) {
+        if (is_mask) {
+            params.mask_start = (uint32_t)(mask_start_base + chunk * mask_chunk);
+            params.num_masks = (uint32_t)(mask_total - chunk * mask_chunk);
+            if (params.num_masks > mask_chunk) params.num_masks = (uint32_t)mask_chunk;
+            clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
+        } else if (is_salted) {
             params.salt_start = chunk * salt_chunk;
             params.num_salts = total_salts - params.salt_start;
             if (params.num_salts > salt_chunk) params.num_salts = salt_chunk;
@@ -1192,7 +1014,9 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
             clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
         }
 
-        size_t global = is_salted
+        size_t global = is_mask
+            ? (size_t)num_words * params.num_masks
+            : is_salted
             ? (size_t)num_words * params.num_salts
             : (size_t)num_words;
         global = ((global + local - 1) / local) * local;
@@ -1219,11 +1043,15 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     *nhits_out = (int)raw_nhits;
     if (raw_nhits > 0) {
         if (raw_nhits > GPU_MAX_HITS) raw_nhits = GPU_MAX_HITS;
+        int cat = gpu_op_category(_gpu_op);
         int is_sha256 = (_gpu_op == JOB_SHA256PASSSALT || _gpu_op == JOB_SHA256SALTPASS);
-        int stride = is_sha256 ? 11 : (_max_iter > 1) ? 7 : 6;
+        int is_sha1 = (_gpu_op == JOB_SHA1PASSSALT || _gpu_op == JOB_SHA1SALTPASS || _gpu_op == JOB_SHA1DRU);
+        int is_md5crypt = (_gpu_op == JOB_MD5CRYPT || _gpu_op == JOB_PHPBB3);
+        int stride = is_sha256 ? 11 : is_sha1 ? 8
+            : is_md5crypt ? 6
+            : (_max_iter > 1 || cat == GPU_CAT_ITER || cat == GPU_CAT_SALTPASS) ? 7 : 6;
         clEnqueueReadBuffer(d->queue, d->b_hits, CL_TRUE, 0, raw_nhits * stride * sizeof(uint32_t), d->h_hits, 0, NULL, NULL);
     }
-
     return d->h_hits;
 }
 
