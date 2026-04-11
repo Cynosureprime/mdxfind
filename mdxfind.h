@@ -1,5 +1,11 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.13  2026/04/05 03:55:52  dlr
+ * Include emmintrin.h under NOTINTEL guard, MAXCHUNK 50MB for Apple Silicon (not embedded ARM)
+ *
+ * Revision 1.12  2026/04/04 18:53:45  dlr
+ * Per-algorithm dispatch with linehints: rate-based lineswanted from bench_rates.h, EMA feedback in ReportStats, per-algorithm curline tracking, GPU lineswanted=UINT_MAX for ordering, Lowline from min(curline), struct job reorder + fileno + JOBFLAG_GPU, FAM enum moved to gpujob.h
+ *
  * Revision 1.11  2026/03/25 23:11:05  dlr
  * Move Hashchain struct to header
  *
@@ -38,6 +44,9 @@
 #if ARM > 6
 #include <arm_neon.h>
 #endif
+#ifndef NOTINTEL
+#include <emmintrin.h>
+#endif
 
 #define MAXLINE (40*1024)
 struct job {
@@ -45,14 +54,14 @@ struct job {
     char *readbuf,*outbuf,*pass;
     unsigned int *found;
     struct LineInfo *readindex;
-    int op,len,clen,flags;
-    int Ruleindex,digits,outlen;
-    unsigned int startline,numline;
     unsigned long long Numbers;
     unsigned long long MaskIndex;
-    unsigned long long MaskCount;
     char *filename;
     int *doneprint;
+    unsigned long long MaskCount;
+    unsigned int startline,numline;
+    int op,len,clen,flags;
+    int Ruleindex,digits,outlen,fileno;
     char prefix[MAXLINE],line[MAXLINE+MAXLINE];
 };
 #define JOBFLAG_PRINT 1
@@ -60,6 +69,7 @@ struct job {
 #define JOBFLAG_NUMBERS 4
 #define JOBFLAG_IP 8
 #define JOBFLAG_PREPEND 16
+#define JOBFLAG_GPU 32
 
 union HashU {
     unsigned char h[256];
@@ -142,7 +152,7 @@ static inline int log2i(uint64_t n) {
    As I write this, typical hard drive speeds are 100 Mbytes/sec, so
    100M represents about 1 seconds of data.  Increase as appropriate.
 */
-#ifdef ARM
+#if defined(ARM) && !defined(MACOSX)
 /* INPUTCHUNK - maximum number of hashes to process at once from stdin */
 #define INPUTCHUNK (100000)
 #define MAXCHUNK (5*1024*1024)

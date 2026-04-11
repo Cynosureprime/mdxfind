@@ -1,5 +1,11 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.27  2026/04/05 15:58:30  dlr
+ * ARM NEON procsaltbb: 4-wide SIMD PHPBB3/phpass iterated MD5, matching Intel SSE path
+ *
+ * Revision 1.26  2026/04/04 21:48:16  dlr
+ * NEON 4-wide MD5SALT: mymd5salt_pre/post/salt2 for ARM, short+long salt batching, AArch64 Neon auto-detect, Metal salt chunking cleanup, remove GPU hashcnt double-counting
+ *
  * Revision 1.25  2026/03/26 19:58:36  dlr
  * Skip sha1_block.s SSSE3 assembly on Windows — uses System V ABI (rdi/rsi), crashes on Win64 (rcx/rdx). Use SHA-NI intrinsics or C sha1_step fallback only.
  *
@@ -657,6 +663,294 @@ void mymd5salt(unsigned char *block, SVAL  *hash) {
   FINAL(3, d, DD);
 }
 
+/* Partial-state MD5: first 8 rounds only (password portion of MD5(pass+salt)) */
+void mymd5salt_pre(unsigned char *block, SVAL *state) {
+  uint32x4_t a, b, c, d;
+  const SVAL *X = (SVAL *) block;
+
+  a = SET1(AA);
+  b = SET1(BB);
+  c = SET1(CC);
+  d = SET1(DD);
+
+  OP(F, a, b, c, d, 0, 7, 0xd76aa478);
+  OP(F, d, a, b, c, 1, 12, 0xe8c7b756);
+  OP(F, c, d, a, b, 2, 17, 0x242070db);
+  OP(F, b, c, d, a, 3, 22, 0xc1bdceee);
+  OP(F, a, b, c, d, 4, 7, 0xf57c0faf);
+  OP(F, d, a, b, c, 5, 12, 0x4787c62a);
+  OP(F, c, d, a, b, 6, 17, 0xa8304613);
+  OP(F, b, c, d, a, 7, 22, 0xfd469501);
+
+  sval_store(&state[0], a);
+  sval_store(&state[1], b);
+  sval_store(&state[2], c);
+  sval_store(&state[3], d);
+}
+
+/* Complete MD5 from saved partial state. Loads a,b,c,d from state[0..3],
+ * runs remaining 56 rounds using full block X[0]-X[15]. */
+void mymd5salt_post(unsigned char *block, SVAL *state, SVAL *hash) {
+  uint32x4_t a, b, c, d;
+  const SVAL *X = (SVAL *) block;
+
+  a = sval_load(&state[0]);
+  b = sval_load(&state[1]);
+  c = sval_load(&state[2]);
+  d = sval_load(&state[3]);
+
+  OP(F, a, b, c, d, 8, 7, 0x698098d8);
+  OP(F, d, a, b, c, 9, 12, 0x8b44f7af);
+  OP(F, c, d, a, b, 10, 17, 0xffff5bb1);
+  OP(F, b, c, d, a, 11, 22, 0x895cd7be);
+  OP(F, a, b, c, d, 12, 7, 0x6b901122);
+  OP(F, d, a, b, c, 13, 12, 0xfd987193);
+  OP(F, c, d, a, b, 14, 17, 0xa679438e);
+  OP(F, b, c, d, a, 15, 22, 0x49b40821);
+  /* Round 2. */
+  OP(G, a, b, c, d, 1, 5, 0xf61e2562);
+  OP(G, d, a, b, c, 6, 9, 0xc040b340);
+  OP(G, c, d, a, b, 11, 14, 0x265e5a51);
+  OP(G, b, c, d, a, 0, 20, 0xe9b6c7aa);
+  OP(G, a, b, c, d, 5, 5, 0xd62f105d);
+  OP(G, d, a, b, c, 10, 9, 0x02441453);
+  OP(G, c, d, a, b, 15, 14, 0xd8a1e681);
+  OP(G, b, c, d, a, 4, 20, 0xe7d3fbc8);
+  OP(G, a, b, c, d, 9, 5, 0x21e1cde6);
+  OP(G, d, a, b, c, 14, 9, 0xc33707d6);
+  OP(G, c, d, a, b, 3, 14, 0xf4d50d87);
+  OP(G, b, c, d, a, 8, 20, 0x455a14ed);
+  OP(G, a, b, c, d, 13, 5, 0xa9e3e905);
+  OP(G, d, a, b, c, 2, 9, 0xfcefa3f8);
+  OP(G, c, d, a, b, 7, 14, 0x676f02d9);
+  OP(G, b, c, d, a, 12, 20, 0x8d2a4c8a);
+  /* Round 3. */
+  OP(H, a, b, c, d, 5, 4, 0xfffa3942);
+  OP(H, d, a, b, c, 8, 11, 0x8771f681);
+  OP(H, c, d, a, b, 11, 16, 0x6d9d6122);
+  OP(H, b, c, d, a, 14, 23, 0xfde5380c);
+  OP(H, a, b, c, d, 1, 4, 0xa4beea44);
+  OP(H, d, a, b, c, 4, 11, 0x4bdecfa9);
+  OP(H, c, d, a, b, 7, 16, 0xf6bb4b60);
+  OP(H, b, c, d, a, 10, 23, 0xbebfbc70);
+  OP(H, a, b, c, d, 13, 4, 0x289b7ec6);
+  OP(H, d, a, b, c, 0, 11, 0xeaa127fa);
+  OP(H, c, d, a, b, 3, 16, 0xd4ef3085);
+  OP(H, b, c, d, a, 6, 23, 0x04881d05);
+  OP(H, a, b, c, d, 9, 4, 0xd9d4d039);
+  OP(H, d, a, b, c, 12, 11, 0xe6db99e5);
+  OP(H, c, d, a, b, 15, 16, 0x1fa27cf8);
+  OP(H, b, c, d, a, 2, 23, 0xc4ac5665);
+  /* Round 4. */
+  OP(I, a, b, c, d, 0, 6, 0xf4292244);
+  OP(I, d, a, b, c, 7, 10, 0x432aff97);
+  OP(I, c, d, a, b, 14, 15, 0xab9423a7);
+  OP(I, b, c, d, a, 5, 21, 0xfc93a039);
+  OP(I, a, b, c, d, 12, 6, 0x655b59c3);
+  OP(I, d, a, b, c, 3, 10, 0x8f0ccc92);
+  OP(I, c, d, a, b, 10, 15, 0xffeff47d);
+  OP(I, b, c, d, a, 1, 21, 0x85845dd1);
+  OP(I, a, b, c, d, 8, 6, 0x6fa87e4f);
+  OP(I, d, a, b, c, 15, 10, 0xfe2ce6e0);
+  OP(I, c, d, a, b, 6, 15, 0xa3014314);
+  OP(I, b, c, d, a, 13, 21, 0x4e0811a1);
+  OP(I, a, b, c, d, 4, 6, 0xf7537e82);
+  OP(I, d, a, b, c, 11, 10, 0xbd3af235);
+  OP(I, c, d, a, b, 2, 15, 0x2ad7d2bb);
+  OP(I, b, c, d, a, 9, 21, 0xeb86d391);
+
+  a = ADD(a, SET1(AA));
+  sval_store(&hash[0], a);
+  FINAL(1, b, BB);
+  FINAL(2, c, CC);
+  FINAL(3, d, DD);
+}
+
+/* Like mymd5salt but adds to existing hash values (FINAL2) instead of IV */
+void mymd5salt2(unsigned char *block, SVAL *hash) {
+  uint32x4_t a, b, c, d;
+  const SVAL *X = (SVAL *) block;
+
+  a = SET1(AA);
+  b = SET1(BB);
+  c = SET1(CC);
+  d = SET1(DD);
+
+  OP(F, a, b, c, d, 0, 7, 0xd76aa478);
+  OP(F, d, a, b, c, 1, 12, 0xe8c7b756);
+  OP(F, c, d, a, b, 2, 17, 0x242070db);
+  OP(F, b, c, d, a, 3, 22, 0xc1bdceee);
+  OP(F, a, b, c, d, 4, 7, 0xf57c0faf);
+  OP(F, d, a, b, c, 5, 12, 0x4787c62a);
+  OP(F, c, d, a, b, 6, 17, 0xa8304613);
+  OP(F, b, c, d, a, 7, 22, 0xfd469501);
+  OP(F, a, b, c, d, 8, 7, 0x698098d8);
+  OP(F, d, a, b, c, 9, 12, 0x8b44f7af);
+  OP(F, c, d, a, b, 10, 17, 0xffff5bb1);
+  OP(F, b, c, d, a, 11, 22, 0x895cd7be);
+  OP(F, a, b, c, d, 12, 7, 0x6b901122);
+  OP(F, d, a, b, c, 13, 12, 0xfd987193);
+  OP(F, c, d, a, b, 14, 17, 0xa679438e);
+  OP(F, b, c, d, a, 15, 22, 0x49b40821);
+  /* Round 2. */
+  OP(G, a, b, c, d, 1, 5, 0xf61e2562);
+  OP(G, d, a, b, c, 6, 9, 0xc040b340);
+  OP(G, c, d, a, b, 11, 14, 0x265e5a51);
+  OP(G, b, c, d, a, 0, 20, 0xe9b6c7aa);
+  OP(G, a, b, c, d, 5, 5, 0xd62f105d);
+  OP(G, d, a, b, c, 10, 9, 0x02441453);
+  OP(G, c, d, a, b, 15, 14, 0xd8a1e681);
+  OP(G, b, c, d, a, 4, 20, 0xe7d3fbc8);
+  OP(G, a, b, c, d, 9, 5, 0x21e1cde6);
+  OP(G, d, a, b, c, 14, 9, 0xc33707d6);
+  OP(G, c, d, a, b, 3, 14, 0xf4d50d87);
+  OP(G, b, c, d, a, 8, 20, 0x455a14ed);
+  OP(G, a, b, c, d, 13, 5, 0xa9e3e905);
+  OP(G, d, a, b, c, 2, 9, 0xfcefa3f8);
+  OP(G, c, d, a, b, 7, 14, 0x676f02d9);
+  OP(G, b, c, d, a, 12, 20, 0x8d2a4c8a);
+  /* Round 3. */
+  OP(H, a, b, c, d, 5, 4, 0xfffa3942);
+  OP(H, d, a, b, c, 8, 11, 0x8771f681);
+  OP(H, c, d, a, b, 11, 16, 0x6d9d6122);
+  OP(H, b, c, d, a, 14, 23, 0xfde5380c);
+  OP(H, a, b, c, d, 1, 4, 0xa4beea44);
+  OP(H, d, a, b, c, 4, 11, 0x4bdecfa9);
+  OP(H, c, d, a, b, 7, 16, 0xf6bb4b60);
+  OP(H, b, c, d, a, 10, 23, 0xbebfbc70);
+  OP(H, a, b, c, d, 13, 4, 0x289b7ec6);
+  OP(H, d, a, b, c, 0, 11, 0xeaa127fa);
+  OP(H, c, d, a, b, 3, 16, 0xd4ef3085);
+  OP(H, b, c, d, a, 6, 23, 0x04881d05);
+  OP(H, a, b, c, d, 9, 4, 0xd9d4d039);
+  OP(H, d, a, b, c, 12, 11, 0xe6db99e5);
+  OP(H, c, d, a, b, 15, 16, 0x1fa27cf8);
+  OP(H, b, c, d, a, 2, 23, 0xc4ac5665);
+  /* Round 4. */
+  OP(I, a, b, c, d, 0, 6, 0xf4292244);
+  OP(I, d, a, b, c, 7, 10, 0x432aff97);
+  OP(I, c, d, a, b, 14, 15, 0xab9423a7);
+  OP(I, b, c, d, a, 5, 21, 0xfc93a039);
+  OP(I, a, b, c, d, 12, 6, 0x655b59c3);
+  OP(I, d, a, b, c, 3, 10, 0x8f0ccc92);
+  OP(I, c, d, a, b, 10, 15, 0xffeff47d);
+  OP(I, b, c, d, a, 1, 21, 0x85845dd1);
+  OP(I, a, b, c, d, 8, 6, 0x6fa87e4f);
+  OP(I, d, a, b, c, 15, 10, 0xfe2ce6e0);
+  OP(I, c, d, a, b, 6, 15, 0xa3014314);
+  OP(I, b, c, d, a, 13, 21, 0x4e0811a1);
+  OP(I, a, b, c, d, 4, 6, 0xf7537e82);
+  OP(I, d, a, b, c, 11, 10, 0xbd3af235);
+  OP(I, c, d, a, b, 2, 15, 0x2ad7d2bb);
+  OP(I, b, c, d, a, 9, 21, 0xeb86d391);
+
+  FINAL2(0, a);
+  FINAL2(1, b);
+  FINAL2(2, c);
+  FINAL2(3, d);
+}
+
+extern int checkhashbb(union HashU *curin, int len, char *salt, struct job *job);
+extern int NoMarkSalt;
+
+/* NEON 4-wide PHPBB3/phpass iterated MD5: process pcnt (1-4) salts in parallel.
+ * SSEBUF[0..3] contain initial MD5(salt+pass) digest as 4-lane NEON vectors.
+ * SSEBUF[4..15] contain pre-packed password+padding (M[4..15]).
+ * Iterates myiter times: MD5(digest + password). */
+void procsaltbb(uint32x4_t *SSEBUF, struct job *job, int pcnt, char *sbuf[], int myiter) {
+  uint32x4_t a, b, c, d;
+  union HashU curin;
+  const SVAL *X = (SVAL *) SSEBUF;
+  int x, y;
+
+  if (pcnt <= 0 || pcnt > 4) return;
+  curin.x[0] = vdupq_n_u32(0);
+  while (myiter--) {
+    a = SET1(AA);
+    b = SET1(BB);
+    c = SET1(CC);
+    d = SET1(DD);
+
+    OP(F, a, b, c, d, 0, 7, 0xd76aa478);
+    OP(F, d, a, b, c, 1, 12, 0xe8c7b756);
+    OP(F, c, d, a, b, 2, 17, 0x242070db);
+    OP(F, b, c, d, a, 3, 22, 0xc1bdceee);
+    OP(F, a, b, c, d, 4, 7, 0xf57c0faf);
+    OP(F, d, a, b, c, 5, 12, 0x4787c62a);
+    OP(F, c, d, a, b, 6, 17, 0xa8304613);
+    OP(F, b, c, d, a, 7, 22, 0xfd469501);
+    OP(F, a, b, c, d, 8, 7, 0x698098d8);
+    OP(F, d, a, b, c, 9, 12, 0x8b44f7af);
+    OP(F, c, d, a, b, 10, 17, 0xffff5bb1);
+    OP(F, b, c, d, a, 11, 22, 0x895cd7be);
+    OP(F, a, b, c, d, 12, 7, 0x6b901122);
+    OP(F, d, a, b, c, 13, 12, 0xfd987193);
+    OP(F, c, d, a, b, 14, 17, 0xa679438e);
+    OP(F, b, c, d, a, 15, 22, 0x49b40821);
+    OP(G, a, b, c, d, 1, 5, 0xf61e2562);
+    OP(G, d, a, b, c, 6, 9, 0xc040b340);
+    OP(G, c, d, a, b, 11, 14, 0x265e5a51);
+    OP(G, b, c, d, a, 0, 20, 0xe9b6c7aa);
+    OP(G, a, b, c, d, 5, 5, 0xd62f105d);
+    OP(G, d, a, b, c, 10, 9, 0x02441453);
+    OP(G, c, d, a, b, 15, 14, 0xd8a1e681);
+    OP(G, b, c, d, a, 4, 20, 0xe7d3fbc8);
+    OP(G, a, b, c, d, 9, 5, 0x21e1cde6);
+    OP(G, d, a, b, c, 14, 9, 0xc33707d6);
+    OP(G, c, d, a, b, 3, 14, 0xf4d50d87);
+    OP(G, b, c, d, a, 8, 20, 0x455a14ed);
+    OP(G, a, b, c, d, 13, 5, 0xa9e3e905);
+    OP(G, d, a, b, c, 2, 9, 0xfcefa3f8);
+    OP(G, c, d, a, b, 7, 14, 0x676f02d9);
+    OP(G, b, c, d, a, 12, 20, 0x8d2a4c8a);
+    OP(H, a, b, c, d, 5, 4, 0xfffa3942);
+    OP(H, d, a, b, c, 8, 11, 0x8771f681);
+    OP(H, c, d, a, b, 11, 16, 0x6d9d6122);
+    OP(H, b, c, d, a, 14, 23, 0xfde5380c);
+    OP(H, a, b, c, d, 1, 4, 0xa4beea44);
+    OP(H, d, a, b, c, 4, 11, 0x4bdecfa9);
+    OP(H, c, d, a, b, 7, 16, 0xf6bb4b60);
+    OP(H, b, c, d, a, 10, 23, 0xbebfbc70);
+    OP(H, a, b, c, d, 13, 4, 0x289b7ec6);
+    OP(H, d, a, b, c, 0, 11, 0xeaa127fa);
+    OP(H, c, d, a, b, 3, 16, 0xd4ef3085);
+    OP(H, b, c, d, a, 6, 23, 0x04881d05);
+    OP(H, a, b, c, d, 9, 4, 0xd9d4d039);
+    OP(H, d, a, b, c, 12, 11, 0xe6db99e5);
+    OP(H, c, d, a, b, 15, 16, 0x1fa27cf8);
+    OP(H, b, c, d, a, 2, 23, 0xc4ac5665);
+    OP(I, a, b, c, d, 0, 6, 0xf4292244);
+    OP(I, d, a, b, c, 7, 10, 0x432aff97);
+    OP(I, c, d, a, b, 14, 15, 0xab9423a7);
+    OP(I, b, c, d, a, 5, 21, 0xfc93a039);
+    OP(I, a, b, c, d, 12, 6, 0x655b59c3);
+    OP(I, d, a, b, c, 3, 10, 0x8f0ccc92);
+    OP(I, c, d, a, b, 10, 15, 0xffeff47d);
+    OP(I, b, c, d, a, 1, 21, 0x85845dd1);
+    OP(I, a, b, c, d, 8, 6, 0x6fa87e4f);
+    OP(I, d, a, b, c, 15, 10, 0xfe2ce6e0);
+    OP(I, c, d, a, b, 6, 15, 0xa3014314);
+    OP(I, b, c, d, a, 13, 21, 0x4e0811a1);
+    OP(I, a, b, c, d, 4, 6, 0xf7537e82);
+    OP(I, d, a, b, c, 11, 10, 0xbd3af235);
+    OP(I, c, d, a, b, 2, 15, 0x2ad7d2bb);
+    OP(I, b, c, d, a, 9, 21, 0xeb86d391);
+
+    SSEBUF[0] = ADD(a, SET1(AA));
+    SSEBUF[1] = ADD(b, SET1(BB));
+    SSEBUF[2] = ADD(c, SET1(CC));
+    SSEBUF[3] = ADD(d, SET1(DD));
+
+  }
+  for (x = 0; x < pcnt; x++) {
+    curin.i[0] = X[0].words[x];
+    curin.i[1] = X[1].words[x];
+    curin.i[2] = X[2].words[x];
+    curin.i[3] = X[3].words[x];
+    if (checkhashbb(&curin, 32, sbuf[x], job) && NoMarkSalt == 0)
+      sbuf[x][3] = 0xfe;
+  }
+}
 
 #endif
 #ifndef NOTINTEL
