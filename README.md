@@ -17,18 +17,25 @@ Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://j
 - **Quick triage** — rapidly cull common passwords from a massive hashlist before using other tools
 - **Arbitrary iteration** — try thousands of iteration counts in a single run
 - **Unknown algorithms** — let mdxfind try 994+ types simultaneously and tell you what matched
-- **CPU-friendly algorithms** — bcrypt, PBKDF2, scrypt, and other algorithms that don't benefit from GPU acceleration
+- **CPU-intensive algorithms** — bcrypt, PBKDF2, scrypt, with GPU acceleration on supported platforms
 - **Salted hashes without known types** — mdxfind can try many salted algorithms with auto-generated salt combinations
 
 ### When NOT to use mdxfind
 
-- Mask/brute-force attacks on GPU-friendly algorithms — use hashcat
+- Pure brute-force attacks with very large keyspaces — hashcat's rule engine and distributed support are more mature
 - Distributed cracking clusters — hashcat + hashtopolis is better suited
-- Single known hash type with a small hash list — hashcat's GPU speed wins here
+- Single known hash type with a small hash list and no iteration — hashcat's GPU speed wins here
 
 ### GPU acceleration
 
-mdxfind supports OpenCL GPU acceleration for salted hash types, using multiple GPUs simultaneously across AMD and NVIDIA hardware. On a 5-GPU system (2x AMD RDNA3 + RTX 4070 Ti + RTX 3080 + AMD iGPU), mdxfind solved 1,000,000 salted MD5 hashes against the rockyou wordlist in 40 seconds at 69 GH/s. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for detailed GPU performance comparisons.
+mdxfind supports GPU acceleration via OpenCL (NVIDIA, AMD) and Metal (Apple Silicon), using multiple GPUs simultaneously. GPU-accelerated operations include:
+
+- **Salted hashes**: MD5SALT, MD5SALTPASS/PASSSALT, SHA1/SHA256/SHA512 salted variants, HMAC types, DES crypt, MD5 crypt, SHA256/SHA512 crypt, PHPBB3
+- **Bcrypt**: Full eksblowfish implementation — 620 h/s on RTX 4070 Ti Super (faster than hashcat)
+- **Unsalted iteration** (`-i`): MD5, SHA1, SHA256, MD4/NTLM, SHA512 with GPU hex-iteration loops
+- **Mask expansion** (`-n`/`-N`): Combined with iteration on GPU — 4.58 Gh/s on Apple M2 Max (MD5 `-i 100 -n '?d?d'`)
+
+On a 5-GPU system (2x AMD RDNA3 + RTX 4070 Ti + RTX 3080 + AMD iGPU), mdxfind solved 1,000,000 salted MD5 hashes against the rockyou wordlist in 40 seconds at 69 GH/s. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for detailed GPU performance comparisons.
 
 ### Antivirus note
 
@@ -122,7 +129,7 @@ mdxfind -f hashfile [options] [wordlist ...]
 | `-u FILE` | Read usernames from file |
 | `-j FILE` | Read peppers (prefixes) from file |
 | `-k FILE` | Read suffixes from file |
-| `-i N` | Iteration count for iterated hash types |
+| `-i N` | Iteration count — GPU-accelerated for MD5, SHA1, SHA256, MD4, SHA512. Composable with `-n`/`-N` masks |
 
 **Password manipulation:**
 
@@ -155,6 +162,8 @@ mdxfind -f hashfile [options] [wordlist ...]
 | `-G list` | List available GPU devices and exit |
 | `-G 0,2,4` | Use only the specified GPU devices (comma-separated indices or ranges like `0-2,5`) |
 | `-G none` | Disable GPU acceleration entirely |
+
+GPU is auto-detected: OpenCL on Linux/FreeBSD/Windows (NVIDIA, AMD), Metal on macOS (Apple Silicon, Intel).
 
 **Output and control:**
 
@@ -612,6 +621,22 @@ The compact table scales efficiently to very large hash counts. Tested with NTLM
 "Total" includes loading hashes + processing a 29M-word wordlist. At 100M hashes, the wordlist processing adds ~9 seconds on the i9 and ~2 seconds on the 72-core Xeon. At 2 billion hashes, the load dominates — the 29M wordlist adds virtually nothing.
 
 The compact table maintains excellent efficiency at scale: only 417K overflow entries out of 2.05 billion (0.02%), at 47.8% load factor with 4.3 billion slots. This is a dataset that would require ~150 GB in a flat hash table; mdxfind handles it on a server with standard memory.
+
+### GPU benchmarks
+
+GPU iteration and mask performance, measured with 14M MD5 hashes from `rockyou.txt`:
+
+| System | GPU | Mode | Hash rate |
+|--------|-----|------|----------:|
+| Desktop | RTX 4070 Ti Super | bcrypt cost=12, 1000 salts | 620 h/s |
+| Desktop | GTX 1080 | bcrypt cost=12, 1000 salts | ~130 h/s |
+| Mac Studio | Apple M2 Max | MD5 `-i 80` | 162 Mh/s |
+| Mac Studio | Apple M2 Max | MD5 `-i 100 -n '?d?d'` | 4.58 Gh/s |
+| Desktop | RTX 4070 Ti Super | MD5 `-i 100 -n '?d?d'` | ~10 Gh/s |
+
+bcrypt on the RTX 4070 Ti Super outperformed hashcat 6.2.3 on the same hardware (620 h/s vs 595 h/s) for 1000 salts at cost=12.
+
+GPU iteration works with all mask modes (`-n`, `-N`) and probes the compact table at every iteration depth, finding matches at any `-i` level in a single pass.
 
 ## Building
 
