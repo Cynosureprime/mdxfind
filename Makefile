@@ -74,7 +74,7 @@ LDFLAGS = -pthread -O3
 # Static libraries (expected in current directory or subdirectories)
 LIBS = libssl.a libcrypto.a libsph.a libmhash.a librhash.a md6.a \
        gosthash/gost2012/gost2012.a bcrypt-master/bcrypt.a \
-       argon2/argon2.a libJudy.a libpcre.a lm/lm.a $(ICONV)
+       argon2/argon2.a libJudy.a libpcre.a lm/lm.a liblzma.a libbz2.a libzstd.a $(ICONV)
 
 # yescrypt (object files, not a .a archive)
 YESCRYPT_OBJS = yescrypt/yescrypt-common.o yescrypt/yescrypt-opt.o \
@@ -311,7 +311,19 @@ YESCRYPT_COMMIT = 0731cce8fdd1636f0bd6b7ce742e0d2a2154c6e0
 PCRE_REPO      = https://github.com/luvit/pcre.git
 PCRE_COMMIT    = 5c78f7d5d7f41bdd4be4867ef3a1030af3e973e3
 
-deps: dep-openssl dep-sphlib dep-mhash dep-rhash dep-md6 dep-streebog dep-bcrypt dep-judy dep-yescrypt dep-pcre
+# bzip2 1.0.8
+BZIP2_REPO     = https://gitlab.com/bzip2/bzip2.git
+BZIP2_TAG      = bzip2-1.0.8
+
+# xz/liblzma 5.4.5
+XZ_REPO        = https://github.com/tukaani-project/xz.git
+XZ_TAG         = v5.4.5
+
+# zstd 1.5.5
+ZSTD_REPO      = https://github.com/facebook/zstd.git
+ZSTD_TAG       = v1.5.5
+
+deps: dep-openssl dep-sphlib dep-mhash dep-rhash dep-md6 dep-streebog dep-bcrypt dep-judy dep-yescrypt dep-pcre dep-bzip2 dep-xz dep-zstd
 	@echo ""
 	@echo "All dependencies built. Run 'make' to build mdxfind and mdsplit."
 
@@ -524,6 +536,51 @@ dep-pcre:
 	cp $(DEPDIR)/pcre/pcre.h $(TOPDIR)/; \
 	echo "  libpcre.a installed"
 
+# ---- bzip2 ----
+dep-bzip2:
+	@echo "==> bzip2 ($(BZIP2_TAG))"
+	@if [ -f $(TOPDIR)/libbz2.a ]; then echo "  already built, skipping"; exit 0; fi; \
+	set -e; \
+	mkdir -p $(DEPDIR); \
+	git clone --depth 1 --branch $(BZIP2_TAG) $(BZIP2_REPO) $(DEPDIR)/bzip2; \
+	cd $(DEPDIR)/bzip2 && \
+	$(MAKE) CC="$(CC)" libbz2.a; \
+	cp $(DEPDIR)/bzip2/libbz2.a $(TOPDIR)/; \
+	cp $(DEPDIR)/bzip2/bzlib.h $(TOPDIR)/; \
+	echo "  libbz2.a installed"
+
+# ---- xz/liblzma ----
+dep-xz:
+	@echo "==> xz/liblzma ($(XZ_TAG))"
+	@if [ -f $(TOPDIR)/liblzma.a ]; then echo "  already built, skipping"; exit 0; fi; \
+	set -e; \
+	mkdir -p $(DEPDIR); \
+	git clone --depth 1 --branch $(XZ_TAG) $(XZ_REPO) $(DEPDIR)/xz; \
+	cd $(DEPDIR)/xz && \
+	./autogen.sh && \
+	./configure --enable-static --disable-shared --disable-xz --disable-xzdec \
+		--disable-lzmadec --disable-lzmainfo --disable-scripts --disable-doc && \
+	$(MAKE); \
+	cp $(DEPDIR)/xz/src/liblzma/.libs/liblzma.a $(TOPDIR)/; \
+	cp $(DEPDIR)/xz/src/liblzma/api/lzma.h $(TOPDIR)/; \
+	cp -r $(DEPDIR)/xz/src/liblzma/api/lzma $(TOPDIR)/; \
+	echo "  liblzma.a installed"
+
+# ---- zstd ----
+dep-zstd:
+	@echo "==> zstd ($(ZSTD_TAG))"
+	@if [ -f $(TOPDIR)/libzstd.a ]; then echo "  already built, skipping"; exit 0; fi; \
+	set -e; \
+	mkdir -p $(DEPDIR); \
+	git clone --depth 1 --branch $(ZSTD_TAG) $(ZSTD_REPO) $(DEPDIR)/zstd; \
+	cd $(DEPDIR)/zstd/lib && \
+	$(MAKE) CC="$(CC)" libzstd.a; \
+	cp $(DEPDIR)/zstd/lib/libzstd.a $(TOPDIR)/; \
+	cp $(DEPDIR)/zstd/lib/zstd.h $(TOPDIR)/; \
+	cp $(DEPDIR)/zstd/lib/zstd_errors.h $(TOPDIR)/; \
+	echo "  libzstd.a installed"
+
 .PHONY: all clean distclean deps \
         dep-openssl dep-sphlib dep-mhash dep-rhash dep-md6 \
-        dep-streebog dep-bcrypt dep-judy dep-yescrypt dep-pcre
+        dep-streebog dep-bcrypt dep-judy dep-yescrypt dep-pcre \
+        dep-bzip2 dep-xz dep-zstd

@@ -95,6 +95,9 @@
 
 #include <zlib.h>
 #include <iconv.h>
+#include <lzma.h>
+#include <bzlib.h>
+#include <zstd.h>
 
 #include "mdxfind.h"
 
@@ -34128,6 +34131,307 @@ int linecmp(const void *a, const void *b) {
 
 static int Cacheindex;
 
+/* ---- Compressed file reader ----
+ * Auto-detects XZ, bzip2, and ZIP formats on first read from gzread().
+ * gzip and plaintext are handled transparently by zlib.
+ * When a non-gzip compressed format is detected, subsequent reads
+ * use the appropriate library decoder instead of gzread(). */
+
+enum compress_type { CMP_GZ = 0, CMP_XZ, CMP_BZ2, CMP_ZIP, CMP_ZSTD };
+
+static struct {
+    enum compress_type type;
+    int detected;          /* 1 = first read done, format known */
+    int gz_closed;         /* 1 = gzFile was closed (non-gzip format detected) */
+    int fd;                /* file descriptor for library reads */
+    char filename[4096];   /* saved filename for reopen */
+    int eof;               /* decoder reached end of stream */
+    /* XZ state */
+    lzma_stream xz;        /* LZMA_STREAM_INIT */
+    unsigned char xz_inbuf[256*1024];
+    /* bzip2 state — low-level streaming API */
+    bz_stream bz;
+    unsigned char bz_inbuf[256*1024];
+    /* ZIP state — uses zlib inflate, liblzma, libbz2 or zstd depending on method */
+    z_stream zip;
+    int zip_init;          /* 1=deflate, 2=lzma, 3=bzip2, 4=zstd in ZIP */
+    size_t zip_remaining;  /* compressed bytes remaining */
+    unsigned char zip_inbuf[256*1024];
+    /* zstd state */
+    ZSTD_DStream *zstd_ds;
+    ZSTD_inBuffer zstd_in;
+    unsigned char zstd_inbuf[256*1024];
+} Creader;
+
+/* Read from the active decoder. Returns bytes read, 0 on EOF. */
+static size_t creader_read(void *buf, size_t len) {
+    if (Creader.type == CMP_XZ) {
+        Creader.xz.next_out = (uint8_t *)buf;
+        Creader.xz.avail_out = len;
+        while (Creader.xz.avail_out > 0) {
+            if (Creader.xz.avail_in == 0 && !Creader.eof) {
+                ssize_t n = read(Creader.fd, Creader.xz_inbuf, sizeof(Creader.xz_inbuf));
+                if (n <= 0) Creader.eof = 1;
+                else { Creader.xz.next_in = Creader.xz_inbuf; Creader.xz.avail_in = n; }
+            }
+            lzma_ret r = lzma_code(&Creader.xz, Creader.eof ? LZMA_FINISH : LZMA_RUN);
+            if (r == LZMA_STREAM_END) { Creader.eof = 1; break; }
+            if (r != LZMA_OK) { Creader.eof = 1; break; }
+            if (Creader.xz.avail_in == 0 && Creader.eof) break;
+        }
+        return len - Creader.xz.avail_out;
+    } else if (Creader.type == CMP_BZ2) {
+        Creader.bz.next_out = (char *)buf;
+        Creader.bz.avail_out = (unsigned)len;
+        while (Creader.bz.avail_out > 0) {
+            if (Creader.bz.avail_in == 0 && !Creader.eof) {
+                ssize_t n = read(Creader.fd, Creader.bz_inbuf, sizeof(Creader.bz_inbuf));
+                if (n <= 0) Creader.eof = 1;
+                else { Creader.bz.next_in = (char *)Creader.bz_inbuf; Creader.bz.avail_in = n; }
+            }
+            int r = BZ2_bzDecompress(&Creader.bz);
+            if (r == BZ_STREAM_END) { Creader.eof = 1; break; }
+            if (r != BZ_OK) { Creader.eof = 1; break; }
+            if (Creader.bz.avail_in == 0 && Creader.eof) break;
+        }
+        return len - Creader.bz.avail_out;
+    } else if (Creader.type == CMP_ZIP) {
+        /* ZIP: dispatch based on zip_init (0=stored, 1=deflate, 2=lzma, 3=bzip2, 4=zstd) */
+        if (Creader.zip_init == 0) {
+            /* Stored — raw read */
+            size_t want = len;
+            if (want > Creader.zip_remaining) want = Creader.zip_remaining;
+            if (want == 0) { Creader.eof = 1; return 0; }
+            ssize_t n = read(Creader.fd, buf, want);
+            if (n <= 0) { Creader.eof = 1; return 0; }
+            Creader.zip_remaining -= n;
+            if (Creader.zip_remaining == 0) Creader.eof = 1;
+            return (size_t)n;
+        }
+        /* Read compressed data from fd into zip_inbuf as needed */
+        #define ZIP_FILL_INPUT() do { \
+            if (Creader.zip_remaining > 0) { \
+                size_t want = sizeof(Creader.zip_inbuf); \
+                if (want > Creader.zip_remaining) want = Creader.zip_remaining; \
+                ssize_t n = read(Creader.fd, Creader.zip_inbuf, want); \
+                if (n <= 0) { Creader.eof = 1; break; } \
+                Creader.zip_remaining -= n; \
+                zip_got = (size_t)n; \
+            } else { Creader.eof = 1; } \
+        } while(0)
+
+        if (Creader.zip_init == 1) {
+            /* Deflate */
+            Creader.zip.next_out = (unsigned char *)buf;
+            Creader.zip.avail_out = (unsigned)len;
+            while (Creader.zip.avail_out > 0) {
+                if (Creader.zip.avail_in == 0 && Creader.zip_remaining > 0) {
+                    size_t zip_got = 0; ZIP_FILL_INPUT();
+                    Creader.zip.next_in = Creader.zip_inbuf;
+                    Creader.zip.avail_in = (unsigned)zip_got;
+                }
+                if (Creader.zip.avail_in == 0) break;
+                int r = inflate(&Creader.zip, Z_NO_FLUSH);
+                if (r == Z_STREAM_END) { Creader.eof = 1; break; }
+                if (r != Z_OK) { Creader.eof = 1; break; }
+            }
+            return len - Creader.zip.avail_out;
+        } else if (Creader.zip_init == 2) {
+            /* LZMA in ZIP */
+            Creader.xz.next_out = (uint8_t *)buf;
+            Creader.xz.avail_out = len;
+            while (Creader.xz.avail_out > 0) {
+                if (Creader.xz.avail_in == 0 && Creader.zip_remaining > 0) {
+                    size_t zip_got = 0; ZIP_FILL_INPUT();
+                    Creader.xz.next_in = Creader.xz_inbuf;
+                    Creader.xz.avail_in = zip_got;
+                    /* Copy to xz_inbuf since zip_inbuf may differ */
+                    memcpy(Creader.xz_inbuf, Creader.zip_inbuf, zip_got);
+                }
+                if (Creader.xz.avail_in == 0) break;
+                lzma_ret r = lzma_code(&Creader.xz, Creader.eof ? LZMA_FINISH : LZMA_RUN);
+                if (r == LZMA_STREAM_END) { Creader.eof = 1; break; }
+                if (r != LZMA_OK) { Creader.eof = 1; break; }
+            }
+            return len - Creader.xz.avail_out;
+        } else if (Creader.zip_init == 3) {
+            /* bzip2 in ZIP */
+            Creader.bz.next_out = (char *)buf;
+            Creader.bz.avail_out = (unsigned)len;
+            while (Creader.bz.avail_out > 0) {
+                if (Creader.bz.avail_in == 0 && Creader.zip_remaining > 0) {
+                    size_t zip_got = 0; ZIP_FILL_INPUT();
+                    Creader.bz.next_in = (char *)Creader.zip_inbuf;
+                    Creader.bz.avail_in = zip_got;
+                }
+                if (Creader.bz.avail_in == 0) break;
+                int r = BZ2_bzDecompress(&Creader.bz);
+                if (r == BZ_STREAM_END) { Creader.eof = 1; break; }
+                if (r != BZ_OK) { Creader.eof = 1; break; }
+            }
+            return len - Creader.bz.avail_out;
+        } else if (Creader.zip_init == 4) {
+            /* zstd in ZIP */
+            ZSTD_outBuffer out = { buf, len, 0 };
+            while (out.pos < out.size) {
+                if (Creader.zstd_in.pos >= Creader.zstd_in.size && Creader.zip_remaining > 0) {
+                    size_t zip_got = 0; ZIP_FILL_INPUT();
+                    Creader.zstd_in.src = Creader.zip_inbuf;
+                    Creader.zstd_in.size = zip_got;
+                    Creader.zstd_in.pos = 0;
+                }
+                if (Creader.zstd_in.pos >= Creader.zstd_in.size) break;
+                size_t r = ZSTD_decompressStream(Creader.zstd_ds, &out, &Creader.zstd_in);
+                if (ZSTD_isError(r) || r == 0) { Creader.eof = 1; break; }
+            }
+            return out.pos;
+        }
+        return 0;
+    } else if (Creader.type == CMP_ZSTD) {
+        ZSTD_outBuffer out = { buf, len, 0 };
+        while (out.pos < out.size) {
+            if (Creader.zstd_in.pos >= Creader.zstd_in.size && !Creader.eof) {
+                ssize_t n = read(Creader.fd, Creader.zstd_inbuf, sizeof(Creader.zstd_inbuf));
+                if (n <= 0) { Creader.eof = 1; break; }
+                Creader.zstd_in.src = Creader.zstd_inbuf;
+                Creader.zstd_in.size = n;
+                Creader.zstd_in.pos = 0;
+            }
+            size_t r = ZSTD_decompressStream(Creader.zstd_ds, &out, &Creader.zstd_in);
+            if (ZSTD_isError(r)) { Creader.eof = 1; break; }
+            if (r == 0) { Creader.eof = 1; break; }  /* frame complete */
+            if (Creader.zstd_in.pos >= Creader.zstd_in.size && Creader.eof) break;
+        }
+        return out.pos;
+    }
+    return 0;
+}
+
+/* Detect format from first gzread() output and initialize decoder.
+ * For non-gzip formats, reopens the file from Creader.filename.
+ * Returns 1 if non-gzip format detected, 0 if gzip/plain. */
+static int creader_detect(char *buf, size_t buflen) {
+    unsigned char *b = (unsigned char *)buf;
+
+    /* Can only handle non-gzip formats if we can reopen the file */
+    if (!Creader.filename[0]) return 0;  /* pipe/stdin — gzip only */
+
+    /* If gzread decompressed gzip data, buf contains plaintext — no magic.
+     * If file was not gzip, gzread passed raw bytes through.
+     * Check for non-gzip compressed format magic in the raw bytes. */
+
+    if (buflen >= 6 && b[0] == 0xfd && b[1] == 0x37 && b[2] == 0x7a &&
+        b[3] == 0x58 && b[4] == 0x5a && b[5] == 0x00) {
+        /* XZ format — reopen file from beginning */
+        Creader.type = CMP_XZ;
+        Creader.fd = open(Creader.filename, O_RDONLY);
+        if (Creader.fd < 0) return 0;
+        memset(&Creader.xz, 0, sizeof(Creader.xz));
+        lzma_stream_decoder(&Creader.xz, UINT64_MAX, LZMA_CONCATENATED);
+        Creader.xz.avail_in = 0;
+        fprintf(stderr, "Detected XZ compressed input\n");
+        return 1;
+    }
+    if (buflen >= 3 && b[0] == 'B' && b[1] == 'Z' && b[2] == 'h') {
+        /* bzip2 format — reopen file from beginning */
+        Creader.type = CMP_BZ2;
+        Creader.fd = open(Creader.filename, O_RDONLY);
+        if (Creader.fd < 0) return 0;
+        memset(&Creader.bz, 0, sizeof(Creader.bz));
+        BZ2_bzDecompressInit(&Creader.bz, 0, 0);
+        Creader.bz.avail_in = 0;
+        fprintf(stderr, "Detected bzip2 compressed input\n");
+        return 1;
+    }
+    if (buflen >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd) {
+        /* Zstandard format */
+        Creader.type = CMP_ZSTD;
+        Creader.fd = open(Creader.filename, O_RDONLY);
+        if (Creader.fd < 0) return 0;
+        Creader.zstd_ds = ZSTD_createDStream();
+        ZSTD_initDStream(Creader.zstd_ds);
+        Creader.zstd_in.src = NULL;
+        Creader.zstd_in.size = 0;
+        Creader.zstd_in.pos = 0;
+        fprintf(stderr, "Detected Zstandard compressed input\n");
+        return 1;
+    }
+    if (buflen >= 4 && b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) {
+        /* ZIP format — parse local file header, inflate first file */
+        if (buflen >= 30) {
+            unsigned short method = b[8] | (b[9] << 8);
+            unsigned int comp_size = b[18] | (b[19]<<8) | (b[20]<<16) | (b[21]<<24);
+            unsigned short name_len = b[26] | (b[27] << 8);
+            unsigned short extra_len = b[28] | (b[29] << 8);
+            unsigned int header_size = 30 + name_len + extra_len;
+
+            Creader.type = CMP_ZIP;
+            Creader.fd = open(Creader.filename, O_RDONLY);
+            if (Creader.fd < 0) return 0;
+            lseek(Creader.fd, header_size, SEEK_SET);
+            Creader.zip_remaining = comp_size;
+
+            if (method == 8) {  /* deflate */
+                memset(&Creader.zip, 0, sizeof(Creader.zip));
+                inflateInit2(&Creader.zip, -MAX_WBITS);
+                Creader.zip.avail_in = 0;
+                Creader.zip_init = 1;
+                fprintf(stderr, "Detected ZIP input (deflate)\n");
+                return 1;
+            } else if (method == 12) {  /* bzip2 */
+                memset(&Creader.bz, 0, sizeof(Creader.bz));
+                BZ2_bzDecompressInit(&Creader.bz, 0, 0);
+                Creader.bz.avail_in = 0;
+                Creader.zip_init = 3;
+                fprintf(stderr, "Detected ZIP input (bzip2)\n");
+                return 1;
+            } else if (method == 14) {  /* LZMA */
+                memset(&Creader.xz, 0, sizeof(Creader.xz));
+                lzma_alone_decoder(&Creader.xz, UINT64_MAX);
+                Creader.xz.avail_in = 0;
+                Creader.zip_init = 2;
+                fprintf(stderr, "Detected ZIP input (LZMA)\n");
+                return 1;
+            } else if (method == 93) {  /* Zstandard */
+                Creader.zstd_ds = ZSTD_createDStream();
+                ZSTD_initDStream(Creader.zstd_ds);
+                Creader.zstd_in.src = NULL;
+                Creader.zstd_in.size = 0;
+                Creader.zstd_in.pos = 0;
+                Creader.zip_init = 4;
+                fprintf(stderr, "Detected ZIP input (zstd)\n");
+                return 1;
+            } else if (method == 0) {  /* stored */
+                Creader.zip_init = 0;
+                Creader.eof = 0;
+                fprintf(stderr, "Detected ZIP input (stored)\n");
+                return 1;
+            } else {
+                fprintf(stderr, "ZIP: unsupported method %d\n", method);
+                close(Creader.fd);
+                Creader.fd = 0;
+                Creader.type = CMP_GZ;
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+static void creader_reset(void) {
+    if (Creader.type == CMP_XZ) lzma_end(&Creader.xz);
+    else if (Creader.type == CMP_BZ2) BZ2_bzDecompressEnd(&Creader.bz);
+    else if (Creader.type == CMP_ZSTD && Creader.zstd_ds) ZSTD_freeDStream(Creader.zstd_ds);
+    else if (Creader.type == CMP_ZIP) {
+        if (Creader.zip_init == 1) inflateEnd(&Creader.zip);
+        else if (Creader.zip_init == 2) lzma_end(&Creader.xz);
+        else if (Creader.zip_init == 3) BZ2_bzDecompressEnd(&Creader.bz);
+        else if (Creader.zip_init == 4 && Creader.zstd_ds) ZSTD_freeDStream(Creader.zstd_ds);
+    }
+    if (Creader.fd > 0) close(Creader.fd);
+    memset(&Creader, 0, sizeof(Creader));
+}
+
 #define RINDEXSIZE (MAXLINEPERCHUNK)
 
 unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
@@ -34168,7 +34472,28 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
     Lastcnt = 0;
     Lastleft = NULL;
   }
-  readlen = gzread(fi, curpos, (MAXCHUNK / 2) - curcnt - 1);
+  if (Creader.detected && Creader.type != CMP_GZ) {
+    /* Non-gzip compressed format — use library decoder */
+    if (Creader.eof)
+      readlen = 0;
+    else
+      readlen = creader_read(curpos, (MAXCHUNK / 2) - curcnt - 1);
+  } else {
+    readlen = gzread(fi, curpos, (MAXCHUNK / 2) - curcnt - 1);
+    /* First read: check for non-gzip compressed formats */
+    if (!Creader.detected && readlen > 0) {
+      Creader.detected = 1;
+      if (creader_detect(curpos, readlen)) {
+        /* Detected non-gzip format — discard raw compressed bytes from gzread,
+         * re-read decompressed data from library decoder into the buffer */
+        gzclose(fi);
+        Creader.gz_closed = 1;
+        curcnt = 0;  /* discard any leftover + raw compressed data */
+        curpos = readbuf;
+        readlen = creader_read(curpos, (MAXCHUNK / 2) - 1);
+      }
+    }
+  }
   curcnt += readlen;
   curpos = readbuf;
   curindex = 0;
@@ -34195,7 +34520,7 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
       curpos[curindex + rlen] = 0;
       curindex += len + 1;
     } else {
-      if (gzeof(fi)) {
+      if ((Creader.detected && Creader.type != CMP_GZ) ? Creader.eof : gzeof(fi)) {
         curpos[curcnt] = '\n';
         rlen = len = (curcnt - curindex);
         if (rlen < 0)
@@ -43922,8 +44247,11 @@ usage:
         fprintf(stderr, "File %s is a directory, ignored\n", argv[y]);
         continue;
       }
+      creader_reset();
       zfi = gzopen(argv[y], "rb");
       Curfile = argv[y];
+      if (S_ISREG(sb.st_mode))
+        strncpy(Creader.filename, argv[y], sizeof(Creader.filename) - 1);
     }
     if (!zfi) {
       perror(argv[y]);
@@ -44051,7 +44379,8 @@ reprocess:
         }
       }
     }
-    gzclose(zfi);
+    if (!Creader.gz_closed) gzclose(zfi);
+    creader_reset();
   }
   possess(FreeWaiting);
   wait_for(FreeWaiting, TO_BE, alloc_maxt * 32);
