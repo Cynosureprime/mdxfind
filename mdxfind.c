@@ -10263,6 +10263,13 @@ do {
 	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 	}
 	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+#ifdef GPU_ENABLED
+	if ((job->op == JOB_SHA512CRYPT || job->op == JOB_SHA256CRYPT) &&
+	    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
+	  /* hashcnt accounted by gpujob thread */
+	  break;
+	}
+#endif
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	  unsigned int cas;
@@ -34841,10 +34848,10 @@ void build_compact_table(void) {
    * stored (enough for compact_fp/idx key + probe_compact's 4-word compare). */
   { static const unsigned char sha512_perm[21][3] = {
         {0,21,42},{22,43,1},{44,2,23},{3,24,45},{25,46,4},
-        {5,26,47},{27,48,6},{7,28,49},{29,50,8},{9,30,51},
-        {31,52,10},{11,32,53},{33,54,12},{13,34,55},{35,56,14},
-        {15,36,57},{37,58,16},{17,38,59},{39,60,18},{19,40,61},
-        {41,62,20}
+        {47,5,26},{6,27,48},{28,49,7},{50,8,29},{9,30,51},
+        {31,52,10},{53,11,32},{12,33,54},{34,55,13},{56,14,35},
+        {15,36,57},{37,58,16},{59,17,38},{18,39,60},{40,61,19},
+        {62,20,41}
     };
     char sc_line[256];
     Word_t *SC_PV;
