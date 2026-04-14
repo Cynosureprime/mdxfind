@@ -35,6 +35,7 @@ mdxfind supports GPU acceleration via OpenCL (NVIDIA, AMD) and Metal (Apple Sili
 - **Unsalted iteration** (`-i`): MD5, SHA1, SHA256, MD4/NTLM, SHA512 with GPU hex-iteration loops
 - **RAW binary iteration** (`-i`): MD5RAW, SHA1RAW, SHA256RAW, SHA384RAW, SHA512RAW — binary re-hash (not hex) on GPU
 - **Mask expansion** (`-n`/`-N`): Combined with iteration on GPU — 4.58 Gh/s on Apple M2 Max (MD5 `-i 100 -n '?d?d'`)
+- **Brute-force mode**: Pure mask-based candidate generation on GPU — 5.37 Gh/s MD5 on RTX 4070 Ti Super (47% faster than hashcat on the same hardware)
 
 On a 5-GPU system (2x AMD RDNA3 + RTX 4070 Ti + RTX 3080 + AMD iGPU), mdxfind solved 1,000,000 salted MD5 hashes against the rockyou wordlist in 40 seconds at 69 GH/s. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for detailed GPU performance comparisons.
 
@@ -252,6 +253,49 @@ mdxfind -m e1 -f hashes.txt < wordlist.xz
 ```
 
 ZIP files are processed as single-entry archives (the first entry is read). For multi-entry ZIP files, extract first or use a tool like `unzip -p` to pipe the contents.
+
+### Brute-Force Mode
+
+When the last argument is not a file, mdxfind treats it as a mask pattern and enters brute-force mode — generating all candidates directly on the GPU without a wordlist.
+
+```bash
+# Brute-force all 9-character lowercase passwords against MD5 hashes
+mdxfind -m e1 -f hashes.txt '?l?l?l?l?l?l?l?l?l'
+
+# Single candidate test (mask with no variable positions)
+mdxfind -m e1 -f hashes.txt 'password'
+
+# Mixed literal and mask characters
+mdxfind -m e1 -f hashes.txt 'pass?d?d?d?d'
+```
+
+Mask characters: `?l` (lowercase), `?u` (uppercase), `?d` (digits), `?s` (special), `?a` (all printable), `?h` (hex lowercase), `?H` (hex uppercase), `?b` (all bytes 0x00-0xFF). Custom charsets use `?[...]` syntax: `?[0-9a-f]`.
+
+If the argument is a valid file, it is processed as a wordlist. Brute-force mode activates only when `stat()` fails on the argument. A diagnostic message confirms:
+
+```
+File ?l?l?l?l?l?l?l?l?l not found: No such file or directory
+Brute force processing detected: 5429503678976 candidates from mask '?l?l?l?l?l?l?l?l?l'
+```
+
+Progress is displayed every 15 seconds with keyspace completion, hash rate, sample candidate, and ETA:
+
+```
+Brute ?l?l?l?l?l?l?l?l?l, 3.9T/5.4T (72.7%), Found=224732, 5.37Gh/s, 'sxegdtkfb', ETA 4m36s
+```
+
+GPU dispatch is automatically tuned at startup using binary-exponential timing probes, targeting 200–400ms per dispatch chunk. This keeps the GPU saturated while maintaining responsive progress updates and avoiding OS GPU watchdog timeouts.
+
+#### Brute-force benchmark: mdxfind vs hashcat
+
+Test: 14.3 million MD5 hashes, 9-character lowercase mask (`?l?l?l?l?l?l?l?l?l` = 5.4 trillion candidates), NVIDIA RTX 4070 Ti Super.
+
+| Tool | Command | Solutions | Rate | Time |
+|------|---------|----------|------|------|
+| **mdxfind** | `mdxfind -m e1 -f hashes.txt '?l?l?l?l?l?l?l?l?l'` | 516,830 | 5.37 GH/s | 16m54s |
+| **hashcat** | `hashcat -O -a 3 -m 0 -o out --potfile-disable hashes.txt '?l?l?l?l?l?l?l?l?l'` | 516,830 | 3.66 GH/s | 25m41s |
+
+Both tools found identical results (verified with [hashpipe](https://github.com/Cynosureprime/hashpipe)). mdxfind was 47% faster on the same hardware.
 
 ### Output Format
 
