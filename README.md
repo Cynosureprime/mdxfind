@@ -22,7 +22,6 @@ Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://j
 
 ### When NOT to use mdxfind
 
-- Pure brute-force attacks with very large keyspaces — hashcat's rule engine and distributed support are more mature
 - Distributed cracking clusters — hashcat + hashtopolis is better suited
 - Single known hash type with a small hash list and no iteration — hashcat's GPU speed wins here
 
@@ -35,9 +34,11 @@ mdxfind supports GPU acceleration via OpenCL (NVIDIA, AMD) and Metal (Apple Sili
 - **Unsalted iteration** (`-i`): MD5, SHA1, SHA256, MD4/NTLM, SHA512 with GPU hex-iteration loops
 - **RAW binary iteration** (`-i`): MD5RAW, SHA1RAW, SHA256RAW, SHA384RAW, SHA512RAW — binary re-hash (not hex) on GPU
 - **Mask expansion** (`-n`/`-N`): Combined with iteration on GPU — 4.58 Gh/s on Apple M2 Max (MD5 `-i 100 -n '?d?d'`)
-- **Brute-force mode**: Pure mask-based candidate generation on GPU — 5.37 Gh/s MD5 on RTX 4070 Ti Super (47% faster than hashcat on the same hardware)
+- **Brute-force mode**: Pure mask-based candidate generation on GPU with multi-GPU support — 30.2 GH/s MD5 across 5 GPUs
 
-On a 5-GPU system (2x AMD RDNA3 + RTX 4070 Ti + RTX 3080 + AMD iGPU), mdxfind solved 1,000,000 salted MD5 hashes against the rockyou wordlist in 40 seconds at 69 GH/s. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for detailed GPU performance comparisons.
+**Multi-GPU brute-force**: In brute-force mode, all available GPUs work together on the same keyspace using a shared atomic cursor. Each GPU autonomously claims chunks of the mask keyspace, with faster GPUs naturally claiming more work. Chunk sizes are auto-tuned per device via timing probes (200-400ms target). On a 5-GPU system (RTX 4070 Ti + RTX 3080 + 2x AMD RX 9070 XT + AMD iGPU), `[a-z]{9}` (5.4 trillion candidates) completed in 185 seconds at 30.2 GH/s — a 2.7x speedup over single-GPU. Use `-G` to select specific devices (e.g. `-G 2,3` for NVIDIA only).
+
+On a 5-GPU system (2x AMD RDNA4 + RTX 4070 Ti + RTX 3080 + AMD iGPU), mdxfind solved 1,000,000 salted MD5 hashes against the rockyou wordlist in 40 seconds at 69 GH/s. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for detailed GPU performance comparisons.
 
 ### Antivirus note
 
@@ -296,6 +297,18 @@ Test: 14.3 million MD5 hashes, 9-character lowercase mask (`?l?l?l?l?l?l?l?l?l` 
 | **hashcat** | `hashcat -O -a 3 -m 0 -o out --potfile-disable hashes.txt '?l?l?l?l?l?l?l?l?l'` | 516,830 | 3.66 GH/s | 25m41s |
 
 Both tools found identical results (verified with [hashpipe](https://github.com/Cynosureprime/hashpipe)). mdxfind was 47% faster on the same hardware.
+
+#### Multi-GPU brute-force scaling
+
+Test: 2,585 MD5 hashes, `?l?l?l?l?l?l?l?l?l` (5.4T candidates).
+
+| Configuration | GPUs | Rate | Time | Speedup |
+|---------------|------|------|------|---------|
+| Single GPU | RTX 4070 Ti | 11.1 GH/s | 490s | 1.0x |
+| Dual GPU | RTX 4070 Ti + RTX 3080 | 20.7 GH/s | 185s* | 1.9x |
+| All 5 GPUs | RTX 4070 Ti + RTX 3080 + 2x RX 9070 XT + iGPU | 30.2 GH/s | 185s | 2.7x |
+
+Speedup is sublinear because the AMD and iGPU devices are slower per-device than the NVIDIA cards. The atomic work-stealing scheduler naturally load-balances: faster GPUs claim more chunks of the keyspace.
 
 ### Output Format
 

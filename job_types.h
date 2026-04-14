@@ -995,5 +995,6 @@
 #define JOB_WPBCRYPT        993
 #define JOB_GOST12512CRYPT  994
 #define JOB_YESCRYPT        995
+#define JOB_MD5SHA256SHA256 996
 #define JOB_DONE 2000
 #endif

@@ -183,9 +183,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.302 2026/04/14 09:21:10 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.303 2026/04/14 15:26:33 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.303  2026/04/14 15:26:33  dlr
+ * Multi-GPU brute-force: atomic cursor keyspace sharing, Word_t fix for 64-bit Judy on Windows, gpujob_return_free, bf_start/bf_stop lifecycle
+ *
  * Revision 1.302  2026/04/14 09:21:10  dlr
  * Divide lineswanted by Numrules when rules are active, so jobs are smaller and more cores stay busy. Regression fix — rule count was previously factored into job sizing.
  *
@@ -9148,10 +9151,37 @@ while (1) {
         }
         gpu_done[gl >> 3] |= (1 << (gl & 7));
       }
-      /* Flush partial batch */
+      /* Flush partial batch.  For brute-force, submit one copy per GPU
+       * device so all GPUs work in parallel via atomic cursor. */
       if (my_jobg && my_jobg->count > 0) {
+        int bf_copies = 1;
+#if defined(OPENCL_GPU)
+        if (job->flags & JOBFLAG_BRUTEFORCE) {
+          extern int gpu_opencl_num_devices(void);
+          bf_copies = gpu_opencl_num_devices();
+          if (bf_copies < 1) bf_copies = 1;
+        }
+#endif
         gpujob_submit(my_jobg);
         my_jobg = NULL;
+        /* Submit additional identical batches for remaining GPUs */
+        for (int bfc = 1; bfc < bf_copies; bfc++) {
+          struct jobg *dup = gpujob_get_free(job->filename, job->startline);
+          dup->op = job->op;
+          dup->filename = job->filename;
+          dup->flags = job->flags;
+          dup->doneprint = job->doneprint;
+          dup->line_num = job->startline;
+          dup->count = 0;
+          dup->word_stride = 0;
+          if (!gpu_try_pack_unsalted(&dup, job, applen, prelen,
+              &job->readbuf[job->readindex[job->startline].offset],
+              job->readindex[job->startline].len)) {
+            gpujob_return_free(dup);
+            break;
+          }
+          gpujob_submit(dup);
+        }
       }
     }
   }
@@ -40576,22 +40606,24 @@ badrule:
         }
         tok = strtok(optarg, ",");
         while (tok) {
-          if (strcmp(tok, "ALL") == 0) {
-            /* Allowlist based on real-world combo list analysis (50m.types).
-             * Match by prefix (^) or exact name. Exclude anything with SALT. */
-            /* Prefix matches cover families found in real combo lists */
-            static const char *all_prefixes[] = {
-              "GOST", "HAV", "MD2", "MD4", "MD5", "MD6",
-              "PANAMA", "RIPEMD", "RMD",
-              "SHA", "SMF", "SNE", "SQL5",
-              "TIGER", "WRL",
+          if (strcmp(tok, "ALL") == 0 || strcmp(tok, ".") == 0) {
+            /* Curated default set: ~22 commonly encountered hash types.
+             * Covers the most frequent unsalted + salted types seen in
+             * real-world combo lists. Use -h REGEX for specific types. */
+            static const char *all_types[] = {
+              /* Unsalted */
+              "MD5", "MD4", "NTLM", "SHA1", "SHA224", "SHA256", "SHA384", "SHA512",
+              "MYSQL3", "SQL5", "WRL", "RMD160", "BLAKE2S256", "KECCAK256",
+              "MD5SHA1", "SHA1MD5",
+              /* Salted */
+              "MD5PASSSALT", "MD5SALTPASS",
+              "SHA1PASSSALT", "SHA1SALTPASS",
+              "SHA256PASSSALT", "SHA512SALTPASS",
               NULL
             };
-            for (x = 1; Types[x]; x++) {
-              const char *tname = Types[x];
-              /* Check prefix matches */
-              for (int pi = 0; all_prefixes[pi]; pi++) {
-                if (strncmp(tname, all_prefixes[pi], strlen(all_prefixes[pi])) == 0) {
+            for (int ti = 0; all_types[ti]; ti++) {
+              for (x = 1; Types[x]; x++) {
+                if (strcmp(Types[x], all_types[ti]) == 0) {
                   J1S(RC, Dohash, x);
                   break;
                 }
@@ -44565,14 +44597,19 @@ usage:
 #endif
 
         /* Dispatch brute-force: one job per algorithm type with full keyspace.
-         * GPU handles mask chunking internally. ReportStats tracks Tothash. */
+         * GPU handles mask chunking internally. ReportStats tracks Tothash.
+         * Multi-GPU: activate atomic cursor mode so all GPUs share keyspace. */
+#if defined(OPENCL_GPU)
+        if (gpujob_available())
+          gpu_opencl_bf_start();
+#endif
         Totalfiles = 1;
         Curfile = argv[0];
         doneprint = 0;
         Readindex[0].offset = 0;
         Readindex[0].len = 0;
         Readbuf[0] = 0;
-        { int NextX = 0, RC;
+        { Word_t NextX = 0; int RC;
           J1F(RC, Dohash, NextX);
           while (RC) {
             x = NextX;
@@ -44787,6 +44824,9 @@ bf_done:
     twist(WorkWaiting, BY, +1);
 #ifdef GPU_ENABLED
     gpujob_shutdown(); /* wait for GPU to finish all work */
+#if defined(OPENCL_GPU)
+    gpu_opencl_bf_stop();
+#endif
 #endif
     possess(HashWaiting);
     twist(HashWaiting, TO, 1);  /* now signal ReportStats to exit */

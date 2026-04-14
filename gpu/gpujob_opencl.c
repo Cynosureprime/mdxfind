@@ -492,7 +492,12 @@ void gpujob(void *arg) {
 
 
                 int iter_num;
-                if (has_iter) {
+                if (is_md5crypt) {
+                    /* md5crypt/phpbb3: fixed stride 6, no iter field */
+                    iter_num = 1;
+                    for (int w = 0; w < 4; w++)
+                        curin.i[w] = entry[2 + w];
+                } else if (has_iter) {
                     iter_num = entry[2];
                     for (int w = 0; w < hash_words; w++)
                         curin.i[w] = entry[3 + w];
@@ -1135,6 +1140,22 @@ void gpujob_submit(struct jobg *g) {
     gpu_sched_active_count--;
     gpu_sched_wake_best();
     release(GPUSchedLock);
+}
+
+/* Return a jobg buffer to the free list without submitting it for work. */
+void gpujob_return_free(struct jobg *g) {
+    g->next = NULL;
+    g->count = 0;
+    g->passbuf_pos = 0;
+    possess(GPUFreeWaiting);
+    if (GPUFreeTail) {
+        *GPUFreeTail = g;
+        GPUFreeTail = &(g->next);
+    } else {
+        GPUFreeHead = g;
+        GPUFreeTail = &(g->next);
+    }
+    twist(GPUFreeWaiting, BY, +1);
 }
 
 /* Non-blocking version: returns NULL immediately if no free buffer. */

@@ -832,6 +832,23 @@ void gpu_opencl_shutdown(void) {
 
 int gpu_opencl_available(void) { return ocl_ready; }
 int gpu_opencl_num_devices(void) { return num_gpu_devs; }
+
+/* Brute-force multi-GPU: shared atomic cursor into mask keyspace. */
+volatile uint64_t _bf_cursor = 0;
+volatile int _bf_active = 0;
+
+void gpu_opencl_bf_start(void) {
+    _bf_cursor = 0;
+    _bf_active = 1;
+    __sync_synchronize();
+}
+
+void gpu_opencl_bf_stop(void) {
+    _bf_active = 0;
+    __sync_synchronize();
+}
+
+int gpu_opencl_bf_active(void) { __sync_synchronize(); return _bf_active; }
 int gpu_opencl_max_batch(int dev_idx) {
     if (dev_idx < 0 || dev_idx >= num_gpu_devs) return GPUBATCH_MAX;
     return gpu_devs[dev_idx].max_batch;
@@ -1248,8 +1265,15 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     if (mask_chunk > mask_total) mask_chunk = mask_total;
     _mask_resume = 0;  /* consumed — reset for next dispatch */
 
+    /* Brute-force multi-GPU: use atomic cursor instead of sequential chunks.
+     * Each GPU claims mask_chunk-sized pieces from _bf_cursor until keyspace
+     * is exhausted.  Non-brute-force dispatches use the original chunk loop. */
+    int bf_mode = (__sync_add_and_fetch(&_bf_active, 0) && is_mask);
+
     int num_chunks;
-    if (is_mask)
+    if (bf_mode)
+        num_chunks = 0;  /* not used — loop controlled by atomic cursor */
+    else if (is_mask)
         num_chunks = (int)((mask_total + mask_chunk - 1) / mask_chunk);
     else if (is_salted)
         num_chunks = (total_salts + salt_chunk - 1) / salt_chunk;
@@ -1259,8 +1283,31 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     struct timespec t0, t1;
     if (!gk->tuned) clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    for (int chunk = 0; chunk < num_chunks; chunk++) {
-        if (is_mask) {
+    for (int chunk = 0; bf_mode ? 1 : (chunk < num_chunks); chunk++) {
+        if (bf_mode) {
+            /* Atomically claim next chunk from shared cursor */
+            uint64_t my_start = __sync_fetch_and_add(&_bf_cursor, mask_chunk);
+            if (my_start >= gpu_mask_total) break;  /* keyspace exhausted */
+            uint64_t remaining = gpu_mask_total - my_start;
+            if (remaining > mask_chunk) remaining = mask_chunk;
+            params.mask_start = my_start;
+            params.num_masks = (uint32_t)remaining;
+            /* Pre-decompose mask_start into per-position base offsets */
+            { uint64_t ms = my_start;
+              uint64_t b0 = 0, b1 = 0;
+              int ntot = gpu_mask_n_prepend + gpu_mask_n_append;
+              for (int bi = ntot - 1; bi >= 0; bi--) {
+                uint8_t sz = gpu_mask_sizes[bi];
+                uint8_t digit = (uint8_t)(ms % sz);
+                ms /= sz;
+                if (bi < 8) b0 |= (uint64_t)digit << (bi * 8);
+                else        b1 |= (uint64_t)digit << ((bi - 8) * 8);
+              }
+              params.mask_base0 = b0;
+              params.mask_base1 = b1;
+            }
+            clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
+        } else if (is_mask) {
             params.mask_start = mask_start_base + (uint64_t)chunk * mask_chunk;
             { uint64_t remaining = mask_total - (uint64_t)chunk * mask_chunk;
               if (remaining > mask_chunk) remaining = mask_chunk;
@@ -1345,7 +1392,11 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
                 chunk_hits * stride * sizeof(uint32_t), d->h_hits, 0, NULL, NULL);
             /* Set resume point and record mask_start for hit reconstruction */
             _last_mask_start = params.mask_start;
-            if (is_mask) {
+            if (bf_mode) {
+                /* Brute-force: cursor already advanced; signal caller to
+                 * re-enter dispatch_batch (cursor handles continuation). */
+                _mask_resume = _bf_cursor < gpu_mask_total ? _bf_cursor : 0;
+            } else if (is_mask) {
                 uint64_t next = mask_start_base + (uint64_t)(chunk + 1) * mask_chunk;
                 if (next < gpu_mask_total)
                     _mask_resume = next;

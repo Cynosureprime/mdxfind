@@ -753,7 +753,12 @@ void gpujob(void *arg) {
 
 
                 int iter_num;
-                if (has_iter) {
+                if (is_phpbb3 || is_descrypt) {
+                    /* phpbb3/descrypt: fixed stride 6, no iter field */
+                    iter_num = 1;
+                    for (int w = 0; w < 4; w++)
+                        curin.i[w] = entry[2 + w];
+                } else if (has_iter) {
                     iter_num = entry[2];
                     for (int w = 0; w < hash_words; w++)
                         curin.i[w] = entry[3 + w];

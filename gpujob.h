@@ -110,6 +110,9 @@ struct jobg *gpujob_try_get_free(void);
 /* Submit a filled JOBG to the GPU work queue. */
 void gpujob_submit(struct jobg *g);
 
+/* Return a JOBG to the free list without submitting for work. */
+void gpujob_return_free(struct jobg *g);
+
 /* Returns 1 if GPU job system is initialized and ready. */
 int gpujob_available(void);
 
