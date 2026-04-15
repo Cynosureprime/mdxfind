@@ -750,6 +750,30 @@ int gpu_opencl_init(void) {
                 continue;
             }
 
+            /* GPU Blacklist: suppress devices known to crash their OpenCL drivers.
+             * Intel iGPUs (UHD/Iris/HD Graphics) crash in igdrcl64.dll on Windows.
+             * AMD integrated GPUs (gfx1036 etc with few CUs) have stability issues.
+             * Users can override with explicit -G <idx> to force-enable. */
+            if (!gpu_device_filter_set) {
+                char vendor[256] = {0};
+                cl_uint cus = 0;
+                clGetDeviceInfo(devs[d], CL_DEVICE_VENDOR, sizeof(vendor), vendor, NULL);
+                clGetDeviceInfo(devs[d], CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cus), &cus, NULL);
+                int blacklisted = 0;
+                /* Intel integrated GPUs — all Intel GPUs are iGPUs */
+                if (strstr(vendor, "Intel"))
+                    blacklisted = 1;
+                /* AMD integrated GPUs — very low CU count (typically 1-4 CUs) */
+                if ((strstr(vendor, "AMD") || strstr(vendor, "Advanced Micro")) && cus <= 4)
+                    blacklisted = 1;
+                if (blacklisted) {
+                    fprintf(stderr, "OpenCL GPU[%d]: %s - blacklisted (use -G %d to force)\n",
+                            all_dev_idx, dname, all_dev_idx);
+                    all_dev_idx++;
+                    continue;
+                }
+            }
+
             if (num_gpu_devs < MAX_GPU_DEVICES) {
                 if (init_device(num_gpu_devs, devs[d]) == 0) {
                     fprintf(stderr, "OpenCL GPU[%d]: %s (%llu MB, %u MHz)\n", all_dev_idx, dname,

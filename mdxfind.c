@@ -183,9 +183,18 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.306 2026/04/14 23:13:53 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.309 2026/04/15 01:58:19 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.309  2026/04/15 01:58:19  dlr
+ * GPU rules dispatch: re-acquire buffer every 128 SIMD flushes, non-blocking; 941M words/run on mmt at 295Mh/s
+ *
+ * Revision 1.308  2026/04/15 01:34:16  dlr
+ * GPU rules dispatch: non-blocking pack into existing buffer, SIMD fallback when GPU busy; lineswanted not UINT_MAX with rules
+ *
+ * Revision 1.307  2026/04/15 01:15:04  dlr
+ * GPU rules dispatch: rule-generated words sent to GPU with SIMD fallback; per-GPU dispatch counters; iGPU blacklist (Intel all, AMD <=4 CUs)
+ *
  * Revision 1.306  2026/04/14 23:13:53  dlr
  * NoMetal global for all platforms; -G none works without GPU; other -G options error on non-GPU builds
  *
@@ -8919,6 +8928,7 @@ rhash_con = NULL;
 argon2_ws = NULL;
 #ifdef GPU_ENABLED
 struct jobg *my_jobg = NULL;
+unsigned int gpu_reacquire = 0;
 #endif
 
 while (1) {
@@ -23541,6 +23551,14 @@ md5sha256:
 		      job->outlen = ljob[ljobi].outlen;
                     }
                     ljobi = 0;
+#ifdef GPU_ENABLED
+                  } else if (Maxiter <= 1 && !my_jobg && gpujob_available() &&
+                             gpu_op_category(job->op) == GPU_CAT_MASK &&
+                             gpu_try_pack_unsalted(&my_jobg, job, 0, 0, cur, len)) {
+                    /* Acquired GPU buffer and packed base word — rules will fill it */
+                    hashcnt++;
+                    ljobi = 0;
+#endif
                   } else {
                     ljobi = 1;
                   }
@@ -23573,6 +23591,13 @@ md5sha256:
                           checkhash(&curin, 32, x, &ljob[ljobi]);
 		          job->outlen = ljob[ljobi].outlen;
                         }
+#ifdef GPU_ENABLED
+                      } else if (Maxiter <= 1 && my_jobg &&
+                                 gpu_try_pack_unsalted(&my_jobg, job, 0, 0,
+                                     ljob[ljobi].pass, ljob[ljobi].len)) {
+                        /* GPU had a buffer ready — candidate packed, skip SIMD */
+                        hashcnt++;
+#endif
                       } else {
                         ljobi++;
                       }
@@ -23655,6 +23680,23 @@ md5sha256:
                         }
                       }
                       ljobi = 0;
+#ifdef GPU_ENABLED
+                      /* Periodically try to re-acquire a GPU buffer.
+                       * Only every 128 SIMD flushes to avoid lock contention. */
+                      if (!my_jobg && Maxiter <= 1 && (++gpu_reacquire & 127) == 0 &&
+                          gpu_op_category(job->op) == GPU_CAT_MASK) {
+                        my_jobg = gpujob_try_get_free();
+                        if (my_jobg) {
+                          my_jobg->op = job->op;
+                          my_jobg->filename = job->filename;
+                          my_jobg->flags = job->flags;
+                          my_jobg->doneprint = job->doneprint;
+                          my_jobg->line_num = job->startline;
+                          my_jobg->count = 0;
+                          my_jobg->word_stride = 0;
+                        }
+                      }
+#endif
                     }
                   }
 		  }
@@ -34260,11 +34302,8 @@ HAV256_5_start:
       } while (((job->flags & JOBFLAG_NUMBERS) && (++number_iter < (job->MaskCount ? job->MaskCount : Iter_Count[job->digits]))) || currule || (Email && emailcur < emailpow));
     }
 #ifdef GPU_ENABLED
-    /* Flush partial GPU batch at end of job — but not for mask batches
-     * which accumulate across words until the batch is full or JOB_DONE */
-    if (my_jobg && my_jobg->count > 0 &&
-        gpu_op_category(my_jobg->op) != GPU_CAT_MASK &&
-        my_jobg->word_stride == 0) {
+    /* Flush partial GPU batch at end of job */
+    if (my_jobg && my_jobg->count > 0) {
       gpujob_submit(my_jobg);
       my_jobg = NULL;
     }
@@ -44847,7 +44886,7 @@ reprocess:
 	    J1N(RC, Dohash, NextX); 
 	    continue; 
 	  }
-	  if (linehints[x].gpu && !NoMetal) {
+	  if (linehints[x].gpu && !NoMetal && !Rules) {
 	    linehints[x].lineswanted = UINT_MAX;
 	    numline = UINT_MAX;
 	  } else {

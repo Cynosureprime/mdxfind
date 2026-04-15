@@ -137,6 +137,12 @@ lock *GPUWorkWaiting, *GPUFreeWaiting;
 static int _gpujob_ready = 0;
 static int _gpujob_count = 1;
 static int _num_jobg_buffers = 0;
+
+/* Per-GPU dispatch counters for diagnostics */
+#define MAX_GPU_SLOTS 64
+static uint64_t _gpu_dispatches[MAX_GPU_SLOTS];
+static uint64_t _gpu_hits[MAX_GPU_SLOTS];
+static uint64_t _gpu_batches[MAX_GPU_SLOTS];
 static int _max_salt_count = 0;
 static int _max_salt_bytes = 0;
 static int overflow_loaded = 0;
@@ -456,10 +462,15 @@ void gpujob(void *arg) {
         do {
         dispatch_retry = 0;
         max_mask_idx = 0;
+        if (my_slot < MAX_GPU_SLOTS) _gpu_batches[my_slot]++;
         hits = gpu_opencl_dispatch_batch(my_slot,
             g->word_stride ? g->raw : g->hexhash[0],
             (const uint16_t *)g->hexlen,
             g->count, &nhits);
+        if (my_slot < MAX_GPU_SLOTS) {
+            _gpu_dispatches[my_slot] += g->count;
+            if (nhits > 0) _gpu_hits[my_slot] += nhits;
+        }
 
         if (hits && nhits > 0) {
             salt_refresh = 1;
@@ -1033,6 +1044,15 @@ void gpujob_shutdown(void) {
         gpujob_submit(sentinel);
     }
     _gpujob_ready = 0;
+
+    /* Report per-GPU dispatch statistics */
+    for (int i = 0; i < _gpujob_count && i < MAX_GPU_SLOTS; i++) {
+        if (_gpu_batches[i] || _gpu_dispatches[i])
+            fprintf(stderr, "OpenCL GPU[%d]: %llu batches, %llu words dispatched, %llu hits\n",
+                i, (unsigned long long)_gpu_batches[i],
+                (unsigned long long)_gpu_dispatches[i],
+                (unsigned long long)_gpu_hits[i]);
+    }
 }
 
 struct jobg *gpujob_get_free(char *filename, unsigned int startline) {
