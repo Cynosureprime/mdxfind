@@ -183,9 +183,27 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.309 2026/04/15 01:58:19 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.315 2026/04/16 03:52:12 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.315  2026/04/16 03:52:12  dlr
+ * Fix MD5DECBASE64MD5/SHA1DECBASE64 plaintext corruption (job->clen overwritten with decoded length). Auto-disable GPU in -z mode.
+ *
+ * Revision 1.314  2026/04/16 03:17:12  dlr
+ * Fix BCRYPT compound salt isolation: procjob uses Typesalt[job->op] instead of hardcoded Typesalt[JOB_BCRYPT]. Loader populates Typesalt per selected type only (no JOB_BCRYPT unconditional). Prevents cross-contamination with separate -M -F pairs.
+ *
+ * Revision 1.313  2026/04/16 03:02:18  dlr
+ * Auto-disable GPU in -z mode (GPU kernels cannot emit debug output). Add Printall guard to pre-scan dispatch path. BCRYPT compound TYPEOPT_NEEDSF->NEEDSJ fix.
+ *
+ * Revision 1.312  2026/04/16 02:33:29  dlr
+ * Fix BCRYPT compound type loading: TYPEOPT_NEEDSF->NEEDSJ for e451/e452 (hex fast-path was stealing structured hashes). Populate Typesalt for JOB_BCRYPT (always) plus each selected compound type in BCRYPT loader. Fixes -M e451 -F crash and "No final hash type found" regression.
+ *
+ * Revision 1.311  2026/04/16 02:02:51  dlr
+ * Remove debug fprintf statements from GPU iteration debugging
+ *
+ * Revision 1.310  2026/04/15 12:42:07  dlr
+ * Fix brute-force progress display with salts: divide Tothash by per-type salt multiplier; return empty GPU buffers at end of job
+ *
  * Revision 1.309  2026/04/15 01:58:19  dlr
  * GPU rules dispatch: re-acquire buffer every 128 SIMD flushes, non-blocking; 941M words/run on mmt at 295Mh/s
  *
@@ -5898,8 +5916,8 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [448] = TYPEOPT_NEEDSF,  /* SHA512_CUSTOM1 */
     [449] = TYPEOPT_NEEDSF,  /* MD5SQL3 */
     [450] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* BCRYPT */
-    [451] = TYPEOPT_NEEDSF | TYPEOPT_SALTJUDY,  /* BCRYPTMD5 */
-    [452] = TYPEOPT_NEEDSF | TYPEOPT_SALTJUDY,  /* BCRYPTSHA1 */
+    [451] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* BCRYPTMD5 */
+    [452] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* BCRYPTSHA1 */
     [453] = TYPEOPT_NEEDSF,  /* MD5sub8-24MD5 */
     [454] = TYPEOPT_NEEDSF,  /* MD5sub8-24MD5sub8-24MD5 */
     [455] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* PHPBB3 */
@@ -8675,10 +8693,14 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
     if (Maxiter > 1 && (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED ||
                         cat == GPU_CAT_SALTPASS || cat == GPU_CAT_SALTED)) {
         switch (job->op) {
-        case JOB_MD5: case JOB_SHA1: case JOB_SHA256:  /* have GPU hex iter */
-        case JOB_MD4: case JOB_MD4UTF16: case JOB_SHA512:
-        case JOB_MD5RAW: case JOB_SHA1RAW: case JOB_SHA256RAW:  /* GPU binary iter */
+        case JOB_MD5: case JOB_SHA1: case JOB_SHA256: case JOB_SHA224:
+        case JOB_MD4: case JOB_MD4UTF16: case JOB_SHA512: case JOB_SHA384:
+        case JOB_MD5RAW: case JOB_SHA1RAW: case JOB_SHA256RAW:
         case JOB_SHA384RAW: case JOB_SHA512RAW:
+        case JOB_RMD160: case JOB_BLAKE2S256: case JOB_WRL: case JOB_MD6256:
+        case JOB_KECCAK224: case JOB_KECCAK256: case JOB_KECCAK384: case JOB_KECCAK512:
+        case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
+        case JOB_STREEBOG_32: case JOB_STREEBOG_64:
             break;
         default: return 0;
         }
@@ -9138,7 +9160,7 @@ while (1) {
    * (GPU busy or word too long), skip to CPU. Use blocking gpujob_get_free
    * to ensure GPU gets full batches. */
   unsigned char *gpu_done = NULL;
-  if (gpujob_available() && gpu_op_category(job->op) == GPU_CAT_MASK &&
+  if (gpujob_available() && !Printall && gpu_op_category(job->op) == GPU_CAT_MASK &&
       ((MaskAppendLen > 0 || MaskPrependLen > 0) || Maxiter > 1 || GPUForce) && !Rules && !Email) {
     extern uint64_t gpu_mask_total;
     if (gpu_mask_total > 0 || Maxiter > 1 || GPUForce) {
@@ -12013,10 +12035,10 @@ nextbb:
 	      case JOB_BCRYPT256:
                 if (len > MAXLINE)
                   break;
-                /* iterate unique salt prefixes from Typesalt[JOB_BCRYPT] */
+                /* iterate unique salt prefixes from Typesalt[job->op] */
                 linebuf2[MAXLINE] = linebuf2[0] = linebuf[0] = 0;
                 cur[len] = 0;
-                JSLF(PV, Typesalt[JOB_BCRYPT], (unsigned char *)linebuf);
+                JSLF(PV, Typesalt[job->op], (unsigned char *)linebuf);
                 while (PV) {
 		  MHASH td;
 		  char lmac[64],hmac_buf[64];
@@ -12084,7 +12106,7 @@ nextbb:
 			  if (!Printall) {
 			    *PV = 1;
 			    { Word_t *SPV;
-			      JSLG(SPV, Typesalt[JOB_BCRYPT], (unsigned char *)linebuf);
+			      JSLG(SPV, Typesalt[job->op], (unsigned char *)linebuf);
 			      if (SPV) PV_DEC(SPV);
 			    }
 			  }
@@ -12118,7 +12140,7 @@ nextbb:
 			}
 		    }
                   }
-                  JSLN(PV, Typesalt[JOB_BCRYPT], (unsigned char *)linebuf);
+                  JSLN(PV, Typesalt[job->op], (unsigned char *)linebuf);
                 }
                 break;
 
@@ -12196,16 +12218,16 @@ BC_Start:
 #ifdef GPU_ENABLED
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[JOB_BCRYPT], tsalt, Printall);
+                                  Typesalt[job->op], tsalt, Printall);
                   snap_valid = 1;
                 }
                 if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
                   break;
 #endif
-                /* iterate unique salt prefixes from Typesalt[JOB_BCRYPT] */
+                /* iterate unique salt prefixes from Typesalt[job->op] */
                 linebuf[0] = 0;
                 cur[len] = 0;
-                JSLF(PV, Typesalt[JOB_BCRYPT], (unsigned char *)linebuf);
+                JSLF(PV, Typesalt[job->op], (unsigned char *)linebuf);
                 while (PV) {
                   if (Printall || *PV > 0) {
                     hashcnt++;
@@ -12215,7 +12237,7 @@ BC_Start:
                       if (!Printall) {
                         *PV = 1;
                         { Word_t *SPV;
-                          JSLG(SPV, Typesalt[JOB_BCRYPT], (unsigned char *)linebuf);
+                          JSLG(SPV, Typesalt[job->op], (unsigned char *)linebuf);
                           if (SPV) PV_DEC(SPV);
                         }
                       }
@@ -12248,7 +12270,7 @@ BC_Start:
 		      }
                     }
                   }
-                  JSLN(PV, Typesalt[JOB_BCRYPT], (unsigned char *)linebuf);
+                  JSLN(PV, Typesalt[job->op], (unsigned char *)linebuf);
                 }
                 break;
 
@@ -21925,7 +21947,6 @@ nextsalt1:
 	        if (len > MAXLINE/2)
 		  break;
 		len = b64_decode(cur, linebuf,&cryptlen);
-		job->clen = cryptlen;
 		cur = linebuf;
                 x = 1;
                 goto MDstart;
@@ -21934,7 +21955,6 @@ nextsalt1:
 	        if (len > MAXLINE/2)
 		  break;
 		len = b64_decode(cur, linebuf,&cryptlen);
-		job->clen = cryptlen;
 		cur = linebuf;
                 x = 1;
                 goto SHA1_start;
@@ -23564,6 +23584,64 @@ md5sha256:
                   }
                   d32 = (uint32_t *) SSEBUF;
                   f32 = (uint32_t *) hashes;
+#ifdef GPU_ENABLED
+		  /* GPU batch fill: apply all rules in bulk, pack directly into GPU slots.
+		   * If any candidate is too long for GPU, flag cpu_needed to re-process
+		   * the word through the SIMD path below (at negligible cost). */
+		  if (currule && Maxiter <= 1 && gpujob_available() &&
+		      gpu_op_category(job->op) == GPU_CAT_MASK) {
+		    if (!my_jobg) {
+		      my_jobg = gpujob_try_get_free();
+		      if (my_jobg) {
+		        my_jobg->op = job->op;
+		        my_jobg->filename = job->filename;
+		        my_jobg->flags = job->flags;
+		        my_jobg->doneprint = job->doneprint;
+		        my_jobg->line_num = job->startline;
+		        my_jobg->count = 0;
+		        my_jobg->word_stride = 64;
+		        my_jobg->max_count = GPUBATCH_MAX;
+		      }
+		    }
+		    if (my_jobg && my_jobg->count < GPUBATCH_MAX) {
+		      int gpu_cpu_needed = 0, gpu_rules_used = 0;
+		      extern int applyrules_gpu_pack(char *, int, char *, int,
+		          char *, int, int, int, uint16_t *, int *, char *, int *, int *);
+		      int gpu_start = my_jobg->count;
+		      int gpu_avail = GPUBATCH_MAX - gpu_start;
+		      int gpu_filled = applyrules_gpu_pack(
+		          cur, len, currule, Numrules,
+		          my_jobg->raw, 64, gpu_start, GPUBATCH_MAX,
+		          my_jobg->passlen, my_jobg->ruleindex,
+		          linebuf, &gpu_cpu_needed, &gpu_rules_used);
+		      if (gpu_filled > 0) {
+		        for (int gi = gpu_start; gi < gpu_start + gpu_filled && gi < GPUBATCH_MAX; gi++) {
+		          my_jobg->passoff[gi] = gi * 64;
+		          my_jobg->clen[gi] = my_jobg->passlen[gi];
+		          my_jobg->hexlen[gi] = my_jobg->passlen[gi];
+		        }
+		        my_jobg->count += gpu_filled;
+		        hashcnt += gpu_filled;
+		        rulecnt += gpu_filled;
+		      }
+		      /* Submit if batch is full */
+		      if (my_jobg->count >= GPUBATCH_MAX) {
+		        gpujob_submit(my_jobg);
+		        my_jobg = NULL;
+		      }
+		      if (!gpu_cpu_needed && gpu_rules_used >= (int)Numrules) {
+		        /* All rules handled by GPU for this word — skip SIMD loop */
+		        currule = NULL;
+		        break;
+		      }
+		      /* Some rules need CPU — submit GPU batch, fall through to SIMD */
+		      if (gpu_cpu_needed && my_jobg && my_jobg->count > 0) {
+		        gpujob_submit(my_jobg);
+		        my_jobg = NULL;
+		      }
+		    }
+		  }
+#endif
 		  if (currule) {
                   while (*((unsigned short int *) currule)) {
                     if (MDXpause) {
@@ -23591,13 +23669,6 @@ md5sha256:
                           checkhash(&curin, 32, x, &ljob[ljobi]);
 		          job->outlen = ljob[ljobi].outlen;
                         }
-#ifdef GPU_ENABLED
-                      } else if (Maxiter <= 1 && my_jobg &&
-                                 gpu_try_pack_unsalted(&my_jobg, job, 0, 0,
-                                     ljob[ljobi].pass, ljob[ljobi].len)) {
-                        /* GPU had a buffer ready — candidate packed, skip SIMD */
-                        hashcnt++;
-#endif
                       } else {
                         ljobi++;
                       }
@@ -34306,6 +34377,10 @@ HAV256_5_start:
     if (my_jobg && my_jobg->count > 0) {
       gpujob_submit(my_jobg);
       my_jobg = NULL;
+    } else if (my_jobg) {
+      /* Empty buffer — return to free list without submitting */
+      gpujob_return_free(my_jobg);
+      my_jobg = NULL;
     }
 #endif
     if (job->outlen) { fwrite(job->outbuf,job->outlen,1,stdout); fflush(stdout);}
@@ -35264,6 +35339,12 @@ void build_compact_table(void) {
     }
     if (!need_gpu) NoMetal = 1;
   }
+  if (Printall) {
+#ifdef GPU_ENABLED
+    if (!NoMetal) fprintf(stderr, "GPU disabled (-z mode)\n");
+#endif
+    NoMetal = 1;
+  }
   if (!NoMetal) {
     int gpu_ok = -1;
 #if defined(__APPLE__) && defined(METAL_GPU)
@@ -35450,12 +35531,19 @@ MDXALIGN void ReportStats(void *dummy) {
       /* Brute-force progress display:
        * Show keyspace progress, rate, sample candidate, and ETA */
       /* Tothash tracks completed hash computations across all active types.
-       * For brute-force with N types, each candidate is hashed N times. */
+       * For brute-force with N types, each candidate is hashed N times.
+       * For salted types, each candidate is also multiplied by the salt count.
+       * Divide by the total multiplier to recover the candidate progress. */
       unsigned long long progress = Tothash;
-      { int nactive = 0; int ti = 0, trc;
+      { unsigned long long multiplier = 0;
+        Word_t ti = 0; int trc;
         J1F(trc, Dohash, ti);
-        while (trc) { nactive++; J1N(trc, Dohash, ti); }
-        if (nactive > 1) progress /= nactive;
+        while (trc) {
+          unsigned int ns = Livesalts[ti];
+          multiplier += (ns > 0) ? ns : 1;
+          J1N(trc, Dohash, ti);
+        }
+        if (multiplier > 1) progress /= multiplier;
       }
       double pct = (BruteForceTotal > 0) ? (100.0 * progress / BruteForceTotal) : 0;
       /* Generate sample candidate from completed progress position */
@@ -37549,18 +37637,25 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
          line[2] == 'x' || line[2] == 'k') && line[3] == '$') {
       if (len > 60) line[60] = 0;
       JSLI(PV, JudyJ[JOB_BCRYPT],(unsigned char *)line);
-      /* extract salt prefix into Typesalt[JOB_BCRYPT] */
+      /* extract salt prefix into Typesalt[job->op] */
       /* $2k$ has 21-char salt (28 prefix), others have 22 (29 prefix) */
       { char bc_salt[30];
         int pfx = (line[2] == 'k') ? 28 : 29;
         memcpy(bc_salt, line, pfx);
         bc_salt[pfx] = 0;
-        JSLI(PV, Typesalt[JOB_BCRYPT], (unsigned char *)bc_salt);
-        if (PV) { if ((*PV)++ == 0) {
-          Saltloaded[JOB_BCRYPT]++;
-          Typesaltcnt[JOB_BCRYPT]++;
-          Typesaltbytes[JOB_BCRYPT] += pfx + 1;
-        } }
+        /* Populate Typesalt for each selected BCRYPT type that uses $2a$ salts */
+        static const int bc_types[] = { JOB_BCRYPT, JOB_BCRYPT256,
+            JOB_BCRYPTMD5, JOB_BCRYPTSHA1, JOB_BCRYPTSHA512, -1 };
+        for (int ci = 0; bc_types[ci] >= 0; ci++) {
+          int bj = bc_types[ci];
+          if (!lf[bj]) continue;
+          JSLI(PV, Typesalt[bj], (unsigned char *)bc_salt);
+          if (PV) { if ((*PV)++ == 0) {
+            Saltloaded[bj]++;
+            Typesaltcnt[bj]++;
+            Typesaltbytes[bj] += pfx + 1;
+          } }
+        }
       }
       Foundcnt[JOB_BCRYPT]++;
       continue;
@@ -41646,8 +41741,8 @@ usage:
       /* -z mode: generate a default bcrypt salt so all bcrypt variants can produce output */
       char bcrypt_defsalt[] = "$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
       JSLI(PV, JudyJ[JOB_BCRYPT],(unsigned char *)bcrypt_defsalt);
-      if (!Typesalt[JOB_BCRYPT]) {
-        JSLI(PV, Typesalt[JOB_BCRYPT], (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
+      if (!Typesalt[job->op]) {
+        JSLI(PV, Typesalt[job->op], (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
         if (PV) (*PV)++;
       }
       Bcryptcnt = 1;
@@ -43760,8 +43855,8 @@ usage:
           /* Ensure shared bcrypt infrastructure has a salt too */
           if (Bcryptcnt == 0) {
             JSLI(PV, JudyJ[JOB_BCRYPT],(unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-            if (!Typesalt[JOB_BCRYPT]) {
-              JSLI(PV, Typesalt[JOB_BCRYPT], (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
+            if (!Typesalt[job->op]) {
+              JSLI(PV, Typesalt[job->op], (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
               if (PV) (*PV)++;
             }
             Bcryptcnt = 1;

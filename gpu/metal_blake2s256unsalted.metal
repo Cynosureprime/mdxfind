@@ -119,45 +119,71 @@ kernel void blake2s256_unsalted_batch(
     /* Single compress with last=1, counter=total_len */
     b2s_compress(h, buf, (ulong)total_len, 1);
 
-    /* BLAKE2S-256: 8 hash words, output is LE — no bswap.
-     * h[0..7] already contains the full hash. */
-    ulong key = (ulong(h[1]) << 32) | h[0];
-    uint fp = uint(key >> 32); if (fp == 0) fp = 1;
-    ulong pos = (key ^ (key >> 32)) & params.compact_mask;
-    bool found = false;
-    for (uint p = 0; p < params.max_probe && !found; p++) {
-        uint cfp = compact_fp[pos]; if (cfp == 0) break;
-        if (cfp == fp) { uint idx = compact_idx[pos];
-            if (idx < params.hash_data_count) {
-                ulong off = hash_data_off[idx];
-                device const uint *ref = (device const uint *)(hash_data_buf + off);
-                if (h[0] == ref[0] && h[1] == ref[1] && h[2] == ref[2] && h[3] == ref[3])
-                    found = true;
-            } }
-        pos = (pos + 1) & params.compact_mask;
+    uint max_iter = params.max_iter;
+
+    for (uint iter = 1; iter <= max_iter; iter++) {
+        /* Probe compact table */
+        ulong key = (ulong(h[1]) << 32) | h[0];
+        uint fp = uint(key >> 32); if (fp == 0) fp = 1;
+        ulong pos = (key ^ (key >> 32)) & params.compact_mask;
+        bool found = false;
+        for (uint p = 0; p < params.max_probe && !found; p++) {
+            uint cfp = compact_fp[pos]; if (cfp == 0) break;
+            if (cfp == fp) { uint idx = compact_idx[pos];
+                if (idx < params.hash_data_count) {
+                    ulong off = hash_data_off[idx];
+                    device const uint *ref = (device const uint *)(hash_data_buf + off);
+                    if (h[0] == ref[0] && h[1] == ref[1] && h[2] == ref[2] && h[3] == ref[3])
+                        found = true;
+                } }
+            pos = (pos + 1) & params.compact_mask;
+        }
+        if (!found && params.overflow_count > 0) {
+            int lo = 0, hi2 = int(params.overflow_count) - 1;
+            while (lo <= hi2 && !found) {
+                int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid];
+                if (key < mkey) hi2 = mid - 1;
+                else if (key > mkey) lo = mid + 1;
+                else {
+                    for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) {
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
+                        if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
+                            found = true; }
+                    for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) {
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
+                        if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
+                            found = true; }
+                    break; } } }
+        if (found) {
+            uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
+            if (slot < params.max_hits) {
+                uint base = slot * HIT_STRIDE;
+                hits[base] = word_idx; hits[base+1] = uint(mask_idx); hits[base+2] = iter;
+                for (int i = 0; i < 8; i++) hits[base+3+i] = h[i];
+                for (uint _z = 11; _z < HIT_STRIDE; _z++) hits[base+_z] = 0; } }
+        if (iter < max_iter) {
+            /* Hex-encode 8 LE hash words into buf[0..63] (64 hex chars) */
+            for (int i = 0; i < 8; i++) {
+                uint s = h[i];
+                uint b0 = s & 0xff, b1 = (s >> 8) & 0xff;
+                uint b2 = (s >> 16) & 0xff, b3 = (s >> 24) & 0xff;
+                uint hi0 = (b0 >> 4) & 0xf, lo0 = b0 & 0xf;
+                uint hi1 = (b1 >> 4) & 0xf, lo1 = b1 & 0xf;
+                uint hi2 = (b2 >> 4) & 0xf, lo2 = b2 & 0xf;
+                uint hi3 = (b3 >> 4) & 0xf, lo3 = b3 & 0xf;
+                buf[i*8+0] = hi0 + ((hi0 < 10) ? '0' : ('a'-10));
+                buf[i*8+1] = lo0 + ((lo0 < 10) ? '0' : ('a'-10));
+                buf[i*8+2] = hi1 + ((hi1 < 10) ? '0' : ('a'-10));
+                buf[i*8+3] = lo1 + ((lo1 < 10) ? '0' : ('a'-10));
+                buf[i*8+4] = hi2 + ((hi2 < 10) ? '0' : ('a'-10));
+                buf[i*8+5] = lo2 + ((lo2 < 10) ? '0' : ('a'-10));
+                buf[i*8+6] = hi3 + ((hi3 < 10) ? '0' : ('a'-10));
+                buf[i*8+7] = lo3 + ((lo3 < 10) ? '0' : ('a'-10));
+            }
+            /* Re-init BLAKE2S and compress 64-byte hex block */
+            for (int i = 0; i < 8; i++) h[i] = B2S_IV[i];
+            h[0] ^= 0x01010020u;
+            b2s_compress(h, buf, 64UL, 1);
+        }
     }
-    if (!found && params.overflow_count > 0) {
-        int lo = 0, hi2 = int(params.overflow_count) - 1;
-        while (lo <= hi2 && !found) {
-            int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid];
-            if (key < mkey) hi2 = mid - 1;
-            else if (key > mkey) lo = mid + 1;
-            else {
-                for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) {
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
-                    if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
-                        found = true; }
-                for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) {
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
-                    if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
-                        found = true; }
-                break; } } }
-    if (found) {
-        uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
-        if (slot < params.max_hits) {
-            uint base = slot * HIT_STRIDE;
-            hits[base] = word_idx; hits[base+1] = mask_idx;
-            hits[base+2] = 1;
-            for (int i = 0; i < 8; i++) hits[base+3+i] = h[i];
-            for (uint _z = 11; _z < HIT_STRIDE; _z++) hits[base+_z] = 0; } }
 }

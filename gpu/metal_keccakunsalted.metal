@@ -117,7 +117,7 @@ static void keccak_fill_masks(thread ulong *block, uint n_pre, uint n_app, uint 
 
 /* Macro-expanded Keccak kernels for each rate */
 
-#define KECCAK_METAL_KERNEL(name, rate, rate_words, hash_words, hash_ulongs) \
+#define KECCAK_METAL_KERNEL(name, rate, rate_words, hash_words, hash_ulongs, pad_byte) \
 kernel void name( \
     device const uint8_t    *words       [[buffer(0)]], \
     device const ushort     *unused_lens [[buffer(1)]], \
@@ -160,62 +160,102 @@ kernel void name( \
     for (int i = 0; i < rate_words; i++) st[i] = block[i]; \
     keccak_f1600(st); \
     \
-    /* Extract all hash words from state (LE, no swap needed) */ \
-    uint h[hash_words]; \
-    for (int i = 0; i < hash_ulongs; i++) { \
-        h[i*2]   = (uint)st[i]; \
-        if (i*2+1 < hash_words) h[i*2+1] = (uint)(st[i] >> 32); \
+    uint max_iter = params.max_iter; \
+    for (uint iter = 1; iter <= max_iter; iter++) { \
+        /* Extract all hash words from state (LE, no swap needed) */ \
+        uint h[hash_words]; \
+        for (int i = 0; i < hash_ulongs; i++) { \
+            h[i*2]   = (uint)st[i]; \
+            if (i*2+1 < hash_words) h[i*2+1] = (uint)(st[i] >> 32); \
+        } \
+        \
+        ulong key = (ulong(h[1]) << 32) | h[0]; \
+        uint fp = uint(key >> 32); if (fp == 0) fp = 1; \
+        ulong pos = (key ^ (key >> 32)) & params.compact_mask; \
+        bool found = false; \
+        for (uint p = 0; p < params.max_probe && !found; p++) { \
+            uint cfp = compact_fp[pos]; if (cfp == 0) break; \
+            if (cfp == fp) { uint idx = compact_idx[pos]; \
+                if (idx < params.hash_data_count) { \
+                    ulong off = hash_data_off[idx]; \
+                    device const uint *ref = (device const uint *)(hash_data_buf + off); \
+                    if (h[0] == ref[0] && h[1] == ref[1] && h[2] == ref[2] && h[3] == ref[3]) \
+                        found = true; \
+                } } \
+            pos = (pos + 1) & params.compact_mask; \
+        } \
+        if (!found && params.overflow_count > 0) { \
+            int lo = 0, hi2 = int(params.overflow_count) - 1; \
+            while (lo <= hi2 && !found) { \
+                int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid]; \
+                if (key < mkey) hi2 = mid - 1; \
+                else if (key > mkey) lo = mid + 1; \
+                else { \
+                    for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) { \
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]); \
+                        if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3]) \
+                            found = true; } \
+                    for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) { \
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]); \
+                        if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3]) \
+                            found = true; } \
+                    break; } } } \
+        if (found) { \
+            uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed); \
+            if (slot < params.max_hits) { \
+                uint base = slot * HIT_STRIDE; \
+                hits[base] = word_idx; hits[base+1] = uint(mask_idx); hits[base+2] = iter; \
+                for (int i = 0; i < hash_words; i++) hits[base+3+i] = h[i]; \
+                for (uint _z = 3+hash_words; _z < HIT_STRIDE; _z++) hits[base+_z] = 0; } } \
+        if (iter < max_iter) { \
+            /* Hex-encode hash output (LE bytes) into sponge input */ \
+            int hex_bytes = hash_ulongs * 8; \
+            if (hash_words == 7) hex_bytes = 28; \
+            if (hash_words == 12) hex_bytes = 48; \
+            int hex_chars = hex_bytes * 2; \
+            uchar hex_str[256]; \
+            for (int i = 0; i < hex_bytes; i++) { \
+                uchar b = (uchar)(st[i/8] >> ((i%8)*8)); \
+                uchar hi_n = (b >> 4), lo_n = (b & 0xf); \
+                hex_str[i*2]   = hi_n + (hi_n < 10 ? '0' : 'a' - 10); \
+                hex_str[i*2+1] = lo_n + (lo_n < 10 ? '0' : 'a' - 10); \
+            } \
+            /* Absorb hex string with sponge padding into fresh state */ \
+            for (int i = 0; i < 25; i++) st[i] = 0; \
+            for (int i = 0; i < hex_chars && i < rate; i++) { \
+                int wi = i / 8; \
+                int bi = (i % 8) * 8; \
+                st[wi] ^= (ulong)hex_str[i] << bi; \
+            } \
+            if (hex_chars < rate) { \
+                int p2 = hex_chars; \
+                st[p2/8] ^= (ulong)pad_byte << ((p2%8)*8); \
+                st[(rate-1)/8] ^= 0x80UL << (((rate-1)%8)*8); \
+                keccak_f1600(st); \
+            } else { \
+                keccak_f1600(st); \
+                for (int i = rate; i < hex_chars; i++) { \
+                    int wi = (i - rate) / 8; \
+                    int bi = ((i - rate) % 8) * 8; \
+                    st[wi] ^= (ulong)hex_str[i] << bi; \
+                } \
+                int p2 = hex_chars - rate; \
+                st[p2/8] ^= (ulong)pad_byte << ((p2%8)*8); \
+                st[(rate-1)/8] ^= 0x80UL << (((rate-1)%8)*8); \
+                keccak_f1600(st); \
+            } \
+        } \
     } \
-    \
-    ulong key = (ulong(h[1]) << 32) | h[0]; \
-    uint fp = uint(key >> 32); if (fp == 0) fp = 1; \
-    ulong pos = (key ^ (key >> 32)) & params.compact_mask; \
-    bool found = false; \
-    for (uint p = 0; p < params.max_probe && !found; p++) { \
-        uint cfp = compact_fp[pos]; if (cfp == 0) break; \
-        if (cfp == fp) { uint idx = compact_idx[pos]; \
-            if (idx < params.hash_data_count) { \
-                ulong off = hash_data_off[idx]; \
-                device const uint *ref = (device const uint *)(hash_data_buf + off); \
-                if (h[0] == ref[0] && h[1] == ref[1] && h[2] == ref[2] && h[3] == ref[3]) \
-                    found = true; \
-            } } \
-        pos = (pos + 1) & params.compact_mask; \
-    } \
-    if (!found && params.overflow_count > 0) { \
-        int lo = 0, hi2 = int(params.overflow_count) - 1; \
-        while (lo <= hi2 && !found) { \
-            int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid]; \
-            if (key < mkey) hi2 = mid - 1; \
-            else if (key > mkey) lo = mid + 1; \
-            else { \
-                for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) { \
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]); \
-                    if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3]) \
-                        found = true; } \
-                for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) { \
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]); \
-                    if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3]) \
-                        found = true; } \
-                break; } } } \
-    if (found) { \
-        uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed); \
-        if (slot < params.max_hits) { \
-            uint base = slot * HIT_STRIDE; \
-            hits[base] = word_idx; hits[base+1] = mask_idx; \
-            hits[base+2] = 1; \
-            for (int i = 0; i < hash_words; i++) hits[base+3+i] = h[i]; \
-            for (uint _z = 3+hash_words; _z < HIT_STRIDE; _z++) hits[base+_z] = 0; } } \
 }
 
-/* Keccak variants (pad byte 0x01, applied by host) */
-KECCAK_METAL_KERNEL(keccak224_unsalted_batch, 144, 18, 7, 4)
-KECCAK_METAL_KERNEL(keccak256_unsalted_batch, 136, 17, 8, 4)
-KECCAK_METAL_KERNEL(keccak384_unsalted_batch, 104, 13, 12, 6)
-KECCAK_METAL_KERNEL(keccak512_unsalted_batch, 72, 9, 16, 8)
+/* Keccak variants (pad byte 0x01) */
+KECCAK_METAL_KERNEL(keccak224_unsalted_batch, 144, 18, 7, 4, 0x01)
+KECCAK_METAL_KERNEL(keccak256_unsalted_batch, 136, 17, 8, 4, 0x01)
+KECCAK_METAL_KERNEL(keccak384_unsalted_batch, 104, 13, 12, 6, 0x01)
+KECCAK_METAL_KERNEL(keccak512_unsalted_batch, 72, 9, 16, 8, 0x01)
 
-/* SHA3 variants (pad byte 0x06, applied by host) */
-KECCAK_METAL_KERNEL(sha3_224_unsalted_batch, 144, 18, 7, 4)
-KECCAK_METAL_KERNEL(sha3_256_unsalted_batch, 136, 17, 8, 4)
-KECCAK_METAL_KERNEL(sha3_384_unsalted_batch, 104, 13, 12, 6)
-KECCAK_METAL_KERNEL(sha3_512_unsalted_batch, 72, 9, 16, 8)
+/* SHA3 variants (pad byte 0x06) */
+KECCAK_METAL_KERNEL(sha3_224_unsalted_batch, 144, 18, 7, 4, 0x06)
+KECCAK_METAL_KERNEL(sha3_256_unsalted_batch, 136, 17, 8, 4, 0x06)
+KECCAK_METAL_KERNEL(sha3_384_unsalted_batch, 104, 13, 12, 6, 0x06)
+KECCAK_METAL_KERNEL(sha3_512_unsalted_batch, 72, 9, 16, 8, 0x06)

@@ -514,9 +514,23 @@ void gpujob(void *arg) {
                     int blen;
                     if (g->word_stride && widx < 4096) {
                         char *slot = g->raw + widx * g->word_stride;
-                        int total_len = ((uint32_t *)slot)[14] >> 3;
+                        int total_len;
+                        if (g->word_stride == 128)
+                            total_len = ((uint32_t *)slot)[30] >> 3;  /* SHA384/SHA512 */
+                        else if (g->word_stride == 712) {
+                            /* MD6: password at B offset 200 + prependlen, length from passlen */
+                            total_len = g->passlen[widx] + gpu_mask_n_prepend + gpu_mask_n_append;
+                        } else if (g->word_stride > 64 && g->word_stride != 128) {
+                            /* Keccak/SHA3: password length stored as uint16 at byte offset rate */
+                            int rate = g->word_stride - 8;  /* stride = rate + 8 */
+                            total_len = (unsigned char)slot[rate] | ((unsigned char)slot[rate+1] << 8);
+                        } else
+                            total_len = ((uint32_t *)slot)[14] >> 3;  /* MD5/SHA1/SHA256 */
                         blen = total_len - gpu_mask_n_prepend - gpu_mask_n_append;
-                        base_word = slot + gpu_mask_n_prepend;
+                        if (g->word_stride == 712)
+                            base_word = slot + 200 + gpu_mask_n_prepend;  /* MD6 B starts at byte 200 */
+                        else
+                            base_word = slot + gpu_mask_n_prepend;
                     } else {
                         base_word = &g->passbuf[g->passoff[widx]];
                         blen = g->passlen[widx];
@@ -1136,9 +1150,12 @@ void gpujob_submit(struct jobg *g) {
     GPUWorkTail = &(g->next);
     twist(GPUWorkWaiting, BY, +1);
 
-    /* Wake the best waiting procjob thread */
+    /* Wake the best waiting procjob thread.
+     * Only decrement active_count if positive — buffers acquired via
+     * gpujob_try_get_free bypass the scheduler and don't increment it. */
     possess(GPUSchedLock);
-    gpu_sched_active_count--;
+    if (gpu_sched_active_count > 0)
+        gpu_sched_active_count--;
     gpu_sched_wake_best();
     release(GPUSchedLock);
 }

@@ -557,7 +557,7 @@ constant ulong SBOB_RC64[12][8] = {
 
 /* ---- LPS transform macro ---- */
 #define SBOG_LPS(dst, src) do { \
-    uchar *tb = (uchar *)(src); \
+    thread uchar *tb = (thread uchar *)(src); \
     for (int _i = 0; _i < 8; _i++) \
         (dst)[_i] = SBOB_SL64[0][tb[_i]] ^ SBOB_SL64[1][tb[_i+8]] ^ \
                     SBOB_SL64[2][tb[_i+16]] ^ SBOB_SL64[3][tb[_i+24]] ^ \
@@ -572,7 +572,7 @@ void streebog_g(ulong h[8], const ulong m[8], ulong n) {
     /* k = LPS(h ^ n) */
     for (int i = 0; i < 8; i++) t[i] = h[i];
     /* XOR n into t (big-endian byte order, n goes into high bytes) */
-    { uchar *tb = (uchar *)t;
+    { thread uchar *tb = (thread uchar *)t;
       for (int i = 63; n > 0; i--) {
           tb[i] ^= n & 0xFF;
           n >>= 8;
@@ -597,14 +597,14 @@ void streebog_g(ulong h[8], const ulong m[8], ulong n) {
 }
 
 /* ---- Private-memory streebog hash (for unsalted kernels) ---- */
-void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
+void streebog_hash_priv(thread uchar *out, int hlen, thread const uchar *data, int datalen) {
     ulong h[8], e[8], m[8];
     ulong n = 0;
     int c;
 
     /* IV */
     { uchar fill = (hlen == 32) ? 0x01 : 0x00;
-      uchar *hb = (uchar *)h;
+      thread uchar *hb = (thread uchar *)h;
       for (int i = 0; i < 64; i++) hb[i] = fill;
     }
     for (int i = 0; i < 8; i++) e[i] = 0;
@@ -612,14 +612,14 @@ void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
     /* Process full 64-byte blocks */
     int pos = 0;
     while (datalen - pos >= 64) {
-        uchar *mb = (uchar *)m;
+        thread uchar *mb = (thread uchar *)m;
         for (int i = 0; i < 64; i++) mb[63-i] = data[pos+i];
 
         streebog_g(h, m, n);
         n += 0x200;
 
         c = 0;
-        uchar *eb = (uchar *)e;
+        thread uchar *eb = (thread uchar *)e;
         for (int i = 63; i >= 0; i--) {
             c += eb[i] + mb[i];
             eb[i] = c & 0xFF;
@@ -629,7 +629,7 @@ void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
     }
 
     /* Pad final block */
-    { uchar *mb = (uchar *)m;
+    { thread uchar *mb = (thread uchar *)m;
       int rem = datalen - pos;
       for (int i = 0; i < 64; i++) mb[i] = 0;
       for (int i = 0; i < rem; i++) mb[63-i] = data[pos+i];
@@ -638,7 +638,7 @@ void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
       streebog_g(h, m, n);
 
       c = 0;
-      uchar *eb = (uchar *)e;
+      thread uchar *eb = (thread uchar *)e;
       for (int i = 63; i >= 0; i--) {
           c += eb[i] + mb[i];
           eb[i] = c & 0xFF;
@@ -648,7 +648,7 @@ void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
       /* finalization: n block (bit count) */
       for (int i = 0; i < 8; i++) m[i] = 0;
       ulong total_bits = (ulong)datalen * 8;
-      mb = (uchar *)m;
+      mb = (thread uchar *)m;
       for (int i = 63; total_bits > 0; i--) {
           mb[i] = total_bits & 0xFF;
           total_bits >>= 8;
@@ -660,7 +660,7 @@ void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
     }
 
     /* Output: for 256-bit, first 32 bytes of h; for 512-bit, all 64 */
-    uchar *hb = (uchar *)h;
+    thread uchar *hb = (thread uchar *)h;
     if (hlen == 32) {
         for (int i = 0; i < 32; i++) out[i] = hb[i];
     } else {
@@ -669,14 +669,14 @@ void streebog_hash_priv(uchar *out, int hlen, const uchar *data, int datalen) {
 }
 
 /* ---- Global-memory streebog hash (for HMAC kernels with global data) ---- */
-void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int datalen) {
+void streebog_hash_global(thread uchar *out, int hlen, device const uchar *data, int datalen) {
     ulong h[8], e[8], m[8];
     ulong n = 0;
     int c;
 
     /* IV */
     { uchar fill = (hlen == 32) ? 0x01 : 0x00;
-      uchar *hb = (uchar *)h;
+      thread uchar *hb = (thread uchar *)h;
       for (int i = 0; i < 64; i++) hb[i] = fill;
     }
     for (int i = 0; i < 8; i++) e[i] = 0;
@@ -684,14 +684,14 @@ void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int da
     /* Process full 64-byte blocks */
     int pos = 0;
     while (datalen - pos >= 64) {
-        uchar *mb = (uchar *)m;
+        thread uchar *mb = (thread uchar *)m;
         for (int i = 0; i < 64; i++) mb[63-i] = data[pos+i];
 
         streebog_g(h, m, n);
         n += 0x200;
 
         c = 0;
-        uchar *eb = (uchar *)e;
+        thread uchar *eb = (thread uchar *)e;
         for (int i = 63; i >= 0; i--) {
             c += eb[i] + mb[i];
             eb[i] = c & 0xFF;
@@ -701,7 +701,7 @@ void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int da
     }
 
     /* Pad final block */
-    { uchar *mb = (uchar *)m;
+    { thread uchar *mb = (thread uchar *)m;
       int rem = datalen - pos;
       for (int i = 0; i < 64; i++) mb[i] = 0;
       for (int i = 0; i < rem; i++) mb[63-i] = data[pos+i];
@@ -710,7 +710,7 @@ void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int da
       streebog_g(h, m, n);
 
       c = 0;
-      uchar *eb = (uchar *)e;
+      thread uchar *eb = (thread uchar *)e;
       for (int i = 63; i >= 0; i--) {
           c += eb[i] + mb[i];
           eb[i] = c & 0xFF;
@@ -719,7 +719,7 @@ void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int da
 
       for (int i = 0; i < 8; i++) m[i] = 0;
       ulong total_bits = (ulong)datalen * 8;
-      mb = (uchar *)m;
+      mb = (thread uchar *)m;
       for (int i = 63; total_bits > 0; i--) {
           mb[i] = total_bits & 0xFF;
           total_bits >>= 8;
@@ -728,7 +728,7 @@ void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int da
       streebog_g(h, e, 0);
     }
 
-    uchar *hb = (uchar *)h;
+    thread uchar *hb = (thread uchar *)h;
     if (hlen == 32) {
         for (int i = 0; i < 32; i++) out[i] = hb[i];
     } else {
@@ -737,27 +737,27 @@ void streebog_hash_global(uchar *out, int hlen, device const uchar *data, int da
 }
 
 /* ---- Private-buffer streebog hash (HMAC inner/outer from local buf) ---- */
-void streebog_hash_buf(uchar *out, int hlen, uchar *data, int datalen) {
+void streebog_hash_buf(thread uchar *out, int hlen, thread uchar *data, int datalen) {
     ulong h[8], e[8], m[8];
     ulong n = 0;
     int c;
 
     { uchar fill = (hlen == 32) ? 0x01 : 0x00;
-      uchar *hb = (uchar *)h;
+      thread uchar *hb = (thread uchar *)h;
       for (int i = 0; i < 64; i++) hb[i] = fill;
     }
     for (int i = 0; i < 8; i++) e[i] = 0;
 
     int pos = 0;
     while (datalen - pos >= 64) {
-        uchar *mb = (uchar *)m;
+        thread uchar *mb = (thread uchar *)m;
         for (int i = 0; i < 64; i++) mb[63-i] = data[pos+i];
 
         streebog_g(h, m, n);
         n += 0x200;
 
         c = 0;
-        uchar *eb = (uchar *)e;
+        thread uchar *eb = (thread uchar *)e;
         for (int i = 63; i >= 0; i--) {
             c += eb[i] + mb[i];
             eb[i] = c & 0xFF;
@@ -766,7 +766,7 @@ void streebog_hash_buf(uchar *out, int hlen, uchar *data, int datalen) {
         pos += 64;
     }
 
-    { uchar *mb = (uchar *)m;
+    { thread uchar *mb = (thread uchar *)m;
       int rem = datalen - pos;
       for (int i = 0; i < 64; i++) mb[i] = 0;
       for (int i = 0; i < rem; i++) mb[63-i] = data[pos+i];
@@ -775,7 +775,7 @@ void streebog_hash_buf(uchar *out, int hlen, uchar *data, int datalen) {
       streebog_g(h, m, n);
 
       c = 0;
-      uchar *eb = (uchar *)e;
+      thread uchar *eb = (thread uchar *)e;
       for (int i = 63; i >= 0; i--) {
           c += eb[i] + mb[i];
           eb[i] = c & 0xFF;
@@ -784,7 +784,7 @@ void streebog_hash_buf(uchar *out, int hlen, uchar *data, int datalen) {
 
       for (int i = 0; i < 8; i++) m[i] = 0;
       ulong total_bits = (ulong)datalen * 8;
-      mb = (uchar *)m;
+      mb = (thread uchar *)m;
       for (int i = 63; total_bits > 0; i--) {
           mb[i] = total_bits & 0xFF;
           total_bits >>= 8;
@@ -793,7 +793,7 @@ void streebog_hash_buf(uchar *out, int hlen, uchar *data, int datalen) {
       streebog_g(h, e, 0);
     }
 
-    uchar *hb = (uchar *)h;
+    thread uchar *hb = (thread uchar *)h;
     if (hlen == 32) {
         for (int i = 0; i < 32; i++) out[i] = hb[i];
     } else {
@@ -802,7 +802,7 @@ void streebog_hash_buf(uchar *out, int hlen, uchar *data, int datalen) {
 }
 
 /* ---- Helper: hash bytes to compact probe uint32s (LE) ---- */
-void streebog_to_probe(uchar *hash, uint *hx, uint *hy, uint *hz, uint *hw) {
+void streebog_to_probe(thread uchar *hash, thread uint *hx, thread uint *hy, thread uint *hz, thread uint *hw) {
     *hx = ((uint)hash[0]) | ((uint)hash[1]<<8) | ((uint)hash[2]<<16) | ((uint)hash[3]<<24);
     *hy = ((uint)hash[4]) | ((uint)hash[5]<<8) | ((uint)hash[6]<<16) | ((uint)hash[7]<<24);
     *hz = ((uint)hash[8]) | ((uint)hash[9]<<8) | ((uint)hash[10]<<16) | ((uint)hash[11]<<24);
@@ -884,13 +884,13 @@ kernel void streebog256_unsalted_batch(
     uint                   tid         [[thread_position_in_grid]])
 {
     
-    uint tid = tid;
+    /* tid from [[thread_position_in_grid]] */
     uint word_idx = tid / params.num_masks;
     ulong mask_idx = params.mask_start + (tid % params.num_masks);
     if (word_idx >= params.num_words) return;
 
     /* Load pre-padded block, fill masks (LE uint32 M[]) */
-    device const uint *src = words + word_idx * 16;
+    device const uint *src = (device const uint *)hexhashes + word_idx * 16;
     uint M[16];
     for (int i = 0; i < 16; i++) M[i] = src[i];
 
@@ -956,7 +956,7 @@ kernel void streebog256_unsalted_batch(
     /* Extract password from LE M[] block */
     int passlen = M[14] >> 3;
     uchar pass[56];
-    uchar *mb = (uchar *)M;
+    thread uchar *mb = (thread uchar *)M;
     for (int i = 0; i < passlen && i < 55; i++) pass[i] = mb[i];
 
     uchar hash[32];
@@ -1008,12 +1008,12 @@ kernel void streebog512_unsalted_batch(
     uint                   tid         [[thread_position_in_grid]])
 {
     
-    uint tid = tid;
+    /* tid from [[thread_position_in_grid]] */
     uint word_idx = tid / params.num_masks;
     ulong mask_idx = params.mask_start + (tid % params.num_masks);
     if (word_idx >= params.num_words) return;
 
-    device const uint *src = words + word_idx * 16;
+    device const uint *src = (device const uint *)hexhashes + word_idx * 16;
     uint M[16];
     for (int i = 0; i < 16; i++) M[i] = src[i];
 
@@ -1078,7 +1078,7 @@ kernel void streebog512_unsalted_batch(
 
     int passlen = M[14] >> 3;
     uchar pass[56];
-    uchar *mb = (uchar *)M;
+    thread uchar *mb = (thread uchar *)M;
     for (int i = 0; i < passlen && i < 55; i++) pass[i] = mb[i];
 
     uchar hash[64];
@@ -1129,7 +1129,7 @@ kernel void hmac_streebog256_kpass_batch(
     uint                   tid         [[thread_position_in_grid]])
 {
     
-    uint tid = tid;
+    /* tid from [[thread_position_in_grid]] */
     uint word_idx = tid / params.num_salts;
     uint salt_idx = params.salt_start + (tid % params.num_salts);
     if (word_idx >= params.num_words) return;
@@ -1212,7 +1212,7 @@ kernel void hmac_streebog256_ksalt_batch(
     uint                   tid         [[thread_position_in_grid]])
 {
     
-    uint tid = tid;
+    /* tid from [[thread_position_in_grid]] */
     uint word_idx = tid / params.num_salts;
     uint salt_idx = params.salt_start + (tid % params.num_salts);
     if (word_idx >= params.num_words) return;
@@ -1295,7 +1295,7 @@ kernel void hmac_streebog512_kpass_batch(
     uint                   tid         [[thread_position_in_grid]])
 {
     
-    uint tid = tid;
+    /* tid from [[thread_position_in_grid]] */
     uint word_idx = tid / params.num_salts;
     uint salt_idx = params.salt_start + (tid % params.num_salts);
     if (word_idx >= params.num_words) return;
@@ -1378,7 +1378,7 @@ kernel void hmac_streebog512_ksalt_batch(
     uint                   tid         [[thread_position_in_grid]])
 {
     
-    uint tid = tid;
+    /* tid from [[thread_position_in_grid]] */
     uint word_idx = tid / params.num_salts;
     uint salt_idx = params.salt_start + (tid % params.num_salts);
     if (word_idx >= params.num_words) return;

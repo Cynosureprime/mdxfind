@@ -1079,10 +1079,10 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
 
     /* Upload words — determine stride based on op type.
      * Unsalted pre-padded data from gpu_try_pack_unsalted uses per-type strides.
-     * Salted password data uses 256-byte stride. */
+     * Salted password data uses 256-byte stride.
+     * Pre-padded batches are identified by cat == GPU_CAT_MASK or GPU_CAT_UNSALTED. */
     int word_stride;
-    if ((cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) &&
-        (num_words > GPUBATCH_MAX || GPUForce)) {
+    if (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) {
         /* Pre-padded data at per-type stride (from gpu_try_pack_unsalted) */
         if (_gpu_op == JOB_SHA512 || _gpu_op == JOB_SHA384 ||
             _gpu_op == JOB_SHA512RAW || _gpu_op == JOB_SHA384RAW)

@@ -2098,3 +2098,104 @@ app_exit:
   return (-2);
 }
 
+/*
+ * applyrules_gpu_pack — Apply rules in bulk and pack results directly
+ * into GPU raw buffer slots (pre-padded hash blocks).
+ *
+ * Parameters:
+ *   line       - original word (read-only)
+ *   len        - original word length
+ *   rules      - packed rule stream (concatenated: [uint16 len][packed][0x00] ...)
+ *   nrules     - number of rules to process from the stream
+ *   raw        - GPU raw buffer (stride * maxcount bytes)
+ *   stride     - bytes per slot (64 for MD5/SHA1/SHA256, 128 for SHA384/SHA512)
+ *   startidx   - first slot index to fill
+ *   maxcount   - max slots available in raw buffer
+ *   passlen    - per-slot password length array (for GPU hit reconstruction)
+ *   ruleindex  - per-slot rule index array (for Ruleindex in GPU hits)
+ *   passbuf    - scratch buffer for applyrule() (MAXLINE*3 bytes)
+ *   cpu_needed - set to 1 if any rule produced a valid candidate that was
+ *                too long for GPU. Caller should re-process the entire word
+ *                through the CPU SIMD path to catch these.
+ *   rules_used - set to number of rules consumed from the stream.
+ *                Caller advances rule pointer by this count.
+ *
+ * Returns: number of GPU slots filled.
+ *
+ * Slots are pre-padded with 0x80 and bit-length for the target hash.
+ * Rules that reject the word or produce unchanged output are silently
+ * skipped — no per-rule tracking. If ANY valid candidate exceeds the
+ * GPU length limit, *cpu_needed is set so the caller can re-process
+ * the word on CPU (at negligible cost: the GPU-found hashes will have
+ * their PV already decremented, so CPU re-finds are no-ops).
+ */
+int applyrules_gpu_pack(char *line, int len, char *rules, int nrules,
+                        char *raw, int stride, int startidx, int maxcount,
+                        uint16_t *passlen, int *ruleindex, char *passbuf,
+                        int *cpu_needed, int *rules_used)
+{
+    int i, idx, count = 0;
+    char *rule = rules;
+    /* Max password length per stride: MD5/SHA1/SHA256 (stride 64) = 55,
+     * SHA384/SHA512 (stride 128) = 111. Formula: stride - 1(0x80) - 8(bitlen) */
+    int maxpasslen = stride - 9;
+    if (stride >= 128) maxpasslen = stride - 17;  /* 64-bit bitlen field */
+
+    idx = startidx;
+    for (i = 0; i < nrules && idx < maxcount; i++) {
+        unsigned short rsize = *((unsigned short *)rule);
+        if (rsize == 0) break;
+        char *packed = rule + 2;
+
+        int clen = applyrule(line, passbuf, len, packed);
+        rule += rsize + 2;
+
+        if (clen <= 0)
+            continue;  /* rejected or unchanged — skip silently */
+
+        if (clen > maxpasslen) {
+            *cpu_needed = 1;  /* valid but too long — flag for CPU re-process */
+            continue;
+        }
+
+        /* Pack directly into GPU slot: aligned SIMD zero, copy, pad, bitlen.
+         * raw buffer is 16-byte aligned (jobg struct layout guarantees this). */
+        char *slot = raw + (idx * stride);
+#ifndef NOTINTEL
+        { __m128i z = _mm_setzero_si128();
+          __m128i *p = (__m128i *)slot;
+          p[0] = z; p[1] = z; p[2] = z; p[3] = z;
+          if (stride >= 128) { p[4] = z; p[5] = z; p[6] = z; p[7] = z; }
+        }
+#elif ARM > 6
+        { uint32x4_t z = vdupq_n_u32(0);
+          uint32x4_t *p = (uint32x4_t *)slot;
+          p[0] = z; p[1] = z; p[2] = z; p[3] = z;
+          if (stride >= 128) { p[4] = z; p[5] = z; p[6] = z; p[7] = z; }
+        }
+#elif defined(POWERPC)
+        { vector unsigned int z = (vector unsigned int){0,0,0,0};
+          vector unsigned int *p = (vector unsigned int *)slot;
+          p[0] = z; p[1] = z; p[2] = z; p[3] = z;
+          if (stride >= 128) { p[4] = z; p[5] = z; p[6] = z; p[7] = z; }
+        }
+#else
+        memset(slot, 0, stride);
+#endif
+        memcpy(slot, passbuf, clen);
+        slot[clen] = (char)0x80;
+        if (stride >= 128)
+            ((uint32_t *)slot)[30] = clen * 8;
+        else
+            ((uint32_t *)slot)[14] = clen * 8;
+
+        passlen[idx] = (uint16_t)clen;
+        ruleindex[idx] = i;
+        idx++;
+        count++;
+    }
+
+    *rules_used = i;
+    return count;
+}
+

@@ -3,8 +3,17 @@
  */
 
 /* K512[], sha512_block, S512_copy_bytes, S512_copy_bytes_p, S512_set_byte,
- * SHA512_IV0..7, bswap64, rotr64, SALTED_PARAMS, PROBE7_NOOVF
+ * bswap64, rotr64, SALTED_PARAMS, PROBE7_NOOVF
  * all provided by metal_common.metal */
+
+#define SHA512_IV0 0x6a09e667f3bcc908UL
+#define SHA512_IV1 0xbb67ae8584caa73bUL
+#define SHA512_IV2 0x3c6ef372fe94f82bUL
+#define SHA512_IV3 0xa54ff53a5f1d36f1UL
+#define SHA512_IV4 0x510e527fade682d1UL
+#define SHA512_IV5 0x9b05688c2b3e6c1fUL
+#define SHA512_IV6 0x1f83d9abfb41bd6bUL
+#define SHA512_IV7 0x5be0cd19137e2179UL
 
 /* Probe and emit full 16-word SHA512 hash from ostate[8] */
 #define PROBE_AND_HIT_SHA512(ostate_arr, word_idx, salt_idx) { \
@@ -47,7 +56,7 @@
                     uint _slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed); \
                     if (_slot < params.max_hits) { uint _base = _slot * 19; \
                         hits[_base] = word_idx; hits[_base+1] = salt_idx; hits[_base+2] = 1; \
-                        for (int _i2=0;_i2<12;_i2++) hits[_base+3+_i2]=_h384[_i2];
+                        for (int _i2=0;_i2<12;_i2++) hits[_base+3+_i2]=_h384[_i2]; \
                         for (uint _z=15;_z<19;_z++) hits[_base+_z]=0; } return; } } } \
         _pos = (_pos + 1) & params.compact_mask; } }
 

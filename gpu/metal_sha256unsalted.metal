@@ -348,14 +348,20 @@ kernel void sha224_unsalted_batch(
             }
         }
         if (iter < max_iter) {
-            /* SHA224: 7 state words -> 56 hex chars -> 14 M[] words, fits in one block */
+            /* SHA224: 7 state words -> 56 hex chars -> M[0..13].
+             * 56 bytes fills M[0..13] completely — no room for padding in
+             * this block, so compress data first, then padding block. */
             sha224_to_hex_lc(state, M);
-            M[14] = 0x80000000u;
-            M[15] = 56 * 8;  /* 56 hex bytes = 448 bits */
+            M[14] = 0x80000000u;  /* padding byte at position 56 */
+            M[15] = 0;
             state[0] = 0xc1059ed8u; state[1] = 0x367cd507u;
             state[2] = 0x3070dd17u; state[3] = 0xf70e5939u;
             state[4] = 0xffc00b31u; state[5] = 0x68581511u;
             state[6] = 0x64f98fa7u; state[7] = 0xbefa4fa4u;
+            sha256_compress(state, M);
+            /* Second block: padding + length */
+            for (int i = 0; i < 15; i++) M[i] = 0;
+            M[15] = 56 * 8;  /* 56 hex bytes = 448 bits */
             sha256_compress(state, M);
         }
     }

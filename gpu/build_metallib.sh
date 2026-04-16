@@ -63,10 +63,11 @@ SELF_CONTAINED_FAMILIES=(
     metal_sha512unsalted
 )
 
-# Families excluded from offline compilation (fall back to JIT at runtime):
-# - metal_hmac_sha512: needs SHA512_IV defines removed from metal_common
-# - metal_streebog: uses pointer casts without address space qualifiers
-# When these .metal files are fixed, add them to the appropriate list above.
+# Common-dependent families that need separate compilation (too large for combined)
+SEPARATE_COMMON_FAMILIES=(
+    metal_streebog
+    metal_hmac_sha512
+)
 
 AIR_FILES=""
 
@@ -93,6 +94,26 @@ else
     exit 1
 fi
 
+# --- Build separate common-dependent families (common + family, compiled individually) ---
+for fam in "${SEPARATE_COMMON_FAMILIES[@]}"; do
+    src="${fam}.metal"
+    air="${AIRDIR}/${fam}.air"
+    sep="${AIRDIR}/${fam}_sep.metal"
+    if [ ! -f "$src" ]; then
+        echo "WARNING: $src not found, skipping" >&2
+        continue
+    fi
+    cp "$COMMON" "$sep"
+    echo "" >> "$sep"
+    cat "$src" >> "$sep"
+    echo "  [metal] $src (separate common-dependent)"
+    if xcrun -sdk macosx metal $METAL_FLAGS -c "$sep" -o "$air" 2>&1; then
+        AIR_FILES="$AIR_FILES $air"
+    else
+        echo "WARNING: $src failed to compile, will use JIT" >&2
+    fi
+done
+
 # --- Build self-contained families as separate .air files ---
 for fam in "${SELF_CONTAINED_FAMILIES[@]}"; do
     src="${fam}.metal"
@@ -118,4 +139,3 @@ echo "  [metallib] linking $OUTLIB"
 xcrun -sdk macosx metallib $AIR_FILES -o "$OUTLIB"
 
 echo "Built $OUTLIB ($(wc -c < "$OUTLIB" | tr -d ' ') bytes)"
-echo "Note: metal_hmac_sha512 and metal_streebog excluded (JIT fallback)"

@@ -16,6 +16,15 @@
 
 /* bswap64 provided by gpu_common.cl */
 
+/* MD6 Q constants for iteration re-hash */
+__constant ulong MD6_QC[15] = {
+    0x7311c2812425cfa0UL, 0x6432286434aac8e7UL, 0xb60450e9ef68b7c1UL,
+    0xe8fb23908d9f06f1UL, 0xdd2e76cba691e5bfUL, 0x0cd0d63b2c30bc41UL,
+    0x1f8ccf6823058f8aUL, 0x54e5ed5b88e3775dUL, 0x4ad12aae0a6d6031UL,
+    0x3e7f16bb88222e0dUL, 0x8af8671d3fb50c2cUL, 0x995ad1178bd25c31UL,
+    0xc878c1dd04c4b633UL, 0x3b72066c7a1552acUL, 0x0d6f3522631effcbUL
+};
+
 /* MD6 compression loop constants */
 #define MD6_n  89
 #define MD6_c  16
@@ -29,27 +38,40 @@
 #define MD6_t4  67
 #define MD6_t5  89
 
-/* Shift amounts for 16 steps per round (w=64) */
-__constant int RS[16] = {10, 5,13,10,11,12, 2, 7,14,15, 7,13,11, 7, 6,12};
-__constant int LS[16] = {11,24, 9,16,15, 9,27,15, 6, 2,29, 8,15, 5,31, 9};
-
 __constant ulong MD6_S0 = 0x0123456789abcdefUL;
 __constant ulong MD6_Smask = 0x7311c2812425cfa0UL;
 
+#define MD6_STEP(rs, ls, step) \
+    x  = S;                               \
+    x ^= A[i + step - MD6_t5];            \
+    x ^= A[i + step - MD6_t0];            \
+    x ^= (A[i + step - MD6_t1] & A[i + step - MD6_t2]); \
+    x ^= (A[i + step - MD6_t3] & A[i + step - MD6_t4]); \
+    x ^= (x >> rs);                       \
+    A[i + step] = x ^ (x << ls);
+
 /* MD6 main compression loop — operates on array A of length r*c+n */
 void md6_compress_loop(ulong *A) {
+    ulong x;
     ulong S = MD6_S0;
     int i = MD6_n;
     for (int j = 0; j < MD6_r * MD6_c; j += MD6_c) {
-        for (int step = 0; step < 16; step++) {
-            ulong x = S;
-            x ^= A[i + step - MD6_t5];
-            x ^= A[i + step - MD6_t0];
-            x ^= (A[i + step - MD6_t1] & A[i + step - MD6_t2]);
-            x ^= (A[i + step - MD6_t3] & A[i + step - MD6_t4]);
-            x ^= (x >> RS[step]);
-            A[i + step] = x ^ (x << LS[step]);
-        }
+        MD6_STEP(10, 11,  0)
+        MD6_STEP( 5, 24,  1)
+        MD6_STEP(13,  9,  2)
+        MD6_STEP(10, 16,  3)
+        MD6_STEP(11, 15,  4)
+        MD6_STEP(12,  9,  5)
+        MD6_STEP( 2, 27,  6)
+        MD6_STEP( 7, 15,  7)
+        MD6_STEP(14,  6,  8)
+        MD6_STEP(15,  2,  9)
+        MD6_STEP( 7, 29, 10)
+        MD6_STEP(13,  8, 11)
+        MD6_STEP(11, 15, 12)
+        MD6_STEP( 7,  5, 13)
+        MD6_STEP( 6, 31, 14)
+        MD6_STEP(12,  9, 15)
         S = (S << 1) ^ (S >> 63) ^ (S & MD6_Smask);
         i += 16;
     }
@@ -79,8 +101,7 @@ __kernel void md6_256_unsalted_batch(
      * word_stride stored in jobg, passed as upload size. */
     __global const ulong *src = (__global const ulong *)(words + word_idx * 712);
 
-    /* We need a working array A of size r*c+n = 104*16+89 = 1753 words.
-     * Load N into the first 89 positions. */
+    /* We need a working array A of size r*c+n = 104*16+89 = 1753 words. */
     ulong A[1753];
     for (int i = 0; i < 89; i++) A[i] = src[i];
 
@@ -166,21 +187,74 @@ __kernel void md6_256_unsalted_batch(
     /* Extract output: last c=16 words of A, then take last d/w=4 words.
      * C[0..15] = A[r*c+n-c .. r*c+n-1] = A[1737..1752]
      * Hash = C[12..15] (last 4 uint64 words = last 256 bits = 8 uint32) */
-    ulong C[4];
-    C[0] = A[1749]; C[1] = A[1750]; C[2] = A[1751]; C[3] = A[1752];
+    uint max_iter = params.max_iter;
+    uint iter = 1;
 
-    /* Byte-swap all 4 uint64 output words to LE, split into 8 uint32 */
-    uint h[8];
-    for (int i = 0; i < 4; i++) {
-        ulong s = bswap64(C[i]);
-        h[i*2]   = (uint)s;
-        h[i*2+1] = (uint)(s >> 32);
-    }
+    for (;;) {
+        /* Extract output: C[12..15] = A[1749..1752] */
+        ulong C0 = A[1749], C1 = A[1750], C2 = A[1751], C3 = A[1752];
 
-    if (probe_compact(h[0], h[1], h[2], h[3], compact_fp, compact_idx,
-                      params.compact_mask, params.max_probe, params.hash_data_count,
-                      hash_data_buf, hash_data_off,
-                      overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {
-        EMIT_HIT_8(hits, hit_count, params.max_hits, word_idx, mask_idx, 1u, h)
+        /* Byte-swap to LE, split into 8 uint32 for probe */
+        uint h[8];
+        ulong s0 = bswap64(C0); h[0] = (uint)s0; h[1] = (uint)(s0 >> 32);
+        ulong s1 = bswap64(C1); h[2] = (uint)s1; h[3] = (uint)(s1 >> 32);
+        ulong s2 = bswap64(C2); h[4] = (uint)s2; h[5] = (uint)(s2 >> 32);
+        ulong s3 = bswap64(C3); h[6] = (uint)s3; h[7] = (uint)(s3 >> 32);
+
+        if (probe_compact(h[0], h[1], h[2], h[3], compact_fp, compact_idx,
+                          params.compact_mask, params.max_probe, params.hash_data_count,
+                          hash_data_buf, hash_data_off,
+                          overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {
+            EMIT_HIT_8(hits, hit_count, params.max_hits, word_idx, mask_idx, iter, h)
+        }
+
+        if (iter >= max_iter) break;
+        iter++;
+
+        /* Hex-encode 32-byte hash into 64-char hex string */
+        uchar buf[64];
+        for (int i = 0; i < 8; i++) {
+            uchar byte_val = (uchar)(C0 >> (56 - i * 8));
+            uchar hi_n = (byte_val >> 4), lo_n = (byte_val & 0xf);
+            buf[i*2]     = hi_n + (hi_n < 10 ? '0' : 'a' - 10);
+            buf[i*2 + 1] = lo_n + (lo_n < 10 ? '0' : 'a' - 10);
+        }
+        for (int i = 0; i < 8; i++) {
+            uchar byte_val = (uchar)(C1 >> (56 - i * 8));
+            uchar hi_n = (byte_val >> 4), lo_n = (byte_val & 0xf);
+            buf[16 + i*2]     = hi_n + (hi_n < 10 ? '0' : 'a' - 10);
+            buf[16 + i*2 + 1] = lo_n + (lo_n < 10 ? '0' : 'a' - 10);
+        }
+        for (int i = 0; i < 8; i++) {
+            uchar byte_val = (uchar)(C2 >> (56 - i * 8));
+            uchar hi_n = (byte_val >> 4), lo_n = (byte_val & 0xf);
+            buf[32 + i*2]     = hi_n + (hi_n < 10 ? '0' : 'a' - 10);
+            buf[32 + i*2 + 1] = lo_n + (lo_n < 10 ? '0' : 'a' - 10);
+        }
+        for (int i = 0; i < 8; i++) {
+            uchar byte_val = (uchar)(C3 >> (56 - i * 8));
+            uchar hi_n = (byte_val >> 4), lo_n = (byte_val & 0xf);
+            buf[48 + i*2]     = hi_n + (hi_n < 10 ? '0' : 'a' - 10);
+            buf[48 + i*2 + 1] = lo_n + (lo_n < 10 ? '0' : 'a' - 10);
+        }
+
+        /* Rebuild N[89]: Q[15] + K[8]=0 + U[1] + V[1] + B[64] */
+        for (int i = 0; i < 15; i++) A[i] = MD6_QC[i];
+        for (int i = 15; i < 23; i++) A[i] = 0;
+        A[23] = (ulong)1 << 56;
+        /* V: r=104, L=64, z=1, p=3584, keylen=0, d=256 */
+        A[24] = ((ulong)104 << 48) | ((ulong)64 << 40) | ((ulong)1 << 36)
+              | ((ulong)3584 << 20) | (ulong)256;
+        /* Pack buf into B[64] as LE uint64, then byte-swap to BE */
+        for (int i = 0; i < 64; i++) {
+            int wi = 25 + (i >> 3);
+            int bi = (i & 7) << 3;
+            if ((i & 7) == 0) A[wi] = 0;
+            A[wi] |= (ulong)buf[i] << bi;
+        }
+        for (int i = 33; i < 89; i++) A[i] = 0;
+        for (int i = 25; i < 89; i++) A[i] = bswap64(A[i]);
+
+        md6_compress_loop(A);
     }
 }

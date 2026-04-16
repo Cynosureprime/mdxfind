@@ -68,15 +68,6 @@ int gpu_hash_words(int op);
 struct jobg {
     struct jobg *next;
     char        *filename;
-    int         *doneprint;
-    int          flags;
-    int          op;                        /* JOB_MD5SALT etc. */
-    int          count;                     /* entries filled (0..GPUBATCH_MAX) */
-    int          max_count;                 /* max entries for this batch (stride-dependent) */
-    uint32_t     passbuf_pos;               /* fill cursor into passbuf */
-    uint32_t     word_stride;               /* bytes per word slot (64, 128, 256) */
-    unsigned int line_num;              /* starting line number for priority ordering */
-
     /* Word data: 256KB contiguous for unsalted 64-byte stride (4096 words).
      * Legacy accesses first half as passbuf, second half as hexhash[]. */
     union {
@@ -92,6 +83,15 @@ struct jobg {
     /* Job context for checkhashkey */
     int          clen[GPUBATCH_MAX];
     int          ruleindex[GPUBATCH_MAX];
+    int         *doneprint;
+    int          flags;
+    int          op;                        /* JOB_MD5SALT etc. */
+    int          count;                     /* entries filled (0..GPUBATCH_MAX) */
+    int          max_count;                 /* max entries for this batch (stride-dependent) */
+    uint32_t     passbuf_pos;               /* fill cursor into passbuf */
+    uint32_t     word_stride;               /* bytes per word slot (64, 128, 256) */
+    unsigned int line_num;              /* starting line number for priority ordering */
+
 };
 
 /* Initialize GPU work queue, allocate JOBG structs, launch gpujob thread.

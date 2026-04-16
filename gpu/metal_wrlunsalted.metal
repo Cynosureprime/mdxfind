@@ -622,6 +622,43 @@ static void whirlpool_compress(thread ulong *hash, thread ulong *block) {
         hash[i] = state[0][i] ^ block[i];
 }
 
+/* General Whirlpool compress: hash = Miyaguchi-Preneel(cv, block) = cv ^ state ^ block */
+static void whirlpool_compress_cv(thread ulong *hash, thread ulong *block, thread ulong *cv) {
+    ulong K[2][8];
+    ulong state[2][8];
+    int m = 0;
+
+    for (int i = 0; i < 8; i++) {
+        K[0][i] = cv[i];
+        state[0][i] = block[i] ^ cv[i];
+    }
+
+    for (int r = 0; r < 10; r++) {
+        K[m^1][0] = WRL_OP(K[m], 0) ^ WRL_RC[r];
+        K[m^1][1] = WRL_OP(K[m], 1);
+        K[m^1][2] = WRL_OP(K[m], 2);
+        K[m^1][3] = WRL_OP(K[m], 3);
+        K[m^1][4] = WRL_OP(K[m], 4);
+        K[m^1][5] = WRL_OP(K[m], 5);
+        K[m^1][6] = WRL_OP(K[m], 6);
+        K[m^1][7] = WRL_OP(K[m], 7);
+
+        state[m^1][0] = WRL_OP(state[m], 0) ^ K[m^1][0];
+        state[m^1][1] = WRL_OP(state[m], 1) ^ K[m^1][1];
+        state[m^1][2] = WRL_OP(state[m], 2) ^ K[m^1][2];
+        state[m^1][3] = WRL_OP(state[m], 3) ^ K[m^1][3];
+        state[m^1][4] = WRL_OP(state[m], 4) ^ K[m^1][4];
+        state[m^1][5] = WRL_OP(state[m], 5) ^ K[m^1][5];
+        state[m^1][6] = WRL_OP(state[m], 6) ^ K[m^1][6];
+        state[m^1][7] = WRL_OP(state[m], 7) ^ K[m^1][7];
+
+        m ^= 1;
+    }
+
+    for (int i = 0; i < 8; i++)
+        hash[i] = state[0][i] ^ block[i] ^ cv[i];
+}
+
 kernel void wrl_unsalted_batch(
     device const uint       *words       [[buffer(0)]],
     device const ushort     *unused_lens [[buffer(1)]],
@@ -733,50 +770,98 @@ kernel void wrl_unsalted_batch(
     ulong hash[8];
     whirlpool_compress(hash, M64);
 
-    /* Whirlpool: probe with first 4 LE uint32, emit 16 words */
-    ulong s0 = bswap64(hash[0]), s1 = bswap64(hash[1]);
-    uint hx = (uint)s0, hy = (uint)(s0 >> 32);
-    uint hz = (uint)s1, hw = (uint)(s1 >> 32);
+    uint max_iter = params.max_iter;
 
-    ulong key = (ulong(hy) << 32) | hx;
-    uint fp = uint(key >> 32); if (fp == 0) fp = 1;
-    ulong pos = (key ^ (key >> 32)) & params.compact_mask;
-    bool found = false;
-    for (uint p = 0; p < params.max_probe && !found; p++) {
-        uint cfp = compact_fp[pos]; if (cfp == 0) break;
-        if (cfp == fp) { uint idx = compact_idx[pos];
-            if (idx < params.hash_data_count) {
-                ulong off = hash_data_off[idx];
-                device const uint *ref = (device const uint *)(hash_data_buf + off);
-                if (hx == ref[0] && hy == ref[1] && hz == ref[2] && hw == ref[3])
-                    found = true;
-            } }
-        pos = (pos + 1) & params.compact_mask;
-    }
-    if (!found && params.overflow_count > 0) {
-        int lo = 0, hi2 = int(params.overflow_count) - 1;
-        while (lo <= hi2 && !found) {
-            int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid];
-            if (key < mkey) hi2 = mid - 1;
-            else if (key > mkey) lo = mid + 1;
-            else {
-                for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) {
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
-                    if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3])
-                        found = true; }
-                for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) {
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
-                    if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3])
-                        found = true; }
-                break; } } }
-    if (found) {
-        uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
-        if (slot < params.max_hits) {
-            uint base = slot * HIT_STRIDE;
-            hits[base] = word_idx; hits[base+1] = mask_idx; hits[base+2] = 1;
+    for (uint iter = 1; iter <= max_iter; iter++) {
+        /* Convert BE hash to LE uint32 for probe */
+        ulong s0 = bswap64(hash[0]), s1 = bswap64(hash[1]);
+        uint hx = (uint)s0, hy = (uint)(s0 >> 32);
+        uint hz = (uint)s1, hw = (uint)(s1 >> 32);
+
+        ulong key = (ulong(hy) << 32) | hx;
+        uint fp = uint(key >> 32); if (fp == 0) fp = 1;
+        ulong pos = (key ^ (key >> 32)) & params.compact_mask;
+        bool found = false;
+        for (uint p = 0; p < params.max_probe && !found; p++) {
+            uint cfp = compact_fp[pos]; if (cfp == 0) break;
+            if (cfp == fp) { uint idx = compact_idx[pos];
+                if (idx < params.hash_data_count) {
+                    ulong off = hash_data_off[idx];
+                    device const uint *ref = (device const uint *)(hash_data_buf + off);
+                    if (hx == ref[0] && hy == ref[1] && hz == ref[2] && hw == ref[3])
+                        found = true;
+                } }
+            pos = (pos + 1) & params.compact_mask;
+        }
+        if (!found && params.overflow_count > 0) {
+            int lo = 0, hi2 = int(params.overflow_count) - 1;
+            while (lo <= hi2 && !found) {
+                int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid];
+                if (key < mkey) hi2 = mid - 1;
+                else if (key > mkey) lo = mid + 1;
+                else {
+                    for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) {
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
+                        if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3])
+                            found = true; }
+                    for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) {
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
+                        if (hx == oref[0] && hy == oref[1] && hz == oref[2] && hw == oref[3])
+                            found = true; }
+                    break; } } }
+        if (found) {
+            uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
+            if (slot < params.max_hits) {
+                uint base = slot * HIT_STRIDE;
+                hits[base] = word_idx; hits[base+1] = uint(mask_idx); hits[base+2] = iter;
+                for (int i = 0; i < 8; i++) {
+                    ulong sw = bswap64(hash[i]);
+                    hits[base+3+i*2]   = (uint)sw;
+                    hits[base+3+i*2+1] = (uint)(sw >> 32);
+                } } }
+        if (iter < max_iter) {
+            /* Hex-encode 8 BE hash words into hex_buf (128 hex chars).
+             * hash[] is BE ulong — extract bytes in BE order. */
+            uchar hex_buf[128];
             for (int i = 0; i < 8; i++) {
-                ulong sw = bswap64(hash[i]);
-                hits[base+3+i*2]   = (uint)sw;
-                hits[base+3+i*2+1] = (uint)(sw >> 32);
-            } } }
+                ulong w = hash[i];
+                for (int b = 0; b < 8; b++) {
+                    uchar byte_val = (uchar)(w >> (56 - b * 8));
+                    uchar hi_n = (byte_val >> 4) & 0xf, lo_n = byte_val & 0xf;
+                    hex_buf[i*16 + b*2]     = hi_n + ((hi_n < 10) ? '0' : ('a'-10));
+                    hex_buf[i*16 + b*2 + 1] = lo_n + ((lo_n < 10) ? '0' : ('a'-10));
+                }
+            }
+
+            /* Block 1: hex_buf[0..63] -> 8 BE uint64, compress with zero IV */
+            ulong blk[8];
+            for (int i = 0; i < 8; i++) {
+                int off = i*8;
+                blk[i] = ((ulong)hex_buf[off]<<56) | ((ulong)hex_buf[off+1]<<48)
+                        | ((ulong)hex_buf[off+2]<<40) | ((ulong)hex_buf[off+3]<<32)
+                        | ((ulong)hex_buf[off+4]<<24) | ((ulong)hex_buf[off+5]<<16)
+                        | ((ulong)hex_buf[off+6]<<8)  | ((ulong)hex_buf[off+7]);
+            }
+            whirlpool_compress(hash, blk);
+
+            /* Block 2: hex_buf[64..127] */
+            for (int i = 0; i < 8; i++) {
+                int off = 64 + i*8;
+                blk[i] = ((ulong)hex_buf[off]<<56) | ((ulong)hex_buf[off+1]<<48)
+                        | ((ulong)hex_buf[off+2]<<40) | ((ulong)hex_buf[off+3]<<32)
+                        | ((ulong)hex_buf[off+4]<<24) | ((ulong)hex_buf[off+5]<<16)
+                        | ((ulong)hex_buf[off+6]<<8)  | ((ulong)hex_buf[off+7]);
+            }
+            ulong cv[8];
+            for (int i = 0; i < 8; i++) cv[i] = hash[i];
+            whirlpool_compress_cv(hash, blk, cv);
+
+            /* Block 3: padding */
+            for (int i = 0; i < 8; i++) blk[i] = 0;
+            blk[0] = 0x8000000000000000UL;
+            blk[7] = 1024UL;  /* 128 * 8 = 1024 bits */
+            for (int i = 0; i < 8; i++) cv[i] = hash[i];
+            whirlpool_compress_cv(hash, blk, cv);
+        }
+    }
 }

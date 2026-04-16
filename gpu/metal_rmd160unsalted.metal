@@ -114,48 +114,66 @@ kernel void rmd160_unsalted_batch(
     uint state[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
     rmd160_block(state, M);
 
-    /* RMD160: 5 hash words, output is LE — no bswap needed */
-    uint h[5];
-    for (int i = 0; i < 5; i++) h[i] = state[i];
+    uint max_iter = params.max_iter;
 
-    /* Probe compact table with first 4 words, emit all 5 */
-    ulong key = (ulong(h[1]) << 32) | h[0];
-    uint fp = uint(key >> 32); if (fp == 0) fp = 1;
-    ulong pos = (key ^ (key >> 32)) & params.compact_mask;
-    bool found = false;
-    for (uint p = 0; p < params.max_probe && !found; p++) {
-        uint cfp = compact_fp[pos]; if (cfp == 0) break;
-        if (cfp == fp) { uint idx = compact_idx[pos];
-            if (idx < params.hash_data_count) {
-                ulong off = hash_data_off[idx];
-                device const uint *ref = (device const uint *)(hash_data_buf + off);
-                if (h[0] == ref[0] && h[1] == ref[1] && h[2] == ref[2] && h[3] == ref[3])
-                    found = true;
-            } }
-        pos = (pos + 1) & params.compact_mask;
+    for (uint iter = 1; iter <= max_iter; iter++) {
+        uint h[5];
+        for (int i = 0; i < 5; i++) h[i] = state[i];
+
+        /* Probe compact table */
+        ulong key = (ulong(h[1]) << 32) | h[0];
+        uint fp = uint(key >> 32); if (fp == 0) fp = 1;
+        ulong pos = (key ^ (key >> 32)) & params.compact_mask;
+        bool found = false;
+        for (uint p = 0; p < params.max_probe && !found; p++) {
+            uint cfp = compact_fp[pos]; if (cfp == 0) break;
+            if (cfp == fp) { uint idx = compact_idx[pos];
+                if (idx < params.hash_data_count) {
+                    ulong off = hash_data_off[idx];
+                    device const uint *ref = (device const uint *)(hash_data_buf + off);
+                    if (h[0] == ref[0] && h[1] == ref[1] && h[2] == ref[2] && h[3] == ref[3])
+                        found = true;
+                } }
+            pos = (pos + 1) & params.compact_mask;
+        }
+        if (!found && params.overflow_count > 0) {
+            int lo = 0, hi2 = int(params.overflow_count) - 1;
+            while (lo <= hi2 && !found) {
+                int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid];
+                if (key < mkey) hi2 = mid - 1;
+                else if (key > mkey) lo = mid + 1;
+                else {
+                    for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) {
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
+                        if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
+                            found = true; }
+                    for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) {
+                        device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
+                        if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
+                            found = true; }
+                    break; } } }
+        if (found) {
+            uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
+            if (slot < params.max_hits) {
+                uint base = slot * HIT_STRIDE;
+                hits[base] = word_idx; hits[base+1] = uint(mask_idx); hits[base+2] = iter;
+                for (int i = 0; i < 5; i++) hits[base+3+i] = h[i];
+                for (uint _z = 8; _z < HIT_STRIDE; _z++) hits[base+_z] = 0; } }
+        if (iter < max_iter) {
+            /* Hex-encode 5 LE state words into M[0..9] (40 hex chars, LE packing) */
+            for (int i = 0; i < 5; i++) {
+                uint s = state[i];
+                uint b0 = s & 0xff, b1 = (s >> 8) & 0xff;
+                uint b2 = (s >> 16) & 0xff, b3 = (s >> 24) & 0xff;
+                M[i*2]   = hex_byte_lc(b0) | (hex_byte_lc(b1) << 16);
+                M[i*2+1] = hex_byte_lc(b2) | (hex_byte_lc(b3) << 16);
+            }
+            M[10] = 0x80;
+            for (int i = 11; i < 14; i++) M[i] = 0;
+            M[14] = 40 * 8; M[15] = 0;  /* 40 hex bytes = 320 bits */
+            state[0] = 0x67452301u; state[1] = 0xEFCDAB89u;
+            state[2] = 0x98BADCFEu; state[3] = 0x10325476u; state[4] = 0xC3D2E1F0u;
+            rmd160_block(state, M);
+        }
     }
-    if (!found && params.overflow_count > 0) {
-        int lo = 0, hi2 = int(params.overflow_count) - 1;
-        while (lo <= hi2 && !found) {
-            int mid = (lo + hi2) / 2; ulong mkey = overflow_keys[mid];
-            if (key < mkey) hi2 = mid - 1;
-            else if (key > mkey) lo = mid + 1;
-            else {
-                for (int d = mid; d >= 0 && overflow_keys[d] == key && !found; d--) {
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
-                    if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
-                        found = true; }
-                for (int d = mid+1; d < int(params.overflow_count) && overflow_keys[d] == key && !found; d++) {
-                    device const uint *oref = (device const uint *)(overflow_hashes + overflow_offsets[d]);
-                    if (h[0] == oref[0] && h[1] == oref[1] && h[2] == oref[2] && h[3] == oref[3])
-                        found = true; }
-                break; } } }
-    if (found) {
-        uint slot = atomic_fetch_add_explicit(hit_count, 1, memory_order_relaxed);
-        if (slot < params.max_hits) {
-            uint base = slot * HIT_STRIDE;
-            hits[base] = word_idx; hits[base+1] = mask_idx;
-            hits[base+2] = 1;
-            for (int i = 0; i < 5; i++) hits[base+3+i] = h[i];
-            for (uint _z = 8; _z < HIT_STRIDE; _z++) hits[base+_z] = 0; } }
 }

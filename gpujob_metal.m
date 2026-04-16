@@ -766,9 +766,23 @@ void gpujob(void *arg) {
                     int blen;
                     if (g->word_stride && widx < 4096) {
                         char *slot = g->raw + widx * g->word_stride;
-                        int total_len = ((uint32_t *)slot)[14] >> 3;
+                        int total_len;
+                        if (g->word_stride == 128)
+                            total_len = ((uint32_t *)slot)[30] >> 3;  /* SHA384/SHA512 */
+                        else if (g->word_stride == 712) {
+                            /* MD6: password at B offset 200 + prependlen, length from passlen */
+                            total_len = g->passlen[widx] + gpu_mask_n_prepend + gpu_mask_n_append;
+                        } else if (g->word_stride > 64 && g->word_stride != 128) {
+                            /* Keccak/SHA3: password length stored as uint16 at byte offset rate */
+                            int rate = g->word_stride - 8;
+                            total_len = (unsigned char)slot[rate] | ((unsigned char)slot[rate+1] << 8);
+                        } else
+                            total_len = ((uint32_t *)slot)[14] >> 3;  /* MD5/SHA1/SHA256 */
                         blen = total_len - gpu_mask_n_prepend - gpu_mask_n_append;
-                        base_word = slot + gpu_mask_n_prepend;
+                        if (g->word_stride == 712)
+                            base_word = slot + 200 + gpu_mask_n_prepend;  /* MD6 B starts at byte 200 */
+                        else
+                            base_word = slot + gpu_mask_n_prepend;
                     } else {
                         base_word = &g->passbuf[g->passoff[widx]];
                         blen = g->passlen[widx];
@@ -1205,6 +1219,21 @@ get_buffer:
     g->count = 0;
     g->passbuf_pos = 0;
     return g;
+}
+
+void gpujob_return_free(struct jobg *g) {
+    g->next = NULL;
+    g->count = 0;
+    g->passbuf_pos = 0;
+    possess(GPUFreeWaiting);
+    if (GPUFreeTail) {
+        *GPUFreeTail = g;
+        GPUFreeTail = &(g->next);
+    } else {
+        GPUFreeHead = g;
+        GPUFreeTail = &(g->next);
+    }
+    twist(GPUFreeWaiting, BY, +1);
 }
 
 void gpujob_submit(struct jobg *g) {

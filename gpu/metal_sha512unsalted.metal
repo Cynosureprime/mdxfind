@@ -10,22 +10,26 @@ using namespace metal;
 constant uint HIT_STRIDE = 19;
 
 struct MetalParams {
-    uint64_t compact_mask;
-    uint     num_words;
-    uint     num_salts;
-    uint     salt_start;
-    uint     max_probe;
-    uint     hash_data_count;
-    uint     max_hits;
-    uint     overflow_count;
-    uint     max_iter;
-    uint     num_masks;
-    uint64_t mask_start;
-    uint     n_prepend;
-    uint     n_append;
-    uint     iter_count;
-    uint64_t mask_base0;
-    uint64_t mask_base1;
+    /* 8-byte fields (offset 0-31) */
+    uint64_t compact_mask;    /*  0: hash table mask */
+    uint64_t mask_start;      /*  8: mask keyspace offset */
+    uint64_t mask_base0;      /* 16: pre-decomposed positions 0-7 */
+    uint64_t mask_base1;      /* 24: pre-decomposed positions 8-15 */
+    /* 4-byte fields (offset 32-79) */
+    uint     num_words;       /* 32: words in batch */
+    uint     num_salts;       /* 36: salts for dispatch */
+    uint     salt_start;      /* 40: starting salt index */
+    uint     max_probe;       /* 44: compact table probe depth */
+    uint     hash_data_count; /* 48: hash_data entries */
+    uint     max_hits;        /* 52: hit buffer capacity */
+    uint     overflow_count;  /* 56: overflow table entries */
+    uint     max_iter;        /* 60: iteration count (-i) */
+    uint     num_masks;       /* 64: mask combinations per chunk */
+    uint     n_prepend;       /* 68: prepend mask positions (-N) */
+    uint     n_append;        /* 72: append mask positions (-n) */
+    uint     iter_count;      /* 76: per-dispatch iteration (PHPBB3) */
+    uint     reserved32[4];   /* 80-95: reserved */
+    uint64_t reserved64[4];   /* 96-127: reserved */
 };
 
 static inline ulong bswap64(ulong x) {
@@ -428,9 +432,39 @@ kernel void sha384_unsalted_batch(
     };
     sha512_compress(state, M);
 
-    sha512_probe_emit(state, 12, word_idx, mask_idx, 1, 1,
-        compact_fp, compact_idx, params.compact_mask, params.max_probe,
-        params.hash_data_count, params.max_hits,
-        hash_data_buf, hash_data_off, overflow_keys, overflow_hashes,
-        overflow_offsets, params.overflow_count, hits, hit_count);
+    uint max_iter = params.max_iter;
+
+    for (uint iter = 1; iter <= max_iter; iter++) {
+        sha512_probe_emit(state, 12, word_idx, mask_idx, iter, max_iter,
+            compact_fp, compact_idx, params.compact_mask, params.max_probe,
+            params.hash_data_count, params.max_hits,
+            hash_data_buf, hash_data_off, overflow_keys, overflow_hashes,
+            overflow_offsets, params.overflow_count, hits, hit_count);
+        if (iter < max_iter) {
+            /* Hex-encode 6 BE state words into M[0..11] (96 hex chars).
+             * 96 bytes fits in one SHA512 block (< 112 byte limit). */
+            for (int i = 0; i < 6; i++) {
+                ulong s = state[i];
+                uint b0 = (s >> 56) & 0xff, b1 = (s >> 48) & 0xff;
+                uint b2 = (s >> 40) & 0xff, b3 = (s >> 32) & 0xff;
+                uint b4 = (s >> 24) & 0xff, b5 = (s >> 16) & 0xff;
+                uint b6 = (s >> 8)  & 0xff, b7 = s & 0xff;
+                M[i*2]   = (hex_byte_be64(b0) << 48) | (hex_byte_be64(b1) << 32)
+                          | (hex_byte_be64(b2) << 16) | hex_byte_be64(b3);
+                M[i*2+1] = (hex_byte_be64(b4) << 48) | (hex_byte_be64(b5) << 32)
+                          | (hex_byte_be64(b6) << 16) | hex_byte_be64(b7);
+            }
+            /* Padding: 0x80 at byte 96, zeros, length at M[14..15] */
+            M[12] = 0x8000000000000000UL;
+            M[13] = 0;
+            M[14] = 0;
+            M[15] = 96 * 8;  /* 96 hex bytes = 768 bits */
+            /* Reset to SHA384 IV */
+            state[0] = 0xcbbb9d5dc1059ed8UL; state[1] = 0x629a292a367cd507UL;
+            state[2] = 0x9159015a3070dd17UL; state[3] = 0x152fecd8f70e5939UL;
+            state[4] = 0x67332667ffc00b31UL; state[5] = 0x8eb44a8768581511UL;
+            state[6] = 0xdb0c2e0d64f98fa7UL; state[7] = 0x47b5481dbefa4fa4UL;
+            sha512_compress(state, M);
+        }
+    }
 }
