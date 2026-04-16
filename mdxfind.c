@@ -184,9 +184,15 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.319 2026/04/16 14:34:09 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.321 2026/04/16 16:22:43 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.321  2026/04/16 16:22:43  dlr
+ * Fix leftover debug fprintf argument list from PHPBB3 investigation
+ *
+ * Revision 1.320  2026/04/16 16:21:33  dlr
+ * Remove debug fprintf from PHPBB3 GPU investigation
+ *
  * Revision 1.319  2026/04/16 14:34:09  dlr
  * Auto-enable -W auto when MDXFIND_CACHE env var is set. Add -W none to disable ETA (overrides env var).
  *
