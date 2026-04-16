@@ -98,6 +98,7 @@
 #include <lzma.h>
 #include <bzlib.h>
 #include <zstd.h>
+#include "sqlite3.h"
 
 #include "mdxfind.h"
 
@@ -183,9 +184,18 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.315 2026/04/16 03:52:12 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.318 2026/04/16 14:15:14 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.318  2026/04/16 14:15:14  dlr
+ * Phase 3: SQLite line count cache (mdxfind.db). Cache keyed on (realpath, size, mtime). -W auto:/path overrides location. MDXFIND_CACHE env var. WAL mode for concurrent access. Prune /tmp/ entries after 7 days. Summary line shows cached vs counted. SQLite amalgamation (sqlite3.c/sqlite3.h) bundled.
+ *
+ * Revision 1.317  2026/04/16 13:36:37  dlr
+ * Phase 2: -W auto background line counter. Spawns thread to decompress and count lines in all input files (gzip/xz/bz2/zstd/zip/plain). Skips pipes, sockets, stdin. Checks HashWaiting for early exit. AutoCountTotalLines updated atomically. ReportStats shows ~prefix while counting is in progress.
+ *
+ * Revision 1.316  2026/04/16 13:25:35  dlr
+ * Add -W option for wordlist ETA display. -W <count>[K|M|G] sets estimated total lines, -W auto placeholder for background counting (Phase 2). ReportStats shows progress/ETA with autoscaled time (seconds to years). Refactor brute-force ETA to use shared format_eta() helper.
+ *
  * Revision 1.315  2026/04/16 03:52:12  dlr
  * Fix MD5DECBASE64MD5/SHA1DECBASE64 plaintext corruption (job->clen overwritten with decoded length). Auto-disable GPU in -z mode.
  *
@@ -6681,6 +6691,14 @@ lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;
 static lock *ReadBuf0, *ReadBuf1, *HashWaiting;
 static lock *ServerState;
 unsigned long long Tothash, Totfound, Totrules;
+/* ETA progress tracking for ReportStats */
+static unsigned long long EstimatedTotalLines = 0;  /* from -W <count> */
+static volatile unsigned long long AutoCountTotalLines = 0;  /* from -W auto */
+static volatile int AutoCountDone = 0;  /* 1 = background counter finished */
+static int AutoCountRequested = 0;  /* 1 = -W auto was requested */
+static char **LineCountArgv = NULL;  /* file list for background counter */
+static int LineCountArgc = 0;
+static char LineCountCachePath[4096] = "";  /* path to mdxfind.db */
 /* Brute-force progress tracking for ReportStats */
 static int BruteForceMode = 0;
 static unsigned long long BruteForceTotal = 0;  /* total keyspace */
@@ -35382,6 +35400,362 @@ void build_compact_table(void) {
 }
 
 
+/* ---- Background line counter for -W auto ---- */
+
+/* Resolve cache database path: CLI override > env var > ./mdxfind.db */
+static void linecount_cache_resolve(void) {
+    if (LineCountCachePath[0]) return;  /* already set by -W auto:/path */
+    const char *env = getenv("MDXFIND_CACHE");
+    if (env && env[0]) {
+        strncpy(LineCountCachePath, env, sizeof(LineCountCachePath) - 1);
+    } else {
+        strncpy(LineCountCachePath, "mdxfind.db", sizeof(LineCountCachePath) - 1);
+    }
+}
+
+/* Open cache DB, create table if needed. Returns NULL on failure. */
+static sqlite3 *linecount_cache_open(void) {
+    linecount_cache_resolve();
+    sqlite3 *db = NULL;
+    if (sqlite3_open(LineCountCachePath, &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
+    sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS linecount ("
+        "  filepath TEXT NOT NULL,"
+        "  filesize INTEGER NOT NULL,"
+        "  mtime INTEGER NOT NULL,"
+        "  lines INTEGER NOT NULL,"
+        "  cached_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+        "  PRIMARY KEY (filepath, filesize, mtime)"
+        ");", NULL, NULL, NULL);
+    /* Prune /tmp/ entries older than 7 days */
+    sqlite3_exec(db,
+        "DELETE FROM linecount WHERE filepath LIKE '/tmp/%'"
+        " AND cached_at < strftime('%s','now') - 604800;",
+        NULL, NULL, NULL);
+    return db;
+}
+
+/* Lookup cached line count. Returns -1 if not found. */
+static long long linecount_cache_lookup(sqlite3 *db, const char *path,
+                                         long long size, long long mtime) {
+    if (!db) return -1;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db,
+        "SELECT lines FROM linecount WHERE filepath=? AND filesize=? AND mtime=?",
+        -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, size);
+    sqlite3_bind_int64(stmt, 3, mtime);
+    long long result = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        result = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+/* Store line count in cache. */
+static void linecount_cache_store(sqlite3 *db, const char *path,
+                                   long long size, long long mtime,
+                                   long long lines) {
+    if (!db) return;
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db,
+        "INSERT OR REPLACE INTO linecount (filepath, filesize, mtime, lines)"
+        " VALUES (?, ?, ?, ?)",
+        -1, &stmt, NULL) != SQLITE_OK)
+        return;
+    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, size);
+    sqlite3_bind_int64(stmt, 3, mtime);
+    sqlite3_bind_int64(stmt, 4, lines);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+/* Count newlines in a buffer */
+static unsigned long long count_newlines(const unsigned char *buf, size_t len) {
+    unsigned long long count = 0;
+    const unsigned char *p = buf, *end = buf + len;
+    while (p < end) {
+        p = memchr(p, '\n', end - p);
+        if (!p) break;
+        count++;
+        p++;
+    }
+    return count;
+}
+
+/* Count lines in a single file, handling gzip/xz/bz2/zstd/zip compression.
+ * Returns line count, or 0 on error. Checks HashWaiting for early exit. */
+static unsigned long long linecount_file(const char *filename) {
+    struct stat sb;
+    if (stat(filename, &sb) != 0) return 0;
+    /* Skip pipes, sockets, devices */
+    if (S_ISFIFO(sb.st_mode) || !S_ISREG(sb.st_mode)) return 0;
+
+    unsigned long long lines = 0;
+    unsigned char hdrbuf[256];
+
+    /* Read first bytes to detect format */
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t hdrlen = read(fd, hdrbuf, sizeof(hdrbuf));
+    close(fd);
+    if (hdrlen < 4) return 0;
+
+    /* Check for early exit */
+    { int done = 0;
+      possess(HashWaiting);
+      done = peek_lock(HashWaiting);
+      release(HashWaiting);
+      if (done) return 0;
+    }
+
+    unsigned char dbuf[256*1024];  /* decompression output buffer */
+
+    if (hdrbuf[0] == 0xfd && hdrbuf[1] == 0x37 && hdrbuf[2] == 0x7a &&
+        hdrbuf[3] == 0x58 && hdrbuf[4] == 0x5a && hdrbuf[5] == 0x00) {
+        /* XZ */
+        fd = open(filename, O_RDONLY);
+        if (fd < 0) return 0;
+        lzma_stream xz = LZMA_STREAM_INIT;
+        lzma_stream_decoder(&xz, UINT64_MAX, LZMA_CONCATENATED);
+        unsigned char inbuf[256*1024];
+        xz.avail_in = 0;
+        int eof = 0;
+        while (!eof) {
+            if (xz.avail_in == 0) {
+                ssize_t n = read(fd, inbuf, sizeof(inbuf));
+                if (n <= 0) eof = 1;
+                else { xz.next_in = inbuf; xz.avail_in = n; }
+            }
+            xz.next_out = dbuf; xz.avail_out = sizeof(dbuf);
+            lzma_ret r = lzma_code(&xz, eof ? LZMA_FINISH : LZMA_RUN);
+            size_t got = sizeof(dbuf) - xz.avail_out;
+            if (got > 0) lines += count_newlines(dbuf, got);
+            if (r == LZMA_STREAM_END || (r != LZMA_OK)) eof = 1;
+            /* Periodic exit check */
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) { lzma_end(&xz); close(fd); return 0; }
+            }
+        }
+        lzma_end(&xz);
+        close(fd);
+    } else if (hdrbuf[0] == 'B' && hdrbuf[1] == 'Z' && hdrbuf[2] == 'h') {
+        /* bzip2 */
+        fd = open(filename, O_RDONLY);
+        if (fd < 0) return 0;
+        bz_stream bz;
+        memset(&bz, 0, sizeof(bz));
+        BZ2_bzDecompressInit(&bz, 0, 0);
+        unsigned char inbuf[256*1024];
+        bz.avail_in = 0;
+        int eof = 0;
+        while (!eof) {
+            if (bz.avail_in == 0) {
+                ssize_t n = read(fd, inbuf, sizeof(inbuf));
+                if (n <= 0) eof = 1;
+                else { bz.next_in = (char *)inbuf; bz.avail_in = n; }
+            }
+            bz.next_out = (char *)dbuf; bz.avail_out = sizeof(dbuf);
+            int r = BZ2_bzDecompress(&bz);
+            size_t got = sizeof(dbuf) - bz.avail_out;
+            if (got > 0) lines += count_newlines(dbuf, got);
+            if (r == BZ_STREAM_END || r != BZ_OK) eof = 1;
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) { BZ2_bzDecompressEnd(&bz); close(fd); return 0; }
+            }
+        }
+        BZ2_bzDecompressEnd(&bz);
+        close(fd);
+    } else if (hdrbuf[0] == 0x28 && hdrbuf[1] == 0xb5 && hdrbuf[2] == 0x2f && hdrbuf[3] == 0xfd) {
+        /* Zstandard */
+        fd = open(filename, O_RDONLY);
+        if (fd < 0) return 0;
+        ZSTD_DStream *ds = ZSTD_createDStream();
+        ZSTD_initDStream(ds);
+        unsigned char inbuf[256*1024];
+        int eof = 0;
+        while (!eof) {
+            ssize_t n = read(fd, inbuf, sizeof(inbuf));
+            if (n <= 0) break;
+            ZSTD_inBuffer zin = { inbuf, (size_t)n, 0 };
+            while (zin.pos < zin.size) {
+                ZSTD_outBuffer zout = { dbuf, sizeof(dbuf), 0 };
+                size_t r = ZSTD_decompressStream(ds, &zout, &zin);
+                if (ZSTD_isError(r)) { eof = 1; break; }
+                if (zout.pos > 0) lines += count_newlines(dbuf, zout.pos);
+            }
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) { ZSTD_freeDStream(ds); close(fd); return 0; }
+            }
+        }
+        ZSTD_freeDStream(ds);
+        close(fd);
+    } else if (hdrbuf[0] == 'P' && hdrbuf[1] == 'K' && hdrbuf[2] == 3 && hdrbuf[3] == 4 && hdrlen >= 30) {
+        /* ZIP — parse local file header, decompress first file */
+        unsigned short method = hdrbuf[8] | (hdrbuf[9] << 8);
+        unsigned int comp_size = hdrbuf[18] | (hdrbuf[19]<<8) | (hdrbuf[20]<<16) | (hdrbuf[21]<<24);
+        unsigned short name_len = hdrbuf[26] | (hdrbuf[27] << 8);
+        unsigned short extra_len = hdrbuf[28] | (hdrbuf[29] << 8);
+        unsigned int header_size = 30 + name_len + extra_len;
+
+        fd = open(filename, O_RDONLY);
+        if (fd < 0) return 0;
+        lseek(fd, header_size, SEEK_SET);
+
+        if (method == 0) {
+            /* Stored */
+            size_t remaining = comp_size;
+            while (remaining > 0) {
+                size_t want = sizeof(dbuf);
+                if (want > remaining) want = remaining;
+                ssize_t n = read(fd, dbuf, want);
+                if (n <= 0) break;
+                lines += count_newlines(dbuf, n);
+                remaining -= n;
+            }
+        } else if (method == 8) {
+            /* Deflate */
+            z_stream zs;
+            memset(&zs, 0, sizeof(zs));
+            inflateInit2(&zs, -15);
+            unsigned char inbuf[256*1024];
+            size_t remaining = comp_size;
+            int eof = 0;
+            while (!eof) {
+                if (zs.avail_in == 0 && remaining > 0) {
+                    size_t want = sizeof(inbuf);
+                    if (want > remaining) want = remaining;
+                    ssize_t n = read(fd, inbuf, want);
+                    if (n <= 0) { eof = 1; break; }
+                    remaining -= n;
+                    zs.next_in = inbuf; zs.avail_in = n;
+                }
+                zs.next_out = dbuf; zs.avail_out = sizeof(dbuf);
+                int r = inflate(&zs, Z_NO_FLUSH);
+                size_t got = sizeof(dbuf) - zs.avail_out;
+                if (got > 0) lines += count_newlines(dbuf, got);
+                if (r == Z_STREAM_END || (r != Z_OK && r != Z_BUF_ERROR)) eof = 1;
+            }
+            inflateEnd(&zs);
+        } else if (method == 14) {
+            /* LZMA in ZIP */
+            lzma_stream xz = LZMA_STREAM_INIT;
+            lzma_alone_decoder(&xz, UINT64_MAX);
+            unsigned char inbuf[256*1024];
+            size_t remaining = comp_size;
+            int eof = 0;
+            /* Skip 4-byte LZMA version header in ZIP */
+            lseek(fd, 4, SEEK_CUR);
+            if (remaining > 4) remaining -= 4; else remaining = 0;
+            while (!eof) {
+                if (xz.avail_in == 0 && remaining > 0) {
+                    size_t want = sizeof(inbuf);
+                    if (want > remaining) want = remaining;
+                    ssize_t n = read(fd, inbuf, want);
+                    if (n <= 0) { eof = 1; break; }
+                    remaining -= n;
+                    xz.next_in = inbuf; xz.avail_in = n;
+                }
+                xz.next_out = dbuf; xz.avail_out = sizeof(dbuf);
+                lzma_ret r = lzma_code(&xz, (remaining == 0) ? LZMA_FINISH : LZMA_RUN);
+                size_t got = sizeof(dbuf) - xz.avail_out;
+                if (got > 0) lines += count_newlines(dbuf, got);
+                if (r == LZMA_STREAM_END || r != LZMA_OK) eof = 1;
+            }
+            lzma_end(&xz);
+        }
+        /* bzip2 and zstd in ZIP — less common, skip for now */
+        close(fd);
+    } else {
+        /* Assume gzip or plain text — use gzread */
+        gzFile gz = gzopen(filename, "rb");
+        if (!gz) return 0;
+        gzbuffer(gz, 256*1024);
+        int n;
+        while ((n = gzread(gz, dbuf, sizeof(dbuf))) > 0) {
+            lines += count_newlines(dbuf, n);
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) { gzclose(gz); return 0; }
+            }
+        }
+        gzclose(gz);
+    }
+    return lines;
+}
+
+MDXALIGN void linecount_thread(void *dummy) {
+    sqlite3 *db = linecount_cache_open();
+    int cache_hits = 0, cache_misses = 0;
+
+    for (int i = 0; i < LineCountArgc; i++) {
+        /* Check for shutdown */
+        possess(HashWaiting);
+        int done = peek_lock(HashWaiting);
+        release(HashWaiting);
+        if (done) break;
+
+        /* Skip stdin */
+        if (strcmp(LineCountArgv[i], "stdin") == 0) continue;
+
+        /* Check cache first */
+        struct stat sb;
+        if (stat(LineCountArgv[i], &sb) != 0) continue;
+        if (S_ISFIFO(sb.st_mode) || !S_ISREG(sb.st_mode)) continue;
+
+        char resolved[4096];
+#ifdef _WIN32
+        char *rp = _fullpath(resolved, LineCountArgv[i], sizeof(resolved));
+#else
+        char *rp = realpath(LineCountArgv[i], resolved);
+#endif
+        if (!rp) strncpy(resolved, LineCountArgv[i], sizeof(resolved) - 1);
+
+        long long cached = linecount_cache_lookup(db, resolved,
+                            (long long)sb.st_size, (long long)sb.st_mtime);
+        if (cached >= 0) {
+            __sync_fetch_and_add(&AutoCountTotalLines, (unsigned long long)cached);
+            cache_hits++;
+            continue;
+        }
+
+        unsigned long long count = linecount_file(LineCountArgv[i]);
+        if (count > 0) {
+            __sync_fetch_and_add(&AutoCountTotalLines, count);
+            linecount_cache_store(db, resolved,
+                (long long)sb.st_size, (long long)sb.st_mtime, (long long)count);
+            cache_misses++;
+        }
+    }
+    if (db) sqlite3_close(db);
+    if (cache_hits > 0 || cache_misses > 0)
+        fprintf(stderr, "Line count: %d cached, %d counted, %llu total lines\n",
+                cache_hits, cache_misses, (unsigned long long)AutoCountTotalLines);
+    __sync_synchronize();
+    AutoCountDone = 1;
+}
+
+static void format_eta(double seconds, char *buf, size_t bufsz) {
+    if (seconds <= 0) { snprintf(buf, bufsz, "done"); return; }
+    if (seconds < 60) { snprintf(buf, bufsz, "%.0fs", seconds); return; }
+    if (seconds < 3600) { snprintf(buf, bufsz, "%dm%02ds", (int)(seconds/60), (int)((int)seconds%60)); return; }
+    if (seconds < 86400) { snprintf(buf, bufsz, "%dh%02dm", (int)(seconds/3600), ((int)seconds%3600)/60); return; }
+    if (seconds < 86400*30) { snprintf(buf, bufsz, "%dd%dh", (int)(seconds/86400), ((int)seconds%86400)/3600); return; }
+    if (seconds < 86400*365) { snprintf(buf, bufsz, "~%dmo%dd", (int)(seconds/(86400*30)), ((int)seconds%(86400*30))/86400); return; }
+    snprintf(buf, bufsz, "~%dy%dmo", (int)(seconds/(86400*365)), ((int)seconds%(86400*365))/(86400*30));
+}
+
 static void format_rate(double val, double *out, char **suffix) {
   *suffix = "";
   if (val < 0.0) val = 0.0;
@@ -35556,16 +35930,7 @@ MDXALIGN void ReportStats(void *dummy) {
       double remaining = (rate > 0 && progress < BruteForceTotal) ?
                           (BruteForceTotal - progress) / rate : 0;
       char eta[64];
-      if (remaining <= 0 || progress >= BruteForceTotal)
-        snprintf(eta, sizeof(eta), "done");
-      else if (remaining < 60)
-        snprintf(eta, sizeof(eta), "%.0fs", remaining);
-      else if (remaining < 3600)
-        snprintf(eta, sizeof(eta), "%dm%02ds", (int)(remaining/60), (int)((int)remaining%60));
-      else if (remaining < 86400)
-        snprintf(eta, sizeof(eta), "%dh%02dm", (int)(remaining/3600), (int)(((int)remaining%3600)/60));
-      else
-        snprintf(eta, sizeof(eta), "%dd%dh", (int)(remaining/86400), (int)(((int)remaining%86400)/3600));
+      format_eta(remaining, eta, sizeof(eta));
       /* Format progress with SI prefix */
       double dprog = (double)progress, dtotal = (double)BruteForceTotal;
       char *pmult = "", *tmult = "";
@@ -35574,8 +35939,44 @@ MDXALIGN void ReportStats(void *dummy) {
       fprintf(stderr, "Brute %s, %.1f%s/%.1f%s (%.1f%%), Found=%llu, %.2f%sh/s, '%s', ETA %s\n",
               Curfile, dprog, pmult, dtotal, tmult, pct, Totfound, hps, mult1, sample, eta);
     } else {
-      fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
-              Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
+      { unsigned long long total_est = EstimatedTotalLines;
+        if (!total_est && AutoCountTotalLines > 0)
+          total_est = AutoCountTotalLines;
+        if (total_est > 0 && TotLines > 0) {
+          /* Compute effective work multiplier: salts * rules * masks */
+          unsigned long long salt_mult = 0;
+          { Word_t ti = 0; int trc;
+            J1F(trc, Dohash, ti);
+            while (trc) {
+              unsigned int ns = Livesalts[ti];
+              salt_mult += (ns > 0) ? ns : 1;
+              J1N(trc, Dohash, ti);
+            }
+          }
+          if (salt_mult < 1) salt_mult = 1;
+          unsigned long long lines_done = Totrules ? Totrules : TotLines;
+          unsigned long long lines_total = total_est;
+          if (Numrules > 1) lines_total *= Numrules;
+          double progress_frac = (double)lines_done / (double)lines_total;
+          if (progress_frac > 1.0) progress_frac = 1.0;
+          double remaining = 0;
+          if (progress_frac > 0.001 && progress_frac < 1.0)
+            remaining = wtime * (1.0 - progress_frac) / progress_frac;
+          char eta[64];
+          format_eta(remaining, eta, sizeof(eta));
+          char prefix = (AutoCountRequested && !AutoCountDone) ? '~' : ' ';
+          double dprog = (double)(Lowline+LowSkip), dtotal = (double)total_est;
+          char *pmult2 = "", *tmult2 = "";
+          format_rate(dprog, &dprog, &pmult2);
+          format_rate(dtotal, &dtotal, &tmult2);
+          fprintf(stderr, "Working on %s, w=%ld, %.1f%s/%.1f%s (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
+                  Curfile, peek_lock(WorkWaiting), dprog, pmult2, dtotal, tmult2,
+                  100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
+        } else {
+          fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
+                  Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
+        }
+      }
     }
     fflush(stdout);
     fflush(stderr);
@@ -40356,7 +40757,7 @@ int main(int argc, char **argv) {
   inhashcnt = 0;
   current_utc_time(&starthash);
 
-  while ((ch = getopt(argc, argv, "?abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:N:R:M:S:U:P:X:")) != -1) {
+  while ((ch = getopt(argc, argv, "?abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:N:R:M:S:U:P:W:X:")) != -1) {
     switch (ch) {
       case 'X':
         s = optarg;
@@ -40468,6 +40869,30 @@ int main(int argc, char **argv) {
       case 'w':
         SkipLine = atoll(optarg);
         fprintf(stderr, "Skipping first %llu lines on wordlist\n", SkipLine);
+        break;
+
+      case 'W':
+        if (strncmp(optarg, "auto", 4) == 0) {
+          AutoCountRequested = 1;
+          if (optarg[4] == ':' && optarg[5]) {
+            strncpy(LineCountCachePath, optarg + 5, sizeof(LineCountCachePath) - 1);
+            fprintf(stderr, "Wordlist ETA: automatic line counting, cache %s\n", LineCountCachePath);
+          } else {
+            fprintf(stderr, "Wordlist ETA: automatic line counting enabled\n");
+          }
+        } else {
+          char *endp;
+          unsigned long long wval = strtoull(optarg, &endp, 10);
+          if (*endp == 'K' || *endp == 'k') { wval *= 1000; endp++; }
+          else if (*endp == 'M' || *endp == 'm') { wval *= 1000000; endp++; }
+          else if (*endp == 'G' || *endp == 'g') { wval *= 1000000000ULL; endp++; }
+          if (wval == 0) {
+            fprintf(stderr, "-W: invalid line count '%s' (use a number or 'auto')\n", optarg);
+            exit(1);
+          }
+          EstimatedTotalLines = wval;
+          fprintf(stderr, "Wordlist ETA: estimated %llu total lines\n", wval);
+        }
         break;
 
       case 'y':
@@ -41574,6 +41999,10 @@ usage:
     printf("-v\tDo not mark salts as found.\n");
     printf("-V\tDisplay version\n");
     printf("-w\tNumber of lines to skip from first wordlist\n");
+    printf("-W\tETA display: -W <count>[K|M|G] set estimated lines,\n");
+    printf("\t-W auto count in background (cached in mdxfind.db),\n");
+    printf("\t-W auto:/path/to/cache.db override cache location\n");
+    printf("\tEnvironment: MDXFIND_CACHE=/path/to/mdxfind.db\n");
     printf("-y\tEnable directory recursion for wordlists\n");
     printf("-z\tEnable debugging information/hash results\n");
     printf("-Z\tEnable histogram of rule hits\n");
@@ -44785,6 +45214,13 @@ usage:
   win_pause_init();
 #endif
   launch(ReportStats, NULL);
+
+  /* Launch background line counter for -W auto */
+  if (AutoCountRequested && argc > 0) {
+    LineCountArgv = argv;
+    LineCountArgc = argc;
+    launch(linecount_thread, NULL);
+  }
 
   /* Brute-force detection: if exactly one argument and it is not a file,
    * try parsing it as a mask pattern. */

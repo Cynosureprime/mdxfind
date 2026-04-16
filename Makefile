@@ -80,7 +80,8 @@ LIBS = libssl.a libcrypto.a libsph.a libmhash.a librhash.a md6.a \
 YESCRYPT_OBJS = yescrypt/yescrypt-common.o yescrypt/yescrypt-opt.o \
                 yescrypt/sha256.o yescrypt/insecure_memzero.o
 
-MDXFIND_OBJS = mdxfind.o yarn.o gosthash/gosthash.o rmd128.o mymd5.o \
+# SQLite amalgamation: https://www.sqlite.org/2025/sqlite-amalgamation-3490100.zip
+MDXFIND_OBJS = mdxfind.o sqlite3.o yarn.o gosthash/gosthash.o rmd128.o mymd5.o \
                ruleproc.o crypt-des.o myprogress.o
 MDSPLIT_OBJS = mdsplit.o
 
@@ -114,8 +115,11 @@ endif
 
 all: mdxfind mdsplit getpass mdxpause
 
-mdxfind.o: mdxfind.c mdxfind.h job_types.h gpujob.h
+mdxfind.o: mdxfind.c mdxfind.h job_types.h gpujob.h sqlite3.h
 	$(CC) $(CFLAGS) -c mdxfind.c
+
+sqlite3.o: sqlite3.c sqlite3.h
+	$(CC) -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -c sqlite3.c
 
 ruleproc.o: ruleproc.c mdxfind.h
 	$(CC) $(CFLAGS) -c ruleproc.c
