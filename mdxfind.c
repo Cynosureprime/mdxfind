@@ -184,9 +184,15 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.322 2026/04/16 18:37:28 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.324 2026/04/18 02:57:42 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.324  2026/04/18 02:57:42  dlr
+ * Align compact hash table entries to 4-byte boundary for GPU uint* access; fix GPU Xid 13 misaligned address crash with non-standard hash lengths in input files
+ *
+ * Revision 1.323  2026/04/17 03:01:51  dlr
+ * ETA: track hash-based progress (Tothash / total_hashes) instead of line-based. Accounts for rules, salts, iterations, and type count.
+ *
  * Revision 1.322  2026/04/16 18:37:28  dlr
  * Show "finishing" instead of "done" in ETA when work queue is non-empty
  *
@@ -35049,18 +35055,23 @@ MDXALIGN void addhash(void *dummy) {
         exit(1);
       }
 #endif
-      /* Store hash data */
-      HashDataOff[HashDataCount] = HashDataBufUsed;
-      HashDataLen[HashDataCount] = len;
-      HashDataFlags[HashDataCount] = 0;
-      memcpy(HashDataBuf + HashDataBufUsed, cur, len);
-      HashDataBufUsed += len;
-      HashDataCount++;
+      /* Store hash data — truncate to 4-byte boundary for GPU uint* access.
+       * The packed stream cursor must advance by the original length. */
+      { int rawlen = len;
+        len &= ~3;
+        if (len < 8) { cur += rawlen; continue; }
+        HashDataOff[HashDataCount] = HashDataBufUsed;
+        HashDataLen[HashDataCount] = len;
+        HashDataFlags[HashDataCount] = 0;
+        memcpy(HashDataBuf + HashDataBufUsed, cur, len);
+        HashDataBufUsed += len;
+        HashDataCount++;
 
-      if (len < minhashlenl)
-        minhashlenl = len;
-      insizel++;
-      cur += len;
+        if (len < minhashlenl)
+          minhashlenl = len;
+        insizel++;
+        cur += rawlen;
+      }
     }
     twist(HashWaiting, BY, -1);
   }
@@ -35966,16 +35977,41 @@ MDXALIGN void ReportStats(void *dummy) {
             }
           }
           if (salt_mult < 1) salt_mult = 1;
-          unsigned long long lines_done = Totrules ? Totrules : TotLines;
-          unsigned long long lines_total = total_est;
-          if (Numrules > 1) lines_total *= Numrules;
-          double progress_frac = (double)lines_done / (double)lines_total;
-          if (progress_frac > 1.0) progress_frac = 1.0;
-          double remaining = 0;
-          if (progress_frac > 0.001 && progress_frac < 1.0)
-            remaining = wtime * (1.0 - progress_frac) / progress_frac;
-          char eta[64];
+          /* ETA from observed hash rate and line progress.
+           * Use line-based progress (Lowline / total_est) as the primary
+           * fraction, since Tothash can exceed computed totals due to
+           * compound types doing multiple internal hash operations.
+           * When all lines are read (progress >= 1.0) but work queue
+           * is non-empty, extrapolate from queue drain rate. */
           long wq = peek_lock(WorkWaiting);
+          double progress_frac;
+          double remaining = 0;
+          unsigned long long lines_pos = Lowline + LowSkip;
+          if (lines_pos >= total_est && wq > 0) {
+            /* All lines dispatched but queue draining.
+             * Track queue drain: use last-seen wq vs current wq over time. */
+            static long prev_wq = 0;
+            static double prev_wtime = 0;
+            if (prev_wq > 0 && prev_wtime > 0 && prev_wq > wq) {
+              double drain_rate = (double)(prev_wq - wq) / (wtime - prev_wtime);
+              if (drain_rate > 0)
+                remaining = (double)wq / drain_rate;
+            }
+            prev_wq = wq;
+            prev_wtime = wtime;
+            progress_frac = 1.0;  /* lines are done */
+          } else {
+            /* Normal progress: line position / total, adjusted for rules */
+            unsigned long long lines_done = Totrules ? Totrules : TotLines;
+            unsigned long long lines_total = total_est;
+            if (Numrules > 1) lines_total *= Numrules;
+            progress_frac = (lines_total > 0) ?
+                (double)lines_done / (double)lines_total : 0;
+            if (progress_frac > 1.0) progress_frac = 1.0;
+            if (progress_frac > 0.001 && progress_frac < 1.0)
+              remaining = wtime * (1.0 - progress_frac) / progress_frac;
+          }
+          char eta[64];
           if (remaining <= 0 && wq > 0)
             snprintf(eta, sizeof(eta), "finishing");
           else

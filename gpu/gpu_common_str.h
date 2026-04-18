@@ -612,4 +612,4 @@ static const char gpu_common_str[] =
     "    /* MD5(\"test\") = 098f6bcd... -> LE word0 = 0xcd6b8f09 */\n"
     "    results[tid] = (hx == 0xcd6b8f09u && hy == 0x73d32146u) ? 1u : 0u;\n"
     "}\n"
-;
+    ;

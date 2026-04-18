@@ -387,4 +387,4 @@ static const char gpu_md5salt_str[] =
     "        EMIT_HIT_4(hits, hit_count, params.max_hits, word_idx, salt_idx, 1, ohx, ohy, ohz, ohw)\n"
     "    }\n"
     "}\n"
-;
+    ;

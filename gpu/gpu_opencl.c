@@ -40,6 +40,7 @@ struct gpu_device {
     /* Salt buffers (updated per-snapshot) */
     cl_mem b_salt_data, b_salt_off, b_salt_len;
     size_t salt_data_cap;
+    size_t salt_off_cap;
     int salts_count;
 
     /* Overflow (uploaded once) */
@@ -442,7 +443,7 @@ static int init_device(int di, cl_device_id dev_id) {
     d->ctx = clCreateContext(NULL, 1, &dev_id, ocl_error_callback, NULL, &err);
     if (!d->ctx) return -1;
 
-    d->queue = clCreateCommandQueue(d->ctx, dev_id, CL_QUEUE_PROFILING_ENABLE, &err);
+    d->queue = clCreateCommandQueue(d->ctx, dev_id, 0, &err);
     if (!d->queue) return -1;
 
     /* Compile common-only program (warms up NVIDIA driver state) */
@@ -515,6 +516,7 @@ static int init_device(int di, cl_device_id dev_id) {
     d->b_overflow_lengths = dev_buf(d, 4, CL_MEM_READ_ONLY);
 
     d->salt_data_cap = 0;
+    d->salt_off_cap = 0;
     d->salts_count = 0;
     d->hexhash_cap = 0;
 
@@ -967,10 +969,17 @@ int gpu_opencl_set_salts(int dev_idx,
         d->b_salt_data = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, salts_size + 4096, NULL, &err);
         d->salt_data_cap = salts_size + 4096;
     }
-    if (d->b_salt_off) clReleaseMemObject(d->b_salt_off);
-    if (d->b_salt_len) clReleaseMemObject(d->b_salt_len);
-    d->b_salt_off = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, num_salts * sizeof(uint32_t), NULL, &err);
-    d->b_salt_len = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, num_salts * sizeof(uint16_t), NULL, &err);
+    /* Reuse existing offset/length buffers if salt count hasn't grown —
+     * repeated clReleaseMemObject/clCreateBuffer leaks NVIDIA driver state */
+    size_t need_off = (size_t)num_salts * sizeof(uint32_t);
+    size_t need_len = (size_t)num_salts * sizeof(uint16_t);
+    if (need_off > d->salt_off_cap) {
+        if (d->b_salt_off) clReleaseMemObject(d->b_salt_off);
+        if (d->b_salt_len) clReleaseMemObject(d->b_salt_len);
+        d->b_salt_off = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, need_off, NULL, &err);
+        d->b_salt_len = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, need_len, NULL, &err);
+        d->salt_off_cap = need_off;
+    }
 
     clEnqueueWriteBuffer(d->queue, d->b_salt_data, CL_TRUE, 0, salts_size, salts, 0, NULL, NULL);
     clEnqueueWriteBuffer(d->queue, d->b_salt_off, CL_TRUE, 0, num_salts * sizeof(uint32_t), salt_offsets, 0, NULL, NULL);
@@ -1169,14 +1178,15 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_lengths);
     }
     /* Dispatch — chunk salts/masks in blocks for GPUs with limited work capacity */
-    size_t local = kern_get_local_size(gk);
     int is_salted = (cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS);
+    size_t local = kern_get_local_size(gk);
     int is_mask = ((cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) && gpu_mask_total > 0);
     int total_salts = is_salted ? d->salts_count : 0;
 
     int salt_start_base = is_salted ? _salt_resume : 0;
     total_salts = is_salted ? (total_salts - salt_start_base) : 0;
     _salt_resume = 0;  /* consumed — reset for next dispatch */
+
 
     /* --- Timing-based dispatch sizing probe --- */
     int fam = gpu_op_family(op);
@@ -1250,8 +1260,12 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
             if (pms >= TIMING_WATCHDOG_MS)
                 break;
 
-            /* Below budget: double and try again */
+            /* Below budget: double and try again, cap at actual dispatch limit */
             uint64_t next = (uint64_t)probe_size * 2;
+            uint64_t max_items = is_salted ? (uint64_t)num_words * d->salts_count
+                               : is_mask ? (uint64_t)num_words * gpu_mask_total
+                               : (uint64_t)num_words;
+            if (next > max_items) break;  /* best_size already set to last successful probe */
             if (next > 0x7FFFFFFF) next = 0x7FFFFFFF;
             probe_size = (uint32_t)next;
         }
@@ -1261,13 +1275,7 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         fprintf(stderr, "OpenCL GPU[%d]: timed family %d: max_items=%u (%.1fms)\n",
                 dev_idx, fam, best_size, best_ms);
 
-        /* Reset hit counter after probe */
-        uint32_t zero2 = 0;
-        if (p_clEnqueueFillBuffer)
-            clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero2, sizeof(zero2), 0, sizeof(zero2), 0, NULL, NULL);
-        else
-            clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero2), &zero2, 0, NULL, NULL);
-        clFinish(d->queue);
+        /* Hit counter will be reset at the start of each chunk's dispatch */
     }
 
     /* Use timed chunk size if available, otherwise fall back to defaults */
@@ -1276,11 +1284,13 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
 
     int salt_chunk = total_salts;
     if (timed_max > 0 && is_salted && num_words > 0) {
-        salt_chunk = (int)(timed_max / num_words);
-        if (salt_chunk < 1024) salt_chunk = 1024;
+        int timed_chunk = (int)(timed_max / num_words);
+        if (timed_chunk < 1024) timed_chunk = 1024;
+        if (timed_chunk < salt_chunk) salt_chunk = timed_chunk;
     } else if (d->max_dispatch > 0 && is_salted && num_words > 0) {
-        salt_chunk = d->max_dispatch / num_words;
-        if (salt_chunk < 1024) salt_chunk = 1024;
+        int disp_chunk = d->max_dispatch / num_words;
+        if (disp_chunk < 1024) disp_chunk = 1024;
+        if (disp_chunk < salt_chunk) salt_chunk = disp_chunk;
     }
 
 #define MASK_CHUNK_DEFAULT 4194304  /* 4M mask combinations per dispatch (fallback) */
@@ -1394,9 +1404,40 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         }
         { cl_int ferr = clFinish(d->queue);
           if (ferr != CL_SUCCESS) {
-            fprintf(stderr, "OpenCL GPU[%d] clFinish error: %d (chunk %d/%d)\n",
-                    dev_idx, ferr, chunk, num_chunks);
-            break;
+            fprintf(stderr, "OpenCL GPU[%d] clFinish error: %d (chunk %d/%d global=%zu)\n",
+                    dev_idx, ferr, chunk, num_chunks, global);
+            /* Reset command queue and retry once */
+            clReleaseCommandQueue(d->queue);
+            d->queue = clCreateCommandQueue(d->ctx, d->dev, 0, &ferr);
+            if (ferr != CL_SUCCESS) {
+              fprintf(stderr, "OpenCL GPU[%d] queue reset failed: %d\n", dev_idx, ferr);
+              break;
+            }
+            /* Re-set kernel args (queue change may invalidate them on some drivers) */
+            int a = 0;
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hexhashes);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hexlens);
+            if (cat == GPU_CAT_MASK)
+                clSetKernelArg(kern, a++, sizeof(cl_mem), &d->bgpu_mask_desc);
+            else
+                clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_data);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_off);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_len);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_compact_fp);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_compact_idx);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_params);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hash_data);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hash_data_off);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hash_data_len);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hits);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hit_count);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_keys);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_hashes);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_offsets);
+            clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_lengths);
+            /* Retry the failed chunk */
+            chunk--;
+            continue;
           }
         }
 
