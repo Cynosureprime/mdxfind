@@ -58,6 +58,13 @@ struct gpu_device {
     /* Per-family timing-based dispatch sizing */
     uint32_t fam_max_items[FAM_COUNT];  /* timed max work items per dispatch */
     int      fam_timed[FAM_COUNT];      /* 1 = probed for this family */
+
+    /* Per-device dispatch state (was global — races with multi-GPU) */
+    int gpu_op;
+    int max_iter;
+    uint64_t mask_resume;
+    uint32_t salt_resume;
+    uint64_t last_mask_start;
 };
 
 static struct gpu_device gpu_devs[MAX_GPU_DEVICES];
@@ -68,10 +75,8 @@ static int ocl_ready = 0;
 static uint64_t _compact_mask = 0;
 static uint32_t _hash_data_count = 0;
 static int _overflow_count = 0;
-static int _max_iter = 1;
-static int _gpu_op = 0;
-static uint64_t _mask_resume = 0;  /* mask_start override for overflow retry */
-static uint32_t _salt_resume = 0;  /* salt_start override for overflow retry */
+/* gpu_op, max_iter, mask_resume, salt_resume, last_mask_start are
+ * per-device fields in struct gpu_device for multi-GPU safety */
 
 /* ---- Timing-based dispatch sizing constants ---- */
 #define TIMING_BUDGET_MIN_MS  200.0
@@ -1016,13 +1021,32 @@ int gpu_opencl_set_overflow(int dev_idx,
     return 0;
 }
 
-void gpu_opencl_set_max_iter(int max_iter) { _max_iter = (max_iter < 1) ? 1 : max_iter; }
-void gpu_opencl_set_mask_resume(uint32_t start) { _mask_resume = start; }
-int gpu_opencl_has_resume(void) { return _mask_resume > 0 || _salt_resume > 0; }
-static uint64_t _last_mask_start = 0;
-uint64_t gpu_opencl_last_mask_start(void) { return _last_mask_start; }
-void gpu_opencl_set_salt_resume(uint32_t start) { _salt_resume = start; }
-void gpu_opencl_set_op(int op) { _gpu_op = op; }
+void gpu_opencl_set_max_iter(int dev_idx, int max_iter) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        gpu_devs[dev_idx].max_iter = (max_iter < 1) ? 1 : max_iter;
+}
+void gpu_opencl_set_mask_resume(int dev_idx, uint32_t start) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        gpu_devs[dev_idx].mask_resume = start;
+}
+int gpu_opencl_has_resume(int dev_idx) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        return gpu_devs[dev_idx].mask_resume > 0 || gpu_devs[dev_idx].salt_resume > 0;
+    return 0;
+}
+uint64_t gpu_opencl_last_mask_start(int dev_idx) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        return gpu_devs[dev_idx].last_mask_start;
+    return 0;
+}
+void gpu_opencl_set_salt_resume(int dev_idx, uint32_t start) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        gpu_devs[dev_idx].salt_resume = start;
+}
+void gpu_opencl_set_op(int dev_idx, int op) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        gpu_devs[dev_idx].gpu_op = op;
+}
 
 /* Mask mode state — accessed by gpujob for hit reconstruction.
  * gpu_mask_desc layout: [sizes[n_total], tables[n_total][256]]
@@ -1073,8 +1097,8 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs || num_words <= 0) return NULL;
     struct gpu_device *d = &gpu_devs[dev_idx];
     if (!d->b_compact_fp) return NULL; /* compact table not loaded (insufficient memory) */
-    /* Look up kernel for current op */
-    int op = _gpu_op;
+    /* Look up kernel for current op (per-device, safe for multi-GPU) */
+    int op = d->gpu_op;
     int cat = gpu_op_category(op);
     struct gpu_kern *gk = (op >= 0 && op < MAX_GPU_KERNELS) ? &dev_kerns[dev_idx].kerns[op] : NULL;
     if (!gk || !gk->kernel) return NULL;
@@ -1083,7 +1107,7 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     if ((cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS) && d->salts_count <= 0) return NULL;
 
     /* For salted iteration, use the salt-iter kernel; otherwise use the registered kernel */
-    cl_kernel kern = (cat == GPU_CAT_SALTED && _max_iter > 1 && d->kern_salt_iter) ? d->kern_salt_iter : gk->kernel;
+    cl_kernel kern = (cat == GPU_CAT_SALTED && d->max_iter > 1 && d->kern_salt_iter) ? d->kern_salt_iter : gk->kernel;
     cl_int err;
 
     /* Upload words — determine stride based on op type.
@@ -1093,18 +1117,18 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     int word_stride;
     if (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) {
         /* Pre-padded data at per-type stride (from gpu_try_pack_unsalted) */
-        if (_gpu_op == JOB_SHA512 || _gpu_op == JOB_SHA384 ||
-            _gpu_op == JOB_SHA512RAW || _gpu_op == JOB_SHA384RAW)
+        if (op == JOB_SHA512 || op == JOB_SHA384 ||
+            op == JOB_SHA512RAW || op == JOB_SHA384RAW)
             word_stride = 128;
-        else if (_gpu_op == JOB_MD6256)
+        else if (op == JOB_MD6256)
             word_stride = 712;
-        else if (_gpu_op == JOB_KECCAK224 || _gpu_op == JOB_SHA3_224)
+        else if (op == JOB_KECCAK224 || op == JOB_SHA3_224)
             word_stride = 152;
-        else if (_gpu_op == JOB_KECCAK256 || _gpu_op == JOB_SHA3_256)
+        else if (op == JOB_KECCAK256 || op == JOB_SHA3_256)
             word_stride = 144;
-        else if (_gpu_op == JOB_KECCAK384 || _gpu_op == JOB_SHA3_384)
+        else if (op == JOB_KECCAK384 || op == JOB_SHA3_384)
             word_stride = 112;
-        else if (_gpu_op == JOB_KECCAK512 || _gpu_op == JOB_SHA3_512)
+        else if (op == JOB_KECCAK512 || op == JOB_SHA3_512)
             word_stride = 80;
         else
             word_stride = 64;
@@ -1137,7 +1161,7 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     params.hash_data_count = _hash_data_count;
     params.max_hits = GPU_MAX_HITS;
     params.overflow_count = _overflow_count;
-    params.max_iter = (cat == GPU_CAT_ITER) ? (_max_iter - 1) : _max_iter;
+    params.max_iter = (cat == GPU_CAT_ITER) ? (d->max_iter - 1) : d->max_iter;
     /* num_masks: 0 for salted types (unused), >0 for mask/unsalted.
      * Iteration-only (no mask) dispatches with num_masks=1. */
     params.num_masks = (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) ? 1 : 0;
@@ -1183,9 +1207,9 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     int is_mask = ((cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) && gpu_mask_total > 0);
     int total_salts = is_salted ? d->salts_count : 0;
 
-    int salt_start_base = is_salted ? _salt_resume : 0;
+    int salt_start_base = is_salted ? d->salt_resume : 0;
     total_salts = is_salted ? (total_salts - salt_start_base) : 0;
-    _salt_resume = 0;  /* consumed — reset for next dispatch */
+    d->salt_resume = 0;  /* consumed — reset for next dispatch */
 
 
     /* --- Timing-based dispatch sizing probe --- */
@@ -1294,7 +1318,7 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     }
 
 #define MASK_CHUNK_DEFAULT 4194304  /* 4M mask combinations per dispatch (fallback) */
-    uint64_t mask_start_base = is_mask ? _mask_resume : 0;
+    uint64_t mask_start_base = is_mask ? d->mask_resume : 0;
     uint64_t mask_total = is_mask ? (gpu_mask_total - mask_start_base) : 0;
     uint64_t mask_chunk;
     if (is_mask) {
@@ -1307,7 +1331,7 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         mask_chunk = 0;
     }
     if (mask_chunk > mask_total) mask_chunk = mask_total;
-    _mask_resume = 0;  /* consumed — reset for next dispatch */
+    d->mask_resume = 0;  /* consumed — reset for next dispatch */
 
     /* Brute-force multi-GPU: use atomic cursor instead of sequential chunks.
      * Each GPU claims mask_chunk-sized pieces from _bf_cursor until keyspace
@@ -1459,15 +1483,15 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
             clEnqueueReadBuffer(d->queue, d->b_hits, CL_TRUE, 0,
                 chunk_hits * GPU_HIT_STRIDE * sizeof(uint32_t), d->h_hits, 0, NULL, NULL);
             /* Set resume point and record mask_start for hit reconstruction */
-            _last_mask_start = params.mask_start;
+            d->last_mask_start = params.mask_start;
             if (bf_mode) {
                 /* Brute-force: cursor already advanced; signal caller to
                  * re-enter dispatch_batch (cursor handles continuation). */
-                _mask_resume = _bf_cursor < gpu_mask_total ? _bf_cursor : 0;
+                d->mask_resume = _bf_cursor < gpu_mask_total ? _bf_cursor : 0;
             } else if (is_mask) {
                 uint64_t next = mask_start_base + (uint64_t)(chunk + 1) * mask_chunk;
                 if (next < gpu_mask_total)
-                    _mask_resume = next;
+                    d->mask_resume = next;
             }
             return d->h_hits;
           }

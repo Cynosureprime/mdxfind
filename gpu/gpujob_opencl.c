@@ -387,7 +387,7 @@ void gpujob(void *arg) {
                 salt_refresh = 0;
                 if (g->op != current_op) {
                     current_op = g->op;
-                    gpu_opencl_set_op(g->op);
+                    gpu_opencl_set_op(my_slot, g->op);
                 }
                 batch_count = 0;
                 tsalt[0] = 0;
@@ -419,7 +419,7 @@ void gpujob(void *arg) {
             }
         } else if (g->op != current_op) {
             current_op = g->op;
-            gpu_opencl_set_op(g->op);
+            gpu_opencl_set_op(my_slot, g->op);
         }
 
         int nhits = 0;
@@ -445,7 +445,7 @@ void gpujob(void *arg) {
         /* Mask mode: set op on first batch */
         if (op_cat == GPU_CAT_MASK && g->op != current_op) {
             current_op = g->op;
-            gpu_opencl_set_op(g->op);
+            gpu_opencl_set_op(my_slot, g->op);
         }
 
         synthetic_job.op = g->op;
@@ -507,8 +507,7 @@ void gpujob(void *arg) {
                     uint32_t midx32 = entry[1];
                     if (midx32 > max_mask_idx) max_mask_idx = midx32;
                     if ((uint32_t)sidx > max_salt_idx) max_salt_idx = (uint32_t)sidx;
-                    extern uint64_t gpu_opencl_last_mask_start(void);
-                    uint64_t chunk_ms = gpu_opencl_last_mask_start();
+                    uint64_t chunk_ms = gpu_opencl_last_mask_start(my_slot);
                     uint64_t midx = chunk_ms + (uint64_t)(midx32 - (uint32_t)chunk_ms);
                     char *base_word;
                     int blen;
@@ -689,15 +688,14 @@ void gpujob(void *arg) {
             if (overflow) {
                 dispatch_retry = 1;
                 if (op_cat == GPU_CAT_MASK || op_cat == GPU_CAT_UNSALTED) {
-                    gpu_opencl_set_mask_resume(max_mask_idx);
+                    gpu_opencl_set_mask_resume(my_slot, max_mask_idx);
                 } else if (op_cat == GPU_CAT_SALTED || op_cat == GPU_CAT_SALTPASS) {
-                    gpu_opencl_set_salt_resume(max_salt_idx);
+                    gpu_opencl_set_salt_resume(my_slot, max_salt_idx);
                 }
             }
             /* Per-chunk hit return: if dispatch_batch returned early with
              * hits and more chunks remain, retry to continue processing. */
-            { extern int gpu_opencl_has_resume(void);
-              if (!dispatch_retry && gpu_opencl_has_resume())
+            { if (!dispatch_retry && gpu_opencl_has_resume(my_slot))
                 dispatch_retry = 1;
             }
 
@@ -978,7 +976,8 @@ int gpujob_init(int num_jobg) {
     if (_max_salt_count < 1024) _max_salt_count = 1024;
     if (_max_salt_bytes < 8192) _max_salt_bytes = 8192;
 
-    gpu_opencl_set_max_iter(Maxiter);
+    for (int di = 0; di < gpu_opencl_num_devices(); di++)
+        gpu_opencl_set_max_iter(di, Maxiter);
 
     /* One gpujob thread per GPU device; compute min batch limit */
     _gpujob_count = gpu_opencl_num_devices();

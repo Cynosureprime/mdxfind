@@ -184,9 +184,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.324 2026/04/18 02:57:42 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.325 2026/04/19 14:06:27 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.325  2026/04/19 14:06:27  dlr
+ * Hash-based ETA progress using Tothash/expected_total for accurate estimates during multi-type finishing phase
+ *
  * Revision 1.324  2026/04/18 02:57:42  dlr
  * Align compact hash table entries to 4-byte boundary for GPU uint* access; fix GPU Xid 13 misaligned address crash with non-standard hash lengths in input files
  *
@@ -35977,39 +35980,24 @@ MDXALIGN void ReportStats(void *dummy) {
             }
           }
           if (salt_mult < 1) salt_mult = 1;
-          /* ETA from observed hash rate and line progress.
-           * Use line-based progress (Lowline / total_est) as the primary
-           * fraction, since Tothash can exceed computed totals due to
-           * compound types doing multiple internal hash operations.
-           * When all lines are read (progress >= 1.0) but work queue
-           * is non-empty, extrapolate from queue drain rate. */
+          /* ETA from hash-based progress: Tothash / expected_total.
+           * expected_total = total_lines × salt_mult × rules × iterations.
+           * This gives accurate progress even when all lines are read but
+           * salted/iterated types are still being processed. */
           long wq = peek_lock(WorkWaiting);
           double progress_frac;
           double remaining = 0;
-          unsigned long long lines_pos = Lowline + LowSkip;
-          if (lines_pos >= total_est && wq > 0) {
-            /* All lines dispatched but queue draining.
-             * Track queue drain: use last-seen wq vs current wq over time. */
-            static long prev_wq = 0;
-            static double prev_wtime = 0;
-            if (prev_wq > 0 && prev_wtime > 0 && prev_wq > wq) {
-              double drain_rate = (double)(prev_wq - wq) / (wtime - prev_wtime);
-              if (drain_rate > 0)
-                remaining = (double)wq / drain_rate;
-            }
-            prev_wq = wq;
-            prev_wtime = wtime;
-            progress_frac = 1.0;  /* lines are done */
-          } else {
-            /* Normal progress: line position / total, adjusted for rules */
-            unsigned long long lines_done = Totrules ? Totrules : TotLines;
-            unsigned long long lines_total = total_est;
-            if (Numrules > 1) lines_total *= Numrules;
-            progress_frac = (lines_total > 0) ?
-                (double)lines_done / (double)lines_total : 0;
+          unsigned long long expected_total = total_est * salt_mult;
+          if (Numrules > 1) expected_total *= Numrules;
+          if (Maxiter > 1) expected_total *= Maxiter;
+          if (expected_total > 0 && Tothash > 0) {
+            progress_frac = (double)Tothash / (double)expected_total;
             if (progress_frac > 1.0) progress_frac = 1.0;
-            if (progress_frac > 0.001 && progress_frac < 1.0)
-              remaining = wtime * (1.0 - progress_frac) / progress_frac;
+            double hps_raw = (double)Tothash / wtime;
+            if (progress_frac > 0.001 && progress_frac < 1.0 && hps_raw > 0)
+              remaining = (double)(expected_total - Tothash) / hps_raw;
+          } else {
+            progress_frac = 0;
           }
           char eta[64];
           if (remaining <= 0 && wq > 0)
@@ -36017,11 +36005,11 @@ MDXALIGN void ReportStats(void *dummy) {
           else
             format_eta(remaining, eta, sizeof(eta));
           char prefix = (AutoCountRequested && !AutoCountDone) ? '~' : ' ';
-          double dprog = (double)(Lowline+LowSkip), dtotal = (double)total_est;
+          double dprog = (double)Tothash, dtotal = (double)expected_total;
           char *pmult2 = "", *tmult2 = "";
           format_rate(dprog, &dprog, &pmult2);
           format_rate(dtotal, &dtotal, &tmult2);
-          fprintf(stderr, "Working on %s, w=%ld, %.1f%s/%.1f%s (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
+          fprintf(stderr, "Working on %s, w=%ld, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
                   Curfile, wq, dprog, pmult2, dtotal, tmult2,
                   100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
         } else {
