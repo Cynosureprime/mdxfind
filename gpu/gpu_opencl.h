@@ -45,6 +45,7 @@ void gpu_opencl_set_max_iter(int dev_idx, int max_iter);
 void gpu_opencl_set_mask_resume(int dev_idx, uint32_t start);
 void gpu_opencl_set_salt_resume(int dev_idx, uint32_t start);
 void gpu_opencl_set_op(int dev_idx, int op);
+int gpu_opencl_get_op(int dev_idx);
 int gpu_opencl_has_resume(int dev_idx);
 uint64_t gpu_opencl_last_mask_start(int dev_idx);
 int gpu_opencl_max_batch(int dev_idx);

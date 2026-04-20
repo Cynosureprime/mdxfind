@@ -49,7 +49,7 @@ struct gpu_device {
     /* Per-dispatch buffers */
     cl_mem b_hits, b_hit_count;
     cl_mem b_hexhashes, b_hexlens, b_params;
-    size_t hexhash_cap;
+    size_t hexhash_cap, hexlens_cap;
     uint32_t *h_hits;    /* host-side hit buffer */
 
     /* Mask mode */
@@ -524,6 +524,7 @@ static int init_device(int di, cl_device_id dev_id) {
     d->salt_off_cap = 0;
     d->salts_count = 0;
     d->hexhash_cap = 0;
+    d->hexlens_cap = 0;
 
     return 0;
 }
@@ -1047,6 +1048,11 @@ void gpu_opencl_set_op(int dev_idx, int op) {
     if (dev_idx >= 0 && dev_idx < num_gpu_devs)
         gpu_devs[dev_idx].gpu_op = op;
 }
+int gpu_opencl_get_op(int dev_idx) {
+    if (dev_idx >= 0 && dev_idx < num_gpu_devs)
+        return gpu_devs[dev_idx].gpu_op;
+    return -1;
+}
 
 /* Mask mode state — accessed by gpujob for hit reconstruction.
  * gpu_mask_desc layout: [sizes[n_total], tables[n_total][256]]
@@ -1136,17 +1142,19 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         word_stride = 256;
     }
     size_t words_size = (size_t)num_words * word_stride;
+    size_t hexlens_upload = ((num_words > GPUBATCH_MAX) ? GPUBATCH_MAX : num_words) * sizeof(uint16_t);
+    /* Reuse GPU buffers, grow as needed, upload via clEnqueueWriteBuffer */
     if (words_size > d->hexhash_cap) {
         if (d->b_hexhashes) clReleaseMemObject(d->b_hexhashes);
-        if (d->b_hexlens) clReleaseMemObject(d->b_hexlens);
         d->b_hexhashes = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, words_size, NULL, &err);
-        d->b_hexlens = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, num_words * sizeof(uint16_t), NULL, &err);
         d->hexhash_cap = words_size;
     }
+    if (hexlens_upload > d->hexlens_cap) {
+        if (d->b_hexlens) clReleaseMemObject(d->b_hexlens);
+        d->b_hexlens = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, hexlens_upload, NULL, &err);
+        d->hexlens_cap = hexlens_upload;
+    }
     clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, hexhashes, 0, NULL, NULL);
-    /* For unsalted pre-padded batches (num_words > GPUBATCH_MAX), hexlens is not
-     * used by the kernel — upload only what's available to keep the buffer valid */
-    size_t hexlens_upload = ((num_words > GPUBATCH_MAX) ? GPUBATCH_MAX : num_words) * sizeof(uint16_t);
     clEnqueueWriteBuffer(d->queue, d->b_hexlens, CL_TRUE, 0, hexlens_upload, hexlens, 0, NULL, NULL);
 
     /* Params — verify 128-byte struct matches kernel */

@@ -48,6 +48,7 @@
 #include <emmintrin.h>
 #include <xmmintrin.h>
 #include <tmmintrin.h>
+#include <immintrin.h>
 #include <cpuid.h>
 
 #endif
@@ -184,9 +185,21 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.325 2026/04/19 14:06:27 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.329 2026/04/20 22:12:08 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.329  2026/04/20 22:12:08  dlr
+ * Remove clen<=0 rejection from gpu_try_pack for SALTPASS types; null passwords with mask append are valid GPU work; set word_stride unconditionally at acquire
+ *
+ * Revision 1.328  2026/04/20 21:28:34  dlr
+ * Set word_stride unconditionally when acquiring jobg from free pool; ensures correct stride for current hash type regardless of previous buffer use
+ *
+ * Revision 1.327  2026/04/20 03:43:17  dlr
+ * AVX2 runtime dispatch for count_newlines and get32; simplified NEON vaddlvq_u8 path; immintrin.h included for AVX2 intrinsics
+ *
+ * Revision 1.326  2026/04/19 21:18:58  dlr
+ * SIMD line counting (SSE2/NEON), malloc_lock buffers, direct read for plain text, posix_fadvise, pre-prepared SQLite statements on main thread to avoid thread stack overflow, fatal error on cache creation failure
+ *
  * Revision 1.325  2026/04/19 14:06:27  dlr
  * Hash-based ETA progress using Tothash/expected_total for accurate estimates during multi-type finishing phase
  *
@@ -3203,6 +3216,108 @@ static int get32_sse2(char *iline, unsigned char *dest, int len) {
   return (cnt);
 }
 
+/* AVX2 implementation — vpshufb LUT, 32 hex chars → 16 bytes per iteration */
+__attribute__((target("avx2")))
+static int get32_avx2(char *iline, unsigned char *dest, int len) {
+  unsigned char c1, c2, *line = (unsigned char *)iline;
+  int cnt = 0;
+
+  const __m256i sub_lut = _mm256_setr_epi8(
+      0, 0, 0, 0x30, 0x37, 0, 0x57, 0,  0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0x30, 0x37, 0, 0x57, 0,  0, 0, 0, 0, 0, 0, 0, 0);
+  const __m256i hi_valid = _mm256_setr_epi8(
+      0, 0, 0, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 1, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  const __m256i lo_valid = _mm256_setr_epi8(
+      1, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+      1, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 1, 1, 1, 0, 0, 0, 0, 0, 0);
+  const __m256i lomask = _mm256_set1_epi8(0x0F);
+  const __m256i pack_hi = _mm256_set1_epi16(0x00F0);
+  const __m256i pack_lo = _mm256_set1_epi16(0x0F00);
+  const __m256i compact = _mm256_setr_epi8(
+      0, 2, 4, 6, 8, 10, 12, 14,  -1,-1,-1,-1,-1,-1,-1,-1,
+      0, 2, 4, 6, 8, 10, 12, 14,  -1,-1,-1,-1,-1,-1,-1,-1);
+
+  while (cnt + 16 <= len) {
+      __m256i input = _mm256_loadu_si256((const __m256i *)line);
+
+      __m256i hi = _mm256_and_si256(_mm256_srli_epi16(input, 4), lomask);
+      __m256i lo = _mm256_and_si256(input, lomask);
+
+      __m256i nibbles = _mm256_sub_epi8(input, _mm256_shuffle_epi8(sub_lut, hi));
+
+      __m256i vcheck = _mm256_and_si256(
+          _mm256_shuffle_epi8(hi_valid, hi),
+          _mm256_shuffle_epi8(lo_valid, lo));
+      int inv_mask = _mm256_movemask_epi8(
+          _mm256_cmpeq_epi8(vcheck, _mm256_setzero_si256()));
+
+      __m256i packed = _mm256_or_si256(
+          _mm256_and_si256(_mm256_slli_epi16(nibbles, 4), pack_hi),
+          _mm256_srli_epi16(_mm256_and_si256(nibbles, pack_lo), 8));
+      __m256i result = _mm256_shuffle_epi8(packed, compact);
+
+      if (inv_mask == 0) {
+          /* Extract 8 bytes from each 128-bit lane */
+          _mm_storel_epi64((__m128i *)dest,
+              _mm256_castsi256_si128(result));
+          _mm_storel_epi64((__m128i *)(dest + 8),
+              _mm256_extracti128_si256(result, 1));
+          cnt += 16; dest += 16; line += 32;
+      } else {
+          int valid_bytes = __builtin_ctz(inv_mask) / 2;
+          if (valid_bytes > 0) {
+            /* Extract from both lanes */
+            unsigned char rbuf[16];
+            _mm_storel_epi64((__m128i *)rbuf,
+                _mm256_castsi256_si128(result));
+            _mm_storel_epi64((__m128i *)(rbuf + 8),
+                _mm256_extracti128_si256(result, 1));
+            memcpy(dest, rbuf, valid_bytes);
+            cnt += valid_bytes;
+            dest += valid_bytes;
+            line += valid_bytes * 2;
+          }
+          break;
+      }
+  }
+  /* SSE2 for 8-byte chunk */
+  if (cnt + 8 <= len) {
+      __m128i input = _mm_loadu_si128((const __m128i *)line);
+      __m128i hi = _mm_and_si128(_mm_srli_epi16(input, 4), _mm256_castsi256_si128(lomask));
+      __m128i lo = _mm_and_si128(input, _mm256_castsi256_si128(lomask));
+      __m128i nibbles = _mm_sub_epi8(input, _mm_shuffle_epi8(
+          _mm256_castsi256_si128(sub_lut), hi));
+      __m128i vcheck = _mm_and_si128(
+          _mm_shuffle_epi8(_mm256_castsi256_si128(hi_valid), hi),
+          _mm_shuffle_epi8(_mm256_castsi256_si128(lo_valid), lo));
+      int inv_mask = _mm_movemask_epi8(
+          _mm_cmpeq_epi8(vcheck, _mm_setzero_si128()));
+      __m128i p = _mm_or_si128(
+          _mm_and_si128(_mm_slli_epi16(nibbles, 4), _mm256_castsi256_si128(pack_hi)),
+          _mm_srli_epi16(_mm_and_si128(nibbles, _mm256_castsi256_si128(pack_lo)), 8));
+      __m128i r = _mm_shuffle_epi8(p, _mm256_castsi256_si128(compact));
+      if (inv_mask == 0) {
+          _mm_storel_epi64((__m128i *)dest, r);
+          cnt += 8; dest += 8; line += 16;
+      } else {
+          int vb = __builtin_ctz(inv_mask) / 2;
+          if (vb > 0) { uint64_t rv; _mm_storel_epi64((__m128i *)&rv, r);
+              memcpy(dest, &rv, vb); cnt += vb; dest += vb; line += vb*2; }
+      }
+  }
+  /* Scalar tail */
+  while (cnt < len) {
+     c1 = trhex[line[0]];
+     c2 = trhex[line[1]];
+     if (c1 > 15 || c2 > 15) break;
+     *dest++ = (c1 << 4) | c2;
+     line += 2;
+     cnt++;
+  }
+  return (cnt);
+}
+
 /* SSSE3 implementation — pshufb LUT, fastest on Intel Core 2+ */
 __attribute__((target("ssse3")))
 static int get32_ssse3(char *iline, unsigned char *dest, int len) {
@@ -3417,7 +3532,9 @@ static int get32_neon32(char *iline, unsigned char *dest, int len) {
 /* Lazy-init dispatcher — called once, then replaced by the best implementation */
 static int get32_init(char *iline, unsigned char *dest, int len) {
 #ifndef NOTINTEL
-  if (HasSSSE3)
+  if (__builtin_cpu_supports("avx2"))
+    get32 = get32_avx2;
+  else if (HasSSSE3)
     get32 = get32_ssse3;
   else
     get32 = get32_sse2;
@@ -8587,11 +8704,9 @@ int gpu_try_pack_unsalted(struct jobg **pjobg, struct job *job, int appendlen, i
         g->doneprint = job->doneprint;
         g->line_num = job->startline;
 	g->count = 0;
-        *pjobg = g;
-    }
-    if (!g->word_stride) {
 	g->word_stride = stride;
 	g->max_count = maxcount;
+        *pjobg = g;
     }
 
     int idx = g->count;
@@ -8713,6 +8828,7 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
       while (MDXpause) sleep(2);
       __sync_fetch_and_sub(&MDXpaused_count, 1);
     }
+    extern int GPUForce;
     int cat = gpu_op_category(job->op);
     if (cat == GPU_CAT_NONE) return 0;
     if (!gpujob_available()) return 0;
@@ -8722,7 +8838,7 @@ static int gpu_try_pack(struct jobg **pjobg, struct job *job,
     if ((cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS) && nsalts_job < 1) return 0;
 
     /* Salt+password types: password must fit in GPU limit */
-    if (cat == GPU_CAT_SALTPASS && (job->clen > GPU_MAX_PASSLEN || job->clen <= 0 || !job->pass)) return 0;
+    if (cat == GPU_CAT_SALTPASS && job->clen > GPU_MAX_PASSLEN) return 0;
 
     /* Iteration types need Maxiter > 1 to benefit from GPU */
     if (cat == GPU_CAT_ITER && Maxiter <= 1) return 0;
@@ -35439,17 +35555,30 @@ static void linecount_cache_resolve(void) {
     }
 }
 
-/* Open cache DB, create table if needed. Returns NULL on failure. */
+/* Open cache DB, create table if needed.
+ * Fatal error if DB doesn't exist and can't be created.
+ * Warning if DB exists but can't be opened (wrong format, etc). */
 static sqlite3 *linecount_cache_open(void) {
     linecount_cache_resolve();
+    int existed = (access(LineCountCachePath, F_OK) == 0);
     sqlite3 *db = NULL;
     if (sqlite3_open(LineCountCachePath, &db) != SQLITE_OK) {
+        if (existed)
+            fprintf(stderr, "Warning: cache %s exists but cannot be opened: %s\n",
+                    LineCountCachePath, db ? sqlite3_errmsg(db) : "unknown error");
+        else {
+            fprintf(stderr, "Fatal: cannot create cache %s: %s\n",
+                    LineCountCachePath, db ? sqlite3_errmsg(db) : "unknown error");
+            if (db) sqlite3_close(db);
+            exit(1);
+        }
         if (db) sqlite3_close(db);
         return NULL;
     }
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
-    sqlite3_exec(db,
+    char *errmsg = NULL;
+    int rc = sqlite3_exec(db,
         "CREATE TABLE IF NOT EXISTS linecount ("
         "  filepath TEXT NOT NULL,"
         "  filesize INTEGER NOT NULL,"
@@ -35457,7 +35586,22 @@ static sqlite3 *linecount_cache_open(void) {
         "  lines INTEGER NOT NULL,"
         "  cached_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
         "  PRIMARY KEY (filepath, filesize, mtime)"
-        ");", NULL, NULL, NULL);
+        ");", NULL, NULL, &errmsg);
+    if (rc != SQLITE_OK) {
+        if (existed)
+            fprintf(stderr, "Warning: cache %s opened but schema invalid: %s\n",
+                    LineCountCachePath, errmsg ? errmsg : "unknown");
+        else {
+            fprintf(stderr, "Fatal: cannot initialize cache %s: %s\n",
+                    LineCountCachePath, errmsg ? errmsg : "unknown");
+            sqlite3_free(errmsg);
+            sqlite3_close(db);
+            exit(1);
+        }
+        sqlite3_free(errmsg);
+        sqlite3_close(db);
+        return NULL;
+    }
     /* Prune /tmp/ entries older than 7 days */
     sqlite3_exec(db,
         "DELETE FROM linecount WHERE filepath LIKE '/tmp/%'"
@@ -35466,22 +35610,21 @@ static sqlite3 *linecount_cache_open(void) {
     return db;
 }
 
+static sqlite3 *LineCountDB;
+static sqlite3_stmt *LC_stmt_lookup;
+static sqlite3_stmt *LC_stmt_store;
+
 /* Lookup cached line count. Returns -1 if not found. */
 static long long linecount_cache_lookup(sqlite3 *db, const char *path,
                                          long long size, long long mtime) {
-    if (!db) return -1;
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db,
-        "SELECT lines FROM linecount WHERE filepath=? AND filesize=? AND mtime=?",
-        -1, &stmt, NULL) != SQLITE_OK)
-        return -1;
-    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 2, size);
-    sqlite3_bind_int64(stmt, 3, mtime);
+    if (!LC_stmt_lookup) return -1;
+    sqlite3_reset(LC_stmt_lookup);
+    sqlite3_bind_text(LC_stmt_lookup, 1, path, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(LC_stmt_lookup, 2, size);
+    sqlite3_bind_int64(LC_stmt_lookup, 3, mtime);
     long long result = -1;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        result = sqlite3_column_int64(stmt, 0);
-    sqlite3_finalize(stmt);
+    if (sqlite3_step(LC_stmt_lookup) == SQLITE_ROW)
+        result = sqlite3_column_int64(LC_stmt_lookup, 0);
     return result;
 }
 
@@ -35489,25 +35632,77 @@ static long long linecount_cache_lookup(sqlite3 *db, const char *path,
 static void linecount_cache_store(sqlite3 *db, const char *path,
                                    long long size, long long mtime,
                                    long long lines) {
-    if (!db) return;
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db,
-        "INSERT OR REPLACE INTO linecount (filepath, filesize, mtime, lines)"
-        " VALUES (?, ?, ?, ?)",
-        -1, &stmt, NULL) != SQLITE_OK)
-        return;
-    sqlite3_bind_text(stmt, 1, path, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 2, size);
-    sqlite3_bind_int64(stmt, 3, mtime);
-    sqlite3_bind_int64(stmt, 4, lines);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    if (!LC_stmt_store) return;
+    sqlite3_reset(LC_stmt_store);
+    sqlite3_bind_text(LC_stmt_store, 1, path, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(LC_stmt_store, 2, size);
+    sqlite3_bind_int64(LC_stmt_store, 3, mtime);
+    sqlite3_bind_int64(LC_stmt_store, 4, lines);
+    sqlite3_step(LC_stmt_store);
 }
 
 /* Count newlines in a buffer */
+/* Line counting buffer size — must be a multiple of 4096.
+ * Larger buffers improve throughput on systems with fast I/O. */
+#if defined(ARM) && ARM < 8
+#define LINECOUNT_BUFSZ  (64 * 1024)
+#else
+#define LINECOUNT_BUFSZ  (256 * 1024)
+#endif
+
+#ifndef NOTINTEL
+__attribute__((target("avx2")))
+static unsigned long long count_newlines_avx2(const unsigned char *buf, size_t len) {
+    unsigned long long count = 0;
+    const unsigned char *p = buf, *end = buf + len;
+    __m256i nl32 = _mm256_set1_epi8('\n');
+    while (p + 32 <= end) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)p);
+        __m256i cmp = _mm256_cmpeq_epi8(v, nl32);
+        count += __builtin_popcount(_mm256_movemask_epi8(cmp));
+        p += 32;
+    }
+    if (p + 16 <= end) {
+        __m128i nl = _mm_set1_epi8('\n');
+        __m128i v = _mm_loadu_si128((const __m128i *)p);
+        count += __builtin_popcount(_mm_movemask_epi8(_mm_cmpeq_epi8(v, nl)));
+        p += 16;
+    }
+    while (p < end) { if (*p++ == '\n') count++; }
+    return count;
+}
+#endif
+
 static unsigned long long count_newlines(const unsigned char *buf, size_t len) {
     unsigned long long count = 0;
     const unsigned char *p = buf, *end = buf + len;
+#ifndef NOTINTEL
+    /* AVX2 fast path (runtime-detected) */
+    static int has_avx2 = -1;
+    if (has_avx2 < 0) has_avx2 = __builtin_cpu_supports("avx2");
+    if (has_avx2) return count_newlines_avx2(buf, len);
+    /* SSE2 fallback */
+    { __m128i nl = _mm_set1_epi8('\n');
+      while (p + 16 <= end) {
+        __m128i v = _mm_loadu_si128((const __m128i *)p);
+        __m128i cmp = _mm_cmpeq_epi8(v, nl);
+        count += __builtin_popcount(_mm_movemask_epi8(cmp));
+        p += 16;
+      }
+    }
+#elif defined(ARM) && ARM >= 8
+    /* NEON: scan 16 bytes at a time */
+    { uint8x16_t nl = vdupq_n_u8('\n');
+      uint8x16_t one = vdupq_n_u8(1);
+      while (p + 16 <= end) {
+        uint8x16_t v = vld1q_u8(p);
+        uint8x16_t cmp = vandq_u8(vceqq_u8(v, nl), one);
+        count += vaddlvq_u8(cmp);
+        p += 16;
+      }
+    }
+#endif
+    /* Scalar tail */
     while (p < end) {
         p = memchr(p, '\n', end - p);
         if (!p) break;
@@ -35543,33 +35738,39 @@ static unsigned long long linecount_file(const char *filename) {
       if (done) return 0;
     }
 
-    unsigned char dbuf[256*1024];  /* decompression output buffer */
+    unsigned char *dbuf = (unsigned char *)malloc_lock(LINECOUNT_BUFSZ, "linecount");
+    unsigned char *inbuf = (unsigned char *)malloc_lock(LINECOUNT_BUFSZ, "linecount");
+    if (!dbuf || !inbuf) { free(dbuf); free(inbuf); return 0; }
+#ifdef __linux__
+#define LC_FADVISE(fd) posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)
+#else
+#define LC_FADVISE(fd) ((void)0)
+#endif
 
     if (hdrbuf[0] == 0xfd && hdrbuf[1] == 0x37 && hdrbuf[2] == 0x7a &&
         hdrbuf[3] == 0x58 && hdrbuf[4] == 0x5a && hdrbuf[5] == 0x00) {
         /* XZ */
         fd = open(filename, O_RDONLY);
-        if (fd < 0) return 0;
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
         lzma_stream xz = LZMA_STREAM_INIT;
         lzma_stream_decoder(&xz, UINT64_MAX, LZMA_CONCATENATED);
-        unsigned char inbuf[256*1024];
         xz.avail_in = 0;
         int eof = 0;
         while (!eof) {
             if (xz.avail_in == 0) {
-                ssize_t n = read(fd, inbuf, sizeof(inbuf));
+                ssize_t n = read(fd, inbuf, LINECOUNT_BUFSZ);
                 if (n <= 0) eof = 1;
                 else { xz.next_in = inbuf; xz.avail_in = n; }
             }
-            xz.next_out = dbuf; xz.avail_out = sizeof(dbuf);
+            xz.next_out = dbuf; xz.avail_out = LINECOUNT_BUFSZ;
             lzma_ret r = lzma_code(&xz, eof ? LZMA_FINISH : LZMA_RUN);
-            size_t got = sizeof(dbuf) - xz.avail_out;
+            size_t got = LINECOUNT_BUFSZ - xz.avail_out;
             if (got > 0) lines += count_newlines(dbuf, got);
             if (r == LZMA_STREAM_END || (r != LZMA_OK)) eof = 1;
-            /* Periodic exit check */
             if ((lines & 0xFFFFF) == 0) {
                 possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
-                if (done) { lzma_end(&xz); close(fd); return 0; }
+                if (done) { lzma_end(&xz); close(fd); goto linecount_done; }
             }
         }
         lzma_end(&xz);
@@ -35577,27 +35778,27 @@ static unsigned long long linecount_file(const char *filename) {
     } else if (hdrbuf[0] == 'B' && hdrbuf[1] == 'Z' && hdrbuf[2] == 'h') {
         /* bzip2 */
         fd = open(filename, O_RDONLY);
-        if (fd < 0) return 0;
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
         bz_stream bz;
         memset(&bz, 0, sizeof(bz));
         BZ2_bzDecompressInit(&bz, 0, 0);
-        unsigned char inbuf[256*1024];
         bz.avail_in = 0;
         int eof = 0;
         while (!eof) {
             if (bz.avail_in == 0) {
-                ssize_t n = read(fd, inbuf, sizeof(inbuf));
+                ssize_t n = read(fd, inbuf, LINECOUNT_BUFSZ);
                 if (n <= 0) eof = 1;
                 else { bz.next_in = (char *)inbuf; bz.avail_in = n; }
             }
-            bz.next_out = (char *)dbuf; bz.avail_out = sizeof(dbuf);
+            bz.next_out = (char *)dbuf; bz.avail_out = LINECOUNT_BUFSZ;
             int r = BZ2_bzDecompress(&bz);
-            size_t got = sizeof(dbuf) - bz.avail_out;
+            size_t got = LINECOUNT_BUFSZ - bz.avail_out;
             if (got > 0) lines += count_newlines(dbuf, got);
             if (r == BZ_STREAM_END || r != BZ_OK) eof = 1;
             if ((lines & 0xFFFFF) == 0) {
                 possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
-                if (done) { BZ2_bzDecompressEnd(&bz); close(fd); return 0; }
+                if (done) { BZ2_bzDecompressEnd(&bz); close(fd); goto linecount_done; }
             }
         }
         BZ2_bzDecompressEnd(&bz);
@@ -35605,24 +35806,24 @@ static unsigned long long linecount_file(const char *filename) {
     } else if (hdrbuf[0] == 0x28 && hdrbuf[1] == 0xb5 && hdrbuf[2] == 0x2f && hdrbuf[3] == 0xfd) {
         /* Zstandard */
         fd = open(filename, O_RDONLY);
-        if (fd < 0) return 0;
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
         ZSTD_DStream *ds = ZSTD_createDStream();
         ZSTD_initDStream(ds);
-        unsigned char inbuf[256*1024];
         int eof = 0;
         while (!eof) {
-            ssize_t n = read(fd, inbuf, sizeof(inbuf));
+            ssize_t n = read(fd, inbuf, LINECOUNT_BUFSZ);
             if (n <= 0) break;
             ZSTD_inBuffer zin = { inbuf, (size_t)n, 0 };
             while (zin.pos < zin.size) {
-                ZSTD_outBuffer zout = { dbuf, sizeof(dbuf), 0 };
+                ZSTD_outBuffer zout = { dbuf, LINECOUNT_BUFSZ, 0 };
                 size_t r = ZSTD_decompressStream(ds, &zout, &zin);
                 if (ZSTD_isError(r)) { eof = 1; break; }
                 if (zout.pos > 0) lines += count_newlines(dbuf, zout.pos);
             }
             if ((lines & 0xFFFFF) == 0) {
                 possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
-                if (done) { ZSTD_freeDStream(ds); close(fd); return 0; }
+                if (done) { ZSTD_freeDStream(ds); close(fd); goto linecount_done; }
             }
         }
         ZSTD_freeDStream(ds);
@@ -35636,14 +35837,15 @@ static unsigned long long linecount_file(const char *filename) {
         unsigned int header_size = 30 + name_len + extra_len;
 
         fd = open(filename, O_RDONLY);
-        if (fd < 0) return 0;
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
         lseek(fd, header_size, SEEK_SET);
 
         if (method == 0) {
             /* Stored */
             size_t remaining = comp_size;
             while (remaining > 0) {
-                size_t want = sizeof(dbuf);
+                size_t want = LINECOUNT_BUFSZ;
                 if (want > remaining) want = remaining;
                 ssize_t n = read(fd, dbuf, want);
                 if (n <= 0) break;
@@ -35655,21 +35857,20 @@ static unsigned long long linecount_file(const char *filename) {
             z_stream zs;
             memset(&zs, 0, sizeof(zs));
             inflateInit2(&zs, -15);
-            unsigned char inbuf[256*1024];
             size_t remaining = comp_size;
             int eof = 0;
             while (!eof) {
                 if (zs.avail_in == 0 && remaining > 0) {
-                    size_t want = sizeof(inbuf);
+                    size_t want = LINECOUNT_BUFSZ;
                     if (want > remaining) want = remaining;
                     ssize_t n = read(fd, inbuf, want);
                     if (n <= 0) { eof = 1; break; }
                     remaining -= n;
                     zs.next_in = inbuf; zs.avail_in = n;
                 }
-                zs.next_out = dbuf; zs.avail_out = sizeof(dbuf);
+                zs.next_out = dbuf; zs.avail_out = LINECOUNT_BUFSZ;
                 int r = inflate(&zs, Z_NO_FLUSH);
-                size_t got = sizeof(dbuf) - zs.avail_out;
+                size_t got = LINECOUNT_BUFSZ - zs.avail_out;
                 if (got > 0) lines += count_newlines(dbuf, got);
                 if (r == Z_STREAM_END || (r != Z_OK && r != Z_BUF_ERROR)) eof = 1;
             }
@@ -35678,24 +35879,22 @@ static unsigned long long linecount_file(const char *filename) {
             /* LZMA in ZIP */
             lzma_stream xz = LZMA_STREAM_INIT;
             lzma_alone_decoder(&xz, UINT64_MAX);
-            unsigned char inbuf[256*1024];
             size_t remaining = comp_size;
             int eof = 0;
-            /* Skip 4-byte LZMA version header in ZIP */
             lseek(fd, 4, SEEK_CUR);
             if (remaining > 4) remaining -= 4; else remaining = 0;
             while (!eof) {
                 if (xz.avail_in == 0 && remaining > 0) {
-                    size_t want = sizeof(inbuf);
+                    size_t want = LINECOUNT_BUFSZ;
                     if (want > remaining) want = remaining;
                     ssize_t n = read(fd, inbuf, want);
                     if (n <= 0) { eof = 1; break; }
                     remaining -= n;
                     xz.next_in = inbuf; xz.avail_in = n;
                 }
-                xz.next_out = dbuf; xz.avail_out = sizeof(dbuf);
+                xz.next_out = dbuf; xz.avail_out = LINECOUNT_BUFSZ;
                 lzma_ret r = lzma_code(&xz, (remaining == 0) ? LZMA_FINISH : LZMA_RUN);
-                size_t got = sizeof(dbuf) - xz.avail_out;
+                size_t got = LINECOUNT_BUFSZ - xz.avail_out;
                 if (got > 0) lines += count_newlines(dbuf, got);
                 if (r == LZMA_STREAM_END || r != LZMA_OK) eof = 1;
             }
@@ -35703,27 +35902,48 @@ static unsigned long long linecount_file(const char *filename) {
         }
         /* bzip2 and zstd in ZIP — less common, skip for now */
         close(fd);
-    } else {
-        /* Assume gzip or plain text — use gzread */
+    } else if (hdrbuf[0] == 0x1f && hdrbuf[1] == 0x8b) {
+        /* gzip — use gzread */
         gzFile gz = gzopen(filename, "rb");
-        if (!gz) return 0;
-        gzbuffer(gz, 256*1024);
+        if (!gz) goto linecount_done;
+        gzbuffer(gz, LINECOUNT_BUFSZ);
         int n;
-        while ((n = gzread(gz, dbuf, sizeof(dbuf))) > 0) {
+        while ((n = gzread(gz, dbuf, LINECOUNT_BUFSZ)) > 0) {
             lines += count_newlines(dbuf, n);
             if ((lines & 0xFFFFF) == 0) {
                 possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
-                if (done) { gzclose(gz); return 0; }
+                if (done) { gzclose(gz); goto linecount_done; }
             }
         }
         gzclose(gz);
+    } else {
+        /* Plain text — direct read with SIMD newline counting */
+        fd = open(filename, O_RDONLY);
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
+        ssize_t n;
+        while ((n = read(fd, dbuf, LINECOUNT_BUFSZ)) > 0) {
+            lines += count_newlines(dbuf, n);
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) { close(fd); goto linecount_done; }
+            }
+        }
+        close(fd);
     }
+linecount_done:
+    free(dbuf);
+    free(inbuf);
     return lines;
 }
 
+/* LineCountDB, LC_stmt_lookup, LC_stmt_store declared before linecount_cache_lookup */
+
 MDXALIGN void linecount_thread(void *dummy) {
-    sqlite3 *db = linecount_cache_open();
+    sqlite3 *db = LineCountDB;
     int cache_hits = 0, cache_misses = 0;
+    struct timespec lc_start, lc_end;
+    clock_gettime(CLOCK_MONOTONIC, &lc_start);
 
     for (int i = 0; i < LineCountArgc; i++) {
         /* Check for shutdown */
@@ -35765,9 +35985,12 @@ MDXALIGN void linecount_thread(void *dummy) {
         }
     }
     if (db) sqlite3_close(db);
+    clock_gettime(CLOCK_MONOTONIC, &lc_end);
+    double lc_secs = (lc_end.tv_sec - lc_start.tv_sec)
+                   + (lc_end.tv_nsec - lc_start.tv_nsec) / 1e9;
     if (cache_hits > 0 || cache_misses > 0)
-        fprintf(stderr, "Line count: %d cached, %d counted, %llu total lines\n",
-                cache_hits, cache_misses, (unsigned long long)AutoCountTotalLines);
+        fprintf(stderr, "Line count: %d cached, %d counted, %llu total lines in %.2fs\n",
+                cache_hits, cache_misses, (unsigned long long)AutoCountTotalLines, lc_secs);
     __sync_synchronize();
     AutoCountDone = 1;
 }
@@ -45269,6 +45492,16 @@ usage:
   if (AutoCountRequested && argc > 0) {
     LineCountArgv = argv;
     LineCountArgc = argc;
+    LineCountDB = linecount_cache_open();  /* open+prepare on main thread (SQLite needs stack) */
+    if (LineCountDB) {
+      sqlite3_prepare_v2(LineCountDB,
+          "SELECT lines FROM linecount WHERE filepath=? AND filesize=? AND mtime=?",
+          -1, &LC_stmt_lookup, NULL);
+      sqlite3_prepare_v2(LineCountDB,
+          "INSERT OR REPLACE INTO linecount (filepath, filesize, mtime, lines)"
+          " VALUES (?, ?, ?, ?)",
+          -1, &LC_stmt_store, NULL);
+    }
     launch(linecount_thread, NULL);
   }
 

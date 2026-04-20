@@ -935,6 +935,7 @@ return_jobg:
         g->next = NULL;
         g->count = 0;
         g->passbuf_pos = 0;
+        g->word_stride = 0;
         possess(GPUFreeWaiting);
         if (GPUFreeTail) {
             *GPUFreeTail = g;

@@ -6,6 +6,11 @@
  * GPU constructs salt + password, computes MD5, checks compact table.
  * Handles 1-block (total <= 55) and 2-block (55 < total <= 119) dynamically.
  * Hit stride is 7 (includes iteration number).
+ *
+ * Uses byte-pointer cast (uchar *)M for message construction instead of
+ * M_copy_bytes() shift-and-OR.  This matches the md5salt_batch approach
+ * and avoids register-spill corruption observed with the OR-based path
+ * when md5_block is inlined at high register pressure (plen >= 32).
  */
 __kernel void md5saltpass_batch(
     __global const uchar *hexhashes, __global const ushort *hexlens,
@@ -38,39 +43,43 @@ __kernel void md5saltpass_batch(
 
     { uint M[16];
       for (int i = 0; i < 16; i++) M[i] = 0;
+      uchar *mb = (uchar *)M;
 
       if (total_len <= 55) {
-        M_copy_bytes(M, 0, salts + soff, slen);
-        M_copy_bytes(M, slen, pass, plen);
-        M_set_byte(M, total_len, 0x80);
+        { __global const uchar *sp = salts + soff;
+          for (int i = 0; i < slen; i++) mb[i] = sp[i];
+        }
+        for (int i = 0; i < plen; i++) mb[slen + i] = pass[i];
+        mb[total_len] = 0x80;
         M[14] = total_len * 8;
         md5_block(&hx, &hy, &hz, &hw, M);
       } else {
         /* Two blocks: fill first 64 bytes from salt+pass */
         int salt_b1 = (slen < 64) ? slen : 64;
-        M_copy_bytes(M, 0, salts + soff, salt_b1);
+        { __global const uchar *sp = salts + soff;
+          for (int i = 0; i < salt_b1; i++) mb[i] = sp[i];
+        }
         int pass_b1 = 64 - salt_b1;
         if (pass_b1 > plen) pass_b1 = plen;
         if (pass_b1 > 0)
-            M_copy_bytes(M, salt_b1, pass, pass_b1);
+            for (int i = 0; i < pass_b1; i++) mb[salt_b1 + i] = pass[i];
         if (total_len < 64)
-            M_set_byte(M, total_len, 0x80);
+            mb[total_len] = 0x80;
         md5_block(&hx, &hy, &hz, &hw, M);
         /* Second block */
         for (int i = 0; i < 16; i++) M[i] = 0;
         int pos2 = 0;
         int salt_b2 = slen - salt_b1;
         if (salt_b2 > 0) {
-            M_copy_bytes(M, 0, salts + soff + salt_b1, salt_b2);
-            pos2 = salt_b2;
+            __global const uchar *sp = salts + soff + salt_b1;
+            for (int i = 0; i < salt_b2; i++) mb[pos2++] = sp[i];
         }
         int pass_b2 = plen - pass_b1;
         if (pass_b2 > 0) {
-            M_copy_bytes(M, pos2, pass + pass_b1, pass_b2);
-            pos2 += pass_b2;
+            for (int i = 0; i < pass_b2; i++) mb[pos2++] = pass[pass_b1 + i];
         }
         if (total_len >= 64)
-            M_set_byte(M, pos2, 0x80);
+            mb[pos2] = 0x80;
         M[14] = total_len * 8;
         md5_block(&hx, &hy, &hz, &hw, M);
       }
@@ -111,40 +120,43 @@ __kernel void md5passsalt_batch(
     uint hx = 0x67452301, hy = 0xEFCDAB89, hz = 0x98BADCFE, hw = 0x10325476;
     { uint M[16];
       for (int i = 0; i < 16; i++) M[i] = 0;
+      uchar *mb = (uchar *)M;
 
       if (total_len <= 55) {
-        M_copy_bytes(M, 0, pass, plen);
-        M_copy_bytes(M, plen, salts + soff, slen);
-        M_set_byte(M, total_len, 0x80);
+        for (int i = 0; i < plen; i++) mb[i] = pass[i];
+        { __global const uchar *sp = salts + soff;
+          for (int i = 0; i < slen; i++) mb[plen + i] = sp[i];
+        }
+        mb[total_len] = 0x80;
         M[14] = total_len * 8;
         md5_block(&hx, &hy, &hz, &hw, M);
       } else {
         /* Two blocks: fill first 64 bytes from pass+salt */
         int pass_b1 = (plen < 64) ? plen : 64;
-        M_copy_bytes(M, 0, pass, pass_b1);
+        for (int i = 0; i < pass_b1; i++) mb[i] = pass[i];
         int salt_b1 = 64 - pass_b1;
         if (salt_b1 > slen) salt_b1 = slen;
-        if (salt_b1 > 0)
-            M_copy_bytes(M, pass_b1, salts + soff, salt_b1);
-        /* If all data fits in block 1, put 0x80 here */
+        if (salt_b1 > 0) {
+            __global const uchar *sp = salts + soff;
+            for (int i = 0; i < salt_b1; i++) mb[pass_b1 + i] = sp[i];
+        }
         if (total_len < 64)
-            M_set_byte(M, total_len, 0x80);
+            mb[total_len] = 0x80;
         md5_block(&hx, &hy, &hz, &hw, M);
         /* Second block: remaining data + padding */
         for (int i = 0; i < 16; i++) M[i] = 0;
         int pos2 = 0;
         int pass_b2 = plen - pass_b1;
         if (pass_b2 > 0) {
-            M_copy_bytes(M, 0, pass + pass_b1, pass_b2);
-            pos2 = pass_b2;
+            for (int i = 0; i < pass_b2; i++) mb[pos2++] = pass[pass_b1 + i];
         }
         int salt_b2 = slen - salt_b1;
         if (salt_b2 > 0) {
-            M_copy_bytes(M, pos2, salts + soff + salt_b1, salt_b2);
-            pos2 += salt_b2;
+            __global const uchar *sp = salts + soff + salt_b1;
+            for (int i = 0; i < salt_b2; i++) mb[pos2++] = sp[i];
         }
         if (total_len >= 64)
-            M_set_byte(M, pos2, 0x80);
+            mb[pos2] = 0x80;
         M[14] = total_len * 8;
         md5_block(&hx, &hy, &hz, &hw, M);
       }

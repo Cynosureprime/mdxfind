@@ -105,7 +105,7 @@ __constant uint K[64] = {
 #define HH(a,b,c,d,m,s,k) { a += (b^c^d) + m + k; a = b + rotate(a,s); }
 #define II(a,b,c,d,m,s,k) { a += (c^(~d|b)) + m + k; a = b + rotate(a,s); }
 
-void md5_block(uint *h0, uint *h1, uint *h2, uint *h3, uint *M) {
+__attribute__((noinline)) void md5_block(uint *h0, uint *h1, uint *h2, uint *h3, uint *M) {
     uint a = *h0, b = *h1, c = *h2, d = *h3;
     FF(a,b,c,d,M[0],(uint)7,0xd76aa478u);  FF(d,a,b,c,M[1],(uint)12,0xe8c7b756u);
     FF(c,d,a,b,M[2],(uint)17,0x242070dbu);  FF(b,c,d,a,M[3],(uint)22,0xc1bdceeeu);
