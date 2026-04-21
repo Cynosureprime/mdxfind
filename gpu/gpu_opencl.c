@@ -1500,6 +1500,8 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
                 uint64_t next = mask_start_base + (uint64_t)(chunk + 1) * mask_chunk;
                 if (next < gpu_mask_total)
                     d->mask_resume = next;
+            } else if (is_salted && chunk + 1 < num_chunks) {
+                d->salt_resume = salt_start_base + (chunk + 1) * salt_chunk;
             }
             return d->h_hits;
           }

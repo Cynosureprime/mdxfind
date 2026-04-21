@@ -1097,6 +1097,8 @@ uint32_t *gpu_metal_dispatch_batch(
                     uint64_t next_start = mask_start_base + (uint64_t)(chunk + 1) * mask_chunk;
                     if (next_start < gpu_mask_total)
                         _mask_resume = next_start;
+                } else if (!is_unsalted && chunk + 1 < num_chunks) {
+                    _salt_resume = salt_start_base + (chunk + 1) * salt_chunk;
                 }
                 return (uint32_t *)[buf_dispatch_hits contents];
             }

@@ -28,7 +28,7 @@
 #include <sys/poll.h>
 #endif
 
-#include <sys/file.h>
+#include <sys/file.h>  /* GPU salt resume fix: gpu_opencl.c r1.53, gpu_metal.m r1.42 */
 #include <dirent.h>
 #include <errno.h>
 #include <stdint.h>
@@ -185,9 +185,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.329 2026/04/20 22:12:08 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.330 2026/04/21 13:16:11 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.330  2026/04/21 13:16:11  dlr
+ * Version bump for GPU salt resume fix (gpu_opencl.c r1.53, gpu_metal.m r1.42)
+ *
  * Revision 1.329  2026/04/20 22:12:08  dlr
  * Remove clen<=0 rejection from gpu_try_pack for SALTPASS types; null passwords with mask append are valid GPU work; set word_stride unconditionally at acquire
  *
