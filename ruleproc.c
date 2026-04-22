@@ -40,9 +40,12 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.12 2026/03/23 17:48:54 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.13 2026/04/22 18:23:53 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.13  2026/04/22 18:23:53  dlr
+ * applyrule workspace parameter, rule_error diagnostic with caret position
+ *
  * Revision 1.12  2026/03/23 17:48:54  dlr
  * Runtime SSE2/SSSE3 dispatch for get32(), remove SSSE3 requirement. Add HasSSSE3 global, SHA1 C fallback for SSE2-only CPUs.
  *
@@ -92,6 +95,34 @@ void print128(char *s,__m128i v)
     fprintf(stderr,"\n");
 }
 #endif
+
+/*
+ * rule_error — report a rule parse error with context.
+ * Shows the full rule line with a caret (^) pointing to the
+ * position of the error, similar to a compiler diagnostic.
+ *
+ *   Rule: d ] ] ] 31e eE 31s
+ *                            ^
+ *   Error: Invalid replace in rule
+ */
+static void rule_error(const char *msg, const char *orule,
+                       const char *rule)
+{
+	int pos = (int)(rule - orule);
+	int len = (int)strlen(orule);
+	int i;
+
+	/* trim trailing newline for display */
+	if (len > 0 && (orule[len-1] == '\n' || orule[len-1] == '\r'))
+		len--;
+
+	fprintf(stderr, "  Rule: %.*s\n", len, orule);
+	fprintf(stderr, "        ");
+	for (i = 0; i < pos && i < len; i++)
+		fputc(' ', stderr);
+	fprintf(stderr, "^\n");
+	fprintf(stderr, "  Error: %s\n", msg);
+}
 
 static inline unsigned char positiontranslate(char c) {
    char *res;
@@ -340,7 +371,9 @@ int packrules(char *line) {
 	n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
@@ -353,7 +386,9 @@ int packrules(char *line) {
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
@@ -367,14 +402,18 @@ int packrules(char *line) {
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
@@ -385,21 +424,27 @@ int packrules(char *line) {
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         *d++ = positiontranslate(n);
@@ -516,7 +561,9 @@ char * parserules(char *line) {
 	n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
 	break;
@@ -540,7 +587,9 @@ char * parserules(char *line) {
 	n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         s++;
@@ -551,7 +600,9 @@ char * parserules(char *line) {
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         s++;
@@ -563,13 +614,17 @@ char * parserules(char *line) {
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
 	break;
@@ -578,19 +633,25 @@ char * parserules(char *line) {
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
         s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-          fprintf(stderr, "Invalid position %c for %c\n", n, c);
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
           rulefail++;
         }
 	break;
@@ -618,7 +679,8 @@ char * parserules(char *line) {
 */
 #define FASTLEN 32
 
-int applyrule(char *line, char *pass, int len, char *rule) {
+int applyrule(char *line, char *pass, int len, char *rule,
+              struct rule_workspace *ws) {
     char *s, *d, *t, r, *cpass;
     unsigned char c, c1;
     char *orule = rule;
@@ -627,7 +689,8 @@ int applyrule(char *line, char *pass, int len, char *rule) {
 #ifndef NOTINTEL
     __m128i *p128,*q128, a128,b128,c128,d128;
 #endif
-    char Memory[MAXLINE+16], Base64buf[MAXLINE+16];
+    char *Memory = ws->Memory;
+    char *Base64buf = ws->Base64buf;
     static char *hextab = "0123456789abcdef";
     static char *Hextab = "0123456789ABCDEF";
     int memlen;
@@ -655,7 +718,9 @@ if (len < FASTLEN) {
 
       default:
         /*
-	      fprintf(stderr,"Unknown rule --> %c <--- in %s\n",c,orule);
+	      { char _msg[64]; snprintf(_msg, sizeof(_msg),
+	        "Unknown rule command '%c'", c);
+	        rule_error(_msg, orule, rule - 1); }
         return(-1);
         */
         break;
@@ -1153,7 +1218,8 @@ if (len < FASTLEN) {
 	c = *rule++;
         r = *rule++;
         if (!c || !r) {
-          fprintf(stderr, "Invalid replace in rule: %c, %c\n", c,r);
+          rule_error("'s' (substitute) requires two characters: sXY",
+                     orule, rule - (c ? 2 : 1));
           return (-3);
         }
 #ifdef NOTINTEL
@@ -1372,7 +1438,9 @@ slowrule:
     switch (c) {
       default:
         /*
-	      fprintf(stderr,"Unknown rule --> %c <--- in %s\n",c,orule);
+	      { char _msg[64]; snprintf(_msg, sizeof(_msg),
+	        "Unknown rule command '%c'", c);
+	        rule_error(_msg, orule, rule - 1); }
         return(-1);
         */
         break;
@@ -1886,7 +1954,8 @@ slowrule:
         c = *rule++;
         r = *rule++;
         if (!c || !r) {
-          fprintf(stderr, "Invalid replace in rule: %c, %c\n", c,r);
+          rule_error("'s' (substitute) requires two characters: sXY",
+                     orule, rule - (c ? 2 : 1));
           return (-3);
         }
 #ifdef NOTINTEL
@@ -2132,7 +2201,8 @@ app_exit:
 int applyrules_gpu_pack(char *line, int len, char *rules, int nrules,
                         char *raw, int stride, int startidx, int maxcount,
                         uint16_t *passlen, int *ruleindex, char *passbuf,
-                        int *cpu_needed, int *rules_used)
+                        int *cpu_needed, int *rules_used,
+                        struct rule_workspace *ws)
 {
     int i, idx, count = 0;
     char *rule = rules;
@@ -2147,7 +2217,7 @@ int applyrules_gpu_pack(char *line, int len, char *rules, int nrules,
         if (rsize == 0) break;
         char *packed = rule + 2;
 
-        int clen = applyrule(line, passbuf, len, packed);
+        int clen = applyrule(line, passbuf, len, packed, ws);
         rule += rsize + 2;
 
         if (clen <= 0)

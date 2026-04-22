@@ -1,5 +1,8 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.15  2026/04/22 18:23:53  dlr
+ * Add struct rule_workspace for heap-allocated applyrule buffers
+ *
  * Revision 1.14  2026/04/14 04:46:11  dlr
  * GPU brute-force: timing probe, per-chunk dispatch, uint64 mask_start, base-offset decomposition, immediate hit processing, MD5SHA256SHA256 (e996)
  *
@@ -138,6 +141,14 @@ union sse_value {
 } __attribute__((aligned(16)));
 typedef union sse_value SVAL;
 #endif
+
+/* Rule processing workspace — heap-allocated, passed to applyrule.
+ * Eliminates large stack allocations that cause stack overflow
+ * on platforms with small default thread stacks (Windows 2MB). */
+struct rule_workspace {
+    char Memory[MAXLINE + 16];
+    char Base64buf[MAXLINE + 16];
+};
 
 #define BCRYPT_HASHSIZE 64
 #define MAXVECSIZE 2000000  /* Maximum test vector size */

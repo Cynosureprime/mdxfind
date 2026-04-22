@@ -185,9 +185,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.330 2026/04/21 13:16:11 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.331 2026/04/22 18:23:53 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.331  2026/04/22 18:23:53  dlr
+ * Fix uninitialized ljobi causing crash on Windows with rules. Add rule_workspace to move applyrule stack arrays to heap. NULL checks on bare malloc/realloc. Improved rule error reporting with caret position.
+ *
  * Revision 1.330  2026/04/21 13:16:11  dlr
  * Version bump for GPU salt resume fix (gpu_opencl.c r1.53, gpu_metal.m r1.42)
  *
@@ -1606,7 +1609,8 @@ extern void procsaltbb(vector unsigned int *SSEBUF, struct job *job, int pcnt, c
 #endif
 
 extern int packrules(char *line);
-extern int applyrule(char *line, char *pass, int len, char *rule);
+extern int applyrule(char *line, char *pass, int len, char *rule,
+                     struct rule_workspace *ws);
 extern void getcpuinfo();
 
 #define RHASH_RESET(v) if (!v) {fprintf(stderr,"RHASH not valid for %s\n",Types[job->op-1]);exit(1);} else {rhash_reset(v);}
@@ -6970,6 +6974,11 @@ static void compact_resize(void) {
                 next = next->next;
             }
             chain = malloc(sizeof(struct Hashchain) + hlen - 9);
+            if (!chain) {
+                fprintf(stderr, "Failed to allocate overflow chain entry (%d bytes)\n",
+                        (int)(sizeof(struct Hashchain) + hlen - 9));
+                exit(1);
+            }
             chain->len = hlen;
             chain->flags = HashDataFlags[i];
             memmove(chain->hash, hash + 8, hlen - 8);
@@ -7040,6 +7049,11 @@ static int compact_insert(void) {
         }
 
         chain = malloc(sizeof(struct Hashchain) + hlen - 9);
+        if (!chain) {
+            fprintf(stderr, "Failed to allocate overflow chain entry (%d bytes)\n",
+                    (int)(sizeof(struct Hashchain) + hlen - 9));
+            exit(1);
+        }
         chain->len = hlen;
         chain->flags = 0;
         memmove(chain->hash, hash + 8, hlen - 8);
@@ -9019,7 +9033,7 @@ static uint32_t lastmask[5] = {0x0,0xff000000,0xffff0000,0xffffff00,0xffffffff};
 static uint32_t lastmask[5] = {0x0, 0xff, 0xffff, 0xffffff, 0xffffffff};
 #endif
 char *TestVec;
-int ljobi, FastRule;
+int ljobi = 0, FastRule;
 uint32_t *d32, *f32, *dd32;
 struct job *ljob;
 char *linebuf, *linebuf2, *tsalt, *tline, *XMLline, *Origline;
@@ -9052,6 +9066,8 @@ if (cd == (iconv_t)-1 || cd1 == (iconv_t)-1 || cd2 == (iconv_t)-1 ||
     perror(memreason);
     exit(1);
 }
+
+struct rule_workspace *rule_ws = malloc_lock(sizeof(struct rule_workspace), memreason);
 
 mdcur = malloc_lock(sizeof(union HashU) * 10,memreason);
 ljob = malloc_lock(sizeof(struct job)*(4+1),memreason);
@@ -9096,7 +9112,6 @@ saltpool = NULL;
 }
 
 tmemmax = memmax;
-
 
 TestVec = NULL;
 desblock = NULL;
@@ -9158,7 +9173,6 @@ while (1) {
   if (job->op == JOB_ARGON2 && !argon2_ws) {
     argon2_ws = malloc_lock(Argon2_maxmem + 16, memreason);
   }
-/* fprintf(stderr,"Job %d start (outbuf=%llx)\n",job->op,job->outbuf); */
   switch (job->op) {
     case JOB_GOSTHEXSALT:
       rhash_con = rhash_init(RHASH_HAS160);
@@ -9512,7 +9526,7 @@ if (pass0 != 0 && currule) {
   if (*((unsigned short int *) currule) == 0)
     break;
   job->Ruleindex++;
-  len = applyrule(tline, cur, len, currule + 2);
+  len = applyrule(tline, cur, len, currule + 2, rule_ws);
   job->len = job->clen = len;
 
   currule += *((unsigned short int *) currule) + 2;
@@ -23128,7 +23142,7 @@ md5sha256:
                   if (currule && *((unsigned short int *) currule) != 0) {
                     job->Ruleindex++;
                     ljob[ljobi].Ruleindex = job->Ruleindex;
-                    x = applyrule(cur, ljob[ljobi].pass, len, currule + 2);
+                    x = applyrule(cur, ljob[ljobi].pass, len, currule + 2, rule_ws);
                     if (x >= 0) {
                       rulecnt++;
                       s = ljob[ljobi].pass;
@@ -23651,7 +23665,7 @@ md5sha256:
                     }
                     cur = job->pass;
                     job->Ruleindex++;
-                    x = applyrule(tline,cur,orig_len,currule+2);
+                    x = applyrule(tline,cur,orig_len,currule+2, rule_ws);
                     currule += *((unsigned short int *)currule) + 2;
                     if (x >= 0) {
                       rulecnt++;
@@ -23764,14 +23778,16 @@ md5sha256:
 		    if (my_jobg && my_jobg->count < GPUBATCH_MAX) {
 		      int gpu_cpu_needed = 0, gpu_rules_used = 0;
 		      extern int applyrules_gpu_pack(char *, int, char *, int,
-		          char *, int, int, int, uint16_t *, int *, char *, int *, int *);
+		          char *, int, int, int, uint16_t *, int *, char *, int *, int *,
+		          struct rule_workspace *);
 		      int gpu_start = my_jobg->count;
 		      int gpu_avail = GPUBATCH_MAX - gpu_start;
 		      int gpu_filled = applyrules_gpu_pack(
 		          cur, len, currule, Numrules,
 		          my_jobg->raw, 64, gpu_start, GPUBATCH_MAX,
 		          my_jobg->passlen, my_jobg->ruleindex,
-		          linebuf, &gpu_cpu_needed, &gpu_rules_used);
+		          linebuf, &gpu_cpu_needed, &gpu_rules_used,
+		          rule_ws);
 		      if (gpu_filled > 0) {
 		        for (int gi = gpu_start; gi < gpu_start + gpu_filled && gi < GPUBATCH_MAX; gi++) {
 		          my_jobg->passoff[gi] = gi * 64;
@@ -23807,7 +23823,7 @@ md5sha256:
                       while (MDXpause) sleep(2);
                       __sync_fetch_and_sub(&MDXpaused_count, 1);
                     }
-                    x = applyrule(cur, ljob[ljobi].pass, len, currule + 2);
+                    x = applyrule(cur, ljob[ljobi].pass, len, currule + 2, rule_ws);
                     currule += *((unsigned short int *) currule) + 2;
                     job->Ruleindex++;
                     if (x >= 0) {
@@ -35331,6 +35347,10 @@ void build_compact_table(void) {
       HashDataOff = malloc(65536 * sizeof(size_t));
       HashDataLen = malloc(65536 * sizeof(unsigned short));
       HashDataFlags = malloc(65536 * sizeof(unsigned short));
+      if (!HashDataBuf || !HashDataOff || !HashDataLen || !HashDataFlags) {
+        fprintf(stderr, "Failed to allocate hash data arrays\n");
+        exit(1);
+      }
     }
     while (BPV) {
       int pfx = (bcline[2] == 'k') ? 28 : 29;
@@ -35440,12 +35460,20 @@ void build_compact_table(void) {
             HashDataOff = realloc(HashDataOff, newcap * sizeof(size_t));
             HashDataLen = realloc(HashDataLen, newcap * sizeof(unsigned short));
             HashDataFlags = realloc(HashDataFlags, newcap * sizeof(unsigned short));
+            if (!HashDataOff || !HashDataLen || !HashDataFlags) {
+              fprintf(stderr, "Failed to allocate hash entry arrays\n");
+              exit(1);
+            }
             memset(HashDataFlags + HashDataCap, 0, (newcap - HashDataCap) * sizeof(unsigned short));
             HashDataCap = newcap;
           }
           if (HashDataBufUsed + 16 > HashDataBufCap) {
             size_t newcap = HashDataBufCap ? HashDataBufCap * 2 : 65536;
             HashDataBuf = realloc(HashDataBuf, newcap);
+            if (!HashDataBuf) {
+              fprintf(stderr, "Failed to allocate hash data buffer\n");
+              exit(1);
+            }
             HashDataBufCap = newcap;
           }
           HashDataOff[HashDataCount] = HashDataBufUsed;
@@ -36667,6 +36695,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               JSLI(PV, JuniperIVE, (unsigned char *)md5h);
               if (*PV == 0) {
                 char *orig = malloc(105);
+                if (!orig) { fprintf(stderr, "Out of memory\n"); exit(1); }
                 memcpy(orig, line, 104);
                 orig[104] = 0;
                 *PV = (Word_t)orig;
@@ -38559,6 +38588,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             if (PV && *PV == 0) {
               /* Store original $PHPS$... line as value for output */
               char *orig = malloc(mystrlen(line) + 1);
+              if (!orig) { fprintf(stderr, "Out of memory\n"); exit(1); }
               strcpy(orig, line);
               *PV = (Word_t)orig;
             }
@@ -40793,6 +40823,7 @@ int main(int argc, char **argv) {
   Word_t lsi;
   char line[MAXLINE + 16], last[MAXLINE + 16], *cur, *ofile, *nfile;
   char workline[MAXLINE + 16];
+  struct rule_workspace main_rule_ws;
   char *pass, *infilename;
   char *Prog = argv[0];
   off_t ret;
@@ -41297,7 +41328,7 @@ badrule:
                 line[0] = 0;
               }
               strcpy(workline, "Password");
-              if (line[0] && applyrule(workline, last, 8, line) == -3)
+              if (line[0] && applyrule(workline, last, 8, line, &main_rule_ws) == -3)
                 goto badrule;
               len = mystrlen(line);
               if (len != 0 && line[0] != '#') {

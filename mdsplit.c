@@ -28,9 +28,24 @@
 
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdsplit.c,v 1.25 2026/02/21 01:58:48 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdsplit.c,v 1.30 2026/04/21 17:11:40 dlr Exp dlr $";
 /*
  * $Log: mdsplit.c,v $
+ * Revision 1.30  2026/04/21 17:11:40  dlr
+ * Fix partial-match false positive: reject matches where boundary char is still hex. Previously fell through to accept any best_len2 > 0 even when no entry passed the boundary check, causing 16-char prefix collisions on reversed hashes to be accepted as valid matches.
+ *
+ * Revision 1.29  2026/04/21 13:35:55  dlr
+ * Fix SolnOff overflow: uint32_t overflows at 4GB of solution data (~93M entries). Changed to size_t for correct indexing at 2B+ entries. Increase COMPACT_MAX_PROBE to 256. Add overflow diagnostics.
+ *
+ * Revision 1.28  2026/04/21 05:37:14  dlr
+ * Phase 2 I/O optimizations: increase default buffer from 500KB to 4MB (256KB on ARM), add posix_fadvise(SEQUENTIAL) on Linux for hash file reads, write buffer pool (64x64KB) for type output files, prefetch compact table slot on probe
+ *
+ * Revision 1.27  2026/04/21 05:27:09  dlr
+ * Replace hard-coded text hash type list with full hash content scan; any non-hex character in the hash portion triggers texthash classification. Future-proof against new crypt/structured types.
+ *
+ * Revision 1.26  2026/04/21 05:12:53  dlr
+ * Phase 1: Replace JudySL Hash with compact hash table for hex hashes. Flat SolnBuf storage with parallel index arrays. Text hashes remain in separate TextHash JudySL. Preserves partial prefix matching, reverse lookup, all file management features.
+ *
  * Revision 1.25  2026/02/21 01:58:48  dlr
  * *** empty log message ***
  *
@@ -151,10 +166,16 @@ char Sep = ':';
 int Exact = 0;
 int Longmatch;
 #ifdef ARM
-#define FILEBUFSIZE 100*1024
+#define FILEBUFSIZE (256*1024)
 #else
-#define FILEBUFSIZE 500*1024
+#define FILEBUFSIZE (4*1024*1024)
 #endif
+
+/* Pool of write buffers for type output files */
+#define HITBUF_COUNT 64
+#define HITBUF_SIZE  (64*1024)
+static char *HitBufPool[HITBUF_COUNT];
+static int   HitBufUsed = 0;
 
 
 int memsize = FILEBUFSIZE;
@@ -165,10 +186,178 @@ char *Inbuf, *Outbuf;
 #endif
 
 Pvoid_t Hfn, Bhash, Hash, Specfn;
+Pvoid_t TextHash = NULL;  /* JudySL for text-based hashes */
 int _dowildcard = -1; /* enable wildcard expansion for Windows */
 
 int Maxsuf = 0;
 pid_t Mypid;
+
+/* Compact hash table for hex hash solutions */
+#define COMPACT_MAX_PROBE 256
+
+static uint32_t *CompactFP;      /* fingerprint array */
+static uint32_t *CompactIdx;     /* index into Soln arrays */
+static uint64_t CompactSize;     /* power of 2 */
+static uint64_t CompactMask;     /* CompactSize - 1 */
+static uint32_t CompactUsed;
+
+/* Flat solution storage for hex hashes */
+static char     *SolnBuf;        /* concatenated solution strings */
+static size_t   SolnBufUsed, SolnBufCap;
+static size_t   *SolnOff;        /* offset into SolnBuf for each solution */
+static uint16_t *SolnHlen;       /* hash portion length */
+static uint16_t *SolnTotalLen;   /* total found string length */
+static struct FNInfo **SolnType; /* pointer to type info */
+static uint64_t *SolnKey;        /* decoded uint64_t key for building compact table */
+static uint32_t SolnCount, SolnCap;
+
+/* Forward declarations */
+extern unsigned char trhex[];
+char *commify(unsigned long long n);
+
+static inline uint64_t compact_mix(uint64_t k) {
+    return k ^ (k >> 32);
+}
+
+/* Decode first 16 hex chars (or fewer) of a string into a uint64_t key.
+ * Uses trhex[] for case-insensitive hex decoding.
+ * Returns the key, or 0 if fewer than 2 hex chars available. */
+static inline uint64_t decode_hex_key(const char *s, int len) {
+    uint64_t key = 0;
+    int i, nibbles;
+    unsigned char c;
+
+    nibbles = (len > 16) ? 16 : len;
+    for (i = 0; i < nibbles; i++) {
+        c = trhex[((unsigned char)s[i]) & 0xff];
+        if (c > 15) break;
+        key = (key << 4) | c;
+    }
+    /* Pad remaining nibbles with 0 if we got fewer than 16 */
+    for (; i < 16; i++)
+        key <<= 4;
+    return key;
+}
+
+/* Add a hex solution to the flat arrays. Returns the index. */
+static uint32_t soln_add(const char *found, int len, int hlen, struct FNInfo *ftype, uint64_t key) {
+    uint32_t idx;
+
+    if (SolnCount >= SolnCap) {
+        uint32_t newcap = SolnCap ? SolnCap * 2 : 1024 * 1024;
+        SolnOff = realloc(SolnOff, newcap * sizeof(size_t));
+        SolnHlen = realloc(SolnHlen, newcap * sizeof(uint16_t));
+        SolnTotalLen = realloc(SolnTotalLen, newcap * sizeof(uint16_t));
+        SolnType = realloc(SolnType, newcap * sizeof(struct FNInfo *));
+        SolnKey = realloc(SolnKey, newcap * sizeof(uint64_t));
+        if (!SolnOff || !SolnHlen || !SolnTotalLen || !SolnType || !SolnKey) {
+            fprintf(stderr, "Out of memory growing Soln arrays at %u entries\n", newcap);
+            exit(1);
+        }
+        SolnCap = newcap;
+    }
+    /* Grow SolnBuf if needed */
+    if (SolnBufUsed + len + 1 > SolnBufCap) {
+        size_t newcap = SolnBufCap ? SolnBufCap * 2 : 64 * 1024 * 1024;
+        while (newcap < SolnBufUsed + len + 1) newcap *= 2;
+        SolnBuf = realloc(SolnBuf, newcap);
+        if (!SolnBuf) {
+            fprintf(stderr, "Out of memory growing SolnBuf to %zu bytes\n", newcap);
+            exit(1);
+        }
+        SolnBufCap = newcap;
+    }
+
+    idx = SolnCount++;
+    SolnOff[idx] = SolnBufUsed;
+    SolnHlen[idx] = (uint16_t)hlen;
+    SolnTotalLen[idx] = (uint16_t)len;
+    SolnType[idx] = ftype;
+    SolnKey[idx] = key;
+    memmove(SolnBuf + SolnBufUsed, found, len + 1);
+    SolnBufUsed += len + 1;
+    return idx;
+}
+
+/* Build the compact hash table from SolnKey[]/SolnCount.
+ * Called after all solutions are loaded. */
+static void build_compact(void) {
+    uint64_t tsize;
+    uint32_t i;
+
+    if (SolnCount == 0) return;
+
+    tsize = 1;
+    while (tsize <= SolnCount) tsize <<= 1;
+    tsize <<= 1;
+
+    CompactSize = tsize;
+    CompactMask = tsize - 1;
+    CompactUsed = 0;
+    CompactFP = calloc(tsize, sizeof(uint32_t));
+    CompactIdx = malloc(tsize * sizeof(uint32_t));
+    if (!CompactFP || !CompactIdx) {
+        fprintf(stderr, "Failed to allocate compact table (%llu slots)\n", (unsigned long long)tsize);
+        exit(1);
+    }
+
+    for (i = 0; i < SolnCount; i++) {
+        uint64_t key = SolnKey[i];
+        uint32_t fp = (uint32_t)(key >> 32);
+        uint64_t pos = compact_mix(key) & CompactMask;
+        int p;
+
+        /* Prefetch lookahead of 8 */
+        if (i + 8 < SolnCount) {
+            uint64_t nkey = SolnKey[i + 8];
+            uint64_t npos = compact_mix(nkey) & CompactMask;
+            __builtin_prefetch(&CompactFP[npos], 1, 1);
+            __builtin_prefetch(&CompactIdx[npos], 1, 1);
+        }
+
+        if (!fp) fp = 1;
+
+        for (p = 0; p < COMPACT_MAX_PROBE; p++) {
+            if (!CompactFP[pos]) {
+                CompactFP[pos] = fp;
+                CompactIdx[pos] = i;
+                CompactUsed++;
+                break;
+            }
+            /* On collision with same fp, keep existing - we'll handle
+             * multiple entries with same key in the lookup (longest match) */
+            if (CompactFP[pos] == fp) {
+                uint32_t eidx = CompactIdx[pos];
+                if (SolnKey[eidx] == key) {
+                    /* Same key - chain: store as linked via next index.
+                     * For simplicity, just keep the first one in the table.
+                     * The match function will scan all SolnCount entries
+                     * with matching key via linear probe. We allow duplicates
+                     * in adjacent probe slots. */
+                }
+            }
+            pos = (pos + 1) & CompactMask;
+        }
+        if (p == COMPACT_MAX_PROBE) {
+            /* Overflow beyond max probe — should be exceedingly rare at <50% load.
+             * Log count for diagnostics. */
+            static uint32_t overflow_count = 0;
+            overflow_count++;
+            if (overflow_count <= 5)
+                fprintf(stderr, "Warning: compact table overflow at entry %u (key %016llx)\n",
+                        i, (unsigned long long)key);
+            /* Place in next available slot — match_compact won't find it
+             * within COMPACT_MAX_PROBE, but this keeps the table consistent */
+            uint64_t opos = pos;
+            while (CompactFP[opos]) opos = (opos + 1) & CompactMask;
+            CompactFP[opos] = fp;
+            CompactIdx[opos] = i;
+            CompactUsed++;
+        }
+    }
+    fprintf(stderr, "Compact table: %s hex entries in %llu slots\n",
+            commify(SolnCount), (unsigned long long)tsize);
+}
 
 char *DefaultType;
 
@@ -628,61 +817,163 @@ void closeall() {
   }
 }
 
+/* match_compact: look up a hex hash in the compact table.
+ * line is the original (possibly mixed-case) hash from the file.
+ * len is the length of the hash portion to match.
+ * Returns a static Resinfo with match info, or NULL on miss. */
+static struct Resinfo _compact_result;
+
+struct Resinfo *match_compact(const char *line, int len) {
+    uint64_t key;
+    uint32_t fp;
+    uint64_t pos;
+    int p, best_match = -1, best_len2 = 0;
+    uint32_t best_idx = 0;
+
+    if (!CompactFP || !SolnCount) return NULL;
+
+    key = decode_hex_key(line, len);
+    fp = (uint32_t)(key >> 32);
+    if (!fp) fp = 1;
+    pos = compact_mix(key) & CompactMask;
+
+    /* Prefetch the compact table slot — hides DRAM latency when table exceeds L3 */
+    __builtin_prefetch(&CompactFP[pos], 0, 1);
+    __builtin_prefetch(&CompactIdx[pos], 0, 1);
+
+    /* First pass: find longest prefix match among all entries with matching fp */
+    for (p = 0; p < COMPACT_MAX_PROBE; p++) {
+        uint64_t cpos = (pos + p) & CompactMask;
+        uint32_t idx;
+        int x, hlen, matchlen;
+        const char *found;
+        signed char ch;
+
+        if (!CompactFP[cpos]) break;
+        if (CompactFP[cpos] != fp) continue;
+
+        idx = CompactIdx[cpos];
+        found = SolnBuf + SolnOff[idx];
+        hlen = SolnHlen[idx];
+
+        /* Compare hash portion case-insensitively */
+        matchlen = (len < hlen) ? len : hlen;
+        for (x = 0; x < matchlen; x++) {
+            ch = line[x];
+            if (isupper(ch)) ch = tolower(ch);
+            if (ch != found[x]) break;
+        }
+        if (x > best_len2) {
+            best_len2 = x;
+            best_idx = idx;
+            best_match = p;
+        }
+    }
+
+    if (best_match < 0) return NULL;
+
+    /* Second pass: among entries with the same best_len2, find the right boundary match */
+    for (p = 0; p < COMPACT_MAX_PROBE; p++) {
+        uint64_t cpos = (pos + p) & CompactMask;
+        uint32_t idx;
+        int x, hlen, matchlen;
+        const char *found;
+        signed char ch;
+
+        if (!CompactFP[cpos]) break;
+        if (CompactFP[cpos] != fp) continue;
+
+        idx = CompactIdx[cpos];
+        found = SolnBuf + SolnOff[idx];
+        hlen = SolnHlen[idx];
+
+        matchlen = (len < hlen) ? len : hlen;
+        for (x = 0; x < matchlen; x++) {
+            ch = line[x];
+            if (isupper(ch)) ch = tolower(ch);
+            if (ch != found[x]) break;
+        }
+        if (x == best_len2) {
+            if (x >= len) {
+                best_idx = idx;
+                goto found_it;
+            }
+            /* Check if next char in file line is non-hex (hash boundary) */
+            ch = line[x];
+            if (trhex[((unsigned int)ch) & 0xff] > 15) {
+                best_idx = idx;
+                goto found_it;
+            }
+        }
+    }
+    /* No entry passed the boundary check — not a valid match */
+    return NULL;
+
+found_it:
+    _compact_result.hashtype = SolnType[best_idx];
+    _compact_result.found = SolnBuf + SolnOff[best_idx];
+    _compact_result.hlen = SolnHlen[best_idx];
+    _compact_result.len = SolnTotalLen[best_idx];
+    _compact_result.next = NULL;
+    return &_compact_result;
+}
+
+/* match_text: look up a text hash in the TextHash JudySL.
+ * Preserves original linked-list collision chain semantics. */
+struct Resinfo *match_text(char *tline, char *line, int len) {
+    int x, len2;
+    Word_t *PV;
+    struct Resinfo *resi1;
+    signed char ch;
+
+    JSLG(PV, TextHash, tline);
+    if (PV) {
+        resi1 = (struct Resinfo *) (*PV);
+        /* Find longest match */
+        len2 = 0;
+        do {
+            for (x = 0; x < len && x < resi1->hlen; x++) {
+                ch = line[x];
+                if (resi1->hashtype->flags & FNInfo_hexhash)
+                    if (isupper(ch)) ch = tolower(ch);
+                if (ch != resi1->found[x]) break;
+            }
+            if (x > len2) len2 = x;
+            resi1 = resi1->next;
+        } while (resi1);
+        resi1 = (struct Resinfo *) (*PV);
+        do {
+            for (x = 0; x < len && x < resi1->hlen; x++) {
+                ch = line[x];
+                if (resi1->hashtype->flags & FNInfo_hexhash)
+                    if (isupper(ch)) ch = tolower(ch);
+                if (ch != resi1->found[x]) break;
+            }
+            if (x == len2) {
+                if (x >= len) break;
+                if (resi1->hashtype->flags & FNInfo_texthash) {
+                    ch = line[x];
+                    if (ch == 0 || ch == Sep || ch <= ' ' || ch > 126) break;
+                }
+            }
+            resi1 = resi1->next;
+        } while (resi1);
+        return (resi1);
+    }
+    return (NULL);
+}
+
+/* match: unified dispatch - hex hashes go to compact table, text to JudySL */
 struct Resinfo *match(char *tline, char *line, int len) {
+    struct Resinfo *r;
 
-  int x, len2;
-  Word_t *PV, RC, tr1;
-  struct FNInfo *curfn;
-  struct Resinfo *resi1, *resi2, *resil;
-  signed char ch;
+    /* Try compact table for hex hashes first */
+    r = match_compact(line, len);
+    if (r) return r;
 
-  JSLG(PV, Hash, tline);
-  if (PV) {
-    resi1 = (struct Resinfo *) (*PV);
-    /* Find longest match */
-    len2 = 0;
-    do {
-      for (x = 0; x < len && x < resi1->hlen; x++) {
-        ch = line[x];
-        if (resi1->hashtype->flags & FNInfo_hexhash)
-          if (isupper(ch))
-            ch = tolower(ch);
-        if (ch != resi1->found[x])
-          break;
-      }
-      if (x > len2)
-        len2 = x;
-      resi1 = resi1->next;
-    } while (resi1);
-    resi1 = (struct Resinfo *) (*PV);
-    do {
-      for (x = 0; x < len && x < resi1->hlen; x++) {
-        ch = line[x];
-        if (resi1->hashtype->flags & FNInfo_hexhash)
-          if (isupper(ch))
-            ch = tolower(ch);
-        if (ch != resi1->found[x])
-          break;
-      }
-      if (x == len2) {
-        if (x >= len)
-          break;
-        if (resi1->hashtype->flags & FNInfo_hexhash) {
-          ch = line[x];
-          if (trhex[((unsigned int) ch) & 0xff] > 15)
-            break;
-        }
-        if (resi1->hashtype->flags & FNInfo_texthash) {
-          ch = line[x];
-          if (ch == 0 || ch == Sep || ch <= ' ' || ch > 126)
-            break;
-        }
-      }
-      resi1 = resi1->next;
-    } while (resi1);
-    return (resi1);
-  }
-  return (NULL);
+    /* Try text hash JudySL */
+    r = match_text(tline, line, len);
+    return r;
 }
 
 char *stripprefix(char *src) {
@@ -814,6 +1105,9 @@ unsigned long long process(char *initfi, int Procall, int Simulate) {
 #ifndef _WIN32
     setbuffer(fi, Inbuf, memsize);
 #endif
+#ifdef __linux__
+    posix_fadvise(fileno(fi), 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
 
     sprintf(file2, "%s.w%d", file1, Mypid);
   }
@@ -881,6 +1175,15 @@ unsigned long long process(char *initfi, int Procall, int Simulate) {
               }
               strncpy(curfn->filename, hashname, MDMAXPATHLEN);
               curfn->fh = fh;
+#ifndef _WIN32
+              /* Assign a write buffer from the pool for better I/O batching */
+              if (HitBufUsed < HITBUF_COUNT) {
+                if (!HitBufPool[HitBufUsed])
+                  HitBufPool[HitBufUsed] = malloc(HITBUF_SIZE);
+                if (HitBufPool[HitBufUsed])
+                  setbuffer(fh, HitBufPool[HitBufUsed++], HITBUF_SIZE);
+              }
+#endif
             }
             if (fprintf(fh, "%s\n", resi1->found) < 0) {
               fprintf(stderr, "Can't append to %s\n", hashname);
@@ -1392,25 +1695,12 @@ int main(int argc, char **argv) {
       }
 
       curfn = mymalloc(sizeof(struct FNInfo), 8);
-      if (strcmp(type, "BCRYPT") == 0 ||
-          strncmp(type, "BCRYPT", 6) == 0 ||
-          strcmp(type, "DESCRYPT") == 0 ||
-          strncmp(type, "APACHE", 6) == 0 ||
-          strcmp(type, "YAH-SHA1") == 0 ||
-          strncmp(type, "PHPBB3", 6) == 0 ||
-          strcmp(type, "CISCO8") == 0 ||
-          strcmp(type, "APR1") == 0 ||
-          strncmp(type, "MD5CRYPT", 8) == 0 ||
-          strncmp(type, "SHA256CRYPT", 11) == 0 ||
-          strncmp(type, "SHA512CRYPT", 11) == 0 ||
-          strncmp(type, "PKCS5S2", 7) == 0 ||
-          strncmp(type, "PBKDF2", 6) == 0)
-        curfn->flags = FNInfo_texthash;
-      else
-        curfn->flags = FNInfo_hexhash;
-      for (x = 0; x < hlen && x < 10; x++) {
-        ch = cur[x];
-        if (trhex[(ch & 0xff)] > 15) {
+      /* Classify as text hash if any non-hex character appears in the hash.
+       * Scan the full hash portion — catches all structured formats ($2b$, $6$,
+       * $argon2id$, etc.) without needing a hard-coded type list. */
+      curfn->flags = FNInfo_hexhash;
+      for (x = 0; x < hlen; x++) {
+        if (trhex[((unsigned char)cur[x]) & 0xff] > 15) {
           curfn->flags = FNInfo_texthash;
           break;
         }
@@ -1421,58 +1711,71 @@ int main(int argc, char **argv) {
       *PV = (Word_t) curfn;
     }
     curfn = (struct FNInfo *) (*PV);
-    if (curfn->flags & FNInfo_texthash) 
-	tlen = (hlen > 30) ? 30 : hlen;
-    else 
-        tlen = (hlen > 16) ? 16 : hlen;
-    for (x = 0; x < tlen; x++) {
-      ch = cur[x];
-      if (Longmatch == 0 && ch == Sep) {
-        tlen = x;
-        break;
-      }
-      if (isupper(ch))
-        ch = tolower(ch);
-      tline[x] = ch;
-    }
-    tline[tlen] = 0;
-    resi1 = mymalloc(sizeof(struct Resinfo), 8);
-    resi1->next = NULL;
-    resi1->hashtype = curfn;
     curfn->incount++;
-    resi1->hlen = hlen;
-    resi1->len = len;
-    resi1->found = mymalloc(len + 1, 1);
-    memmove(resi1->found, cur, len + 1);
-    JSLG(PV, Hash, tline);
-    if (PV) {
-      resi2 = (struct Resinfo *) (*PV);
-      do {
-        resil = resi2;
-        if (memcmp(resi2->found, cur, hlen) == 0) {
-          if (len < resi2->len || (len == resi2->len && curfn->iter > resi2->hashtype->iter)) {
-            resi2->hashtype = resi1->hashtype;
-            resi2->hlen = resi1->hlen;
-            resi2->len = resi1->len;
-            resi2->found = resi1->found;
-          }
+
+    if (curfn->flags & FNInfo_hexhash) {
+      /* Hex hash: lowercase the found string's hash portion, store in compact arrays */
+      char *lowered = mymalloc(len + 1, 1);
+      uint64_t key;
+      memmove(lowered, cur, len + 1);
+      for (x = 0; x < hlen; x++)
+        if (isupper(lowered[x]))
+          lowered[x] = tolower(lowered[x]);
+      key = decode_hex_key(lowered, hlen);
+      soln_add(lowered, len, hlen, curfn, key);
+    } else {
+      /* Text hash: insert into TextHash JudySL with Resinfo chain */
+      tlen = (hlen > 30) ? 30 : hlen;
+      for (x = 0; x < tlen; x++) {
+        ch = cur[x];
+        if (Longmatch == 0 && ch == Sep) {
+          tlen = x;
           break;
         }
-        resi2 = resi2->next;
-      } while (resi2);
-      if (!resi2)
-        resil->next = resi1;
-    } else {
-      JSLI(PV, Hash, tline);
-      if (!PV) {
-        fprintf(stderr, "Hash add fail\n");
-        exit(1);
+        if (isupper(ch))
+          ch = tolower(ch);
+        tline[x] = ch;
       }
-      *PV = (Word_t) resi1;
+      tline[tlen] = 0;
+      resi1 = mymalloc(sizeof(struct Resinfo), 8);
+      resi1->next = NULL;
+      resi1->hashtype = curfn;
+      resi1->hlen = hlen;
+      resi1->len = len;
+      resi1->found = mymalloc(len + 1, 1);
+      memmove(resi1->found, cur, len + 1);
+      JSLG(PV, TextHash, tline);
+      if (PV) {
+        resi2 = (struct Resinfo *) (*PV);
+        do {
+          resil = resi2;
+          if (memcmp(resi2->found, cur, hlen) == 0) {
+            if (len < resi2->len || (len == resi2->len && curfn->iter > resi2->hashtype->iter)) {
+              resi2->hashtype = resi1->hashtype;
+              resi2->hlen = resi1->hlen;
+              resi2->len = resi1->len;
+              resi2->found = resi1->found;
+            }
+            break;
+          }
+          resi2 = resi2->next;
+        } while (resi2);
+        if (!resi2)
+          resil->next = resi1;
+      } else {
+        JSLI(PV, TextHash, tline);
+        if (!PV) {
+          fprintf(stderr, "TextHash add fail\n");
+          exit(1);
+        }
+        *PV = (Word_t) resi1;
+      }
     }
   }
   fclose(fi);
   printf("%s result lines processed, %d type%s found\n", commify(Inres), Hashcount, (Hashcount == 1) ? "" : "s");
+  if (SolnCount)
+    build_compact();
   if (Hashcount == 0) exit(0);
 
   line[0] = 0;
