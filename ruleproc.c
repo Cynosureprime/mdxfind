@@ -35,14 +35,18 @@ int IntelSSE;
 int HasSSSE3;
 #endif
 
+
 #include "mdxfind.h"
 
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.13 2026/04/22 18:23:53 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.14 2026/04/22 22:02:53 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.14  2026/04/22 22:02:53  dlr
+ * struct rule_workspace in mdxfind.h with extern applyrule, remove duplicate declarations
+ *
  * Revision 1.13  2026/04/22 18:23:53  dlr
  * applyrule workspace parameter, rule_error diagnostic with caret position
  *
