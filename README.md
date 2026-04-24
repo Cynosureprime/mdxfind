@@ -302,7 +302,6 @@ Mask characters: `?l` (lowercase), `?u` (uppercase), `?d` (digits), `?s` (specia
 On activation, mdxfind prints a confirmation line:
 
 ```
-Brute force processing...
 Brute force processing detected: 5429503678976 candidates from mask '?l?l?l?l?l?l?l?l?l'
 ```
 
