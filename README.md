@@ -284,7 +284,7 @@ ZIP files are processed as single-entry archives (the first entry is read). For 
 
 ### Brute-Force Mode
 
-When the last argument is not a file, mdxfind treats it as a mask pattern and enters brute-force mode — generating all candidates directly on the GPU without a wordlist.
+Brute-force mode triggers when exactly one positional (non-option) argument is supplied and `stat(2)` fails on it — i.e. no file of that name exists. The argument is then parsed as a mask pattern and the full keyspace is enumerated without a wordlist. If the single argument is a valid file it is treated as a wordlist, and if two or more wordlist arguments are given brute-force mode does not activate.
 
 ```bash
 # Brute-force all 9-character lowercase passwords against MD5 hashes
@@ -299,10 +299,10 @@ mdxfind -m e1 -f hashes.txt 'pass?d?d?d?d'
 
 Mask characters: `?l` (lowercase), `?u` (uppercase), `?d` (digits), `?s` (special), `?a` (all printable), `?h` (hex lowercase), `?H` (hex uppercase), `?b` (all bytes 0x00-0xFF). Custom charsets use `?[...]` syntax: `?[0-9a-f]`.
 
-If the argument is a valid file, it is processed as a wordlist. Brute-force mode activates only when `stat()` fails on the argument. A diagnostic message confirms:
+On activation, mdxfind prints a confirmation line:
 
 ```
-File ?l?l?l?l?l?l?l?l?l not found: No such file or directory
+Brute force processing...
 Brute force processing detected: 5429503678976 candidates from mask '?l?l?l?l?l?l?l?l?l'
 ```
 
