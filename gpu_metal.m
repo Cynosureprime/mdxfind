@@ -46,6 +46,12 @@
 #include "gpu/metal_bcrypt_str.h"
 #include "gpu/metal_sha1_str.h"
 #include "gpu/metal_md5crypt_str.h"
+/* Packed-password dispatch kernels (GPU rule path) */
+#include "gpu/metal_md5_packed_str.h"
+#include "gpu/metal_md4_packed_str.h"
+#include "gpu/metal_sha1_packed_str.h"
+#include "gpu/metal_sha256_packed_str.h"
+#include "gpu/metal_sha512_packed_str.h"
 
 /* Family IDs from gpujob.h FAM_* enum — Metal uses a subset */
 static const char *mtl_family_source[FAM_COUNT] = {
@@ -86,6 +92,12 @@ static id<MTLComputePipelineState> mtl_pipeline_salts;  /* salts-only kernel */
 static id<MTLComputePipelineState> mtl_pipeline_iter;   /* salted iteration override */
 static id<MTLComputePipelineState> mtl_pipelines[JOB_DONE]; /* per-op dispatch kernels */
 static id<MTLLibrary>             mtl_fam_lib[FAM_COUNT]; /* per-family compiled libraries */
+
+/* Per-family packed kernel pipelines — compiled lazily on first packed dispatch.
+ * Keyed by FAM_MD5UNSALTED/FAM_SHA1UNSALTED/FAM_SHA256UNSALTED/FAM_MD4UNSALTED/
+ * FAM_SHA512UNSALTED. All packed kernels baked into the embedded metallib. */
+static id<MTLComputePipelineState> mtl_pipeline_packed[FAM_COUNT];
+static int                         mtl_pipeline_packed_tried[FAM_COUNT];
 
 /* Metal kernel-to-op mapping table (mirrors OpenCL kernel_map) */
 static const struct {
@@ -165,6 +177,46 @@ static const struct {
     {NULL, {-1}, 0}
 };
 #define MTL_KERN_ITER_IDX 2
+
+/* Packed kernel registry: maps FAM_* to packed kernel entry point + JIT source.
+ * Precompiled metallib is primary; JIT source is fallback only (not expected). */
+static const struct {
+    const char *source;      /* JIT fallback source (includes metal_common if not self-contained) */
+    int         self_contained; /* 1 = no metal_common prefix in JIT path */
+    const char *entry;       /* kernel function name */
+} mtl_packed_kernel_map[FAM_COUNT] = {
+    [FAM_MD5UNSALTED]    = { metal_md5_packed_str,    0, "md5_packed_batch" },
+    [FAM_SHA1UNSALTED]   = { metal_sha1_packed_str,   0, "sha1_packed_batch" },
+    [FAM_SHA256UNSALTED] = { metal_sha256_packed_str, 0, "sha256_packed_batch" },
+    [FAM_MD4UNSALTED]    = { metal_md4_packed_str,    0, "md4_packed_batch" },
+    [FAM_SHA512UNSALTED] = { metal_sha512_packed_str, 1, "sha512_packed_batch" },
+};
+
+/* Map JOB_* op to packed kernel family. -1 if no packed kernel.
+ * Includes JOB_NTLMH + JOB_NTLM (MD4 family, utf-16 packed on host side). */
+static int metal_packed_family(int op) {
+    switch (op) {
+    case JOB_MD5: case JOB_MD5UC: case JOB_MD5RAW:
+        return FAM_MD5UNSALTED;
+    case JOB_SHA1: case JOB_SHA1RAW: case JOB_SQL5:
+        return FAM_SHA1UNSALTED;
+    case JOB_SHA256: case JOB_SHA256RAW: case JOB_SHA224:
+        return FAM_SHA256UNSALTED;
+    case JOB_MD4:
+    case JOB_NTLMH:
+    case JOB_NTLM:
+        return FAM_MD4UNSALTED;
+    case JOB_SHA512: case JOB_SHA512RAW: case JOB_SHA384: case JOB_SHA384RAW:
+        return FAM_SHA512UNSALTED;
+    default:
+        return -1;
+    }
+}
+
+int gpu_metal_packed_capable(int op) {
+    return metal_packed_family(op) >= 0;
+}
+
 static int                        mtl_ready = 0;
 
 /* ---- Compact table GPU buffers (zero-copy where possible) ---- */
@@ -200,6 +252,16 @@ static int           _dispatch_bufs_ready = 0;
 static size_t        _salt_data_capacity = 0;
 static int           _salts_count = 0;
 static int           _max_hits = 0;
+
+/* ---- Packed password buffers (GPU rule dispatch) ---- */
+static id<MTLBuffer> buf_packed_data;   /* 128MB password data [len][bytes]... */
+static id<MTLBuffer> buf_packed_wordoff;/* uint32 byte offset per word */
+static id<MTLBuffer> buf_packed_hits;   /* GPU_PACKED_MAX_HITS * 19 uint32 */
+static id<MTLBuffer> buf_packed_hit_cnt;/* atomic uint hit counter */
+static id<MTLBuffer> buf_packed_params; /* MetalParams uniform */
+static size_t        packed_data_cap = 0;
+static size_t        packed_wordoff_cap = 0;
+static uint32_t     *packed_hits_host = NULL;  /* caller-visible hit buffer */
 
 /* ---- Overflow hash table for GPU binary search fallback ---- */
 static id<MTLBuffer> buf_overflow_keys;    /* sorted uint64_t keys */
@@ -1380,6 +1442,166 @@ int gpu_metal_dispatch(
         b_params_buf = nil; local_hits = nil; local_hit_count = nil;
 
         return (int)nhits;
+    }
+}
+
+/* ---- Packed password dispatch (GPU rule path) ---- */
+
+/* Lazy-compile packed kernel pipeline for a given family.
+ * Primary path: precompiled metallib. Falls back to JIT only if metallib
+ * is unavailable or doesn't contain the kernel.
+ * Returns the pipeline, or nil on failure. */
+static id<MTLComputePipelineState> mtl_get_packed_pipeline(int pfam) {
+    if (pfam < 0 || pfam >= FAM_COUNT) return nil;
+    if (mtl_pipeline_packed[pfam]) return mtl_pipeline_packed[pfam];
+    if (mtl_pipeline_packed_tried[pfam]) return nil;
+    mtl_pipeline_packed_tried[pfam] = 1;
+
+    const char *entry = mtl_packed_kernel_map[pfam].entry;
+    if (!entry) return nil;
+    NSString *fname = [NSString stringWithUTF8String:entry];
+    NSError *error = nil;
+
+    /* Primary: precompiled metallib */
+    if (mtl_precompiled_lib) {
+        id<MTLFunction> fn = [mtl_precompiled_lib newFunctionWithName:fname];
+        if (fn) {
+            id<MTLComputePipelineState> ps = [mtl_device newComputePipelineStateWithFunction:fn error:&error];
+            if (ps) {
+                mtl_pipeline_packed[pfam] = ps;
+                return ps;
+            }
+            fprintf(stderr, "Metal: packed pipeline '%s' failed: %s\n", entry,
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+        } else {
+            fprintf(stderr, "Metal: packed kernel '%s' not in metallib\n", entry);
+        }
+    }
+
+    /* JIT fallback (should not happen in production — metallib is authoritative) */
+    const char *src = mtl_packed_kernel_map[pfam].source;
+    int selfc = mtl_packed_kernel_map[pfam].self_contained;
+    if (!src || !mtl_compile_opts) return nil;
+    NSString *nssrc = selfc ?
+        [NSString stringWithUTF8String:src] :
+        [NSString stringWithFormat:@"%s%s", metal_common_str, src];
+    id<MTLLibrary> lib = [mtl_device newLibraryWithSource:nssrc options:mtl_compile_opts error:&error];
+    if (!lib) {
+        fprintf(stderr, "Metal: packed JIT '%s' compile error: %s\n", entry,
+                error ? [[error localizedDescription] UTF8String] : "unknown");
+        return nil;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:fname];
+    if (!fn) return nil;
+    id<MTLComputePipelineState> ps = [mtl_device newComputePipelineStateWithFunction:fn error:&error];
+    if (ps) mtl_pipeline_packed[pfam] = ps;
+    return ps;
+}
+
+uint32_t *gpu_metal_dispatch_packed(
+    const char *packed_buf,
+    uint32_t packed_size,
+    const uint32_t *word_offset,
+    uint32_t num_words,
+    uint32_t word_start,
+    int op,
+    int *nhits_out)
+{
+    *nhits_out = 0;
+    if (!mtl_ready || num_words == 0 || !packed_buf || !word_offset) return NULL;
+
+    int pfam = metal_packed_family(op);
+    if (pfam < 0) return NULL;
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = mtl_get_packed_pipeline(pfam);
+        if (!pipeline) return NULL;
+
+        /* Lazy-allocate persistent packed buffers */
+        if (packed_data_cap < packed_size) {
+            buf_packed_data = [mtl_device newBufferWithLength:packed_size
+                                                     options:MTLResourceStorageModeShared];
+            packed_data_cap = packed_size;
+        }
+        size_t wo_size = (size_t)num_words * sizeof(uint32_t);
+        if (packed_wordoff_cap < wo_size) {
+            buf_packed_wordoff = [mtl_device newBufferWithLength:wo_size
+                                                         options:MTLResourceStorageModeShared];
+            packed_wordoff_cap = wo_size;
+        }
+        if (!buf_packed_hits) {
+            buf_packed_hits = [mtl_device newBufferWithLength:GPU_PACKED_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t)
+                                                      options:MTLResourceStorageModeShared];
+            buf_packed_hit_cnt = [mtl_device newBufferWithLength:sizeof(uint32_t)
+                                                         options:MTLResourceStorageModeShared];
+            buf_packed_params = [mtl_device newBufferWithLength:sizeof(MetalParams)
+                                                        options:MTLResourceStorageModeShared];
+            packed_hits_host = (uint32_t *)[buf_packed_hits contents];
+        }
+
+        /* Copy data + offsets on first chunk only (chunked dispatch reuses buffer) */
+        if (word_start == 0) {
+            memcpy([buf_packed_data contents], packed_buf, packed_size);
+            memcpy([buf_packed_wordoff contents], word_offset, wo_size);
+        }
+
+        /* Fill params */
+        MetalParams *params = (MetalParams *)[buf_packed_params contents];
+        memset(params, 0, sizeof(*params));
+        params->compact_mask = _compact_mask;
+        params->num_words = num_words;
+        params->max_probe = 256;
+        params->hash_data_count = _hash_data_count;
+        params->max_hits = GPU_PACKED_MAX_HITS;
+        params->overflow_count = _overflow_count;
+        params->max_iter = (_max_iter > 0) ? _max_iter : 1;
+        params->reserved32[0] = word_start;
+        params->reserved32[1] = packed_size;
+
+        /* Zero hit counter */
+        *((uint32_t *)[buf_packed_hit_cnt contents]) = 0;
+
+        /* Compute dispatch size: one thread per word, capped at 16M per chunk */
+        uint32_t dispatch_words = num_words - word_start;
+        if (dispatch_words > 16777216u) dispatch_words = 16777216u;
+
+        id<MTLCommandBuffer> cmdbuf = [mtl_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:buf_packed_data       offset:0 atIndex:0];
+        [enc setBuffer:buf_packed_wordoff    offset:0 atIndex:1];
+        /* Buffers 2-5: unused placeholders (kernel signature compatibility).
+         * Reuse small existing buffers to satisfy Metal argument requirements. */
+        [enc setBuffer:(buf_word_data ? buf_word_data : buf_packed_data) offset:0 atIndex:2];
+        [enc setBuffer:(buf_word_off  ? buf_word_off  : buf_packed_wordoff) offset:0 atIndex:3];
+        [enc setBuffer:(buf_word_len  ? buf_word_len  : buf_packed_hit_cnt) offset:0 atIndex:4];
+        [enc setBuffer:(buf_salt_data ? buf_salt_data : buf_packed_data) offset:0 atIndex:5];
+        [enc setBuffer:buf_compact_fp        offset:0 atIndex:6];
+        [enc setBuffer:buf_compact_idx       offset:0 atIndex:7];
+        [enc setBuffer:buf_packed_params     offset:0 atIndex:8];
+        [enc setBuffer:buf_hash_data         offset:0 atIndex:9];
+        [enc setBuffer:buf_hash_data_off     offset:0 atIndex:10];
+        [enc setBuffer:buf_hash_data_len     offset:0 atIndex:11];
+        [enc setBuffer:buf_packed_hits       offset:0 atIndex:12];
+        [enc setBuffer:buf_packed_hit_cnt    offset:0 atIndex:13];
+        [enc setBuffer:(buf_overflow_keys    ? buf_overflow_keys    : buf_packed_data) offset:0 atIndex:14];
+        [enc setBuffer:(buf_overflow_hashes  ? buf_overflow_hashes  : buf_packed_data) offset:0 atIndex:15];
+        [enc setBuffer:(buf_overflow_offsets ? buf_overflow_offsets : buf_packed_wordoff) offset:0 atIndex:16];
+        [enc setBuffer:(buf_overflow_lengths ? buf_overflow_lengths : buf_packed_wordoff) offset:0 atIndex:17];
+
+        NSUInteger tg_size = [pipeline maxTotalThreadsPerThreadgroup];
+        if (tg_size > 256) tg_size = 256;
+        MTLSize grid = MTLSizeMake(dispatch_words, 1, 1);
+        MTLSize tgroup = MTLSizeMake(tg_size, 1, 1);
+        [enc dispatchThreads:grid threadsPerThreadgroup:tgroup];
+        [enc endEncoding];
+        [cmdbuf commit];
+        [cmdbuf waitUntilCompleted];
+
+        uint32_t raw_nhits = *((uint32_t *)[buf_packed_hit_cnt contents]);
+        *nhits_out = (int)raw_nhits;
+        if (raw_nhits > GPU_PACKED_MAX_HITS) raw_nhits = GPU_PACKED_MAX_HITS;
+        return (raw_nhits > 0) ? packed_hits_host : NULL;
     }
 }
 

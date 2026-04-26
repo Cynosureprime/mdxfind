@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <iconv.h>
 #include "mdxfind.h"
 #include "job_types.h"
 #include "gpujob.h"
@@ -556,6 +557,132 @@ void gpujob(void *arg) {
         uint32_t *hits = NULL;
         int op_cat = gpu_op_category(g->op);
 
+        /* Packed password dispatch — GPU rule path.
+         * Mirrors OpenCL consumer block in gpu/gpujob_opencl.c around line 459.
+         * Chunked at 16M words per dispatch to prevent hit buffer overflow. */
+        if (g->packed && g->packed_count > 0) {
+            synthetic_job.op = g->op;
+            synthetic_job.flags = g->flags;
+            synthetic_job.filename = g->filename;
+            synthetic_job.doneprint = g->doneprint;
+            synthetic_job.found = (unsigned int *)&found;
+            synthetic_job.outlen = 0;
+
+            #define GPU_PACKED_CHUNK_METAL 16777216  /* 16M words per chunk */
+            uint32_t word_start = 0;
+            while (word_start < g->packed_count) {
+                hits = gpu_metal_dispatch_packed(
+                    g->packed_buf, g->packed_pos,
+                    g->word_offset, g->packed_count,
+                    word_start, g->op, &nhits);
+                uint32_t chunk_end = word_start + GPU_PACKED_CHUNK_METAL;
+                if (chunk_end > g->packed_count) chunk_end = g->packed_count;
+
+                if (hits && nhits > 0) {
+                    int stored = nhits;
+                    if (stored > GPU_PACKED_MAX_HITS) stored = GPU_PACKED_MAX_HITS;
+                    int hw = gpu_hash_words(g->op);
+                    int hexlen = hw * 8;
+                    for (int h = 0; h < stored; h++) {
+                        uint32_t *entry = hits + h * GPU_HIT_STRIDE;
+                        uint32_t widx = entry[0];
+                        if (widx >= g->packed_count) continue;
+                        for (int w = 0; w < hw; w++) curin.i[w] = entry[3 + w];
+
+                        /* Reconstruct password from packed buffer. For NTLMH the
+                         * buffer holds UTF-16LE zero-extended bytes; strip the 0x00
+                         * high byte of each pair to recover the original ASCII/utf-8-ish
+                         * bytes. For NTLM the buffer holds UTF-16LE (possibly from
+                         * iconv); convert back to UTF-8 via iconv. Other ops use
+                         * the raw packed bytes directly.  Per-thread iconv handle
+                         * initialized lazily. */
+                        uint32_t pos = g->word_offset[widx];
+                        if (pos >= g->packed_pos) continue;
+                        uint8_t plen = (uint8_t)g->packed_buf[pos];
+                        if (pos + 1 + plen > g->packed_pos) continue;
+                        char *pword = g->packed_buf + pos + 1;
+
+                        int iter_num = entry[2];
+                        int out_len;
+                        if (g->op == JOB_NTLMH) {
+                            /* Strip 0x00 high bytes; plen must be even. */
+                            int n = (int)plen / 2;
+                            for (int ii = 0; ii < n; ii++) synthetic_job.line[ii] = pword[2 * ii];
+                            synthetic_job.line[n] = 0;
+                            out_len = n;
+                        } else if (g->op == JOB_NTLM) {
+                            static __thread iconv_t cd_u16_to_u8 = (iconv_t)0;
+                            if (cd_u16_to_u8 == (iconv_t)0)
+                                cd_u16_to_u8 = iconv_open("UTF-8", "UTF-16LE");
+                            if (cd_u16_to_u8 == (iconv_t)-1) {
+                                memcpy(synthetic_job.line, pword, plen);
+                                synthetic_job.line[plen] = 0;
+                                out_len = plen;
+                            } else {
+                                size_t ic_in = plen;
+                                size_t ic_out = MAXLINE;
+                                char *ip = pword;
+                                char *op = synthetic_job.line;
+                                /* Reset conversion state, then convert. */
+                                iconv(cd_u16_to_u8, NULL, NULL, NULL, NULL);
+                                if (iconv(cd_u16_to_u8, &ip, &ic_in, &op, &ic_out) == (size_t)-1 &&
+                                    ic_out == MAXLINE) {
+                                    /* Conversion failed entirely — fall back to zero-extend strip. */
+                                    int n = (int)plen / 2;
+                                    for (int ii = 0; ii < n; ii++) synthetic_job.line[ii] = pword[2 * ii];
+                                    synthetic_job.line[n] = 0;
+                                    out_len = n;
+                                } else {
+                                    out_len = (int)(MAXLINE - ic_out);
+                                    if (out_len < 0) out_len = 0;
+                                    if (out_len >= MAXLINE) out_len = MAXLINE - 1;
+                                    synthetic_job.line[out_len] = 0;
+                                }
+                            }
+                        } else {
+                            memcpy(synthetic_job.line, pword, plen);
+                            synthetic_job.line[plen] = 0;
+                            out_len = plen;
+                        }
+                        synthetic_job.clen = out_len;
+                        synthetic_job.pass = synthetic_job.line;
+                        synthetic_job.Ruleindex = 0;
+                        checkhash(&curin, hexlen, iter_num, &synthetic_job);
+                    }
+                }
+
+                /* Hit-buffer overflow: halve chunk, resume after highest widx */
+                if (nhits > GPU_PACKED_MAX_HITS) {
+                    uint32_t max_widx = word_start;
+                    int s2 = GPU_PACKED_MAX_HITS;
+                    for (int h2 = 0; h2 < s2; h2++) {
+                        uint32_t w2 = hits[h2 * GPU_HIT_STRIDE];
+                        if (w2 > max_widx) max_widx = w2;
+                    }
+                    word_start = max_widx + 1;
+                } else {
+                    word_start = chunk_end;
+                }
+            }
+
+            if (synthetic_job.outlen > 0) {
+                fwrite(outbuf, synthetic_job.outlen, 1, stdout);
+                fflush(stdout);
+                synthetic_job.outlen = 0;
+            }
+
+            hashcnt += (uint64_t)g->packed_count * Maxiter;
+            if (hashcnt > 10000000 || found > 0) {
+                possess(FreeWaiting);
+                Tothash += hashcnt;
+                Totfound += found;
+                release(FreeWaiting);
+                hashcnt = 0;
+                found = 0;
+            }
+            goto return_jobg;
+        }
+
         if (g->count == 0) goto return_jobg;
         /* Unsalted types (GPU_CAT_MASK) have no salts — use num_masks instead.
          * Set nsalts_packed=1 as dummy so dispatch proceeds. */
@@ -1045,6 +1172,9 @@ return_jobg:
         g->count = 0;
         g->passbuf_pos = 0;
         g->word_stride = 0;
+        g->packed = 0;
+        g->packed_count = 0;
+        g->packed_pos = 0;
         possess(GPUFreeWaiting);
         if (GPUFreeTail) {
             *GPUFreeTail = g;
@@ -1117,6 +1247,11 @@ int gpujob_init(int num_jobg) {
 
     for (int i = 0; i < num_jobg; i++) {
         struct jobg *g = (struct jobg *)malloc_lock(sizeof(struct jobg), "jobg");
+        g->packed_buf = NULL;
+        g->word_offset = NULL;
+        g->packed = 0;
+        g->packed_count = 0;
+        g->packed_pos = 0;
         if (GPUFreeTail) {
             *GPUFreeTail = g;
             GPUFreeTail = &(g->next);
@@ -1317,6 +1452,7 @@ int gpu_op_category(int op) {
     case JOB_MD5: case JOB_MD5UC:
     case JOB_MD4:
     case JOB_NTLMH:
+    case JOB_NTLM:
     case JOB_SHA1:
     case JOB_SHA224:
     case JOB_SHA256:
@@ -1375,7 +1511,7 @@ int gpu_op_family(int op) {
         return FAM_SHA1;
     case JOB_MD5: case JOB_MD5UC: case JOB_MD5RAW:
         return FAM_MD5UNSALTED;
-    case JOB_MD4: case JOB_NTLMH:
+    case JOB_MD4: case JOB_NTLMH: case JOB_NTLM:
         return FAM_MD4UNSALTED;
     case JOB_SHA1: case JOB_SHA1RAW: case JOB_SQL5:
         return FAM_SHA1UNSALTED;

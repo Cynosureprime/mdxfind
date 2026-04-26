@@ -55,6 +55,12 @@ struct gpu_device {
     /* Mask mode */
     cl_mem bgpu_mask_desc;  /* mask descriptor: charset IDs per position */
 
+    /* Packed password dispatch (GPU rule path) */
+    cl_mem b_packed_buf, b_chunk_index;
+    cl_kernel kern_packed;         /* MD5 packed kernel (legacy, TODO: remove) */
+    cl_kernel kern_packed_fam[FAM_COUNT];  /* per-family packed kernels */
+    size_t packed_buf_cap, chunk_index_cap;
+
     /* Per-family timing-based dispatch sizing */
     uint32_t fam_max_items[FAM_COUNT];  /* timed max work items per dispatch */
     int      fam_timed[FAM_COUNT];      /* 1 = probed for this family */
@@ -236,6 +242,11 @@ static char *load_kernel_file(const char *path) {
 #include "gpu_md5mask_str.h"
 #include "gpu_descrypt_str.h"
 #include "gpu_md5unsalted_str.h"
+#include "gpu_md5_packed_str.h"
+#include "gpu_sha1_packed_str.h"
+#include "gpu_sha256_packed_str.h"
+#include "gpu_md4_packed_str.h"
+#include "gpu_sha512_packed_str.h"
 #include "gpu_md4unsalted_str.h"
 #include "gpu_sha1unsalted_str.h"
 #include "gpu_sha256unsalted_str.h"
@@ -346,7 +357,41 @@ static const char *family_source[FAM_COUNT] = {
     [FAM_RMD160UNSALTED]    = gpu_rmd160unsalted_str,
     [FAM_BLAKE2S256UNSALTED] = gpu_blake2s256unsalted_str,
     [FAM_BCRYPT]            = gpu_bcrypt_str,
+    [FAM_MD5PACKED]         = gpu_md5_packed_str,
 };
+
+/* Packed kernel registry: maps FAM_* to packed kernel source and entry point.
+ * Used by gpu_opencl_dispatch_packed() to compile/select the right kernel. */
+static const struct {
+    const char *source;      /* kernel source string (from _str.h) */
+    const char *entry;       /* kernel function name */
+} packed_kernel_map[FAM_COUNT] = {
+    [FAM_MD5UNSALTED]        = { gpu_md5_packed_str,  "md5_packed_batch" },
+    [FAM_SHA1UNSALTED]       = { gpu_sha1_packed_str, "sha1_packed_batch" },
+    [FAM_SHA256UNSALTED]     = { gpu_sha256_packed_str, "sha256_packed_batch" },
+    [FAM_MD4UNSALTED]        = { gpu_md4_packed_str,  "md4_packed_batch" },
+    [FAM_SHA512UNSALTED]     = { gpu_sha512_packed_str, "sha512_packed_batch" },
+};
+
+/* Map JOB_* op to packed kernel family. Returns -1 if no packed kernel. */
+static int packed_family(int op) {
+    switch (op) {
+    case JOB_MD5: case JOB_MD5UC: case JOB_MD5RAW:
+        return FAM_MD5UNSALTED;
+    case JOB_SHA1: case JOB_SHA1RAW: case JOB_SQL5:
+        return FAM_SHA1UNSALTED;
+    case JOB_SHA256: case JOB_SHA256RAW: case JOB_SHA224:
+        return FAM_SHA256UNSALTED;
+    case JOB_MD4:
+    case JOB_NTLMH:
+    case JOB_NTLM:
+        return FAM_MD4UNSALTED;
+    case JOB_SHA512: case JOB_SHA512RAW: case JOB_SHA384: case JOB_SHA384RAW:
+        return FAM_SHA512UNSALTED;
+    default:
+        return -1;
+    }
+}
 
 /* Kernel-to-op mapping table. Each entry: kernel function name, ops it serves, family.
  * Adding a new GPU algorithm = one line here + a .cl file in gpu/. */
@@ -427,6 +472,7 @@ static const struct {
     {"rmd160_unsalted_batch",          {JOB_RMD160, -1}, FAM_RMD160UNSALTED},
     {"blake2s256_unsalted_batch",      {JOB_BLAKE2S256, -1}, FAM_BLAKE2S256UNSALTED},
     {"bcrypt_batch",                   {JOB_BCRYPT, -1}, FAM_BCRYPT},
+    {"md5_packed_batch",               {-1}, FAM_MD5PACKED},  /* no JOB_ — dispatched directly */
     {NULL, {-1}, 0}
 };
 #define KERN_ITER_IDX 2  /* index of md5salt_iter in kernel_map (for Maxiter override) */
@@ -500,18 +546,20 @@ static int init_device(int di, cl_device_id dev_id) {
     if (compute_units < 8)
         d->max_batch = compute_units * 8;   /* tiny GPU: 4 CU -> 32 words */
     else
-        d->max_batch = GPUBATCH_MAX;        /* 8+ CU: full 512 */
+        d->max_batch = GPUBATCH_RULE_MAX;   /* 8+ CU: full 4192 */
     if (d->max_batch < 16) d->max_batch = 16;
-    if (d->max_batch > GPUBATCH_MAX) d->max_batch = GPUBATCH_MAX;
+    if (d->max_batch > GPUBATCH_RULE_MAX) d->max_batch = GPUBATCH_RULE_MAX;
     fprintf(stderr, "OpenCL GPU[%d]: %u compute units, batch size %d\n",
             di, compute_units, d->max_batch);
 
     /* Per-device dispatch buffers */
+    /* Hit buffer sized for packed dispatch: up to GPU_PACKED_MAX_HITS (9.7MB).
+     * Also used by standard dispatch (which needs at most GPU_MAX_HITS). */
     d->b_hits = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
-                               GPU_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t), NULL, &err);
+                               GPU_PACKED_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t), NULL, &err);
     d->b_hit_count = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR,
                                      sizeof(uint32_t), NULL, &err);
-    d->h_hits = (uint32_t *)malloc_lock(GPU_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t),"device_init");
+    d->h_hits = (uint32_t *)malloc_lock(GPU_PACKED_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t),"device_init");
     d->b_params = dev_buf(d, sizeof(OCLParams), CL_MEM_READ_ONLY);
 
     /* Dummy overflow buffers (replaced when overflow is loaded) */
@@ -1095,6 +1143,151 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
     return 0;
 }
 
+/* Dispatch a packed password buffer to GPU for hashing.
+ * Selects kernel based on op (JOB_MD5, JOB_SHA1, etc).
+ * packed_buf: [len_byte][password_bytes]... tightly packed
+ * word_offset: uint32 byte offset per word into packed_buf
+ * packed_size: total bytes in packed_buf
+ * num_words: total passwords in buffer
+ * Returns hit buffer pointer and sets *nhits_out. */
+uint32_t *gpu_opencl_dispatch_packed(int dev_idx,
+    const char *packed_buf, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    uint32_t word_start, int op, int *nhits_out)
+{
+    *nhits_out = 0;
+    if (dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
+    if (num_words == 0) return NULL;
+    struct gpu_device *d = &gpu_devs[dev_idx];
+    cl_int err;
+
+    /* Select packed kernel by op */
+    int pfam = packed_family(op);
+    if (pfam < 0) return NULL;
+
+    /* Compile packed kernel on first use for this family.
+     * Uses separate program compilation from the standard (non-packed) kernels
+     * because the packed kernel source is different. */
+    cl_kernel kern = d->kern_packed_fam[pfam];
+    if (!kern) {
+        if (!packed_kernel_map[pfam].source) return NULL;
+        /* Compile packed kernel source (separate from fam_prog which has the standard kernel) */
+        cl_program prog;
+        const char *sources[2] = { gpu_common_str, packed_kernel_map[pfam].source };
+        prog = clCreateProgramWithSource(d->ctx, 2, sources, NULL, &err);
+        if (!prog) return NULL;
+        err = clBuildProgram(prog, 1, &d->dev, "-cl-std=CL1.2", NULL, NULL);
+        if (err != CL_SUCCESS) {
+            char log[4096];
+            clGetProgramBuildInfo(prog, d->dev,
+                CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
+            fprintf(stderr, "OpenCL GPU[%d]: packed kernel build error (fam %d): %s\n", dev_idx, pfam, log);
+            clReleaseProgram(prog);
+            return NULL;
+        }
+        kern = clCreateKernel(prog, packed_kernel_map[pfam].entry, &err);
+        if (!kern) {
+            fprintf(stderr, "OpenCL GPU[%d]: failed to create packed kernel '%s'\n",
+                    dev_idx, packed_kernel_map[pfam].entry);
+            clReleaseProgram(prog);
+            return NULL;
+        }
+        d->kern_packed_fam[pfam] = kern;
+        /* Note: prog leaked intentionally — kernel holds a reference */
+    }
+
+    /* Grow GPU buffers as needed */
+    if ((size_t)packed_size > d->packed_buf_cap) {
+        if (d->b_packed_buf) clReleaseMemObject(d->b_packed_buf);
+        d->b_packed_buf = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, packed_size, NULL, &err);
+        d->packed_buf_cap = packed_size;
+    }
+    size_t wo_size = (size_t)num_words * sizeof(uint32_t);
+    if (wo_size > d->chunk_index_cap) {
+        if (d->b_chunk_index) clReleaseMemObject(d->b_chunk_index);
+        d->b_chunk_index = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, wo_size, NULL, &err);
+        d->chunk_index_cap = wo_size;
+    }
+
+    /* Upload packed data and word offsets (skip if word_start > 0 = same buffer, chunked dispatch) */
+    if (word_start == 0) {
+        clEnqueueWriteBuffer(d->queue, d->b_packed_buf, CL_TRUE, 0, packed_size, packed_buf, 0, NULL, NULL);
+        clEnqueueWriteBuffer(d->queue, d->b_chunk_index, CL_TRUE, 0, wo_size, word_offset, 0, NULL, NULL);
+    }
+
+    /* Build params */
+    _Static_assert(sizeof(OCLParams) == 128, "OCLParams must be 128 bytes");
+    OCLParams params;
+    memset(&params, 0, sizeof(params));
+    params.compact_mask = _compact_mask;
+    params.num_words = num_words;
+    params.max_probe = 256;
+    params.hash_data_count = _hash_data_count;
+    params.max_hits = GPU_PACKED_MAX_HITS;
+    params.overflow_count = _overflow_count;
+    params.max_iter = d->max_iter;
+    params.reserved32[0] = word_start;
+    params.reserved32[1] = packed_size;
+
+    clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
+
+    /* Zero hit counter */
+    uint32_t zero = 0;
+    if (p_clEnqueueFillBuffer)
+        clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero, sizeof(zero), 0, sizeof(zero), 0, NULL, NULL);
+    else
+        clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero), &zero, 0, NULL, NULL);
+    clFinish(d->queue);
+
+    /* Set kernel args */
+    {
+        int a = 0;
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_packed_buf);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_chunk_index);  /* word_offset */
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_data);   /* unused */
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_off);    /* unused */
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_salt_len);    /* unused */
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_compact_fp);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_compact_idx);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_params);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hash_data);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hash_data_off);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hash_data_len);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hits);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hit_count);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_keys);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_hashes);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_offsets);
+        clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_overflow_lengths);
+    }
+
+    /* Launch: one thread per word in this chunk (max 1M) */
+    uint32_t dispatch_words = num_words - word_start;
+    if (dispatch_words > 16777216) dispatch_words = 16777216;  /* GPU_PACKED_CHUNK */
+    size_t local = 256;
+    size_t global = ((dispatch_words + local - 1) / local) * local;
+    err = clEnqueueNDRangeKernel(d->queue, kern, 1, NULL, &global, &local, 0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL GPU[%d] packed dispatch error: %d (global=%zu)\n", dev_idx, err, global);
+        return NULL;
+    }
+    clFinish(d->queue);
+
+    /* Read hit count */
+    uint32_t raw_nhits = 0;
+    clEnqueueReadBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(raw_nhits), &raw_nhits, 0, NULL, NULL);
+    *nhits_out = raw_nhits;
+    if (raw_nhits > GPU_PACKED_MAX_HITS) raw_nhits = GPU_PACKED_MAX_HITS;
+
+    /* Read hits if any */
+    if (raw_nhits > 0) {
+        clEnqueueReadBuffer(d->queue, d->b_hits, CL_TRUE, 0,
+            raw_nhits * GPU_HIT_STRIDE * sizeof(uint32_t), d->h_hits, 0, NULL, NULL);
+    }
+
+    return (raw_nhits > 0) ? d->h_hits : NULL;
+}
+
 uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     const char *hexhashes, const uint16_t *hexlens,
     int num_words, int *nhits_out)
@@ -1142,7 +1335,7 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
         word_stride = 256;
     }
     size_t words_size = (size_t)num_words * word_stride;
-    size_t hexlens_upload = ((num_words > GPUBATCH_MAX) ? GPUBATCH_MAX : num_words) * sizeof(uint16_t);
+    size_t hexlens_upload = ((num_words > GPUBATCH_RULE_MAX) ? GPUBATCH_RULE_MAX : num_words) * sizeof(uint16_t);
     /* Reuse GPU buffers, grow as needed, upload via clEnqueueWriteBuffer */
     if (words_size > d->hexhash_cap) {
         if (d->b_hexhashes) clReleaseMemObject(d->b_hexhashes);

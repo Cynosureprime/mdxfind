@@ -22,7 +22,7 @@ enum {
     FAM_WRLUNSALTED, FAM_MD6256UNSALTED, FAM_KECCAKUNSALTED,
     FAM_HMAC_SHA512, FAM_MYSQL3UNSALTED, FAM_HMAC_RMD160, FAM_HMAC_RMD320,
     FAM_HMAC_BLAKE2S, FAM_STREEBOG, FAM_SHA512CRYPT, FAM_SHA256CRYPT,
-    FAM_RMD160UNSALTED, FAM_BLAKE2S256UNSALTED, FAM_BCRYPT, FAM_COUNT
+    FAM_RMD160UNSALTED, FAM_BLAKE2S256UNSALTED, FAM_BCRYPT, FAM_MD5PACKED, FAM_COUNT
 };
 
 /* Forward declarations for mdxfind types */
@@ -37,7 +37,12 @@ extern "C" {
 void *malloc_lock(size_t size, const char *reason);
 
 #define GPUBATCH_MAX   512
-#define GPUBATCH_PASS  (GPUBATCH_MAX * 256)  /* ~128KB password buffer */
+#define GPUBATCH_RULE_MAX 4192  /* max words for rule-packing MD5 path */
+#define GPUBATCH_PASS  (GPUBATCH_RULE_MAX * 64)  /* 262KB: fits GPUBATCH_RULE_MAX at stride 64 */
+
+/* Packed password buffer for GPU rule dispatch */
+#define GPUBATCH_PACKED_SIZE (128 * 1024 * 1024)  /* 128MB per buffer */
+#define GPUBATCH_PACKED_MAXWORDS (128 * 1024 * 1024)  /* limited by buffer, not word count */
 
 /* GPU algorithm categories */
 #define GPU_CAT_NONE     0   /* not GPU-capable */
@@ -48,6 +53,7 @@ void *malloc_lock(size_t size, const char *reason);
 #define GPU_CAT_UNSALTED 5   /* unsalted pre-padded: GPU fills masks into M[] */
 
 #define GPU_MAX_PASSLEN  55  /* max password length for GPU (single MD5 block with salt) */
+#define GPU_PACKED_MAX_HITS 262144  /* hit buffer size for packed dispatch */
 
 /* Universal GPU hit entry stride: 19 uint32 words per hit.
  * Layout: [0]=word_idx [1]=salt_idx [2]=iter_num [3..18]=hash[0..15]
@@ -68,29 +74,37 @@ int gpu_hash_words(int op);
 struct jobg {
     struct jobg *next;
     char        *filename;
-    /* Word data: 256KB contiguous for unsalted 64-byte stride (4096 words).
+    /* Word data: contiguous buffer for pre-padded words.
+     * GPUBATCH_RULE_MAX * 64 = 262KB for MD5 rule-packing path.
      * Legacy accesses first half as passbuf, second half as hexhash[]. */
     union {
-        char     raw[GPUBATCH_PASS + GPUBATCH_MAX * 256]; /* 256KB contiguous */
+        char     raw[GPUBATCH_PASS + GPUBATCH_MAX * 256]; /* legacy size */
         struct { char passbuf[GPUBATCH_PASS]; char hexhash[GPUBATCH_MAX][256]; };
     };
-    uint16_t     hexlen[GPUBATCH_MAX];
+    uint16_t     hexlen[GPUBATCH_RULE_MAX];
 
     /* Password data for checkhashkey output */
-    uint32_t     passoff[GPUBATCH_MAX];
-    uint16_t     passlen[GPUBATCH_MAX];
+    uint32_t     passoff[GPUBATCH_RULE_MAX];
+    uint16_t     passlen[GPUBATCH_RULE_MAX];
 
     /* Job context for checkhashkey */
-    int          clen[GPUBATCH_MAX];
-    int          ruleindex[GPUBATCH_MAX];
+    int          clen[GPUBATCH_RULE_MAX];
+    int          ruleindex[GPUBATCH_RULE_MAX];
     int         *doneprint;
     int          flags;
     int          op;                        /* JOB_MD5SALT etc. */
-    int          count;                     /* entries filled (0..GPUBATCH_MAX) */
+    int          count;                     /* entries filled (0..GPUBATCH_RULE_MAX) */
     int          max_count;                 /* max entries for this batch (stride-dependent) */
     uint32_t     passbuf_pos;               /* fill cursor into passbuf */
     uint32_t     word_stride;               /* bytes per word slot (64, 128, 256) */
     unsigned int line_num;              /* starting line number for priority ordering */
+
+    /* Packed password buffer (GPU rule dispatch) */
+    char        *packed_buf;               /* 128MB malloc'd buffer: [len][data]... */
+    uint32_t    *word_offset;              /* byte offset per word */
+    uint32_t     packed_count;             /* words packed so far */
+    uint32_t     packed_pos;               /* byte fill cursor in packed_buf */
+    int          packed;                   /* 1 = packed format, 0 = legacy */
 
 };
 
@@ -123,6 +137,12 @@ int gpujob_available(void);
 
 /* Returns per-device batch limit (min across all GPUs). */
 int gpujob_batch_max(void);
+
+/* Returns number of batches waiting in GPU work queue. */
+int gpujob_queue_depth(void);
+
+/* Returns number of free jobg buffers available. */
+int gpujob_free_count(void);
 
 #ifdef __cplusplus
 }

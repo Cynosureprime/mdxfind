@@ -61,6 +61,11 @@ uint32_t *gpu_opencl_dispatch_batch(int dev_idx,
     const char *hexhashes, const uint16_t *hexlens,
     int num_words, int *nhits_out);
 
+uint32_t *gpu_opencl_dispatch_packed(int dev_idx,
+    const char *packed_buf, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    uint32_t word_start, int op, int *nhits_out);
+
 #ifdef __cplusplus
 }
 #endif

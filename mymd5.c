@@ -1,5 +1,11 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.30  2026/04/26 15:19:22  dlr
+ * Pomelo: silence -Wmacro-redefined for F/G/H. The MD5 round macros earlier in the file use F/G/H with three args; Pomelo's same-named macros are single-arg and confined to the Pomelo round function. Add #undef F/G/H immediately before the Pomelo block — the MD5 macros aren't referenced past this point. Three new warnings (one per macro on every host) cleared. POMELO -z e429 output unchanged.
+ *
+ * Revision 1.29  2026/04/26 15:08:51  dlr
+ * Pomelo cross-platform port: append portable POMELO v2 implementation (PHC submission by Hongjun Wu, 2015) to mymd5.c. The new code lives at the end of mymd5.c with a 128-bit vector abstraction layer that selects SSE2 (Intel), NEON (ARM AArch64/v7), Altivec/VSX (PowerPC), or scalar fallback (SPARC, generic) at compile time via predefined macros (__SSE2__, __ARM_NEON, __ALTIVEC__/__VSX__). Source is pom.c at the top of the tree (test harness omitted). Local build clean; -z e429 POMELO self-test produces the expected hash for default user 'administrator'.
+ *
  * Revision 1.28  2026/04/14 19:56:38  dlr
  * POWER8 AltiVec SIMD: mymd5salt_pre/post/salt2, procsaltbb for 4-wide MD5SALT and PHPBB3 (3x speedup)
  *
@@ -2986,5 +2992,336 @@ void SHA(char *cur, int len, unsigned char *dest) {
         dest[4*i+2] = (h[i] >>  8) & 0xFF;
         dest[4*i+3] =  h[i]        & 0xFF;
     }
+}
+
+
+
+/* ============================================================
+ * POMELO v2 (PHC submission by Hongjun Wu, Jan 31, 2015)
+ * Restructured for multi-platform SIMD support: SSE2 (Intel),
+ * NEON (ARM AArch64/v7), Altivec/VSX (PowerPC), scalar fallback
+ * (SPARC, generic). Source: pom.c at the top of this tree.
+ * Moved here from mdxfind.c (was Intel-only) to enable JOB_POMELO
+ * on every platform.
+ * ============================================================ */
+
+/* MD5 round macros above use F/G/H with three args — undefine here so
+ * Pomelo's same-named single-arg macros are unambiguous and don't trip
+ * -Wmacro-redefined. The MD5 versions aren't referenced past this point. */
+#undef F
+#undef G
+#undef H
+// PHC submission:  POMELO v2
+// Designed by:     Hongjun Wu (Email: wuhongjun@gmail.com)
+// This code was written by Hongjun Wu on Jan 31, 2015.
+//
+// Restructured for multi-platform SIMD support by Waffle, 2026.
+// Builds on Intel (SSE2), ARM (NEON), PowerPC (Altivec/VSX),
+// and scalar fallback (SPARC, etc).
+//
+// m_cost is an integer, 0 <= m_cost <= 25; the memory size is 2**(13+m_cost) bytes
+// t_cost is an integer, 0 <= t_cost <= 25; the number of steps is roughly:  2**(8+m_cost+t_cost)
+// For the machine today, it is recommended that: 5 <= t_cost + m_cost <= 25;
+// one may use the parameters: m_cost = 15; t_cost = 0; (256 MegaByte memory)
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ============================================================
+// Platform detection and 128-bit vector abstraction
+// ============================================================
+
+#if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
+  // Intel SSE2
+  #define POM_SSE2 1
+  #include <emmintrin.h>
+  typedef __m128i pom128_t;
+
+  #define POM_ADD(x, y)       _mm_add_epi64((x), (y))
+  #define POM_XOR(x, y)       _mm_xor_si128((x), (y))
+  #define POM_OR(x, y)        _mm_or_si128((x), (y))
+  #define POM_SHL64(x, n)     _mm_slli_epi64((x), (n))
+  #define POM_SHR64(x, n)     _mm_srli_epi64((x), (n))
+  #define POM_BYTEL8(x)       _mm_slli_si128((x), 8)
+  #define POM_BYTER8(x)       _mm_srli_si128((x), 8)
+  #define POM_ZERO()          _mm_setzero_si128()
+  static inline unsigned long long pom_getlo64(__m128i x) {
+    return (unsigned long long)_mm_cvtsi128_si64(x);
+  }
+  #define POM_GETLO64(x)      pom_getlo64(x)
+
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+  // ARM NEON (AArch64 and ARMv7 with NEON)
+  #define POM_NEON 1
+  #include <arm_neon.h>
+  typedef uint64x2_t pom128_t;
+
+  #define POM_ADD(x, y)       vaddq_u64((x), (y))
+  #define POM_XOR(x, y)       veorq_u64((x), (y))
+  #define POM_OR(x, y)        vorrq_u64((x), (y))
+  #define POM_SHL64(x, n)     vshlq_n_u64((x), (n))
+  #define POM_SHR64(x, n)     vshrq_n_u64((x), (n))
+  // Byte shift left 8: move low 64 to high, zero low
+  static inline pom128_t pom_bytel8(pom128_t x) {
+    return vextq_u64(vdupq_n_u64(0), x, 1);
+  }
+  // Byte shift right 8: move high 64 to low, zero high
+  static inline pom128_t pom_byter8(pom128_t x) {
+    return vextq_u64(x, vdupq_n_u64(0), 1);
+  }
+  #define POM_BYTEL8(x)       pom_bytel8(x)
+  #define POM_BYTER8(x)       pom_byter8(x)
+  #define POM_ZERO()          vdupq_n_u64(0)
+  static inline unsigned long long pom_getlo64(pom128_t x) {
+    return vgetq_lane_u64(x, 0);
+  }
+  #define POM_GETLO64(x)      pom_getlo64(x)
+
+#elif defined(__ALTIVEC__) || defined(__VSX__)
+  // PowerPC Altivec/VSX
+  #define POM_ALTIVEC 1
+  #include <altivec.h>
+  // "vector" is a keyword in Altivec; use __vector to avoid conflicts
+  typedef __vector unsigned long long pom128_t;
+
+  #define POM_ADD(x, y)       vec_add((x), (y))
+  #define POM_XOR(x, y)       vec_xor((x), (y))
+  #define POM_OR(x, y)        vec_or((x), (y))
+  // Per-element 64-bit shifts
+  static inline pom128_t pom_shl64(pom128_t x, unsigned int n) {
+    pom128_t sv = {n, n};
+    return vec_sl(x, sv);
+  }
+  static inline pom128_t pom_shr64(pom128_t x, unsigned int n) {
+    pom128_t sv = {n, n};
+    return vec_sr(x, sv);
+  }
+  #define POM_SHL64(x, n)     pom_shl64((x), (n))
+  #define POM_SHR64(x, n)     pom_shr64((x), (n))
+  // Byte shift left 8: move element 1 to 0 position, zero the other
+  // On big-endian PPC: sld shifts left, we want low dword to high
+  static inline pom128_t pom_bytel8(pom128_t x) {
+    pom128_t zero = {0, 0};
+  #ifdef __LITTLE_ENDIAN__
+    return vec_sld(x, zero, 8);
+  #else
+    return vec_sld(zero, x, 8);
+  #endif
+  }
+  static inline pom128_t pom_byter8(pom128_t x) {
+    pom128_t zero = {0, 0};
+  #ifdef __LITTLE_ENDIAN__
+    return vec_sld(zero, x, 8);
+  #else
+    return vec_sld(x, zero, 8);
+  #endif
+  }
+  #define POM_BYTEL8(x)       pom_bytel8(x)
+  #define POM_BYTER8(x)       pom_byter8(x)
+  #define POM_ZERO()          ((pom128_t){0, 0})
+  // Extract low 64 bits — endian-aware
+  static inline unsigned long long pom_getlo64(pom128_t x) {
+  #ifdef __LITTLE_ENDIAN__
+    return x[0];
+  #else
+    return x[1];
+  #endif
+  }
+  #define POM_GETLO64(x)      pom_getlo64(x)
+
+#else
+  // Scalar fallback (SPARC, generic)
+  #define POM_SCALAR 1
+  typedef struct { unsigned long long lo, hi; } pom128_t;
+
+  static inline pom128_t pom_add(pom128_t x, pom128_t y) {
+    pom128_t r; r.lo = x.lo + y.lo; r.hi = x.hi + y.hi; return r;
+  }
+  static inline pom128_t pom_xor(pom128_t x, pom128_t y) {
+    pom128_t r; r.lo = x.lo ^ y.lo; r.hi = x.hi ^ y.hi; return r;
+  }
+  static inline pom128_t pom_or(pom128_t x, pom128_t y) {
+    pom128_t r; r.lo = x.lo | y.lo; r.hi = x.hi | y.hi; return r;
+  }
+  static inline pom128_t pom_shl64(pom128_t x, int n) {
+    pom128_t r; r.lo = x.lo << n; r.hi = x.hi << n; return r;
+  }
+  static inline pom128_t pom_shr64(pom128_t x, int n) {
+    pom128_t r; r.lo = x.lo >> n; r.hi = x.hi >> n; return r;
+  }
+  // Byte shift left 8: low → high, zero low
+  static inline pom128_t pom_bytel8(pom128_t x) {
+    pom128_t r; r.hi = x.lo; r.lo = 0; return r;
+  }
+  // Byte shift right 8: high → low, zero high
+  static inline pom128_t pom_byter8(pom128_t x) {
+    pom128_t r; r.lo = x.hi; r.hi = 0; return r;
+  }
+
+  #define POM_ADD(x, y)       pom_add((x), (y))
+  #define POM_XOR(x, y)       pom_xor((x), (y))
+  #define POM_OR(x, y)        pom_or((x), (y))
+  #define POM_SHL64(x, n)     pom_shl64((x), (n))
+  #define POM_SHR64(x, n)     pom_shr64((x), (n))
+  #define POM_BYTEL8(x)       pom_bytel8(x)
+  #define POM_BYTER8(x)       pom_byter8(x)
+  static inline pom128_t pom_zero(void) {
+    pom128_t r; r.lo = r.hi = 0; return r;
+  }
+  #define POM_ZERO()          pom_zero()
+  static inline unsigned long long pom_getlo64(pom128_t x) {
+    return x.lo;
+  }
+  #define POM_GETLO64(x)      pom_getlo64(x)
+
+#endif
+
+// ============================================================
+// POMELO macros using platform-neutral primitives
+// ============================================================
+
+#define POM_ROTL(x, n)      POM_XOR(POM_SHL64((x), (n)), POM_SHR64((x), (64-(n))))
+
+// Function F0: update the state using a nonlinear feedback shift register
+#define F0(i)  {               \
+    i0 = ((i) - 0*2)  & mask1; \
+    i1 = ((i) - 2*2)  & mask1; \
+    i2 = ((i) - 3*2)  & mask1; \
+    i3 = ((i) - 7*2)  & mask1; \
+    i4 = ((i) - 13*2) & mask1; \
+    S[i0]   = POM_XOR(POM_ADD(POM_XOR(S[i1],   S[i2]),   S[i3]),   S[i4]);    \
+    S[i0+1] = POM_XOR(POM_ADD(POM_XOR(S[i1+1], S[i2+1]), S[i3+1]), S[i4+1]);  \
+    temp = S[i0];                  \
+    S[i0]   = POM_XOR(POM_BYTEL8(S[i0]),   POM_BYTER8(S[i0+1]));  \
+    S[i0+1] = POM_XOR(POM_BYTEL8(S[i0+1]), POM_BYTER8(temp));   \
+    S[i0]   = POM_ROTL(S[i0],  17);  \
+    S[i0+1] = POM_ROTL(S[i0+1],17);  \
+}
+
+// Function F: update the state using a nonlinear feedback shift register
+#define F(i)  {              \
+    i0 = ((i) - 0*2)  & mask1; \
+    i1 = ((i) - 2*2)  & mask1; \
+    i2 = ((i) - 3*2)  & mask1; \
+    i3 = ((i) - 7*2)  & mask1; \
+    i4 = ((i) - 13*2) & mask1; \
+    S[i0]   = POM_ADD(S[i0],POM_XOR(POM_ADD(POM_XOR(S[i1],   S[i2]),   S[i3]),   S[i4]));    \
+    S[i0+1] = POM_ADD(S[i0+1],POM_XOR(POM_ADD(POM_XOR(S[i1+1], S[i2+1]), S[i3+1]), S[i4+1]));  \
+    temp = S[i0];                  \
+    S[i0]   = POM_XOR(POM_BYTEL8(S[i0]),   POM_BYTER8(S[i0+1]));  \
+    S[i0+1] = POM_XOR(POM_BYTEL8(S[i0+1]), POM_BYTER8(temp));   \
+    S[i0]   = POM_ROTL(S[i0],  17);  \
+    S[i0+1] = POM_ROTL(S[i0+1],17);  \
+}
+
+#define G(i, random_number)  {                                                          \
+    index_global = ((random_number >> 16) & mask) << 1;                                \
+    for (j = 0; j < 64; j = j+2)                                                        \
+    {                                                                                  \
+        F(i+j);                                                                        \
+        index_global     = (index_global + 2) & mask1;                                 \
+        index_local      = (((i + j) >> 1) - 0x1000 + (random_number & 0x1fff)) & mask;\
+        index_local      = index_local << 1;                                           \
+        S[i0]            = POM_ADD(S[i0],  POM_SHL64(S[index_local],1));                \
+        S[i0+1]          = POM_ADD(S[i0+1],POM_SHL64(S[index_local+1],1));              \
+        S[index_local]   = POM_ADD(S[index_local],   POM_SHL64(S[i0],2));               \
+        S[index_local+1] = POM_ADD(S[index_local+1], POM_SHL64(S[i0+1],2));             \
+        S[i0]            = POM_ADD(S[i0],  POM_SHL64(S[index_global],1));               \
+        S[i0+1]          = POM_ADD(S[i0+1],POM_SHL64(S[index_global+1],1));             \
+        S[index_global]  = POM_ADD(S[index_global],  POM_SHL64(S[i0],3));               \
+        S[index_global+1]= POM_ADD(S[index_global+1],POM_SHL64(S[i0+1],3));             \
+        random_number   += (random_number << 2);                                       \
+        random_number    = (random_number << 19) ^ (random_number >> 45)  ^ 3141592653589793238ULL;   \
+    }                                                                                  \
+}
+
+#define H(i, random_number)  {                                                         \
+    index_global = ((random_number >> 16) & mask) << 1;                                \
+    for (j = 0; j < 64; j = j+2)                                                       \
+    {                                                                                  \
+        F(i+j);                                                                        \
+        index_global     = (index_global + 2) & mask1;                                 \
+        index_local      = (((i + j) >> 1) - 0x1000 + (random_number & 0x1fff)) & mask;\
+        index_local      = index_local << 1;                                           \
+        S[i0]            = POM_ADD(S[i0],  POM_SHL64(S[index_local],1));                \
+        S[i0+1]          = POM_ADD(S[i0+1],POM_SHL64(S[index_local+1],1));              \
+        S[index_local]   = POM_ADD(S[index_local],   POM_SHL64(S[i0],2));               \
+        S[index_local+1] = POM_ADD(S[index_local+1], POM_SHL64(S[i0+1],2));             \
+        S[i0]            = POM_ADD(S[i0],  POM_SHL64(S[index_global],1));               \
+        S[i0+1]          = POM_ADD(S[i0+1],POM_SHL64(S[index_global+1],1));             \
+        S[index_global]  = POM_ADD(S[index_global],  POM_SHL64(S[i0],3));               \
+        S[index_global+1]= POM_ADD(S[index_global+1],POM_SHL64(S[i0+1],3));             \
+        random_number  = POM_GETLO64(S[i3]);                                             \
+    }                                                                                  \
+}
+
+// ============================================================
+// PHS: POMELO hash function
+// ============================================================
+
+int PHS(void *out, size_t outlen, const void *in, size_t inlen,
+        const void *salt, size_t saltlen,
+        unsigned int t_cost, unsigned int m_cost) {
+  unsigned long long i, j;
+  pom128_t temp;
+  unsigned long long i0, i1, i2, i3, i4;
+  pom128_t S[4096];
+  unsigned long long random_number, index_global, index_local;
+  unsigned long long state_size, mask, mask1;
+
+  // Check the size of password, salt and output.
+  // Password is at most 256 bytes; the salt is at most 64 bytes.
+  if (inlen > 256 || saltlen > 64 || outlen > 256 ||
+      inlen < 0 || saltlen < 0 || outlen < 0) return 1;
+
+  // Step 1: Initialize the state S
+  state_size = 1ULL << (13 + m_cost);   // state size is 2**(13+m_cost) bytes
+  mask  = (1ULL << (8 + m_cost)) - 1;   // modulo state_size/32
+  mask1 = (1ULL << (9 + m_cost)) - 1;   // modulo state_size/16
+
+  // Step 2: Load the password, salt, input/output sizes into the state S
+  for (i = 0; i < inlen; i++)
+    ((unsigned char *) S)[i] = ((unsigned char *) in)[i];
+  for (i = 0; i < saltlen; i++)
+    ((unsigned char *) S)[inlen + i] = ((unsigned char *) salt)[i];
+  for (i = inlen + saltlen; i < 384; i++)
+    ((unsigned char *) S)[i] = 0;
+  ((unsigned char *) S)[384] = inlen & 0xff;
+  ((unsigned char *) S)[385] = (inlen >> 8) & 0xff;
+  ((unsigned char *) S)[386] = saltlen;
+  ((unsigned char *) S)[387] = outlen & 0xff;
+  ((unsigned char *) S)[388] = (outlen >> 8) & 0xff;
+  ((unsigned char *) S)[389] = 0;
+  ((unsigned char *) S)[390] = 0;
+  ((unsigned char *) S)[391] = 0;
+
+  ((unsigned char *) S)[392] = 1;
+  ((unsigned char *) S)[393] = 1;
+  for (i = 394; i < 416; i++)
+    ((unsigned char *) S)[i] = ((unsigned char *) S)[i - 1] + ((unsigned char *) S)[i - 2];
+
+  // Step 3: Expand the data into the whole state
+  for (i = 13 * 2; i < (1ULL << (9 + m_cost)); i = i + 2)
+    F0(i);
+
+  // Step 4: Update the state using function G
+  random_number = 123456789ULL;
+  for (i = 0; i < (1ULL << (8 + m_cost + t_cost)); i = i + 64)
+    G(i, random_number);
+
+  // Step 5: Update the state using function H
+  for (i = 1ULL << (8 + m_cost + t_cost);
+       i < (1ULL << (9 + m_cost + t_cost)); i = i + 64)
+    H(i, random_number);
+
+  // Step 6: Update the state using function F
+  for (i = 0; i < (1ULL << (9 + m_cost)); i = i + 2)
+    F(i);
+
+  // Step 7: Generate the output
+  memcpy(out, ((unsigned char *) S) + state_size - outlen, outlen);
+
+  return 0;
 }
 

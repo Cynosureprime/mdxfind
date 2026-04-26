@@ -185,9 +185,54 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.331 2026/04/22 18:23:53 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.346 2026/04/26 15:09:00 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.346  2026/04/26 15:09:00  dlr
+ * Pomelo cross-platform port (mdxfind side): remove the Intel-only POMELO PHS implementation (formerly lines 2802-2962, ~161 lines) and the !NOTINTEL stub that errored out on ARM/PowerPC. PHS is now provided by the portable implementation at the end of mymd5.c. Add an extern int PHS(...) prototype near the existing extern mymd5/mysha1 declarations. JOB_POMELO (e429) now works on every platform — Intel SSE2, ARM NEON, PowerPC Altivec/VSX, and scalar fallback. Local build clean; -z e429 self-test passes.
+ *
+ * Revision 1.345  2026/04/26 14:38:45  dlr
+ * Phase 4 fix #2: gate rule advance on (!JOBFLAG_NUMBERS || number_iter >= loop_bound) so rules-only (no -n) advances correctly. Rev 1.344 broke rules-only because the do/while bottom check at line 34678 only increments number_iter when JOBFLAG_NUMBERS is set; for rules-only that flag is false, so number_iter stays at 0 and the gate '0 >= 1' never triggers. Result: rule never advanced, every iter restored rule_base = orig_word, the 5k-rule MD5 benchmark on mmt found only 2807 hits (orig-word matches) instead of 13896 (full rule × word matches), and throughput dropped from 270 MH/s to 72 MH/s as the chokepoint queue stalled packing the same orig word repeatedly. Fix: extend the gate to advance the rule on every iter when JOBFLAG_NUMBERS is unset (matches pre-Phase-4 behavior for rules-only), and only require mask-cycle wrap when masks are actually iterating. Local full validation: rules+numbers 30/3000, rules-only 3/300, numbers-only 10, iter-only 2, ?d mask 30, 5-rule chain 6 — all match expected.
+ *
+ * Revision 1.344  2026/04/26 14:10:58  dlr
+ * Phase 4 fix: stop double-firing the no-rule pass on GPU. Rev 1.343's conditional pass0 transition (deferred until masks wrap) caused the no-rule branch to fire twice per word on the GPU rules+masks path: iter 0 GPU short-circuits and continues without transitioning pass0 (because number_iter+1 < loop_bound), so iter 1 enters the no-rule branch AGAIN with the same orig word, GPU short-circuits AGAIN, then pass0 finally transitions on iter 2 to the currule branch. User's GPU test 4 on 1.343 showed 700 GPU words (= 100 × 7) instead of expected 600 (= 100 × 6). Hit count was preserved (600/600) because the extra packs computed hashes that didn't match anything in the user's specific 600.txt fixture, but the wasted GPU work is incorrect. Fix: restore the unconditional 'pass0 = 1' line outside the if/elif block (matches the original pre-Phase-3 placement). The currule branch's else-clause restoration (memcpy(job->line, rule_base, ...)) handles the CPU mask iteration over the no-rule base correctly even with unconditional transition: rule_base = orig word stashed by the no-rule branch on iter 0; iter 1+ enters the elif-currule branch, takes the else clause (number_iter < loop_bound), restores orig word, mask block appends next mask. Local validation: rules+numbers 30, 3000; rules-only 3; numbers-only 10; iter-only 2; ?d mask 30; 5-rule chain 6 — all match expected.
+ *
+ * Revision 1.343  2026/04/26 12:43:11  dlr
+ * Phase 4: CPU rules+masks/numbers cross-product fix. Restructure the rule-advance block in procjob's per-word do/while loop to gate currule advancement on mask-cycle wrap (not every iteration). The implicit no-rule pass (pass0=0 first iter) now also iterates all masks/numbers, matching GPU behavior so CPU and GPU produce identical hit sets. Per the architect's design (team-state today) plus the user's clarification that the implicit no-rule pass is a foundational mdxfind feature (feedback_no_rule_pass.md). Pre-Phase-4 (rev 1.342): rules+masks on CPU produced incorrect output — Phase 3's unconditional number_iter/MaskIndex reset on rule advance prevented mask iteration entirely (only 1 candidate per rule). Pre-Phase-3: rule[i] paired with mask[i] in lock-step, no cross-product. The fix: (1) add rule_base buffer (thread-local stash for rule output, MAXLINE+16 bytes); (2) reset rule_base_len = -1 per word so first rule pass takes the if-branch; (3) replace rule-advance block with three-state gate — pass0=0 stashes original word and defers pass0 transition until masks wrap (so no-rule pass iterates all masks); pass0=1 + masks-wrapped advances rule + applyrule + stashes; pass0=1 + mid-mask-cycle restores rule_base via cheap memcpy; (4) loop_bound matches the do/while bottom (job->MaskCount when -n mask syntax, Iter_Count[digits] for legacy -n N numeric, 1 otherwise); (5) restore the && !currule guards on prefix-save/restore at lines 9583/9594 (Phase 3 edits #1/#2 reverted) — rule_base now handles rule-aware restoration. Verified locally with -z (CPU): 1 word × (1 no-rule + 2 rules) × 10 numbers = 30; 100 words × 30 = 3000; rules-only 1+5=6; numbers-only 10; iter-only -i 2 = 2 (Phase 2b path unchanged). Adds approx 1 memcpy per mask iteration when rules active; <5% perf impact on mask-active workloads, 0% on rules-only. No kernel edits, no pack-format changes. GPU rules+masks (Phase 3 test 4 baseline 600/600) needs re-validation on mmt.
+ *
+ * Revision 1.342  2026/04/26 05:45:40  dlr
+ * Phase 3 of procjob() GPU dispatch consolidation: enable rules+masks coexistence on the slab-format dispatch path. Four edits in mdxfind.c per architect's final design (team-state today): (1) line 9578 — drop && !currule from prefix-save guard so the original word is preserved even when rules are active (tline holds the rule input independently); (2) line 9587 — drop && !currule from prefix-restore guard so per-rule mask iteration starts from a clean job->line each pass; (3) line 9602 — insert number_iter = 0; job->MaskIndex = 0; on rule advance so the new rule iterates masks from index 0 (without this, rules[1..] inherit wrapped number_iter and skip GPU eligibility because the MaskIndex==0 guard at 9635 fails); (4) line 9635 — add !Printall to the GPU-pack guard so -z mode stays on CPU for full enumeration. The slab kernel (gpu_md5unsalted.cl) already iterates masks and accepts ruled bytes; no kernel edits needed. Chokepoint at 9266 unchanged (its !job->MaskCount gate stays correct: chokepoint=packed=rules-only, slab path=rules+masks). gpujob_submit_bf unchanged (it serves the chokepoint's packed format; multi-GPU mask BF is out of scope for Phase 3 per user). Validation per architect's matrix: rules-only baseline (mmt 5k-rule MD5 ≥401 MH/s), masks-only baseline (RTX 4070 Ti 9-char mask ≥11.1 GH/s), rules+masks GPU vs CPU agreement (-G none should produce identical hit set), Printall safety (every rule×mask candidate emitted), iter-only regression (g1 test still 200 GPU words/300 hits), cross-product math (-r 5-rules -m e1 -n ?d on 100 words → Tothash ≈ 5000). Local -z e1/e84/e856 sanity passes.
+ *
+ * Revision 1.341  2026/04/26 03:39:21  dlr
+ * Phase 2b iter-only GPU support: add slab-format dispatch in the per-word loop for the (Maxiter > 1, no rules, no keys, no email, no mask) configuration. Phase 2b's pre-scan deletion (rev 1.338) lost GPU coverage for iter-only jobs because the chokepoint's packed kernel does not iterate (rev 1.339 attempted to use it for iter and produced false-negatives — reverted in 1.340). The fix routes iter-only jobs through gpu_try_pack_unsalted (slab format), which the slab kernel iterates internally up to max_iter, emitting hits at each iteration level. This is the same path the deleted pre-scan used and the same path the legacy mask short-circuit at line ~9620 uses for masks; the new branch is its iter-only sibling. Insertion at the top of the per-word loop after word setup, before rule/mask/email handling. Conditions ensure no overlap with chokepoint (which requires Rules||Keys||Email) or the legacy mask short-circuit (which requires job->MaskCount). On GPU pack success, 'continue' skips the CPU switch; on pack failure (word too long, GPU busy, !gpujob_available, Printall), falls through to CPU. Local -z e1/e84/e856 self-tests pass. Validation: re-run user's g1 test (-i 2 -h md6256,sha3-256$ g1.pass) — expect '200 GPU words dispatched, 200 hits' restored, 300/300 total. Also restores MD5 -i 80 GPU acceleration per ~/src/github/mdxfind/readme.md baseline (162 MH/s on M2 Max).
+ *
+ * Revision 1.340  2026/04/26 02:59:59  dlr
+ * REVERT rev 1.339 (Phase 2b correction): the chokepoint do_pack_gpu gate cannot be extended to cover Maxiter > 1 because the chokepoint's packed-format kernel (gpu_md5_packed.cl etc.) does NOT iterate — it runs one hash per word. With the gate extension in 1.339, iter-only jobs hit the chokepoint, get packed, the kernel runs hash() at iter=1 only, and produces zero hits when the target hashes are at iter>1. The chokepoint's 'goto gpu_packed_done' then jumps over the CPU switch, so CPU never re-tries — the hits are silently lost. User-visible: g1 test on 1.339 found 100/300 hashes vs the expected 300/300. This revert restores 1.338's behavior: iter-only-without-rules falls back to CPU (correct results, no GPU acceleration on that case). Real iter-only GPU support requires either (a) restoring the pre-scan path, or (b) adding iteration support to the packed kernels — both larger changes that need architect re-spec. For now, correctness over speed: 1.340 = 1.338's gate.
+ *
+ * Revision 1.339  2026/04/26 02:38:06  dlr
+ * Phase 2b correction: extend chokepoint do_pack_gpu gate to cover iter-only workloads. Phase 2b's pre-scan deletion (rev 1.338) silently regressed iter-only-without-rules jobs to CPU because the chokepoint's gate at mdxfind.c:9259 required (Rules || Keys || Email). The deleted pre-scan was the only path that handled the (Maxiter > 1, no rules, no mask, unsalted) configuration. Add 'Maxiter > 1' to the gate so iter-only jobs route through the chokepoint and benefit from the kernel's existing max_iter support (gpu_opencl.c:1365 already sets params.max_iter from the per-device max_iter, the kernel iterates internally). Local -z e1/e84/e856 self-tests pass (CPU paths unchanged). Iter-only GPU validation must happen on a GPU host: re-running the user's g1 test (-i 2 -h md6256,sha3-256$) against this rev should restore '200 GPU words dispatched, 200 hits' that rev 1.337 demonstrated and rev 1.338 lost. Per feedback_mask_perf_baseline.md, ~/src/github/mdxfind/readme.md documents the baseline for MD5 -i 80 (Mac Studio M2 Max: 162 MH/s) and MD5 -i 100 -n ?d?d (RTX 4070 Ti Super: ~10 GH/s) — post-fix runs should not regress more than ~5% from these.
+ *
+ * Revision 1.338  2026/04/26 02:20:05  dlr
+ * Phase 2b of procjob() GPU dispatch consolidation: delete the GPU pre-scan block and the gpu_done bitmap-skip site; migrate the multi-GPU brute-force fan-out into a new gpujob_submit_bf helper; wire the helper into the chokepoint flush sites. The pre-scan was an 81-line opportunistic packing path for unsalted mask types (Maxiter>1 or mask present, no rules) that ran a full second pass over the readbuf and used a per-thread bitmap to mark GPU-handled words for the main loop to skip. Per the architect's analysis (team-state today), the pre-scan was a net loss: the main loop's chokepoint at line 9870 already saturates PCI upload, and CPU rule-generation outpaces the GPU transfer rate (project_rule_perf_20260422.md). The bitmap-check at the head of the main loop also vanishes. The multi-GPU fan-out (one packed copy per OpenCL device, atomic mask cursor parallelism for brute-force jobs) moves into gpujob_submit_bf, which byte-copies the chokepoint's packed format (packed_buf + word_offset arrays) instead of the slab format the old pre-scan used; the helper allocates and populates dup buffers BEFORE submitting the source so g remains owned by us during the copy. Helper is OPENCL_GPU-gated (Metal hosts are single-GPU). Helper is wired into the mid-job overflow flush at the chokepoint (~line 9981) and the end-of-job flush at ~34643. JOB_DONE worker shutdown flush at ~9227 is intentionally NOT routed through the helper (per architect: BF jobs already passed through the per-job flush by then). Two misleading 'word_stride = 0' lines that the rev 1.336 fix made harmless vanish naturally with the pre-scan deletion. Sanity verified locally: -z e1 hash-table init, -z e84 KECCAK224 self-test, -z e856 JUNIPERSSG regression all pass.
+ *
+ * Revision 1.337  2026/04/26 01:36:20  dlr
+ * Phase 2a of procjob() GPU dispatch consolidation: per-op gpu_maxlen at the chokepoint setup. The chokepoint at mdxfind.c:9870 was hardcoding gpu_maxlen=55 for all ops except SHA512/SHA384 (111) and NTLM/NTLMH (27), silently rejecting Keccak/SHA3 candidates of length 56-143 and MD6256 candidates up to 511 even though gpu_try_pack_unsalted (mdxfind.c:8697-8723) supports them. Add per-op switch arms mirroring the gpu_try_pack_unsalted maxpasslen table: MD6256=511, KECCAK/SHA3-224=143, -256=135, -384=103, -512=71. Also fix the second hardcoded 55 inside the variant loop at line 9974: 'if (enc_len > 55)' becomes 'if (enc_len > gpu_maxlen)' so the new caps are not undermined. Per Phase 2 architect re-spec (team-state today). Sanity verified locally with -z e84 KECCAK224 self-test and -z e856 JUNIPERSSG regression.
+ *
+ * Revision 1.336  2026/04/25 16:40:29  dlr
+ * GPU buffer-overflow fix in gpu_try_pack_unsalted: move g->word_stride and g->max_count assignments out of the 'if (!g)' allocation block so they are set on every entry, not just first allocation. Pre-allocated buffers (the blocking-acquire path at mdxfind.c:9402-9412 and the brute-force dup at 9438) skip the allocation branch but still need correct stride for the current hash type. With the bug, all GPU pack slots collapsed to slot 0 (idx*0), and the consumer's hit-reconstruction in gpu/gpujob_opencl.c:682 read stale M[14] length values, overrunning the cand[256] stack buffer and triggering glibc FORTIFY_SOURCE / __memcpy_chk. Reproducer: rev 1.330 with multiple compound MD5BASE64 types + -i 2/3 + -y directory recursion crashed deterministically (exit 134 SIGABRT); patched v1.330 ran clean to completion (7,091 hits vs the 2,881 partial output before the original crash). Fix is idempotent — stride and maxcount are deterministic functions of job->op. Reported externally on Windows GTX 1650; reproduced on Linux x86-64 hpi7 (GTX 960). Diagnosed via gdb + disassembly + structural source review (team-state Round 4); empirically verified via patched v1.330 build on .205 + hpi7 test (Round 5).
+ *
+ * Revision 1.335  2026/04/25 12:48:07  dlr
+ * Phase 1 of procjob() GPU dispatch consolidation: delete vestigial JOB_MD5 SIMD FastRule embedded gpu_try_pack_unsalted call. The path was structurally unreachable on the rules+GPU benchmark — when do_pack_gpu==1 the chokepoint at line 9870 packs candidates and 'goto gpu_packed_done' jumps over the entire switch(job->op), so JOB_MD5 case never executes and this dead block never fires. The deletion incidentally eliminates the 2x Tothash double-count documented 2026-04-19 in the team-state, which is why mdxfind has always agreed with hashcat to within 0.05% — the double count was structurally unreachable on real workloads. After deletion the remaining branches are 'len >= 56 -> heap iter (ljobi=0)' and 'else -> SSE batch (ljobi=1)', which is the correct behavior. Sanity verified locally with -z e1 hash-table init and -z e856 JUNIPERSSG self-test.
+ *
+ * Revision 1.334  2026/04/25 12:45:26  dlr
+ * e856 fix + brute-force quiet: add JOB_JUNIPERSSG default_users entry so -z -f /dev/null produces a JUNIPERSSG test hash (every type must self-emit in -z mode); drop spurious 'File not found' fprintf in brute-force mask detection so 'mdxfind ?d?d' falls through to mask parsing silently.
+ *
+ * Revision 1.333  2026/04/24 15:49:06  dlr
+ * e369/e786 host encoding for GPU packed path: NTLMH zero-extend (1 variant, hashcat-compat), NTLM 3-variant iconv with memcmp dedup (CP1252 variant C). 2x length gate (input cap 27 bytes). Family-table entries for JOB_NTLM/JOB_NTLMH. Verified byte-identical GPU vs CPU on dev1 Metal and fpga OpenCL across e369 (152/152), e786 primary (100/100), e786 superset (expected 30-hit iconv gap on non-ASCII, hashcat-compat by design).
+ *
+ * Revision 1.332  2026/04/23 22:06:18  dlr
+ * GPU packed dispatch for rule processing: 128MB packed buffers with per-word uint32 offsets, one-thread-per-word kernels for MD5/SHA1/SHA256/MD4/SHA512, 16M-word chunked dispatch, lazy allocation, iteration support. GPU entry point before switch(job->op) with do_pack_gpu gating. FastRule disabled when GPU packed active. Typesaltbytes int->long long overflow fix for 100M+ salts. Salt loading progress bars. Unchecked strdup fix.
+ *
  * Revision 1.331  2026/04/22 18:23:53  dlr
  * Fix uninitialized ljobi causing crash on Windows with rules. Add rule_workspace to move applyrule stack arrays to heap. NULL checks on bare malloc/realloc. Improved rule error reporting with caret position.
  *
@@ -1469,6 +1514,9 @@ extern void mysha1(void *message, int len, unsigned char *hash);
 
 extern void mymd5(void *message, int len, unsigned char *hash);
 
+/* POMELO v2 PHC hash; portable implementation in mymd5.c (was Intel-only inline). */
+extern int PHS(void *out, size_t outlen, const void *in, size_t inlen, const void *salt, size_t saltlen, unsigned int t_cost, unsigned int m_cost);
+
 extern void myprogress(char *cur, int len, char *dest);
 
 /* SM3 standalone implementation (GB/T 32905-2016) for crypt_round interface */
@@ -1884,7 +1932,7 @@ char *combo_pepper;
 Pvoid_t *Typesalt;
 Pvoid_t *Typehashsalt; /* parallel Judy: same key as Typesalt, value = ptr to precomputed hash of salt */
 int *Typesaltcnt;      /* max entries per Typesalt[type] */
-int *Typesaltbytes;    /* total salt string bytes per type */
+long long *Typesaltbytes;    /* total salt string bytes per type */
 struct saltentry {
     char *salt;      /* points into thread-local saltpool (copy of Judy key) */
     Word_t *PV;      /* cached PV pointer — stable for Judy lifetime */
@@ -2757,167 +2805,6 @@ inline char *findeol(char *s, int l) {
 
      
 
-#ifndef NOTINTEL
-// PHC submission:  POMELO v2
-// Designed by:     Hongjun Wu (Email: wuhongjun@gmail.com)
-// This code was written by Hongjun Wu on Jan 31, 2015.
-
-// This code gives the C implementation of POMELO using the SSE2 instructions.
-
-// m_cost is an integer, 0 <= m_cost <= 25; the memory size is 2**(13+m_cost) bytes
-// t_cost is an integer, 0 <= t_cost <= 25; the number of steps is roughly:  2**(8+m_cost+t_cost)
-// For the machine today, it is recommended that: 5 <= t_cost + m_cost <= 25;
-// one may use the parameters: m_cost = 15; t_cost = 0; (256 MegaByte memory)
-
-#include <immintrin.h>
-
-#define ADD128(x, y)       _mm_add_epi64((x), (y))
-#define XOR128(x, y)       _mm_xor_si128((x),(y))     /*XOR(x,y) = x ^ y, where x and y are two 128-bit word*/
-#define OR128(x, y)        _mm_or_si128((x),(y))      /*OR(x,y)  = x | y, where x and y are two 128-bit word*/
-#define ROTL128(x, n)      XOR128(_mm_slli_epi64((x), (n)),  _mm_srli_epi64((x),(64-n)))  /*Rotate 2 64-bit unsigned integers in x to the left by n-bit positions*/
-#define SHIFTL128(x, n)    _mm_slli_epi64((x), (n))
-#define SHIFTL64(x)       _mm_slli_si128(x, 8)
-#define SHIFTR64(x)       _mm_srli_si128(x, 8)
-
-// Function F0 update the state using a nonlinear feedback shift register
-#define F0(i)  {               \
-    i0 = ((i) - 0*2)  & mask1; \
-    i1 = ((i) - 2*2)  & mask1; \
-    i2 = ((i) - 3*2)  & mask1; \
-    i3 = ((i) - 7*2)  & mask1; \
-    i4 = ((i) - 13*2) & mask1; \
-    S[i0]   = XOR128(ADD128(XOR128(S[i1],   S[i2]),   S[i3]),   S[i4]);    \
-    S[i0+1] = XOR128(ADD128(XOR128(S[i1+1], S[i2+1]), S[i3+1]), S[i4+1]);  \
-    temp = S[i0];                  \
-    S[i0]   = XOR128(SHIFTL64(S[i0]),   SHIFTR64(S[i0+1]));  \
-    S[i0+1] = XOR128(SHIFTL64(S[i0+1]), SHIFTR64(temp));   \
-    S[i0]   = ROTL128(S[i0],  17);  \
-    S[i0+1] = ROTL128(S[i0+1],17);  \
-}
-
-// Function F update the state using a nonlinear feedback shift register
-#define F(i)  {              \
-    i0 = ((i) - 0*2)  & mask1; \
-    i1 = ((i) - 2*2)  & mask1; \
-    i2 = ((i) - 3*2)  & mask1; \
-    i3 = ((i) - 7*2)  & mask1; \
-    i4 = ((i) - 13*2) & mask1; \
-    S[i0]   = ADD128(S[i0],XOR128(ADD128(XOR128(S[i1],   S[i2]),   S[i3]),   S[i4]));    \
-    S[i0+1] = ADD128(S[i0+1],XOR128(ADD128(XOR128(S[i1+1], S[i2+1]), S[i3+1]), S[i4+1]));  \
-    temp = S[i0];                  \
-    S[i0]   = XOR128(SHIFTL64(S[i0]),   SHIFTR64(S[i0+1]));  \
-    S[i0+1] = XOR128(SHIFTL64(S[i0+1]), SHIFTR64(temp));   \
-    S[i0]   = ROTL128(S[i0],  17);  \
-    S[i0+1] = ROTL128(S[i0+1],17);  \
-}
-
-#define G(i, random_number)  {                                                          \
-    index_global = ((random_number >> 16) & mask) << 1;                                \
-    for (j = 0; j < 64; j = j+2)                                                        \
-    {                                                                                  \
-        F(i+j);                                                                        \
-        index_global     = (index_global + 2) & mask1;                                 \
-        index_local      = (((i + j) >> 1) - 0x1000 + (random_number & 0x1fff)) & mask;\
-        index_local      = index_local << 1;                                           \
-        S[i0]            = ADD128(S[i0],  SHIFTL128(S[index_local],1));                \
-        S[i0+1]          = ADD128(S[i0+1],SHIFTL128(S[index_local+1],1));              \
-        S[index_local]   = ADD128(S[index_local],   SHIFTL128(S[i0],2));               \
-        S[index_local+1] = ADD128(S[index_local+1], SHIFTL128(S[i0+1],2));             \
-        S[i0]            = ADD128(S[i0],  SHIFTL128(S[index_global],1));               \
-        S[i0+1]          = ADD128(S[i0+1],SHIFTL128(S[index_global+1],1));             \
-        S[index_global]  = ADD128(S[index_global],  SHIFTL128(S[i0],3));               \
-        S[index_global+1]= ADD128(S[index_global+1],SHIFTL128(S[i0+1],3));             \
-        random_number   += (random_number << 2);                                       \
-        random_number    = (random_number << 19) ^ (random_number >> 45)  ^ 3141592653589793238ULL;   \
-    }                                                                                  \
-}
-
-#define H(i, random_number)  {                                                         \
-    index_global = ((random_number >> 16) & mask) << 1;                                \
-    for (j = 0; j < 64; j = j+2)                                                       \
-    {                                                                                  \
-        F(i+j);                                                                        \
-        index_global     = (index_global + 2) & mask1;                                 \
-        index_local      = (((i + j) >> 1) - 0x1000 + (random_number & 0x1fff)) & mask;\
-        index_local      = index_local << 1;                                           \
-        S[i0]            = ADD128(S[i0],  SHIFTL128(S[index_local],1));                \
-        S[i0+1]          = ADD128(S[i0+1],SHIFTL128(S[index_local+1],1));              \
-        S[index_local]   = ADD128(S[index_local],   SHIFTL128(S[i0],2));               \
-        S[index_local+1] = ADD128(S[index_local+1], SHIFTL128(S[i0+1],2));             \
-        S[i0]            = ADD128(S[i0],  SHIFTL128(S[index_global],1));               \
-        S[i0+1]          = ADD128(S[i0+1],SHIFTL128(S[index_global+1],1));             \
-        S[index_global]  = ADD128(S[index_global],  SHIFTL128(S[i0],3));               \
-        S[index_global+1]= ADD128(S[index_global+1],SHIFTL128(S[i0+1],3));             \
-        random_number  = ((unsigned long long*)S)[i3<<1];                                                        \
-    }                                                                                     \
-}
-
-
-int PHS(void *out, size_t outlen, const void *in, size_t inlen, const void *salt, size_t saltlen, unsigned int t_cost, unsigned int m_cost) {
-  unsigned long long i, j;
-  __m128i temp;
-  unsigned long long i0, i1, i2, i3, i4;
-  __m128i S[4096];
-  unsigned long long random_number, index_global, index_local;
-  unsigned long long state_size, mask, mask1;
-
-  //check the size of password, salt and output. Password is at most 256 bytes; the salt is at most 32 bytes.
-  if (inlen > 256 || saltlen > 64 || outlen > 256 || inlen < 0 || saltlen < 0 || outlen < 0) return 1;
-
-  //Step 1: Initialize the state S
-  state_size = 1ULL << (13 + m_cost);   // state size is 2**(13+m_cost) bytes
-  mask = (1ULL << (8 + m_cost)) - 1;   // mask is used for modulation: modulo size_size/32;
-  mask1 = (1ULL << (9 + m_cost)) - 1;   // mask is used for modulation: modulo size_size/16;
-
-  //Step 2: Load the password, salt, input/output sizes into the state S
-  for (i = 0; i < inlen; i++)
-    ((unsigned char *) S)[i] = ((unsigned char *) in)[i];         // load password into S
-  for (i = 0; i < saltlen; i++)
-    ((unsigned char *) S)[inlen + i] = ((unsigned char *) salt)[i]; // load salt into S
-  for (i = inlen + saltlen; i < 384; i++)
-    ((unsigned char *) S)[i] = 0;
-  ((unsigned char *) S)[384] = inlen & 0xff;         // load password length (in bytes) into S;
-  ((unsigned char *) S)[385] = (inlen >> 8) & 0xff;  // load password length (in bytes) into S;
-  ((unsigned char *) S)[386] = saltlen;              // load salt length (in bytes) into S;
-  ((unsigned char *) S)[387] = outlen & 0xff;        // load output length (in bytes into S)
-  ((unsigned char *) S)[388] = (outlen >> 8) & 0xff; // load output length (in bytes into S)
-  ((unsigned char *) S)[389] = 0;
-  ((unsigned char *) S)[390] = 0;
-  ((unsigned char *) S)[391] = 0;
-
-  ((unsigned char *) S)[392] = 1;
-  ((unsigned char *) S)[393] = 1;
-  for (i = 394; i < 416; i++)
-    ((unsigned char *) S)[i] = ((unsigned char *) S)[i - 1] + ((unsigned char *) S)[i - 2];
-
-  //Step 3: Expand the data into the whole state
-  for (i = 13 * 2; i < (1ULL << (9 + m_cost)); i = i + 2)
-    F0(i);
-
-  //Step 4: Update the state using function G
-  random_number = 123456789ULL;
-  for (i = 0; i < (1ULL << (8 + m_cost + t_cost)); i = i + 64)
-    G(i, random_number);
-
-  //Step 5: Update the state using function H
-  for (i = 1ULL << (8 + m_cost + t_cost); i < (1ULL << (9 + m_cost + t_cost)); i = i + 64)
-    H(i, random_number);
-
-  //Step 6: Update the state using function F
-  for (i = 0; i < (1ULL << (9 + m_cost)); i = i + 2)
-    F(i);
-
-  //Step 7: Generate the output
-  memcpy(out, ((unsigned char *) S) + state_size - outlen, outlen);
-
-  return 0;
-}
-
-#else
-int PHS(void *out, size_t outlen, const void *in, size_t inlen, const void *salt, size_t saltlen, unsigned int t_cost, unsigned int m_cost){
-    fprintf(stderr,"PHS is unsupported on ARM/POWERPC\n");exit(1);
-}
-#endif
 
 
 
@@ -7342,6 +7229,7 @@ static const struct { int job; const char *user; } default_users[] = {
   { JOB_POSTGRESCRAM, "postgres" },
   { JOB_SHA1USERSQL3, "admin" },
   { JOB_SHA512SHA512RAWUSER, "admin" },
+  { JOB_JUNIPERSSG, "netscreen" },
   { 0, NULL }
 };
 static void init_default_salts(void) {
@@ -8721,10 +8609,15 @@ int gpu_try_pack_unsalted(struct jobg **pjobg, struct job *job, int appendlen, i
         g->doneprint = job->doneprint;
         g->line_num = job->startline;
 	g->count = 0;
-	g->word_stride = stride;
-	g->max_count = maxcount;
         *pjobg = g;
     }
+    /* Set per-op invariants on every entry, not just first allocation.
+     * Pre-allocated buffers (mdxfind.c:9402-9412 blocking-acquire and
+     * 9438 brute-force dup) skip the !g branch but still need correct
+     * stride for the current hash type. Idempotent: stride and maxcount
+     * are deterministic functions of job->op. */
+    g->word_stride = stride;
+    g->max_count = maxcount;
 
     int idx = g->count;
     char *slot = g->raw + (idx * g->word_stride);
@@ -8807,7 +8700,7 @@ int gpu_try_pack_unsalted(struct jobg **pjobg, struct job *job, int appendlen, i
         }
     }
 
-    if (idx < GPUBATCH_MAX) {
+    if (idx < GPUBATCH_RULE_MAX) {
         g->passoff[idx] = idx * g->word_stride;
         g->passlen[idx] = len;
         g->clen[idx] = len;
@@ -8823,6 +8716,66 @@ gpu_pack_done:
         *pjobg = NULL;
     }
     return 1;
+}
+
+/*
+ * gpujob_submit_bf — Submit a packed jobg with multi-GPU brute-force fan-out.
+ *
+ * For non-BF jobs or single-GPU OpenCL, equivalent to a plain gpujob_submit().
+ * For brute-force mask jobs on multi-GPU OpenCL, submits N identical packed
+ * batches (one per device) so all GPUs work in parallel via atomic mask
+ * cursor. The duplicated buffers are byte-for-byte copies of the source
+ * packed_buf and word_offset arrays — replication uses the chokepoint's
+ * packed format, NOT the slab format that the now-deleted pre-scan used.
+ *
+ * On exit, *pjobg == NULL.
+ */
+static void gpujob_submit_bf(struct jobg **pjobg, struct job *job)
+{
+    struct jobg *g = *pjobg;
+    if (!g) return;
+    int bf_copies = 1;
+#if defined(OPENCL_GPU)
+    if (job->flags & JOBFLAG_BRUTEFORCE) {
+        extern int gpu_opencl_num_devices(void);
+        bf_copies = gpu_opencl_num_devices();
+        if (bf_copies < 1) bf_copies = 1;
+    }
+#endif
+    /* Allocate and populate dup buffers from g BEFORE submitting g
+     * (after submit, g is owned by the worker queue and may be recycled). */
+    enum { MAX_BF_DUPS = 16 };
+    struct jobg *dups[MAX_BF_DUPS];
+    int ndups = bf_copies - 1;
+    if (ndups > MAX_BF_DUPS) ndups = MAX_BF_DUPS;
+    for (int bfc = 0; bfc < ndups; bfc++) {
+        struct jobg *dup = gpujob_get_free(job->filename, job->startline);
+        if (!dup) { ndups = bfc; break; }
+        if (!dup->packed_buf) {
+            dup->packed_buf  = (char *)malloc_lock(GPUBATCH_PACKED_SIZE,
+                                                   "packed_buf");
+            dup->word_offset = (uint32_t *)malloc_lock(
+                                  (GPUBATCH_PACKED_SIZE / 2) * sizeof(uint32_t),
+                                  "word_offset");
+        }
+        dup->op           = job->op;
+        dup->filename     = job->filename;
+        dup->flags        = job->flags;
+        dup->doneprint    = job->doneprint;
+        dup->line_num     = job->startline;
+        dup->packed       = 1;
+        dup->packed_count = g->packed_count;
+        dup->packed_pos   = g->packed_pos;
+        dup->count        = 0;
+        memcpy(dup->packed_buf, g->packed_buf, g->packed_pos);
+        memcpy(dup->word_offset, g->word_offset,
+               g->packed_count * sizeof(uint32_t));
+        dups[bfc] = dup;
+    }
+    gpujob_submit(g);
+    *pjobg = NULL;
+    for (int bfc = 0; bfc < ndups; bfc++)
+        gpujob_submit(dups[bfc]);
 }
 
 /*
@@ -8992,6 +8945,7 @@ char *sbuf[4], *acthash[4];
 int slen[4], actlen[4];
 unsigned char *lm;
 int done2, saltlen, maxsaltlen, maxsaltlens, pass0, emaillen, emailcur, emailpow, peplen;
+int do_pack_gpu = 0, gpu_maxlen = 55;
 int snap_valid, nsalts_job;
 unsigned int found, lineproc;
 unsigned long long mswap, rulecnt, hashcnt;
@@ -9037,6 +8991,8 @@ int ljobi = 0, FastRule;
 uint32_t *d32, *f32, *dd32;
 struct job *ljob;
 char *linebuf, *linebuf2, *tsalt, *tline, *XMLline, *Origline;
+char *rule_base;       /* Phase 4: cached rule output for mid-mask-cycle restore */
+int rule_base_len = -1;
 wchar_t *wline, *wline1;
 char *mdbuf, *newbuf;
 struct saltentry *saltsnap;
@@ -9075,6 +9031,7 @@ linebuf = malloc_lock(MAXLINE * 3,memreason);
 linebuf2 = malloc_lock(MAXLINE * 3,memreason);
 tsalt = malloc_lock(MAXLINE,memreason);
 tline = malloc_lock(MAXLINE + 16,memreason);
+rule_base = malloc_lock(MAXLINE + 16,memreason);  /* Phase 4 rules+masks restore */
 XMLline = malloc_lock(MAXLINE + 16,memreason);
 Origline = malloc_lock(MAXLINE + 16,memreason);
 wline = malloc_lock((MAXLINE + 16) * sizeof(wchar_t),memreason);
@@ -9085,7 +9042,8 @@ Outbuf = malloc_lock(OUTBUFSIZE+1024,memreason);
 saltsnap = NULL;
 saltpool = NULL;
 
-{ int maxcnt = 0, maxbytes = 0;
+{ int maxcnt = 0;
+  long long maxbytes = 0;
   Word_t sti = 0;
   J1F(RC, Dohash, sti);
   while (RC) {
@@ -9094,20 +9052,21 @@ saltpool = NULL;
       if (Typesaltbytes[sti] > maxbytes) maxbytes = Typesaltbytes[sti];
       /* HMAC key=$salt types use Typeuser — count those too */
       if (Typeuser && Typeuser[sti]) {
-        Word_t cnt = 0, bytes = 0;
+        Word_t cnt = 0;
+        long long bytes = 0;
         unsigned char tbuf[MAXLINE];
         tbuf[0] = 0;
         JSLF(PV, Typeuser[sti], tbuf);
         while (PV) { cnt++; bytes += mystrlen((char *)tbuf) + 1; JSLN(PV, Typeuser[sti], tbuf); }
         if (cnt > (Word_t)maxcnt) maxcnt = (int)cnt;
-        if (bytes > (Word_t)maxbytes) maxbytes = (int)bytes;
+        if (bytes > maxbytes) maxbytes = bytes;
       }
     }
     J1N(RC, Dohash, sti);
   }
   if (maxcnt) {
-    saltsnap = malloc_lock(maxcnt * sizeof(struct saltentry), memreason);
-    saltpool = malloc_lock(maxbytes + 16, memreason);
+    saltsnap = malloc_lock((size_t)maxcnt * sizeof(struct saltentry), memreason);
+    saltpool = malloc_lock((size_t)maxbytes + 16, memreason);
   }
 }
 
@@ -9136,7 +9095,7 @@ while (1) {
   }
   if (job->op == JOB_DONE) {
 #ifdef GPU_ENABLED
-    if (my_jobg && my_jobg->count > 0) {
+    if (my_jobg && (my_jobg->count > 0 || my_jobg->packed_count > 0)) {
       gpujob_submit(my_jobg);
       my_jobg = NULL;
     }
@@ -9163,6 +9122,50 @@ while (1) {
   hashcnt = 0;
   found = 0;
   FastRule = 0;
+#ifdef GPU_ENABLED
+  { int do_pack_gpu_val = 0;
+    int gpu_maxlen_val = 55;
+    if (gpujob_available() && (Rules || Keys || Email) &&
+        !job->MaskCount &&
+        gpu_op_category(job->op) == GPU_CAT_MASK) {
+      do_pack_gpu_val = 1;
+      /* Per-op max password length. Must match maxpasslen in
+       * gpu_try_pack_unsalted (mdxfind.c:8697-8723) so the chokepoint
+       * does not silently reject candidates the kernel could handle. */
+      switch (job->op) {
+        case JOB_SHA512: case JOB_SHA384:
+        case JOB_SHA512RAW: case JOB_SHA384RAW:
+          gpu_maxlen_val = 111;
+          break;
+        case JOB_NTLM: case JOB_NTLMH:
+          /* UTF-16LE zero-extend doubles length; 2*len must fit MD4 one block (<=55) */
+          gpu_maxlen_val = 27;
+          break;
+        case JOB_MD6256:
+          gpu_maxlen_val = 511;
+          break;
+        case JOB_KECCAK224: case JOB_SHA3_224:
+          gpu_maxlen_val = 143;
+          break;
+        case JOB_KECCAK256: case JOB_SHA3_256:
+          gpu_maxlen_val = 135;
+          break;
+        case JOB_KECCAK384: case JOB_SHA3_384:
+          gpu_maxlen_val = 103;
+          break;
+        case JOB_KECCAK512: case JOB_SHA3_512:
+          gpu_maxlen_val = 71;
+          break;
+        default:
+          gpu_maxlen_val = 55;
+          break;
+      }
+    }
+    do_pack_gpu = do_pack_gpu_val;
+    gpu_maxlen = gpu_maxlen_val;
+    if (do_pack_gpu) FastRule = 0;  /* GPU handles rules, disable SIMD stacking */
+  }
+#endif
   tline[0] = 0;
   job->outlen = 0;
   job->outbuf = Outbuf;
@@ -9324,88 +9327,6 @@ while (1) {
     }
   }
 
-#ifdef GPU_ENABLED
-  /* GPU pre-scan: for unsalted mask types, scan all words and pack GPU-eligible
-   * ones into batches using blocking dispatch. A bitmap tracks which lines were
-   * GPU-handled so the main loop can skip them.
-   * Uses gpu_try_pack_unsalted for per-algorithm packing; if it returns 0
-   * (GPU busy or word too long), skip to CPU. Use blocking gpujob_get_free
-   * to ensure GPU gets full batches. */
-  unsigned char *gpu_done = NULL;
-  if (gpujob_available() && !Printall && gpu_op_category(job->op) == GPU_CAT_MASK &&
-      ((MaskAppendLen > 0 || MaskPrependLen > 0) || Maxiter > 1 || GPUForce) && !Rules && !Email) {
-    extern uint64_t gpu_mask_total;
-    if (gpu_mask_total > 0 || Maxiter > 1 || GPUForce) {
-      static __thread unsigned char *gpu_done_buf = NULL;
-      static __thread int gpu_done_size = 0;
-      int nbytes = (job->numline + 7) / 8;
-      if (nbytes > gpu_done_size) {
-        if (gpu_done_buf) free(gpu_done_buf);
-        gpu_done_buf = (unsigned char *)malloc_lock(nbytes, "gpu_done");
-        gpu_done_size = nbytes;
-      }
-      gpu_done = gpu_done_buf;
-      memset(gpu_done, 0, nbytes);
-      int applen = MaskAppendLen, prelen = MaskPrependLen;
-
-      for (unsigned int gl = 0; gl < job->numline; gl++) {
-        char *s = &job->readbuf[job->readindex[job->startline + gl].offset];
-        int slen = job->readindex[job->startline + gl].len;
-
-        /* Try non-blocking pack first; if GPU busy, block for a buffer */
-        if (!gpu_try_pack_unsalted(&my_jobg, job, applen, prelen, s, slen)) {
-          if (!my_jobg) {
-            /* GPU was busy — block for a free buffer and retry */
-            my_jobg = gpujob_get_free(job->filename, job->startline);
-            my_jobg->op = job->op;
-            my_jobg->filename = job->filename;
-            my_jobg->flags = job->flags;
-            my_jobg->doneprint = job->doneprint;
-            my_jobg->line_num = job->startline;
-            my_jobg->count = 0;
-            my_jobg->word_stride = 0; /* pack function will set on first use */
-          }
-          if (!gpu_try_pack_unsalted(&my_jobg, job, applen, prelen, s, slen))
-            continue;  /* word too long or unsupported — skip to CPU */
-        }
-        gpu_done[gl >> 3] |= (1 << (gl & 7));
-      }
-      /* Flush partial batch.  For brute-force, submit one copy per GPU
-       * device so all GPUs work in parallel via atomic cursor. */
-      if (my_jobg && my_jobg->count > 0) {
-        int bf_copies = 1;
-#if defined(OPENCL_GPU)
-        if (job->flags & JOBFLAG_BRUTEFORCE) {
-          extern int gpu_opencl_num_devices(void);
-          bf_copies = gpu_opencl_num_devices();
-          if (bf_copies < 1) bf_copies = 1;
-        }
-#endif
-        gpujob_submit(my_jobg);
-        my_jobg = NULL;
-        /* Submit additional identical batches for remaining GPUs */
-        for (int bfc = 1; bfc < bf_copies; bfc++) {
-          struct jobg *dup = gpujob_get_free(job->filename, job->startline);
-          dup->op = job->op;
-          dup->filename = job->filename;
-          dup->flags = job->flags;
-          dup->doneprint = job->doneprint;
-          dup->line_num = job->startline;
-          dup->count = 0;
-          dup->word_stride = 0;
-          if (!gpu_try_pack_unsalted(&dup, job, applen, prelen,
-              &job->readbuf[job->readindex[job->startline].offset],
-              job->readindex[job->startline].len)) {
-            gpujob_return_free(dup);
-            break;
-          }
-          gpujob_submit(dup);
-        }
-      }
-    }
-  }
-#endif
-
   for (curline = job->startline; numline < job->numline; curline++, numline++, lineproc++) {
 
     if (ltime.tv_sec != current.tv_sec) {
@@ -9450,26 +9371,33 @@ while (1) {
     s = &job->readbuf[job->readindex[curline].offset];
     d = job->line;
     len = job->readindex[curline].len;
-#ifdef GPU_ENABLED
-    /* Skip words already dispatched to GPU in the pre-scan phase */
-    if (gpu_done) {
-      unsigned int gi = numline;
-      if (gpu_done[gi >> 3] & (1 << (gi & 7)))
-        continue;
-    }
-#endif
     Lfstate = 0;
 
     cur = job->line;
     job->len = len;
     orig_len = len;
     number_iter = 0;
+    rule_base_len = -1;  /* Phase 4: invalidate per-word so first rule pass takes if-branch */
     job->pass = job->line;
     currule = Rules;
     job->Ruleindex = 0;
 
     fastcopy(d, s, len);
     d[len] = 0;
+
+#ifdef GPU_ENABLED
+    /* Iter-only GPU path: when -i N>1 is requested without rules/keys/email/mask,
+     * pack the word once via the slab format (gpu_try_pack_unsalted). The slab
+     * kernel iterates internally up to max_iter and emits hits at each level.
+     * Replaces the Phase 2b-deleted pre-scan; the chokepoint's packed kernel
+     * does not iterate, so iter-only must use the slab kernel. */
+    if (Maxiter > 1 && !job->MaskCount && !Rules && !Email && !Keys &&
+        gpu_op_category(job->op) == GPU_CAT_MASK &&
+        gpujob_available() && !Printall &&
+        gpu_try_pack_unsalted(&my_jobg, job, 0, 0, cur, len)) {
+      continue;  /* GPU consumed this word; skip CPU switch */
+    }
+#endif
 
     if (currule) {
 #ifndef NOTINTEL
@@ -9508,6 +9436,10 @@ while (1) {
       emailpow = 1 << emaillen;
     }
 
+/* Phase 4: prefix-save only when no rules. With rules active, the rule_base
+ * stash (set by the rule-advance block below on each new rule) handles
+ * mid-mask-cycle restoration. Without rules, this preserves the original word
+ * across mask iterations for prepend-mask cases. */
 if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && !currule) {
   memcpy(job->prefix, job->line, orig_len);
   job->prefix[orig_len] = 0;
@@ -9516,23 +9448,77 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
 do {
 cur = job->line;
 len = orig_len;
-/* For mask with prepend, restore the original word each iteration */
+/* For mask with prepend, restore the original word each iteration.
+ * Phase 4: only when no rules. With rules active, the rule-advance block
+ * below handles restoration via rule_base. */
 if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && !currule && number_iter > 0) {
   memcpy(job->line, job->prefix, orig_len);
   job->line[orig_len] = 0;
 }
-if (pass0 != 0 && currule) {
+/* Phase 4: rules+masks cross-product — gate rule advance on mask-cycle wrap.
+ * When job->MaskCount is 0 (no mask) or number_iter has wrapped past MaskCount,
+ * advance to the next rule, applyrule, stash output to rule_base, reset mask
+ * state. Otherwise (mid-mask-cycle for the current rule), restore rule output
+ * from rule_base via cheap memcpy and let the mask code append/prepend a new
+ * mask value to it. The implicit no-rule pass (pass0==0 first iter) is
+ * preserved — see feedback_no_rule_pass.md. */
+/* Loop bound matches the do/while bottom check at line ~34678:
+ * uses MaskCount when -n with mask syntax, else Iter_Count[digits] for
+ * legacy -n N numeric iteration. For neither, value is 1 (no iteration). */
+{
+  int loop_bound = (job->flags & JOBFLAG_NUMBERS)
+      ? (job->MaskCount ? (int)job->MaskCount : Iter_Count[job->digits])
+      : 1;
 
-  if (*((unsigned short int *) currule) == 0)
-    break;
-  job->Ruleindex++;
-  len = applyrule(tline, cur, len, currule + 2, rule_ws);
-  job->len = job->clen = len;
-
-  currule += *((unsigned short int *) currule) + 2;
-  if (len < 0)
-    continue;
-  rulecnt++;
+  if (pass0 == 0) {
+    /* No-rule pass: stash the original word into rule_base so subsequent
+     * mask iterations can restore it cheaply via the elif's else branch.
+     * CPU mask iteration for the no-rule base happens through that path
+     * (rule_base = orig word, currule != NULL, number_iter < loop_bound).
+     * GPU iterates masks internally in one short-circuit pack — either
+     * way the no-rule "pass" is done after this iteration completes. */
+    if (loop_bound > 1) {
+      memcpy(rule_base, job->line, len);
+      rule_base[len] = 0;
+      rule_base_len = len;
+    }
+  } else if (currule) {
+    /* Advance rule when (no mask iteration active) or (masks have wrapped).
+     * For rules-only (no -n), JOBFLAG_NUMBERS is false → number_iter never
+     * increments → must use the !NUMBERS guard to advance every iter, like
+     * the pre-Phase-4 behavior. For rules+masks, advance only on wrap. */
+    if (!(job->flags & JOBFLAG_NUMBERS) || number_iter >= loop_bound) {
+      /* Masks wrapped (or no mask) — advance to next rule. */
+      if (*((unsigned short int *) currule) == 0)
+        break;
+      job->Ruleindex++;
+      len = applyrule(tline, cur, orig_len, currule + 2, rule_ws);
+      job->len = job->clen = len;
+      currule += *((unsigned short int *) currule) + 2;
+      if (len < 0) {
+        /* Bad rule: skip ahead. Reset mask state so next iter advances past it. */
+        number_iter = 0;
+        job->MaskIndex = 0;
+        continue;
+      }
+      rulecnt++;
+      number_iter = 0;
+      job->MaskIndex = 0;
+      job->Numbers = 0;
+      if (loop_bound > 1) {
+        /* Stash for cheap restore on subsequent mask iterations of this rule. */
+        memcpy(rule_base, job->line, len);
+        rule_base[len] = 0;
+        rule_base_len = len;
+      }
+    } else {
+      /* Mid-mask-cycle: restore rule (or no-rule) output via cheap memcpy. */
+      memcpy(job->line, rule_base, rule_base_len);
+      job->line[rule_base_len] = 0;
+      len = rule_base_len;
+      cur = job->line;
+    }
+  }
 }
 pass0 = 1;
 if (Email && emailcur < emailpow) {
@@ -9565,7 +9551,8 @@ if (job->flags & JOBFLAG_NUMBERS) {
      * GPU kernel expands all mask combinations from the pre-padded M[].
      * Suppress remaining mask iterations by advancing number_iter to the loop limit. */
     { extern uint64_t gpu_mask_total;
-    if (gpu_mask_total > 0 && job->MaskIndex == 0 &&
+    /* Phase 3: !Printall so -z mode stays on CPU for full enumeration. */
+    if (gpu_mask_total > 0 && job->MaskIndex == 0 && !Printall &&
         gpu_try_pack_unsalted(&my_jobg,job,MaskAppendLen,MaskPrependLen,job->line,len)) {
       number_iter = (int)(job->MaskCount ? job->MaskCount : Iter_Count[job->digits]) - 1;
       Lfstate = 0;
@@ -9830,6 +9817,138 @@ do {
       currule = NULL;
 
 
+#ifdef GPU_ENABLED
+    /* GPU packed dispatch: pack candidate and skip CPU switch.
+     * do_pack_gpu is set once at job start based on op + mode. */
+    if (do_pack_gpu && len >= 0 && len <= gpu_maxlen) {
+      /* Build one or more encoded variants of this candidate.
+       * Most ops: one variant == raw bytes.
+       * JOB_NTLMH: one variant == UTF-16LE zero-extend (hashcat-compatible).
+       * JOB_NTLM:  up to 3 UTF-16LE variants (utf-8 iconv, zero-extend, cp1251 iconv),
+       *            deduped via memcmp to avoid redundant submissions for ASCII input.
+       * Hit-reconstruction logic in gpujob_opencl.c / gpujob_metal.m reverses
+       * the encoding by op: NTLMH strips 0x00 high bytes, NTLM iconvs back to utf-8.
+       */
+      char pkg_enc[3][256];
+      int  pkg_enc_len[3];
+      int  pkg_nvariants = 1;
+      pkg_enc_len[0] = len;
+      if (len > 0) memcpy(pkg_enc[0], cur, len);
+      if (job->op == JOB_NTLMH) {
+        /* Single UTF-16LE zero-extended variant — matches hashcat -m 1000 exactly. */
+        pkg_nvariants = 1;
+        pkg_enc_len[0] = 2 * len;
+        to_utf16le(cur, pkg_enc[0], len);
+      } else if (job->op == JOB_NTLM) {
+        /* Mirrors the CPU JOB_NTLM path at mdxfind.c:14132-14194:
+         *   Variant A: iconv UTF-8 → UTF-16LE   (cd)
+         *   Variant B: iconv CP1251 → UTF-8 → UTF-16LE (cd_cp1251, cd)
+         *   Variant C: iconv CP1252 → UTF-8 → UTF-16LE (cd_cp1252, cd)
+         * Each variant only admitted when its first-stage iconv produces output.
+         * No zero-extend variant on purpose — the CPU JOB_NTLM does not test it.
+         */
+        char tmp_u8[256];
+        /* Variant A: UTF-8 → UTF-16LE. */
+        pkg_enc_len[0] = 0;
+        { size_t a_in = len, a_out = sizeof(pkg_enc[0]);
+          char *a_ip = cur, *a_op = pkg_enc[0];
+          if (iconv(cd, &a_ip, &a_in, &a_op, &a_out) != (size_t)-1 && a_out < sizeof(pkg_enc[0]))
+            pkg_enc_len[0] = (int)(sizeof(pkg_enc[0]) - a_out);
+        }
+        /* Variant B: CP1251 → UTF-8 → UTF-16LE. */
+        pkg_enc_len[1] = 0;
+        { size_t c_in = len, c_out = sizeof(tmp_u8);
+          char *c_ip = cur, *c_op = tmp_u8;
+          if (iconv(cd_cp1251, &c_ip, &c_in, &c_op, &c_out) != (size_t)-1 &&
+              c_out < sizeof(tmp_u8)) {
+            int u8len = (int)(sizeof(tmp_u8) - c_out);
+            size_t d_in = u8len, d_out = sizeof(pkg_enc[1]);
+            char *d_ip = tmp_u8, *d_op = pkg_enc[1];
+            if (iconv(cd, &d_ip, &d_in, &d_op, &d_out) != (size_t)-1 &&
+                d_out < sizeof(pkg_enc[1]))
+              pkg_enc_len[1] = (int)(sizeof(pkg_enc[1]) - d_out);
+          }
+        }
+        /* Variant C: CP1252 → UTF-8 → UTF-16LE. */
+        pkg_enc_len[2] = 0;
+        { size_t c_in = len, c_out = sizeof(tmp_u8);
+          char *c_ip = cur, *c_op = tmp_u8;
+          if (iconv(cd_cp1252, &c_ip, &c_in, &c_op, &c_out) != (size_t)-1 &&
+              c_out < sizeof(tmp_u8)) {
+            int u8len = (int)(sizeof(tmp_u8) - c_out);
+            size_t d_in = u8len, d_out = sizeof(pkg_enc[2]);
+            char *d_ip = tmp_u8, *d_op = pkg_enc[2];
+            if (iconv(cd, &d_ip, &d_in, &d_op, &d_out) != (size_t)-1 &&
+                d_out < sizeof(pkg_enc[2]))
+              pkg_enc_len[2] = (int)(sizeof(pkg_enc[2]) - d_out);
+          }
+        }
+        pkg_nvariants = 3;
+        /* Dedup via memcmp. Drop zero-length and exact duplicates. */
+        int kept = 0;
+        for (int v = 0; v < 3; v++) {
+          if (pkg_enc_len[v] <= 0) continue;
+          int dup = 0;
+          for (int k = 0; k < kept; k++) {
+            if (pkg_enc_len[k] == pkg_enc_len[v] &&
+                memcmp(pkg_enc[k], pkg_enc[v], pkg_enc_len[v]) == 0) { dup = 1; break; }
+          }
+          if (dup) continue;
+          if (kept != v) {
+            pkg_enc_len[kept] = pkg_enc_len[v];
+            memcpy(pkg_enc[kept], pkg_enc[v], pkg_enc_len[v]);
+          }
+          kept++;
+        }
+        pkg_nvariants = kept;
+      }
+      /* Skip if no variants survived (e.g., NTLM with zero-length input). */
+      if (pkg_nvariants <= 0) goto gpu_packed_done;
+      for (int pv = 0; pv < pkg_nvariants; pv++) {
+        int enc_len = pkg_enc_len[pv];
+        if (enc_len < 0 || enc_len > 255) continue;  /* uint8 length slot */
+        if (enc_len > gpu_maxlen) continue;          /* per-op max from setup at line 9197 */
+        if (!my_jobg) {
+          my_jobg = gpujob_get_free(job->filename, job->startline);
+          if (!my_jobg->packed_buf) {
+            my_jobg->packed_buf = (char *)malloc_lock(GPUBATCH_PACKED_SIZE, "packed_buf");
+            my_jobg->word_offset = (uint32_t *)malloc_lock((GPUBATCH_PACKED_SIZE / 2) * sizeof(uint32_t), "word_offset");
+          }
+          my_jobg->op = job->op;
+          my_jobg->filename = job->filename;
+          my_jobg->flags = job->flags;
+          my_jobg->doneprint = job->doneprint;
+          my_jobg->line_num = job->startline;
+          my_jobg->packed = 1;
+          my_jobg->packed_count = 0;
+          my_jobg->packed_pos = 0;
+        }
+        if (my_jobg->packed_pos + 1 + enc_len > GPUBATCH_PACKED_SIZE) {
+          gpujob_submit_bf(&my_jobg, job);
+          my_jobg = gpujob_get_free(job->filename, job->startline);
+          if (!my_jobg->packed_buf) {
+            my_jobg->packed_buf = (char *)malloc_lock(GPUBATCH_PACKED_SIZE, "packed_buf");
+            my_jobg->word_offset = (uint32_t *)malloc_lock((GPUBATCH_PACKED_SIZE / 2) * sizeof(uint32_t), "word_offset");
+          }
+          my_jobg->op = job->op;
+          my_jobg->filename = job->filename;
+          my_jobg->flags = job->flags;
+          my_jobg->doneprint = job->doneprint;
+          my_jobg->line_num = job->startline;
+          my_jobg->packed = 1;
+          my_jobg->packed_count = 0;
+          my_jobg->packed_pos = 0;
+        }
+        my_jobg->word_offset[my_jobg->packed_count] = my_jobg->packed_pos;
+        my_jobg->packed_buf[my_jobg->packed_pos++] = (char)enc_len;
+        if (enc_len > 0)
+          memcpy(my_jobg->packed_buf + my_jobg->packed_pos, pkg_enc[pv], enc_len);
+        my_jobg->packed_pos += enc_len;
+        my_jobg->packed_count++;
+      }
+      goto gpu_packed_done;
+    }
+#endif
 /*     printf("Starting job %d (%s) %llx\n",job->op,Types[job->op],job->outbuf);  */
     switch (job->op) {
 
@@ -23743,79 +23862,11 @@ md5sha256:
 		      job->outlen = ljob[ljobi].outlen;
                     }
                     ljobi = 0;
-#ifdef GPU_ENABLED
-                  } else if (Maxiter <= 1 && !my_jobg && gpujob_available() &&
-                             gpu_op_category(job->op) == GPU_CAT_MASK &&
-                             gpu_try_pack_unsalted(&my_jobg, job, 0, 0, cur, len)) {
-                    /* Acquired GPU buffer and packed base word — rules will fill it */
-                    hashcnt++;
-                    ljobi = 0;
-#endif
                   } else {
                     ljobi = 1;
                   }
                   d32 = (uint32_t *) SSEBUF;
                   f32 = (uint32_t *) hashes;
-#ifdef GPU_ENABLED
-		  /* GPU batch fill: apply all rules in bulk, pack directly into GPU slots.
-		   * If any candidate is too long for GPU, flag cpu_needed to re-process
-		   * the word through the SIMD path below (at negligible cost). */
-		  if (currule && Maxiter <= 1 && gpujob_available() &&
-		      gpu_op_category(job->op) == GPU_CAT_MASK) {
-		    if (!my_jobg) {
-		      my_jobg = gpujob_try_get_free();
-		      if (my_jobg) {
-		        my_jobg->op = job->op;
-		        my_jobg->filename = job->filename;
-		        my_jobg->flags = job->flags;
-		        my_jobg->doneprint = job->doneprint;
-		        my_jobg->line_num = job->startline;
-		        my_jobg->count = 0;
-		        my_jobg->word_stride = 64;
-		        my_jobg->max_count = GPUBATCH_MAX;
-		      }
-		    }
-		    if (my_jobg && my_jobg->count < GPUBATCH_MAX) {
-		      int gpu_cpu_needed = 0, gpu_rules_used = 0;
-		      extern int applyrules_gpu_pack(char *, int, char *, int,
-		          char *, int, int, int, uint16_t *, int *, char *, int *, int *,
-		          struct rule_workspace *);
-		      int gpu_start = my_jobg->count;
-		      int gpu_avail = GPUBATCH_MAX - gpu_start;
-		      int gpu_filled = applyrules_gpu_pack(
-		          cur, len, currule, Numrules,
-		          my_jobg->raw, 64, gpu_start, GPUBATCH_MAX,
-		          my_jobg->passlen, my_jobg->ruleindex,
-		          linebuf, &gpu_cpu_needed, &gpu_rules_used,
-		          rule_ws);
-		      if (gpu_filled > 0) {
-		        for (int gi = gpu_start; gi < gpu_start + gpu_filled && gi < GPUBATCH_MAX; gi++) {
-		          my_jobg->passoff[gi] = gi * 64;
-		          my_jobg->clen[gi] = my_jobg->passlen[gi];
-		          my_jobg->hexlen[gi] = my_jobg->passlen[gi];
-		        }
-		        my_jobg->count += gpu_filled;
-		        hashcnt += gpu_filled;
-		        rulecnt += gpu_filled;
-		      }
-		      /* Submit if batch is full */
-		      if (my_jobg->count >= GPUBATCH_MAX) {
-		        gpujob_submit(my_jobg);
-		        my_jobg = NULL;
-		      }
-		      if (!gpu_cpu_needed && gpu_rules_used >= (int)Numrules) {
-		        /* All rules handled by GPU for this word — skip SIMD loop */
-		        currule = NULL;
-		        break;
-		      }
-		      /* Some rules need CPU — submit GPU batch, fall through to SIMD */
-		      if (gpu_cpu_needed && my_jobg && my_jobg->count > 0) {
-		        gpujob_submit(my_jobg);
-		        my_jobg = NULL;
-		      }
-		    }
-		  }
-#endif
 		  if (currule) {
                   while (*((unsigned short int *) currule)) {
                     if (MDXpause) {
@@ -23855,7 +23906,7 @@ md5sha256:
 		      SSEBUF[9] = r1; SSEBUF[10] = r1;SSEBUF[11] = r1;
                       hashcnt += ljobi;
 		      SSEBUF[12] = r1; SSEBUF[13] = r1;
-		         
+
                       for (x = 0; x < ljobi; x++) {
                         int j;
                         s = ljob[x].pass;
@@ -23925,23 +23976,6 @@ md5sha256:
                         }
                       }
                       ljobi = 0;
-#ifdef GPU_ENABLED
-                      /* Periodically try to re-acquire a GPU buffer.
-                       * Only every 128 SIMD flushes to avoid lock contention. */
-                      if (!my_jobg && Maxiter <= 1 && (++gpu_reacquire & 127) == 0 &&
-                          gpu_op_category(job->op) == GPU_CAT_MASK) {
-                        my_jobg = gpujob_try_get_free();
-                        if (my_jobg) {
-                          my_jobg->op = job->op;
-                          my_jobg->filename = job->filename;
-                          my_jobg->flags = job->flags;
-                          my_jobg->doneprint = job->doneprint;
-                          my_jobg->line_num = job->startline;
-                          my_jobg->count = 0;
-                          my_jobg->word_stride = 0;
-                        }
-                      }
-#endif
                     }
                   }
 		  }
@@ -34542,15 +34576,17 @@ HAV256_5_start:
                 fprintf(stderr, "Unknown job type %d\n", job->op);
                 exit(1);
             }
+#ifdef GPU_ENABLED
+gpu_packed_done: ;
+#endif
           } while (job->flags & JOBFLAG_HEX);
         } while (curkey);
       } while (((job->flags & JOBFLAG_NUMBERS) && (++number_iter < (job->MaskCount ? job->MaskCount : Iter_Count[job->digits]))) || currule || (Email && emailcur < emailpow));
     }
 #ifdef GPU_ENABLED
     /* Flush partial GPU batch at end of job */
-    if (my_jobg && my_jobg->count > 0) {
-      gpujob_submit(my_jobg);
-      my_jobg = NULL;
+    if (my_jobg && (my_jobg->count > 0 || my_jobg->packed_count > 0)) {
+      gpujob_submit_bf(&my_jobg, job);
     } else if (my_jobg) {
       /* Empty buffer — return to free list without submitting */
       gpujob_return_free(my_jobg);
@@ -35503,7 +35539,7 @@ void build_compact_table(void) {
                       JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
                       JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD4, JOB_SHA1,
                       JOB_SHA224, JOB_SHA256, JOB_SHA384, JOB_SHA512,
-                      JOB_WRL, JOB_NTLMH, JOB_MD6256, JOB_SHA256RAW,
+                      JOB_WRL, JOB_NTLMH, JOB_NTLM, JOB_MD6256, JOB_SHA256RAW,
                       JOB_KECCAK224, JOB_KECCAK256, JOB_KECCAK384, JOB_KECCAK512,
                       JOB_SHA3_224, JOB_SHA3_256, JOB_SHA3_384, JOB_SHA3_512,
                       JOB_HMAC_MD5, JOB_HMAC_MD5_KPASS,
@@ -36263,11 +36299,20 @@ MDXALIGN void ReportStats(void *dummy) {
           char *pmult2 = "", *tmult2 = "";
           format_rate(dprog, &dprog, &pmult2);
           format_rate(dtotal, &dtotal, &tmult2);
-          fprintf(stderr, "Working on %s, w=%ld, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
+          if (gpujob_available())
+            fprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
+                  Curfile, wq, gpujob_queue_depth(), gpujob_free_count(), dprog, pmult2, dtotal, tmult2,
+                  100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
+          else
+            fprintf(stderr, "Working on %s, w=%ld, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
                   Curfile, wq, dprog, pmult2, dtotal, tmult2,
                   100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
         } else {
-          fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
+          if (gpujob_available())
+            fprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
+                  Curfile, peek_lock(WorkWaiting), gpujob_queue_depth(), gpujob_free_count(), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
+          else
+            fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
                   Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
         }
       }
@@ -40982,7 +41027,7 @@ int main(int argc, char **argv) {
                   x == JOB_SHA1SALTPASS || x == JOB_SHA1PASSSALT ||
                   x == JOB_SHA1DRU || x == JOB_PHPBB3 ||
                   x == JOB_DESCRYPT || x == JOB_MD5 ||
-                  x == JOB_MD4 || x == JOB_NTLMH ||
+                  x == JOB_MD4 || x == JOB_NTLMH || x == JOB_NTLM ||
                   x == JOB_SHA1 ||
                   x == JOB_SHA224 || x == JOB_SHA256 ||
                   x == JOB_SHA384 || x == JOB_SHA512 ||
@@ -45076,13 +45121,20 @@ usage:
       while (RC) {
         if (ti < JOB_DONE && (TypeOpts[ti] & TYPEOPT_SALTJUDY) &&
             (TypeOpts[ti] & TYPEOPT_NEEDSALT) && !Typesalt[ti]) {
-          line[0] = 0;
-          JSLF(PV, SaltArray, (unsigned char *)line);
-          while (PV) {
-            Word_t *TPV;
-            JSLI(TPV, Typesalt[ti], (unsigned char *)line);
-            if (TPV) *TPV = 1000000;
-            JSLN(PV, SaltArray, (unsigned char *)line);
+          { int _sc = 0;
+            int _sp = (Numsalts > 500000);
+            line[0] = 0;
+            JSLF(PV, SaltArray, (unsigned char *)line);
+            while (PV) {
+              Word_t *TPV;
+              JSLI(TPV, Typesalt[ti], (unsigned char *)line);
+              if (TPV) *TPV = 1000000;
+              if (_sp && (++_sc % 100000) == 0)
+                fprintf(stderr, "Loading salts for %s: %d of %ld\r", Types[ti], _sc, Numsalts);
+              JSLN(PV, SaltArray, (unsigned char *)line);
+            }
+            if (_sp)
+              fprintf(stderr, "Loading salts for %s: %d done                    \n", Types[ti], _sc);
           }
         }
         J1N(RC, Dohash, ti);
@@ -45096,10 +45148,14 @@ usage:
     J1F(RC, Dohash, ti);
     while (RC) {
       if (ti < JOB_DONE && Typesalt[ti]) {
-        int cnt = 0, bytes = 0;
+        int cnt = 0;
+        long long bytes = 0;
+        int salt_progress = (Numsalts > 500000);
         line[0] = 0;
         JSLF(PV, Typesalt[ti], (unsigned char *)line);
         while (PV) {
+          if (salt_progress && (cnt % 100000) == 0 && cnt > 0)
+            fprintf(stderr, "Preparing salts for %s: %d of %ld\r", Types[ti], cnt, Numsalts);
           /* Precompute MD5(salt) for types that need it */
           if (ti == JOB_MD5_MD5SALTMD5PASS || ti == JOB_SHA1_MD5_MD5SALTMD5PASS ||
               ti == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT || ti == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) {
@@ -45118,7 +45174,10 @@ usage:
               shex = (char *)malloc_lock(33, "salthash");
               prmd5(shash, shex, 32);
               shex[32] = 0;
-              se->salt = strdup(line);
+              { int _sl = mystrlen(line);
+                se->salt = (char *)malloc_lock(_sl + 1, "salthash");
+                memcpy(se->salt, line, _sl + 1);
+              }
               se->PV = PV;
               se->saltlen = mystrlen(line);
               se->hashsalt = shex;
@@ -45133,6 +45192,8 @@ usage:
           }
           JSLN(PV, Typesalt[ti], (unsigned char *)line);
         }
+        if (salt_progress)
+          fprintf(stderr, "Preparing salts for %s: %d done                    \n", Types[ti], cnt);
         Typesaltcnt[ti] = cnt;
         Typesaltbytes[ti] = bytes;
         Livesalts[ti] = cnt;
@@ -45248,7 +45309,7 @@ usage:
 	  case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam = 1u << FAM_MD5SALTPASS; break;
 	  case JOB_MD5: case JOB_MD5UC: fam = (1u << FAM_MD5SALT) | (1u << FAM_MD5UNSALTED); break;
 	  case JOB_MD5RAW: fam = 1u << FAM_MD5UNSALTED; break;
-	  case JOB_MD4: case JOB_NTLMH: fam = 1u << FAM_MD4UNSALTED; break;
+	  case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: fam = 1u << FAM_MD4UNSALTED; break;
 	  case JOB_SHA1: case JOB_SHA1RAW: fam = 1u << FAM_SHA1UNSALTED; break;
 	  case JOB_SHA256: case JOB_SHA256RAW: fam = 1u << FAM_SHA256UNSALTED; break;
 	  case JOB_SHA224: fam = 1u << FAM_SHA256UNSALTED; break;
@@ -45310,7 +45371,7 @@ usage:
     gpu_avail = gpu_opencl_available();
 #endif
     if (gpu_avail) {
-      gpujob_init(maxt + 16);
+      gpujob_init(maxt * 2 + maxt / 2);
       gpu_batch_lines = gpujob_batch_max();
 #ifdef OPENCL_GPU
       /* Compile GPU kernel families for active hash types */
@@ -45325,7 +45386,7 @@ usage:
             case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam |= 1u << FAM_MD5SALTPASS; break;
             case JOB_MD5: case JOB_MD5UC: fam |= (1u << FAM_MD5ITER) | (1u << FAM_MD5MASK) | (1u << FAM_MD5UNSALTED); break;
             case JOB_MD5RAW: fam |= 1u << FAM_MD5UNSALTED; break;
-            case JOB_MD4: case JOB_NTLMH: fam |= 1u << FAM_MD4UNSALTED; break;
+            case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: fam |= 1u << FAM_MD4UNSALTED; break;
             case JOB_SHA1: case JOB_SHA1RAW: fam |= 1u << FAM_SHA1UNSALTED; break;
             case JOB_SHA256: case JOB_SHA256RAW: fam |= 1u << FAM_SHA256UNSALTED; break;
             case JOB_SHA224: fam |= 1u << FAM_SHA256UNSALTED; break;
@@ -45544,7 +45605,6 @@ usage:
   if (argc == 1 && strcmp(argv[0], "stdin") != 0) {
     struct stat bf_sb;
     if (stat(argv[0], &bf_sb) != 0) {
-      fprintf(stderr, "File %s not found: %s\n", argv[0], strerror(errno));
       mask_init_classes();
       if (parse_mask_into(argv[0], MaskAppendPattern, &MaskAppendLen,
                           &MaskAppendTotal) == 0) {
@@ -45745,8 +45805,7 @@ reprocess:
 	      linehints[x].lineswanted /= Livesalts[x];
 	    if (MaskTotal > 1)
 	      linehints[x].lineswanted /= MaskTotal;
-	    if (Numrules > 1)
-	      linehints[x].lineswanted /= Numrules;
+	    /* Numrules division removed: packed GPU buffers handle all rules per word */
 	    if (linehints[x].rate < 100)
 	      linehints[x].lineswanted = 1;
 	    else if (linehints[x].lineswanted < 512)

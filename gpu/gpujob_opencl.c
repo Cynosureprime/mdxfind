@@ -26,6 +26,7 @@
 #ifndef NOTINTEL
 #include <emmintrin.h>
 #endif
+#include <iconv.h>
 #include "mdxfind.h"
 #include "job_types.h"
 #include "gpujob.h"
@@ -61,7 +62,7 @@ extern int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, i
 extern int build_salt_snapshot(void *snap, char *pool,
                 void *judy, char *keybuf, int printall);
 extern int *Typesaltcnt;
-extern int *Typesaltbytes;
+extern long long *Typesaltbytes;
 
 /* Return the correct salt/user Judy for a given op.
  * HMAC key=$salt types store their "salt" (the HMAC key) in Typeuser. */
@@ -146,7 +147,7 @@ static uint64_t _gpu_batches[MAX_GPU_SLOTS];
 static int _max_salt_count = 0;
 static int _max_salt_bytes = 0;
 static int overflow_loaded = 0;
-static int _gpu_batch_max = GPUBATCH_MAX; /* min across all devices */
+static int _gpu_batch_max = GPUBATCH_RULE_MAX; /* min across all devices */
 
 /* ---- GPU scheduling — priority buffer allocation ---- */
 struct gpu_waiter {
@@ -425,7 +426,7 @@ void gpujob(void *arg) {
         int nhits = 0;
         uint32_t *hits = NULL;
 
-        if (g->count == 0) goto return_jobg;
+        if (g->count == 0 && !g->packed) goto return_jobg;
         if ((op_cat == GPU_CAT_SALTED || op_cat == GPU_CAT_SALTPASS) && nsalts_packed == 0) {
             /* Stale nsalts_packed — force a fresh rebuild before giving up.
              * Words in this batch were packed when salts were still active. */
@@ -454,6 +455,135 @@ void gpujob(void *arg) {
         synthetic_job.doneprint = g->doneprint;
         synthetic_job.found = (unsigned int *)&found;
         synthetic_job.outlen = 0;
+
+        /* Packed password dispatch — GPU rule path */
+        if (g->packed && g->packed_count > 0) {
+            /* Dispatch in chunks to prevent hit buffer overflow.
+             * packed_buf and word_offset are re-uploaded each chunk call
+             * (dispatch function handles buffer reuse via capacity tracking).
+             * Only params + hit counter change between chunks. */
+            #define GPU_PACKED_CHUNK 16777216  /* 16M words per chunk */
+            uint32_t word_start = 0;
+            while (word_start < g->packed_count) {
+                if (my_slot < MAX_GPU_SLOTS) _gpu_batches[my_slot]++;
+                hits = gpu_opencl_dispatch_packed(my_slot,
+                    g->packed_buf, g->packed_pos,
+                    g->word_offset, g->packed_count,
+                    word_start, g->op, &nhits);
+                uint32_t chunk_end = word_start + GPU_PACKED_CHUNK;
+                if (chunk_end > g->packed_count) chunk_end = g->packed_count;
+                if (my_slot < MAX_GPU_SLOTS) {
+                    _gpu_dispatches[my_slot] += chunk_end - word_start;
+                    if (nhits > 0) _gpu_hits[my_slot] += nhits;
+                }
+
+                if (hits && nhits > 0) {
+                    int stored = nhits;
+                    if (stored > GPU_PACKED_MAX_HITS) stored = GPU_PACKED_MAX_HITS;
+
+                    for (int h = 0; h < stored; h++) {
+                        uint32_t *entry = hits + h * GPU_HIT_STRIDE;
+                        uint32_t widx = entry[0];
+                        if (widx >= g->packed_count) continue;
+
+                        { int hw = gpu_hash_words(g->op);
+                          for (int w = 0; w < hw; w++)
+                            curin.i[w] = entry[3 + w];
+                        }
+
+                        /* Reconstruct password directly from word_offset.
+                         * For NTLMH the packed bytes are UTF-16LE zero-extended —
+                         * strip 0x00 high bytes to recover plaintext. For NTLM the
+                         * packed bytes are UTF-16LE (possibly via iconv) — convert
+                         * back to UTF-8. Other ops use packed bytes verbatim. */
+                        uint32_t pos = g->word_offset[widx];
+                        if (pos >= g->packed_pos) continue;
+                        uint8_t plen = (uint8_t)g->packed_buf[pos];
+                        if (pos + 1 + plen > g->packed_pos) continue;
+                        char *pword = g->packed_buf + pos + 1;
+
+                        int iter_num = entry[2];
+                        int hexlen = gpu_hash_words(g->op) * 8;
+                        int out_len;
+                        if (g->op == JOB_NTLMH) {
+                            int n = (int)plen / 2;
+                            for (int ii = 0; ii < n; ii++) synthetic_job.line[ii] = pword[2 * ii];
+                            synthetic_job.line[n] = 0;
+                            out_len = n;
+                        } else if (g->op == JOB_NTLM) {
+                            static __thread iconv_t cd_u16_to_u8 = (iconv_t)0;
+                            if (cd_u16_to_u8 == (iconv_t)0)
+                                cd_u16_to_u8 = iconv_open("UTF-8", "UTF-16LE");
+                            if (cd_u16_to_u8 == (iconv_t)-1) {
+                                memcpy(synthetic_job.line, pword, plen);
+                                synthetic_job.line[plen] = 0;
+                                out_len = plen;
+                            } else {
+                                size_t ic_in = plen;
+                                size_t ic_out = MAXLINE;
+                                char *ip = pword;
+                                char *op = synthetic_job.line;
+                                iconv(cd_u16_to_u8, NULL, NULL, NULL, NULL);
+                                if (iconv(cd_u16_to_u8, &ip, &ic_in, &op, &ic_out) == (size_t)-1 &&
+                                    ic_out == MAXLINE) {
+                                    int n = (int)plen / 2;
+                                    for (int ii = 0; ii < n; ii++) synthetic_job.line[ii] = pword[2 * ii];
+                                    synthetic_job.line[n] = 0;
+                                    out_len = n;
+                                } else {
+                                    out_len = (int)(MAXLINE - ic_out);
+                                    if (out_len < 0) out_len = 0;
+                                    if (out_len >= MAXLINE) out_len = MAXLINE - 1;
+                                    synthetic_job.line[out_len] = 0;
+                                }
+                            }
+                        } else {
+                            memcpy(synthetic_job.line, pword, plen);
+                            synthetic_job.line[plen] = 0;
+                            out_len = plen;
+                        }
+                        synthetic_job.clen = out_len;
+                        synthetic_job.pass = synthetic_job.line;
+                        synthetic_job.Ruleindex = 0;
+                        checkhash(&curin, hexlen, iter_num, &synthetic_job);
+                    }
+                }
+
+                /* On hit buffer overflow, halve chunk size and retry from
+                 * max_widx+1. Stored hits are already processed above.
+                 * Hits between word_start and max_widx that didn't fit are
+                 * re-found on retry (checkhash deduplicates via PV). */
+                if (nhits > GPU_PACKED_MAX_HITS) {
+                    uint32_t max_widx = word_start;
+                    int s2 = nhits > GPU_PACKED_MAX_HITS ? GPU_PACKED_MAX_HITS : nhits;
+                    for (int h2 = 0; h2 < s2; h2++) {
+                        uint32_t w2 = hits[h2 * GPU_HIT_STRIDE];
+                        if (w2 > max_widx) max_widx = w2;
+                    }
+                    word_start = max_widx + 1;
+                } else {
+                    word_start = chunk_end;
+                }
+            }
+
+            /* Flush output buffer */
+            if (synthetic_job.outlen > 0) {
+                fwrite(outbuf, synthetic_job.outlen, 1, stdout);
+                fflush(stdout);
+                synthetic_job.outlen = 0;
+            }
+
+            hashcnt += (uint64_t)g->packed_count * Maxiter;
+            if (hashcnt > 10000000 || found > 0) {
+                possess(FreeWaiting);
+                Tothash += hashcnt;
+                Totfound += found;
+                release(FreeWaiting);
+                hashcnt = 0;
+                found = 0;
+            }
+            goto return_jobg;
+        }
 
         /* Mask overflow retry loop: if GPU hit buffer overflows, process stored hits
          * then re-dispatch starting from the highest mask_idx seen. */
@@ -503,7 +633,7 @@ void gpujob(void *arg) {
                 if (op_cat == GPU_CAT_MASK || op_cat == GPU_CAT_UNSALTED) {
                     /* Mask/unsalted: reconstruct candidate from base word + mask index.
                      * Recover full 64-bit mask_idx from truncated uint32 + mask_start. */
-                    synthetic_job.Ruleindex = (widx < GPUBATCH_MAX) ? g->ruleindex[widx] : 0;
+                    synthetic_job.Ruleindex = (widx < GPUBATCH_RULE_MAX) ? g->ruleindex[widx] : 0;
                     uint32_t midx32 = entry[1];
                     if (midx32 > max_mask_idx) max_mask_idx = midx32;
                     if ((uint32_t)sidx > max_salt_idx) max_salt_idx = (uint32_t)sidx;
@@ -511,7 +641,7 @@ void gpujob(void *arg) {
                     uint64_t midx = chunk_ms + (uint64_t)(midx32 - (uint32_t)chunk_ms);
                     char *base_word;
                     int blen;
-                    if (g->word_stride && widx < 4096) {
+                    if (g->word_stride && widx < GPUBATCH_RULE_MAX) {
                         char *slot = g->raw + widx * g->word_stride;
                         int total_len;
                         if (g->word_stride == 128)
@@ -936,6 +1066,9 @@ return_jobg:
         g->count = 0;
         g->passbuf_pos = 0;
         g->word_stride = 0;
+        g->packed = 0;
+        g->packed_count = 0;
+        g->packed_pos = 0;
         possess(GPUFreeWaiting);
         if (GPUFreeTail) {
             *GPUFreeTail = g;
@@ -984,7 +1117,7 @@ int gpujob_init(int num_jobg) {
     _gpujob_count = gpu_opencl_num_devices();
     if (_gpujob_count < 1) _gpujob_count = 1;
 
-    _gpu_batch_max = GPUBATCH_MAX;
+    _gpu_batch_max = GPUBATCH_RULE_MAX;
     for (int i = 0; i < _gpujob_count; i++) {
         int mb = gpu_opencl_max_batch(i);
         if (mb < _gpu_batch_max) _gpu_batch_max = mb;
@@ -1008,6 +1141,11 @@ int gpujob_init(int num_jobg) {
 
     for (int i = 0; i < num_jobg; i++) {
         struct jobg *g = (struct jobg *)malloc_lock(sizeof(struct jobg), "jobg");
+        g->packed_buf = NULL;
+        g->word_offset = NULL;
+        g->packed = 0;
+        g->packed_count = 0;
+        g->packed_pos = 0;
         if (GPUFreeTail) {
             *GPUFreeTail = g;
             GPUFreeTail = &(g->next);
@@ -1251,6 +1389,7 @@ int gpu_op_category(int op) {
     case JOB_MD5: case JOB_MD5UC:
     case JOB_MD4:
     case JOB_NTLMH:
+    case JOB_NTLM:
     case JOB_SHA1:
     case JOB_SHA224:
     case JOB_SHA256:
@@ -1308,7 +1447,7 @@ int gpu_op_family(int op) {
         return FAM_SHA1;
     case JOB_MD5: case JOB_MD5UC: case JOB_MD5RAW:
         return FAM_MD5UNSALTED;
-    case JOB_MD4: case JOB_NTLMH:
+    case JOB_MD4: case JOB_NTLMH: case JOB_NTLM:
         return FAM_MD4UNSALTED;
     case JOB_SHA1: case JOB_SHA1RAW: case JOB_SQL5:
         return FAM_SHA1UNSALTED;

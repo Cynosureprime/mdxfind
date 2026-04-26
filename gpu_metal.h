@@ -160,6 +160,32 @@ void gpu_metal_set_mask_resume(uint32_t start);
 void gpu_metal_set_salt_resume(uint32_t start);
 int gpu_metal_has_resume(void);
 
+/* ---- Packed password dispatch (GPU rule path) ---- */
+
+/* Dispatch a packed password buffer to the GPU.
+ * Selects kernel based on op (JOB_MD5, JOB_SHA1, etc).
+ * packed_buf:  [len_byte][password_bytes]... tightly packed
+ * word_offset: uint32 byte offset per word into packed_buf
+ * packed_size: total bytes in packed_buf
+ * num_words:   total passwords in buffer
+ * word_start:  chunk offset (0 on first call, advances per chunk)
+ * op:          JOB_* to select packed kernel family
+ *
+ * Returns hit buffer pointer (valid until next call) and sets *nhits_out.
+ * Each hit: GPU_HIT_STRIDE (19) uint32s — widx, sidx, iter, hash[0..15].
+ * NULL return means no dispatch happened (unsupported op, etc). */
+uint32_t *gpu_metal_dispatch_packed(
+    const char *packed_buf,
+    uint32_t packed_size,
+    const uint32_t *word_offset,
+    uint32_t num_words,
+    uint32_t word_start,
+    int op,
+    int *nhits_out);
+
+/* Returns 1 if a packed Metal kernel exists for this op, 0 otherwise. */
+int gpu_metal_packed_capable(int op);
+
 /* ---- Double-buffer slot API ---- */
 
 /* Initialize double-buffer dispatch slots. Call once from gpujob_init.

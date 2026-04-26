@@ -6,7 +6,7 @@
 
 Multi-threaded, multi-algorithm hash search engine. Searches wordlists against large hash collections across 994 hash types simultaneously, using Judy arrays for memory-efficient hash storage and SIMD acceleration on supported platforms. Includes **mdsplit**, a companion tool that separates solved hashes by type into organized output files.
 
-See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons.
+See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons.
 
 Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://judy.sourceforge.net/) for compressed hash lookup, and [hashpipe](https://github.com/Cynosureprime/hashpipe) for hash verification.
 
@@ -36,7 +36,7 @@ mdxfind supports GPU acceleration via OpenCL (NVIDIA, AMD) and Metal (Apple Sili
 - **Mask expansion** (`-n`/`-N`): Combined with iteration on GPU — 4.58 Gh/s on Apple M2 Max (MD5 `-i 100 -n '?d?d'`)
 - **Brute-force mode**: Pure mask-based candidate generation on GPU with multi-GPU support — 30.2 GH/s MD5 across 5 GPUs
 
-**Multi-GPU brute-force**: In brute-force mode, all available GPUs work together on the same keyspace using a shared atomic cursor. Each GPU autonomously claims chunks of the mask keyspace, with faster GPUs naturally claiming more work. Chunk sizes are auto-tuned per device via timing probes (200-400ms target). On a 5-GPU system (RTX 4070 Ti + RTX 3080 + 2x AMD RX 9070 XT + AMD iGPU), `[a-z]{9}` (5.4 trillion candidates) completed in 185 seconds at 30.2 GH/s — a 2.7x speedup over single-GPU. Use `-G` to select specific devices (e.g. `-G 2,3` for NVIDIA only).
+**Brute-force mode** (no wordlist, mask-only): activated by a single positional argument that does not resolve to a file. Available GPUs share the keyspace via an atomic cursor with per-device autotuning; a 5-GPU MD5 run (RTX 4070 Ti + RTX 3080 + 2x AMD RX 9070 XT + AMD iGPU) reaches 30.2 GH/s on `?l?l?l?l?l?l?l?l?l` (5.4 trillion candidates, 185s). See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for activation rules, multi-GPU dispatch, and `-G` device selection.
 
 On a 5-GPU system (2x AMD RDNA4 + RTX 4070 Ti + RTX 3080 + AMD iGPU), mdxfind solved 1,000,000 salted MD5 hashes against the rockyou wordlist in 40 seconds at 69 GH/s. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for detailed GPU performance comparisons.
 
@@ -284,57 +284,20 @@ ZIP files are processed as single-entry archives (the first entry is read). For 
 
 ### Brute-Force Mode
 
-Brute-force mode triggers when exactly one positional (non-option) argument is supplied and `stat(2)` fails on it — i.e. no file of that name exists. The argument is then parsed as a mask pattern and the full keyspace is enumerated without a wordlist. If the single argument is a valid file it is treated as a wordlist, and if two or more wordlist arguments are given brute-force mode does not activate.
+When a single positional argument is supplied and is not a file, mdxfind treats it as a mask and enumerates the full keyspace with no wordlist. GPU dispatch is autotuned per device and all available GPUs share the keyspace via an atomic cursor.
 
 ```bash
-# Brute-force all 9-character lowercase passwords against MD5 hashes
+# 9-character lowercase brute force
 mdxfind -m e1 -f hashes.txt '?l?l?l?l?l?l?l?l?l'
 
-# Single candidate test (mask with no variable positions)
-mdxfind -m e1 -f hashes.txt 'password'
+# Digit-only PINs
+mdxfind -m e1 -f hashes.txt '?d?d?d?d?d?d'
 
 # Mixed literal and mask characters
 mdxfind -m e1 -f hashes.txt 'pass?d?d?d?d'
 ```
 
-Mask characters: `?l` (lowercase), `?u` (uppercase), `?d` (digits), `?s` (special), `?a` (all printable), `?h` (hex lowercase), `?H` (hex uppercase), `?b` (all bytes 0x00-0xFF). Custom charsets use `?[...]` syntax: `?[0-9a-f]`.
-
-On activation, mdxfind prints a confirmation line:
-
-```
-Brute force processing detected: 5429503678976 candidates from mask '?l?l?l?l?l?l?l?l?l'
-```
-
-Progress is displayed every 15 seconds with keyspace completion, hash rate, sample candidate, and ETA:
-
-```
-Brute ?l?l?l?l?l?l?l?l?l, 3.9T/5.4T (72.7%), Found=224732, 5.37Gh/s, 'sxegdtkfb', ETA 4m36s
-```
-
-GPU dispatch is automatically tuned at startup using binary-exponential timing probes, targeting 200–400ms per dispatch chunk. This keeps the GPU saturated while maintaining responsive progress updates and avoiding OS GPU watchdog timeouts.
-
-#### Brute-force benchmark: mdxfind vs hashcat
-
-Test: 14.3 million MD5 hashes, 9-character lowercase mask (`?l?l?l?l?l?l?l?l?l` = 5.4 trillion candidates), NVIDIA RTX 4070 Ti Super.
-
-| Tool | Command | Solutions | Rate | Time |
-|------|---------|----------|------|------|
-| **mdxfind** | `mdxfind -m e1 -f hashes.txt '?l?l?l?l?l?l?l?l?l'` | 516,830 | 5.37 GH/s | 16m54s |
-| **hashcat** | `hashcat -O -a 3 -m 0 -o out --potfile-disable hashes.txt '?l?l?l?l?l?l?l?l?l'` | 516,830 | 3.66 GH/s | 25m41s |
-
-Both tools found identical results (verified with [hashpipe](https://github.com/Cynosureprime/hashpipe)). mdxfind was 47% faster on the same hardware.
-
-#### Multi-GPU brute-force scaling
-
-Test: 2,585 MD5 hashes, `?l?l?l?l?l?l?l?l?l` (5.4T candidates).
-
-| Configuration | GPUs | Rate | Time | Speedup |
-|---------------|------|------|------|---------|
-| Single GPU | RTX 4070 Ti | 11.1 GH/s | 490s | 1.0x |
-| Dual GPU | RTX 4070 Ti + RTX 3080 | 20.7 GH/s | 185s* | 1.9x |
-| All 5 GPUs | RTX 4070 Ti + RTX 3080 + 2x RX 9070 XT + iGPU | 30.2 GH/s | 185s | 2.7x |
-
-Speedup is sublinear because the AMD and iGPU devices are slower per-device than the NVIDIA cards. The atomic work-stealing scheduler naturally load-balances: faster GPUs claim more chunks of the keyspace.
+See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for the full activation rules, mask syntax, multi-GPU dispatch, scaling benchmarks, and the `-G` device-selection flag.
 
 ### Output Format
 
