@@ -1,5 +1,8 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.31  2026/04/26 21:33:38  dlr
+ * Pomelo: portable pom_getlo64 for i686 (32-bit Intel). The intrinsic _mm_cvtsi128_si64 is only available in 64-bit x86 mode; on i686 it produces 'undefined reference' at link time. Gate the existing call on __x86_64__/_M_X64/_M_AMD64 and fall back to _mm_storel_epi64 (SSE2-portable, available in all x86 modes) on 32-bit. Caught by mdxfind-release's Linux i686 build at .207. macOS x86_64 sanity build clean; POMELO -z e429 still produces the canonical hash.
+ *
  * Revision 1.30  2026/04/26 15:19:22  dlr
  * Pomelo: silence -Wmacro-redefined for F/G/H. The MD5 round macros earlier in the file use F/G/H with three args; Pomelo's same-named macros are single-arg and confined to the Pomelo round function. Add #undef F/G/H immediately before the Pomelo block — the MD5 macros aren't referenced past this point. Three new warnings (one per macro on every host) cleared. POMELO -z e429 output unchanged.
  *
@@ -3047,7 +3050,16 @@ void SHA(char *cur, int len, unsigned char *dest) {
   #define POM_BYTER8(x)       _mm_srli_si128((x), 8)
   #define POM_ZERO()          _mm_setzero_si128()
   static inline unsigned long long pom_getlo64(__m128i x) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+    /* 64-bit-only intrinsic */
     return (unsigned long long)_mm_cvtsi128_si64(x);
+#else
+    /* i686 / 32-bit Intel: _mm_cvtsi128_si64 is unavailable. _mm_storel_epi64
+     * writes the low 8 bytes to memory and is SSE2-portable on every x86. */
+    unsigned long long out;
+    _mm_storel_epi64((__m128i *)&out, x);
+    return out;
+#endif
   }
   #define POM_GETLO64(x)      pom_getlo64(x)
 

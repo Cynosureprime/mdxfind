@@ -185,9 +185,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.346 2026/04/26 15:09:00 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.347 2026/04/26 22:04:54 dlr Exp dlr $";
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.347  2026/04/26 22:04:54  dlr
+ * ReportStats: guard gpujob_available()/gpujob_queue_depth()/gpujob_free_count() calls with #ifdef GPU_ENABLED. The progress-message format selector at lines 36302-36316 was unconditional; on platforms without a GPU backend (Linux i686, ARM6/7, ppc64le, FreeBSD, etc.), GPU_ENABLED is correctly undefined per the existing gate at mdxfind.c:145, but these specific calls compiled regardless and produced 'undefined reference' link errors. The fix uses the standard if/else with #ifdef-around-the-if pattern: the GPU branch is guarded; the no-GPU else-branch (without gq= field) becomes unconditional and links cleanly on every platform. Caught by mdxfind-release at the Linux i686 (.207) step. Build verified on local x86_64 (GPU_ENABLED set, GPU branch fires) and on .207 (GPU_ENABLED unset, no-GPU branch fires, link succeeds, POMELO -z e429 self-test passes).
+ *
  * Revision 1.346  2026/04/26 15:09:00  dlr
  * Pomelo cross-platform port (mdxfind side): remove the Intel-only POMELO PHS implementation (formerly lines 2802-2962, ~161 lines) and the !NOTINTEL stub that errored out on ARM/PowerPC. PHS is now provided by the portable implementation at the end of mymd5.c. Add an extern int PHS(...) prototype near the existing extern mymd5/mysha1 declarations. JOB_POMELO (e429) now works on every platform — Intel SSE2, ARM NEON, PowerPC Altivec/VSX, and scalar fallback. Local build clean; -z e429 self-test passes.
  *
@@ -36299,19 +36302,23 @@ MDXALIGN void ReportStats(void *dummy) {
           char *pmult2 = "", *tmult2 = "";
           format_rate(dprog, &dprog, &pmult2);
           format_rate(dtotal, &dtotal, &tmult2);
+#ifdef GPU_ENABLED
           if (gpujob_available())
             fprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
                   Curfile, wq, gpujob_queue_depth(), gpujob_free_count(), dprog, pmult2, dtotal, tmult2,
                   100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
           else
+#endif
             fprintf(stderr, "Working on %s, w=%ld, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
                   Curfile, wq, dprog, pmult2, dtotal, tmult2,
                   100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
         } else {
+#ifdef GPU_ENABLED
           if (gpujob_available())
             fprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
                   Curfile, peek_lock(WorkWaiting), gpujob_queue_depth(), gpujob_free_count(), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
           else
+#endif
             fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
                   Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
         }
