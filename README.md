@@ -786,7 +786,7 @@ The Makefile detects the build platform automatically. Tested on:
 - Linux i386 (32-bit)
 - Linux ppc64le (PowerPC 8)
 - FreeBSD 13.2 x86\_64 (uses gmake)
-- Windows x86, x64, and ARM64 (cross-compiled via mingw-w64 / llvm-mingw)
+- Windows x86, x64, and ARM64 (cross-compiled via mingw-w64 / llvm-mingw) — see [docs/WINDOWS.md](docs/WINDOWS.md) for getting it running past Smart App Control and Defender
 
 ## Type Indices and Hashcat Modes
 

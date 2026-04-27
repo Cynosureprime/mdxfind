@@ -541,7 +541,7 @@ mdxfind -h "ALL" -h "!salt,!user" -f hashes.txt wordlist.txt
 
 ## Antivirus False Positives
 
-Some antivirus vendors on VirusTotal occasionally flag mdxfind as a coin miner, due to its hashing features. This is a false positive — mdxfind does not mine cryptocurrency. It is a hash-cracking tool for security research.
+mdxfind shows up on VirusTotal with a handful of hits, typically classified as `Hacktool`, `Riskware`, or occasionally `Coinminer`. None of these are malicious behavior — mdxfind doesn't mine, doesn't phone home, and doesn't touch anything outside the files you point it at. The classifications fire on the on-disk pattern (extensive cryptographic code, hash-table lookup machinery, mask-based candidate enumeration) that overlaps with how a credential-recovery tool legitimately works. Windows users will hit the same classifier at runtime via Windows Defender; see [WINDOWS.md](WINDOWS.md) for practical paths to running mdxfind on Windows without fighting the OS defenses.
 
 ## Rule-Based Password Mutations (-r and -R switches)
 
