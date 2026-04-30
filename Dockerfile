@@ -9,7 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     autoconf \
     automake \
+    autopoint \
     libtool \
+    gettext \
+    pkg-config \
     perl \
     nasm \
     zlib1g-dev \
