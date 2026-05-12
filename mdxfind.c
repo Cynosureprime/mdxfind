@@ -36981,6 +36981,7 @@ static size_t creader_read(void *buf, size_t len) {
             while (Creader.xz.avail_out > 0) {
                 if (Creader.xz.avail_in == 0 && Creader.zip_remaining > 0) {
                     size_t zip_got = 0; ZIP_FILL_INPUT();
+                    if (zip_got > sizeof(Creader.xz_inbuf)) zip_got = sizeof(Creader.xz_inbuf);
                     Creader.xz.next_in = Creader.xz_inbuf;
                     Creader.xz.avail_in = zip_got;
                     /* Copy to xz_inbuf since zip_inbuf may differ */
