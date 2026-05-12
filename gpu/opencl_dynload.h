@@ -24,8 +24,10 @@ extern cl_int (*p_clGetDeviceInfo)(cl_device_id, cl_device_info, size_t, void *,
 extern cl_context (*p_clCreateContext)(const cl_context_properties *, cl_uint, const cl_device_id *, void (CL_CALLBACK *)(const char *, const void *, size_t, void *), void *, cl_int *);
 extern cl_command_queue (*p_clCreateCommandQueue)(cl_context, cl_device_id, cl_command_queue_properties, cl_int *);
 extern cl_program (*p_clCreateProgramWithSource)(cl_context, cl_uint, const char **, const size_t *, cl_int *);
+extern cl_program (*p_clCreateProgramWithBinary)(cl_context, cl_uint, const cl_device_id *, const size_t *, const unsigned char **, cl_int *, cl_int *);
 extern cl_int (*p_clBuildProgram)(cl_program, cl_uint, const cl_device_id *, const char *, void (CL_CALLBACK *)(cl_program, void *), void *);
 extern cl_int (*p_clGetProgramBuildInfo)(cl_program, cl_device_id, cl_program_build_info, size_t, void *, size_t *);
+extern cl_int (*p_clGetProgramInfo)(cl_program, cl_program_info, size_t, void *, size_t *);
 extern cl_kernel (*p_clCreateKernel)(cl_program, const char *, cl_int *);
 extern cl_int (*p_clGetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_kernel_work_group_info, size_t, void *, size_t *);
 extern cl_mem (*p_clCreateBuffer)(cl_context, cl_mem_flags, size_t, void *, cl_int *);
@@ -40,6 +42,9 @@ extern cl_int (*p_clEnqueueFillBuffer)(cl_command_queue, cl_mem, const void *, s
 extern cl_int (*p_clSetKernelArg)(cl_kernel, cl_uint, size_t, const void *);
 extern cl_int (*p_clEnqueueNDRangeKernel)(cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *, const size_t *, cl_uint, const cl_event *, cl_event *);
 extern cl_int (*p_clFinish)(cl_command_queue);
+extern cl_int (*p_clReleaseEvent)(cl_event);
+extern cl_int (*p_clGetEventProfilingInfo)(cl_event, cl_profiling_info, size_t, void *, size_t *);
+extern cl_int (*p_clGetMemObjectInfo)(cl_mem, cl_mem_info, size_t, void *, size_t *);
 
 /* Redirect all clXxx calls to function pointers */
 #define clGetPlatformIDs p_clGetPlatformIDs
@@ -48,8 +53,10 @@ extern cl_int (*p_clFinish)(cl_command_queue);
 #define clCreateContext p_clCreateContext
 #define clCreateCommandQueue p_clCreateCommandQueue
 #define clCreateProgramWithSource p_clCreateProgramWithSource
+#define clCreateProgramWithBinary p_clCreateProgramWithBinary
 #define clBuildProgram p_clBuildProgram
 #define clGetProgramBuildInfo p_clGetProgramBuildInfo
+#define clGetProgramInfo p_clGetProgramInfo
 #define clCreateKernel p_clCreateKernel
 #define clGetKernelWorkGroupInfo p_clGetKernelWorkGroupInfo
 #define clCreateBuffer p_clCreateBuffer
@@ -64,6 +71,9 @@ extern cl_int (*p_clFinish)(cl_command_queue);
 #define clSetKernelArg p_clSetKernelArg
 #define clEnqueueNDRangeKernel p_clEnqueueNDRangeKernel
 #define clFinish p_clFinish
+#define clReleaseEvent p_clReleaseEvent
+#define clGetEventProfilingInfo p_clGetEventProfilingInfo
+#define clGetMemObjectInfo p_clGetMemObjectInfo
 
 #endif /* OPENCL_GPU */
 #endif /* OPENCL_DYNLOAD_H */

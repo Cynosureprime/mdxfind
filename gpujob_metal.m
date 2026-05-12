@@ -147,13 +147,13 @@ static int overflow_loaded = 0;
 struct gpu_waiter {
     struct gpu_waiter *next;
     char *filename;
-    unsigned int startline;
+    unsigned long long startline;       /* widened from unsigned int — wordlist line positions can exceed 4.29B */
     lock *wake;
 };
 
 static lock *GPUSchedLock;
 static char *gpu_sched_filename = NULL;
-static unsigned int gpu_sched_curline = 0;
+static unsigned long long gpu_sched_curline = 0;   /* widened to match struct job::startline */
 static int gpu_sched_active = 0;
 static struct gpu_waiter *gpu_waiter_head = NULL;
 static struct gpu_waiter *gpu_waiter_pool = NULL;
@@ -1294,13 +1294,12 @@ void gpujob_shutdown(void) {
         struct jobg *sentinel = gpujob_get_free(NULL, 0);
         sentinel->op = 2000;
         sentinel->count = 0;
-        sentinel->line_num = 0;
         gpujob_submit(sentinel);
     }
     _gpujob_ready = 0;
 }
 
-struct jobg *gpujob_get_free(char *filename, unsigned int startline) {
+struct jobg *gpujob_get_free(char *filename, unsigned long long startline) {
     /* NULL filename = shutdown sentinel, skip scheduling */
     if (!filename) goto get_buffer;
 
@@ -1599,6 +1598,15 @@ int gpu_hash_words(int op) {
     default:
         return 4;
     }
+}
+
+/* Stub: Metal backend is single-device (Apple Silicon's integrated GPU), so
+ * a per-device share line is meaningless. The OpenCL implementation in
+ * gpu/gpujob_opencl.c already early-returns when n_active <= 1 for the same
+ * reason. Keep this no-op so the linker is satisfied — the symbol is referenced
+ * unconditionally from main() in mdxfind.c. */
+void gpujob_print_share_line(FILE *fp) {
+    (void)fp;
 }
 
 #endif /* __APPLE__ && METAL_GPU */

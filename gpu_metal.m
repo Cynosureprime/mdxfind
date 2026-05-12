@@ -39,11 +39,25 @@
 #include "gpu/metal_hmac_rmd320_str.h"
 #include "gpu/metal_hmac_blake2s_str.h"
 #include "gpu/metal_streebog_str.h"
-#include "gpu/metal_sha512crypt_str.h"
+/* metal_sha512crypt_str.h removed in SHA512CRYPTMD5 carrier ship
+ * (2026-05-08): the OpenCL slab kernel sha512crypt_batch is retired and
+ * its Metal sibling follows. Both JOB_SHA512CRYPT (Phase 3) and JOB_-
+ * SHA512CRYPTMD5 (Phase 4) route through the unified template path via
+ * the SHACRYPT shared core. RCS history retains the source at
+ * gpu/RCS/metal_sha512crypt.metal,v. */
 #include "gpu/metal_sha256crypt_str.h"
 #include "gpu/metal_rmd160unsalted_str.h"
 #include "gpu/metal_blake2s256unsalted_str.h"
-#include "gpu/metal_bcrypt_str.h"
+/* metal_bcrypt_str.h retired 2026-05-09 (task #218): Phase 6 OpenCL ship
+ * (2026-05-08) severed the Metal BCRYPT dispatch path by removing the
+ * procjob gpu_try_pack call under #ifdef GPU_ENABLED (the chokepoint
+ * admit + salt-snapshot precondition + pack-site clamp that replaced it
+ * are #ifdef OPENCL_GPU only — Metal builds never reach them). Metal
+ * BCRYPT has been CPU-only since that ship; this commit cleans the dark
+ * kernel from working tree. RCS history retained at gpu/RCS/. Future
+ * OpenCL-to-Metal template-path conversion is on the roadmap and would
+ * re-add Metal BCRYPT support via a Metal template scaffold + algo_mode
+ * dispatch (multi-month parallel-implementation; not Phase 6 followup). */
 #include "gpu/metal_sha1_str.h"
 #include "gpu/metal_md5crypt_str.h"
 /* Packed-password dispatch kernels (GPU rule path) */
@@ -75,11 +89,15 @@ static const char *mtl_family_source[FAM_COUNT] = {
     [FAM_HMAC_RMD320]       = metal_hmac_rmd320_str,
     [FAM_HMAC_BLAKE2S]      = metal_hmac_blake2s_str,
     [FAM_STREEBOG]          = metal_streebog_str,
-    [FAM_SHA512CRYPT]       = metal_sha512crypt_str,
+    /* [FAM_SHA512CRYPT] retired in SHA512CRYPTMD5 carrier ship
+     * (2026-05-08): both Phase 3 SHA512CRYPT and Phase 4 SHA512CRYPTMD5
+     * now route through the unified template path. Implicit NULL
+     * designated initializer. */
     [FAM_SHA256CRYPT]       = metal_sha256crypt_str,
     [FAM_RMD160UNSALTED]    = metal_rmd160unsalted_str,
     [FAM_BLAKE2S256UNSALTED] = metal_blake2s256unsalted_str,
-    [FAM_BCRYPT]             = metal_bcrypt_str,
+    /* [FAM_BCRYPT] retired 2026-05-09 (task #218); implicit NULL designated
+     * initializer. See retirement comment at #include block above. */
     [FAM_MD5CRYPT]           = metal_md5crypt_str,
     [FAM_SHA1]               = metal_sha1_str,
 };
@@ -168,11 +186,13 @@ static const struct {
     {"hmac_streebog256_ksalt_batch",   {JOB_HMAC_STREEBOG256_KSALT, -1}, FAM_STREEBOG},
     {"hmac_streebog512_kpass_batch",   {JOB_HMAC_STREEBOG512_KPASS, -1}, FAM_STREEBOG},
     {"hmac_streebog512_ksalt_batch",   {JOB_HMAC_STREEBOG512_KSALT, -1}, FAM_STREEBOG},
-    {"sha512crypt_batch",              {JOB_SHA512CRYPT, JOB_SHA512CRYPTMD5, -1}, FAM_SHA512CRYPT},
+    /* sha512crypt_batch retired in Phase 4 SHA512CRYPTMD5 ship (2026-05-08);
+     * orphan kernel_map row was inconsistent with [FAM_SHA512CRYPT]=NULL.
+     * Cleaned here alongside bcrypt_batch retirement (task #218). */
     {"sha256crypt_batch",              {JOB_SHA256CRYPT, -1}, FAM_SHA256CRYPT},
     {"rmd160_unsalted_batch",          {JOB_RMD160, -1}, FAM_RMD160UNSALTED},
     {"blake2s256_unsalted_batch",      {JOB_BLAKE2S256, -1}, FAM_BLAKE2S256UNSALTED},
-    {"bcrypt_batch",                   {JOB_BCRYPT, -1}, FAM_BCRYPT},
+    /* bcrypt_batch retired 2026-05-09 (task #218); see #include block above. */
     {"md5crypt_batch",                 {JOB_MD5CRYPT, -1}, FAM_MD5CRYPT},
     {NULL, {-1}, 0}
 };

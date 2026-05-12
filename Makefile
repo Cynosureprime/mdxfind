@@ -97,7 +97,7 @@ endif
 
 # OpenCL GPU objects (Linux, FreeBSD, aarch64)
 ifdef OPENCL_GPU
-  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o
+  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o
   CFLAGS += -Igpu
 endif
 
@@ -185,11 +185,13 @@ gpu_metal.o: gpu_metal.m gpu_metal.h gpujob.h job_types.h gpu/mdxfind_metallib.h
              gpu/metal_descrypt_str.h gpu/metal_md5unsalted_str.h gpu/metal_md4unsalted_str.h \
              gpu/metal_sha1unsalted_str.h gpu/metal_sha256unsalted_str.h gpu/metal_sha512unsalted_str.h \
              gpu/metal_md6256unsalted_str.h gpu/metal_wrlunsalted_str.h gpu/metal_keccakunsalted_str.h \
-             gpu/metal_mysql3unsalted_str.h gpu/metal_hmac_sha256_str.h gpu/metal_hmac_sha512_str.h \
+             gpu/metal_mysql3unsalted_str.h gpu/metal_hmac_sha512_str.h \
              gpu/metal_hmac_rmd160_str.h gpu/metal_hmac_rmd320_str.h gpu/metal_hmac_blake2s_str.h \
-             gpu/metal_streebog_str.h gpu/metal_sha256crypt_str.h gpu/metal_sha512crypt_str.h \
+             gpu/metal_streebog_str.h gpu/metal_sha256crypt_str.h \
              gpu/metal_rmd160unsalted_str.h gpu/metal_blake2s256unsalted_str.h \
-             gpu/metal_bcrypt_str.h gpu/metal_sha1_str.h gpu/metal_md5crypt_str.h
+             gpu/metal_sha1_str.h gpu/metal_md5crypt_str.h \
+             gpu/metal_md5_packed_str.h gpu/metal_md4_packed_str.h \
+             gpu/metal_sha1_packed_str.h gpu/metal_sha256_packed_str.h gpu/metal_sha512_packed_str.h
 	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpu_metal.m
 
 gpujob_metal.o: gpujob_metal.m gpujob.h job_types.h gpu_metal.h mdxfind.h
@@ -207,21 +209,36 @@ job_types.h: mdxfind.c
 
 
 ifdef OPENCL_GPU
-gpu/gpu_opencl.o: gpu/gpu_opencl.c gpu/gpu_opencl.h gpu/gpu_kernels_str.h gpujob.h job_types.h \
-                  gpu/gpu_common_str.h gpu/gpu_md5salt_str.h gpu/gpu_md5saltpass_str.h \
-                  gpu/gpu_md5iter_str.h gpu/gpu_phpbb3_str.h gpu/gpu_md5crypt_str.h \
-                  gpu/gpu_md5_md5saltmd5pass_str.h gpu/gpu_sha1_str.h gpu/gpu_sha256_str.h \
-                  gpu/gpu_md5mask_str.h gpu/gpu_descrypt_str.h gpu/gpu_md5unsalted_str.h \
-                  gpu/gpu_md4unsalted_str.h gpu/gpu_sha1unsalted_str.h \
-                  gpu/gpu_sha256unsalted_str.h gpu/gpu_sha512unsalted_str.h \
-                  gpu/gpu_md6256unsalted_str.h gpu/gpu_wrlunsalted_str.h \
-                  gpu/gpu_keccakunsalted_str.h gpu/gpu_mysql3unsalted_str.h \
-                  gpu/gpu_hmac_sha256_str.h gpu/gpu_hmac_sha512_str.h \
-                  gpu/gpu_hmac_rmd160_str.h gpu/gpu_hmac_rmd320_str.h \
-                  gpu/gpu_hmac_blake2s_str.h gpu/gpu_streebog_str.h \
-                  gpu/gpu_sha256crypt_str.h gpu/gpu_sha512crypt_str.h \
-                  gpu/gpu_rmd160unsalted_str.h gpu/gpu_blake2s256unsalted_str.h \
-                  gpu/gpu_bcrypt_str.h
+gpu/gpu_opencl.o: gpu/gpu_opencl.c gpu/gpu_opencl.h gpu/gpu_kernel_cache.h gpujob.h job_types.h \
+                  gpu/gpu_common_str.h gpu/gpu_md5salt_str.h \
+                  gpu/gpu_template_str.h gpu/gpu_md5_rules_str.h \
+                  gpu/gpu_md5_core_str.h gpu/gpu_md5_bf_str.h \
+                  gpu/gpu_md4_core_str.h gpu/gpu_md4utf16_core_str.h \
+                  gpu/gpu_sha1_core_str.h gpu/gpu_sha1dru_core_str.h gpu/gpu_sha1raw_core_str.h \
+                  gpu/gpu_sha224_core_str.h gpu/gpu_sha256_core_str.h gpu/gpu_sha256raw_core_str.h \
+                  gpu/gpu_sha384_core_str.h gpu/gpu_sha384raw_core_str.h \
+                  gpu/gpu_sha512_core_str.h gpu/gpu_sha512raw_core_str.h \
+                  gpu/gpu_md5raw_core_str.h \
+                  gpu/gpu_ripemd160_core_str.h gpu/gpu_ripemd320_core_str.h \
+                  gpu/gpu_blake2s256_core_str.h gpu/gpu_blake2b256_core_str.h gpu/gpu_blake2b512_core_str.h \
+                  gpu/gpu_keccak224_core_str.h gpu/gpu_keccak256_core_str.h \
+                  gpu/gpu_keccak384_core_str.h gpu/gpu_keccak512_core_str.h \
+                  gpu/gpu_sha3_224_core_str.h gpu/gpu_sha3_256_core_str.h \
+                  gpu/gpu_sha3_384_core_str.h gpu/gpu_sha3_512_core_str.h \
+                  gpu/gpu_md6256_core_str.h gpu/gpu_ntlmh_core_str.h \
+                  gpu/gpu_mysql3_core_str.h gpu/gpu_wrl_core_str.h gpu/gpu_sql5_core_str.h \
+                  gpu/gpu_streebog256_core_str.h gpu/gpu_streebog512_core_str.h \
+                  gpu/gpu_md5salt_core_str.h gpu/gpu_md5saltpass_core_str.h gpu/gpu_md5passsalt_core_str.h \
+                  gpu/gpu_sha1saltpass_core_str.h gpu/gpu_sha1passsalt_core_str.h \
+                  gpu/gpu_sha224saltpass_core_str.h \
+                  gpu/gpu_sha256saltpass_core_str.h gpu/gpu_sha256passsalt_core_str.h \
+                  gpu/gpu_sha384saltpass_core_str.h \
+                  gpu/gpu_sha512saltpass_core_str.h gpu/gpu_sha512passsalt_core_str.h \
+                  gpu/gpu_ripemd160saltpass_core_str.h gpu/gpu_ripemd320saltpass_core_str.h \
+                  gpu/gpu_hmac_blake2s_core_str.h \
+                  gpu/gpu_hmac_streebog256_core_str.h gpu/gpu_hmac_streebog512_core_str.h \
+                  gpu/gpu_phpbb3_core_str.h gpu/gpu_md5crypt_core_str.h gpu/gpu_shacrypt_core_str.h \
+                  gpu/gpu_descrypt_core_str.h gpu/gpu_bcrypt_core_str.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/gpu_opencl.c -o gpu/gpu_opencl.o
 
 gpu/gpujob_opencl.o: gpu/gpujob_opencl.c gpu/gpu_opencl.h gpujob.h job_types.h mdxfind.h
@@ -229,6 +246,9 @@ gpu/gpujob_opencl.o: gpu/gpujob_opencl.c gpu/gpu_opencl.h gpujob.h job_types.h m
 
 gpu/opencl_dynload.o: gpu/opencl_dynload.c gpu/opencl_dynload.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/opencl_dynload.c -o gpu/opencl_dynload.o
+
+gpu/gpu_kernel_cache.o: gpu/gpu_kernel_cache.c gpu/gpu_kernel_cache.h
+	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/gpu_kernel_cache.c -o gpu/gpu_kernel_cache.o
 endif
 
 # _str.h files are pre-generated on the dev machine and committed directly.

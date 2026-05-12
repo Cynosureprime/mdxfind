@@ -1,142 +1,22 @@
-__kernel void md5salt_batch(
-    __global const uchar *hexhashes, __global const ushort *hexlens,
-    __global const uchar *salts, __global const uint *salt_offsets, __global const ushort *salt_lens,
-    __global const uint *compact_fp, __global const uint *compact_idx,
-    __global const OCLParams *params_buf,
-    __global const uchar *hash_data_buf, __global const ulong *hash_data_off, __global const ushort *hash_data_len,
-    __global uint *hits, __global volatile uint *hit_count,
-    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,
-    __global const uint *overflow_offsets, __global const ushort *overflow_lengths)
-{
-    OCLParams params = *params_buf;
-    uint tid = get_global_id(0);
-    uint word_idx = tid / params.num_salts;
-    uint salt_idx = params.salt_start + (tid % params.num_salts);
-    if (word_idx >= params.num_words) return;
-
-    uint M[16];
-    __global const uint *mwords = (__global const uint *)(hexhashes + word_idx * 256);
-    for (int i = 0; i < 8; i++) M[i] = mwords[i];
-    for (int i = 8; i < 16; i++) M[i] = 0;
-
-    uint soff = salt_offsets[salt_idx];
-    int slen = salt_lens[salt_idx];
-    int total_len = 32 + slen;
-    uchar *mbytes = (uchar *)M;
-    for (int i = 0; i < slen; i++)
-        mbytes[32 + i] = salts[soff + i];
-    mbytes[total_len] = 0x80;
-    M[14] = total_len * 8;
-
-    uint hx = 0x67452301, hy = 0xEFCDAB89, hz = 0x98BADCFE, hw = 0x10325476;
-    md5_block(&hx, &hy, &hz, &hw, M);
-
-    if (probe_compact(hx, hy, hz, hw, compact_fp, compact_idx,
-                      params.compact_mask, params.max_probe, params.hash_data_count,
-                      hash_data_buf, hash_data_off,
-                      overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {
-        EMIT_HIT_4(hits, hit_count, params.max_hits, word_idx, salt_idx, 1u, hx, hy, hz, hw)
-    }
-}
-
-__kernel void md5salt_sub8_24(
-    __global const uchar *hexhashes, __global const ushort *hexlens,
-    __global const uchar *salts, __global const uint *salt_offsets, __global const ushort *salt_lens,
-    __global const uint *compact_fp, __global const uint *compact_idx,
-    __global const OCLParams *params_buf,
-    __global const uchar *hash_data_buf, __global const ulong *hash_data_off, __global const ushort *hash_data_len,
-    __global uint *hits, __global volatile uint *hit_count,
-    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,
-    __global const uint *overflow_offsets, __global const ushort *overflow_lengths)
-{
-    OCLParams params = *params_buf;
-    uint tid = get_global_id(0);
-    uint word_idx = tid / params.num_salts;
-    uint salt_idx = params.salt_start + (tid % params.num_salts);
-    if (word_idx >= params.num_words) return;
-
-    uint M[16];
-    __global const uint *mwords = (__global const uint *)(hexhashes + word_idx * 256);
-    for (int i = 0; i < 4; i++) M[i] = mwords[i];
-    for (int i = 4; i < 16; i++) M[i] = 0;
-
-    uint soff = salt_offsets[salt_idx];
-    int slen = salt_lens[salt_idx];
-    int total_len = 16 + slen;
-    uchar *mbytes = (uchar *)M;
-    for (int i = 0; i < slen; i++) mbytes[16 + i] = salts[soff + i];
-    mbytes[total_len] = 0x80;
-    M[14] = total_len * 8;
-
-    uint hx = 0x67452301, hy = 0xEFCDAB89, hz = 0x98BADCFE, hw = 0x10325476;
-    md5_block(&hx, &hy, &hz, &hw, M);
-
-    if (probe_compact(hx, hy, hz, hw, compact_fp, compact_idx,
-                      params.compact_mask, params.max_probe, params.hash_data_count,
-                      hash_data_buf, hash_data_off,
-                      overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {
-        EMIT_HIT_4(hits, hit_count, params.max_hits, word_idx, salt_idx, 1u, hx, hy, hz, hw)
-    }
-}
-
-/* hex_byte_lc, md5_to_hex_lc provided by gpu_common.cl */
-
-__kernel void md5salt_iter(
-    __global const uchar *hexhashes, __global const ushort *hexlens,
-    __global const uchar *salts, __global const uint *salt_offsets, __global const ushort *salt_lens,
-    __global const uint *compact_fp, __global const uint *compact_idx,
-    __global const OCLParams *params_buf,
-    __global const uchar *hash_data_buf, __global const ulong *hash_data_off, __global const ushort *hash_data_len,
-    __global uint *hits, __global volatile uint *hit_count,
-    __global const ulong *overflow_keys, __global const uchar *overflow_hashes,
-    __global const uint *overflow_offsets, __global const ushort *overflow_lengths)
-{
-    OCLParams params = *params_buf;
-    uint tid = get_global_id(0);
-    uint word_idx = tid / params.num_salts;
-    uint salt_idx = params.salt_start + (tid % params.num_salts);
-    if (word_idx >= params.num_words) return;
-
-    uint M[16];
-    __global const uint *mwords = (__global const uint *)(hexhashes + word_idx * 256);
-    for (int i = 0; i < 8; i++) M[i] = mwords[i];
-    for (int i = 8; i < 16; i++) M[i] = 0;
-
-    uint soff = salt_offsets[salt_idx];
-    int slen = salt_lens[salt_idx];
-    int total_len = 32 + slen;
-    uchar *mbytes = (uchar *)M;
-    for (int i = 0; i < slen; i++) mbytes[32 + i] = salts[soff + i];
-    mbytes[total_len] = 0x80;
-    M[14] = total_len * 8;
-
-    uint hx = 0x67452301, hy = 0xEFCDAB89, hz = 0x98BADCFE, hw = 0x10325476;
-    md5_block(&hx, &hy, &hz, &hw, M);
-
-    for (uint iter = 0; iter < params.max_iter; iter++) {
-        if (iter > 0) {
-            uint hwords[4]; hwords[0]=hx; hwords[1]=hy; hwords[2]=hz; hwords[3]=hw;
-            uchar *hb = (uchar *)hwords;
-            uint Mi[16];
-            uchar *mb = (uchar *)Mi;
-            for (int i = 0; i < 16; i++) {
-                uchar hi = hb[i] >> 4, lo = hb[i] & 0xf;
-                mb[i*2]   = hi + (hi < 10 ? '0' : 'a' - 10);
-                mb[i*2+1] = lo + (lo < 10 ? '0' : 'a' - 10);
-            }
-            Mi[8] = 0x80; Mi[9]=0; Mi[10]=0; Mi[11]=0;
-            Mi[12]=0; Mi[13]=0; Mi[14]=256; Mi[15]=0;
-            hx = 0x67452301; hy = 0xEFCDAB89; hz = 0x98BADCFE; hw = 0x10325476;
-            md5_block(&hx, &hy, &hz, &hw, Mi);
-        }
-        if (probe_compact(hx, hy, hz, hw, compact_fp, compact_idx,
-                          params.compact_mask, params.max_probe, params.hash_data_count,
-                          hash_data_buf, hash_data_off,
-                          overflow_keys, overflow_hashes, overflow_offsets, params.overflow_count)) {
-            EMIT_HIT_4(hits, hit_count, params.max_hits, word_idx, salt_idx, iter + 1, hx, hy, hz, hw)
-        }
-    }
-}
+/*
+ * $Revision: 1.7 $
+ * $Log: gpu_md5salt.cl,v $
+ * Revision 1.7  2026/05/11 05:22:01  dlr
+ * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.
+ *
+ */
+/* B8 retirement (2026-05-06): md5salt_batch and md5salt_sub8_24 kernels
+ * removed — JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT
+ * routed through unified template path (gpu_template.cl + gpu_md5salt_core.cl)
+ * via params.algo_mode at B6/B6.6. RCS history retains the slab kernels
+ * (rev <= 1.x) for reference.
+ *
+ * 2026-05-07: md5salt_iter kernel retired — JOB_MD5SALT iter coverage
+ * routes through the unified template path's per-iter loop (gpu_template.cl
+ * template_phase0 → template_iterate(&st) using gpu_md5salt_core.cl).
+ * The probe_max_dispatch capacity probe now exercises hmac_md5_ksalt_batch
+ * (same 17-arg slab signature). Only HMAC-MD5 kernels remain live in
+ * this file. */
 
 /* hex_byte_lc/uc, md5_to_hex_lc/uc provided by gpu_common.cl */
 

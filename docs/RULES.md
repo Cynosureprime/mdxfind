@@ -90,6 +90,7 @@ A 5,000-rule MD5 run on a single NVIDIA RTX 4070 Ti SUPER establishes the rules-
 | `TN` | Toggle case at position N | `password` → `pAssword` (T1) |
 | `E` | Title case (capitalize after each space) | `hello world` → `Hello World` |
 | `eX` | Title case with custom separator X | `hello-world` → `Hello-World` (e-) |
+| `3NX` | Toggle case of first letter after the Nth occurrence of separator X | `foo.bar.baz` → `foo.Bar.baz` (30.) |
 
 ## Insertion and Deletion
 

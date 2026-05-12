@@ -26,8 +26,10 @@ cl_int (*p_clGetDeviceInfo)(cl_device_id, cl_device_info, size_t, void *, size_t
 cl_context (*p_clCreateContext)(const cl_context_properties *, cl_uint, const cl_device_id *, void (CL_CALLBACK *)(const char *, const void *, size_t, void *), void *, cl_int *);
 cl_command_queue (*p_clCreateCommandQueue)(cl_context, cl_device_id, cl_command_queue_properties, cl_int *);
 cl_program (*p_clCreateProgramWithSource)(cl_context, cl_uint, const char **, const size_t *, cl_int *);
+cl_program (*p_clCreateProgramWithBinary)(cl_context, cl_uint, const cl_device_id *, const size_t *, const unsigned char **, cl_int *, cl_int *);
 cl_int (*p_clBuildProgram)(cl_program, cl_uint, const cl_device_id *, const char *, void (CL_CALLBACK *)(cl_program, void *), void *);
 cl_int (*p_clGetProgramBuildInfo)(cl_program, cl_device_id, cl_program_build_info, size_t, void *, size_t *);
+cl_int (*p_clGetProgramInfo)(cl_program, cl_program_info, size_t, void *, size_t *);
 cl_kernel (*p_clCreateKernel)(cl_program, const char *, cl_int *);
 cl_int (*p_clGetKernelWorkGroupInfo)(cl_kernel, cl_device_id, cl_kernel_work_group_info, size_t, void *, size_t *);
 cl_mem (*p_clCreateBuffer)(cl_context, cl_mem_flags, size_t, void *, cl_int *);
@@ -42,6 +44,9 @@ cl_int (*p_clEnqueueFillBuffer)(cl_command_queue, cl_mem, const void *, size_t, 
 cl_int (*p_clSetKernelArg)(cl_kernel, cl_uint, size_t, const void *);
 cl_int (*p_clEnqueueNDRangeKernel)(cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *, const size_t *, cl_uint, const cl_event *, cl_event *);
 cl_int (*p_clFinish)(cl_command_queue);
+cl_int (*p_clReleaseEvent)(cl_event);
+cl_int (*p_clGetEventProfilingInfo)(cl_event, cl_profiling_info, size_t, void *, size_t *);
+cl_int (*p_clGetMemObjectInfo)(cl_mem, cl_mem_info, size_t, void *, size_t *);
 
 static int dynload_done = 0;
 
@@ -72,8 +77,10 @@ int opencl_dynload_init(void) {
     p_clCreateContext = DLSYM(lib, "clCreateContext");
     p_clCreateCommandQueue = DLSYM(lib, "clCreateCommandQueue");
     p_clCreateProgramWithSource = DLSYM(lib, "clCreateProgramWithSource");
+    p_clCreateProgramWithBinary = DLSYM(lib, "clCreateProgramWithBinary");
     p_clBuildProgram = DLSYM(lib, "clBuildProgram");
     p_clGetProgramBuildInfo = DLSYM(lib, "clGetProgramBuildInfo");
+    p_clGetProgramInfo = DLSYM(lib, "clGetProgramInfo");
     p_clCreateKernel = DLSYM(lib, "clCreateKernel");
     p_clGetKernelWorkGroupInfo = DLSYM(lib, "clGetKernelWorkGroupInfo");
     p_clCreateBuffer = DLSYM(lib, "clCreateBuffer");
@@ -88,6 +95,9 @@ int opencl_dynload_init(void) {
     p_clSetKernelArg = DLSYM(lib, "clSetKernelArg");
     p_clEnqueueNDRangeKernel = DLSYM(lib, "clEnqueueNDRangeKernel");
     p_clFinish = DLSYM(lib, "clFinish");
+    p_clReleaseEvent = DLSYM(lib, "clReleaseEvent");
+    p_clGetEventProfilingInfo = DLSYM(lib, "clGetEventProfilingInfo");
+    p_clGetMemObjectInfo = DLSYM(lib, "clGetMemObjectInfo");
 
     /* Verify critical functions resolved */
     if (!p_clGetPlatformIDs || !p_clGetDeviceIDs || !p_clCreateContext ||

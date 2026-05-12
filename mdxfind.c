@@ -31,6 +31,9 @@
 #include <sys/file.h>  /* GPU salt resume fix: gpu_opencl.c r1.53, gpu_metal.m r1.42 */
 #include <dirent.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <sys/mman.h>     /* mlock() for pinned host buffers used by GPU upload */
+#endif
 #include <stdint.h>
 #include <stdatomic.h>
 
@@ -103,16 +106,30 @@
 
 #include "mdxfind.h"
 
+/* O_BINARY is needed on Windows to keep open() from doing CRLF translation
+ * and stopping at 0x1A (Ctrl-Z EOF) on binary compressed input. xz/bz2/zstd/
+ * ZIP streams routinely contain those byte values and get corrupted in text
+ * mode. On Linux/macOS O_BINARY is not defined; define it to 0 so the same
+ * `O_RDONLY | O_BINARY` works everywhere. Bug reported by @mastercho on
+ * 2026-05-10 against a Windows mdxfind build silently failing to
+ * xz-decompress a HashMob found file (hashmob.net_2026-04-13.found.xz,
+ * 7.85 GB compressed). macOS/Linux unaffected. */
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
 const struct Benchrates { int idx; long long rate; } bench_rates[] = {
 #include "bench_rates.h"
 ,{INT_MAX,0}
 };
 
 struct  Linehints {
+	/* 8-byte fields */
 	long long rate;
 	volatile long long hashes_accum;  /* per-algorithm hash counter for EMA feedback */
+	unsigned long long curline, numline;  /* widened from unsigned int — wordlist line positions can exceed 4.29B */
+	/* 4-byte fields */
 	unsigned int lineswanted, gpu;
-	unsigned int curline, numline;
 } *linehints;
 int linehints_count;  /* number of entries in linehints[] (highest op + 1) */
 
@@ -153,6 +170,7 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 #include "cuda_md5salt.h"
 #elif defined(OPENCL_GPU)
 #include "gpu_opencl.h"
+#include "gpu_kernel_cache.h"
 #endif
 #define NO_JOB_TYPES 1
 #include "gpujob.h"
@@ -185,9 +203,556 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.347 2026/04/26 22:04:54 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.463 2026/05/11 14:16:27 dlr Exp dlr $";
+
+/* Parse the RCS revision out of Version[] for use as the GPU kernel cache
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.463 2026/05/11 14:16:27 dlr Exp dlr $".
+ * Returns a pointer to a static buffer; safe to call multiple times. */
+static const char *mdxfind_rev_string(void) {
+    static char rev[32] = {0};
+    if (rev[0]) return rev;
+    const char *p = strstr(Version, ",v ");
+    if (!p) { snprintf(rev, sizeof(rev), "unknown"); return rev; }
+    p += 3;
+    const char *end = strchr(p, ' ');
+    if (!end) { snprintf(rev, sizeof(rev), "unknown"); return rev; }
+    size_t n = (size_t)(end - p);
+    if (n >= sizeof(rev)) n = sizeof(rev) - 1;
+    memcpy(rev, p, n);
+    rev[n] = 0;
+    return rev;
+}
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.463  2026/05/11 14:16:27  dlr
+ * Phase 1.8 host-side neutralization (adaptive_bf_chunk_size CHUNK_HARD reduction): kernel revert (gpu_template.cl 1.16) removed the for-loop wrap; host servo still computes inner_iter > 1 for chunks > NDRANGE_HARD, which the kernel now ignores, causing ~1000× rate collapse via NDRange/chunk_total misalignment (caught during revert validation: V1 raw MD5 BF without MDXFIND_BF_INNER_ITER=1 env override showed 1.36 MH/s vs target 1.0 GH/s). Fix: CHUNK_HARD reduced from 2^35 to 2^31 (= NDRANGE_HARD). Step 4.6 unsalted branch `if (ndrange > NDRANGE_HARD)` is now structurally never true; inner_iter stays at the initial 1u. Salted branch already forced 1. Host-side Phase 1.8 servo machinery retained as dead-but-harmless (could be cleaned up in a separate pass; minimal-surgery revert keeps the OCLParams field, jobg field, env override, etc. as dormant infrastructure). Now binary works correctly without env override; servo never picks inner_iter > 1.
+ *
+ * Revision 1.462  2026/05/11 05:18:51  dlr
+ * BF Phase 3b Tranche C: my_jobg defensive cleanup. After Tranche A deleted gpu_try_pack (the only my_jobg setter), the defensive `if (my_jobg && ...)` checks at lines ~10261/36723/36726 always evaluate false. Simplified 3 dead conditional sites; variable declaration retained as NULL stub with explanatory comment for source compatibility with surviving comment references. Brief s stated line numbers (10225/36679/36682) were stale from Tranche B; actual sites verified via re-audit.
+ *
+ * Revision 1.461  2026/05/11 03:48:15  dlr
+ * BF Phase 1.9 A1: BF chunk-producer at ~48603-48636 computes bf_fast_eligible per host gate (op==JOB_MD5, Numrules<=1, !Typesalt[op], n_prepend==0, n_append in [1,8]); MDXFIND_GPU_FAST_DISABLE env override forces 0. Sets job->bf_fast_eligible. Legacy single-job arm at ~48716 sets it to 0. Procjob short-circuit at ~10366 copies job->bf_fast_eligible to g->bf_fast_eligible.
+ *
+ * Revision 1.460  2026/05/11 00:29:01  dlr
+ * Gate BF Phase 1.6 sidecar WRITE block on OPENCL_GPU (parallel to existing READ block guard at ~48518). Caught during .209 Win ARM64 cross-compile attempt for @mastercho O_BINARY xz fix delivery. Win ARM64 build (NOTINTEL=1 DARM=8, no OPENCL_GPU) failed with 5 undeclared-identifier errors: BF_SIDECAR_MIN_CHUNKS, BF_SIDECAR_RATE_MIN/MAX, bf_sidecar_path, bf_sidecar_write_rate — all defined in OPENCL_GPU-only sections. The read block at 48518 was correctly wrapped at Phase 1.6 ship time; the write block was missed. Pure preprocessor gate; no logic change on OPENCL_GPU builds.
+ *
+ * Revision 1.459  2026/05/11 00:11:52  dlr
+ * Windows mkdir compat: wrap mkdir() in bf_sidecar_mkdir_p with #ifdef _WIN32 since Windows mkdir takes 1 argument (no mode). Caught during .209 Windows cross-compile attempt of the O_BINARY fix (build agent flagged this as pre-existing issue from BF Phase 1.6 sidecar). Linux/macOS unchanged.
+ *
+ * Revision 1.458  2026/05/11 00:09:09  dlr
+ * Acknowledge @mastercho as the bug reporter in the O_BINARY comment block. Comment-only update next to the O_BINARY define near top of file; references the specific file (hashmob.net_2026-04-13.found.xz, 7.85 GB compressed) and the report date. No code change.
+ *
+ * Revision 1.457  2026/05/11 00:02:59  dlr
+ * Windows xz/bz2/zstd/ZIP corruption fix: add O_BINARY to all open() calls that read compressed data. On Windows, open(filename, O_RDONLY) defaults to text mode — translates \r\n -> \n on read and stops at 0x1A (Ctrl-Z EOF). Binary compressed streams contain those byte values and get corrupted before liblzma/libbz2/libzstd/zlib see them. macOS/Linux unaffected (O_BINARY not defined; #define to 0). 10 sites fixed: 4 in creader_detect path (xz/bz2/zstd/zip reopen-as-fd after gzopen detection at lines 37024-37066); 6 in linecount header detection + per-format reopens (lines 38112-38224). /dev/urandom open at line 154 left alone (device file, no text-mode concerns, and code path is gated on !defined(_WIN32) anyway). Bug reported 2026-05-10 against Windows mdxfind silently failing to decompress hashmob.net_2026-04-13.found.xz (7.85 GB compressed). Diagnostic: xz integrity OK on file; mdxfind text-mode read corrupted the LZMA stream before lzma_code() could decode it. Fix is identity transform on Unix builds.
+ *
+ * Revision 1.456  2026/05/10 23:55:55  dlr
+ * BF Phase 3b Tranche B (B1): delete gpu_try_pack function at ~line 10061 (~143 LOC). Zero callers post-Tranche A (24 call sites deleted at rev 1.455). Per architect §11 audit: every op handled by gpu_try_pack now returns GPU_CAT_MASK from gpu_op_category(); the gates inside the function rejected all live ops in that category. P0.2 verified zero callers; my_jobg cleanup at 10225/36679/36682 deferred to Tranche C (now permanently NULL; left as harmless dead defense-in-depth). Validated by retained Phase 2 V2.5 10000/10000 byte-exact + V1.8 inner_iter=4 3/3 + capacity probe smoke pass.
+ *
+ * Revision 1.455  2026/05/10 22:09:01  dlr
+ * BF Phase 3b Tranche A: delete 24 gpu_try_pack call sites in mdxfind.c (-158 LOC). All sites structurally unreachable today — every op handled now returns GPU_CAT_MASK from gpu_op_category(), and the gates inside gpu_try_pack at lines 10067-10107 reject all live ops in that category. Per architect §11 audit 2026-05-10. P0.1 GPUForce edge-case pre-flight verified dead (-G force vs -G none byte-exact on MD5SALT 10x2 fixture); P0.2 binary state confirmed pre-deletion. Pattern 1 (22 sites): delete the `#ifdef GPU_ENABLED { if(gpu_try_pack...) break; } #endif` block. Pattern 2 (2 sites): preserve the CPU body, delete only the if/else wrapper. Site #1 (crypt_round at 13044) also removed save_pass/save_clen swap dance for SHA512CRYPTMD5; CPU path now flows directly. Site #18 (HMAC_start at 30640) also removed GPU-only build_salt_snapshot setup; CPU path uses JSLF(PV, ujudy, ...) directly. gpu_try_pack function itself NOT touched yet (Tranche B). gpu_opencl_dispatch_batch NOT touched (Tranche B). Validated on fpga 1080: V2 MD5SALT 100-salt BF 10000/10000 byte-exact (rules-engine chokepoint admit path active); V3 8d unsalted BF 3/3 @ 97.77 MH/s effective; V4 wordlist+best64 49/50 cracks bit-identical GPU=CPU. .205 build green; binary -40 bytes (compiler was already trimming most dead branches). Ready for Tranche B.
+ *
+ * Revision 1.454  2026/05/10 21:34:40  dlr
+ * BF Phase 1.7d: raise bootstrap-wait safety cap from 60s to 180s. Cold-cache NVIDIA template-kernel JIT on ioblade Ampere/Ada takes 60-64s (caught during Phase 1.7c validation), just exceeding the prior 60s cap and causing rate_ema to stay at seed for the entire JIT period (cost: ~1m wall time on cold-cache 10-min runs). 180s covers cold NVIDIA + Mali Rusticl + AMD driver JIT outliers. Warm-cache runs complete in <1s regardless (the cap only triggers in pathological cold-start scenarios). Single-LOC behavioral change; no validation needed beyond regression on Phase 1.7c V1.7c.
+ *
+ * Revision 1.453  2026/05/10 21:22:12  dlr
+ * BF Phase 1.8 servo activation (adaptive_bf_chunk_size + producer + procjob): (1) Split CHUNK_HARD=2^35 (logical) + NDRANGE_HARD=2^31 (kernel global_work_size, AMD-portable) at 9685-9696. (2) Servo signature gains uint32_t *out_inner_iter at 9676. (3) Step 4.5 salt cap uses NDRANGE_HARD (not CHUNK_HARD) so salted chunks stay NDRange-bound. (4) Step 4.6 NEW inner_iter derivation: inner_iter = max(1, ceil(ndrange_size / NDRANGE_HARD)); cap at 16; round chunk_total DOWN to clean multiple. (5) Phase 1.8 unsalted-only guard: when salts_per_page > 1, force inner_iter=1 + emit one-shot WARNING stderr (visibility for Phase 1.8b sizing decision). (6) Trace adds inner_iter=%u. (7) MDXFIND_BF_CHUNK_SIZE env override: out_inner_iter=1 (NDRange-bound debug semantics). (8) NEW MDXFIND_BF_INNER_ITER env override alongside MDXFIND_BF_CHUNK_SIZE for deterministic Phase 1.8 testing — debug-only, transient. (9) BF chunk producer at 48767-48809 threads this_inner_iter from servo; populates job->bf_inner_iter + job->bf_offset_per_word (now = this_mspw * this_inner_iter = per-word total coverage; semantic change from Phase 1.7 where it = bf_num_masks). (10) Procjob short-circuit at 10398-10428 derives num_words via bf_offset_per_word (covers pre/post-1.8 paths) + g->bf_inner_iter = job->bf_inner_iter. Phase 1.8 validated end-to-end via env override (V1.8.2 100M cands inner_iter=4 3/3 cracks 600 MH/s); servo-derived path validated logically (servo correctly defers to NDRANGE_HARD when chunk_total > 2^31), only rarely activates on a single 1080 (1.3 GH/s × 5s ≈ 6.5 GW exceeds 2^31 only marginally). Fast multi-GPU rigs (shooter 12×4090, ioblade post-cache-warm) will see meaningful inner_iter > 1 in steady-state.
+ *
+ * Revision 1.452  2026/05/10 20:29:56  dlr
+ * BF Phase 1.7c warmup-quirk fixes (M3 + multi-device bootstrap). (a) M3 — defer first atomic_store per slot. New _Atomic int bf_dev_first_dispatch_done[BF_MAX_GPU_SLOTS] static at line 7537. Per-op state reset at line 48598-48605 zeros the flag for each dev alongside existing wall_us/chunk_total zeroing. The atomic_store wrapping in gpu/gpujob_opencl.c skips the FIRST BF dispatch per slot (which includes per-op template JIT compile time at gpu/gpu_opencl.c:11019 → ~12s on cold cache); SECOND-and-later dispatches store wall_us + chunk_total normally. Eliminates JIT pollution of the EMA. (b) Multi-device bootstrap-wait. Replaced break-on-first-feedback at line 9705-9748 with wait-for-ALL-live-devices (uses gpu_opencl_num_devices() accessor). 60s safety cap retained. With M3 in play, bootstrap waits for all live devices to complete TWO dispatches (first deferred, second stored) before sizing chunk #2. Combined effect: rate_ema seeds from clean post-JIT observations across all devices simultaneously, eliminating the asymmetric warmup observed in Phase 1.5 (rate_ema stuck at JIT-polluted 97 MH/s for 850 chunks). Validated on fpga 1080: 8d/9d BF 3/3 cracks (single-chunk runs don\047t exercise bootstrap). Validated on ioblade 4070 Ti + 3080 + gfx1201 with cold sidecar + cold kernel cache: 4/4 cracks; M3 correctly suppressed JIT samples; multi-device bootstrap fired and waited for all 3 devices. KNOWN ISSUE: cold-cache NVIDIA JIT on ioblade takes 60-64s — exceeds the 60s safety cap, causing 9m23s wall vs 8m19s Phase 1.7v2 baseline (17.79 GH/s vs 20.04 GH/s). With warm kernel cache (typical case post first-binary-load), JIT is ~0.4s per device, bootstrap completes in <1s, and runs match the baseline. Cold-cache slowdown is expected and acceptable; consider raising max_wait_us to 120-180s in a follow-up if cold-start tail becomes routine.
+ *
+ * Revision 1.451  2026/05/10 19:13:04  dlr
+ * BF Phase 1.6 sidecar persistence: bf_rate_ema persisted per-(device, op) at ~/.mdxfind/dynsize/<dev_uuid>/bf_<op_lower>.txt. Mirrors dynsize prototype path/format conventions. (a) 4 helpers + 4 macros at lines 9472-9626: bf_sidecar_path/read_rate/write_rate/mkdir_p, BF_SIDECAR_SCHEMA_VERSION=1, BF_SIDECAR_MIN_CHUNKS=5 (lowered from brief 20 — fpga 1080 10-digit BF runs to completion in 6 chunks; 5 is enough for bootstrap+4 EMA integrations). (b) Read at op-start (lines 48571-48595): scan all participating devs; MIN-of-disk seed (conservative — under-seed grows fast via EMA, over-seed risks oversize first chunks). Falls back to 1 GH/s seed if no file or unparseable. Sanity-check rate in [100 MH/s, 100 GH/s]. (c) Write at op-end (lines 48666-48698): per-device, observed-rate from atomics; atomic write via tmp+rename. Skip if bf_chunks_produced <= 5 (insufficient data). Validated on fpga 1080: V1.6 first run (no sidecar) chunk_0 rate_ema=1000 MH/s seed; V1.6 second run (sidecar=1524841291) chunk_0 rate_ema=1524.84 MH/s — 1.52x larger seed → 1.52x larger first chunk → 6→5 batches. 3/3 cracks both runs. V1.2 non-BF regression 3/3 byte-exact.
+ *
+ * Revision 1.450  2026/05/10 18:51:29  dlr
+ * BF Phase 3 legacy machinery deletion (partial). Net -188 LOC in mdxfind.c. DELETED: gpujob_submit_bf (~55 LOC), bf_min_time_threshold_s (~20 LOC), bf_partition_setup (~103 LOC), and call sites including end-of-job flush at 36801 (replaced with plain gpujob_submit + my_jobg=NULL). DEFERRED: gpu_opencl_dispatch_batch whole-function deletion — agent audit found gpu_try_pack still wired into 27+ algorithm switch cases for chokepoint-rejected fallback paths (BCRYPT/MD5CRYPT/SHA-CRYPT/HMAC family/PHPBB3/etc), producing g->packed=0 slab slots that route through dispatch_batch. Reachability is real, not theoretical. Architect followup needed to either migrate remaining gpu_try_pack call sites or prove them unreachable via stronger gate analysis before retiring dispatch_batch entirely. Validated on fpga 1080: V3.1 4d MD5SALT 5-salt BF 25/25 byte-exact; V2.5 8d MD5SALT 100-salt BF 10000/10000 byte-exact 2.41 GH/s; V3.2 unsalted regressions pass; V1.2 non-BF wordlist+rules 20/20 byte-exact.
+ *
+ * Revision 1.449  2026/05/10 18:28:06  dlr
+ * BF Phase 2 salted migration: ALL BF (salted + unsalted) routes through bf_chunk_producer. (1) Site 2.1 at line 48578: removed Typesalt[x] == NULL split from chunk-producer activation gate; both salted and unsalted GPU_CAT_MASK ops now use chunk-as-job. (2) Site 2.2 at line 9805 (in adaptive_bf_chunk_size): added Step 4.5 salt-axis cap after candidate target compute. Reads Typesaltcnt[op] (mdxfind.c global, set at salt-load time); MDXFIND_SPP env override or default 1024 capped by total_salts. salts_per_page = min(Typesaltcnt[op], MDXFIND_SPP_env_or_1024); chunk_total <= CHUNK_HARD / salts_per_page (STRICT cap, no CHUNK_MIN floor — floor would mask the salt-axis cap and overrun NDRange on AMD RDNA4 per Phase 1.7). For 100 salts: chunk_total <= ~21.5M; for 1024 salts: <= ~2M. SURPRISE: initial impl had CHUNK_MIN floor active; would have crashed AMD with CL_INVALID_GLOBAL_WORK_SIZE on heavy salt loads. Pascal/Ampere/Ada are tolerant; AMD strict. Floor removed. Validated on fpga 1080: V2.1 4d MD5SALT 5-salt BF 5/5 byte-exact; V2.2 4d PHPBB3 5-salt BF 5/5; V2.5 8d MD5SALT 100-salt BF 100/100 byte-exact 10 GH/s aggregate (chunk_total=21,495,808 = 2^31/100, 5 batches); V1.4b unsalted regressions pass (8d 1.18 GH/s, 10d 1.25 GH/s); V1.2 non-BF wordlist+rules 23/23 bit-identical. dynsize × BF salted: cache HIT, plateau action, no shrink/halve/cliff (Phase 1.5 b71_mask_size substitution carries through). bf_partition_setup retained for Phase 3 deletion; legacy single-job activation arm structurally unreachable for GPU_CAT_MASK ops post-Phase-2.
+ *
+ * Revision 1.448  2026/05/10 17:56:50  dlr
+ * BF Phase 1.7: MIN-rate to MAX-rate flip in adaptive_bf_chunk_size. Per user design intent 2026-05-10: chunks sized for fast devices; weak devices accept long single-chunk walls (5s on 4090 -> 50s on 1080 -> 500s on Mali). Reframes heterogeneity from safety problem to throughput property. Variable rename observed_min -> observed_max; comparator flip rate_d > observed_max; trace label observed_min_MHs -> observed_max_MHs; comment updates. CHUNK_HARD KEPT at 2^31 (was 2^31): Phase 1.7 v1 attempted to raise to 2^33 but AMD gfx1201/RDNA4 rejects NDRange global > 2^31 with CL_INVALID_GLOBAL_WORK_SIZE (caught on ioblade 2026-05-10). 2^31 is the safe driver-portable ceiling until kernel-side inner iteration unlocks larger logical chunks (Phase 1.8 candidate). Validated on ioblade 3-GPU (RTX 4070 Ti + RTX 3080 + gfx1201): wall 8m19.85s (5% faster than Phase 1.5 baseline 8m45s, due to warm kernel cache); aggregate 20.04 GH/s vs 19.48 baseline; additivity 0.999 vs 0.985; 4/4 cracks. Servo convergence: cap reached at chunk_no=5 (1 feedback cycle) vs Phase 1.5 MIN-rate at chunk ~850 — definitively better.
+ *
+ * Revision 1.447  2026/05/10 15:06:48  dlr
+ * BF Phase 1.4b bootstrap-wait point. Adaptive servo now actually receives feedback before sizing chunk #2. New file-scope static bf_first_feedback_seen (atomic int, 0). At top of adaptive_bf_chunk_size after env-override but before per-device feedback scan: when flag unset AND bf_chunks_produced > 0, poll bf_dev_wall_us[] every 5ms up to 60s safety cap; sets flag unconditionally on exit (even timeout); emits WARNING if no feedback arrived. Per-op state reset (~48520) zeros the flag alongside existing rate_ema/chunks_produced resets. Validated on fpga 1080 V1.4b 10-digit BF (10G keyspace): chunk_no=0 traces at t=0.684s with rate_ema=1000 seed; bootstrap wait fires; chunk_no=5 at t=1.298s shows rate_ema=1526 MHs and observed_min=1632 MHs (EMA converging toward 1.34 GH/s observed); chunk_total grew to ~890M; total wall 6.76s at 1.48 GH/s steady-state. 8-digit (1 chunk) unchanged 1.7s; V1.2 non-BF regression byte-exact. The 10-digit "None found" is the pre-existing gpu_mask_total <= 0xFFFFFFFFu host gate (Phase 1.5 territory), not a Phase 1.4b regression.
+ *
+ * Revision 1.446  2026/05/10 14:55:17  dlr
+ * BF Phase 1.4 adaptive chunk sizing servo. Replaces static compute_bf_chunk_size with adaptive_bf_chunk_size: per-call EMA(alpha=0.7) update of bf_rate_ema from per-device atomic feedback (bf_dev_wall_us[], bf_dev_chunk_total[] arrays sized BF_MAX_GPU_SLOTS=64); MIN-rate-across-fresh-devices for slow-device safety (option iii); target_seconds ramps 1.0s → 5.0s over first 10 chunks; clamps [2^28, 2^31]; tail-clamp at keyspace boundary; geometry resolution factored into bf_chunk_geometry helper. New file-scope statics: bf_rate_ema (1 GH/s seed), bf_chunks_produced (warmup counter). Per-op state reset at BF activation arm (~48449). MDXFIND_BF_CHUNK_SIZE env override preserved (bypasses servo entirely). MDXFIND_BF_ADAPTIVE_TRACE env-gated stderr telemetry shows chunk_no, chunk_total, nwords, mspw, target_s, rate_ema_MHs, observed_min_MHs, fresh_devs at every 5 chunks during warmup / 50 after. Validated on fpga 1080: V1.4 9-digit BF (1G keyspace, 1 chunk @ 1G) 3/3 cracks 1.74s; V1.4 8-digit (100M, 1 chunk tail-clamped) 3/3 1.74s; V1.2 non-BF regression 8/8 byte-exact (servo never invoked when bf_chunk==0). Known limitation: producer pipelines all chunks back-to-back gated only on FreeWaiting; for short BF runs (queue-depth chunks or fewer) no clFinish-fed atomic update arrives before producer races through, so rate_ema stays at seed for the entire run. Adaptive infrastructure correct; convergence requires producer throttling (Phase 1.5). Sites: mdxfind.c statics 7494-7515, geometry helper 9563-9627, adaptive_bf_chunk_size 9629-9774, BF activation 48449-48560; gpujob_opencl.c externs 55-65, atomic-store telemetry 881-902.
+ *
+ * Revision 1.445  2026/05/10 14:04:18  dlr
+ * BF Tranche 3 activation: BF on unsalted ops now uses the GPU. Sites: (1) compute_bf_chunk_size helper (after bf_min_time_threshold_s) — env override MDXFIND_BF_CHUNK_SIZE (debug-only, transient), else slowest-device fam_rate * target_seconds, fallback 1 GH/s when fam_rate==0 (post-B9 unsalted families do not warm-probe). chunk_total clamped [2^28, 2^31]; mask_size_per_word picked s.t. num_words <= GPU_RULES_MAX_WORDS_PER_BATCH=16384. (2) BF activation main-thread loop (mdxfind.c ~48320-48455) replaces single-job-per-op with per-op chunk producer; each chunk job carries flags=JOBFLAG_NUMBERS|JOBFLAG_BRUTEFORCE|JOBFLAG_BF_CHUNK + MaskIndex=cursor + MaskCount=chunk_total + bf_offset_per_word/bf_num_masks. Tail-handling shrinks num_words for partial last chunk. (3) Procjob short-circuit at chokepoint entry: detects JOBFLAG_BF_CHUNK, acquires rules-engine slot via gpujob_get_free_rules, lazy-allocates packed_buf + word_offset, fills synthetic single empty plaintext (packed_count=num_words; all word_offset[i]=0), populates jobg.bf_* fields, gpujob_submit, returns job to FreeWaiting. Skips CPU rule walker entirely. (4) Chokepoint admit gate widened defensively to admit JOBFLAG_BF_CHUNK (short-circuit normally pre-empts but defense-in-depth). Validated on fpga 1080: V1.3 4-digit cracks 4/4 GPU=CPU byte-exact; V1.4 8-digit BF 100M cands at 1.34 GH/s peak kernel rate (253x speedup vs 5.26 MH/s baseline; 19x wall-clock); V1.2 non-BF regression byte-exact 7 cracks. NOT done: multi-GPU validation, salted BF (Phase 2). Tothash over-count via b71_mask_size_acct = gpu_mask_total noted as cosmetic followup.
+ *
+ * Revision 1.444  2026/05/10 03:11:13  dlr
+ * *** empty log message ***
+ *
+ * Revision 1.443  2026/05/09 08:01:34  dlr
+ * Fix CPU SHA512CRYPTMD5 (e538) explicit-rounds bug: linebuf-aliasing between MD5-hex KEY and crypt_round P-stretch corrupted KEY across salt iterations. Stage prmd5 output to linebuf+MAXLINE (mirrors PHPBB3MD5 pattern at line 13713) so crypt_round's per-iteration memmove(linebuf, cur, len) refresh works correctly. Pre-fix: order-dependent miscompute (only first lex-sorted salt entry produced correct digest); post-fix: 3/3 byte-exact cracks across all salt orderings. SHA512CRYPT (e513) sibling unaffected. Surfaced via Phase 4 SHA512CRYPTMD5 GPU template differential testing 2026-05-08; predates Phase 4 (reproducible on Phase 3 binary 5c42d9fc98).
+ *
+ * Revision 1.442  2026/05/09 05:00:54  dlr
+ * BCRYPT (e450) Phase 6: chokepoint admit + salt-snapshot precondition + rules-engine pack-site host clamp (len=72 for JOB_BCRYPT). Slab gpu_try_pack call at procjob removed. Routes through unified template path with bespoke kernel via algo_mode=8. Final algorithm in slab-retirement ladder.
+ *
+ * Revision 1.441  2026/05/08 21:42:47  dlr
+ * DESCRYPT (e500) Phase 5: chokepoint admit + salt-snapshot precondition + rules-engine pack-site host truncation clamp (len=8 for JOB_DESCRYPT). Routes through unified template path with bespoke algo_mode=7.
+ *
+ * Revision 1.440  2026/05/08 19:47:41  dlr
+ * SHA512CRYPTMD5 (e538) Phase 4: chokepoint admit + salt-snapshot precondition for JOB_SHA512CRYPTMD5; routes through unified template path with kernel-side algo_mode=1 MD5-preprocess; slab #include for gpu_sha512crypt_str.h removed (Phase 4 retirement).
+ *
+ * Revision 1.439  2026/05/08 18:25:48  dlr
+ * SHA512CRYPT (e514) Phase 3: chokepoint admit OR-chain + salt-snapshot precondition negation for JOB_SHA512CRYPT, mirroring SHA256CRYPT siblings.
+ *
+ * Revision 1.438  2026/05/08 17:23:07  dlr
+ * SHA256CRYPT (e512) Phase 2: chokepoint admit + nsalts_job guard + compact-table loader (b64 decode 32-byte trailer, first-16 compact_insert mirroring SHA512CRYPT).
+ *
+ * Revision 1.437  2026/05/08 13:56:26  dlr
+ * MD5CRYPT carrier ship 2026-05-08: 2-site host wiring for JOB_MD5CRYPT (e511). (1) gpu_rules_engine_active OR-chain extended at chokepoint admit (~line 10606) -- JOB_MD5CRYPT joins the rules-engine-eligible op set alongside JOB_PHPBB3 + the HMAC families. (2) Salt-snapshot precondition negation list extended (~line 10783) so MD5CRYPT falls under the salt-snapshot guard. JOB_MD5CRYPT already pre-existed in gpu_ops[] at line 37079 + [GPU] tag at line 42769 + iter-types whitelist (per architect §11 inventory). Templated count delta 56 -> 57. Phase 1 of Unix-crypt ladder (MD5CRYPT -> SHA256CRYPT -> SHA512CRYPT -> SHA512CRYPTMD5).
+ *
+ * Revision 1.436  2026/05/08 06:18:11  dlr
+ * PHPBB3 carrier ship 2026-05-08: 2-site host wiring for JOB_PHPBB3 (e455). (1) gpu_rules_engine_active OR-chain extended at chokepoint admit (~line 10583) — JOB_PHPBB3 joins the rules-engine-eligible op set alongside the HMAC families. (2) Salt-snapshot precondition negation list extended (~line 10778) so PHPBB3 falls under the salt-snapshot guard. JOB_PHPBB3 already pre-existed in gpu_ops[] at line 37078 + [GPU] tag at line 42768 (per architect §11 inventory). Templated count delta 55 -> 56.
+ *
+ * Revision 1.435  2026/05/08 05:33:39  dlr
+ * Family D HMAC-SHA256 e217 e795 SHIPPED FOR REAL THIS TIME - rules-engine OR-arm extended for JOB_HMAC_SHA256 and JOB_HMAC_SHA256_KPASS at gpu_rules_engine_active gate (~10440) - salt-snapshot precondition negation list extended (~10641) - prior chokepoint admit (~42721) and nsalts_job guard (~47251) were already in place from prior attempt rollforward but the rules-engine entry gate was missing in the rollback - HMAC body uses RUNTIME gate not preprocessor #if - rev 1.7 Pascal NVIDIA ABORT lesson - HMAC ladder COMPLETE 21 of 21 algos shipped final HMAC family
+ *
+ * Revision 1.434  2026/05/08 04:14:02  dlr
+ * B12 Phase 4: drop FAM_MD5ITER + FAM_MD5MASK from JOB_MD5/JOB_MD5UC fam mask. Both families are retired in this same commit (gpu_opencl.c rev 1.147). Keep FAM_MD5UNSALTED bit for ABI stability of the FAM_* enum (B9-retired but compile-time NULL-skipped).
+ *
+ * Revision 1.433  2026/05/08 03:27:02  dlr
+ * Family K HMAC-STREEBOG-512 carrier (2026-05-08): chokepoint admit + nsalts_job > 0 guard extensions for JOB_HMAC_STREEBOG512_KSALT (e840) + JOB_HMAC_STREEBOG512_KPASS (e839). Both ops join the unified template path via the hand-written Path A carrier GPU template kernel (gpu_hmac_streebog512_core.cl) + algo_mode=5/6 runtime variant. HMAC body branches at the top of template_finalize (gated on algo_mode >= 5u inline, single branch covering both KSALT + KPASS since kernel-side math is identical). max_iter forced to 1 host-side at the rules-engine pack site (HMAC has no CPU iter loop). UNLIKE Families A-H whose KSALT siblings have TYPEOPT_NEEDUSER (salt-data in Typeuser), Streebog HMAC (256+512) has TYPEOPT_NEEDSALT for BOTH KSALT + KPASS - salt-data lives in Typesalt[op] for both ops; gpu_salt_judy() routes both to the Typesalt default arm (mirrors Family J pattern). Slab kernels surgically deleted from gpu_streebog.cl (whole-file #if 0 wrap; gpu_streebog.cl rev 1.8 - file is empty post-Family-K retirement). Final HMAC family in the ladder. Templated count delta: 54 -> 55. HMAC LADDER COMPLETE: 19/21 algos shipped (Family D HMAC-SHA256 deferred per project_family_d_deferred.md).
+ *
+ * Revision 1.432  2026/05/08 02:54:32  dlr
+ * Family J HMAC-STREEBOG-256 carrier (2026-05-08): chokepoint admit + nsalts_job > 0 guard extensions for JOB_HMAC_STREEBOG256_KSALT (e838) + JOB_HMAC_STREEBOG256_KPASS (e837). Both ops join the unified template path via the hand-written Path A carrier GPU template kernel (gpu_hmac_streebog256_core.cl) + algo_mode=5/6 runtime variant. HMAC body branches at the top of template_finalize (gated on algo_mode >= 5u inline, single branch covering both KSALT + KPASS since kernel-side math is identical). max_iter forced to 1 host-side at the rules-engine pack site (HMAC has no CPU iter loop). UNLIKE Families A-H whose KSALT siblings have TYPEOPT_NEEDUSER (salt-data in Typeuser), Streebog HMAC has TYPEOPT_NEEDSALT for BOTH KSALT + KPASS - salt-data lives in Typesalt[op] for both ops; gpu_salt_judy() routes both to the Typesalt default arm. Slab kernels surgically deleted from gpu_streebog.cl (gpu_streebog.cl rev 1.7); KEEP streebog512 HMAC kernels (Family K scope). Templated count delta: 53 to 54.
+ *
+ * Revision 1.431  2026/05/08 01:55:13  dlr
+ * Family I HMAC-BLAKE2S carrier (2026-05-08): chokepoint admit JOB_HMAC_BLAKE2S to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate (~line 10491). nsalts_job > 0 guard extended to cover JOB_HMAC_BLAKE2S in the same triple-conjunct pattern as Families A/B/C/E/F/G/H. Single algo_mode (5) — no KPASS sibling op exists in mdxfind for HMAC-BLAKE2S. Routes through unified template path (gpu_template.cl + gpu_hmac_blake2s_core.cl) via params.algo_mode=5. max_iter forced to 1 host-side. Slab kernel hmac_blake2s_kpass_batch retired in same commit.
+ *
+ * Revision 1.430  2026/05/08 01:24:16  dlr
+ * Family H HMAC-RIPEMD-320 carrier (2026-05-08): chokepoint admit JOB_HMAC_RMD320 + JOB_HMAC_RMD320_KPASS to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate (line ~10472). nsalts_job > 0 guard extended to cover JOB_HMAC_RMD320 + JOB_HMAC_RMD320_KPASS in the same triple-conjunct pattern as Family G's RMD160 / Families A/B/C/E/F's HMAC-* (line ~10577). Both ops route through the unified template path (gpu_template.cl + gpu_ripemd320saltpass_core.cl) via params.algo_mode = 5 / 6. The HMAC body branches at the top of template_finalize (gated on HASH_WORDS==10 in finalize_prepend_rmd.cl.frag) and returns early. max_iter forced to 1 host-side mirrors Families A/B/C/E/F/G. Slab kernels retired in same commit (gpu_hmac_rmd320.cl whole-file #if 0 wrap).
+ *
+ * Revision 1.429  2026/05/08 00:42:33  dlr
+ * Family_G_HMAC-RMD160_carrier_2026-05-08_chokepoint_admit_for_JOB_HMAC_RMD160_KSALT_e211_KPASS_e798_plus_nsalts_job_guard_join_template_path_via_RIPEMD160SALTPASS_carrier_kernel_algo_mode_5-6
+ *
+ * Revision 1.428  2026/05/08 00:08:04  dlr
+ * Family F: HMAC-SHA512 (e218/e797) chokepoint admit + nsalts_job guard. Joins JOB_HMAC_SHA384/_KPASS/SHA512SALTPASS as the seventh+eighth GPU-eligible salted ops sharing a SHA-family salted template kernel via algo_mode 5/6.
+ *
+ * Revision 1.427  2026/05/07 23:48:35  dlr
+ * Family E HMAC-SHA384 chokepoint: admit JOB_HMAC_SHA384_KSALT (e543) + JOB_HMAC_SHA384_KPASS (e796), nsalts_job guard. CPU/GPU md5 match validated on fpga GTX 1080 (4-cell × 2 algos = 100/100 per cell).
+ *
+ * Revision 1.426  2026/05/07 17:49:28  dlr
+ * Family D HMAC-SHA256 ABORTED - rollback chokepoint admit and nsalts_job guard for JOB_HMAC_SHA256 and JOB_HMAC_SHA256_KPASS. Template-path HMAC-SHA256 produces wrong digests on NVIDIA Pascal - slab kernels restored. Routing reverts to legacy slab path until kernel bug isolated
+ *
+ * Revision 1.425  2026/05/07 17:19:58  dlr
+ * Family D HMAC-SHA256 e217 e795 chokepoint admit - rules-engine OR-arm extended for JOB_HMAC_SHA256 and JOB_HMAC_SHA256_KPASS - nsalts_job greater than 0 salted-op guard extended - both ops route through SHA256SALTPASS unified template via algo_mode 5 6 - HMAC body branches at top of template_finalize gated on HASH_WORDS 8 and returns early bypassing the SHA256 salt-pass chain - max_iter forced to 1 host-side mirrors Families A B C - no gpu_hash_words latent bug to fix unlike Family C since SHA256 emits full 8-word digest no truncation - slab kernels hmac_sha256_ksalt_batch and hmac_sha256_kpass_batch RETIRED in same commit
+ *
+ * Revision 1.424  2026/05/07 17:04:49  dlr
+ * Family C HMAC-SHA224 e216 e794 chokepoint admit - rules-engine OR-arm extended for JOB_HMAC_SHA224 and JOB_HMAC_SHA224_KPASS - nsalts_job greater than 0 salted-op guard extended - both ops route through SHA224SALTPASS unified template via algo_mode 5 6 - HMAC body branches at top of template_finalize gated on HASH_WORDS 7 and returns early bypassing the SHA224 salt-pass chain - max_iter forced to 1 host-side mirrors Families A and B
+ *
+ * Revision 1.423  2026/05/07 16:46:02  dlr
+ * Family B HMAC-SHA1 e215 e793 chokepoint admit - rules-engine OR-arm extended for JOB_HMAC_SHA1 and JOB_HMAC_SHA1_KPASS - nsalts_job > 0 salted-op guard extended - both ops route through SHA1SALTPASS unified template via algo_mode 5 6 - HMAC body branches at top of template_finalize and returns early bypassing the SHA1 salt-pass chain - max_iter forced to 1 host-side mirrors Family A and SHA1DRU
+ *
+ * Revision 1.422  2026/05/07 16:25:11  dlr
+ * Family A: JOB_HMAC_MD5 (e214) + JOB_HMAC_MD5_KPASS (e792) admitted to chokepoint rules-engine pack site; salt-snapshot precondition gates extended (Typeuser for KSALT via gpu_salt_judy, Typesalt for KPASS). Both ops now route through unified template path (gpu_template.cl + gpu_md5salt_core.cl) via algo_mode 5/6 — share kernel with MD5SALT family. CPU paths unchanged (mdxfind.c:29250 + 29423).
+ *
+ * Revision 1.421  2026/05/07 09:53:21  dlr
+ * B9 (2026-05-07): unsalted slab retirement (compile-only ship). Final phase of the B7.6+ ladder. (1) Delete the legacy mask short-circuit at procjob() (formerly the "#ifdef GPU_ENABLED ... #endif" block at ~line 10911-10951) - it called gpu_try_pack_unsalted (sole call site) for unsalted slab packing of mask-only-no-rules workloads, and gpu_try_pack for the legacy mask path. Per B7.7a + B7.7b + B7.8 (rules-engine eligibility expanded to all 16+16 mask configs for all relevant ops), this short-circuit is no longer load-bearing; mask configs > 16+16 positions and other unmapped configurations CPU-fallback per architect §11 (B9 row). (2) Delete gpu_try_pack_unsalted() function (formerly mdxfind.c rev 1.420 lines 9268-9430, 162 lines) - sole caller deleted. (3) Pairs with gpu/gpu_opencl.c rev 1.129: 11 unsalted _str.h includes deleted, 11 family_source[] entries set to NULL designated initializer (compile_families NULL-skips), 22 kernel_map[] entries deleted, 11 .cl + 11 _str.h files deleted from working tree (RCS history retained). gpu_opencl_dispatch_batch() function STAYS - load-bearing for SALTED/SALTPASS ops (PHPBB3, MD5CRYPT, DESCRYPT, HMAC_*, SHA512CRYPT, SHA256CRYPT, BCRYPT, salted MD5SALT-family pre-template) packed via gpu_try_pack (the salted variant) at non-mask-short-circuit call sites. The Q1 conservative-keep on MD6256 was moot - structurally unreachable without the legacy short-circuit regardless of file presence. .205 build green (md5 d43378e3bb2d5c46838a72a0b749dc4c, 10148440 bytes; ~197 KB smaller than B7.9). Compile-only scope per user 2026-05-07; integrated post-this-batch validation deferred. The full B7.6+ + B9 cleanup compile-only batch is now COMPLETE.
+ *
+ * Revision 1.420  2026/05/07 09:26:41  dlr
+ * B7.9 (2026-05-07): chokepoint pack retirement (option A1 pure-retire variant). Delete the legacy chokepoint pack block at procjob() inner do/while around line 11199-11374 (140-line pre-encoding + 5-packed-kernel dispatch) — replaced with: keep the gpu_skip_no_rule_pack skip-then-goto interlock (still load-bearing against the FastRule SIMD walker hijacking currule = NULL via the JOB_MD5 case at line 24338), remove the do_pack_gpu pack body. RCS history retains the 140-line pack with NTLMH UTF-16LE zero-extend + NTLM iconv UTF-8/CP1251/CP1252 multi-variant + 3-deep dedup + 16M-word chunk dispatch. CPU-rule outputs that previously rode the chokepoint pack now CPU-fallback through the switch — architect-accepted ~5% throughput hit per project_b76plus_mask_iter_closure.md §13 Q2 option A1 (recommended over A2 per-word program index). 100%-GPU-eligible workloads (gpu_legacy_slot_unused == 1, dominant production case) already bypassed the chokepoint via gpu_skip_no_rule_pack — no net change for that case. GPU_CAT_MASK ops without a packed_family entry (KECCAK*, SHA3_*, RMD160, RMD320, BLAKE2*, MYSQL3, STREEBOG_*, WRL, MD6256, salted variants) no longer silent-zero-hit when chokepoint fires (packed_family used to return -1 → NULL → silent loss); they now CPU-fallback correctly. Pairs with gpu/gpu_opencl.c rev 1.128 (5 packed _str.h includes deleted, family_source[FAM_MD5PACKED] entry retired, packed_kernel_map[] + packed_family() functions retired, gpu_opencl_dispatch_packed() function retired, kernel_map md5_packed_batch entry retired, JOB_MD5UC added to dispatch_md5_rules admit list as B7.7a-oversight closure) + gpu/gpu_opencl.h rev 1.21 (gpu_opencl_dispatch_packed declaration retired) + gpu/gpujob_opencl.c rev 1.100 (packed-dispatch branch at lines 1141-1287 deleted; replaced with defensive abort since every packed slot is now rules-engine). 5 .cl + 5 _str.h files deleted from working tree (gpu_md5_packed.cl, gpu_sha1_packed.cl, gpu_sha256_packed.cl, gpu_md4_packed.cl, gpu_sha512_packed.cl + siblings); RCS history retained. .205 build green: mdxfind hash fb08bf8ecc5075c8a95ff6938065e6f5 (10345640 bytes; ~57 KB smaller than B7.8 from removing the 5 packed kernel strings + dispatch_packed). Compile-only ship per user 2026-05-07 directive; smoke validation deferred to integrated post-this-batch (4-cell + priv_mem + canonical 21,289 + Win NVIDIA preflight for B7.7a/B7.7b/B7.8/B7.9). M4 from B9 gate-fail (project_b76plus_mask_iter_closure.md) closed; B7 ladder M1 + M3 + M4 + M5 all closed in source.
+ *
+ * Revision 1.419  2026/05/07 09:00:57  dlr
+ * Memo B Phase B7.8: chokepoint gate cap lift 8+8 -> 16+16 to admit larger mask configurations through the template / rules-engine path. Four sites updated: (1) mask_b71_eligible (line ~10287) widened from MaskPrependLen/MaskAppendLen <= 8 to <= 16. (2) gpu_legacy_slot_unused number_iter advance gate (line ~10705) widened identically. (3) C2.3 GPU-eligible-rule skip b71_mask_skip_ok gate (line ~10823) widened identically. (4) Slab-path mask short-circuit b71_slab_skip gate (line ~10920) widened identically. Doc block at line ~10262-10286 updated to record B7.8 lift (MASK_POS_CAP 8 -> 16). Pairs with gpu/gpu_template.cl rev 1.9 (kernel clamp lift to 16u) + gpu/gpu_opencl.c rev 1.127 (host MASK_POS_CAP enum + b7_mask_eligible gate) + gpu/gpu_template_str.h regenerated. Compile-only scope per user 2026-05-07; integrated post-B7.9 validation deferred. Per architect §3 R2 priv_mem prediction: +200-500 B per device, expected to fit comfortably under gfx1201 43,024 B HARD GATE.
+ *
+ * Revision 1.418  2026/05/07 08:46:59  dlr
+ * B7.7b: rules-engine admit list — add JOB_MD6256 OR-arm. Final M5 closure from B9 gate-fail per project_b76plus_mask_iter_closure.md. New gpu_md6256_core.cl provides MD6-256 single-block leaf compression on the unified template path; iter > 1 feeds lowercase hex of prior 32-byte digest (64 ASCII chars) matching CPU semantics at mdxfind.c:25836-25855. HASH_WORDS=8 (256-bit digest = 8 uint32 LE), BASE_ALGO=md6. Per-iter probe like SQL5; distinct from SHA1DRU's max_iter=1 internal loop. KNOWN ACCEPTED RISK: gfx1201 priv_mem may bust 43,024 B HARD GATE due to MD6's 14 KB compression scratch (1753-ulong A array). Compile-only ship per user 2026-05-07 OPTION A; integrated post-B7.9 validation will reveal gfx1201 status. Fall-back: leave gpu_md6256unsalted.cl as gfx1201-only slab fallback. Pairs with gpu_opencl.c rev 1.126 (per-device prog/kern + 7-site host wiring) and new gpu_md6256_core.cl rev 1.1.
+ *
+ * Revision 1.417  2026/05/07 08:32:39  dlr
+ * B7.7a (2026-05-07): JOB_MD5UC via algo_mode. Add JOB_MD5UC to four lists: rules-engine admit list (10287), iter-types whitelist (9653), gpu_ops[] (37007), and [GPU] tag display (42698). Per OPTION A from architect's project_b76plus_mask_iter_closure.md: closes part of M5 from B9 gate-fail, no new GPU_TEMPLATE_* enum, no new spec. Pairs with gpu_opencl.c rev 1.124 (resolver case + algo_mode setter) and gpu_md5_core.cl rev 1.3 (template_iterate UC branch via GPU_TEMPLATE_ITERATE_HAS_ALGO_MODE ifdef). Iter=1 byte-exact between MD5 and MD5UC; UC branch only fires inter-iter (mirrors CPU MDstart at line 25386). Compile-only ship; smoke validation deferred to post-B7.9 integrated batch.
+ *
+ * Revision 1.416  2026/05/07 07:36:00  dlr
+ * B6.11 SHA1DRU chokepoint admit: JOB_SHA1DRU joins the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate (~line 10315). First 1M-iteration algorithm on the unified template path. SHA1(pass) + 1,000,000 iters of SHA1(hex_lc(state) || pass); ONE probe at the final state (mdxfind.c:14261-14285). The 1M loop runs INSIDE template_finalize (gpu_sha1dru_core.cl); host forces params.max_iter=1 at the rules-engine dispatch site (gpu_opencl.c rev 1.124) so the kernel's outer iter loop runs exactly once. The slab kernel sha1dru_batch (gpu_sha1.cl) is removed in this same commit (B8 cleanup). The legacy gpu_try_pack call at line 14267 stays in place — structurally unreachable post-category-move (gpu_op_category returns GPU_CAT_MASK; gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops; iter-types whitelist excludes SHA1DRU). Templated count 45→46. ioblade build (.205) + Win64 cross-build (.209) clean. 4-cell byte-exact 10/10 cracks across CPU + 3 GPUs (md5 725bc892d3bf372052e922967b66e0a6). Adjacent regressions e259/e8/e34 byte-exact 3/3 across all 4 cells. .205 mdxfind=fe06d5da8094da350705ff29ee50c0d9; .209 mdxfind.exe=b279a09d1cc717e323a240ce913962bf. priv_mem readouts: gfx1201 41,328 B (HARD GATE 43,024 B PASS, 1,696 B headroom).
+ *
+ * Revision 1.415  2026/05/07 05:54:58  dlr
+ * B6.10 e386 SHA512PASSSALT chokepoint admit (FINAL B6 ladder step). SHA512(pass||salt) APPEND-shape sibling of B6.9 SHA512SALTPASS; second 64-bit-state salted variant on the codegen path. OR-arm + nsalts_job > 0 guard extended to cover JOB_SHA512PASSSALT in same triple-conjunct pattern as SHA512SALTPASS / SHA256SALTPASS / SHA224SALTPASS / SHA1SALTPASS / MD5SALTPASS / MD5SALT / MD5PASSSALT / SHA1PASSSALT / SHA256PASSSALT. After this lands, the entire SHA-512-family salted slab dispatcher is reachable for ZERO ops; full B8 slab-retirement opens up. Validated 600/600 byte-exact across CPU + 3 GPUs (4070 Ti / 3080 / gfx1201) with cracks md5 3347d81c72fe6c9a4318417525b44b09. Adjacent regressions e388/e413/e385/e373 byte-exact. priv_mem readouts: 4070 Ti = 41,088 B; 3080 = 41,088 B; gfx1201 = 41,744 B (HARD GATE 43,024 B PASS — 1,280 B headroom; 288 B LEANER than B6.9 sibling SHA512SALTPASS at 42,032 B).
+ *
+ * Revision 1.414  2026/05/07 05:29:38  dlr
+ * B6.9 SHA512SALTPASS fan-out: chokepoint admit JOB_SHA512SALTPASS to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate; nsalts_job > 0 guard extended to cover SHA512SALTPASS in the same triple-conjunct pattern as SHA256SALTPASS / SHA224SALTPASS / SHA1SALTPASS / MD5SALTPASS / MD5SALT. First 64-bit-state salted variant on the codegen path. ioblade build (.205) + Win64 cross-build (.209) clean; 600/600 byte-exact across CPU + 3 GPUs (4070 Ti / 3080 / gfx1201). Cracks md5 0cd07e87b62803357d481cffc175878c across all 4 cells. Adjacent regressions e412/e832/e385/e373/e394 byte-exact across CPU + 3 GPUs. priv_mem readouts: 4070 Ti = 41,088 B; 3080 = 41,088 B; gfx1201 = 42,032 B (HARD GATE 43,024 B PASS — 992 B headroom; under unsalted SHA-512 reading of 42,520 B). Authors a sibling main template (sha512_style_salted.cl.tmpl) AND a sibling fragment (finalize_prepend_be64.cl.frag) per the codegen-reconsideration memo's 'splits over parameterization' + 'width-bearing constants belong in templates' rules: SHA-512's 64-bit ulong state, 128-byte block, 128-bit length field cannot be cleanly parameterized into the SHA-256 template/fragment without #if-tangling. After this lands, e386 SHA512PASSSALT becomes near-spec-reuse (~30 min, plus a finalize_append_be64.cl.frag sibling).
+ *
+ * Revision 1.413  2026/05/07 04:54:22  dlr
+ * B6.8 e367 MD5_MD5SALTMD5PASS chokepoint admit + nsalts_job > 0 guard. Fifth MD5SALT-family variant on the unified template path; shares kern_template_phase0_md5salt via params.algo_mode=4 (no new GPU_TEMPLATE_* enum). Salt-hex pre-computed by host (saltsnap[].hashsalt populated in main() salt walk at lines 46989-47015); host packs it into salt_buf via gpu_pack_salts(use_hashsalt=1) — already wired pre-B6.8. The legacy gpu_try_pack(...JOB_MD5_MD5SALTMD5PASS...) call at line 17051 stays in place — structurally unreachable post-category-move (gpu_op_category returns GPU_CAT_MASK, gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops). Validated: 600/600 byte-exact across CPU + 3 GPUs (md5 05336f50bbd26889a839f7e04ff4bc50). Adjacent regression e31/e350/e541/e542 byte-exact 15/15 on all 4 cells (md5 3ef205322289eb762a9492a383dd0852). gfx1201 priv_mem 41,072 B (HARD GATE 43,024 PASS). Build: .205 mdxfind=70c31410dfcedf98f0adba1acfa270eb, .209 mdxfind.exe=b13f5833f8e4aefc674d5263ee231bde. Templated count remains 43; B8 candidate adds md5_md5saltmd5pass_batch slab kernel.
+ *
+ * Revision 1.412  2026/05/07 04:26:47  dlr
+ * B6.7 SHA256PASSSALT fan-out: chokepoint admit JOB_SHA256PASSSALT to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate; nsalts_job > 0 guard extended to cover SHA256PASSSALT in the same triple-conjunct pattern as SHA256SALTPASS / SHA1PASSSALT. The legacy gpu_try_pack(...JOB_SHA256PASSSALT...) call at line 27653 stays in place — structurally unreachable post-category-move (gpu_op_category returns GPU_CAT_MASK, gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops) but kept as defense-in-depth. ioblade build (.205) + Win64 cross-build (.209) clean; 100/100 hashes × 6 salts byte-exact across CPU + 3 GPUs (4070 Ti, 3080, gfx1201); md5 085eaf2b546ec71c29d5557b83672ec1 across all 4 cells. Pure spec reuse via codegen tool — sha256_style_salted.cl.tmpl + finalize_append_be.cl.frag both already shipped (B6.2 + B6.5). Codegen tool revs 1.6→1.7 (specs.py) and 1.6→1.7 (codegen.py routing widened).
+ *
+ * Revision 1.411  2026/05/07 03:51:34  dlr
+ * B6.6 (2026-05-06): MD5SALT family algo_mode shared-kernel — e350/e541/e542 join e31 via runtime variant flag in OCLParams.algo_mode. No new GPU_TEMPLATE_* enums; resolver returns kern_template_phase0_md5salt for all 4 ops. finalize_append_to_hex32.cl.frag extended with 4-way encode branch. Validation: 12/12 cells byte-exact.
+ *
+ * Revision 1.410  2026/05/07 02:57:29  dlr
+ * B6.5 SHA1PASSSALT fan-out: chokepoint admit JOB_SHA1PASSSALT to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate; nsalts_job > 0 guard extended to cover SHA1PASSSALT in the same triple-conjunct pattern as SHA1SALTPASS. The legacy gpu_try_pack(...JOB_SHA1PASSSALT...) call at line 14241 stays in place — structurally unreachable post-category-move (gpu_op_category returns GPU_CAT_MASK, gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops) but kept as defense-in-depth. ioblade build (.205) + Win64 cross-build (.209) clean; 100/100 hashes x 6 salts x 99,999 rules byte-exact across CPU + 3 GPUs (4070 Ti, 3080, gfx1201). Cracks md5 4d31f101c57ceb0916de168151f17c22 across all 4 cells. Authors finalize_append_be.cl.frag fragment which unblocks SHA256PASSSALT next via pure spec reuse.
+ *
+ * Revision 1.409  2026/05/07 02:35:13  dlr
+ * B6.4 MD5PASSSALT (e373) shipped via codegen tool. Validation: 600/600 byte-exact across CPU + 3 GPUs (md5 5211afb803e8bec56832b51923417d3c). Canonical 21,289 MD5 unique-hash md5 63923af616a26cde7358671fa9f13229 PASS. Win64 cross-build green. JOB_MD5PASSSALT moved from GPU_CAT_SALTPASS slab to GPU_CAT_MASK template (slab kernel md5passsalt_batch now structurally unreachable; B8 candidate). Authors finalize_append.cl.frag (LE PREPEND-mirror with pass/salt order swapped) — unblocks SHA1PASSSALT/SHA256PASSSALT next via finalize_append_be.cl.frag sibling.
+ *
+ * Revision 1.408  2026/05/06 23:01:34  dlr
+ * B6.3 SHA224 fan-out: chokepoint admit JOB_SHA224SALTPASS.
+ *
+ * Revision 1.407  2026/05/06 22:00:06  dlr
+ * B6.2 SHA256 fan-out: chokepoint admit JOB_SHA256SALTPASS to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate; nsalts_job > 0 guard extended to cover SHA256SALTPASS in the same triple-conjunct pattern as MD5SALT/MD5SALTPASS/SHA1SALTPASS. The legacy gpu_try_pack(...JOB_SHA256SALTPASS...) call at line 27618 stays — structurally unreachable post-category-move (gpu_op_category returns GPU_CAT_MASK, gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops) but kept as defense-in-depth. Validated: 100/100 hashes × 100 salts × 100 rules byte-exact + 9/9 iter-chain (-i 3) on all 3 GPUs on ioblade. .205 build mdxfind=7343b29ca24cbee5a2bb3d38b9e7af23, .209 Win64 cross-build mdxfind.exe=551cf4aed34ae740c6992172ead5175c.
+ *
+ * Revision 1.406  2026/05/06 21:28:35  dlr
+ * B6.1 SHA1 fan-out: chokepoint admit JOB_SHA1SALTPASS to the rules-engine-eligible OR-chain at the gpu_rules_engine_active gate; nsalts_job > 0 guard extended to cover SHA1SALTPASS in the same triple-conjunct pattern as MD5SALT/MD5SALTPASS. The legacy gpu_try_pack(...JOB_SHA1SALTPASS...) call at line 14395 stays in place — structurally unreachable post-category-move (gpu_op_category returns GPU_CAT_MASK, gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops) but kept as defense-in-depth. ioblade build (.205) + Win64 cross-build (.209) clean; 100/100 hashes × 100 salts × 60 rules byte-exact across CPU + 3 GPUs.
+ *
+ * Revision 1.405  2026/05/06 20:17:31  dlr
+ * B6_salt_axis_chokepoint_widening_for_JOB_MD5SALT_and_JOB_MD5SALTPASS_with_nsalts_job_guard_for_salted_ops
+ *
+ * Revision 1.404  2026/05/06 17:17:41  dlr
+ * Remove JOB_NTLM (e369) from GPU advertising. Per architect re-pin (project_memo_b_multivariant_hook.md SUPERSEDED 2026-05-05): NTLM is permanently CPU-only by design. Rules engine assumes ASCII bytes; NTLM emits 2-3 UTF-16LE candidate plains per word via iconv (utf-8/cp1251/cp1252) which the rules engine cannot process correctly. NTLMH (e786) is the GPU-capable variant (single zero-extend, hashcat-broken-conversion); MD4UTF16 (e496) is the iter sibling. Removed from need_gpu list (gpu_ops[] array, line 36780) and [GPU] tag advertisement (line 42459). Defensive max-len case at line 9942 left in place (dead code, harmless). Family-table assignments at 46984/47063 unchanged (NTLM is MD4-family regardless of GPU capability).
+ *
+ * Revision 1.403  2026/05/06 16:12:26  dlr
+ * B5 sub-batch 5b retry: STREEBOG-256 (e430) + STREEBOG-512 (e431) template-path ports. SBOG_LPS rewrite (rev 1.5) validated by sub-6.5 WRL diagnostic; new template cores carry the same shift-then-mask pattern. 12-cell ioblade validation 100/100 byte-exact across 3 GPUs (RTX 4070 Ti SUPER, RTX 3080, gfx1201/RDNA4) at iter=1 and iter=3 — gfx1201 was the load-bearing test (sub-5b deferred at 4/100 with the original uchar-cast macro). Canonical 21,289 MD5 unique-hash md5 63923af616a26cde7358671fa9f13229 PASS. Win64 cross-build green. Templated algorithm count 30 -> 32. Wires: gpu_opencl.c per-device fields + GPU_TEMPLATE_STREEBOG{256,512}=31/32 enums + env-var arms + compile/lazy helper pairs + resolver arms (JOB_STREEBOG_32/64) + dispatch op-check; mdxfind.c chokepoint widening at 10312.
+ *
+ * Revision 1.402  2026/05/06 14:00:33  dlr
+ * B5 sub-batch 6.5 (2026-05-05): chokepoint widening for WRL (-m e5). gpu_rules_engine_active gate at line ~10309 now permits JOB_WRL alongside the existing 29 algos. WRL = Whirlpool 512-bit hash; Miyaguchi-Preneel construction over 64-byte BE block with 256-bit BE length encoding (last 32 bytes of final block). Iter > 1 feeds back 128 lowercase hex chars of prior 64-byte digest (CPU JOB_WRL at mdxfind.c:28019-28024). Pairs with gpu/gpu_opencl.c rev 1.109 (GPU_TEMPLATE_WRL=30 + per-device prog/kern fields + compile/lazy helpers + resolve_kernel arm + dispatch_md5_rules op-check arm) + new gpu/gpu_wrl_core.cl rev 1.1 + gpu/gpu_wrl_core_str.h rev 1.1. JOB_WRL was already in [GPU] tag list (line 42440), need_gpu list (line 36757), gpu_op_category (gpujob_opencl.c:2197 -> GPU_CAT_MASK), gpu_op_family (gpujob_opencl.c:2265 -> FAM_WRLUNSALTED), gpu_hash_words (gpujob_opencl.c:2310 -> 16), iter-types whitelist (line 9613), and FAM_WRLUNSALTED bitmask (line 47046). gpu_maxlen=55 default suffices (template_finalize multi-block path supports any input length). Unified template family is now 30 algorithms (was 29 in B5 sub-batch 7). Validation: 6/6 ioblade cells byte-exact CPU vs GPU (RTX 4070 Ti + RTX 3080 + gfx1201 x iter=1 + iter=3, 100/100 BYTE-EXACT each); priv_mem_size 41280 / 41280 / 41816 B (under SHA-512 baseline 42520 B); canonical 21,289 MD5 regression PASS at 4m 9.7s wall, unique-hash md5 023dafcfea1d875709a31e25b07bbf78 IDENTICAL to canon.b5sub7 baseline. Diagnostic verdict: WRL gfx1201 100/100 PASS — the Streebog B5 sub-batch 5b RDNA4 deferral is SBOG_LPS-specific (uchar-from-ulong reinterpret cast pattern), NOT a generic 16 KB __constant capacity issue. Architect should consider option 3 (split SBOB_SL64 into 1D arrays addressed similarly) or option 1 (move SBOB_SL64 to __global) for Streebog re-attempt.
+ *
+ * Revision 1.401  2026/05/06 04:48:40  dlr
+ * Memo B Phase B5 sub-batch 7 (2026-05-05): chokepoint widening for MYSQL3 (-m e456). gpu_rules_engine_active gate at line ~10296 now permits JOB_MYSQL3 alongside the existing 28 algos. MYSQL3 = legacy MySQL OLD_PASSWORD() hash, 64-bit output, per-byte arithmetic accumulator (no MD-style block). The CPU JOB_MYSQL3 iter loop (mdxfind.c:25177-25187) feeds back the 16 lowercase ASCII hex chars of the prior 8-byte digest. Pairs with gpu/gpu_opencl.c rev 1.108 (GPU_TEMPLATE_MYSQL3=29 + per-device prog/kern fields + compile/lazy helpers + resolve_kernel arm + dispatch_md5_rules op-check arm) + gpu/gpujob_opencl.c rev 1.87 (load_overflow zero-pads sub-128-bit overflow entries to 16 bytes - mirrors the HashDataBuf zero-pad fix in mdxfind.c:36400-36412 rev 1.399 - which was the actual missing piece for MYSQL3 byte-exactness when the table overflows) + new gpu/gpu_mysql3_core.cl rev 1.1 (MYSQL3 per-byte loop in template_finalize, recover-from-byteswapped-state hex-feedback iter step). Also adds JOB_MYSQL3 to the iter-types whitelist (line 9614). MYSQL3 was already in [GPU] tag list (line 42459), need_gpu list (line 36772), and FAM_MYSQL3UNSALTED bitmask (line 47040). Unified template family is now 29 algorithms (was 28 in B5 sub-batch 8). Validation: 6/6 ioblade cells byte-exact CPU vs GPU (RTX 4070 Ti + RTX 3080 + gfx1201 x iter=1 + iter=3, 100/100 BYTE-EXACT each); priv_mem_size 40960 / 40960 / 40976 B (well under SHA-512 baseline 42520 B); canonical 21,289 MD5 regression PASS (unique-hash md5 023dafcfea1d875709a31e25b07bbf78 IDENTICAL to canon.b5sub6 + canon.b5sub8 baselines).
+ *
+ * Revision 1.400  2026/05/06 04:05:43  dlr
+ * Memo B Phase B5 sub-batch 8 (2026-05-05): chokepoint widening for MD4UTF16 (-m e496). gpu_rules_engine_active gate at line ~10231 now permits JOB_MD4UTF16 alongside the existing 27 algos. MD4UTF16 = MD4(UTF-16LE-zero-extend(p)) on iter==1, MD4(UTF-16LE-zero-extend(lowercase_hex(prev_digest))) on iter > 1. Single-variant per CPU JOB_MD4UTF16 at mdxfind.c:15040-15068 (hex-feedback path is pure ASCII so iter > 1 has no hashcat-compat gap; iter==1 inherits the same documented zero-extend-vs-iconv gap as NTLMH on non-ASCII inputs). Pairs with gpu/gpu_opencl.c rev 1.107 (GPU_TEMPLATE_MD4UTF16=28 + per-device prog/kern fields + compile/lazy helpers + resolve_kernel arm + dispatch_md5_rules op-check arm + family-resolve arm) + gpu/gpujob_opencl.c rev 1.86 (gpu_op_category JOB_MD4UTF16 -> GPU_CAT_MASK + gpu_op_family -> FAM_MD4UNSALTED) + new gpu/gpu_md4utf16_core.cl rev 1.1 (clone of gpu_ntlmh_core.cl with proper iter step). Host-side wiring: (1) chokepoint gate at line 10284 admits JOB_MD4UTF16, (2) gpu_maxlen_val=27 for JOB_MD4UTF16 at line 9929 (UTF-16LE doubles length, must fit MD4 single block <=55), (3) JOB_MD4UTF16 added to need_gpu ops list at line 36742, (4) JOB_MD4UTF16 added to FAM_MD4UNSALTED bitmask at lines 46946 (Metal) + 47025 (OpenCL); JOB_MD4UTF16 was already in [GPU] tag list (line 42454) and iter-types whitelist (line 9603). Unified template family is now 28 algorithms (was 27 in B5 sub-batch 6). Validation: 6/6 ioblade cells byte-exact CPU vs GPU (RTX 4070 Ti + RTX 3080 + gfx1201 x iter=1 + iter=3, 100/100 BYTE-EXACT each); priv_mem_size 41024 / 41024 / 41060 B (under SHA-512 baseline 42520 B); canonical 21,289 MD5 regression PASS (unique-hash md5 63923af616a26cde7358671fa9f13229 IDENTICAL to all prior baselines).
+ *
+ * Revision 1.399  2026/05/06 02:25:59  dlr
+ * MYSQL3 unblock (option c per project_memo_b_subhash_probe.md): zero-pad HashDataBuf entries to 16-byte minimum so the GPU 4xuint32 compact-table probe never spills into the next entry. HashDataLen[i] keeps the real length so CPU memcmp paths are unaffected. Pre-size bumped to 2*MAXADDHASHBUF to cover the 1.6x worst-case expansion (MYSQL3 8-byte input -> 16-byte stored). Sites 36560/36694 already >=16 bytes; no change. Validation: ioblade canonical 21,289 MD5 PASS (unique-hash md5 63923af616a26cde7358671fa9f13229).
+ *
+ * Revision 1.398  2026/05/06 01:51:30  dlr
+ * Memo B Phase B5 sub-batch 6 Tier B: chokepoint widening for NTLMH. gpu_rules_engine_active gate at line ~10241 now permits JOB_NTLMH alongside the existing 26 algos. NTLMH = MD4(UTF-16LE-zero-extend(p)) — hashcat-compatible single-variant. The CPU JOB_NTLMH iconv variants (utf-8/cp1251/cp1252) remain on CPU (same hashcat-compat gap as existing slab kernel md4utf16_unsalted_batch). Unified template family is now 27 algorithms. Validation: 3/3 cells byte-exact CPU vs GPU on ioblade; canonical 21,289 MD5 regression PASS.
+ *
+ * Revision 1.397  2026/05/06 01:35:30  dlr
+ * Memo B Phase B5 sub-batch 6 Tier C: chokepoint widening for SQL5. gpu_rules_engine_active gate at line ~10241 now permits JOB_SQL5 alongside the existing 25 algos. SQL5 = MySQL 4.1+ password (SHA1(SHA1(p))) with UPPERCASE-hex iter feedback. Per-algo template_state holds two SHA1 chains. Also adds JOB_SQL5 to the gpu_try_pack iter-types switch (line 9595) for legacy slab-path consistency. Unified template family is now 26 algorithms. Validation: 6/6 cells byte-exact CPU vs GPU on ioblade; canonical 21,289 MD5 regression PASS.
+ *
+ * Revision 1.396  2026/05/06 01:20:28  dlr
+ * Memo B Phase B5 sub-batch 6 Tier A: chokepoint widening for MD5RAW/SHA1RAW/SHA256RAW. gpu_rules_engine_active gate at line ~10241 now permits JOB_MD5RAW + JOB_SHA1RAW + JOB_SHA256RAW alongside the existing 22 algos. Reuses MD5/SHA1/SHA256 compression cores byte-for-byte; only template_iterate diverges (binary-digest re-feed instead of hex-encoded). Option B: covers Maxiter > 1 byte-exact. Unified template family is now 25 algorithms (was 22). Validation: 18/18 cells byte-exact CPU vs GPU on ioblade; canonical 21,289 MD5 regression PASS.
+ *
+ * Revision 1.395  2026/05/06 00:35:51  dlr
+ * B5 sub-batch 5a Tier 1: chokepoint widening for SHA384RAW + SHA512RAW. See gpu/gpu_opencl.c rev 1.103 for validation.
+ *
+ * Revision 1.394  2026/05/05 23:33:45  dlr
+ * B5 sub-batch 4: SHA3/Keccak family chokepoint widening (8 sponge ops)
+ *
+ * Revision 1.393  2026/05/05 22:53:42  dlr
+ * Memo B Phase B5 sub-batch 3 (2026-05-06): chokepoint widening for BLAKE2 family.
+ * The gpu_rules_engine_active per-word gate (~10194) now permits JOB_BLAKE2S256,
+ * JOB_BLAKE2B256, JOB_BLAKE2B512 in addition to the prior 9-algo set (MD5, MD4,
+ * SHA1, SHA224, SHA256, SHA384, SHA512, RMD160, RMD320). Also extends:
+ *   - need_gpu op-list at ~36670 (so GPU init triggers when only BLAKE2b ops
+ *     are requested; without this addition the GPU device wasn't being brought
+ *     up at all for `-m e845` / `-m e841` workloads)
+ *   - help-print [GPU] tag list at ~42357 (so `mdxfind -h` shows [GPU] for
+ *     BLAKE2B-256 and BLAKE2B-512)
+ * BLAKE2B-160 omitted from B5 sub-batch 3 — JOB_BLAKE2B160 is not defined in
+ * mdxfind.c (the brief listed four variants but only three have job-type
+ * plumbing). Pairs with gpu/gpu_opencl.c rev 1.101 + new gpu_blake2{s256,b256,
+ * b512}_core.cl + gpu_common.cl rev 1.13 (b2b_compress). Validation: ioblade
+ * canonical 21,289 byte-exact (MD5 production preserved at 4m20s wall); BLAKE2S-256
+ * + BLAKE2B-256 + BLAKE2B-512 each byte-exact CPU vs GPU 2000/2000 lines per
+ * device across RTX 4070 Ti / RTX 3080 / gfx1201.
+ *
+ * Revision 1.392  2026/05/05 13:54:26  dlr
+ * Memo B Phase B7.6: validated user-defined character classes (?[abc] inline syntax) on the template path. NO code changes — custom classes already routed through gpu_opencl_set_mask via MaskClasses[cid].chars + .count (existing slab-path machinery at mdxfind.c:46977+); the template kernel reads the same charset bytes regardless of whether they came from a builtin (?d, ?l, ?u, ...) or a user-defined ?[..] class. The chokepoint gate (B7.5 scope: MaskPrependLen/MaskAppendLen both in [0,8], sum >= 1) already accepts custom-class configurations since they look identical at this level. This commit only updates the comment block to record B7.6 validation. Validated byte-exact on ioblade (RTX 4070 Ti / RTX 3080 / gfx1201): B7.6 PRIMARY (-N ?[abc] custom prepend, 30/30); B7.6 extended (-N ?[abc] -n ?[123] combined custom prepend + custom append, 90/90). All prior gates (canonical 21,289, B7.1-B7.5 regressions) remain byte-exact under the same b75 binary.
+ *
+ * Revision 1.391  2026/05/05 13:52:58  dlr
+ * Memo B Phase B7.5: chokepoint widening to admit combined prepend+append mask (-N ?d -n ?l?l) on the template / rules-engine path. mask_b71_eligible widened from B7.4 scope (separately admitted prepend-only OR append-only) to B7.5 scope (MaskPrependLen in [0, 8] AND MaskAppendLen in [0, 8] AND MaskPrependLen+MaskAppendLen >= 1). number_iter loop-bound advance, C2.3 GPU-eligible-rule skip, and slab-path mask short-circuit (b71_slab_skip) all widened identically. Kernel + host buffer wire format already supported combined cases (added in B7.3); this commit just relaxes the chokepoint gate. Validated byte-exact on ioblade (RTX 4070 Ti / RTX 3080 / gfx1201): canonical 21,289 (no-mask MD5+rules regression guard) byte-exact, unique-hash md5 63923af616a26cde7358671fa9f13229 IDENTICAL to B7.4 baseline; B7.1 regression (-n ?d, 100/100); B7.2 regression (-n ?d?d?d, 10000/10000); B7.3 regression (-N ?d, 1000/1000); B7.4 regression (-N ?d?d?d, 10000/10000); B7.5 PRIMARY (-N ?d -n ?l?l, 33800/33800). VGPR readings unchanged (4070 Ti 41040 B / 3080 41040 B / gfx1201 41056 B). Multi-GPU mask continues to hit pre-existing CL_OUT_OF_RESOURCES (project_multigpu_false_positives.md, NOT B7.5-introduced); single-GPU validation only.
+ *
+ * Revision 1.390  2026/05/05 13:44:31  dlr
+ * Memo B Phase B7.4: chokepoint widening to admit multi-position prepend mask (-N ?d?d?d) on the template / rules-engine path. mask_b71_eligible widened from B7.3 scope (only MaskPrependLen==1) to (MaskPrependLen >= 1 && MaskPrependLen <= 8 && MaskAppendLen == 0). number_iter loop-bound advance, C2.3 GPU-eligible-rule skip, and slab-path mask short-circuit (b71_slab_skip) all widened identically. Kernel + host buffer wire format ALREADY supported multi-position prepend (added in B7.3); this commit just relaxes the chokepoint gate. Future B7.5-B7.6 sub-phases widen further (combined prepend+append, custom classes). Validated byte-exact on ioblade (RTX 4070 Ti / RTX 3080 / gfx1201): canonical 21,289 (no-mask MD5+rules regression guard) byte-exact, unique-hash md5 63923af616a26cde7358671fa9f13229 IDENTICAL to B7.3 baseline; B7.1 regression (-n ?d, 100/100); B7.2 regression (-n ?d?d?d, 10000/10000); B7.3 regression (-N ?d, 1000/1000); B7.4 PRIMARY (-N ?d?d?d, 10000/10000); B7.4 mixed-class sanity (-N ?l?d, 2600/2600). VGPR readings unchanged from B7.2/B7.3 (4070 Ti 41040 B / 3080 41040 B / gfx1201 41056 B). Multi-GPU mask continues to hit pre-existing CL_OUT_OF_RESOURCES (project_multigpu_false_positives.md, NOT B7.4-introduced); single-GPU validation only.
+ *
+ * Revision 1.389  2026/05/05 13:35:52  dlr
+ * Memo B Phase B7.3: chokepoint widening to admit single-position prepend mask (-N ?d) on the template / rules-engine path. mask_b71_eligible widened from B7.2 scope (no-mask OR (npre==0 && napp in [1,8])) to B7.3 scope (no-mask OR B7.2 OR (npre==1 && napp==0)). number_iter loop-bound advance, C2.3 GPU-eligible-rule skip, and slab-path mask short-circuit (b71_slab_skip) all widened identically so prepend mask configurations route through the template kernel without double-pack from the slab path. Future B7.4-B7.6 sub-phases widen further (multi-prepend, combined prepend+append, custom classes); kernel + host buffer wire format already supports all of those — only this gate restricts. Validated byte-exact on ioblade (RTX 4070 Ti / RTX 3080 / gfx1201): canonical 21,289 (no-mask MD5+rules regression guard) byte-exact, unique-hash md5 63923af616a26cde7358671fa9f13229 IDENTICAL to B7.2 baseline; B7.1 regression (-n ?d, 100/100); B7.2 regression (-n ?d?d?d, 10000/10000); B7.3 PRIMARY (-N ?d, 1000/1000). VGPR readings unchanged from B7.2 (4070 Ti 41040 B / 3080 41040 B / gfx1201 41056 B). Multi-GPU mask continues to hit pre-existing CL_OUT_OF_RESOURCES (project_multigpu_false_positives.md, NOT B7.3-introduced); single-GPU validation only.
+ *
+ * Revision 1.388  2026/05/05 12:59:03  dlr
+ * Memo B Phase B7.2: chokepoint widening for multi-position append mask on the rules-engine / template path. mask_b71_eligible gate widened from MaskAppendLen == 1 to MaskAppendLen >= 1 && <= 8 (MASK_POS_CAP, matching the kernel-side fixed-array buffer cap). C2.3 (CPU rule walker GPU-eligible-rule skip) gate widened identically so multi-position mask configurations route through the rules-engine kernel and CPU walker correctly skips GPU-eligible rules. Slab-path mask short-circuit (b71_slab_skip) widened identically so the slab kernel does not double-pack words that the rules-engine slot already absorbed. number_iter loop-bound advance for the gpu_legacy_slot_unused case also widened: ensures the outer do/while does not iterate MaskCount additional times CPU-hashing stale state once the kernel iterated all (rule, mask_idx) coordinates. Validated byte-exact on ioblade (RTX 4070 Ti / RTX 3080 / gfx1201) for canonical 21289 (no-mask regression guard), B7.1 single-position regression (?d 590/590 byte-exact per GPU), and B7.2 multi-position primary gate (?d?d?d 10000/10000 byte-exact per GPU; sanity-check ?l?d 3000/3000 and 4-position ?u?u?d?d 5000/5000 byte-exact per GPU). Out of scope: B7.3 prepend, B7.4-7.6 combined / custom classes.
+ *
+ * Revision 1.387  2026/05/05 12:36:28  dlr
+ * Memo B Phase B7.1: chokepoint widened to admit single-position append masks on the template / rules-engine path. (1) Drop the !job->MaskCount clause from the rules-engine pack gate at ~10146; replace with mask_b71_eligible = !MaskCount || (MaskPrependLen == 0 && MaskAppendLen == 1) — i.e., admit no-mask runs (unchanged) PLUS B7.1's single-position append, route everything else (multi-position append, prepend, combined) to the slab path until B7.2-B7.5 ship. (2) On successful rules-engine pack with B7.1 mask + gpu_legacy_slot_unused == 1, set number_iter = job->MaskCount so the outer do/while exits cleanly after the first pass — the kernel iterated mask_idx for every (word, rule) and the CPU side has no remaining work; without this, the loop bottom's (number_iter < MaskCount) would re-iterate MaskCount times CPU-hashing stale state. (3) C2.3 widened (~10405): gate the GPU-eligible-rule skip on mask_b71_eligible too, so the CPU rule walker skips GPU-eligible rules even when MaskCount > 0 (rules-engine kernel covers the (rule, mask) Cartesian). (4) Slab-path mask short-circuits at ~10509 / ~10532 now check b71_slab_skip = word_packed_by_rules_engine && (MaskPrependLen == 0 && MaskAppendLen == 1) and skip the slab pack when set — without this, BOTH paths pack the same word and produce 2x GPU work / 2x hits. Validated byte-exact CPU vs GPU on ioblade (RTX 4070 Ti, RTX 3080, gfx1201) for MD5 + rules + -n ?d (1000/1000 brief-spec fixture) and MD5 + rules + -n ?l (780/780 sanity check). Canonical 21,289 regression on multi-GPU (no mask): byte-exact, unique-hash md5 63923af616a26cde7358671fa9f13229 matches B5 sub-batch 2 baseline. Multi-GPU + mask hits the pre-existing CL_OUT_OF_RESOURCES on RTX 3080 / RTX 4070 Ti (project_multigpu_false_positives.md), NOT introduced by B7.1 — same FATAL reproduces on b5sb2 binary; defer to that investigation.
+ *
+ * Revision 1.386  2026/05/05 12:03:55  dlr
+ * B5 sub-batch 2: chokepoint widening at gpu_rules_engine_active gate (~10145) to permit JOB_RMD160 / JOB_RMD320; gpu_try_pack_packed unsalted op switch (~9546) extended with JOB_RMD320 (RMD160 was already there); per-op stride/maxcount/maxpasslen sizing extended for JOB_RMD320 (same as RMD160: stride=64, maxcount=4096, maxpasslen=55); 'need_gpu' op list (~36567) extended with JOB_RMD320; help-print [GPU] tag list (~42247) extended with JOB_RMD320.
+ *
+ * Revision 1.385  2026/05/05 11:09:56  dlr
+ * linecount auto-expunge: add #ifdef _WIN32 guard around realpath().
+ *
+ * Win64 cross-build on .209 broke after rev 1.383 with:
+ *   mdxfind.c:47245: error: call to undeclared function 'realpath'
+ *   ISO C99 and later do not support implicit function declarations
+ *
+ * Three realpath() call sites exist in mdxfind.c:
+ *   37039 - linecount_cache_lookup (cache hit check)        guarded ✓
+ *   47381 - linecount_cache_finalize (end-of-file persist)  guarded ✓
+ *   47245 - linecount auto-expunge hot path (rev 1.383 add) UNGUARDED  ← bug
+ *
+ * The other two sites use the _fullpath / realpath pattern via #ifdef
+ * _WIN32. The new auto-expunge site missed it.
+ *
+ * Fix: wrap with the same #ifdef _WIN32 / _fullpath / #else / realpath
+ * pattern as the existing sites (37036-37040 model). One-line guard pair
+ * + swap to _fullpath on Windows.
+ *
+ * Per task #129 mdx-build investigation: iconv link situation unchanged
+ * from B3 (working baseline); not broken; not the cause. Single source
+ * edit; no Makefile change.
+ *
+ * Validation: ioblade canonical 21,289 byte-exact regression guard. Win64
+ * cross-build on .209 expected to compile clean now (verify after ci).
+ *
+ * Revision 1.384  2026/05/05 05:41:58  dlr
+ * B5 sub-batch 1 chokepoint widening: rules-engine GPU path now permits {MD5, MD4, SHA1, SHA224, SHA256, SHA384, SHA512}. Adds JOB_SHA384 and JOB_SHA512 to the per-word gate at ~10112. Pairs with gpu/gpu_opencl.c rev 1.96 (template_phase0 dispatch + compile/lazy/resolver wiring) and new gpu/gpu_sha384_core.cl rev 1.1 + gpu/gpu_sha512_core.cl rev 1.1. Real-mdxfind SHA384/SHA512 work now routes through the dispatch template (gpu_template.cl + gpu_<algo>_core.cl); first 64-bit-state algos in the family. Validation: ioblade canonical 21,289 bit-exact MD5 production regression; SHA384/SHA512 CPU vs GPU byte-exact 99/99 each on 100-word x 100-rule fixture across all 3 ioblade GPUs (RTX 4070 Ti, RTX 3080, gfx1201) plus tri-GPU multi-device dispatch. R2 priv_mem_size readings: NVIDIA 41,088 B (vs SHA256/224 41,024 = +64); gfx1201 42,504/42,520 B for SHA384/SHA512 (vs SHA256/224 41,332 = +1172/+1188 from W[80] schedule) — within budget, kernels build clean and produce byte-exact output.
+ *
+ * Revision 1.383  2026/05/05 03:35:32  dlr
+ * linecount cache: auto-expunge poisoned row on runtime detection.
+ *
+ * When the main read loop's detection block (Fileline > AutoCountTotalLines)
+ * fires, the cached value is materially wrong — almost certainly a partial
+ * count from a pre-1.375 mdxfind that crashed before EOF (1.375 added
+ * the 'complete=1' gate that prevents NEW poisoning, but doesn't expunge
+ * EXISTING poisoned rows). Per task #122 mdx-debug investigation: the only
+ * authoritative correction path was linecount_cache_finalize at clean
+ * gzclose, so a session that doesn't run to completion left the poisoned
+ * row in place forever.
+ *
+ * Fix: when detection fires AND projected >= 2x cached AND the file is real
+ * (not stdin), DELETE the row immediately. Next session re-counts from
+ * scratch via linecount_thread; current session's natural finalize at
+ * gzclose still writes the authoritative count if this run completes.
+ *
+ * Implementation: new linecount_cache_delete(filepath) helper mirrors
+ * linecount_cache_finalize's connection lifecycle (open, WAL+busy_timeout
+ * PRAGMAs, prepared DELETE statement, wal_checkpoint(TRUNCATE), close-with-
+ * rc-logged). Per-file 'cache_expunged' sticky flag (reset on each new
+ * file open) gates the DELETE+stderr to fire at most once per file even
+ * if the detection block triggers across many cacheline batches.
+ *
+ * Concrete trigger Shooter saw: hashmob.net.found.v7 cached at ~12M lines
+ * (likely a partial count from a pre-1.375 crash); actual file ~3.755B
+ * lines. Detection fires at line ~12M; projection extrapolates to ~3.7B
+ * (312x cached); DELETE fires; expunge stderr line emitted; current run
+ * continues at the projected estimate; next session starts clean.
+ *
+ * Validation: ioblade canonical 21,289 byte-exact regression guard. The
+ * canonical workload doesn't typically trip detection (rockyou's
+ * 14,341,564 cached count matches actual), so the expunge path stays
+ * dormant. Synthetic test deferred (would require manually poisoning
+ * the SQLite db on ioblade — same effect achievable by Shooter clearing
+ * his row manually if needed).
+ *
+ * Revision 1.382  2026/05/05 03:07:19  dlr
+ * B5 chokepoint widen: gpu_rules_engine_active path now permits {MD5, MD4, SHA1, SHA224, SHA256} ops. Replaces the JOB_MD5-only clause at the per-word gate. Pairs with gpu/gpu_opencl.c rev 1.94 widening of dispatch_md5_rules early-return + new gpu_template_resolve_kernel helper that selects the right per-op template kernel. Real-mdxfind workloads on these 5 algorithms now route through the template path (gpu_template.cl + gpu_<algo>_core.cl) instead of falling through to slab/CPU. Validation: ioblade canonical 21,289 bit-exact (MD5 production) + per-algo CPU-vs-GPU byte-exact regressions on synthesized 1000-word fixtures.
+ *
+ * Revision 1.381  2026/05/05 02:04:11  dlr
+ * Slot pool packed_buf_rules + word_offset_rules: malloc_pinned -> calloc.
+ *
+ * Continuation of the rev 1.91 (gpu/gpu_opencl.c) hashcat-pattern conversion. These two slot-pool host buffers are allocated when a rules-engine slot first acquires its packed payload (mdxfind.c rules-engine acquire path, two sites). In B1's coalesced dispatch path they are HOST-ONLY: procjob fills them via memcpy, then dispatch_md5_rules memcpys them into d->h_dispatch_payload (rev 1.91 USE_HOST_PTR cl_mem) before the synchronous WriteBuffer. They are never directly bound to a cl_mem.
+ *
+ * Drop malloc_pinned (which on Windows attempts VirtualLock and consistently fails because of the working-set quota — Shooter's pin summary: 320 attempts, 318 failed). plain calloc. Eliminates the two persistent stderr warnings:
+ *
+ *   Warning: VirtualLock(4194304) for packed_buf_rules failed; pin-on-demand fallback.
+ *   Warning: VirtualLock(65536) for word_offset_rules failed; pin-on-demand fallback.
+ *
+ * These warnings flood Shooter's stderr — 12 GPUs * 160 slots = 1920 attempts of each kind per session, all failing. They aren't fatal but they noise up diagnostics.
+ *
+ * Cite: feedback_hashcat_host_buffer_pattern.md (the discipline) and feedback_win_nvidia_coverage_gap.md (Linux-vs-Windows test gap).
+ *
+ * NOT touching the legacy slab path's packed_buf / word_offset (gpujob_submit_bf at ~9255, chokepoint at ~10732/10747) — those are slab-path retiring in B8 per memo B phase ladder.
+ *
+ * Validation: ioblade canonical 21,289 byte-exact regression guard; Win64 cross-compile + Shooter handoff. The hashcat pattern is proven on his rig already (rev 1.91 fixed the FATAL crash class).
+ *
+ * Revision 1.380  2026/05/04 17:10:02  dlr
+ * Route iter-only / unsalted-no-rules MD5 path through rules-engine kernel; subsume the older slab path. Replaces gpu/gpu_opencl.c rev 1.82's wrong-direction fix (now reverted to 1.81 + ci'd as 1.83). Three host-side changes: (1) drop Numrules > 0 clause from rules-engine setup at ~43459 — when Numrules == 0, synthesize a 1-byte program containing only NUL byte; the kernel reads NUL → is_no_rule=1 → runs MD5+probe on original word once. New gpu_rules_engine_active flag distinguishes 'engine wired' from 'real user rules present'. gpu_rule_count = 1, gpu_rule_membership = NULL (no Numrules array needed). (2) Per-word gate at ~10047 now branches on gpu_rules_engine_active AND (Numrules == 0 || currule != NULL); gpu_rule_membership accesses already null-guarded at C2.3 site. (3) Delete iter-only slab branch at ~10034 (the 5-line block calling gpu_try_pack_unsalted) — subsumed by rules-engine path. Also extends the gpu_packed_done goto at ~10629 to fire on gpu_skip_no_rule_pack alone (was gated on do_pack_gpu); needed because Numrules == 0 leaves do_pack_gpu == 0 (no Rules buffer) but the rules-engine kernel still computed md5(word) and the CPU switch must be skipped to avoid duplicate work. Validation: ioblade RTX 4070 Ti + RTX 3080 + gfx1201 — small fixture (1999 hashes × 10K rockyou words, -m e1 -i5): 1999/1999 cracks byte-exact CPU vs GPU. ioblade canonical 21,289 byte-exact regression: PASS at 3:16.6 wall (matches B2 baseline 3:16.63). Stderr confirms 'GPU rule engine: synthetic-only no-rule pass uploaded to 3/3 device(s)' and rules path consumed all 9999 words via 1 batch (0 slab dispatches). Iter level emit verified via mixed-iter fixture: 100 MD5x01 + 100 MD5x03 + 1799 MD5x05 — exact match. Build green on .205 (md5 119d9ccbc51d358a51eba867c314cbb2, 10075616 bytes).
+ *
+ * Revision 1.379  2026/05/04 14:32:53  dlr
+ * Startup-phase diagnostic instrumentation: tsfprintf [T+ S.SSSs] prefix on init-phase stderr emit. Adds tsfprintf() helper (thread-safe via TsfLock); replaces ~25 init-phase fprintf(stderr,..) calls (Took N seconds, Compact hash table, GPU rule engine, Searching through, Maximum/Minimum hash, Using N cores, Working on comfort line). Per-(reason, size_class_4MB) malloc_pinned warn-tracking + consolidated end-of-init pin summary emitted on first ReportStats comfort line — replaces the prior global-warn-once that hid second-kind failures. MDXFIND_PIN_TRACE=1 enables per-attempt pin lines (~140) + hashes_shown alloc START/DONE per device (~6 extra). Designed for diagnosing Shooter 12-GPU rig 10s init-pause; ioblade smoke 21,289/21,289 cracks bit-exact.
+ *
+ * Revision 1.378  2026/05/04 03:46:11  dlr
+ * Memo C: parallel set_compact_table + set_rules per-device upload loops; new -G serial/-G s CLI kill option for parallel-init.
+ *
+ * build_compact_table prelude: new static sct_thread_fn() helper + struct srl_arg + srl_thread_fn() helper.
+ *
+ * set_compact_table loop: yarn-launched per-device thread, joined after all devices submit. Compact data is shared read-only; each device has its own cl_context + cl_command_queue. CL_MEM_COPY_HOST_PTR copies into device-resident memory so concurrent reads of host pages from N driver threads are safe.
+ *
+ * set_rules loop (rules-engine upload): same pattern via srl_thread_fn. Per-device rc gathered into srl_arg.rc, tallied after join for n_uploaded.
+ *
+ * CLI: -G serial / -G s sets _serial_init=1 via gpu_opencl_set_serial_init(1), fall back to single-threaded gpu_opencl_init loop. Per-device set_compact_table / set_overflow / set_rules loops still parallelize independently (intentional — they are mdxfind-side, not gated by the kernel-init kill switch).
+ *
+ * Validated on ioblade: parallel and -G serial both produce 21,289 cracks bit-exact; parallel shows out-of-order init log lines, serial shows strict order.
+ *
+ * Revision 1.377  2026/05/03 22:25:52  dlr
+ * Restore 'startline' parameter to gpujob_get_free / gpujob_get_free_rules — widened to unsigned long long for >4B-line wordlists. The earlier API removal (1.40 of gpujob.h) was based on the OpenCL path's '(void)startline;' shim, but the Metal path in gpujob_metal.m has an active priority scheduler (gpu_sched_curline + gpu_waiter linked list) that uses startline to prefer earlier-line jobs. Removal broke macOS local build at 'no matching function for call to gpujob_get_free' on the shutdown sentinel. Restoration: parameter back in API, widened to ulonglong; gpu_sched_curline + struct gpu_waiter::startline widened to ulonglong; OpenCL impl ignores via (void)startline; — both backends ABI-consistent now. Caught by mdxfind-release first step (macOS local build).
+ *
+ * Revision 1.376  2026/05/03 21:48:16  dlr
+ * linecount_cache_finalize: remove duplicate lc_secs/cache_hits/AutoCountDone block accidentally pasted inside the new function during the prior edit (those belong to linecount_thread, which still has them at lines 36755-36762). Fixes 'undeclared identifier' compile errors on .205.
+ *
+ * Revision 1.375  2026/05/03 21:46:54  dlr
+ * Widening + cache-poison fix.
+ *
+ * Widening (forward-looking; Shooter's hashmob.net.found.v7 is 3.16B lines, fits in 32-bit but no headroom):
+ * - struct job::startline,numline: unsigned int -> unsigned long long; reordered (8-byte first, 4-byte after); prefix[] aligned(16) to keep buffer alignment after the +8 bytes
+ * - struct Linehints::curline,numline: widened + reordered
+ * - MDXlowest_line: 'volatile unsigned int = 0xFFFFFFFF' -> 'atomic_ullong = ULLONG_MAX'. C11 atomics auto-handle platform conditionalization (x86-64/ARM64: plain mov/ldr/str; i386: LOCK CMPXCHG8B; ARMv7: LDREXD/STREXD). All 4 read/write sites use atomic_load_explicit/atomic_store_explicit with memory_order_relaxed. lowest_line/restart locals widened to match. Sentinels migrated to ULLONG_MAX.
+ * - cacheline()::nextline static + curline local widened (the actual chunk-position counter)
+ * - procjob locals (curline,numline,sl) widened
+ * - read-loop locals widened
+ * - numline = UINT_MAX -> ULLONG_MAX (lineswanted stays 32-bit — per-job target)
+ * - struct jobg fully reorganized (8-byte first / 4-byte / 1-byte slot_kind / 4-byte arrays / 2-byte arrays / aligned union last); 'unsigned int line_num' deleted (vestigial — never compared, only assigned)
+ * - gpujob_get_free* dropped 'startline' parameter (the parameter was already discarded with '(void)startline;')
+ * - 7 dead 'g->line_num = job->startline;' lines deleted
+ * - 5 callers updated to drop startline arg
+ *
+ * Cache-poison fix (root cause of Shooter's wrong-ETA bug 2026-05-03: cache held 12M lines for hashmob.net.found.v7 vs 3.16B actual):
+ * - Fix 1: linecount_file() gains 'int *complete' out-param. Default *complete=0; set to 1 only via natural fall-through after read-loop runs to EOF. linecount_thread() now skips cache store when complete=0 — partial counts from HashWaiting early-bail no longer poison future sessions.
+ * - Fix 2a: New atomic_ullong CurfileBytesRead/CurfileBytesTotal globals. cacheline() accumulates readlen into CurfileBytesRead per chunk. Main read loop sets CurfileBytesTotal from sb.st_size at file open; resets CurfileBytesRead.
+ * - Fix 2b: After 'Fileline += Linecount' in main read loop, if Fileline > AutoCountTotalLines (cache was wrong), project new estimate from byte-position ratio (Fileline * total_bytes / read_bytes) and CAS-loop-bump AutoCountTotalLines monotonically. ReportStats's ETA self-corrects without code change to ReportStats.
+ * - Fix 2c: New linecount_cache_finalize(filepath, size, mtime, actual_lines) function. Called after gzclose per wordlist (skipping stdin + Fileline==0). Opens own SQLite connection, INSERT OR REPLACE under WAL+busy_timeout, PRAGMA wal_checkpoint(TRUNCATE), close — overwrites poisoned partial entry with the authoritative count discovered at EOF.
+ * - comfort line: 'line N' position now appears in the percentage branch too (not just the no-estimate fallback).
+ *
+ * Revision 1.374  2026/05/03 19:51:08  dlr
+ * comfort line: include 'line N' in the progress branch (where total_est > 0). Was only present in the fallback branch when ETA wasn't computable. Both signals are useful — the absolute line position helps when the user wants to know how far through a wordlist they are independent of the percentage.
+ *
+ * Revision 1.373  2026/05/03 18:33:45  dlr
+ * GPU kernel cache: add mdxfind_rev_string() to parse rev from $Header in Version[], call gpu_kernel_cache_init(rev) immediately before gpu_opencl_init() in OPENCL_GPU branch. Idempotent; warns + disables if MDXFIND_CACHE unset (no probes, no directory creation).
+ *
+ * Revision 1.372  2026/05/03 16:52:08  dlr
+ * linecount cache: finalize LC_stmt_lookup/LC_stmt_store before sqlite3_close, log close return code on failure. Was leaking mdxfind.db-wal/.db-shm because the unfinalized prepared statements made sqlite3_close return SQLITE_BUSY silently (rc was discarded), preventing the WAL checkpoint + cleanup from running. WAL mode kept (multi-process concurrent reader+writer needed).
+ *
+ * Revision 1.371  2026/05/03 15:25:20  dlr
+ * c/s display: include Totrules_gpu in 15-second rate window. Was always reading 0 when all rules ran on the GPU because Totrules is only incremented by the CPU FastRule path. Same pattern as #71 EMA fix — final summary already aggregated, per-tick window did not.
+ *
+ * Revision 1.370  2026/05/02 17:27:35  dlr
+ * Cosmetic: drop "+ 1 synthetic no-rule pass" from startup log.
+ * The synthetic no-rule pass is intrinsic mdxfind behavior, not
+ * worth calling out in the rule-engine init message.
+ *
+ * Revision 1.369  2026/05/02 17:20:01  dlr
+ * task #84 fix: call gpu_opencl_finalize_active_count() after the per-device set_compact_table loop. If zero devices survived (all hit the VRAM gate), finalize flips ocl_ready=0 so subsequent gpu_opencl_available() calls return false and mdxfind routes everything to CPU FastRule (effectively -G none).
+ *
+ * Revision 1.368  2026/05/02 04:51:09  dlr
+ * Promote rules-engine input gate from hardcoded 55 to shared
+ * GPU_RULES_MAX_INPUT_LEN=255 (gpujob.h). Routes long-tail rockyou
+ * words (~0.007%) through GPU rules engine instead of CPU FastRule,
+ * matching the walker's buf[256] capacity. Single source of truth
+ * across mdxfind.c and gpu/gpu_md5_rules.cl (RULE_BUF_LIMIT must
+ * match GPU_RULES_MAX_INPUT_LEN -- comment in gpujob.h flags the
+ * sync requirement).
+ *
+ * Revision 1.367  2026/05/02 02:52:48  dlr
+ * ReportStats line-number fix: source from main()-local Fileline
+ * instead of per-algorithm/per-chunk (Lowline+LowSkip). Promote
+ * Fileline to module-scope global; ReportStats now displays
+ * monotonic file position instead of slowest-algorithm offset
+ * within current chunk (which collapsed to 0 at every 25 MB
+ * chunk boundary, producing user-reported backward jumps).
+ *
+ * Revision 1.366  2026/05/02 01:48:34  dlr
+ * Combined EMA + walker fold fix (task #71): (1) ReportStats EMA: snapshot Tothash per tick and attribute the GPU-side delta to JOB_MD5's hashes_accum. The rules-engine GPU path (gpu/gpujob_opencl.c) bumps Tothash atomic but doesn't feed linehints[op].hashes_accum, so the EMA was decaying based on the ~0.007% FastRule CPU contribution from words > 55 chars that bypass the C2.2 GPU pack — drove lineswanted way below ioblade-class steady state on mmt's single-GPU run (#69 median pc=6997 vs ioblade 13984). Single-op MD5 attribution; multi-op rules-engine documented as approximate. Validator PASS on ioblade RX 9070 (32,500 / 32,500 / 0 divergent / 0 one-sided).
+ *
+ * Revision 1.365  2026/05/01 19:43:52  dlr
+ * Add VALIDATE_PHASE_RUNTIME marker for harness loader/runtime split; gated on MDXFIND_RULE_VALIDATOR; pure additive when env unset; emitted once just before launch(ReportStats) so rule-loader test-applies (line 41928) sit before the marker and runtime applyrule() invocations sit after.
+ *
+ * Revision 1.364  2026/04/30 20:54:05  dlr
+ * Always pack rules-engine batches to full slot capacity (GPU_RULES_MAX_WORDS_PER_BATCH = 16384). Replaces the prior formula (4M lane target / floor 256) with direct use of word_offset_entries. Per-dispatch GPU compute time grows from ~9ms (256w) to ~470ms (16K w) on a 4090 at 100k rules — gap fraction projects from 8% to <1% on capacity-bound rigs. ioblade was already at 1% idle so the change is neutral there (231.5s → 234.6s, within noise; 21,289 cracks bit-exact). The win is for Shooter's 12-GPU rig where rev 1.361 showed 27% per-device idle from accumulated host-side overhead per dispatch. With 1.638B candidates per dispatch and observed avg 57 hits/Mcandidates, expected hits per batch = 93K avg / ~465K worst-case 5×; under the 1M cap from gpujob.h rev 1.35. Zero overflow warns observed across full 14.3M-word ioblade run. Total dispatches drop 48× (56K → 1.2K across 3 GPUs).
+ *
+ * Revision 1.363  2026/04/30 19:35:06  dlr
+ * Convert Tothash and Totfound to atomic_ullong; drop FreeWaiting lock at all GPU dispatch sites in gpu/gpujob_opencl.c. The lock was 76-way contended on Shooter's 12-GPU rig (12 gpujob workers + 64 procjob threads). Both counters are pure accumulators with no read-modify-write semantics needed beyond a single atomic add — _Atomic compound assign is well-defined per C11 (LOCK XADD on x86-64). Existing precedent: Totrules_gpu is already atomic_ullong (gpujob_opencl.c:667). Sites changed: mdxfind.c:6907 (declaration), 41507 (init split into atomic_store + plain int assign), gpu/gpujob_opencl.c:58 (extern), 757-763, 905-911, 1156-1161, 1402-1408, 1441-1445 (lock-free atomic_fetch_add). At procjob's per-second checkpoint (mdxfind.c:9667/9671 and 35156/35160) the FreeWaiting lock stays — it also covers TotLines/Totrules updates and the per-thread reset, low rate so contention is minimal. Validated on ioblade rockyou×HashMob.100k×0_combined: 21,289 cracks unchanged, 231.5s wall (was 232.5s with locks; small Δ because ioblade's 3-GPU contention was light). Real impact pending Shooter's next access window where FreeWaiting was the binding lock.
+ *
+ * Revision 1.362  2026/04/30 19:18:51  dlr
+ * GPU rule-engine: bump words-per-batch floor 64→256, lane target 1M→4M. The prior 64-word floor caused per-dispatch GPU compute time of ~1.8ms on a 4090 (with 100k rules) — and post-currule=NULL fix on Shooter's 12-GPU rig the per-dispatch host overhead was the binding constraint, not CPU rule iteration. Trace-timestamp analysis of Shooter's 1.361 run showed: (a) per-device idle 27% uniform across all 12 devices, (b) inter-dispatch gap ~670µs, (c) gap distribution with 20% of gaps in the 500-1000µs range — the signature of synchronous lock+broadcast overhead in the GPUWorkWaiting/GPULegacy-RulesFreeWaiting pattern. With 4× larger batches: dispatch rate drops 4×, per-dispatch GPU time grows to ~7ms, gap fraction projects to ~8% (670µs / 7670µs). Hit-buffer headroom is ample (262144 entries vs ~1.5 hits/word worst-case). Validated on ioblade rockyou×HashMob.100k×0_combined: 21,289 cracks unchanged, 232.5s wall (was 237.5s), per-device hash rate +2-3% (idle was already 1-2% at only 3-GPU contention so amortization gain is small there). Real impact on 12-GPU pending Shooter's next access window. Constants: max_words_lanes = 4000000 / gpu_rule_count, floor 256, ceiling word_offset_entries (16384 from GPU_RULES_MAX_WORDS_PER_BATCH).
+ *
+ * Revision 1.361  2026/04/30 15:49:49  dlr
+ * GPU rule-engine: skip the inner CPU rule-walk loop when all rules are GPU-eligible. After a successful C2.2 pack, if gpu_legacy_slot_unused is set (rl.ncpu == 0), NULL currule so the outer do/while exits after the no-rule pass. Without this, every word triggers Numrules iterations of the inner do/while just to hit C2.3 and 'continue' past each GPU-eligible rule — for HashMob.100k × 1M words that's 100 BILLION no-op iterations across procjob threads, eating ~half the wall time. Empirical on ioblade (RTX 4070 Ti + RTX 3080 + RX 9070): single-GPU 1M words drops 43.4s → ?, idle drops from 57% → 4%; 3-GPU 1M words drops 27.4s → 25.4s and per-device idle drops to 3-4% (was 67-84%). Per-card aggregate hash rate scales 2.27× across the 3 mismatched cards vs 1.71× wall — gap is per-device setup overhead (kernel build, warm probe, table register) which amortizes on longer runs. Cracks 9388/9388 preserved across all configurations. 200k smoke: single 25.39s → 14.32s, 3-GPU 27.44s → 12.42s. The optimization is gated on gpu_legacy_slot_unused so workloads with mixed GPU+CPU rules still walk the rule list as before. Per-word lost-slot fallback (when gpujob_get_free_rules returns NULL) is unaffected — currule stays non-NULL, walker runs as before.
+ *
+ * Revision 1.360  2026/04/30 14:19:44  dlr
+ * Fix gpu_skip_no_rule_pack interlock that double-fired the no-rule pass on every GPU-eligible word. The Phase-4 'pass0 = 1' line at ~9972 mutates pass0 before the legacy chokepoint check at ~10281 reads it, so gpu_skip_no_rule_pack always evaluated to 0 — both the rules-engine kernel (synthetic ':') AND the legacy chokepoint pack ran md5(word) per word, doubling GPU work and inflating the per-device hash_Gh/s metric by 2x. Snapshot pass0 at the top of the inner do/while body (was_pass0_zero) and use the snapshot at the chokepoint check. Also goto gpu_packed_done when skipping — without the goto, control falls through to the JOB_MD5 case in the chokepoint switch where line 9835's per-word 'FastRule = 1' setting (overriding line 9490's 'if (do_pack_gpu) FastRule = 0') triggers the SIMD rule walker at line 24338, walking all rules through CPU and setting 'currule = NULL' at line 24500 — exiting the outer do/while before C2.3 can engage. Empirically validated on ioblade (RTX 4070 Ti) with HashMob.100k.rule x 100words.txt: legacy slot drops from 75094 to 74995 entries (the 99 duplicate no-rule packs eliminated), C2.3 fires 9899901 times correctly, Tothash drops from 9975094 to 9974995, 189/189 cracks preserved. Shooter's 12-GPU production trace shows the bug at scale: legacy entries (14415534) approximately equals rules-engine words (14340539), confirming the duplicate was costing 14.4M hashes per HashMob.100k x rockyou pass. Per-device hash_Gh/s metric over-count remains for task #47 (legacy entry count gets multiplied by gpu_rule_count in the formula, separate fix).
+ *
+ * Revision 1.359  2026/04/29 22:38:03  dlr
+ * GPU rule engine: -i N (iter) support + multi-GPU diagnostics bundle.
+ *
+ * Iter (-i N) support, validated byte-exact against CPU on mmt (21,289 cracks at -i 1, 60,784 at -i 10). Kernel iter loop in gpu_md5_rules.cl, dispatch wires Maxiter through gpu_opencl_dispatch_md5_rules, chokepoint gate at mdxfind.c lifted from ==1 to >=1, harness fixtures in gpu_rules_test.c.
+ *
+ * Multi-GPU diagnostic infrastructure (one-shot, low overhead, opt-in tracer):
+ * - Path-a read-back probes after every per-device upload (rule_program, rule_offset, compact_fp, compact_idx, overflow). Silent on correctness; fprintf+abort on mismatch.
+ * - Per-batch dispatch tracer gated on MDXFIND_DISPATCH_TRACE env var; logs dev/op/packed_count/packed_pos/input_xor/iter/masks/hits/wall_us per dispatch.
+ * - warm_probe_async early-return now logs WARN with probe_thread_count.
+ * - Per-device end-of-run summary: name, BDF, batches/words/hits, wall/busy/idle, hash_Gh/s (rules*iter expanded), word_Mh/s, h2d_GBps, LnkSta start/end via lspci.
+ * - Per-device share line printed by gpujob_print_share_line() before final summary.
+ *
+ * Validated on ioblade 2-GPU NVIDIA: 21,289 cracks byte-exact, no probe false-fires, tracer silent without env var. SHOOTER 169-cracks 'multi-GPU bug' resolved as not-a-bug (different hash file at SHOOTER); hashcat agrees within 4 cracks (165 vs 169) on same hardware/file.
+ *
+ * Revision 1.358  2026/04/29 00:34:17  dlr
+ * Two-pool jobg slot allocator: rules-engine and legacy chokepoint pools are now disjoint. struct jobg gains slot_kind, packed_buf_size, word_offset_entries fields; fill sites read sizes from the slot. New gpujob_get_free_rules entry point. gpujob_init hard-stops if rule count exceeds compile-time ceiling. Fixes SEGV from cross-path slot reuse with mismatched buffer caps. Bundle includes ruleproc '3' (TOGGLE_AT_SEP) op support and packrules NEED_BYTES truncation guards. Validated on mmt: 21,289 cracks for HashMob.100k.rule x rockyou.txt in 617s, exact match with pre-fix baseline.
+ *
+ * Revision 1.357  2026/04/28 05:18:17  dlr
+ * GPU rule engine: pre-load overflow hashes to GPU at session start.
+ *
+ * GAP DEBUG instrumentation (rev 1.64) pinned the dominant startup cost: load_overflow took 3s on fpga (16 cores) and presumably ~30s on mmt (64 cores). The work itself is microseconds (1649 entries x 16-byte = 26 KB upload), but the WORKER thread doing it was contending with 16 procjob threads filling batches at full CPU rate. cap_ipc_lock made it WORSE (3s -> 6.9s) because procjobs now succeed at mlock(268MB), creating real memory-subsystem contention.
+ *
+ * Fix: move the overflow upload from the lazy worker-side load_overflow() (gpu/gpujob_opencl.c) to mdxfind.c session start, right after the existing GPU rule engine setup block. At that point procjob threads haven't launched yet — the system is quiet, the upload happens at native speed.
+ *
+ * Implementation: new gpujob_overflow_preload_all() public function in gpu/gpujob_opencl.c (rev 1.66) wraps the existing load_overflow per device, sets gpu_overflow_preloaded flag. Worker's lazy path becomes a no-op when flag set (still falls back if pre-load couldn't run for some reason — defensive). New extern declaration in gpujob.h (rev 1.31).
+ *
+ * Companion edit: gpu/gpujob_opencl.c rev 1.66, gpujob.h rev 1.31. mdxfind.c calls gpujob_overflow_preload_all() right after the existing rule engine block at line ~42889.
+ *
+ * Revision 1.356  2026/04/28 04:56:47  dlr
+ * GPU rule engine: add Totrules_gpu atomic + fold into 'total rule-generated passwords tested' final summary line.
+ *
+ * The counter line at the end of the run was undercounting by ~2500x on rules+GPU workloads because Totrules only tracked CPU-side candidates. With Layer 3 routing rules through the GPU, GPU-expanded (word,rule) pairs were invisible.
+ *
+ * New atomic_ullong Totrules_gpu (defined here, extern'd into gpu/gpujob_opencl.c which increments per dispatch). Print site at line ~46414 includes atomic_load(&Totrules_gpu) in the displayed total. Print gate widened so the line still fires when Totrules==0 but GPU contributed.
+ *
+ * Companion edit in gpu/gpujob_opencl.c rev 1.65 does the actual incrementing.
+ *
+ * Revision 1.355  2026/04/28 04:02:24  dlr
+ * Sub-commit C2: chokepoint hook activating GPU rule engine dispatch.
+ *
+ * Add per-thread my_jobg_rules slot (C2.1) alongside my_jobg; add early JOB_DONE flush for
+ * the new slot (C2.1.5); add start-of-word hook (C2.2) that packs the original word into the
+ * rules_engine batch when gate conditions are met (MD5, iter==1, no mask/email/keys/Printall,
+ * currule set, len<=55); add per-rule GPU-eligible skip (C2.3) that advances currule and
+ * continues past rules where gpu_rule_membership[Ruleindex-1]==1, with my_jobg set as guard;
+ * add end-of-job flush (C2.4) for my_jobg_rules using plain gpujob_submit (not submit_bf).
+ * The rules_engine=1 flag on the jobg activates the sub-commit-B dispatch path in
+ * gpujob_opencl.c. cpu-only rules and the no-rule pass still fire on CPU unchanged.
+ *
+ * Revision 1.354  2026/04/28 03:24:28  dlr
+ * Sub-commit C1: add gpu_rule_membership bitmap global and populate it.
+ *
+ * Global gpu_rule_membership (calloc, Numrules bytes) allocated and filled
+ * inside the n_uploaded>0 branch immediately after gpu_rule_count is set.
+ * Each orig[i] that maps back to a valid Rules[] index is marked 1.
+ * Includes member_count==rl.ngpu consistency check that emits a WARNING to
+ * stderr if the orig[] map is inconsistent.  No behavior change — C2 will
+ * consume the bitmap for chokepoint dispatch gating.
+ *
+ * Revision 1.353  2026/04/28 02:36:39  dlr
+ * Sub-commit A fix: move the GPU rule engine block from after rule-load (line ~42437) to after build_compact_table() (line ~42721).
+ *
+ * Sequencing bug caught by mdx-build smoke on mmt rev 1.352: gpu_opencl_init() runs inside build_compact_table() (line 35797), so the prior rule-load placement fired before any GPU device existed and silently no-op'd via the gpu_opencl_available() guard. Evidence from smoke: '999 total rules in use' printed (rule load complete) but no 'GPU rule engine: N/M' line followed; later 'OpenCL GPU: 1 device initialized' showed init was downstream.
+ *
+ * Fix: hoist the entire #ifdef OPENCL_GPU block to the natural place after build_compact_table() returns. Rules and Numrules are stable by then. Block contents unchanged. Comment in-block now documents the placement constraint.
+ *
+ * Revision 1.352  2026/04/28 02:25:42  dlr
+ * GPU rule engine Layer 3 sub-commit A: classify rules + per-device upload at session start.
+ *
+ * After Numrules is finalized in the rule-load block (~line 42437), walk the length-prefixed Rules buffer to build a char** of rule-bytecode pointers, call classify_rules(), and for each GPU-eligible rule pack its bytecode (with trailing NUL) into a contiguous program buffer. Upload to every available GPU device via gpu_opencl_set_rules(). Cache the program, offset table, and gpu->original-rule-index map in new globals (gpu_rule_program / gpu_rule_offsets / gpu_rule_origin / gpu_rule_program_len / gpu_rule_count) — sub-commits B/C/D will use them for chokepoint dispatch and applyrule-replay hit decoding.
+ *
+ * Reports a one-line summary to stderr: 'GPU rule engine: N/M rules eligible (P%), B-byte program uploaded to D/D device(s)'. On all-uploads-failed (likely __constant size limit on rule programs > ~64 KB — HashMob.5k packs to ~25 KB which fits, but HashMob.100k at ~500 KB does not), gpu_rule_count remains 0 and sub-commit C will fall back to the existing CPU rule-expansion path.
+ *
+ * OPENCL_GPU-gated. No dispatch path change yet — proves the classifier integration and per-device upload work end-to-end inside mdxfind.
+ *
+ * Revision 1.351  2026/04/27 15:19:00  dlr
+ * Phase 6.2 trigger relocation + malloc_pinned for GPU-upload host buffers. (1) Phase 6.2: gpu_opencl_warm_probe_async() trigger moves from line 45813 (after BF set_mask) to right after gpu_opencl_compile_families() at the end of the GPU init block in main. The probe runs concurrently with the rest of mdxfind's BF-activation setup (mask parse, BF detection, set_mask, Dohash scan) instead of immediately blocking bf_partition_setup's wait. The synthetic compact/mask path in gpu_opencl.c rev 1.60 makes this safe even though set_compact_table/set_mask haven't run yet. The old 45813 trigger site is removed. (2) malloc_pinned helper: page-aligned posix_memalign + mlock for the four packed_buf and word_offset allocation sites that feed clEnqueueWriteBuffer. Pinned host memory lets the OpenCL driver DMA at full PCIe bandwidth instead of the pin-on-demand path that pageable malloc'd memory triggers (mmt April 23 timing showed ~21ms steady-state upload-per-dispatch for 180MB, ~28% of PCIe 4.0 x16 saturation, consistent with pageable transfer rate). On mlock failure (RLIMIT_MEMLOCK too small) the function warns once and returns the page-aligned but non-locked allocation — correctness preserved, only performance varies. Tested on mmt with mlock succeeding (ulimit -l unlimited); the rate isolation is pending diagnosis of a separate pre-existing GPU-dispatch regression where 5k-rule MD5 workloads see ~330× fewer GPU batches in current head than in the April 23 baseline.
+ *
+ * Revision 1.350  2026/04/27 03:45:03  dlr
+ * Phase 6.1 mdxfind side: fire warm-probe early, wait at partition. Right after gpu_opencl_set_mask() in the BF activation branch, scan Dohash for the first selected op and call gpu_opencl_warm_probe_async(op). The probe runs concurrently with the rest of BF activation setup (Dohash scan, per-job init, free-list claim). bf_partition_setup() now opens with gpu_opencl_warm_probe_wait() before gpu_opencl_bf_start(); this either no-ops (if the probe already finished concurrently) or blocks briefly (~200-400ms) for the slowest device's probe to complete. Result: by the time bf_partition_setup polls fam_rate, every device has a real rate, so partition fires on every BF run instead of always falling through to single-cursor mode. Multi-op BF (uncommon) still uses op[0]'s family for both probe and partition basis — documented limitation.
+ *
+ * Revision 1.349  2026/04/27 02:45:10  dlr
+ * Phase 6c: wire multi-GPU brute-force keyspace partition into BF activation. Adds bf_min_time_threshold_s(op) (per-op minimum runtime gate: 1s default, 2s for medium iteration crypts, 5s for bcrypt/yescrypt) and bf_partition_setup(ops, n_ops, total_keyspace) (polls per-device autotune rates via gpu_opencl_fam_rate, gates on max(threshold) across selected ops, computes proportional per-device shares, reserves a 5% tail buffer for thermal variance via gpu_opencl_bf_set_tail_start). Activation site at the BF dispatch (formerly bare gpu_opencl_bf_start()) now scans Dohash to collect the op set and calls bf_partition_setup, which itself invokes gpu_opencl_bf_start() unconditionally. Single-GPU and num_devs<=1 paths short-circuit to the rev 1.348 fast path; rate-zero or sub-threshold cases fall back to single-cursor mode with stderr explanation. Stderr emits per-device share table when partitioning. Multi-op BF documented as using job_ops[0]'s family rate.
+ *
+ * Revision 1.348  2026/04/27 00:51:21  dlr
+ * Phase 4 -2 handler: when applyrule returns -2 (rule output equals input) mid-mask-cycle, set number_iter to loop_bound (not 0) so the next iter takes the if-branch and applies the next rule cleanly. Resetting to 0 caused the next iter to take the else-branch and replay the previous rule's mask cycle from rule_base, producing duplicated hashes. Pre-Phase-4 didn't have this bug because the rule-advance fired every iter (no gating). Caught by a synthetic test: word 'ABC' + rule 'u' (which produces 'ABC', returning -2) + -n 2d: pre-fix produced 20 hashes (replay), post-fix correctly produces 10 (no-rule × 10 masks; rule auto-skipped). Companion fix to ruleproc.c lfastcmp same revision.
+ *
  * Revision 1.347  2026/04/26 22:04:54  dlr
  * ReportStats: guard gpujob_available()/gpujob_queue_depth()/gpujob_free_count() calls with #ifdef GPU_ENABLED. The progress-message format selector at lines 36302-36316 was unconditional; on platforms without a GPU backend (Linux i686, ARM6/7, ppc64le, FreeBSD, etc.), GPU_ENABLED is correctly undefined per the existing gate at mdxfind.c:145, but these specific calls compiled regardless and produced 'undefined reference' link errors. The fix uses the standard if/else with #ifdef-around-the-if pattern: the GPU branch is guarded; the no-GPU else-branch (without gq= field) becomes unconditional and links cleanly on every platform. Caught by mdxfind-release at the Linux i686 (.207) step. Build verified on local x86_64 (GPU_ENABLED set, GPU branch fires) and on .207 (GPU_ENABLED unset, no-GPU branch fires, link succeeds, POMELO -z e429 self-test passes).
  *
@@ -1684,6 +2249,217 @@ void *malloc_lock(size_t size, const char *reason)
   return(mem);
 }
 
+/* ============================================================
+ * Startup-phase diagnostic instrumentation (Shooter 12-GPU rig).
+ *
+ * tsfprintf(fp, fmt, ...) prints with a "[T+ S.SSSs] " prefix
+ * (right-aligned, 13 chars) so init-phase events can be timed
+ * against process start. Origin set on first call. Thread-safe
+ * via TsfLock so the prefix and message stay on one line even
+ * under concurrent emission from multiple gpujob/probe threads.
+ *
+ * Always-on. Emits to the supplied FILE* (typically stderr).
+ *
+ * The pin-tracker counters track every malloc_pinned() outcome
+ * by reason string. Pin summary is emitted at end of init via
+ * tsfprintf_pin_summary(). When MDXFIND_PIN_TRACE=1 is set in
+ * the environment, every pin attempt also emits a per-attempt
+ * line so sequencing is fully visible.
+ *
+ * Defined here (above malloc_pinned) so malloc_pinned() can call
+ * pin_record() directly without a forward decl mismatch.
+ * ============================================================ */
+#include <stdarg.h>
+static lock *TsfLock = NULL;
+static struct timespec tsfprintf_origin;
+static int tsfprintf_origin_set = 0;
+static int Pin_trace_cached = -1;
+
+static int tsfprintf_pin_trace(void) {
+  if (Pin_trace_cached == -1) {
+    const char *e = getenv("MDXFIND_PIN_TRACE");
+    Pin_trace_cached = (e && *e && *e != '0') ? 1 : 0;
+  }
+  return Pin_trace_cached;
+}
+
+static double tsfprintf_now_seconds(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (!tsfprintf_origin_set) {
+    /* Race-tolerant: under a possess(TsfLock) the first writer wins.
+     * If TsfLock is NULL (very early call before main inits locks)
+     * we just set on first call without lock — startup is single-
+     * threaded at that point. */
+    tsfprintf_origin = now;
+    tsfprintf_origin_set = 1;
+  }
+  double s  = (double)(now.tv_sec - tsfprintf_origin.tv_sec);
+  double ns = (double)(now.tv_nsec - tsfprintf_origin.tv_nsec) / 1.0e9;
+  double t  = s + ns;
+  if (t < 0) t = 0;
+  return t;
+}
+
+void tsfprintf(FILE *fp, const char *fmt, ...) {
+  va_list ap;
+  if (TsfLock) possess(TsfLock);
+  double t = tsfprintf_now_seconds();
+  fprintf(fp, "[T+%7.3fs] ", t);
+  va_start(ap, fmt);
+  vfprintf(fp, fmt, ap);
+  va_end(ap);
+  if (TsfLock) release(TsfLock);
+}
+
+/* ---- Pin-tracker for malloc_pinned outcomes ---- */
+#define PIN_KIND_MAX 16
+struct pin_kind_stat {
+  char     reason[64];
+  int      ok;
+  int      fail;
+  size_t   ok_bytes;
+  size_t   fail_bytes;
+  /* warn-per-(reason, size_class_4MB): bitmap of size classes
+   * (size / (4*1024*1024)) seen failing for this reason. Caps
+   * at 256 distinct 4MB classes; beyond that we just don't warn. */
+  uint8_t  warned_class[256];
+};
+static struct pin_kind_stat Pin_stats[PIN_KIND_MAX];
+static int Pin_stats_count = 0;
+
+/* Locate-or-allocate the kind slot for `reason`. NULL safe. */
+static struct pin_kind_stat *pin_kind_find(const char *reason) {
+  if (!reason) reason = "unknown";
+  for (int i = 0; i < Pin_stats_count; i++) {
+    if (strncmp(Pin_stats[i].reason, reason, sizeof(Pin_stats[i].reason)) == 0)
+      return &Pin_stats[i];
+  }
+  if (Pin_stats_count >= PIN_KIND_MAX) return NULL;
+  struct pin_kind_stat *k = &Pin_stats[Pin_stats_count++];
+  strncpy(k->reason, reason, sizeof(k->reason) - 1);
+  k->reason[sizeof(k->reason) - 1] = 0;
+  k->ok = k->fail = 0;
+  k->ok_bytes = k->fail_bytes = 0;
+  memset(k->warned_class, 0, sizeof(k->warned_class));
+  return k;
+}
+
+/* Record a pin attempt. locked=1 if mlock/VirtualLock succeeded.
+ * Caller already holds Memlock (locks ordering). Decision to warn
+ * is made here so warn-per-(reason,size_class) is consistent across
+ * multiple kinds — fixes the prior global-warn-once bug that hid
+ * the second-kind failure on Shooter's rig. */
+static void pin_record(const char *reason, size_t size, int locked) {
+  struct pin_kind_stat *k = pin_kind_find(reason);
+  if (!k) return;
+  if (locked) {
+    k->ok++;
+    k->ok_bytes += size;
+  } else {
+    k->fail++;
+    k->fail_bytes += size;
+    /* warn first time we see this (reason, size_class_4MB) tuple. */
+    size_t cls = size / (4ULL * 1024 * 1024);
+    if (cls < sizeof(k->warned_class) / sizeof(k->warned_class[0])
+        && !k->warned_class[cls]) {
+      k->warned_class[cls] = 1;
+#ifdef _WIN32
+      tsfprintf(stderr,
+        "Warning: VirtualLock(%zu) for %s failed; GPU upload will use\n"
+        "         pin-on-demand fallback.\n", size, reason);
+#else
+      tsfprintf(stderr,
+        "Warning: mlock(%zu) for %s failed (%s); GPU upload will use the\n"
+        "         pin-on-demand fallback. Raise RLIMIT_MEMLOCK\n"
+        "         (ulimit -l unlimited) for fastest PCIe transfers.\n",
+        size, reason, strerror(errno));
+#endif
+    }
+  }
+  if (tsfprintf_pin_trace()) {
+    int cum_ok = 0, cum_fail = 0;
+    for (int i = 0; i < Pin_stats_count; i++) {
+      cum_ok += Pin_stats[i].ok;
+      cum_fail += Pin_stats[i].fail;
+    }
+    tsfprintf(stderr,
+        "pin %s: %zu B -> %s (cum: %d locked, %d failed)\n",
+        reason, size, locked ? "OK" : "FAIL", cum_ok, cum_fail);
+  }
+}
+
+/* Emit the end-of-init pin summary. Always on. */
+void tsfprintf_pin_summary(void) {
+  int total_ok = 0, total_fail = 0;
+  size_t total_ok_bytes = 0, total_fail_bytes = 0;
+  for (int i = 0; i < Pin_stats_count; i++) {
+    total_ok        += Pin_stats[i].ok;
+    total_fail      += Pin_stats[i].fail;
+    total_ok_bytes  += Pin_stats[i].ok_bytes;
+    total_fail_bytes+= Pin_stats[i].fail_bytes;
+  }
+  if (Pin_stats_count == 0) return;   /* no malloc_pinned'd allocations */
+  tsfprintf(stderr,
+      "pin summary: %d attempts, %d locked (%zu MB), %d failed (%zu MB)\n",
+      total_ok + total_fail, total_ok, total_ok_bytes / (1024*1024),
+      total_fail, total_fail_bytes / (1024*1024));
+  /* Per-kind breakdown — helps separate packed_buf_rules vs packed_buf
+   * (legacy) vs hashes_shown failures. Each kind goes on its own
+   * tsfprintf so the [T+ ...] prefix repeats. */
+  for (int i = 0; i < Pin_stats_count; i++) {
+    struct pin_kind_stat *k = &Pin_stats[i];
+    tsfprintf(stderr,
+        "  by kind: %s: %d ok / %d fail (%zu MB locked, %zu MB failed)\n",
+        k->reason, k->ok, k->fail,
+        k->ok_bytes / (1024*1024),
+        k->fail_bytes / (1024*1024));
+  }
+}
+
+/* Page-aligned and mlock'd allocation for buffers that the OpenCL driver
+ * uploads to the GPU via clEnqueueWriteBuffer. Pinning the source pages
+ * lets the driver DMA at full PCIe bandwidth instead of going through the
+ * pin-on-demand fallback that pageable malloc'd memory triggers.
+ *
+ * If mlock fails (typically RLIMIT_MEMLOCK too small), we keep the
+ * page-aligned allocation but warn-per-(reason, size_class_4MB) via
+ * pin_record(). The caller gets correct memory in either case; only
+ * performance changes. */
+void *malloc_pinned(size_t size, const char *reason)
+{
+  void *mem = NULL;
+  int locked = 0;
+#ifdef _WIN32
+  possess(Memlock);
+  mem = _aligned_malloc(size, 4096);
+  if (mem) {
+    memset(mem, 0, size);
+    locked = VirtualLock(mem, size) ? 1 : 0;
+    pin_record(reason, size, locked);
+    memmax += size;
+  }
+  release(Memlock);
+#else
+  size_t pagesize = (size_t)sysconf(_SC_PAGESIZE);
+  if (pagesize < sizeof(void *)) pagesize = sizeof(void *) * 16;
+  possess(Memlock);
+  if (posix_memalign(&mem, pagesize, size) != 0) mem = NULL;
+  if (mem) {
+    memset(mem, 0, size);
+    locked = (mlock(mem, size) == 0) ? 1 : 0;
+    pin_record(reason, size, locked);
+    memmax += size;
+  }
+  release(Memlock);
+#endif
+  if (!mem) {
+    fprintf(stderr, "Out of memory during %s\n", reason);
+    exit(1);
+  }
+  return mem;
+}
+
 
 
 
@@ -1693,7 +2469,7 @@ struct LineInfo {
 };
 
 char *Curfile;
-unsigned long long int Lowline, LowSkip, TotLines;
+unsigned long long int Lowline, LowSkip, TotLines, Fileline;
 Pvoid_t HashL;
 Pvoid_t JuniperIVE;  /* secondary mapping: md5crypt hash → original Juniper IVE base64 */
 Pvoid_t Dohash, Doload, SaltArray, UserArray, KeyArray, RuleArray, NRuleArray, PepperArray;
@@ -1951,6 +2727,40 @@ int XOR_key_len;
 char *XOR_key;
 char *Keys, *Readbuf, *Rules, *ValidRules, *Peppers;
 int Rulesize;
+
+/* GPU rule engine — Layer 3 globals. Populated after rule load by the
+ * classify_rules + gpu_opencl_set_rules block. Sub-commit A populates
+ * these but does not yet route dispatch through them; B/C/D will. The
+ * host-side gpu_rule_program copy is retained so applyrule replay on
+ * GPU hits has the same bytecode the kernel saw. */
+unsigned char *gpu_rule_program = NULL;   /* packed bytecodes, NUL-separated */
+uint32_t      *gpu_rule_offsets = NULL;   /* byte offset of each rule */
+int           *gpu_rule_origin  = NULL;   /* maps gpu rule idx -> original Rules[] index;
+                                             -1 sentinel = synthetic `:` no-rule pass
+                                             (no corresponding Rules[] entry) */
+uint32_t       gpu_rule_program_len = 0;
+int            gpu_rule_count   = 0;      /* nonzero = engine active for this session;
+                                             includes the synthetic `:` rule, so this is
+                                             rl.ngpu+1 not rl.ngpu */
+unsigned char *gpu_rule_membership = NULL;  /* membership[i]==1 if rule i is GPU-eligible.
+                                              Indexed by original Rules[] order (0..Numrules-1).
+                                              Synthetic `:` does NOT appear here (no Rules[] entry).
+                                              NULL when rules_engine is inactive. */
+int            gpu_legacy_slot_unused = 0;  /* 1 = rl.ncpu == 0 + rules engine active. The legacy
+                                              jobg slot (my_jobg) is never used in the chokepoint
+                                              for this session — both CPU rule expansions (none)
+                                              and the no-rule pass (handled by synthetic `:` on
+                                              the GPU) are absent. Allows slot allocations to use
+                                              the smaller GPUBATCH_RULES_*_SIZE buffers instead of
+                                              the 128 MB / 256 MB legacy sizes. */
+int            gpu_rules_engine_active = 0; /* 1 = rules-engine kernel path is wired (per-device
+                                              rule program uploaded). Covers both Numrules > 0
+                                              (real rule program + synthetic ":" no-rule pass)
+                                              and Numrules == 0 (synthetic ":"-only program for
+                                              iter-only / unsalted-no-rules-no-mask workloads,
+                                              replacing the older slab path). The per-word gate
+                                              in procjob branches on this; when Numrules == 0
+                                              gpu_rule_membership is NULL. */
 struct LineInfo *Readindex;
 struct timespec starthash, current;
 
@@ -6725,7 +7535,63 @@ struct job *WorkHead, **WorkTail;
 lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;
 static lock *ReadBuf0, *ReadBuf1, *HashWaiting;
 static lock *ServerState;
-unsigned long long Tothash, Totfound, Totrules;
+/* Tothash and Totfound are accumulated from the GPU dispatch hot path
+ * (gpu/gpujob_opencl.c flushes thread-local hashcnt/found here every
+ * ~10M hashes — i.e. every other dispatch with a 100k-rule workload).
+ * On a 12-GPU rig that's ~1620 atomic adds/sec from the GPU side plus
+ * once-per-second checkpoint from each procjob worker. Atomics let us
+ * drop the FreeWaiting lock at every GPU site (was a 76-way contended
+ * mutex with the procjob pool); the procjob checkpoint keeps the lock
+ * because it also touches TotLines/Totrules. _Atomic compound-assign
+ * (Tothash += x) is well-defined per C11 — emits LOCK XADD on x86. */
+atomic_ullong Tothash;
+atomic_ullong Totfound;
+unsigned long long Totrules;
+/* GPU rule engine: simulated count of (word × rule) candidates the GPU
+ * kernel processed. The kernel doesn't feed back per-lane counts (would
+ * serialize on an atomic), so we increment by g->packed_count * gpu_rule_count
+ * once per dispatch in the worker (gpu/gpujob_opencl.c). Atomic because
+ * the worker thread writes while ReportStats / final print read. */
+atomic_ullong Totrules_gpu = 0;
+
+/* Phase 1.4: BF adaptive chunk-sizing servo state.
+ *
+ * Per-device dispatch feedback. After every BF chunk dispatch's clFinish,
+ * gpu/gpujob_opencl.c writes the wall_us and exact candidate count of the
+ * chunk to these atomics (one slot per active GPU device). The BF chunk
+ * producer in the main thread reads them before each new chunk to refresh
+ * its rate-EMA estimate; chunks_produced ramps target_seconds 1s -> 5s
+ * over the first 10 chunks. Both arrays are sized BF_MAX_GPU_SLOTS (=64,
+ * matches MAX_GPU_SLOTS local to gpujob_opencl.c). atomic_store_explicit
+ * with memory_order_relaxed is sufficient — producer doesn't need
+ * happens-before, just a recent enough sample.
+ *
+ * rate_ema is single-producer (main thread BF activation loop only), so
+ * a plain uint64 is fine; chunks_produced likewise. Reset to initial
+ * values at the start of each BF op so the servo restarts per op rather
+ * than carrying state across ops with potentially different rates. */
+#define BF_MAX_GPU_SLOTS 64
+_Atomic uint64_t bf_dev_wall_us[BF_MAX_GPU_SLOTS];
+_Atomic uint64_t bf_dev_chunk_total[BF_MAX_GPU_SLOTS];
+static uint64_t bf_rate_ema = 1000000000ull;   /* initial 1 GH/s seed */
+static uint32_t bf_chunks_produced = 0;
+/* Phase 1.4b: producer-side bootstrap wait flag. Cleared at op start, set
+ * once after the producer has observed the first device feedback. Until
+ * then, after submitting chunk 0 the producer blocks at the top of
+ * adaptive_bf_chunk_size until any device posts a non-zero wall_us; this
+ * lets the EMA see real feedback before sizing chunk 1. After the flag
+ * is set, every subsequent call races ahead with no wait. */
+static _Atomic int bf_first_feedback_seen = 0;
+/* Phase 1.7c (2026-05-09): per-slot first-dispatch flag. The very first BF
+ * dispatch on a given slot's queue includes per-op template JIT inside
+ * gpu_opencl_dispatch_md5_rules -> gpu_template_resolve_kernel
+ * (gpu/gpu_opencl.c ~11019), which can take ~12 s with no kernel cache.
+ * That JIT-contaminated wall_us would poison both the bootstrap-wait
+ * (seeing a wildly slow rate) and the rate-EMA (anchoring at JIT speed
+ * for several chunks). gpujob_opencl.c skips the atomic_store on the
+ * first dispatch per slot and only stores wall_us on subsequent (clean)
+ * dispatches. Cleared at op start alongside other servo state. */
+_Atomic int bf_dev_first_dispatch_done[BF_MAX_GPU_SLOTS];
 /* ETA progress tracking for ReportStats */
 static unsigned long long EstimatedTotalLines = 0;  /* from -W <count> */
 static volatile unsigned long long AutoCountTotalLines = 0;  /* from -W auto */
@@ -6744,8 +7610,28 @@ atomic_ullong *Totalfound[JOB_DONE], *RuleCnt;
 /* SIGUSR1 pauses, SIGUSR2 resumes (Unix); named events (Windows) */
 volatile int MDXpause = 0;
 volatile int MDXpaused_count = 0;
-volatile unsigned int MDXlowest_line = 0xFFFFFFFF;
+/* atomic_ullong: x86-64 + ARM64 emit plain mov/ldr/str (8-byte aligned single-instruction
+ * atomic). 32-bit targets emit LOCK CMPXCHG8B (i386) or LDREXD/STREXD (ARMv7), preserving
+ * tear-free semantics. Read/written via atomic_load_explicit / atomic_store_explicit with
+ * memory_order_relaxed (no cross-thread happens-before required — this is just a sloppy
+ * minimum). Sentinel ULLONG_MAX = "no thread has reported a position yet". */
+atomic_ullong MDXlowest_line = ULLONG_MAX;
 volatile char *MDXlowest_file = NULL;
+
+/* Live byte-position tracking for the current wordlist — used by the main
+ * read loop to project total line count when the cached estimate proves wrong
+ * (cache-poison from an early-bailed linecount_file in a prior session).
+ *
+ * CurfileBytesTotal: file size from stat at wordlist open.
+ * CurfileBytesRead:  decompressed bytes consumed so far (gz-decoded for
+ *                    .gz files, raw read() bytes for plain text and the
+ *                    library-decoded paths in cacheline()).
+ *
+ * Projection: when Fileline overshoots AutoCountTotalLines, the new estimate
+ * is `Fileline * CurfileBytesTotal / CurfileBytesRead` — a self-correcting
+ * extrapolation that converges to the true line count as we approach EOF. */
+atomic_ullong CurfileBytesTotal = 0;
+atomic_ullong CurfileBytesRead  = 0;
 #ifdef GPU_ENABLED
 static void sig_gpu_exit(int sig) { (void)sig; _exit(1); }
 #endif
@@ -6791,7 +7677,7 @@ static void compact_resize(void) {
     uint32_t new_overflow = 0;
     Pvoid_t new_ovh = NULL;
 
-    fprintf(stderr, "Compact hash table: growing from %llu to %llu slots\n",
+    tsfprintf(stderr, "Compact hash table: growing from %llu to %llu slots\n",
            (unsigned long long)old_size, (unsigned long long)new_size);
 
     new_fp = calloc(new_size, sizeof(uint32_t));
@@ -8559,384 +9445,669 @@ static inline void lm_des_key(const unsigned char *raw7, DES_key_schedule *ks)
 
 #ifdef GPU_ENABLED
 
-int gpu_try_pack_unsalted(struct jobg **pjobg, struct job *job, int appendlen, int prependlen, char *pass, int len)
-{
-    struct jobg *g = *pjobg;
-    int is_sha512 = (job->op == JOB_SHA512 || job->op == JOB_SHA384 ||
-                     job->op == JOB_SHA512RAW || job->op == JOB_SHA384RAW);
-    int is_utf16 = (job->op == JOB_NTLMH);
-    int is_md6 = (job->op == JOB_MD6256);
-    int keccak_rate = 0;  /* 0 = not keccak/sha3 */
-    int stride, maxcount, maxpasslen;
+/* B9 (2026-05-07): gpu_try_pack_unsalted() retired. Sole caller was the
+ * legacy mask short-circuit at procjob() (formerly ~line 10911-10951),
+ * also retired in this same commit. Function packed pre-padded slab
+ * batches for the 11 unsalted slab kernels (also retired). RCS history
+ * retains the prior implementation (mdxfind.c rev 1.420). */
 
-    switch (job->op) {
-    case JOB_MD5: case JOB_MD4: case JOB_SHA1:
-    case JOB_SHA224: case JOB_SHA256: case JOB_SHA256RAW:
-    case JOB_WRL: case JOB_NTLMH:
-    case JOB_SQL5: case JOB_SHA1RAW: case JOB_MD5RAW:
-    case JOB_MYSQL3:
-    case JOB_STREEBOG_32: case JOB_STREEBOG_64:
-    case JOB_RMD160:
-    case JOB_BLAKE2S256:
-       stride = 64; maxcount = 4096; maxpasslen = 55; break;
-    case JOB_SHA384RAW: case JOB_SHA512RAW:
-       stride = 128; maxcount = 2048; maxpasslen = 111; break;
-    case JOB_SHA384: case JOB_SHA512:
-       stride = 128; maxcount = 2048; maxpasslen = 111; break;
-    case JOB_MD6256:
-       stride = 712; maxcount = 359; maxpasslen = 511; break;
-    case JOB_KECCAK224: case JOB_SHA3_224:
-       keccak_rate = 144; stride = 152; maxcount = 1724; maxpasslen = 143; break;
-    case JOB_KECCAK256: case JOB_SHA3_256:
-       keccak_rate = 136; stride = 144; maxcount = 1820; maxpasslen = 135; break;
-    case JOB_KECCAK384: case JOB_SHA3_384:
-       keccak_rate = 104; stride = 112; maxcount = 2340; maxpasslen = 103; break;
-    case JOB_KECCAK512: case JOB_SHA3_512:
-       keccak_rate = 72; stride = 80; maxcount = 3276; maxpasslen = 71; break;
-    default:
-       return(0);
-    }
+/* BF Phase 3 (2026-05-10): gpujob_submit_bf, bf_min_time_threshold_s, and
+ * bf_partition_setup retired. The multi-GPU atomic-cursor BF partition
+ * design has been superseded by the chunk-as-job producer below — each
+ * BF chunk is a self-describing rules-engine job that any GPU worker can
+ * dequeue, so per-device pre-partitioning is no longer needed. The
+ * end-of-job flush at the bottom of procjob now uses plain gpujob_submit
+ * (procjob outer loop never produces BF mask data on the slab path
+ * post-Phase-2; gpujob_submit_bf had nothing to fan out). RCS history
+ * retains the prior implementations (mdxfind.c rev 1.449). See
+ * project_bf_chunk_as_job.md Phase 3. */
 
-    if (is_utf16) {
-        if (2 * (prependlen + len + appendlen) > maxpasslen) return 0;
-    } else {
-        if ((prependlen + len + appendlen) > maxpasslen) return 0;
-    }
-
-    if (!g) {
-	g = gpujob_try_get_free();
-	if (!g) return 0;  /* GPU busy, fall through to CPU */
-        g->op = job->op;
-        g->filename = job->filename;
-        g->flags = job->flags;
-        g->doneprint = job->doneprint;
-        g->line_num = job->startline;
-	g->count = 0;
-        *pjobg = g;
-    }
-    /* Set per-op invariants on every entry, not just first allocation.
-     * Pre-allocated buffers (mdxfind.c:9402-9412 blocking-acquire and
-     * 9438 brute-force dup) skip the !g branch but still need correct
-     * stride for the current hash type. Idempotent: stride and maxcount
-     * are deterministic functions of job->op. */
-    g->word_stride = stride;
-    g->max_count = maxcount;
-
-    int idx = g->count;
-    char *slot = g->raw + (idx * g->word_stride);
-    /* Zero the slot — SIMD for aligned 64-byte chunks, memset for remainder */
-    { int zlen = stride;
-#ifdef INTEL
-      union HashU *h = (union HashU *)slot;
-      while (zlen >= 64) {
-        h->x[0] = _mm_setzero_si128(); h->x[1] = _mm_setzero_si128();
-        h->x[2] = _mm_setzero_si128(); h->x[3] = _mm_setzero_si128();
-        h++; zlen -= 64;
-      }
-      if (zlen > 0) memset(h, 0, zlen);
-#elif ARM > 6
-      union HashU *h = (union HashU *)slot;
-      while (zlen >= 64) {
-        h->x[0] = vdupq_n_u32(0); h->x[1] = vdupq_n_u32(0);
-        h->x[2] = vdupq_n_u32(0); h->x[3] = vdupq_n_u32(0);
-        h++; zlen -= 64;
-      }
-      if (zlen > 0) memset(h, 0, zlen);
-#else
-      memset(slot, 0, stride);
-#endif
-    }
-
-    int total;
-    if (keccak_rate) {
-        /* Keccak/SHA-3: sponge padding into rate-sized block.
-         * Pad byte: 0x01 for Keccak, 0x06 for SHA-3. LE byte order (no swap). */
-        int pad_byte = (job->op >= JOB_SHA3_224 && job->op <= JOB_SHA3_512) ? 0x06 : 0x01;
-        memcpy(slot + prependlen, pass, len);
-        total = prependlen + len + appendlen;
-        slot[total] |= pad_byte;
-        slot[keccak_rate - 1] |= (char)0x80;
-        /* Store total_len as uint16 at byte offset rate for kernel mask append */
-        slot[keccak_rate] = total & 0xff;
-        slot[keccak_rate + 1] = (total >> 8) & 0xff;
-    } else if (is_md6) {
-        /* MD6-256: pack full N[89] array.
-         * Q[15] constants + K[8]=0 + U[1] + V[1] + B[64] with message as LE bytes.
-         * Kernel byte-swaps B portion before compression. */
-        static const uint64_t MD6_Q[15] = {
-            0x7311c2812425cfa0ULL, 0x6432286434aac8e7ULL, 0xb60450e9ef68b7c1ULL,
-            0xe8fb23908d9f06f1ULL, 0xdd2e76cba691e5bfULL, 0x0cd0d63b2c30bc41ULL,
-            0x1f8ccf6823058f8aULL, 0x54e5ed5b88e3775dULL, 0x4ad12aae0a6d6031ULL,
-            0x3e7f16bb88222e0dULL, 0x8af8671d3fb50c2cULL, 0x995ad1178bd25c31ULL,
-            0xc878c1dd04c4b633ULL, 0x3b72066c7a1552acULL, 0x0d6f3522631effcbULL
-        };
-        uint64_t *N = (uint64_t *)slot;
-        /* N[0..14] = Q */
-        memcpy(N, MD6_Q, 15 * sizeof(uint64_t));
-        /* N[15..22] = K = 0 (already zeroed) */
-        /* N[23] = U = nodeID(ell=1, i=0) */
-        N[23] = (uint64_t)1 << 56;
-        /* N[24] = V = control_word(r=104, L=64, z=1, p=pad_bits, keylen=0, d=256) */
-        total = prependlen + len + appendlen;
-        int p_bits = 64 * 64 - total * 8;
-        N[24] = ((uint64_t)104 << 48) | ((uint64_t)64 << 40) | ((uint64_t)1 << 36) |
-                ((uint64_t)p_bits << 20) | (uint64_t)256;
-        /* N[25..88] = B: place password at byte offset prependlen within B.
-         * B starts at slot byte offset 25*8 = 200. LE byte order — kernel bswaps. */
-        memcpy(slot + 200 + prependlen, pass, len);
-    } else if (is_utf16) {
-        int off = 2 * prependlen;
-        for (int i = 0; i < len; i++) {
-            slot[off + 2*i] = pass[i];
-        }
-        total = 2 * (prependlen + len + appendlen);
-        slot[total] = (char)0x80;
-        ((uint32_t *)slot)[14] = total * 8;
-    } else {
-        memcpy(slot + prependlen, pass, len);
-        total = prependlen + len + appendlen;
-        slot[total] = (char)0x80;
-        if (is_sha512) {
-            ((uint32_t *)slot)[30] = total * 8;
-        } else {
-            ((uint32_t *)slot)[14] = total * 8;
-        }
-    }
-
-    if (idx < GPUBATCH_RULE_MAX) {
-        g->passoff[idx] = idx * g->word_stride;
-        g->passlen[idx] = len;
-        g->clen[idx] = len;
-        g->ruleindex[idx] = job->Ruleindex;
-        g->hexlen[idx] = total;
-    }
-
-gpu_pack_done:
-    g->count++;
-
-    if (g->count >= maxcount) {
-        gpujob_submit(g);
-        *pjobg = NULL;
-    }
-    return 1;
-}
-
-/*
- * gpujob_submit_bf — Submit a packed jobg with multi-GPU brute-force fan-out.
- *
- * For non-BF jobs or single-GPU OpenCL, equivalent to a plain gpujob_submit().
- * For brute-force mask jobs on multi-GPU OpenCL, submits N identical packed
- * batches (one per device) so all GPUs work in parallel via atomic mask
- * cursor. The duplicated buffers are byte-for-byte copies of the source
- * packed_buf and word_offset arrays — replication uses the chokepoint's
- * packed format, NOT the slab format that the now-deleted pre-scan used.
- *
- * On exit, *pjobg == NULL.
- */
-static void gpujob_submit_bf(struct jobg **pjobg, struct job *job)
-{
-    struct jobg *g = *pjobg;
-    if (!g) return;
-    int bf_copies = 1;
 #if defined(OPENCL_GPU)
-    if (job->flags & JOBFLAG_BRUTEFORCE) {
-        extern int gpu_opencl_num_devices(void);
-        bf_copies = gpu_opencl_num_devices();
-        if (bf_copies < 1) bf_copies = 1;
+extern int gpu_op_family(int op);
+
+/*
+ * bf_chunk_geometry — given a target chunk_total (in candidates), pick
+ * (num_words, mask_size_per_word) such that:
+ *   chunk_total = num_words * mask_size_per_word  (adjusted upward as needed)
+ *   num_words <= GPU_RULES_MAX_WORDS_PER_BATCH
+ *
+ * Private helper, called by adaptive_bf_chunk_size. Mirrors the geometry
+ * resolution from the static compute_bf_chunk_size that this replaced —
+ * the only callable difference is that the rate-EMA servo lives in the
+ * caller. Mask-fold semantics for small keyspaces are preserved (Tranche 3
+ * lesson 4): when chunk_total < 1<<17, mspw == chunk_total with nwords=1
+ * so the kernel doesn't fold mask values back into already-tested space.
+ *
+ * On entry chunk_total may be any value; on exit it has been adjusted up
+ * to nwords*mspw (the kernel covers exactly that many candidates).
+ */
+static void bf_chunk_geometry(uint64_t *chunk_total_io,
+                              uint32_t *out_num_words,
+                              uint32_t *out_mask_size_per_word)
+{
+    uint64_t chunk_total = *chunk_total_io;
+
+    /* Pick mask_size_per_word: prefer power-of-2 around 128K-1M for clean
+     * divmod in the kernel. Start at 128K; scale up if num_words would
+     * exceed the rules-engine batch cap. For small keyspaces (chunk_total
+     * < 128K), we DON'T want mspw=128K — that would make the kernel iterate
+     * past chunk_total with no host-side bound, producing duplicate hits
+     * (mask_idx wraps via the kernel's append_idx % append_combos to test
+     * the same plaintext repeatedly, which trips dedup). For chunk_total
+     * < default mspw, shrink mspw to match (single-word chunk fully covers
+     * the keyspace; kernel runs exactly chunk_total lanes). */
+    uint32_t mspw;
+    if (chunk_total < (1ULL << 17)) {
+        mspw = (uint32_t)chunk_total;
+        if (mspw == 0u) mspw = 1u;
+    } else {
+        mspw = 1u << 17;     /* 128K default for medium+ keyspaces */
     }
-#endif
-    /* Allocate and populate dup buffers from g BEFORE submitting g
-     * (after submit, g is owned by the worker queue and may be recycled). */
-    enum { MAX_BF_DUPS = 16 };
-    struct jobg *dups[MAX_BF_DUPS];
-    int ndups = bf_copies - 1;
-    if (ndups > MAX_BF_DUPS) ndups = MAX_BF_DUPS;
-    for (int bfc = 0; bfc < ndups; bfc++) {
-        struct jobg *dup = gpujob_get_free(job->filename, job->startline);
-        if (!dup) { ndups = bfc; break; }
-        if (!dup->packed_buf) {
-            dup->packed_buf  = (char *)malloc_lock(GPUBATCH_PACKED_SIZE,
-                                                   "packed_buf");
-            dup->word_offset = (uint32_t *)malloc_lock(
-                                  (GPUBATCH_PACKED_SIZE / 2) * sizeof(uint32_t),
-                                  "word_offset");
+    uint32_t nwords;
+    while (1) {
+        uint64_t nw_u64 = (chunk_total + (uint64_t)mspw - 1) / (uint64_t)mspw;
+        if (nw_u64 <= (uint64_t)GPU_RULES_MAX_WORDS_PER_BATCH) {
+            nwords = (uint32_t)nw_u64;
+            break;
         }
-        dup->op           = job->op;
-        dup->filename     = job->filename;
-        dup->flags        = job->flags;
-        dup->doneprint    = job->doneprint;
-        dup->line_num     = job->startline;
-        dup->packed       = 1;
-        dup->packed_count = g->packed_count;
-        dup->packed_pos   = g->packed_pos;
-        dup->count        = 0;
-        memcpy(dup->packed_buf, g->packed_buf, g->packed_pos);
-        memcpy(dup->word_offset, g->word_offset,
-               g->packed_count * sizeof(uint32_t));
-        dups[bfc] = dup;
+        /* Too many words — double mspw and retry. Cap at 2^28 (256M) to
+         * keep kernel inner-loop bounded; at that point we'd need >16K
+         * num_words so chunk_total must be > 4 TiW, exceeding the 2^31
+         * Q1 cap; defensive trim. */
+        if (mspw >= (1u << 28)) {
+            chunk_total = (uint64_t)mspw * (uint64_t)GPU_RULES_MAX_WORDS_PER_BATCH;
+            nwords = GPU_RULES_MAX_WORDS_PER_BATCH;
+            break;
+        }
+        mspw <<= 1;
     }
-    gpujob_submit(g);
-    *pjobg = NULL;
-    for (int bfc = 0; bfc < ndups; bfc++)
-        gpujob_submit(dups[bfc]);
+
+    /* Adjust chunk_total upward to exact nwords * mspw geometry. */
+    chunk_total = (uint64_t)nwords * (uint64_t)mspw;
+
+    *chunk_total_io         = chunk_total;
+    *out_num_words          = nwords;
+    *out_mask_size_per_word = mspw;
+}
+
+/* ============================================================
+ * BF Phase 1.6 (2026-05-09): per-(device, op) rate_ema sidecar
+ * persistence.
+ *
+ * Path: ~/.mdxfind/dynsize/<dev_uuid>/bf_<opname_lower>.txt
+ *   <dev_uuid>: from gpu_opencl_dev_uuid() — same FNV-1a 64-bit
+ *               digest the dynsize prototype uses.
+ *   <opname>:   lowercase Types[op] (e.g. "md5", "sha1", "md5salt").
+ *
+ * Format (text, key=value, one per line):
+ *   schema_version=1
+ *   rate_ema=5680000000
+ *   written_unix=1778440000
+ *
+ * Read at op-start: take MIN across all device sidecars present
+ * (conservative seed; under-seed grows fast via EMA, over-seed risks
+ * oversize first chunks and big retry penalties).
+ *
+ * Write at op-end (chunk-producer-loop completion): only when
+ * bf_chunks_produced > BF_SIDECAR_MIN_CHUNKS (=20) — enough to have
+ * converged. Atomic write via .tmp + rename.
+ *
+ * Sanity bounds: [1e8, 1e11] hashes/sec (100 MH/s .. 100 GH/s).
+ * Anything outside is treated as corrupt and ignored.
+ * ============================================================ */
+
+#define BF_SIDECAR_SCHEMA_VERSION 1
+/* MIN_CHUNKS: producer-iteration count required before persisting. Each
+ * iteration of adaptive_bf_chunk_size increments bf_chunks_produced;
+ * after the bootstrap wait (chunk 0) the EMA(alpha=0.7) sees per-device
+ * feedback on every subsequent call. By chunk 5 the EMA has integrated
+ * 4-5 real samples (each weighted ~0.7^k), which is enough convergence
+ * to be a useful next-run seed. Lower thresholds (e.g. 2) would persist
+ * a still-warming-up value; higher (e.g. 20) miss short BF runs entirely
+ * (10-digit MD5 BF on a 1080 = 6 chunks total). 5 is the practical floor. */
+#define BF_SIDECAR_MIN_CHUNKS    5u
+#define BF_SIDECAR_RATE_MIN      ((uint64_t)100000000ull)        /* 100 MH/s */
+#define BF_SIDECAR_RATE_MAX      ((uint64_t)100000000000ull)     /* 100 GH/s */
+
+/* Best-effort recursive mkdir. Returns 0 on success / already-exists.
+ * Mirrors the dynsize_mkdir_p helper in gpu_opencl.c. Windows mkdir takes
+ * one argument (no mode); wrap so the same call works on both platforms. */
+#ifdef _WIN32
+#define BF_MKDIR(path) (void)mkdir(path)
+#else
+#define BF_MKDIR(path) (void)mkdir((path), 0755)
+#endif
+static int bf_sidecar_mkdir_p(const char *path) {
+    char buf[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(buf)) return -1;
+    memcpy(buf, path, n + 1);
+    for (size_t i = 1; i < n; i++) {
+        if (buf[i] == '/') {
+            buf[i] = '\0';
+            BF_MKDIR(buf);
+            buf[i] = '/';
+        }
+    }
+    BF_MKDIR(buf);
+    return 0;
+}
+
+/* Compose sidecar path. Writes to out (cap bytes); returns 0 on success,
+ * -1 on HOME-missing or path-too-long. dev_idx selects the GPU device
+ * (UUID derivation); op selects the algorithm (Types[op] -> lowercase).
+ * Mirrors dynsize_cache_path naming convention. */
+static int bf_sidecar_path(int dev_idx, int op, char *out, size_t cap) {
+    if (!out || cap < 32) return -1;
+    const char *home = getenv("HOME");
+    if (!home || !*home) return -1;
+    char uuid[32];
+    gpu_opencl_dev_uuid(dev_idx, uuid, sizeof(uuid));
+    if (uuid[0] == 0) return -1;
+    /* Build lowercase op name. Types[] indexed by op (small, well-bounded;
+     * fits in 32 chars for all 200+ entries). */
+    extern char *Types[];
+    const char *opname = Types[op];
+    if (!opname) return -1;
+    char opname_lc[40];
+    size_t i = 0;
+    for (; opname[i] && i < sizeof(opname_lc) - 1; i++) {
+        char c = opname[i];
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+        /* Replace any path-unfriendly char (e.g. '/' in 'GOST-CRYPTO' has '-')
+         * with '_'. Only '-' and '/' realistically appear in Types[]. */
+        if (c == '/' || c == '\\') c = '_';
+        opname_lc[i] = c;
+    }
+    opname_lc[i] = 0;
+    int n = snprintf(out, cap, "%s/.mdxfind/dynsize/%s/bf_%s.txt",
+                     home, uuid, opname_lc);
+    return (n > 0 && (size_t)n < cap) ? 0 : -1;
+}
+
+/* Read a sidecar file's rate_ema. Returns 0 on success, -1 on any failure
+ * (file missing, parse error, out-of-bounds value). On success, *out_rate
+ * is the persisted rate in hashes/sec. */
+static int bf_sidecar_read_rate(const char *path, uint64_t *out_rate) {
+    if (!path || !out_rate) return -1;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[256];
+    uint64_t rate = 0;
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long uval = 0;
+        char key[64];
+        if (sscanf(line, " %63[^=]= %llu", key, &uval) == 2) {
+            if (!strcmp(key, "rate_ema")) {
+                rate = (uint64_t)uval;
+                found = 1;
+            }
+        }
+    }
+    fclose(fp);
+    if (!found) return -1;
+    if (rate < BF_SIDECAR_RATE_MIN || rate > BF_SIDECAR_RATE_MAX) return -1;
+    *out_rate = rate;
+    return 0;
+}
+
+/* Write a sidecar file with the given rate_ema. Atomic via .tmp + rename;
+ * creates parent dir if needed. Best-effort: failures logged once and
+ * ignored. Returns 0 on success, -1 on failure. */
+static int bf_sidecar_write_rate(const char *path, uint64_t rate) {
+    if (!path) return -1;
+    if (rate < BF_SIDECAR_RATE_MIN || rate > BF_SIDECAR_RATE_MAX) return -1;
+    /* Ensure parent dir tree exists. */
+    char dirbuf[1024];
+    size_t plen = strlen(path);
+    size_t i = plen;
+    while (i > 0 && path[i-1] != '/') i--;
+    if (i == 0) return -1;
+    if (i >= sizeof(dirbuf)) return -1;
+    memcpy(dirbuf, path, i - 1);
+    dirbuf[i - 1] = '\0';
+    bf_sidecar_mkdir_p(dirbuf);
+    /* Atomic write: tmp + rename. */
+    char tmp[1100];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) return -1;
+    FILE *fp = fopen(tmp, "w");
+    if (!fp) return -1;
+    fprintf(fp,
+        "schema_version=%d\n"
+        "rate_ema=%llu\n"
+        "written_unix=%lld\n",
+        BF_SIDECAR_SCHEMA_VERSION,
+        (unsigned long long)rate,
+        (long long)time(NULL));
+    fclose(fp);
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
 }
 
 /*
- * gpu_try_pack — Pack one word into a GPU batch (JOBG).
+ * adaptive_bf_chunk_size — Phase 1.4 rate-EMA servo for BF chunk sizing.
  *
- * For GPU_CAT_SALTED: packs hex(MD5(password)) for salted dispatch.
- * For GPU_CAT_ITER: packs hex(MD5(password)) for bare iteration dispatch.
+ * Replaces the static compute_bf_chunk_size with a feedback loop. Each
+ * dispatched chunk's wall_us and exact candidate count are written by
+ * gpu/gpujob_opencl.c into the bf_dev_wall_us[] / bf_dev_chunk_total[]
+ * atomics. The producer reads those before each new chunk to refresh
+ * its rate-EMA estimate. After warmup (10 chunks) the servo targets
+ * a 5-second wall on the slowest active device.
  *
- * Returns 1 if word was consumed by GPU (caller should skip CPU path).
- * Returns 0 if GPU not applicable (caller does CPU processing).
+ * Per-call algorithm:
+ *   1. Read bf_dev_wall_us[]/bf_dev_chunk_total[] for all BF_MAX_GPU_SLOTS
+ *      entries. Per-device sample is fresh iff wall_us > 0; per-device
+ *      rate = chunk_total_d / wall_us_d * 1e6 (hashes/sec).
+ *      Take rate = MIN over fresh devices (option iii, slow-device safety).
+ *      If no devices fresh yet (very first chunk), rate = current rate_ema.
+ *   2. EMA update: rate_ema = 0.7 * rate_ema + 0.3 * rate
+ *   3. target_seconds ramps 1.0 -> 5.0 over the first 10 chunks; flat 5.0
+ *      thereafter.
+ *   4. chunk_total = clamp(rate_ema * target_seconds, 2^28, 2^31)
+ *   5. chunk_total = min(chunk_total, mask_total - chunk_cursor)  (tail)
+ *   6. bf_chunk_geometry resolves (num_words, mask_size_per_word).
+ *   7. chunks_produced++; emit telemetry per N chunks (5 in warmup, 50
+ *      after) when MDXFIND_BF_ADAPTIVE_TRACE != "0" (default-on for the
+ *      Phase 1.4 shake-out).
  *
- * my_jobg is a per-thread pointer maintained across calls.
- * Submits the batch when full and sets *my_jobg = NULL.
+ * MDXFIND_BF_CHUNK_SIZE env override: when set, BYPASSES the servo and
+ * uses the env value as constant chunk_total (debug-only, transient).
+ *
+ * Caller MUST reset bf_chunks_produced=0 + bf_rate_ema=1e9 at op-start
+ * so the servo restarts per op (multi-op BF where families have different
+ * rates would otherwise carry stale rate from the previous op).
+ *
+ * Returns 0 on success, -1 on permanent failure (op has no GPU support).
  */
-static int gpu_try_pack(struct jobg **pjobg, struct job *job,
-                        union HashU *curin, int nsalts_job, int nonblock)
+static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
+                                  int num_devs, int op,
+                                  uint64_t *out_chunk_total,
+                                  uint32_t *out_num_words,
+                                  uint32_t *out_mask_size_per_word,
+                                  uint32_t *out_inner_iter)
 {
-    if (MDXpause) {
-      __sync_fetch_and_add(&MDXpaused_count, 1);
-      while (MDXpause) sleep(2);
-      __sync_fetch_and_sub(&MDXpaused_count, 1);
-    }
-    extern int GPUForce;
-    int cat = gpu_op_category(job->op);
-    if (cat == GPU_CAT_NONE) return 0;
-    if (!gpujob_available()) return 0;
-    if (Rotatehash || Printall) return 0;
+    if (!gpujob_available() || mask_total == 0) return -1;
+    if (gpu_op_category(op) == GPU_CAT_NONE) return -1;
 
-    /* Salted types need at least one salt for GPU dispatch */
-    if ((cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS) && nsalts_job < 1) return 0;
+    /* Floor / cap. Min 256M for queue responsiveness, max 2^31 NDRange —
+     * empirically the limit on at least one OpenCL driver (AMD gfx1201/RDNA4
+     * rejects NDRange global dimension > 2^31 with CL_INVALID_GLOBAL_WORK_SIZE,
+     * confirmed on ioblade 2026-05-10 during Phase 1.7 cap-raise attempt
+     * to 2^33).
+     *
+     * BF Phase 1.8 (2026-05-10): split CHUNK_HARD into two ceilings —
+     *   NDRANGE_HARD = 2^31 — the AMD-portable NDRange global ceiling.
+     *   CHUNK_HARD   = 2^35 — the LOGICAL chunk ceiling, unlocked by the
+     *                  kernel inner_iter loop (each lane processes up to
+     *                  inner_iter mask values; inner_iter <= 16 so
+     *                  logical = NDRange * inner_iter <= 2^35).
+     *
+     * Phase 1.8 REVERTED 2026-05-11: kernel for-loop wrap removed (gpu_template.cl
+     * rev 1.16). The runtime-bounded for-loop caused 2.19× Pascal regression
+     * (NVCC register-pressure spike on inner_iter=1 codegen). Host-side servo
+     * machinery for inner_iter is retained as dead-but-harmless code; kernel
+     * ignores params.inner_iter now. To prevent the servo from picking
+     * inner_iter > 1 (which the kernel cannot honor and which causes ~1000×
+     * rate collapse via NDRange/chunk_total misalignment), CHUNK_HARD is now
+     * reduced to NDRANGE_HARD. The unsalted Step 4.6 branch never fires; the
+     * salted branch already forced inner_iter=1. */
+    const uint64_t CHUNK_MIN    = (uint64_t)1 << 28;          /*  256M */
+    const uint64_t NDRANGE_HARD = (uint64_t)1 << 31;          /*  2 GiW NDRange ceiling */
+    const uint64_t CHUNK_HARD   = (uint64_t)1 << 31;          /*  Phase 1.8 REVERTED — was 2^35; collapsed to NDRANGE_HARD */
+    const uint32_t INNER_ITER_CAP = 16u;                      /*  per project_bf_chunk_as_job.md */
 
-    /* Salt+password types: password must fit in GPU limit */
-    if (cat == GPU_CAT_SALTPASS && job->clen > GPU_MAX_PASSLEN) return 0;
-
-    /* Iteration types need Maxiter > 1 to benefit from GPU */
-    if (cat == GPU_CAT_ITER && Maxiter <= 1) return 0;
-
-    /* GPU kernels without iteration support: fall back to CPU when -i > 1.
-     * Exclude types with GPU iteration support. */
-    if (Maxiter > 1 && (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED ||
-                        cat == GPU_CAT_SALTPASS || cat == GPU_CAT_SALTED)) {
-        switch (job->op) {
-        case JOB_MD5: case JOB_SHA1: case JOB_SHA256: case JOB_SHA224:
-        case JOB_MD4: case JOB_MD4UTF16: case JOB_SHA512: case JOB_SHA384:
-        case JOB_MD5RAW: case JOB_SHA1RAW: case JOB_SHA256RAW:
-        case JOB_SHA384RAW: case JOB_SHA512RAW:
-        case JOB_RMD160: case JOB_BLAKE2S256: case JOB_WRL: case JOB_MD6256:
-        case JOB_KECCAK224: case JOB_KECCAK256: case JOB_KECCAK384: case JOB_KECCAK512:
-        case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
-        case JOB_STREEBOG_32: case JOB_STREEBOG_64:
-            break;
-        default: return 0;
+    /* Env override: MDXFIND_BF_CHUNK_SIZE. Bypasses servo entirely.
+     * BF Phase 1.8: env value is interpreted as NDRange-bound (no inner iter)
+     * so the existing debug semantics are preserved. inner_iter forced to 1
+     * unless MDXFIND_BF_INNER_ITER is ALSO set (debug-only Phase 1.8 override). */
+    const char *env = getenv("MDXFIND_BF_CHUNK_SIZE");
+    if (env && *env) {
+        unsigned long long v = strtoull(env, NULL, 0);
+        if (v > 0 && v <= NDRANGE_HARD) {
+            uint64_t ct = (uint64_t)v;
+            if (ct > mask_total - chunk_cursor) ct = mask_total - chunk_cursor;
+            uint32_t env_inner = 1u;
+            const char *ie = getenv("MDXFIND_BF_INNER_ITER");
+            if (ie && *ie) {
+                int iv = atoi(ie);
+                if (iv >= 1 && iv <= (int)INNER_ITER_CAP)
+                    env_inner = (uint32_t)iv;
+            }
+            /* If env_inner > 1 we need ct to be a multiple of env_inner so
+             * the kernel geometry splits cleanly. Round DOWN. */
+            if (env_inner > 1u) {
+                ct = (ct / env_inner) * env_inner;
+                if (ct == 0) ct = env_inner;
+            }
+            bf_chunk_geometry(&ct, out_num_words, out_mask_size_per_word);
+            /* Mirror Step 6 mspw split for inner_iter > 1. */
+            if (env_inner > 1u) {
+                if ((*out_mask_size_per_word % env_inner) != 0u) {
+                    env_inner = 1u;
+                } else {
+                    *out_mask_size_per_word /= env_inner;
+                }
+            }
+            *out_chunk_total = ct;
+            *out_inner_iter = env_inner;
+            bf_chunks_produced++;
+            return 0;
         }
     }
 
-    /* Mask mode: need masks configured, password must fit.
-     * Exception: iteration-only (-i > 1, no -n) dispatches with num_masks=1. */
-    if (cat == GPU_CAT_MASK) {
-        extern uint64_t gpu_mask_total;
-        if (gpu_mask_total == 0 && Maxiter <= 1 && !GPUForce) return 0;
-        if (job->clen <= 0 || !job->pass) return 0;
+    /* Phase 1.4b: bootstrap wait. The producer's outer gate is FreeWaiting
+     * (CPU JOB-slot count); procjob short-circuits BF chunks in microseconds,
+     * so without this wait the producer races through every chunk before any
+     * GPU clFinish posts feedback. Block ONCE — after chunk 0 has been
+     * submitted but before sizing any subsequent chunk — until at least one
+     * device reports a non-zero wall. Subsequent calls skip past instantly. */
+    if (!atomic_load_explicit(&bf_first_feedback_seen, memory_order_relaxed) &&
+        bf_chunks_produced > 0) {
+        /* Phase 1.7c (2026-05-09): wait for ALL live devices to post
+         * feedback, not just the first. With a shared FIFO and 1:1
+         * device:slot mapping, fast devices win all races and slow
+         * devices starve until chunks grow. Original Phase 1.4b code
+         * broke as soon as ANY device posted, which left the rate-EMA
+         * anchored on the fastest device's first sample (asymmetric
+         * warmup). Combined with M3 (skip first JIT-contaminated
+         * dispatch), the EMA now bootstraps from clean post-JIT samples
+         * across all devices simultaneously. */
+        int num_live;
+#if defined(OPENCL_GPU)
+        num_live = gpu_opencl_num_devices();
+        if (num_live <= 0 || num_live > BF_MAX_GPU_SLOTS) num_live = 1;
+#else
+        num_live = 1;
+#endif
+        int waited_us = 0;
+        const int poll_interval_us = 5000;        /* 5 ms */
+        const int max_wait_us = 180 * 1000 * 1000; /* 180 s safety cap (raised
+                                                    * from 60 s in Phase 1.7d
+                                                    * 2026-05-10): cold-cache
+                                                    * NVIDIA template-kernel
+                                                    * JIT on ioblade Ampere/
+                                                    * Ada takes 60-64s, just
+                                                    * exceeding the prior cap;
+                                                    * 180 s covers Mali Rusticl
+                                                    * and AMD driver JIT
+                                                    * outliers too. Warm-cache
+                                                    * runs complete in <1 s
+                                                    * regardless. */
+        int seen = 0;
+        while (waited_us < max_wait_us) {
+            seen = 0;
+            for (int d = 0; d < BF_MAX_GPU_SLOTS; d++) {
+                if (atomic_load_explicit(&bf_dev_wall_us[d],
+                                         memory_order_relaxed) > 0) {
+                    seen++;
+                }
+            }
+            if (seen >= num_live) break;
+            usleep(poll_interval_us);
+            waited_us += poll_interval_us;
+        }
+        atomic_store_explicit(&bf_first_feedback_seen, 1,
+                              memory_order_relaxed);
+        if (seen < num_live) {
+            fprintf(stderr,
+                    "[bf-servo] bootstrap-wait timeout: seen=%d/%d devices "
+                    "reported in %d s; running with seed rate %.0f MH/s\n",
+                    seen, num_live, max_wait_us / 1000000,
+                    (double)bf_rate_ema / 1e6);
+        }
     }
 
-    struct jobg *g = *pjobg;
-    if (!g) {
-        if (nonblock) {
-            g = gpujob_try_get_free();
-            if (!g) return 0;  /* GPU busy, fall through to CPU */
+    /* Step 1: scan per-device feedback for a fresh rate sample. Take MIN
+     * across fresh devices for slow-device safety (option iii) — the
+     * slowest device's wall time bounds queue responsiveness. Producer is
+     * single-threaded; relaxed atomics are fine.
+     *
+     * Phase 1.7 (2026-05-10): scan picks MAX rate across fresh devices, not
+     * MIN. User design intent: chunks sized for fast devices; weak devices
+     * accept long single-chunk walls (5s on 4090 → 50s on 1080 → 500s on
+     * Mali). "Weak GPUs contribute at their own pace; users who don't want
+     * this exclude them via -G." Reframes heterogeneity from safety problem
+     * to throughput property — fewer dispatches on fast devices, less
+     * host-overhead-per-second. */
+    uint64_t observed_max = 0;
+    int fresh_devs = 0;
+    for (int d = 0; d < BF_MAX_GPU_SLOTS; d++) {
+        uint64_t w = atomic_load_explicit(&bf_dev_wall_us[d],
+                                          memory_order_relaxed);
+        uint64_t c = atomic_load_explicit(&bf_dev_chunk_total[d],
+                                          memory_order_relaxed);
+        if (w > 0 && c > 0) {
+            /* rate_d in hashes/sec = c / (w / 1e6) = c * 1e6 / w */
+            uint64_t rate_d = (uint64_t)((double)c * 1e6 / (double)w);
+            if (rate_d > 0) {
+                if (rate_d > observed_max)
+                    observed_max = rate_d;
+                fresh_devs++;
+            }
+        }
+    }
+
+    /* Step 2: EMA update. If no fresh sample yet (first chunk of run),
+     * keep current rate_ema (initial 1 GH/s seed). */
+    uint64_t rate_now = (fresh_devs > 0) ? observed_max : bf_rate_ema;
+    /* rate_ema = 0.7 * rate_ema + 0.3 * rate_now, integer math. */
+    bf_rate_ema = (uint64_t)((double)bf_rate_ema * 0.7 +
+                             (double)rate_now    * 0.3);
+    if (bf_rate_ema == 0) bf_rate_ema = 1; /* guard */
+
+    /* Step 3: target_seconds ramp. */
+    const uint32_t WARMUP_CHUNKS = 10;
+    double target_s;
+    if (bf_chunks_produced < WARMUP_CHUNKS) {
+        target_s = 1.0 + (5.0 - 1.0) *
+                   (double)bf_chunks_produced / (double)WARMUP_CHUNKS;
+    } else {
+        target_s = 5.0;
+    }
+
+    /* Step 4: candidate target. Ceiling is CHUNK_HARD (logical, 2^35) —
+     * inner_iter unlocks chunks larger than the 2^31 NDRange ceiling. */
+    double cands_d = (double)bf_rate_ema * target_s;
+    if (cands_d < (double)CHUNK_MIN) cands_d = (double)CHUNK_MIN;
+    if (cands_d > (double)CHUNK_HARD) cands_d = (double)CHUNK_HARD;
+    uint64_t chunk_total = (uint64_t)cands_d;
+
+    /* BF Phase 1.8 (2026-05-10): track salts_per_page early because both
+     * the salt cap (Step 4.5) AND the inner_iter derivation (Step 4.6)
+     * need it. Defaults to 1 for unsalted ops. */
+    uint32_t salts_per_page = 1u;
+
+    /* Step 4.5: Phase 2 salt-axis cap (2026-05-10). For salted ops the
+     * per-dispatch kernel lanes = num_words * n_rules * mask_size_per_word
+     * * salts_per_page = chunk_total * salts_per_page (n_rules=1 for BF).
+     * The NDRange ceiling is NDRANGE_HARD = 2^31 (AMD gfx1201 driver limit;
+     * see Phase 1.7 ABORT). So chunk_total <= NDRANGE_HARD / salts_per_page.
+     *
+     * BF Phase 1.8 (2026-05-10): salted path FORCES inner_iter = 1 per
+     * project_bf_chunk_as_job.md — combined_ridx encoding already saturates
+     * uint32 with the salt axis; adding iter_idx bits would overflow.
+     * Stretching to inner_iter > 1 for salted is deferred to Phase 1.8b.
+     *
+     * salts_per_page mirrors the dispatcher's derivation at gpu_opencl.c
+     * ~10316: default 1024, override via MDXFIND_SPP env or dynsize cache,
+     * range cap [1, 65536]. We use the default 1024 (or the env override if
+     * set) capped by Typesaltcnt[op]. Dynsize feedback isn't readable from
+     * the CPU producer cleanly — a conservative cap based on the static
+     * default is safe (the dispatcher's per-page split keeps things bounded
+     * even if dynsize later picks a smaller spp). Unsalted ops (Typesaltcnt
+     * == 0 or NULL) bypass — they fold to salts_per_page == 1, no cap. */
+    if (Typesaltcnt) {
+        int total_salts = Typesaltcnt[op];
+        if (total_salts > 0) {
+            uint32_t spp_default = 1024u;
+            const char *spp_env = getenv("MDXFIND_SPP");
+            if (spp_env && *spp_env) {
+                int v = atoi(spp_env);
+                if (v >= 1 && v <= 65536) spp_default = (uint32_t)v;
+            }
+            salts_per_page =
+                ((uint32_t)total_salts < spp_default)
+                ? (uint32_t)total_salts : spp_default;
+            if (salts_per_page > 1u) {
+                /* The salt cap is STRICT: NDRange global = chunk_total *
+                 * salts_per_page must fit in NDRANGE_HARD. The CHUNK_MIN
+                 * floor CANNOT override this — exceeding the AMD RDNA4
+                 * NDRange limit would produce CL_INVALID_GLOBAL_WORK_SIZE
+                 * (Phase 1.7 ABORT lesson). For 1024 salts, salt_capped =
+                 * 2 MW (well under the 256M CHUNK_MIN); accept smaller
+                 * chunks — the BF queue absorbs them. Floor at 1 to
+                 * guarantee forward progress on pathological salt counts.
+                 *
+                 * BF Phase 1.8: salted path is capped to NDRANGE_HARD (not
+                 * CHUNK_HARD) because inner_iter is forced to 1 for salted
+                 * (see Step 4.6); logical == NDRange when inner_iter==1. */
+                uint64_t salt_capped =
+                    NDRANGE_HARD / (uint64_t)salts_per_page;
+                if (salt_capped == 0) salt_capped = 1;
+                if (chunk_total > salt_capped) chunk_total = salt_capped;
+            }
+        }
+    }
+
+    /* Step 4.6: BF Phase 1.8 (2026-05-10) inner_iter derivation. Compute
+     * the inner_iter that lets chunk_total fit under NDRANGE_HARD given
+     * the salts_per_page contribution to the NDRange.
+     *   NDRange = (chunk_total / inner_iter) * salts_per_page
+     *           = chunk_total * salts_per_page / inner_iter
+     * Requirement: NDRange <= NDRANGE_HARD.
+     *   inner_iter >= chunk_total * salts_per_page / NDRANGE_HARD
+     *
+     * Salted path: force inner_iter = 1 (combined_ridx encoding limit;
+     * see comment above Step 4.5). Salted is Phase 1.8b territory.
+     *
+     * Round chunk_total DOWN to a clean multiple of inner_iter so the
+     * kernel's iter_idx loop has uniform length across all (word, rule)
+     * lanes (avoids tail-bookkeeping in the kernel). */
+    uint32_t inner_iter = 1u;
+    if (salts_per_page > 1u) {
+        /* Salted: phase 1.8 unsalted-only. Emit a WARNING when salted BF
+         * would benefit from inner_iter > 1 so Phase 1.8b prioritization
+         * has visibility data. The product chunk_total * salts_per_page
+         * already fits NDRANGE_HARD (Step 4.5 enforced it). */
+        static int _salted_warning_emitted = 0;
+        uint64_t would_benefit =
+            (uint64_t)bf_rate_ema * (uint64_t)target_s *
+            (uint64_t)salts_per_page;
+        if (!_salted_warning_emitted && would_benefit > NDRANGE_HARD) {
+            fprintf(stderr,
+                "[bf-servo] WARNING: salted BF op=%d salts_per_page=%u "
+                "target_cands ~%llu exceeds NDRANGE_HARD; inner_iter "
+                "forced to 1 (Phase 1.8 unsalted-only guard). Phase 1.8b "
+                "deferred — see project_bf_chunk_as_job.md.\n",
+                op, salts_per_page,
+                (unsigned long long)would_benefit);
+            _salted_warning_emitted = 1;
+        }
+        inner_iter = 1u;
+    } else {
+        /* Unsalted: pick inner_iter so NDRange <= NDRANGE_HARD. */
+        uint64_t ndrange = chunk_total;  /* salts_per_page == 1 */
+        if (ndrange > NDRANGE_HARD) {
+            /* ceil(ndrange / NDRANGE_HARD) */
+            uint64_t needed = (ndrange + NDRANGE_HARD - 1) / NDRANGE_HARD;
+            if (needed > (uint64_t)INNER_ITER_CAP) needed = INNER_ITER_CAP;
+            inner_iter = (uint32_t)needed;
+            /* Round chunk_total DOWN to a clean multiple of inner_iter so
+             * the kernel's iter_idx loop covers uniform mask ranges. */
+            chunk_total = (chunk_total / inner_iter) * inner_iter;
+            if (chunk_total == 0u) chunk_total = inner_iter;
+        }
+    }
+
+    /* Step 5: tail clamp. */
+    uint64_t remain = mask_total - chunk_cursor;
+    if (chunk_total > remain) {
+        chunk_total = remain;
+        /* Tail chunk: a non-multiple of inner_iter would leave kernel
+         * lanes processing partial ranges. Simpler to drop inner_iter for
+         * the tail; the chunk is smaller anyway. */
+        if (inner_iter > 1u) {
+            inner_iter = 1u;
+        }
+    }
+
+    /* Step 6: geometry resolution. bf_chunk_geometry derives
+     * (num_words, mask_size_per_word) from chunk_total. With inner_iter,
+     * the kernel's per-lane mask range = mask_size_per_word, and total
+     * coverage per word = mask_size_per_word * inner_iter. The geometry
+     * helper sees only chunk_total (logical) and picks num_words /
+     * mspw such that num_words * mspw == chunk_total; the inner_iter
+     * factor applies orthogonally inside the kernel. */
+    bf_chunk_geometry(&chunk_total, out_num_words, out_mask_size_per_word);
+    /* mspw the geometry helper picked includes the inner_iter factor —
+     * we need to divide it back out for the kernel's per-iter mask_size
+     * (== bf_num_masks). The per-word stride (bf_offset_per_word) is
+     * mspw * inner_iter == the helper's pre-divide value. */
+    uint32_t mspw_logical = *out_mask_size_per_word;
+    if (inner_iter > 1u) {
+        /* Ensure mspw_logical is divisible by inner_iter. Step 4.6 already
+         * rounded chunk_total to a multiple, and bf_chunk_geometry tends
+         * to pick mspw as a power of two near 131072. Fall back to 1 if
+         * the math doesn't work cleanly. */
+        if ((mspw_logical % inner_iter) != 0u) {
+            /* Geometry doesn't split cleanly into inner_iter — drop the
+             * inner iteration for this chunk. */
+            inner_iter = 1u;
         } else {
-            g = gpujob_get_free(job->filename, job->startline);
+            *out_mask_size_per_word = mspw_logical / inner_iter;
         }
-        g->op = job->op;
-        g->filename = job->filename;
-        g->flags = job->flags;
-        g->doneprint = job->doneprint;
-        g->line_num = job->startline;
-        *pjobg = g;
     }
 
-    int idx = g->count;
-
-    /* GPU_CAT_SALTPASS / GPU_CAT_MASK: pack raw password bytes */
-    if (cat == GPU_CAT_SALTPASS || cat == GPU_CAT_MASK) {
-        memcpy(g->hexhash[idx], job->pass, job->clen);
-        g->hexlen[idx] = job->clen;
-        goto gpu_pack_done;
+    /* Step 7: telemetry. Default-on; suppress only when explicit "0". */
+    int trace_on = 1;
+    {
+        const char *te = getenv("MDXFIND_BF_ADAPTIVE_TRACE");
+        if (te && te[0] == '0' && te[1] == 0) trace_on = 0;
+    }
+    if (trace_on) {
+        uint32_t emit_every = (bf_chunks_produced < WARMUP_CHUNKS) ? 5 : 50;
+        if (bf_chunks_produced == 0 || (bf_chunks_produced % emit_every) == 0) {
+            fprintf(stderr,
+                "[bf-servo] chunk_no=%u chunk_total=%llu nwords=%u mspw=%u "
+                "inner_iter=%u target_s=%.2f rate_ema_MHs=%.2f "
+                "observed_max_MHs=%.2f fresh_devs=%d\n",
+                bf_chunks_produced,
+                (unsigned long long)chunk_total,
+                *out_num_words, *out_mask_size_per_word,
+                inner_iter,
+                target_s,
+                (double)bf_rate_ema / 1e6,
+                (fresh_devs > 0) ? ((double)observed_max / 1e6) : 0.0,
+                fresh_devs);
+        }
     }
 
-    unsigned char *hb = curin->h;
-    uint32_t *mw = (uint32_t *)g->hexhash[idx];
-
-    /* Pack hex hash into M[] words, per algorithm */
-    switch (job->op) {
-    case JOB_MD5UCSALT:
-    case JOB_MD5UC:
-        for (int mi = 0; mi < 8; mi++) {
-            unsigned short h0 = *(unsigned short *)&hexlut_uc[hb[mi*2] * 2];
-            unsigned short h1 = *(unsigned short *)&hexlut_uc[hb[mi*2+1] * 2];
-            mw[mi] = h0 | ((uint32_t)h1 << 16);
-        }
-        g->hexlen[idx] = 32;
-        break;
-    case JOB_MD5revMD5SALT:
-        { char revbuf[36];
-          prmd5REV(hb, revbuf, 32);
-          for (int mi = 0; mi < 8; mi++)
-              mw[mi] = *(uint32_t *)&revbuf[mi * 4];
-        }
-        g->hexlen[idx] = 32;
-        break;
-    case JOB_MD5sub8_24SALT:
-        for (int mi = 0; mi < 4; mi++) {
-            unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2] * 2];
-            unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[4 + mi*2+1] * 2];
-            mw[mi] = h0 | ((uint32_t)h1 << 16);
-        }
-        mw[4] = mw[5] = mw[6] = mw[7] = 0;
-        g->hexlen[idx] = 16;
-        break;
-    case JOB_SHA1DRU:
-        /* Pack hex(SHA1(pass)) [40 bytes] + raw password [plen bytes] */
-        for (int mi = 0; mi < 10; mi++) {
-            unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
-            unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
-            mw[mi] = h0 | ((uint32_t)h1 << 16);
-        }
-        /* Raw password after the 40 hex bytes */
-        memcpy((char *)mw + 40, job->pass, job->clen);
-        g->hexlen[idx] = 40 + job->clen; /* kernel derives plen = hexlen - 40 */
-        break;
-    default: /* JOB_MD5SALT, JOB_MD5 — lowercase hex */
-        for (int mi = 0; mi < 8; mi++) {
-            unsigned short h0 = *(unsigned short *)&hexlut_lc[hb[mi*2] * 2];
-            unsigned short h1 = *(unsigned short *)&hexlut_lc[hb[mi*2+1] * 2];
-            mw[mi] = h0 | ((uint32_t)h1 << 16);
-        }
-        g->hexlen[idx] = 32;
-        break;
-    }
-
-gpu_pack_done:
-    /* Pack password data for hit verification */
-    g->passoff[idx] = g->passbuf_pos;
-    memcpy(&g->passbuf[g->passbuf_pos], job->pass, job->clen);
-    g->passlen[idx] = job->clen;
-    g->clen[idx] = job->clen;
-    g->ruleindex[idx] = job->Ruleindex;
-    g->passbuf_pos += job->clen;
-    g->count++;
-
-    /* Submit when batch limit reached */
-    if (g->count >= gpujob_batch_max() ||
-        g->passbuf_pos + 4096 > GPUBATCH_PASS) {
-        gpujob_submit(g);
-        *pjobg = NULL;
-    }
-    return 1;
+    *out_inner_iter  = inner_iter;
+    *out_chunk_total = chunk_total;
+    bf_chunks_produced++;
+    return 0;
 }
+#endif  /* OPENCL_GPU */
+
+/* BF Phase 3b Tranche B (2026-05-10): gpu_try_pack() retired. The function
+ * was the sole producer of slab-format (g->packed=0) GPU jobs for SALTED /
+ * SALTPASS / ITER / MASK ops. Tranche A (2026-05-10, rev 1.455) deleted all
+ * 24 call sites — each call site was structurally unreachable because
+ * gpu_op_category returned GPU_CAT_MASK or GPU_CAT_NONE for every live op
+ * and gpu_try_pack's gates at the top of the body rejected those categories
+ * before pack/dispatch. Tranche B (this commit) deletes the function body
+ * itself plus its sole downstream consumer gpu_opencl_dispatch_batch (in
+ * gpu/gpu_opencl.c) and the slab-arm dispatcher in gpu/gpujob_opencl.c.
+ *
+ * All GPU dispatch now flows through the rules-engine path
+ * (gpu_opencl_dispatch_md5_rules) via the chokepoint pack at
+ * mdxfind.c:10613/10660. RCS history retains the prior gpu_try_pack
+ * implementation (mdxfind.c rev 1.455). */
 #endif /* GPU_ENABLED */
 
 MDXALIGN void procjob(void *dummy) {
@@ -8963,7 +10134,7 @@ void (*hashfunc2)(char *, int, unsigned char *);
 void (*hashinit)(void *);
 void (*hashop)(void *, const void *, size_t);
 void (*hashfin)(void *, void *);
-unsigned int curline, numline;
+unsigned long long curline, numline;     /* widened from unsigned int */
 unsigned long long tmemmax;
 void *desblock;
 #if ARM > 6
@@ -9084,7 +10255,16 @@ SSEBUF[15]=_mm_setzero_si128();
 rhash_con = NULL;
 argon2_ws = NULL;
 #ifdef GPU_ENABLED
+/* BF Phase 3b Tranche C (2026-05-10): my_jobg declaration retained as a
+ * NULL stub for source compatibility with comments / log entries that
+ * still mention it. Tranche A deleted the only setter (gpu_try_pack); the
+ * three dead defensive conditional sites at JOB_DONE flush (~10261) and
+ * end-of-job flush (~36723) deleted in this tranche. All live GPU traffic
+ * flows through my_jobg_rules (rules-engine batch). If a future feature
+ * resurrects a non-rules slab slot, declare a fresh variable rather than
+ * reviving this stub. */
 struct jobg *my_jobg = NULL;
+struct jobg *my_jobg_rules = NULL;  /* rules-engine batch (sub-commit C2) */
 unsigned int gpu_reacquire = 0;
 #endif
 
@@ -9098,9 +10278,14 @@ while (1) {
   }
   if (job->op == JOB_DONE) {
 #ifdef GPU_ENABLED
-    if (my_jobg && (my_jobg->count > 0 || my_jobg->packed_count > 0)) {
-      gpujob_submit(my_jobg);
-      my_jobg = NULL;
+    /* BF Phase 3b Tranche C (2026-05-10): my_jobg defensive flush deleted;
+     * variable is permanently NULL post-Tranche-A. */
+    if (my_jobg_rules && my_jobg_rules->packed_count > 0) {
+      gpujob_submit(my_jobg_rules);
+      my_jobg_rules = NULL;
+    } else if (my_jobg_rules) {
+      gpujob_return_free(my_jobg_rules);
+      my_jobg_rules = NULL;
     }
 #endif
     release(WorkWaiting);
@@ -9119,6 +10304,134 @@ while (1) {
     __sync_fetch_and_sub(&MDXpaused_count, 1);
   }
 
+#if defined(OPENCL_GPU)
+  /* BF chunk-as-job (Tranche 3, 2026-05-09): main thread produces chunk
+   * descriptors with JOBFLAG_BF_CHUNK; procjob short-circuits here to fill
+   * a synthetic single-empty-plaintext rules-engine slot and submit
+   * directly. The kernel iterates the chunk's mask range internally via
+   * mask_offset_per_word + mask_start (Tranche 2 kernel edit at
+   * gpu_template.cl:283). No CPU rule walker, no wordlist iteration.
+   *
+   * Job is returned to FreeWaiting at the bottom of this branch (mirrors
+   * the procjob outer-loop cleanup at line ~36450+). On any structural
+   * failure (no rules-engine slot, !gpujob_available), falls through to
+   * the regular procjob path which CPU-fallbacks the BF — corrects but
+   * slow (the 5.26 MH/s baseline). */
+  if (job->flags & JOBFLAG_BF_CHUNK) {
+    int bf_short_circuit_ok = 0;
+    if (gpujob_available()) {
+      struct jobg *g = gpujob_get_free_rules(job->filename, job->startline);
+      if (g) {
+        if (!g->packed_buf) {
+          /* Mirrors the B1 host-only buffer pattern from the rules-engine
+           * pack site (mdxfind.c:11144). Plain calloc; the driver pins
+           * d->h_dispatch_payload internally. */
+          g->packed_buf = (char *)calloc(1, g->packed_buf_size);
+          if (!g->packed_buf) {
+            fprintf(stderr, "Out of memory: BF chunk packed_buf calloc (%zu bytes)\n",
+                    g->packed_buf_size);
+            exit(1);
+          }
+          g->word_offset = (uint32_t *)calloc(g->word_offset_entries,
+                                              sizeof(uint32_t));
+          if (!g->word_offset) {
+            fprintf(stderr, "Out of memory: BF chunk word_offset calloc (%u entries)\n",
+                    g->word_offset_entries);
+            exit(1);
+          }
+        }
+        /* Synthetic single empty plaintext at byte offset 0 of packed_buf:
+         * one length-prefix byte = 0 (zero-length plaintext). All N word
+         * slots point to this same offset; the kernel's mask_idx +=
+         * mask_start + word_idx * mask_offset_per_word decomposes each
+         * word_idx into a distinct mask range. */
+        g->packed_buf[0] = 0;     /* plen = 0 */
+        uint32_t bf_num_masks_v       = job->bf_num_masks;
+        uint32_t bf_offset_per_word_v = job->bf_offset_per_word;
+        /* BF Phase 1.8 (2026-05-10): each word slot covers
+         * bf_num_masks * inner_iter mask values (== bf_offset_per_word in
+         * the servo's derivation). Use bf_offset_per_word as the per-word
+         * total so num_words = ceil(MaskCount / bf_offset_per_word). For
+         * inner_iter==1 / inner_iter==0 (servo default), bf_offset_per_word
+         * == bf_num_masks and this is bit-identical to the pre-1.8 formula. */
+        uint32_t per_word_total = (bf_offset_per_word_v > 0)
+            ? bf_offset_per_word_v : bf_num_masks_v;
+        uint32_t num_words = (per_word_total > 0)
+            ? (uint32_t)((job->MaskCount + (uint64_t)per_word_total - 1) /
+                         (uint64_t)per_word_total)
+            : 1u;
+        if (num_words > g->word_offset_entries)
+          num_words = g->word_offset_entries;
+        if (num_words < 1) num_words = 1;
+        for (uint32_t i = 0; i < num_words; i++) g->word_offset[i] = 0;
+        g->packed_count = num_words;
+        g->packed_pos   = 1;       /* one byte (the plen=0 prefix) used */
+        g->op           = job->op;
+        g->filename     = job->filename;
+        g->flags        = job->flags;
+        g->doneprint    = job->doneprint;
+        g->packed       = 1;
+        g->rules_engine = 1;
+        g->bf_chunk         = 1;
+        g->bf_mask_start    = (uint64_t)job->MaskIndex;
+        g->bf_offset_per_word = bf_offset_per_word_v;
+        g->bf_num_masks     = bf_num_masks_v;
+        /* BF Phase 1.8 (2026-05-10): copy inner_iter from struct job into
+         * jobg. Default 0 from struct job memset means "today's behavior"
+         * (kernel coerces 0 -> 1). For inner_iter > 1 (set by servo),
+         * each lane processes inner_iter consecutive mask values. */
+        g->bf_inner_iter    = job->bf_inner_iter;
+        /* Phase 1.9 Tranche A1 (2026-05-10): copy fast-path eligibility
+         * flag from struct job to jobg. Producer set this when the BF
+         * chunk qualifies for the gpu_md5_bf.cl fast template kernel
+         * (op==JOB_MD5, Numrules<=1, unsalted, append-only mask, env
+         * MDXFIND_GPU_FAST_DISABLE unset). The dispatcher
+         * (gpu_opencl_dispatch_md5_rules) reads this off the jobg and
+         * swaps to kern_template_phase0_md5_bf when applicable. */
+        g->bf_fast_eligible = (unsigned char)(job->bf_fast_eligible ? 1u : 0u);
+        gpujob_submit(g);
+        bf_short_circuit_ok = 1;
+      } else {
+        fprintf(stderr,
+            "BF chunk: rules-engine slot pool exhausted; CPU fallback for op=%d "
+            "MaskIndex=%llu MaskCount=%llu\n",
+            job->op,
+            (unsigned long long)job->MaskIndex,
+            (unsigned long long)job->MaskCount);
+      }
+    }
+    if (bf_short_circuit_ok) {
+      /* Cleanup: mirror the procjob outer-loop tail (lines ~36469-36482 +
+       * ~36495-36513). For BF chunk jobs there's no outbuf to write
+       * (kernel emits hits to gpujob), no rhash_con to free (we never
+       * allocated), no snap_valid / Livesalts. Just release ReadBuf0
+       * (the submit path twisted UP at mdxfind.c:48230) and return the
+       * job to FreeWaiting. */
+      if (job->readbuf == Readbuf) {
+        possess(ReadBuf0);
+        twist(ReadBuf0, BY, -1);
+      } else {
+        possess(ReadBuf1);
+        twist(ReadBuf1, BY, -1);
+      }
+      possess(FreeWaiting);
+      job->op   = 0;
+      job->next = NULL;
+      if (FreeTail) {
+        *FreeTail = job;
+        FreeTail = &(job->next);
+      } else {
+        FreeHead = job;
+        FreeTail = &(job->next);
+      }
+      twist(FreeWaiting, BY, +1);
+      continue;     /* next iteration of procjob's outer while(1) */
+    }
+    /* bf_short_circuit_ok == 0: fall through to legacy CPU BF path.
+     * The job retains JOBFLAG_BF_CHUNK + JOBFLAG_BRUTEFORCE; the per-line
+     * loop will CPU-iterate the mask range (slow, but correct). */
+  }
+#endif
 
   numline = 0;
   rulecnt = 0;
@@ -9128,8 +10441,17 @@ while (1) {
 #ifdef GPU_ENABLED
   { int do_pack_gpu_val = 0;
     int gpu_maxlen_val = 55;
-    if (gpujob_available() && (Rules || Keys || Email) &&
-        !job->MaskCount &&
+    /* BF chunk-as-job (Tranche 3, 2026-05-09): chunks normally short-
+     * circuit at the procjob entry above (line ~9999-10100) and never
+     * reach this gate. The widening below is defensive — if the short-
+     * circuit fell through (e.g., gpujob_available() flipped between
+     * these checks), the chokepoint pack would still need to admit
+     * BF-chunk jobs. JOBFLAG_BF_CHUNK + GPU_CAT_MASK + gpujob_available
+     * is the entry condition. */
+    if (gpujob_available() &&
+        ((Rules || Keys || Email) ||
+         (job->flags & JOBFLAG_BF_CHUNK)) &&
+        ((job->flags & JOBFLAG_BF_CHUNK) || !job->MaskCount) &&
         gpu_op_category(job->op) == GPU_CAT_MASK) {
       do_pack_gpu_val = 1;
       /* Per-op max password length. Must match maxpasslen in
@@ -9140,8 +10462,11 @@ while (1) {
         case JOB_SHA512RAW: case JOB_SHA384RAW:
           gpu_maxlen_val = 111;
           break;
-        case JOB_NTLM: case JOB_NTLMH:
-          /* UTF-16LE zero-extend doubles length; 2*len must fit MD4 one block (<=55) */
+        case JOB_NTLM: case JOB_NTLMH: case JOB_MD4UTF16:
+          /* UTF-16LE zero-extend doubles length; 2*len must fit MD4 one block (<=55).
+           * MD4UTF16 (B5 sub-batch 8): same constraint as NTLMH for iter==1; the
+           * iter > 1 feedback is a fixed 32 hex chars -> 64 UTF-16LE bytes -> 2 MD4
+           * blocks, handled inside template_iterate. */
           gpu_maxlen_val = 27;
           break;
         case JOB_MD6256:
@@ -9321,12 +10646,13 @@ while (1) {
 
   /* Track lowest active line at job start */
   { char *fn = job->filename;
-    unsigned int sl = job->startline;
+    unsigned long long sl = job->startline;
     if (MDXlowest_file == NULL || fn < MDXlowest_file) {
       MDXlowest_file = fn;
-      MDXlowest_line = sl;
-    } else if (fn == MDXlowest_file && sl < MDXlowest_line) {
-      MDXlowest_line = sl;
+      atomic_store_explicit(&MDXlowest_line, sl, memory_order_relaxed);
+    } else if (fn == MDXlowest_file &&
+               sl < atomic_load_explicit(&MDXlowest_line, memory_order_relaxed)) {
+      atomic_store_explicit(&MDXlowest_line, sl, memory_order_relaxed);
     }
   }
 
@@ -9353,9 +10679,10 @@ while (1) {
       { char *fn = job->filename;
         if (MDXlowest_file == NULL || fn < MDXlowest_file) {
           MDXlowest_file = fn;
-          MDXlowest_line = curline;
-        } else if (fn == MDXlowest_file && curline < MDXlowest_line) {
-          MDXlowest_line = curline;
+          atomic_store_explicit(&MDXlowest_line, curline, memory_order_relaxed);
+        } else if (fn == MDXlowest_file &&
+                   curline < atomic_load_explicit(&MDXlowest_line, memory_order_relaxed)) {
+          atomic_store_explicit(&MDXlowest_line, curline, memory_order_relaxed);
         }
       }
       if (MDXpause) {
@@ -9384,23 +10711,1038 @@ while (1) {
     job->pass = job->line;
     currule = Rules;
     job->Ruleindex = 0;
+#ifdef OPENCL_GPU
+    int word_packed_by_rules_engine = 0;  /* Set by the C2.2 hook below when this word's
+                                           * original bytes get packed into my_jobg_rules.
+                                           * The legacy chokepoint then knows the kernel
+                                           * will compute md5(word) for the no-rule pass
+                                           * via the synthetic `:` rule, so it can skip
+                                           * packing pass0==0 for this word. */
+#endif
 
     fastcopy(d, s, len);
     d[len] = 0;
 
-#ifdef GPU_ENABLED
-    /* Iter-only GPU path: when -i N>1 is requested without rules/keys/email/mask,
-     * pack the word once via the slab format (gpu_try_pack_unsalted). The slab
-     * kernel iterates internally up to max_iter and emits hits at each level.
-     * Replaces the Phase 2b-deleted pre-scan; the chokepoint's packed kernel
-     * does not iterate, so iter-only must use the slab kernel. */
-    if (Maxiter > 1 && !job->MaskCount && !Rules && !Email && !Keys &&
-        gpu_op_category(job->op) == GPU_CAT_MASK &&
-        gpujob_available() && !Printall &&
-        gpu_try_pack_unsalted(&my_jobg, job, 0, 0, cur, len)) {
-      continue;  /* GPU consumed this word; skip CPU switch */
+#ifdef OPENCL_GPU
+    /* Sub-commit C2: GPU rule engine — pack the ORIGINAL word into the rules_engine
+     * slot. The kernel does the (word x rule) Cartesian product itself; CPU loop
+     * below skips GPU-eligible rules (see C2.3). The implicit no-rule pass fires
+     * normally via the existing chokepoint (pass0==0 iteration).
+     *
+     * Numrules == 0 path: when no user rules are loaded but the engine is active
+     * (synthetic-only `:` program uploaded at session start), the kernel runs
+     * exactly the no-rule pass for each packed word. This subsumes the older
+     * iter-only slab path (-i N>1, no rules, no mask) — Maxiter is threaded
+     * through to the kernel via gpu_opencl_set_max_iter. currule is NULL in
+     * this case (no user rules to walk), so the gate accepts NULL when
+     * Numrules == 0. gpu_rule_membership is also NULL on this path; all
+     * downstream membership accesses are guarded by `gpu_rule_membership &&`. */
+    /* Memo B Phase B7.1-B7.6 (2026-05-05/06): the chokepoint admits
+     * append masks (B7.1+B7.2), prepend masks (B7.3+B7.4), combined
+     * prepend+append (B7.5), AND user-defined character classes (B7.6,
+     * via inline ?[abc] syntax). The kernel's third geometry axis handles
+     * mask iteration; the host hit-replay decodes combined_ridx and
+     * re-prepends/-appends the mask bytes to the candidate plaintext.
+     *
+     * mask_b71_eligible: TRUE when no mask is active OR when the mask
+     * configuration is in B7.5/B7.8 scope:
+     *   - MaskPrependLen in [0, 16], MaskAppendLen in [0, 16],
+     *     MaskPrependLen + MaskAppendLen >= 1. Both bounds are
+     *     MASK_POS_CAP=16 (kernel-side fixed-array cap per section;
+     *     B7.8 lift from 8).
+     *
+     * The legacy MaskLen path is folded into MaskAppendPattern at parse
+     * time when MaskPrepend == 0 (see mdxfind.c:42677-42789), so by the
+     * time we reach this gate, MaskAppendLen / MaskPrependLen are the
+     * canonical state.
+     *
+     * B7.6 validated 2026-05-06: user-defined classes (?[abc]?[123])
+     * route through gpu_opencl_set_mask via MaskClasses[cid].chars +
+     * .count (mdxfind.c:46977+); the kernel reads the same charset
+     * bytes regardless of whether they came from a builtin class
+     * (?d, ?l, ...) or a user-defined ?[..] inline class. Byte-exact
+     * on ioblade for both prepend-only (?[abc]) and combined
+     * prepend+append (?[abc] / ?[123]) custom-class fixtures. */
+    int mask_b71_eligible =
+        !job->MaskCount ||
+        (MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
+         MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
+         (MaskPrependLen + MaskAppendLen) >= 1);
+    if (gpu_rules_engine_active &&
+        (job->op == JOB_MD5 || job->op == JOB_MD5UC || job->op == JOB_MD4 ||
+         job->op == JOB_SHA1 || job->op == JOB_SHA224 ||
+         job->op == JOB_SHA256 ||
+         job->op == JOB_SHA384 || job->op == JOB_SHA512 ||
+         job->op == JOB_RMD160 || job->op == JOB_RMD320 ||
+         /* B5 sub-batch 3 (2026-05-06): BLAKE2 family. Three variants
+          * wired (BLAKE2B-160 omitted — JOB_BLAKE2B160 not defined). */
+         job->op == JOB_BLAKE2S256 ||
+         job->op == JOB_BLAKE2B256 || job->op == JOB_BLAKE2B512 ||
+         /* B5 sub-batch 4 (2026-05-03): SHA3 / Keccak family.
+          * KECCAK-{224,256,384,512} suffix=0x01 + SHA3-{224,256,384,512}
+          * suffix=0x06; sponge construction (rate=200-2*output_bytes;
+          * Keccak-f[1600] permutation). All eight variants now route
+          * through the rules-engine template path instead of falling
+          * through to the slab path (gpu_keccakunsalted.cl). */
+         job->op == JOB_KECCAK224 || job->op == JOB_KECCAK256 ||
+         job->op == JOB_KECCAK384 || job->op == JOB_KECCAK512 ||
+         job->op == JOB_SHA3_224 || job->op == JOB_SHA3_256 ||
+         job->op == JOB_SHA3_384 || job->op == JOB_SHA3_512 ||
+         /* B5 sub-batch 5a Tier 1 (2026-05-03): SHA384RAW + SHA512RAW.
+          * Reuse SHA384/SHA512 compression; binary-digest iter step
+          * (Option B: covers Maxiter > 1 byte-exact). */
+         job->op == JOB_SHA384RAW || job->op == JOB_SHA512RAW ||
+         /* B5 sub-batch 6 Tier A (2026-05-03): MD5RAW + SHA1RAW + SHA256RAW.
+          * Reuse MD5/SHA1/SHA256 compression; binary-digest iter step
+          * (Option B: covers Maxiter > 1 byte-exact). */
+         job->op == JOB_MD5RAW || job->op == JOB_SHA1RAW ||
+         job->op == JOB_SHA256RAW ||
+         /* B5 sub-batch 6 Tier C (2026-05-03): SQL5 (MySQL 4.1+ password).
+          * SHA1(SHA1(p)) with UPPERCASE-hex iter feedback. Two SHA1 chains
+          * in template_state. CPU reference at mdxfind.c JOB_SQL5 (line 25301). */
+         job->op == JOB_SQL5 ||
+         /* B6.11 SHA1DRU fan-out (2026-05-06): SHA1DRU (Drupal SHA1, hashcat
+          * -m 7900) — first 1M-iteration algorithm on the unified template
+          * path. SHA1(pass) followed by 1,000,000 iterations of
+          * SHA1(hex_lc(state) || pass); ONE probe at the final state
+          * (mdxfind.c:14261-14285). The 1M loop runs INSIDE template_finalize
+          * (gpu_sha1dru_core.cl); host forces params.max_iter=1 at the
+          * rules-engine dispatch site so the kernel's outer iter loop runs
+          * exactly once. The slab kernel sha1dru_batch (gpu/gpu_sha1.cl) is
+          * removed in this same commit (B8 cleanup). The legacy gpu_try_pack
+          * path is structurally unreachable post-category-move (gpu_op_-
+          * category returns GPU_CAT_MASK; gpu_try_pack returns 0 for non-
+          * GPU_CAT_SALTED/SALTPASS ops + iter-types whitelist excludes
+          * SHA1DRU). */
+         job->op == JOB_SHA1DRU ||
+         /* B5 sub-batch 6 Tier B (2026-05-03): NTLMH (NT password hash).
+          * MD4(UTF-16LE-zero-extend(p)) — hashcat-compatible. The
+          * gpu_ntlmh_core template_finalize handles arbitrary length via
+          * a per-32-input-byte-block while loop; the standard
+          * GPU_RULES_MAX_INPUT_LEN cap is sufficient. The CPU JOB_NTLMH
+          * tests up to 3 iconv variants for non-Unicode mode; the GPU
+          * path implements ONLY the zero-extend variant (hashcat-compat
+          * by design — same gap as the existing slab kernel). */
+         job->op == JOB_NTLMH ||
+         /* B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496). Same
+          * MD4(UTF-16LE-zero-extend(p)) as NTLMH but with iter loop
+          * support: iter > 1 feeds back lowercase hex of prior digest
+          * zero-extended to UTF-16LE (64 bytes) and MD4'd. The iconv
+          * variant remains on CPU for non-ASCII inputs (same hashcat-
+          * compat gap as NTLMH); on the iter feedback path the input is
+          * always lowercase hex chars [0-9a-f] (pure ASCII) so the gap
+          * does not apply to iter > 1 work. */
+         job->op == JOB_MD4UTF16 ||
+         /* B7.7b (2026-05-07): JOB_MD6256 (-m 17800) — final M5 closure
+          * from B9 gate-fail. MD6-256 single-block leaf compression,
+          * 89-ulong N input + 1753-ulong A working array (14 KB stack)
+          * + 8-uint32 LE digest. Iter > 1 feeds lowercase hex of prior
+          * 32-byte digest (64 ASCII chars) per CPU semantics at
+          * mdxfind.c:25836-25855. New core gpu_md6256_core.cl
+          * (HASH_WORDS=8, BASE_ALGO=md6); per-iter probe like SQL5
+          * (vs. SHA1DRU's max_iter=1 internal loop). KNOWN ACCEPTED
+          * RISK: gfx1201 priv_mem may bust 43,024 B HARD GATE due to
+          * MD6's 14 KB compression scratch. Compile-only ship per user
+          * 2026-05-07 OPTION A; integrated post-B7.9 validation will
+          * reveal gfx1201 status. Fall-back: leave gpu_md6256unsalted.cl
+          * as gfx1201-only slab fallback. */
+         job->op == JOB_MD6256 ||
+         /* B5 sub-batch 7 (2026-05-05): MYSQL3 (-m e456). Legacy MySQL
+          * OLD_PASSWORD() hash, 64-bit output. Per-byte arithmetic
+          * accumulator loop (no MD-style block); iter > 1 feeds back the
+          * lowercase ASCII hex of the prior 8-byte digest (16 chars).
+          * Probe via the default 4-word path (h[2..3]=0); host zero-pad
+          * of HashDataBuf to 16 bytes (mdxfind.c:36400-36412 rev 1.399+)
+          * makes the 4-uint32 compare byte-exact for the 8-byte digest. */
+         job->op == JOB_MYSQL3 ||
+         /* B5 sub-batch 6.5 (2026-05-05): WRL (-m e5). Whirlpool 512-bit
+          * hash. Miyaguchi-Preneel construction over a 64-byte BE block
+          * with 256-bit BE length encoding (last 32 bytes of final block).
+          * Iter > 1 feeds back 128 lowercase hex chars of the prior digest
+          * (CPU JOB_WRL at mdxfind.c:28019-28024). Identical 16 KB
+          * __constant SBOX shape to Streebog (B5 sub-batch 5b deferred);
+          * different access pattern (direct ulong shift-then-mask, no
+          * uchar-from-ulong reinterpret) — diagnostic data point for
+          * RDNA4 gfx1201 incompatibility hypothesis. */
+         job->op == JOB_WRL ||
+         /* B5 sub-batch 5b retry (2026-05-06): Streebog-256 + Streebog-512
+          * (-m e430/e431). GOST R 34.11-2012 with 16 KB __constant SBOB_SL64.
+          * SBOG_LPS rewritten in gpu_streebog.cl rev 1.5 + new template cores
+          * to use shift-then-mask byte extraction (same pattern as WRL_OP).
+          * sub-6.5 WRL ship validated 100/100 on gfx1201; this retry tests
+          * the rewritten SBOG_LPS on the Streebog template path. */
+         job->op == JOB_STREEBOG_32 || job->op == JOB_STREEBOG_64 ||
+         /* B6 salt-axis (2026-05-06): MD5SALT (-m 10) + MD5SALTPASS (-m 20)
+          * — first two salted variants on the unified template path.
+          * MD5SALT = MD5(hex32(MD5(p)) || salt) (double-MD5 chain;
+          * mdxfind.c:21943-21974). MD5SALTPASS = MD5(salt || pass) (simple
+          * prepend; mdxfind.c:15776-15832). The salt snapshot is built /
+          * uploaded by gpujob_opencl.c at line ~580 (needs_salt_snapshot
+          * widened to fire for MASK + Typesalt[] ops, §11 row 20).
+          * B6.1 SHA1 fan-out (2026-05-06): SHA1SALTPASS (-m 110) — first
+          * SHA-family salted variant. SHA1(salt || pass) (simple prepend;
+          * mdxfind.c:14369-14418). Same template-routed path as
+          * MD5SALTPASS but with HASH_WORDS=5 + BASE_ALGO=sha1 in
+          * defines_str (kernel-cache disambiguation) and BE message-word
+          * build + bswap32-on-probe in the per-algorithm core.
+          * B6.2 SHA256 fan-out (2026-05-06): SHA256SALTPASS (-m 1410) —
+          * second SHA-family salted variant. SHA256(salt || pass) (simple
+          * prepend; mdxfind.c:27603-27651). Same template-routed path;
+          * HASH_WORDS=8 + BASE_ALGO=sha256 in defines_str. The legacy
+          * gpu_try_pack(...JOB_SHA256SALTPASS...) at line ~27618 stays in
+          * place — structurally unreachable post-category-move but kept
+          * as defense-in-depth (gpu_op_category returns GPU_CAT_MASK,
+          * gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops).
+          * B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS (-m 1310) —
+          * third SHA-family salted variant. SHA224(salt || pass) (simple
+          * prepend; mdxfind.c:30447). Same template-routed path;
+          * HASH_WORDS=7 + BASE_ALGO=sha256 in defines_str — SHA224
+          * reuses sha256_block compression with 7-word truncated output.
+          * Previously CPU-only (no gpu_op_category case → GPU_CAT_NONE);
+          * this change adds first-class GPU template routing. */
+         job->op == JOB_MD5SALT || job->op == JOB_MD5SALTPASS ||
+         job->op == JOB_SHA1SALTPASS ||
+         job->op == JOB_SHA256SALTPASS ||
+         job->op == JOB_SHA224SALTPASS ||
+         /* B6.4 MD5PASSSALT fan-out (2026-05-06): MD5PASSSALT (-m 10) —
+          * first APPEND-shape salted variant on the codegen path.
+          * MD5(pass || salt) (simple append; mdxfind.c:16627-16669).
+          * Same template-routed path as MD5SALTPASS but defines_str
+          * disambiguates via SALT_POSITION=APPEND (vs PREPEND); same
+          * BASE_ALGO=md5 + HASH_WORDS=4. The legacy gpu_try_pack call
+          * at line ~16641 stays in place — structurally unreachable
+          * post-category-move (gpu_op_category returns GPU_CAT_MASK,
+          * gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops). */
+         job->op == JOB_MD5PASSSALT ||
+         /* B6.5 SHA1PASSSALT fan-out (2026-05-06): SHA1PASSSALT (-m 100) —
+          * first SHA-family APPEND-shape salted variant on the codegen
+          * path. SHA1(pass || salt) (simple append; mdxfind.c:14227-14270).
+          * Same template-routed path as SHA1SALTPASS but defines_str
+          * disambiguates via SALT_POSITION=APPEND (vs PREPEND); same
+          * BASE_ALGO=sha1 + HASH_WORDS=5. The legacy gpu_try_pack call
+          * at line ~14241 stays in place — structurally unreachable
+          * post-category-move (gpu_op_category returns GPU_CAT_MASK,
+          * gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops). */
+         job->op == JOB_SHA1PASSSALT ||
+         /* B6.7 SHA256PASSSALT fan-out (2026-05-06): SHA256PASSSALT (-m 1410) —
+          * second SHA-family APPEND-shape salted variant on the codegen
+          * path. SHA256(pass || salt) (simple append; mdxfind.c:27639-27677).
+          * Pure spec reuse — sha256_style_salted.cl.tmpl + finalize_append_-
+          * be.cl.frag both already shipped (B6.2 + B6.5). defines_str
+          * disambiguates from SHA256SALTPASS via SALT_POSITION=APPEND
+          * (vs PREPEND); same BASE_ALGO=sha256 + HASH_WORDS=8. The legacy
+          * gpu_try_pack call at line ~27653 stays in place — structurally
+          * unreachable post-category-move (gpu_op_category returns
+          * GPU_CAT_MASK, gpu_try_pack returns 0 for non-GPU_CAT_SALTED/
+          * SALTPASS ops). */
+         job->op == JOB_SHA256PASSSALT ||
+         /* B6.9 SHA512 fan-out (2026-05-06): SHA512SALTPASS (-m 1710) —
+          * first 64-bit-state salted variant on the codegen path.
+          * SHA512(salt || pass) (simple PREPEND; mdxfind.c:13981-14023).
+          * Same template-routed path as the SHA-256 family but the
+          * underlying compression primitive is sha512_block (8 ulong
+          * state, 128-byte block, 128-bit length field). defines_str
+          * disambiguates from every other salted template via
+          * HASH_BLOCK_BYTES=128 (unique among salted variants on the
+          * codegen path) + HASH_WORDS=16 + BASE_ALGO=sha512. The legacy
+          * SHA-512-family slab path's gpu_try_pack call is NOT in scope
+          * for this row — JOB_SHA512SALTPASS was previously handled
+          * through the GPU_CAT_SALTPASS slab path (sha512crypt-style
+          * generic salted dispatcher); this change moves it to
+          * GPU_CAT_MASK so the unified template path takes the work.
+          * gpu_op_category returns GPU_CAT_MASK for JOB_SHA512SALTPASS
+          * post-this-change; the legacy slab dispatcher is structurally
+          * unreachable. */
+         job->op == JOB_SHA512SALTPASS ||
+         /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT
+          * (-m 1720) — second 64-bit-state salted variant on the codegen
+          * path. SHA512(pass || salt) (simple APPEND; mdxfind.c:14069-
+          * 14127). FINAL B6 ladder step. APPEND-shape sibling of
+          * SHA512SALTPASS — same template path; only finalize-time
+          * salt position differs. Cache disambiguated via SALT_POSITION=
+          * APPEND (vs PREPEND); same BASE_ALGO=sha512 + HASH_WORDS=16 +
+          * HASH_BLOCK_BYTES=128 axes — single-axis delta. After this
+          * lands, the entire SHA-512-family salted slab dispatcher
+          * (legacy GPU_CAT_SALTPASS path for both arms) is structurally
+          * unreachable; full B8 slab-retirement opens up. */
+         job->op == JOB_SHA512PASSSALT ||
+         /* B6.6 (2026-05-06): MD5SALT family variants share the SAME GPU
+          * kernel as e31 MD5SALT via params.algo_mode. e350 MD5UCSALT
+          * (uppercase hex), e541 MD5revMD5SALT (reversed hex), e542
+          * MD5sub8_24SALT (slice [8:24] of hex). No new GPU_TEMPLATE_*
+          * enum; resolver returns kern_template_phase0_md5salt for all 4.
+          * B6.8 (2026-05-06): JOB_MD5_MD5SALTMD5PASS (e367) joins as
+          * algo_mode=4. Outer MD5 over hex32(MD5(salt)) || hex32(MD5(pass)).
+          * Salt-hex pre-computed by host (saltsnap[].hashsalt populated at
+          * mdxfind.c:46989-47015 for this job type); host packs it into
+          * salt_buf via gpu_pack_salts(use_hashsalt=1). The legacy
+          * gpu_try_pack(...JOB_MD5_MD5SALTMD5PASS...) call at line ~17051
+          * stays in place — structurally unreachable post-category-move
+          * (gpu_op_category returns GPU_CAT_MASK, gpu_try_pack returns 0
+          * for non-GPU_CAT_SALTED/SALTPASS ops). */
+         job->op == JOB_MD5UCSALT ||
+         job->op == JOB_MD5revMD5SALT ||
+         job->op == JOB_MD5sub8_24SALT ||
+         job->op == JOB_MD5_MD5SALTMD5PASS ||
+         /* Family A (2026-05-07): JOB_HMAC_MD5 (e214) + JOB_HMAC_MD5_KPASS
+          * (e792) join the unified template path via the MD5SALT GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches at
+          * the top of template_finalize and returns early. Slab kernels
+          * hmac_md5_ksalt_batch + hmac_md5_kpass_batch are LEFT IN PLACE
+          * (probe_max_dispatch capacity-probe anchor at gpu_opencl.c:1672)
+          * but become structurally unreachable post-category-move
+          * (gpu_op_category returns GPU_CAT_MASK; gpu_try_pack returns 0
+          * for non-GPU_CAT_SALTED/SALTPASS ops). max_iter is forced to 1
+          * host-side at the rules-engine pack site (gpu_opencl.c, mirrors
+          * SHA1DRU). CPU references: mdxfind.c:29250 (KSALT) +
+          * mdxfind.c:29423 (KPASS). */
+         job->op == JOB_HMAC_MD5 ||
+         job->op == JOB_HMAC_MD5_KPASS ||
+         /* Family B (2026-05-07): JOB_HMAC_SHA1 (e215) + JOB_HMAC_SHA1_KPASS
+          * (e793) join the unified template path via the SHA1SALTPASS GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches at
+          * the top of template_finalize (gated on HASH_WORDS==5) and
+          * returns early. Slab kernels hmac_sha1_ksalt_batch +
+          * hmac_sha1_kpass_batch RETIRED in this same commit (no probe
+          * anchor — probe_max_dispatch is anchored on FAM_MD5SALT). max_iter
+          * is forced to 1 host-side at the rules-engine pack site. CPU
+          * references: mdxfind.c:29301 (KSALT) + mdxfind.c:29454 (KPASS). */
+         job->op == JOB_HMAC_SHA1 ||
+         job->op == JOB_HMAC_SHA1_KPASS ||
+         /* Family C (2026-05-07): JOB_HMAC_SHA224 (e216) + JOB_HMAC_SHA224_KPASS
+          * (e794) join the unified template path via the SHA224SALTPASS GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches at
+          * the top of template_finalize (gated on HASH_WORDS==7) and
+          * returns early. Slab kernels hmac_sha224_ksalt_batch +
+          * hmac_sha224_kpass_batch RETIRED in this same commit (no probe
+          * anchor — probe_max_dispatch is anchored on FAM_MD5SALT). max_iter
+          * is forced to 1 host-side at the rules-engine pack site. CPU
+          * references: mdxfind.c:29326 case + HMAC_start label (KSALT) +
+          * mdxfind.c:29479 case + HMAC_KPASS_start label (KPASS).
+          *
+          * Note: prior slab path's gpu_hash_words(HMAC_SHA224)=8 was a
+          * latent bug — kernel emitted h[7] from sha256_block's discarded
+          * working state, so hybrid_check at hexlen=64 would fail any
+          * real hit. Template path corrects to gpu_hash_words=7 (matches
+          * CPU hmac_len=56). */
+         job->op == JOB_HMAC_SHA224 ||
+         job->op == JOB_HMAC_SHA224_KPASS ||
+         /* Family D (2026-05-08): JOB_HMAC_SHA256 (e217) + JOB_HMAC_SHA256_KPASS
+          * (e795) join the unified template path via the SHA256SALTPASS GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches at
+          * the top of template_finalize using RUNTIME gate `if (HASH_WORDS
+          * == 8 && algo_mode >= 5u)` (NEVER `#if`; rev 1.7 Pascal NVIDIA
+          * ABORT lesson — see CRITICAL comment in finalize_prepend_be.cl.frag).
+          * Returns early with the full 8-word digest (no truncation).
+          * Slab kernels hmac_sha256_ksalt_batch + hmac_sha256_kpass_batch
+          * RETIRED in this same commit (gpu_sha256.cl whole-file deleted;
+          * mirrors Family J pattern). max_iter is forced to 1 host-side
+          * at the rules-engine pack site. CPU references: mdxfind.c:29581
+          * case JOB_HMAC_SHA256 + HMAC_start (KSALT, hmac_len=64) +
+          * mdxfind.c:29734 case JOB_HMAC_SHA256_KPASS + HMAC_KPASS_start
+          * (KPASS, hmac_len=64). Final HMAC family in the ladder; HMAC
+          * ladder COMPLETE 21/21 algos shipped. */
+         job->op == JOB_HMAC_SHA256 ||
+         job->op == JOB_HMAC_SHA256_KPASS ||
+         /* Family E HMAC-SHA384 carrier (2026-05-08): JOB_HMAC_SHA384
+          * (e543) + JOB_HMAC_SHA384_KPASS (e796) join the unified
+          * template path via the SHA384SALTPASS-shaped carrier GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches
+          * at the top of template_finalize (gated on HASH_WORDS==12
+          * in finalize_prepend_be64.cl.frag) and returns early. Slab
+          * kernels hmac_sha384_ksalt_batch + hmac_sha384_kpass_batch
+          * RETIRED in this same commit (no probe anchor — probe_max_-
+          * dispatch is anchored on FAM_MD5SALT). max_iter is forced to
+          * 1 host-side at the rules-engine pack site. CPU references:
+          * mdxfind.c:29369 case JOB_HMAC_SHA384 + HMAC_start (KSALT,
+          * hmac_len=96) + mdxfind.c:29522 case JOB_HMAC_SHA384_KPASS +
+          * HMAC_KPASS_start (KPASS, hmac_len=96). */
+         job->op == JOB_HMAC_SHA384 ||
+         job->op == JOB_HMAC_SHA384_KPASS ||
+         /* Family F (2026-05-08): JOB_HMAC_SHA512 (e218) + JOB_HMAC_SHA512_KPASS
+          * (e797) join the unified template path via the SHA512SALTPASS GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches at
+          * the top of template_finalize (gated on HASH_WORDS==16 in
+          * finalize_prepend_be64.cl.frag) and returns early. Slab kernels
+          * hmac_sha512_ksalt_batch + hmac_sha512_kpass_batch RETIRED in
+          * this same commit (whole gpu_hmac_sha512.cl file retired as
+          * Family E already retired its only other live kernels — the
+          * SHA-384 slabs). max_iter is forced to 1 host-side at the rules-
+          * engine pack site. CPU references: mdxfind.c:29400 case JOB_-
+          * HMAC_SHA512 + HMAC_start (KSALT, hmac_len=128) + mdxfind.c:
+          * 29553 case JOB_HMAC_SHA512_KPASS + HMAC_KPASS_start (KPASS,
+          * hmac_len=128). */
+         job->op == JOB_HMAC_SHA512 ||
+         job->op == JOB_HMAC_SHA512_KPASS ||
+         /* Family G HMAC-RIPEMD-160 carrier (2026-05-08): JOB_HMAC_RMD160
+          * (e211) + JOB_HMAC_RMD160_KPASS (e798) join the unified
+          * template path via the RIPEMD160SALTPASS-shaped carrier GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches
+          * at the top of template_finalize (gated on HASH_WORDS==5 in
+          * finalize_prepend_rmd.cl.frag) and returns early. Slab
+          * kernels hmac_rmd160_ksalt_batch + hmac_rmd160_kpass_batch
+          * RETIRED in this same commit (no probe anchor — probe_max_-
+          * dispatch is anchored on FAM_MD5SALT). max_iter is forced to
+          * 1 host-side at the rules-engine pack site. CPU references:
+          * mdxfind.c:29391 case JOB_HMAC_RMD160 + HMAC_start (KSALT,
+          * hmac_len=40) + mdxfind.c:29584 case JOB_HMAC_RMD160_KPASS +
+          * HMAC_KPASS_start (KPASS, hmac_len=40). */
+         job->op == JOB_HMAC_RMD160 ||
+         job->op == JOB_HMAC_RMD160_KPASS ||
+         /* Family H HMAC-RIPEMD-320 carrier (2026-05-08): JOB_HMAC_RMD320
+          * (e213) + JOB_HMAC_RMD320_KPASS (e799) join the unified
+          * template path via the RIPEMD320SALTPASS-shaped carrier GPU
+          * kernel + algo_mode=5/6 runtime variant. HMAC body branches
+          * at the top of template_finalize (gated on HASH_WORDS==10 in
+          * finalize_prepend_rmd.cl.frag — sibling of Family G's
+          * HASH_WORDS==5 RMD160 branch) and returns early. Slab
+          * kernels hmac_rmd320_ksalt_batch + hmac_rmd320_kpass_batch
+          * RETIRED in this same commit (whole-file retirement; no
+          * probe anchor — probe_max_dispatch is anchored on FAM_-
+          * MD5SALT). max_iter is forced to 1 host-side at the rules-
+          * engine pack site. CPU references: mdxfind.c:29428 case
+          * JOB_HMAC_RMD320 + HMAC_start (KSALT, hmac_len=80) +
+          * mdxfind.c:29616 case JOB_HMAC_RMD320_KPASS + HMAC_KPASS_-
+          * start (KPASS, hmac_len=80). */
+         job->op == JOB_HMAC_RMD320 ||
+         job->op == JOB_HMAC_RMD320_KPASS ||
+         /* Family I HMAC-BLAKE2S carrier (2026-05-08): JOB_HMAC_BLAKE2S
+          * (e828) joins the unified template path via the hand-written
+          * Path A carrier GPU template kernel + algo_mode=5 runtime
+          * variant. HMAC body branches at the top of template_finalize
+          * (gated on algo_mode == 5u inline in gpu_hmac_blake2s_core.cl
+          * — NOT in a fragment; Path A keeps the core self-contained)
+          * and returns early. Slab kernel hmac_blake2s_kpass_batch
+          * RETIRED in this same commit (whole-file retirement; no probe
+          * anchor — probe_max_dispatch is anchored on FAM_MD5SALT).
+          * max_iter is forced to 1 host-side at the rules-engine pack
+          * site. CPU reference: mdxfind.c:30341 case JOB_HMAC_BLAKE2S +
+          * checkhashsalt(curin, 64, s1, saltlen, 0, job) (hmac_len=64
+          * hex chars / 32 bytes). Single algo_mode — no KPASS sibling
+          * op exists in mdxfind for HMAC-BLAKE2S (the algorithm is
+          * KPASS-shape but named without -KPASS suffix). */
+         job->op == JOB_HMAC_BLAKE2S ||
+         /* Family J HMAC-STREEBOG-256 carrier (2026-05-08): JOB_HMAC_-
+          * STREEBOG256_KSALT (e838) + JOB_HMAC_STREEBOG256_KPASS (e837)
+          * join the unified template path via the hand-written Path A
+          * carrier GPU template kernel + algo_mode=5/6 runtime variant.
+          * HMAC body branches at the top of template_finalize (gated
+          * on algo_mode >= 5u inline in gpu_hmac_streebog256_core.cl —
+          * NOT in a fragment; Path A keeps the core self-contained;
+          * single branch covers both KSALT + KPASS since kernel-side
+          * math is identical) and returns early. Slab kernels hmac_-
+          * streebog256_kpass_batch + hmac_streebog256_ksalt_batch
+          * SURGICALLY DELETED in this same commit (KEEP streebog512
+          * HMAC kernels — Family K scope; surgical block delete, not
+          * whole-file). max_iter is forced to 1 host-side at the
+          * rules-engine pack site (HMAC has no CPU iter loop). CPU
+          * references: mdxfind.c:30764 JOB_HMAC_STREEBOG256_KPASS +
+          * mdxfind.c:30822 JOB_HMAC_STREEBOG256_KSALT — both call
+          * checkhashsalt(curin, 64, s1, saltlen, 0, job) (hmac_len=64
+          * hex chars / 32 bytes; iter=0 sentinel). */
+         job->op == JOB_HMAC_STREEBOG256_KSALT ||
+         job->op == JOB_HMAC_STREEBOG256_KPASS ||
+         /* Family K HMAC-STREEBOG-512 carrier (2026-05-08): JOB_HMAC_-
+          * STREEBOG512_KSALT (e840) + JOB_HMAC_STREEBOG512_KPASS (e839)
+          * join the unified template path via the hand-written Path A
+          * carrier GPU template kernel (gpu_hmac_streebog512_core.cl) +
+          * algo_mode=5/6 runtime variant. HMAC body branches at the top
+          * of template_finalize (gated on algo_mode >= 5u inline in
+          * gpu_hmac_streebog512_core.cl - NOT in a fragment; Path A
+          * keeps the core self-contained; single branch covers both
+          * KSALT + KPASS since kernel-side math is identical) and
+          * returns early. Slab kernels hmac_streebog512_kpass_batch +
+          * hmac_streebog512_ksalt_batch SURGICALLY DELETED in this same
+          * commit (whole-file #if 0 wrap; gpu_streebog.cl is empty post-
+          * Family-K retirement - B10 retired unsalted streebog batches
+          * earlier; Family J retired streebog256 HMACs). max_iter is
+          * forced to 1 host-side at the rules-engine pack site (HMAC
+          * has no CPU iter loop). CPU references: mdxfind.c:30918
+          * JOB_HMAC_STREEBOG512_KPASS + mdxfind.c:30975 JOB_HMAC_-
+          * STREEBOG512_KSALT - both call checkhashsalt(curin, 128, s1,
+          * saltlen, 0, job) (hmac_len=128 hex chars / 64 bytes; iter=0
+          * sentinel). Final HMAC family in the ladder. */
+         job->op == JOB_HMAC_STREEBOG512_KSALT ||
+         job->op == JOB_HMAC_STREEBOG512_KPASS ||
+         /* PHPBB3 carrier (2026-05-08): JOB_PHPBB3 (e455) joins the
+          * unified template path via the hand-written Path A carrier
+          * GPU template kernel (gpu_phpbb3_core.cl). Iterated MD5
+          * chain (count = 1 << itoa64(salt[3]); typically 128..2^30
+          * iters) runs INSIDE template_finalize; only the FINAL state
+          * is probed (matches CPU semantics at mdxfind.c:13620 which
+          * calls checkhashbb ONCE after the for-loop). max_iter forced
+          * to 1 host-side at the rules-engine pack site so the kernel's
+          * outer iter loop runs exactly once and template_iterate (a
+          * stub) is never called. Slab kernel phpbb3_batch (gpu_phpbb3.cl)
+          * RETIRED in this same commit (whole-file retirement; FAM_-
+          * PHPBB3 had only this one live kernel; probe_max_dispatch is
+          * anchored on FAM_MD5SALT so retirement does not require a
+          * probe migration). CPU reference: mdxfind.c JOB_PHPBB3 at
+          * lines 13415-13628 + checkhashbb at line 13620 (also lines
+          * 13706/13732 for the SCALAR fallback paths). The chokepoint
+          * admit gates job->clen <= 39 implicitly via the existing
+          * gate at mdxfind.c:13450 (which short-circuits to GPU only
+          * for <=39-byte passwords); the kernel re-applies the cap
+          * defensively. Mirrors SHA1DRU pattern (B6.11 precedent;
+          * iterated-crypt with internal iter count). */
+         job->op == JOB_PHPBB3 ||
+         /* MD5CRYPT carrier (2026-05-08): JOB_MD5CRYPT (e511) joins the
+          * unified template path via the hand-written Path A carrier
+          * GPU template kernel (gpu_md5crypt_core.cl). Iterated MD5
+          * chain (FIXED 1000 iters per BSD $1$ md5crypt) runs INSIDE
+          * template_finalize; only the FINAL state is probed (matches
+          * CPU semantics at mdxfind.c:13071 which calls hybrid_check
+          * ONCE after the for-loop). max_iter forced to 1 host-side at
+          * the rules-engine pack site so the kernel's outer iter loop
+          * runs exactly once and template_iterate (a stub) is never
+          * called. Slab kernel md5crypt_batch (gpu_md5crypt.cl) RETIRED
+          * in this same commit (whole-file retirement; FAM_MD5CRYPT had
+          * only this one live kernel; probe_max_dispatch is anchored on
+          * FAM_MD5SALT so retirement does not require a probe migration).
+          * CPU reference: mdxfind.c JOB_MD5CRYPT at lines 13017-13117 +
+          * hybrid_check at line 13071. Mirrors PHPBB3 / SHA1DRU pattern
+          * (iterated-crypt with internal iter count). Phase 1 of the
+          * Unix-crypt ladder (MD5CRYPT -> SHA256CRYPT -> SHA512CRYPT ->
+          * SHA512CRYPTMD5). */
+         job->op == JOB_MD5CRYPT ||
+         /* SHA256CRYPT carrier (2026-05-08): JOB_SHA256CRYPT (e512) joins
+          * the unified template path via the SHACRYPT shared core
+          * (gpu_shacrypt_core.cl at HASH_WORDS=8). 5-step glibc crypt-
+          * sha256 chain (default 5000 rounds; configurable via
+          * "rounds=N$" salt prefix decoded INSIDE the kernel) runs
+          * INSIDE template_finalize; only the FINAL state is probed
+          * (matches CPU semantics at mdxfind.c:12290 which has ONE
+          * checkhash-equivalent call after the inner for-loop).
+          * max_iter forced to 1 host-side at the rules-engine pack site
+          * so the kernel's outer iter loop runs exactly once and
+          * template_iterate (a stub) is never called. Slab kernel
+          * sha256crypt_batch (gpu_sha256crypt.cl) RETIRED in this same
+          * commit (whole-file retirement; FAM_SHA256CRYPT had only this
+          * one live kernel; probe_max_dispatch is anchored on FAM_-
+          * MD5SALT so retirement does not require a probe migration).
+          * CPU reference: mdxfind.c JOB_SHA256CRYPT entry at line 12121
+          * + shared crypt_round body at 12177-12290. Phase 2 of the
+          * Unix-crypt ladder. */
+         job->op == JOB_SHA256CRYPT ||
+         /* SHA512CRYPT carrier (2026-05-08): JOB_SHA512CRYPT (e513) joins
+          * the unified template path via the SHACRYPT shared core
+          * (gpu_shacrypt_core.cl at HASH_WORDS=16). 5-step glibc crypt-
+          * sha512 chain (default 5000 rounds; configurable via
+          * "rounds=N$" salt prefix decoded INSIDE the kernel) runs
+          * INSIDE template_finalize; only the FINAL state is probed
+          * (matches CPU semantics at mdxfind.c:12290 which has ONE
+          * checkhash-equivalent call after the inner for-loop).
+          * max_iter forced to 1 host-side at the rules-engine pack site
+          * so the kernel's outer iter loop runs exactly once and
+          * template_iterate (a stub) is never called. SHA512CRYPTMD5
+          * (e510) REMAINS on the slab path for now (Phase 4 will move
+          * it). CPU reference: mdxfind.c JOB_SHA512CRYPT entry at line
+          * 12183 + shared crypt_round body at 12177-12290 (cryptlen=64
+          * branch). Phase 3 of the Unix-crypt ladder. */
+         job->op == JOB_SHA512CRYPT ||
+         /* SHA512CRYPTMD5 carrier (2026-05-08): JOB_SHA512CRYPTMD5 (e510)
+          * joins the unified template path via the SHACRYPT shared core
+          * (gpu_shacrypt_core.cl at HASH_WORDS=16). REUSES the SAME
+          * compiled program/kernel as Phase 3 SHA512CRYPT — both have
+          * BASE_ALGO=sha512crypt + HASH_WORDS=16 + HAS_SALT=1 +
+          * SALT_POSITION=PREPEND. Distinction is purely in the HOST:
+          * mdxfind.c:12256-12258 swaps job->pass with the 32-char MD5
+          * hex of the original password BEFORE gpu_try_pack — the GPU
+          * sees a 32-byte ASCII-hex "password" and runs the SAME
+          * SHA-512 crypt chain as SHA512CRYPT. CPU semantics at
+          * mdxfind.c:12199-12212 (mymd5+prmd5 -> goto crypt_round to
+          * the cryptlen=64 branch). Phase 4 of the Unix-crypt ladder. */
+         job->op == JOB_SHA512CRYPTMD5 ||
+         /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): JOB_DESCRYPT
+          * (e500) joins the unified template path via the hand-written
+          * Path A carrier (gpu_descrypt_core.cl). 25-iter DES Feistel
+          * chain (FIXED iteration count per Unix DES crypt(3) "old-style")
+          * runs INSIDE template_finalize; only the FINAL state is probed
+          * (matches CPU semantics at mdxfind.c:23673 which calls JSLG
+          * once after the bsd_crypt_des for-loop). max_iter forced to 1
+          * host-side at the rules-engine pack site. Slab kernel
+          * descrypt_batch (gpu_descrypt.cl) RETIRED in this same commit.
+          * probe_max_dispatch is anchored on FAM_MD5SALT (hmac_md5_-
+          * ksalt_batch), not FAM_DESCRYPT, so retirement does not
+          * require a probe migration. CPU reference: mdxfind.c
+          * JOB_DESCRYPT at lines 23636-23722 + crypt-des.c bsd_crypt_des.
+          * Truncation strategy is hybrid: (a) host-side at the rules-
+          * engine pack site below (line ~11021) clamps pack_len = 8 for
+          * post-rule outputs > 8 bytes (honors user's "prior to
+          * dispatching" intent); (b) kernel-side defensive `if (plen >
+          * 8) plen = 8;` cap; (c) implicit DES key schedule truncation
+          * via the 8-byte fixed key buffer. The salt-pack filter at
+          * gpujob_opencl.c gpu_pack_salts skips saltlen != 2 entries so
+          * extended-DES `_CCCCSSSS` 9-char salts CPU-fallback through
+          * bsd_crypt_des (extended DES is OUT OF SCOPE for the GPU
+          * Phase 5 kernel; admitted via the chokepoint here regardless,
+          * but no salts pass through and the dispatch is a structural
+          * no-op for those hashes). Phase 5 of the Unix-crypt ladder
+          * (FINAL phase; Unix-crypt slab path fully retired across all
+          * 5 Unix-crypt ops). */
+         job->op == JOB_DESCRYPT ||
+         /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): JOB_BCRYPT
+          * (e450) joins the unified template path via the hand-written
+          * Path A carrier (gpu_bcrypt_core.cl). 2^cost Eksblowfish chain
+          * (cost parsed per-salt-string at kernel entry; SIMT divergence
+          * accepted per Q3 user decision) runs INSIDE template_finalize;
+          * only the FINAL state is probed (CPU semantics: bcrypt yields
+          * a single 24-byte digest per crypt_rn call). max_iter forced
+          * to 1 host-side at the rules-engine pack site. Slab kernel
+          * bcrypt_batch (gpu_bcrypt.cl) RETIRED in this same commit.
+          * probe_max_dispatch is anchored on FAM_MD5SALT (hmac_md5_-
+          * ksalt_batch), not FAM_BCRYPT, so retirement does not require
+          * a probe migration. CPU reference: mdxfind.c JOB_BCRYPT at
+          * lines 14169-14230 + bcrypt-master/crypt_blowfish/wrapper.c
+          * crypt_rn ("chars after 72 are ignored"). Truncation strategy
+          * is HYBRID: (a) host-side at the rules-engine pack site below
+          * (line ~11082) clamps pack_len = 72 for post-rule outputs >
+          * 72 bytes (honors user's "prior to dispatching" intent);
+          * (b) kernel-side defensive `if (len > 72) len = 72;` cap in
+          * gpu_bcrypt_core.cl template_finalize. Workgroup-shared
+          * __local Eksblowfish state via GPU_TEMPLATE_HAS_LOCAL_BUFFER
+          * scaffold extension (4 KB per lane × BCRYPT_WG_SIZE=8 lanes
+          * = 32 KB per WG, fits Pascal/RDNA/Mali-T860). Compound
+          * siblings BCRYPTMD5 (e451) / BCRYPTSHA1 (e452) / BCRYPTSHA512
+          * (e967) remain CPU-only via gpu_op_category default fall-
+          * through; only JOB_BCRYPT singleton is admitted here. Phase 6
+          * of the slab-retirement ladder (final major slab kernel). */
+         job->op == JOB_BCRYPT) &&
+        mask_b71_eligible &&
+        !Email && !Keys &&
+        !Printall &&
+        (Numrules == 0 || currule != NULL) &&
+        /* B6 salt-axis (2026-05-06): for salted ops require a non-empty
+         * salt snapshot built by the procjob preamble at line ~10112.
+         * Without salts the GPU dispatch is structurally a no-op (the
+         * salt-page outer loop in gpu_opencl_dispatch_md5_rules early-
+         * exits on this_page_salts==0); avoid the round-trip by gating
+         * here. Unsalted ops short-circuit the conjunct because their
+         * arm of the OR-chain is the dominant condition.
+         * B6.1 SHA1 fan-out (2026-05-06): JOB_SHA1SALTPASS joins the
+         * salted-op set for this guard.
+         * B6.2 SHA256 fan-out (2026-05-06): JOB_SHA256SALTPASS joins
+         * the salted-op set for this guard.
+         * B6.3 SHA224 fan-out (2026-05-06): JOB_SHA224SALTPASS joins
+         * the salted-op set for this guard. */
+        ((job->op != JOB_MD5SALT &&
+          job->op != JOB_MD5SALTPASS &&
+          job->op != JOB_SHA1SALTPASS &&
+          job->op != JOB_SHA256SALTPASS &&
+          job->op != JOB_SHA224SALTPASS &&
+          /* B6.4 MD5PASSSALT fan-out (2026-05-06): JOB_MD5PASSSALT joins
+           * the salted-op set for this guard. Salt-snapshot precondition
+           * identical to MD5SALTPASS — only finalize-time byte order
+           * differs. */
+          job->op != JOB_MD5PASSSALT &&
+          /* B6.5 SHA1PASSSALT fan-out (2026-05-06): JOB_SHA1PASSSALT joins
+           * the salted-op set for this guard. Salt-snapshot precondition
+           * identical to SHA1SALTPASS — only finalize-time byte order
+           * differs. */
+          job->op != JOB_SHA1PASSSALT &&
+          /* B6.7 SHA256PASSSALT fan-out (2026-05-06): JOB_SHA256PASSSALT
+           * joins the salted-op set for this guard. Salt-snapshot
+           * precondition identical to SHA256SALTPASS — only finalize-time
+           * byte order differs. */
+          job->op != JOB_SHA256PASSSALT &&
+          /* B6.9 SHA512 fan-out (2026-05-06): JOB_SHA512SALTPASS joins
+           * the salted-op set for this guard. Salt-snapshot precondition
+           * identical to SHA256SALTPASS — only the underlying compression
+           * primitive width differs (sha512_block vs sha256_block) at
+           * the kernel side; the salt buffer plumbing is identical. */
+          job->op != JOB_SHA512SALTPASS &&
+          /* B6.10 SHA512PASSSALT fan-out (2026-05-06): JOB_SHA512PASSSALT
+           * joins the salted-op set for this guard. Salt-snapshot
+           * precondition identical to SHA512SALTPASS — only finalize-
+           * time byte order differs (APPEND vs PREPEND), invisible at
+           * the salt-snapshot level. FINAL B6 ladder step. */
+          job->op != JOB_SHA512PASSSALT &&
+          /* B6.6 (2026-05-06): MD5SALT family variants — same salt-snapshot
+           * precondition as e31 MD5SALT. */
+          job->op != JOB_MD5UCSALT &&
+          job->op != JOB_MD5revMD5SALT &&
+          job->op != JOB_MD5sub8_24SALT &&
+          /* B6.8 (2026-05-06): JOB_MD5_MD5SALTMD5PASS (e367) — same
+           * salt-snapshot precondition as e31 MD5SALT (the snapshot is
+           * built by build_hashsalt_snapshot in the procjob preamble at
+           * mdxfind.c:10141, populating saltsnap[].hashsalt for use by
+           * the GPU pack site). */
+          job->op != JOB_MD5_MD5SALTMD5PASS &&
+          /* Family A (2026-05-07): JOB_HMAC_MD5 + JOB_HMAC_MD5_KPASS —
+           * salt-snapshot precondition. KSALT (e214) reads from Typeuser
+           * (HMAC key); KPASS (e792) reads from Typesalt (HMAC message).
+           * gpu_salt_judy() resolves the right Judy at the GPU pack
+           * site. Without a non-empty snapshot the GPU dispatch would
+           * be a no-op (the salt-page outer loop early-exits on
+           * this_page_salts==0). */
+          job->op != JOB_HMAC_MD5 &&
+          job->op != JOB_HMAC_MD5_KPASS &&
+          /* Family B (2026-05-07): JOB_HMAC_SHA1 + JOB_HMAC_SHA1_KPASS —
+           * salt-snapshot precondition (same shape as Family A; only the
+           * underlying hash differs). gpu_salt_judy() resolves Typeuser
+           * for KSALT (e215) / Typesalt for KPASS (e793). */
+          job->op != JOB_HMAC_SHA1 &&
+          job->op != JOB_HMAC_SHA1_KPASS &&
+          /* Family C (2026-05-07): JOB_HMAC_SHA224 + JOB_HMAC_SHA224_KPASS —
+           * salt-snapshot precondition (same shape as Family B; SHA224
+           * digest width). gpu_salt_judy() resolves Typeuser for KSALT
+           * (e216) / Typesalt for KPASS (e794). */
+          job->op != JOB_HMAC_SHA224 &&
+          job->op != JOB_HMAC_SHA224_KPASS &&
+          /* Family D (2026-05-08): JOB_HMAC_SHA256 + JOB_HMAC_SHA256_KPASS —
+           * salt-snapshot precondition (same shape as Family C; SHA256
+           * digest width). gpu_salt_judy() resolves Typeuser for KSALT
+           * (e217) / Typesalt for KPASS (e795). HMAC body uses RUNTIME
+           * gate (NEVER `#if`; rev 1.7 Pascal NVIDIA ABORT lesson).
+           * Final HMAC family in the ladder. */
+          job->op != JOB_HMAC_SHA256 &&
+          job->op != JOB_HMAC_SHA256_KPASS &&
+          /* Family E HMAC-SHA384 carrier (2026-05-08): JOB_HMAC_SHA384 +
+           * JOB_HMAC_SHA384_KPASS — salt-snapshot precondition. KSALT
+           * (e543) reads from Typeuser (HMAC key); KPASS (e796) reads
+           * from Typesalt (HMAC message). gpu_salt_judy() resolves the
+           * right Judy at the GPU pack site. Same shape as Families A/B/C
+           * — only digest width and underlying compression differ. */
+          job->op != JOB_HMAC_SHA384 &&
+          job->op != JOB_HMAC_SHA384_KPASS &&
+          /* Family F (2026-05-08): JOB_HMAC_SHA512 + JOB_HMAC_SHA512_KPASS —
+           * salt-snapshot precondition. KSALT (e218) reads from Typeuser
+           * (HMAC key); KPASS (e797) reads from Typesalt (HMAC message).
+           * gpu_salt_judy() resolves the right Judy at the GPU pack site.
+           * Same shape as Families A/B/C/E — only digest width differs
+           * (16 LE uint32 = 64 bytes, no truncation). */
+          job->op != JOB_HMAC_SHA512 &&
+          job->op != JOB_HMAC_SHA512_KPASS &&
+          /* Family G HMAC-RIPEMD-160 carrier (2026-05-08): JOB_HMAC_RMD160
+           * + JOB_HMAC_RMD160_KPASS — salt-snapshot precondition. KSALT
+           * (e211) reads from Typeuser (HMAC key); KPASS (e798) reads
+           * from Typesalt (HMAC message). gpu_salt_judy() resolves the
+           * right Judy at the GPU pack site. Same shape as Families
+           * A/B/C/E/F — only digest width differs (5 LE uint32 = 20
+           * bytes; LE-direct convention vs SHA-1's BE-bswap). */
+          job->op != JOB_HMAC_RMD160 &&
+          job->op != JOB_HMAC_RMD160_KPASS &&
+          /* Family H HMAC-RIPEMD-320 carrier (2026-05-08): JOB_HMAC_RMD320
+           * + JOB_HMAC_RMD320_KPASS — salt-snapshot precondition. KSALT
+           * (e213) reads from Typeuser (HMAC key); KPASS (e799) reads
+           * from Typesalt (HMAC message). gpu_salt_judy() resolves the
+           * right Judy at the GPU pack site. Same shape as Families
+           * A/B/C/E/F/G — only digest width differs (10 LE uint32 = 40
+           * bytes; LE-direct convention shared with RMD160 sibling). */
+          job->op != JOB_HMAC_RMD320 &&
+          job->op != JOB_HMAC_RMD320_KPASS &&
+          /* Family I HMAC-BLAKE2S carrier (2026-05-08): JOB_HMAC_BLAKE2S
+           * — salt-snapshot precondition. The op is KPASS-shape (key=pass,
+           * msg=salt) so the "salt" source is Typesalt (HMAC message);
+           * gpu_salt_judy(JOB_HMAC_BLAKE2S) resolves Typesalt at the GPU
+           * pack site. Same shape as Families A/B/C/E/F/G/H — only digest
+           * width differs (8 LE uint32 = 32 bytes; LE-direct convention
+           * shared with BLAKE2S256 sibling). Single algo_mode (5); no
+           * KPASS sibling op variant for HMAC-BLAKE2S. */
+          job->op != JOB_HMAC_BLAKE2S &&
+          /* Family J HMAC-STREEBOG-256 carrier (2026-05-08): JOB_HMAC_-
+           * STREEBOG256_KSALT + JOB_HMAC_STREEBOG256_KPASS — salt-
+           * snapshot precondition. UNLIKE Families A/B/C/E/F/G/H whose
+           * KSALT siblings have TYPEOPT_NEEDUSER (salt-data in Typeuser),
+           * Streebog-256 HMAC KSALT (e838) has TYPEOPT_NEEDSALT — salt-
+           * data lives in Typesalt[op] just like KPASS (e837). gpu_salt_-
+           * judy() routes both ops to the Typesalt default arm. Same
+           * shape as siblings on the digest-width axis (8 LE uint32 =
+           * 32 bytes; LE-direct convention from the slab Streebog-256
+           * kernel). Two algo_modes (5 KSALT / 6 KPASS) distinguish at
+           * the kernel level (see template_finalize in gpu_hmac_-
+           * streebog256_core.cl which swaps the (key, msg) source mapping
+           * between data and salt_bytes per algo_mode). */
+          job->op != JOB_HMAC_STREEBOG256_KSALT &&
+          job->op != JOB_HMAC_STREEBOG256_KPASS &&
+          /* Family K HMAC-STREEBOG-512 carrier (2026-05-08): JOB_HMAC_-
+           * STREEBOG512_KSALT + JOB_HMAC_STREEBOG512_KPASS - salt-
+           * snapshot precondition. Same TYPEOPT_NEEDSALT routing as
+           * Family J STREEBOG-256 (BOTH KSALT and KPASS have salt-data
+           * in Typesalt[op] per mdxfind.c lines 7057-7058). gpu_salt_-
+           * judy() routes both ops to the Typesalt default arm. Same
+           * shape as Family J on the digest-width axis (16 LE uint32 =
+           * 64 bytes, vs Family J's 8 LE uint32 = 32 bytes; LE-direct
+           * convention from the slab Streebog-512 kernel). Two algo_-
+           * modes (5 KSALT / 6 KPASS) distinguish at the kernel level
+           * (see template_finalize in gpu_hmac_streebog512_core.cl which
+           * swaps the (key, msg) source mapping between data and salt_-
+           * bytes per algo_mode). Final HMAC family in the ladder. */
+          job->op != JOB_HMAC_STREEBOG512_KSALT &&
+          job->op != JOB_HMAC_STREEBOG512_KPASS &&
+          /* PHPBB3 carrier (2026-05-08): JOB_PHPBB3 — salt-snapshot
+           * precondition. The salt source is Typesalt[JOB_PHPBB3]
+           * (TYPEOPT_NEEDSALT default) — gpu_salt_judy(JOB_PHPBB3)
+           * resolves Typesalt at the GPU pack site. The salt snapshot
+           * carries the full 12-byte "$H$<cost><8>" prefix; the
+           * 8-byte-salt + cost-char are read inside template_finalize
+           * (salt_bytes[4..11] for step 1; salt_bytes[3] for the iter-
+           * count decode). gpu_pack_salts is called with use_hashsalt=
+           * 0 (no hashsalt synthesis). Without a non-empty snapshot
+           * the GPU dispatch would be a no-op (the salt-page outer
+           * loop in gpu_opencl_dispatch_md5_rules early-exits on
+           * this_page_salts==0). */
+          job->op != JOB_PHPBB3 &&
+          /* MD5CRYPT carrier (2026-05-08): JOB_MD5CRYPT — salt-snapshot
+           * precondition. The salt source is Typesalt[JOB_MD5CRYPT]
+           * (TYPEOPT_NEEDSALT default) -- gpu_salt_judy(JOB_MD5CRYPT)
+           * resolves Typesalt at the GPU pack site. The salt snapshot
+           * carries the full variable-length "$1$<salt>$" prefix
+           * (5..12 bytes); the raw salt is extracted inside template_-
+           * finalize by skipping salt_bytes[0..2] ("$1$") and reading
+           * until '$' or end-of-buffer (cap 8 bytes). gpu_pack_salts is
+           * called with use_hashsalt=0 (no hashsalt synthesis). Without
+           * a non-empty snapshot the GPU dispatch would be a no-op (the
+           * salt-page outer loop in gpu_opencl_dispatch_md5_rules
+           * early-exits on this_page_salts==0). Phase 1 of the Unix-
+           * crypt ladder. */
+          job->op != JOB_MD5CRYPT &&
+          /* SHA256CRYPT carrier (2026-05-08): JOB_SHA256CRYPT -- salt-
+           * snapshot precondition. The salt source is Typesalt[JOB_-
+           * SHA256CRYPT] (TYPEOPT_NEEDSALT default) -- gpu_salt_judy
+           * (JOB_SHA256CRYPT) resolves Typesalt at the GPU pack site.
+           * The salt snapshot carries the full variable-length
+           * "$5$[rounds=N$]<salt>$" prefix; the kernel parses + extracts
+           * raw_salt up to 16 bytes inline in template_finalize.
+           * gpu_pack_salts is called with use_hashsalt=0 (no hashsalt
+           * synthesis). Without a non-empty snapshot the GPU dispatch
+           * would be a no-op (salt-page outer loop early-exits on
+           * this_page_salts==0). Phase 2 of the Unix-crypt ladder. */
+          job->op != JOB_SHA256CRYPT &&
+          /* SHA512CRYPT carrier (2026-05-08): JOB_SHA512CRYPT -- salt-
+           * snapshot precondition. The salt source is Typesalt[JOB_-
+           * SHA512CRYPT] (TYPEOPT_NEEDSALT default) -- gpu_salt_judy
+           * (JOB_SHA512CRYPT) resolves Typesalt at the GPU pack site.
+           * The salt snapshot carries the full variable-length
+           * "$6$[rounds=N$]<salt>$" prefix; the kernel parses + extracts
+           * raw_salt up to 16 bytes inline in template_finalize.
+           * gpu_pack_salts is called with use_hashsalt=0 (no hashsalt
+           * synthesis). Without a non-empty snapshot the GPU dispatch
+           * would be a no-op (salt-page outer loop early-exits on
+           * this_page_salts==0). Phase 3 of the Unix-crypt ladder. */
+          job->op != JOB_SHA512CRYPT &&
+          /* SHA512CRYPTMD5 carrier (2026-05-08): JOB_SHA512CRYPTMD5 --
+           * salt-snapshot precondition. Salt source is Typesalt[JOB_-
+           * SHA512CRYPTMD5] (TYPEOPT_NEEDSALT default) -- gpu_salt_judy
+           * (JOB_SHA512CRYPTMD5) resolves Typesalt at the GPU pack site.
+           * Salt content is identical to JOB_SHA512CRYPT (both share
+           * "$6$[rounds=N$]<salt>$" prefix; mdxfind.c:47077-47087
+           * inserts the same line into BOTH Judy arrays). Phase 4 of
+           * the Unix-crypt ladder. */
+          job->op != JOB_SHA512CRYPTMD5 &&
+          /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): JOB_-
+           * DESCRYPT -- salt-snapshot precondition. Salt source is
+           * Typesalt[JOB_DESCRYPT] (TYPEOPT_NEEDSALT|TYPEOPT_SALTJUDY
+           * at mdxfind.c:6742). gpu_salt_judy(JOB_DESCRYPT) routes to
+           * the Typesalt default arm. The salt snapshot carries the
+           * 2-byte phpitoa64 salt (mdxfind.c:44649 stores 2 bytes via
+           * JSLI(JudyJ[JOB_DESCRYPT], line) and store_typesalt(JOB_-
+           * DESCRYPT, line, 2)). gpu_pack_salts is called with use_-
+           * hashsalt=0 (no hashsalt synthesis); the salt-pack filter
+           * at gpu_pack_salts skips saltlen != 2 entries so extended-
+           * DES `_CCCCSSSS` 9-char salts CPU-fallback through bsd_-
+           * crypt_des. Without a non-empty snapshot the GPU dispatch
+           * would be a no-op (the salt-page outer loop in gpu_opencl_-
+           * dispatch_md5_rules early-exits on this_page_salts==0). Phase
+           * 5 of the Unix-crypt ladder (FINAL phase). */
+          job->op != JOB_DESCRYPT &&
+          /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): JOB_BCRYPT --
+           * salt-snapshot precondition. Salt source is Typesalt[JOB_-
+           * BCRYPT] (TYPEOPT_NEEDSJ|TYPEOPT_SALTJUDY at mdxfind.c:6695).
+           * gpu_salt_judy(JOB_BCRYPT) routes to the Typesalt default
+           * arm. The salt snapshot carries the FULL 60-char (or 59-char
+           * $2k variant) "$2[abkxy]$NN$<22-b64-salt><31-b64-hash>"
+           * crypt(3) hash line (mdxfind.c:40402-40436 stores via JSLI
+           * + store_typesalt with the full line as both Judy key and
+           * Typesalt entry). gpu_pack_salts is called with use_-
+           * hashsalt=0 (no hashsalt synthesis); kernel parses cost +
+           * variant + raw-salt inline from salt_bytes[0..salt_len)
+           * inside template_finalize. Without a non-empty snapshot the
+           * GPU dispatch would be a no-op (the salt-page outer loop in
+           * gpu_opencl_dispatch_md5_rules early-exits on this_page_-
+           * salts==0). Phase 6 of the slab-retirement ladder (final
+           * major slab kernel). */
+          job->op != JOB_BCRYPT) ||
+         nsalts_job > 0) &&
+        len > 0 && len <= GPU_RULES_MAX_INPUT_LEN) {
+      /* Maxiter > 1 is now handled by the iter loop inside
+       * md5_rules_phase0 (mirrors gpu_md5_packed.cl). The host upload
+       * path passes Maxiter via gpu_opencl_set_max_iter; the kernel
+       * emits 1-indexed iter levels that checkhash() decodes into the
+       * MD5x01 / MD5x02 / ... output labels. The existing -i 1 path is
+       * byte-identical to before (single iteration, iter==1 emitted). */
+      /* Slot acquisition + lazy alloc reads its own size fields, set at
+       * gpujob_init time. Pool isolation guarantees the slot's buffer
+       * capacity matches the rules-engine path's needs; cross-pool reuse
+       * is structurally impossible. */
+      if (!my_jobg_rules) {
+        my_jobg_rules = gpujob_get_free_rules(job->filename, job->startline);
+        if (my_jobg_rules) {
+          if (!my_jobg_rules->packed_buf) {
+            /* B1 path: these slot buffers are HOST-ONLY (memcpy'd into
+             * d->h_dispatch_payload at dispatch time, never bound to a
+             * cl_mem). Plain calloc per feedback_hashcat_host_buffer_pattern.md
+             * — eliminates VirtualLock(4194304) and VirtualLock(65536)
+             * failures that flood Shooter's Win NVIDIA stderr without
+             * achieving anything. The driver pins the dispatch_payload
+             * cl_mem internally via USE_HOST_PTR (rev 1.91 of gpu_opencl.c). */
+            my_jobg_rules->packed_buf = (char *)calloc(1, my_jobg_rules->packed_buf_size);
+            if (!my_jobg_rules->packed_buf) {
+              fprintf(stderr, "Out of memory: packed_buf_rules calloc (%zu bytes)\n",
+                      my_jobg_rules->packed_buf_size);
+              exit(1);
+            }
+            my_jobg_rules->word_offset = (uint32_t *)calloc(my_jobg_rules->word_offset_entries, sizeof(uint32_t));
+            if (!my_jobg_rules->word_offset) {
+              fprintf(stderr, "Out of memory: word_offset_rules calloc (%u entries)\n",
+                      my_jobg_rules->word_offset_entries);
+              exit(1);
+            }
+          }
+          my_jobg_rules->op = job->op;
+          my_jobg_rules->filename = job->filename;
+          my_jobg_rules->flags = job->flags;
+          my_jobg_rules->doneprint = job->doneprint;
+          my_jobg_rules->packed = 1;
+          my_jobg_rules->rules_engine = 1;   /* activates sub-commit B dispatch */
+          my_jobg_rules->packed_count = 0;
+          my_jobg_rules->packed_pos = 0;
+        }
+      }
+      if (my_jobg_rules) {
+        /* Always pack to the full slot capacity (GPU_RULES_MAX_WORDS_PER_BATCH
+         * = 16384 words, sized in gpujob.h). Larger batches amortize the
+         * per-dispatch host-side overhead (slot return,
+         * pthread_cond_broadcast, queue dequeue, Tothash update — measured
+         * ~670µs total on Shooter's 12-GPU rig 2026-04-30). At 16K words ×
+         * 100K rules = 1.638B candidates per dispatch, kernel runs ~470ms
+         * on a 4090 vs ~9ms with 256-word batches — gap fraction projects
+         * from 8% to under 1%. Hit-buffer headroom: GPU_PACKED_MAX_HITS =
+         * 1,048,576 (rev 1.35), observed avg ~57 hits per million
+         * candidates puts avg hits/batch at 93K and 5× worst-case at
+         * ~465K — comfortably under cap. The rules-engine path is
+         * single-shot (no chunking/retry); if a batch ever exceeds the
+         * hit cap, gpu_opencl.c warns on stderr at >=90% (approach) and
+         * >=100% (overflow with lost count) — see rev 1.65 of that file. */
+        int max_words_lanes = (int)my_jobg_rules->word_offset_entries;
+        if ((int)my_jobg_rules->packed_count >= max_words_lanes ||
+            my_jobg_rules->packed_pos + 1 + len > my_jobg_rules->packed_buf_size) {
+          gpujob_submit(my_jobg_rules);
+          my_jobg_rules = gpujob_get_free_rules(job->filename, job->startline);
+          if (my_jobg_rules) {
+            if (!my_jobg_rules->packed_buf) {
+              /* Slot buffers are HOST-ONLY in B1 path; see comment at the
+               * matching site above. */
+              my_jobg_rules->packed_buf = (char *)calloc(1, my_jobg_rules->packed_buf_size);
+              if (!my_jobg_rules->packed_buf) {
+                fprintf(stderr, "Out of memory: packed_buf_rules calloc (%zu bytes)\n",
+                        my_jobg_rules->packed_buf_size);
+                exit(1);
+              }
+              my_jobg_rules->word_offset = (uint32_t *)calloc(my_jobg_rules->word_offset_entries, sizeof(uint32_t));
+              if (!my_jobg_rules->word_offset) {
+                fprintf(stderr, "Out of memory: word_offset_rules calloc (%u entries)\n",
+                        my_jobg_rules->word_offset_entries);
+                exit(1);
+              }
+            }
+            my_jobg_rules->op = job->op;
+            my_jobg_rules->filename = job->filename;
+            my_jobg_rules->flags = job->flags;
+            my_jobg_rules->doneprint = job->doneprint;
+            my_jobg_rules->packed = 1;
+            my_jobg_rules->rules_engine = 1;
+            my_jobg_rules->packed_count = 0;
+            my_jobg_rules->packed_pos = 0;
+          }
+        }
+      }
+      if (my_jobg_rules) {
+        if (my_jobg_rules->packed_count >= my_jobg_rules->word_offset_entries) {
+          fprintf(stderr,
+            "BUG: rules-engine word_offset overflow at pack: "
+            "slot_kind=%u packed_count=%u woff_cap_entries=%u "
+            "packed_pos=%u packed_buf_size=%zu len=%d "
+            "gpu_rule_count=%d slot=%p word_offset=%p packed_buf=%p\n",
+            (unsigned)my_jobg_rules->slot_kind,
+            my_jobg_rules->packed_count, my_jobg_rules->word_offset_entries,
+            my_jobg_rules->packed_pos, my_jobg_rules->packed_buf_size,
+            len, gpu_rule_count,
+            (void *)my_jobg_rules,
+            (void *)my_jobg_rules->word_offset,
+            (void *)my_jobg_rules->packed_buf);
+          abort();
+        }
+        my_jobg_rules->word_offset[my_jobg_rules->packed_count] = my_jobg_rules->packed_pos;
+        /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): host-side
+         * truncation clamp for JOB_DESCRYPT at the rules-engine pack
+         * site. Standard DES uses only the first 8 bytes of the key
+         * (crypt-des.c:626 NUL-terminate-on-first-NUL semantics); post-
+         * rule outputs longer than 8 bytes silently truncate to 8 on
+         * the CPU side. We pre-truncate the packed length here so the
+         * GPU receives the same 8-byte canonical form regardless of
+         * whether the rule produced a 9- or 39-byte output. The kernel
+         * has its own defensive `if (plen > 8) plen = 8;` cap as
+         * belt-and-suspenders; the host-side clamp is the architect-
+         * specified honor of the user's "prior to dispatching" intent
+         * for the no-rule synthetic pass. Two distinct rule outputs
+         * that differ only in bytes 9+ collide on the same DES output
+         * (acceptable -- same as CPU). Phase 5 of the Unix-crypt ladder
+         * (FINAL phase). */
+        int pack_len = len;
+        if (job->op == JOB_DESCRYPT && pack_len > 8) pack_len = 8;
+        /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): host-side
+         * truncation clamp for JOB_BCRYPT at the rules-engine pack site.
+         * Standard bcrypt silently truncates passwords > 72 bytes via
+         * BF_set_key key-cycling natural drop semantics (matches CPU
+         * crypt_blowfish/wrapper.c:288 "chars after 72 are ignored").
+         * We pre-truncate the packed length here so the GPU receives
+         * the same 72-byte canonical form regardless of whether the
+         * rule produced a 73-byte or 200-byte output. The kernel has
+         * its own defensive `if (len > 72) len = 72;` cap as belt-and-
+         * suspenders; the host-side clamp is the architect-specified
+         * honor of the user's "prior to dispatching" intent for the
+         * no-rule synthetic pass. Two distinct rule outputs that
+         * differ only in bytes 73+ collide on the same bcrypt output
+         * (acceptable -- same as CPU). Phase 6 of the slab-retirement
+         * ladder (final major slab kernel). */
+        if (job->op == JOB_BCRYPT && pack_len > 72) pack_len = 72;
+        my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] = (char)pack_len;
+        memcpy(my_jobg_rules->packed_buf + my_jobg_rules->packed_pos, cur, pack_len);
+        my_jobg_rules->packed_pos += pack_len;
+        my_jobg_rules->packed_count++;
+        word_packed_by_rules_engine = 1;  /* legacy chokepoint will skip pass0==0 below */
+        /* All rules are GPU-eligible (gpu_legacy_slot_unused) AND this
+         * word packed successfully — the kernel will compute every
+         * (word, rule) pair via the synthetic `:` and the user rules.
+         * The outer rule-walk do/while would otherwise iterate Numrules
+         * times per word just to hit C2.3 and `continue`, which on
+         * HashMob.100k × 200k words is 20 billion no-op iterations.
+         * NULL currule so the outer loop exits after the no-rule pass. */
+        if (gpu_legacy_slot_unused) currule = NULL;
+        /* Memo B Phase B7.1 (2026-05-05): when the rules-engine path
+         * absorbed a single-position append mask, the kernel iterated
+         * every mask_idx for every (word, rule) pair. The outer do/
+         * while would otherwise run MaskCount additional iterations
+         * (the JOBFLAG_NUMBERS branch at the loop bottom: number_iter
+         * < MaskCount), CPU-hashing each one with a stale plaintext
+         * (since currule==NULL means the elif-currule branch's mask
+         * append never fires). Suppress those iterations by jumping
+         * number_iter to the loop bound. Only fires when MaskCount is
+         * set AND gpu_legacy_slot_unused is set (i.e., the rules-engine
+         * path will fully cover this word's (rule, mask) Cartesian).
+         * For mixed GPU+CPU rules (gpu_legacy_slot_unused == 0), the
+         * CPU walker still needs to iterate masks for the CPU rules. */
+        if (gpu_legacy_slot_unused && job->MaskCount &&
+            MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
+            MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
+            (MaskPrependLen + MaskAppendLen) >= 1) {
+          number_iter = (int)job->MaskCount;  /* loop bottom: !(number_iter < MaskCount) */
+        }
+      }
     }
-#endif
+#endif /* OPENCL_GPU */
+    /* fall through: CPU loop handles no-rule pass and CPU-only rules (C2.3 skips GPU rules) */
 
     if (currule) {
 #ifndef NOTINTEL
@@ -9449,6 +11791,13 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
 }
 
 do {
+/* Snapshot pass0 before the unconditional `pass0 = 1` below. The legacy
+ * chokepoint's gpu_skip_no_rule_pack interlock needs to know whether THIS
+ * iteration is the no-rule pass (pass0 was 0 on entry); reading pass0 at
+ * the chokepoint site would always see 1 because line ~9972 mutates it
+ * first, which silently broke the interlock and double-fired the no-rule
+ * pass on every word for 100%-GPU-eligible workloads (task #46). */
+int was_pass0_zero = (pass0 == 0);
 cur = job->line;
 len = orig_len;
 /* For mask with prepend, restore the original word each iteration.
@@ -9495,12 +11844,46 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
       if (*((unsigned short int *) currule) == 0)
         break;
       job->Ruleindex++;
+#ifdef OPENCL_GPU
+      /* C2.3: skip CPU expansion for GPU-eligible rules — kernel handles them.
+       * Ruleindex is 1-based after increment; bitmap is 0-indexed.
+       * B7.1/B7.2: also skip when the chokepoint admitted a multi-
+       * position append mask (n_prepend == 0, n_append in [1, 8],
+       * MaskCount > 0); the kernel iterated mask_idx for every
+       * (rule, word) so CPU re-walk would double-fire. */
+      int b71_mask_skip_ok =
+          !job->MaskCount ||
+          (MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
+           MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
+           (MaskPrependLen + MaskAppendLen) >= 1);
+      if (gpu_rule_membership && my_jobg_rules &&
+          (job->Ruleindex - 1) < (int)Numrules &&
+          gpu_rule_membership[job->Ruleindex - 1] &&
+          gpu_rule_count > 0 && job->op == JOB_MD5 &&
+          b71_mask_skip_ok &&
+          !Email && !Keys && !Printall) {
+        /* Maxiter>1 path: kernel iterates internally (md5_rules_phase0);
+         * see gate at top of word loop for full rationale. */
+        /* Rule is GPU-eligible: advance currule past it and skip CPU applyrule. */
+        currule += *((unsigned short int *) currule) + 2;
+        number_iter = loop_bound;  /* trigger next-rule advance on next iter */
+        job->MaskIndex = 0;
+        continue;
+      }
+#endif /* OPENCL_GPU */
       len = applyrule(tline, cur, orig_len, currule + 2, rule_ws);
       job->len = job->clen = len;
       currule += *((unsigned short int *) currule) + 2;
       if (len < 0) {
-        /* Bad rule: skip ahead. Reset mask state so next iter advances past it. */
-        number_iter = 0;
+        /* len == -2: ruleproc.c:2169 sentinel for "rule output equals input"
+         *            (auto-skip — no-rule pass already covered this candidate).
+         * len == -1: rule failed to apply for some other reason.
+         * Either way skip the hash and move to the next rule. Setting
+         * number_iter to loop_bound (rather than 0) makes the next iter take
+         * the if-branch above and apply the next rule cleanly; resetting to 0
+         * would instead replay the previous rule's mask cycle from rule_base.
+         * Also reset MaskIndex so the new rule's mask sequence starts at 0. */
+        number_iter = loop_bound;
         job->MaskIndex = 0;
         continue;
       }
@@ -9549,27 +11932,17 @@ if (job->flags & JOBFLAG_NUMBERS) {
 		   (int) ((job->Numbers >> 8) & 0xff),
 		   (int) ((job->Numbers) & 0xff));
   else if (job->MaskCount) {
-#ifdef GPU_ENABLED
-    /* Unsalted pre-padded path: pack base word at MaskIndex==0 only.
-     * GPU kernel expands all mask combinations from the pre-padded M[].
-     * Suppress remaining mask iterations by advancing number_iter to the loop limit. */
-    { extern uint64_t gpu_mask_total;
-    /* Phase 3: !Printall so -z mode stays on CPU for full enumeration. */
-    if (gpu_mask_total > 0 && job->MaskIndex == 0 && !Printall &&
-        gpu_try_pack_unsalted(&my_jobg,job,MaskAppendLen,MaskPrependLen,job->line,len)) {
-      number_iter = (int)(job->MaskCount ? job->MaskCount : Iter_Count[job->digits]) - 1;
-      Lfstate = 0;
-      continue;
-    } }
-    /* GPU mask mode (legacy): send base word once, GPU generates all mask candidates.
-     * Suppress remaining mask iterations by advancing number_iter to the loop limit. */
-    if (job->MaskIndex == 0 && gpu_op_category(job->op) == GPU_CAT_MASK &&
-        gpu_try_pack(&my_jobg, job, NULL, 0, 1)) {
-      number_iter = (int)(job->MaskCount ? job->MaskCount : Iter_Count[job->digits]) - 1;
-      Lfstate = 0;
-      continue;
-    }
-#endif
+    /* B9 (2026-05-07): legacy mask short-circuit retired. The prior
+     * #ifdef GPU_ENABLED block packed mask-only-no-rules workloads via
+     * either gpu_try_pack_unsalted (unsalted slab kernels — retired in
+     * this same commit) or gpu_try_pack (legacy mask path — kept for
+     * salted ops). All GPU_CAT_MASK ops now route exclusively through
+     * the unified template / rules-engine path (chokepoint at line ~10299,
+     * gpu_rules_engine_active gate). Mask configurations within
+     * MaskPrependLen <= 16 + MaskAppendLen <= 16 (B7.8 cap) AND admitted
+     * to the rules-engine OR-chain are GPU-handled there; configurations
+     * outside that scope CPU-fall-back per architect §11 (B9 row).
+     * RCS history retains the prior block (mdxfind.c rev 1.420). */
     if (MaskPrependLen > 0 && MaskAppendLen > 0) {
       /* Dual mask: decompose combined index into prepend and append indices */
       unsigned long long idx = job->MaskIndex;
@@ -9821,136 +12194,50 @@ do {
 
 
 #ifdef GPU_ENABLED
-    /* GPU packed dispatch: pack candidate and skip CPU switch.
-     * do_pack_gpu is set once at job start based on op + mode. */
-    if (do_pack_gpu && len >= 0 && len <= gpu_maxlen) {
-      /* Build one or more encoded variants of this candidate.
-       * Most ops: one variant == raw bytes.
-       * JOB_NTLMH: one variant == UTF-16LE zero-extend (hashcat-compatible).
-       * JOB_NTLM:  up to 3 UTF-16LE variants (utf-8 iconv, zero-extend, cp1251 iconv),
-       *            deduped via memcmp to avoid redundant submissions for ASCII input.
-       * Hit-reconstruction logic in gpujob_opencl.c / gpujob_metal.m reverses
-       * the encoding by op: NTLMH strips 0x00 high bytes, NTLM iconvs back to utf-8.
-       */
-      char pkg_enc[3][256];
-      int  pkg_enc_len[3];
-      int  pkg_nvariants = 1;
-      pkg_enc_len[0] = len;
-      if (len > 0) memcpy(pkg_enc[0], cur, len);
-      if (job->op == JOB_NTLMH) {
-        /* Single UTF-16LE zero-extended variant — matches hashcat -m 1000 exactly. */
-        pkg_nvariants = 1;
-        pkg_enc_len[0] = 2 * len;
-        to_utf16le(cur, pkg_enc[0], len);
-      } else if (job->op == JOB_NTLM) {
-        /* Mirrors the CPU JOB_NTLM path at mdxfind.c:14132-14194:
-         *   Variant A: iconv UTF-8 → UTF-16LE   (cd)
-         *   Variant B: iconv CP1251 → UTF-8 → UTF-16LE (cd_cp1251, cd)
-         *   Variant C: iconv CP1252 → UTF-8 → UTF-16LE (cd_cp1252, cd)
-         * Each variant only admitted when its first-stage iconv produces output.
-         * No zero-extend variant on purpose — the CPU JOB_NTLM does not test it.
-         */
-        char tmp_u8[256];
-        /* Variant A: UTF-8 → UTF-16LE. */
-        pkg_enc_len[0] = 0;
-        { size_t a_in = len, a_out = sizeof(pkg_enc[0]);
-          char *a_ip = cur, *a_op = pkg_enc[0];
-          if (iconv(cd, &a_ip, &a_in, &a_op, &a_out) != (size_t)-1 && a_out < sizeof(pkg_enc[0]))
-            pkg_enc_len[0] = (int)(sizeof(pkg_enc[0]) - a_out);
-        }
-        /* Variant B: CP1251 → UTF-8 → UTF-16LE. */
-        pkg_enc_len[1] = 0;
-        { size_t c_in = len, c_out = sizeof(tmp_u8);
-          char *c_ip = cur, *c_op = tmp_u8;
-          if (iconv(cd_cp1251, &c_ip, &c_in, &c_op, &c_out) != (size_t)-1 &&
-              c_out < sizeof(tmp_u8)) {
-            int u8len = (int)(sizeof(tmp_u8) - c_out);
-            size_t d_in = u8len, d_out = sizeof(pkg_enc[1]);
-            char *d_ip = tmp_u8, *d_op = pkg_enc[1];
-            if (iconv(cd, &d_ip, &d_in, &d_op, &d_out) != (size_t)-1 &&
-                d_out < sizeof(pkg_enc[1]))
-              pkg_enc_len[1] = (int)(sizeof(pkg_enc[1]) - d_out);
-          }
-        }
-        /* Variant C: CP1252 → UTF-8 → UTF-16LE. */
-        pkg_enc_len[2] = 0;
-        { size_t c_in = len, c_out = sizeof(tmp_u8);
-          char *c_ip = cur, *c_op = tmp_u8;
-          if (iconv(cd_cp1252, &c_ip, &c_in, &c_op, &c_out) != (size_t)-1 &&
-              c_out < sizeof(tmp_u8)) {
-            int u8len = (int)(sizeof(tmp_u8) - c_out);
-            size_t d_in = u8len, d_out = sizeof(pkg_enc[2]);
-            char *d_ip = tmp_u8, *d_op = pkg_enc[2];
-            if (iconv(cd, &d_ip, &d_in, &d_op, &d_out) != (size_t)-1 &&
-                d_out < sizeof(pkg_enc[2]))
-              pkg_enc_len[2] = (int)(sizeof(pkg_enc[2]) - d_out);
-          }
-        }
-        pkg_nvariants = 3;
-        /* Dedup via memcmp. Drop zero-length and exact duplicates. */
-        int kept = 0;
-        for (int v = 0; v < 3; v++) {
-          if (pkg_enc_len[v] <= 0) continue;
-          int dup = 0;
-          for (int k = 0; k < kept; k++) {
-            if (pkg_enc_len[k] == pkg_enc_len[v] &&
-                memcmp(pkg_enc[k], pkg_enc[v], pkg_enc_len[v]) == 0) { dup = 1; break; }
-          }
-          if (dup) continue;
-          if (kept != v) {
-            pkg_enc_len[kept] = pkg_enc_len[v];
-            memcpy(pkg_enc[kept], pkg_enc[v], pkg_enc_len[v]);
-          }
-          kept++;
-        }
-        pkg_nvariants = kept;
-      }
-      /* Skip if no variants survived (e.g., NTLM with zero-length input). */
-      if (pkg_nvariants <= 0) goto gpu_packed_done;
-      for (int pv = 0; pv < pkg_nvariants; pv++) {
-        int enc_len = pkg_enc_len[pv];
-        if (enc_len < 0 || enc_len > 255) continue;  /* uint8 length slot */
-        if (enc_len > gpu_maxlen) continue;          /* per-op max from setup at line 9197 */
-        if (!my_jobg) {
-          my_jobg = gpujob_get_free(job->filename, job->startline);
-          if (!my_jobg->packed_buf) {
-            my_jobg->packed_buf = (char *)malloc_lock(GPUBATCH_PACKED_SIZE, "packed_buf");
-            my_jobg->word_offset = (uint32_t *)malloc_lock((GPUBATCH_PACKED_SIZE / 2) * sizeof(uint32_t), "word_offset");
-          }
-          my_jobg->op = job->op;
-          my_jobg->filename = job->filename;
-          my_jobg->flags = job->flags;
-          my_jobg->doneprint = job->doneprint;
-          my_jobg->line_num = job->startline;
-          my_jobg->packed = 1;
-          my_jobg->packed_count = 0;
-          my_jobg->packed_pos = 0;
-        }
-        if (my_jobg->packed_pos + 1 + enc_len > GPUBATCH_PACKED_SIZE) {
-          gpujob_submit_bf(&my_jobg, job);
-          my_jobg = gpujob_get_free(job->filename, job->startline);
-          if (!my_jobg->packed_buf) {
-            my_jobg->packed_buf = (char *)malloc_lock(GPUBATCH_PACKED_SIZE, "packed_buf");
-            my_jobg->word_offset = (uint32_t *)malloc_lock((GPUBATCH_PACKED_SIZE / 2) * sizeof(uint32_t), "word_offset");
-          }
-          my_jobg->op = job->op;
-          my_jobg->filename = job->filename;
-          my_jobg->flags = job->flags;
-          my_jobg->doneprint = job->doneprint;
-          my_jobg->line_num = job->startline;
-          my_jobg->packed = 1;
-          my_jobg->packed_count = 0;
-          my_jobg->packed_pos = 0;
-        }
-        my_jobg->word_offset[my_jobg->packed_count] = my_jobg->packed_pos;
-        my_jobg->packed_buf[my_jobg->packed_pos++] = (char)enc_len;
-        if (enc_len > 0)
-          memcpy(my_jobg->packed_buf + my_jobg->packed_pos, pkg_enc[pv], enc_len);
-        my_jobg->packed_pos += enc_len;
-        my_jobg->packed_count++;
-      }
+    /* B7.9 (2026-05-07): chokepoint pack retired (option A1 pure-retire
+     * variant per project_b76plus_mask_iter_closure.md §13 Q2). The legacy
+     * chokepoint pack block that previously pre-encoded candidates and
+     * dispatched them to the 5 packed kernels (md5/sha1/sha256/md4/sha512_
+     * packed) is gone; CPU-rule outputs now CPU-fallback for the residual
+     * mixed CPU+GPU rule workloads. Architect-accepted ~5% throughput hit.
+     *
+     * The gpu_skip_no_rule_pack interlock REMAINS in place and is more
+     * load-bearing than ever: when the rules-engine kernel has already
+     * absorbed this word's no-rule pass via the synthetic `:` rule, we
+     * MUST still bypass the CPU switch. Without the goto:
+     *   - The JOB_MD5 case's FastRule SIMD walker (~line 24338) fires
+     *   - It walks all rules CPU-side
+     *   - It sets currule = NULL at ~line 24500
+     *   - The outer do/while exits before C2.3 can engage
+     *   - The rules-engine kernel's hits land in a slot whose enclosing
+     *     iteration was effectively voided
+     * See feedback_chokepoint_fastrule_walker.md and
+     * feedback_cpu_rule_walk_starves_gpu.md for the full failure mode.
+     *
+     * Pre-B7.9 the chokepoint pack ALSO ended in `goto gpu_packed_done`
+     * for the same reason (skip the CPU switch after a successful pack).
+     * B7.9 deletes the pack body but keeps the skip-then-goto on the
+     * gpu_skip_no_rule_pack path because the FastRule walker hazard is
+     * unchanged. */
+#ifdef OPENCL_GPU
+    int gpu_skip_no_rule_pack = (was_pass0_zero && word_packed_by_rules_engine);
+#else
+    int gpu_skip_no_rule_pack = 0;
+#endif
+    if (gpu_skip_no_rule_pack)
       goto gpu_packed_done;
-    }
+    /* B7.9 (2026-05-07): the `if (do_pack_gpu && len ...)` block formerly
+     * here has been removed. RCS history retains the 140-line chokepoint
+     * pack with its NTLM/NTLMH multi-variant encoding (UTF-16LE zero-
+     * extend, iconv UTF-8/CP1251/CP1252) and its goto gpu_packed_done.
+     * For mixed CPU+GPU rule workloads on JOB_NTLMH or JOB_MD4 etc., the
+     * CPU-rule outputs that previously rode the chokepoint pack now CPU-
+     * fallback through the switch below. CPU has correct semantics for
+     * every op already; the only loss is the GPU acceleration of the
+     * rule-applied bytes (architect-accepted ~5%). For 100%-GPU-eligible
+     * rule workloads (gpu_legacy_slot_unused == 1) the rules-engine
+     * kernel already handles every (word, rule) combination — there is
+     * no behavioral regression. */
 #endif
 /*     printf("Starting job %d (%s) %llx\n",job->op,Types[job->op],job->outbuf);  */
     switch (job->op) {
@@ -10627,7 +12914,7 @@ do {
 
       case JOB_SHA512CRYPTMD5:
       	mymd5(cur,len,curin.h);
-	cur = prmd5(curin.h,linebuf,32);
+	cur = prmd5(curin.h,linebuf+MAXLINE,32);  /* stage to non-aliased region; crypt_round overwrites linebuf[] in P-stretch (mirrors PHPBB3MD5 pattern at line 13713) */
 	len = 32;
 	if (Typedone[job->op]) break;
 	if (!Typesalt[job->op]) break;
@@ -10676,26 +12963,6 @@ do {
 	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 	}
 	if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-	if ((job->op == JOB_SHA512CRYPT || job->op == JOB_SHA256CRYPT ||
-	     job->op == JOB_SHA512CRYPTMD5) &&
-	    1) {
-	  /* SHA512CRYPTMD5: override password with pre-computed MD5 hex (cur/len) */
-	  char *save_pass = NULL; int save_clen = 0;
-	  if (job->op == JOB_SHA512CRYPTMD5) {
-	    save_pass = job->pass; save_clen = job->clen;
-	    job->pass = cur; job->clen = len; /* cur = 32-char MD5 hex */
-	  }
-	  int packed = gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0);
-	  if (job->op == JOB_SHA512CRYPTMD5) {
-	    job->pass = save_pass; job->clen = save_clen;
-	  }
-	  if (packed) {
-	    /* hashcnt accounted by gpujob thread */
-	    break;
-	  }
-	}
-#endif
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	  unsigned int cas;
@@ -11556,12 +13823,6 @@ release(FreeWaiting);
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   /* Typesalt key is "$1$salt$" — extract salt after "$1$" */
@@ -12014,21 +14275,6 @@ crypt_done: ;
                     if (!nsalts_job) { Typedone[job->op] = 1; break; }
                   }
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                  if (job->op == JOB_PHPBB3 && job->clen <= 39 &&
-                      gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 1)) {
-                    /* hashcnt accounted by gpujob thread */
-                    /* compact out found salts so GPU workload shrinks */
-                    { int si;
-                    for (si = nsalts_job - 1; si >= 0; si--) {
-                      if (!Printall && *saltsnap[si].PV == 0)
-                        saltsnap[si] = saltsnap[--nsalts_job];
-                    }
-                    if (!nsalts_job) Typedone[job->op] = 1;
-                    }
-                    break;
-                  }
-#endif
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       s1 = saltsnap[si].salt;
@@ -12099,13 +14345,6 @@ nextbb:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (job->op == JOB_PHPBB3 && job->clen <= 39 &&
-                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 1)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
 #if ARM > 6
                 /* NEON 4-wide PHPBB3: batch 4 salts with same iteration count */
                 if (len < 40) {
@@ -12510,13 +14749,30 @@ BC_Start:
                 if (len > MAXLINE)
                   break;
 #ifdef GPU_ENABLED
+                /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): the
+                 * legacy slab `gpu_try_pack(...JOB_BCRYPT...)` call
+                 * formerly at this site has been DELETED. JOB_BCRYPT
+                 * now exclusively routes through the rules-engine path
+                 * via the chokepoint admit at gpu_rules_engine_active
+                 * (~line 10205) + the salt-snapshot precondition gate
+                 * (~line 10955) + the host-side pack-site clamp at
+                 * (~line 11082). The salt snapshot still needs to be
+                 * built BEFORE the chokepoint admit gate fires (the
+                 * gate's `nsalts_job > 0` arm gates on this snapshot);
+                 * the build_salt_snapshot call below is preserved so
+                 * the chokepoint sees populated salts on the FIRST
+                 * word arriving here. The compound siblings
+                 * (BCRYPTMD5/BCRYPTSHA1/BCRYPTSHA512) fall through to
+                 * BC_Start label and use the SAME snapshot under
+                 * Typesalt[job->op] (their own loaders populate
+                 * Typesalt per mdxfind.c:40411-40425). RCS history
+                 * retains the prior gpu_try_pack call. Phase 6 of the
+                 * slab-retirement ladder (final major slab kernel). */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                   Typesalt[job->op], tsalt, Printall);
                   snap_valid = 1;
                 }
-                if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-                  break;
 #endif
                 /* iterate unique salt prefixes from Typesalt[job->op] */
                 linebuf[0] = 0;
@@ -12663,10 +14919,6 @@ sha512salt_s:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-                  break;
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -12722,10 +14974,6 @@ sha512salt_s:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-                  break;
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -12884,12 +15132,6 @@ sha512salt_s:
                   break;
                 hashcnt++;
                 mysha1((char *)cur, len, curin.h);
-#ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, &curin, 0, 0)) {
-                  hashcnt += 1000000;
-                  break;
-                }
-#endif
                 memmove(linebuf + 40, cur, len);
 
                 for (x = 1; x < 1000001; x++) {
@@ -12978,13 +15220,6 @@ sha1passsalt:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (job->op == JOB_SHA1PASSSALT && Maxiter <= 1 &&
-                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -13183,13 +15418,6 @@ sha1saltpass:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if ((job->op == JOB_SHA1SALTPASS) && Maxiter <= 1 &&
-                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -14609,13 +16837,6 @@ md4utf16:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (job->op == JOB_MD5SALTPASS &&
-                    gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15397,12 +17618,6 @@ sha1_truncsalt:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15734,13 +17949,6 @@ morepep:
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 mymd5(cur, len, md5buf.h);
                 prmd5(md5buf.h, linebuf + 32, 32);
-#ifdef GPU_ENABLED
-                if (job->op == JOB_MD5_MD5SALTMD5PASS && Maxiter <= 1 &&
-                    gpu_try_pack(&my_jobg, job, &md5buf, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 char passmd5 = linebuf[32];
                 for (si = 0; si < nsalts_job; si++) {
@@ -20807,11 +23015,6 @@ MD5SALTstart:
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
               { int si, compact_ctr = 0;
               d = mdbuf + len;
-#ifdef GPU_ENABLED
-              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job, 0)) {
-                /* hashcnt accounted by gpujob thread */
-              } else
-#endif /* GPU_ENABLED */
               {
 #if ARM > 6 || defined(POWERPC)
               /* SIMD 4-wide salt loop (NEON / AltiVec) */
@@ -21041,12 +23244,6 @@ MD5SALTstart:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-              if (gpu_try_pack(&my_jobg, job, &curin, nsalts_job, 0)) {
-                /* hashcnt accounted by gpujob thread */
-                break;
-              }
-#endif /* GPU_ENABLED */
                 init_md5sse(cur, len, SSEBUF);
                 done2 = 0;
                 maxsaltlens = maxsaltlen = 0;
@@ -22054,11 +24251,6 @@ nextsalt1:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 1)) {
-                  break;
-                }
-#endif
                 Word_t *HPV;
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
@@ -26357,12 +28549,6 @@ sha1sha256:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -26403,12 +28589,6 @@ sha1sha256:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0)) {
-                  /* hashcnt accounted by gpujob thread */
-                  break;
-                }
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -28255,16 +30435,6 @@ HAV256_5_start:
                 { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
-#ifdef GPU_ENABLED
-                  if (saltsnap && !snap_valid) {
-                    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    ujudy, tsalt, Printall);
-                    snap_valid = 1;
-                  }
-                  if (saltsnap && nsalts_job > 0 &&
-                      gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-                    break;
-#endif
                   tsalt[0] = 0;
                   JSLF(PV, ujudy, (unsigned char *)tsalt);
                   while (PV) {
@@ -28365,10 +30535,6 @@ HAV256_5_start:
                   if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 }
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-                if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-                  break;
-#endif
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   MHASH td;
@@ -29055,10 +31221,6 @@ HAV256_5_start:
 		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 		}
 		if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-		if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-		  break;
-#endif
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -29450,10 +31612,6 @@ HAV256_5_start:
 		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 		}
 		if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-		if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-		  break;
-#endif
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -29508,10 +31666,6 @@ HAV256_5_start:
 		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 		}
 		if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-		if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-		  break;
-#endif
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -29566,10 +31720,6 @@ HAV256_5_start:
 		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 		}
 		if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-		if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-		  break;
-#endif
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -29623,10 +31773,6 @@ HAV256_5_start:
 		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
 		}
 		if (!nsalts_job) { Typedone[job->op] = 1; break; }
-#ifdef GPU_ENABLED
-		if (nsalts_job > 0 && gpu_try_pack(&my_jobg, job, NULL, nsalts_job, 0))
-		  break;
-#endif
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -34587,14 +36733,22 @@ gpu_packed_done: ;
       } while (((job->flags & JOBFLAG_NUMBERS) && (++number_iter < (job->MaskCount ? job->MaskCount : Iter_Count[job->digits]))) || currule || (Email && emailcur < emailpow));
     }
 #ifdef GPU_ENABLED
-    /* Flush partial GPU batch at end of job */
-    if (my_jobg && (my_jobg->count > 0 || my_jobg->packed_count > 0)) {
-      gpujob_submit_bf(&my_jobg, job);
-    } else if (my_jobg) {
-      /* Empty buffer — return to free list without submitting */
-      gpujob_return_free(my_jobg);
-      my_jobg = NULL;
+    /* Flush partial GPU batch at end of job. BF Phase 3 (2026-05-10):
+     * gpujob_submit_bf retired alongside the rest of the legacy atomic-
+     * cursor BF machinery. BF Phase 3b Tranche C (2026-05-10): the
+     * my_jobg defensive submit/return arms here are deleted; my_jobg is
+     * permanently NULL post-Tranche-A. Only the rules-engine flush
+     * remains. */
+    /* C2.4: Flush rules-engine batch at end of job (NOT submit_bf — single-submit). */
+#ifdef OPENCL_GPU
+    if (my_jobg_rules && my_jobg_rules->packed_count > 0) {
+      gpujob_submit(my_jobg_rules);
+      my_jobg_rules = NULL;
+    } else if (my_jobg_rules) {
+      gpujob_return_free(my_jobg_rules);
+      my_jobg_rules = NULL;
     }
+#endif /* OPENCL_GPU */
 #endif
     if (job->outlen) { fwrite(job->outbuf,job->outlen,1,stdout); fflush(stdout);}
     if (job->readbuf == Readbuf) {
@@ -34908,7 +37062,7 @@ static int creader_detect(char *buf, size_t buflen) {
         b[3] == 0x58 && b[4] == 0x5a && b[5] == 0x00) {
         /* XZ format — reopen file from beginning */
         Creader.type = CMP_XZ;
-        Creader.fd = open(Creader.filename, O_RDONLY);
+        Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
         if (Creader.fd < 0) return 0;
         memset(&Creader.xz, 0, sizeof(Creader.xz));
         lzma_stream_decoder(&Creader.xz, UINT64_MAX, LZMA_CONCATENATED);
@@ -34919,7 +37073,7 @@ static int creader_detect(char *buf, size_t buflen) {
     if (buflen >= 3 && b[0] == 'B' && b[1] == 'Z' && b[2] == 'h') {
         /* bzip2 format — reopen file from beginning */
         Creader.type = CMP_BZ2;
-        Creader.fd = open(Creader.filename, O_RDONLY);
+        Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
         if (Creader.fd < 0) return 0;
         memset(&Creader.bz, 0, sizeof(Creader.bz));
         BZ2_bzDecompressInit(&Creader.bz, 0, 0);
@@ -34930,7 +37084,7 @@ static int creader_detect(char *buf, size_t buflen) {
     if (buflen >= 4 && b[0] == 0x28 && b[1] == 0xb5 && b[2] == 0x2f && b[3] == 0xfd) {
         /* Zstandard format */
         Creader.type = CMP_ZSTD;
-        Creader.fd = open(Creader.filename, O_RDONLY);
+        Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
         if (Creader.fd < 0) return 0;
         Creader.zstd_ds = ZSTD_createDStream();
         ZSTD_initDStream(Creader.zstd_ds);
@@ -34950,7 +37104,7 @@ static int creader_detect(char *buf, size_t buflen) {
             unsigned int header_size = 30 + name_len + extra_len;
 
             Creader.type = CMP_ZIP;
-            Creader.fd = open(Creader.filename, O_RDONLY);
+            Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
             if (Creader.fd < 0) return 0;
             lseek(Creader.fd, header_size, SEEK_SET);
             Creader.zip_remaining = comp_size;
@@ -35020,8 +37174,9 @@ static void creader_reset(void) {
 
 unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
   char *curpos, *readbuf, *f;
-  static unsigned int nextline;
-  unsigned int dest, curline, len, Linecount, rlen;
+  static unsigned long long nextline;     /* widened — wordlist position counter, can exceed 4.29B */
+  unsigned long long curline;             /* widened — derived from nextline */
+  unsigned int dest, len, Linecount, rlen;
   struct LineInfo *readindex;
   int cacheindex;
   size_t readlen;
@@ -35077,6 +37232,14 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
         readlen = creader_read(curpos, (MAXCHUNK / 2) - 1);
       }
     }
+  }
+  /* Live byte tracking for the current wordlist — drives ETA self-correction
+   * when AutoCountTotalLines (from the SQLite cache) holds a poisoned partial
+   * count from a prior session that bailed early on HashWaiting. */
+  if (readlen > 0) {
+    atomic_fetch_add_explicit(&CurfileBytesRead,
+                              (unsigned long long)readlen,
+                              memory_order_relaxed);
   }
   curcnt += readlen;
   curpos = readbuf;
@@ -35204,10 +37367,12 @@ MDXALIGN void addhash(void *dummy) {
       HashDataCap = newcap;
     }
 
-    /* Pre-size data buffer for this batch (max MAXADDHASHBUF bytes per batch) */
-    if (HashDataBufUsed + MAXADDHASHBUF > HashDataBufCap) {
+    /* Pre-size data buffer for this batch. Worst case: MYSQL3 input is 10 bytes
+     * (2-byte len + 8 raw); stored after sub-128-bit zero-pad is 16 bytes = 1.6x.
+     * Allocate 2*MAXADDHASHBUF to cover any sub-128-bit expansion. */
+    if (HashDataBufUsed + 2 * MAXADDHASHBUF > HashDataBufCap) {
       size_t newcap = HashDataBufCap ? HashDataBufCap * 2 : 65536;
-      while (newcap < HashDataBufUsed + MAXADDHASHBUF) newcap *= 2;
+      while (newcap < HashDataBufUsed + 2 * MAXADDHASHBUF) newcap *= 2;
       HashDataBuf = realloc(HashDataBuf, newcap);
       if (!HashDataBuf) {
         fprintf(stderr, "Failed to allocate hash data buffer\n");
@@ -35233,7 +37398,10 @@ MDXALIGN void addhash(void *dummy) {
       }
 #endif
       /* Store hash data — truncate to 4-byte boundary for GPU uint* access.
-       * The packed stream cursor must advance by the original length. */
+       * The packed stream cursor must advance by the original length.
+       * Sub-128-bit outputs (e.g. MYSQL3, 8 bytes) are zero-padded in storage
+       * to 16 bytes so the GPU 4xuint32 probe never spills into the next entry.
+       * HashDataLen[i] keeps the real length (CPU memcmp is unaffected). */
       { int rawlen = len;
         len &= ~3;
         if (len < 8) { cur += rawlen; continue; }
@@ -35241,7 +37409,12 @@ MDXALIGN void addhash(void *dummy) {
         HashDataLen[HashDataCount] = len;
         HashDataFlags[HashDataCount] = 0;
         memcpy(HashDataBuf + HashDataBufUsed, cur, len);
-        HashDataBufUsed += len;
+        if (len < 16) {
+          memset(HashDataBuf + HashDataBufUsed + len, 0, 16 - len);
+          HashDataBufUsed += 16;
+        } else {
+          HashDataBufUsed += len;
+        }
         HashDataCount++;
 
         if (len < minhashlenl)
@@ -35255,6 +37428,38 @@ MDXALIGN void addhash(void *dummy) {
 }
 
 
+#if defined(OPENCL_GPU)
+/* Per-device set_compact_table worker thread (Memo C parallelization).
+ * Reads file-scope CompactFP/CompactIdx/HashData* globals (set by
+ * build_compact_table prior to spawning); writes only into gpu_devs[di]
+ * which is owned by this thread for the duration. */
+static void sct_thread_fn(void *payload) {
+  int di = *(int *)payload;
+  gpu_opencl_set_compact_table(di, CompactFP, CompactIdx,
+      CompactSize, CompactMask,
+      HashDataBuf, HashDataBufUsed,
+      HashDataOff, HashDataCount, HashDataLen);
+}
+
+/* Per-device set_rules worker thread payload + body (Memo C). The rule
+ * program data (prog/offs) is shared read-only across threads; only the
+ * per-device gpu_devs[di] state is mutated and that's disjoint per slot.
+ * rc field gathers the per-device set_rules return value for tally after
+ * join. */
+struct srl_arg {
+  int            di;
+  unsigned char *prog;
+  uint32_t       prog_len;
+  uint32_t      *offs;
+  int            n_rules;
+  int            rc;
+};
+static void srl_thread_fn(void *payload) {
+  struct srl_arg *a = (struct srl_arg *)payload;
+  a->rc = gpu_opencl_set_rules(a->di, a->prog, a->prog_len, a->offs, a->n_rules);
+}
+#endif
+
 void build_compact_table(void) {
   size_t i;
   uint64_t tsize;
@@ -35267,7 +37472,7 @@ void build_compact_table(void) {
   while (tsize <= HashDataCount) tsize <<= 1;
   tsize <<= 1;
 
-  fprintf(stderr, "Compact hash table: growing from 0 to %llu slots\n",
+  tsfprintf(stderr, "Compact hash table: growing from 0 to %llu slots\n",
          (unsigned long long)tsize);
 
   CompactSize = tsize;
@@ -35357,7 +37562,7 @@ void build_compact_table(void) {
   {
     double bt = (double)bend.tv_sec + bend.tv_nsec * 1e-9
               - (double)bstart.tv_sec - bstart.tv_nsec * 1e-9;
-    fprintf(stderr, "Compact table: %llu entries, %llu slots (%.1f%% load), %u overflow, %.2fs build\n",
+    tsfprintf(stderr, "Compact table: %llu entries, %llu slots (%.1f%% load), %u overflow, %.2fs build\n",
             (unsigned long long)Insize, (unsigned long long)tsize,
             100.0 * CompactUsed / tsize,
             overflow_count, bt);
@@ -35532,17 +37737,137 @@ void build_compact_table(void) {
     /* SHA512CRYPTMD5 shares the same $6$ hashes in JudyJ[JOB_SHA512CRYPT],
      * so the compact table entries above already cover both types. */
   }
+  /* Decode SHA256CRYPT ($5$) hashes from JudyJ and insert into compact table
+   * for GPU probing.  Mirrors the SHA512CRYPT block above.  The 43-char b64
+   * trailer decodes to 32 raw bytes via 10 three-byte permutation tuples plus
+   * a final 2-byte tail (encoded as 3 b64 chars).  Only the first 16 bytes of
+   * the 32-byte raw hash are stored (enough for compact_fp/idx key +
+   * probe_compact's 4-word compare).  Permutation tuples are the inverse of
+   * the SHA-256 b64 encoder at mdxfind.c:12784 (cryptlen==32 path). */
+  { static const unsigned char sha256_perm[10][3] = {
+        { 0,10,20},{21, 1,11},{12,22, 2},{ 3,13,23},{24, 4,14},
+        {15,25, 5},{ 6,16,26},{27, 7,17},{18,28, 8},{ 9,19,29}
+    };
+    char s5_line[256];
+    Word_t *S5_PV;
+    int s5_added = 0;
+    init_phpatoi64();
+    s5_line[0] = 0;
+    JSLF(S5_PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)s5_line);
+    /* Ensure HashDataBuf is allocated (may be NULL if no hex hashes were loaded) */
+    if (S5_PV && !HashDataBuf) {
+      HashDataBufCap = 65536;
+      HashDataBuf = malloc(HashDataBufCap);
+      HashDataOff = malloc(65536 * sizeof(size_t));
+      HashDataLen = malloc(65536 * sizeof(unsigned short));
+      HashDataFlags = malloc(65536 * sizeof(unsigned short));
+      if (HashDataFlags) memset(HashDataFlags, 0, 65536 * sizeof(unsigned short));
+      HashDataCap = 65536;
+    } else if (S5_PV && HashDataCap == 0) {
+      /* Arrays exist (e.g. from bcrypt/SHA512CRYPT block) but HashDataCap not tracked */
+      HashDataCap = 65536;
+    }
+    while (S5_PV) {
+      /* Find hash portion: $5$[rounds=N$]salt$HASH (43 chars) */
+      char *hp = s5_line + 3; /* skip "$5$" */
+      if (strncmp(hp, "rounds=", 7) == 0) {
+        hp = strchr(hp, '$');
+        if (hp) hp++;
+      }
+      if (hp) hp = strchr(hp, '$');
+      if (hp) hp++; /* hp now points to 43-char hash */
+      if (hp && strlen(hp) >= 43) {
+        unsigned char raw[32];
+        int decode_ok = 1;
+        /* Decode 10 groups of 4 base64 chars -> 3 bytes each (covers raw[0..29]) */
+        for (int g = 0; g < 10 && decode_ok; g++) {
+          int c0 = phpatoi64[(unsigned char)hp[g*4]];
+          int c1 = phpatoi64[(unsigned char)hp[g*4+1]];
+          int c2 = phpatoi64[(unsigned char)hp[g*4+2]];
+          int c3 = phpatoi64[(unsigned char)hp[g*4+3]];
+          if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0) { decode_ok = 0; break; }
+          unsigned int v = c0 | (c1 << 6) | (c2 << 12) | (c3 << 18);
+          raw[sha256_perm[g][0]] = (v >> 16) & 0xff;
+          raw[sha256_perm[g][1]] = (v >> 8) & 0xff;
+          raw[sha256_perm[g][2]] = v & 0xff;
+        }
+        if (decode_ok) {
+          /* Final 2 bytes raw[30],raw[31]: 3 base64 chars (encoder emits 3,
+           * top 4 bits of the 18-bit value are zero; we ignore them). */
+          int c0 = phpatoi64[(unsigned char)hp[40]];
+          int c1 = phpatoi64[(unsigned char)hp[41]];
+          int c2 = phpatoi64[(unsigned char)hp[42]];
+          if (c0 >= 0 && c1 >= 0 && c2 >= 0) {
+            unsigned int v = c0 | (c1 << 6) | (c2 << 12);
+            raw[30] = v & 0xff;
+            raw[31] = (v >> 8) & 0xff;
+          } else {
+            decode_ok = 0;
+          }
+        }
+        if (decode_ok) {
+          /* Grow arrays if needed */
+          if (HashDataCount + 1 > HashDataCap) {
+            size_t newcap = HashDataCap ? HashDataCap * 2 : 4096;
+            HashDataOff = realloc(HashDataOff, newcap * sizeof(size_t));
+            HashDataLen = realloc(HashDataLen, newcap * sizeof(unsigned short));
+            HashDataFlags = realloc(HashDataFlags, newcap * sizeof(unsigned short));
+            if (!HashDataOff || !HashDataLen || !HashDataFlags) {
+              fprintf(stderr, "Failed to allocate hash entry arrays\n");
+              exit(1);
+            }
+            memset(HashDataFlags + HashDataCap, 0, (newcap - HashDataCap) * sizeof(unsigned short));
+            HashDataCap = newcap;
+          }
+          if (HashDataBufUsed + 16 > HashDataBufCap) {
+            size_t newcap = HashDataBufCap ? HashDataBufCap * 2 : 65536;
+            HashDataBuf = realloc(HashDataBuf, newcap);
+            if (!HashDataBuf) {
+              fprintf(stderr, "Failed to allocate hash data buffer\n");
+              exit(1);
+            }
+            HashDataBufCap = newcap;
+          }
+          HashDataOff[HashDataCount] = HashDataBufUsed;
+          HashDataLen[HashDataCount] = 16;
+          HashDataFlags[HashDataCount] = 0;
+          memcpy(HashDataBuf + HashDataBufUsed, raw, 16);
+          HashDataBufUsed += 16;
+          compact_insert();
+          HashDataCount++;
+          s5_added++;
+        }
+      }
+      JSLN(S5_PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)s5_line);
+    }
+    if (s5_added)
+      fprintf(stderr, "Compact table: added %d SHA256CRYPT hashes for GPU probing\n", s5_added);
+  }
 #ifdef GPU_ENABLED
   /* Only initialize GPU if at least one GPU-capable hash type is selected */
   { int need_gpu = 0;
     int gpu_ops[] = { JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT,
                       JOB_MD5SALTPASS, JOB_MD5PASSSALT,
                       JOB_SHA256PASSSALT, JOB_SHA256SALTPASS,
+                      /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS joins
+                       * the GPU-init op list so `mdxfind -G N -M SHA224SALTPASS`
+                       * (without other GPU types) actually initializes GPU
+                       * devices. Without this entry the chokepoint admit gate
+                       * never fires (GPU init is skipped in the type-loader
+                       * preamble). */
+                      JOB_SHA224SALTPASS,
                       JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS,
                       JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
-                      JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD4, JOB_SHA1,
+                      JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD5UC, JOB_MD4, JOB_SHA1,
                       JOB_SHA224, JOB_SHA256, JOB_SHA384, JOB_SHA512,
-                      JOB_WRL, JOB_NTLMH, JOB_NTLM, JOB_MD6256, JOB_SHA256RAW,
+                      /* JOB_NTLM (e369): permanently CPU-only by design. The rules
+                       * engine assumes ASCII input bytes; NTLM emits 2-3 UTF-16LE
+                       * candidate plains per word via iconv (utf-8/cp1251/cp1252)
+                       * which the rules engine cannot process correctly. NTLMH
+                       * (e786) is the GPU-capable variant (single zero-extend, the
+                       * hashcat-broken-conversion); MD4UTF16 (e496) is the iter
+                       * sibling. */
+                      JOB_WRL, JOB_NTLMH, JOB_MD4UTF16, JOB_MD6256, JOB_SHA256RAW,
                       JOB_KECCAK224, JOB_KECCAK256, JOB_KECCAK384, JOB_KECCAK512,
                       JOB_SHA3_224, JOB_SHA3_256, JOB_SHA3_384, JOB_SHA3_512,
                       JOB_HMAC_MD5, JOB_HMAC_MD5_KPASS,
@@ -35561,7 +37886,11 @@ void build_compact_table(void) {
                       JOB_SHA512CRYPT, JOB_SHA256CRYPT, JOB_SHA512CRYPTMD5,
                       JOB_MD5RAW, JOB_SHA1RAW, JOB_SHA384RAW, JOB_SHA512RAW,
                       JOB_SQL5, JOB_MYSQL3, JOB_DESCRYPT,
-                      JOB_RMD160, JOB_BLAKE2S256, JOB_BCRYPT, -1 };
+                      JOB_RMD160, JOB_RMD320, JOB_BLAKE2S256,
+                      /* B5 sub-batch 3 (2026-05-06): BLAKE2B-256 / BLAKE2B-512
+                       * GPU template. BLAKE2B-160 omitted — no JOB_BLAKE2B160. */
+                      JOB_BLAKE2B256, JOB_BLAKE2B512,
+                      JOB_BCRYPT, -1 };
     for (int gi = 0; gpu_ops[gi] >= 0; gi++) {
       Word_t grc;
       J1T(grc, Dohash, gpu_ops[gi]);
@@ -35582,6 +37911,11 @@ void build_compact_table(void) {
 #elif defined(CUDA_GPU)
     gpu_ok = cuda_md5salt_init();
 #elif defined(OPENCL_GPU)
+    /* Initialize GPU kernel binary cache before any clBuildProgram calls.
+     * Idempotent. If MDXFIND_CACHE is unset, warns once and disables —
+     * subsequent gpu_kernel_cache_* calls become no-ops, gpu_opencl_init()
+     * proceeds to JIT every kernel from source as before. */
+    gpu_kernel_cache_init(mdxfind_rev_string());
     gpu_ok = gpu_opencl_init();
 #endif
     if (gpu_ok == 0 && CompactFP && HashDataBuf && HashDataOff && HashDataLen && CompactSize > 0) {
@@ -35597,11 +37931,26 @@ void build_compact_table(void) {
           HashDataOff, HashDataCount, HashDataLen);
 #elif defined(OPENCL_GPU)
       { int ndev = gpu_opencl_num_devices();
-        for (int di = 0; di < ndev; di++)
-          gpu_opencl_set_compact_table(di, CompactFP, CompactIdx,
-              CompactSize, CompactMask,
-              HashDataBuf, HashDataBufUsed,
-              HashDataOff, HashDataCount, HashDataLen);
+        /* Parallel per-device compact-table upload (Memo C). Each device has
+         * its own cl_context + cl_command_queue; CL_MEM_COPY_HOST_PTR copies
+         * host data into device-resident memory and concurrent reads of the
+         * same host pages from N driver threads are safe (memcpy reads of
+         * read-only data). The per-thread function lives at file scope as
+         * sct_thread_fn() — see just above main. */
+        thread *sct_threads[64];
+        int sct_args[64];
+        for (int di = 0; di < ndev && di < 64; di++) {
+          sct_args[di] = di;
+          sct_threads[di] = launch(sct_thread_fn, &sct_args[di]);
+        }
+        for (int di = 0; di < ndev && di < 64; di++)
+          join(sct_threads[di]);
+        /* Aggregate result: how many devices survived set_compact_table?
+         * If zero, this flips gpu_opencl_available() back to false so
+         * the rest of mdxfind treats it like -G none. Per-device disable
+         * details (the "DEVICE DISABLED" lines) were already emitted by
+         * set_compact_table itself. */
+        gpu_opencl_finalize_active_count();
       }
 #endif
     } else if (gpu_ok == 0) {
@@ -35783,18 +38132,25 @@ static unsigned long long count_newlines(const unsigned char *buf, size_t len) {
 }
 
 /* Count lines in a single file, handling gzip/xz/bz2/zstd/zip compression.
- * Returns line count, or 0 on error. Checks HashWaiting for early exit. */
-static unsigned long long linecount_file(const char *filename) {
+ * Returns line count, or 0 on error.
+ * `complete` (if non-NULL) is set to 1 only if counting ran to EOF without
+ * bailing on HashWaiting. The caller MUST check this before persisting the
+ * count to the SQLite cache — otherwise an early-bail partial count poisons
+ * future sessions (the cause of the wrong-ETA bug seen on Shooter
+ * 2026-05-03 with hashmob.net.found.v7: 12M cached vs 3.16B actual). */
+static unsigned long long linecount_file(const char *filename, int *complete) {
+    if (complete) *complete = 0;   /* default: assume incomplete until proven otherwise */
     struct stat sb;
     if (stat(filename, &sb) != 0) return 0;
     /* Skip pipes, sockets, devices */
     if (S_ISFIFO(sb.st_mode) || !S_ISREG(sb.st_mode)) return 0;
 
     unsigned long long lines = 0;
+    int completed = 0;             /* reaches 1 only via natural fall-through after read loop */
     unsigned char hdrbuf[256];
 
     /* Read first bytes to detect format */
-    int fd = open(filename, O_RDONLY);
+    int fd = open(filename, O_RDONLY | O_BINARY);
     if (fd < 0) return 0;
     ssize_t hdrlen = read(fd, hdrbuf, sizeof(hdrbuf));
     close(fd);
@@ -35820,7 +38176,7 @@ static unsigned long long linecount_file(const char *filename) {
     if (hdrbuf[0] == 0xfd && hdrbuf[1] == 0x37 && hdrbuf[2] == 0x7a &&
         hdrbuf[3] == 0x58 && hdrbuf[4] == 0x5a && hdrbuf[5] == 0x00) {
         /* XZ */
-        fd = open(filename, O_RDONLY);
+        fd = open(filename, O_RDONLY | O_BINARY);
         if (fd < 0) goto linecount_done;
         LC_FADVISE(fd);
         lzma_stream xz = LZMA_STREAM_INIT;
@@ -35847,7 +38203,7 @@ static unsigned long long linecount_file(const char *filename) {
         close(fd);
     } else if (hdrbuf[0] == 'B' && hdrbuf[1] == 'Z' && hdrbuf[2] == 'h') {
         /* bzip2 */
-        fd = open(filename, O_RDONLY);
+        fd = open(filename, O_RDONLY | O_BINARY);
         if (fd < 0) goto linecount_done;
         LC_FADVISE(fd);
         bz_stream bz;
@@ -35875,7 +38231,7 @@ static unsigned long long linecount_file(const char *filename) {
         close(fd);
     } else if (hdrbuf[0] == 0x28 && hdrbuf[1] == 0xb5 && hdrbuf[2] == 0x2f && hdrbuf[3] == 0xfd) {
         /* Zstandard */
-        fd = open(filename, O_RDONLY);
+        fd = open(filename, O_RDONLY | O_BINARY);
         if (fd < 0) goto linecount_done;
         LC_FADVISE(fd);
         ZSTD_DStream *ds = ZSTD_createDStream();
@@ -35906,7 +38262,7 @@ static unsigned long long linecount_file(const char *filename) {
         unsigned short extra_len = hdrbuf[28] | (hdrbuf[29] << 8);
         unsigned int header_size = 30 + name_len + extra_len;
 
-        fd = open(filename, O_RDONLY);
+        fd = open(filename, O_RDONLY | O_BINARY);
         if (fd < 0) goto linecount_done;
         LC_FADVISE(fd);
         lseek(fd, header_size, SEEK_SET);
@@ -35988,7 +38344,7 @@ static unsigned long long linecount_file(const char *filename) {
         gzclose(gz);
     } else {
         /* Plain text — direct read with SIMD newline counting */
-        fd = open(filename, O_RDONLY);
+        fd = open(filename, O_RDONLY | O_BINARY);
         if (fd < 0) goto linecount_done;
         LC_FADVISE(fd);
         ssize_t n;
@@ -36001,9 +38357,11 @@ static unsigned long long linecount_file(const char *filename) {
         }
         close(fd);
     }
+    completed = 1;     /* reached only via natural fall-through; all early bails goto linecount_done */
 linecount_done:
     free(dbuf);
     free(inbuf);
+    if (complete) *complete = completed;
     return lines;
 }
 
@@ -36046,23 +38404,130 @@ MDXALIGN void linecount_thread(void *dummy) {
             continue;
         }
 
-        unsigned long long count = linecount_file(LineCountArgv[i]);
+        int complete = 0;
+        unsigned long long count = linecount_file(LineCountArgv[i], &complete);
         if (count > 0) {
             __sync_fetch_and_add(&AutoCountTotalLines, count);
-            linecount_cache_store(db, resolved,
-                (long long)sb.st_size, (long long)sb.st_mtime, (long long)count);
-            cache_misses++;
+            /* Only persist to cache if we counted to EOF — partial counts
+             * from HashWaiting early-bail would poison future sessions. */
+            if (complete) {
+                linecount_cache_store(db, resolved,
+                    (long long)sb.st_size, (long long)sb.st_mtime, (long long)count);
+                cache_misses++;
+            } else {
+                fprintf(stderr,
+                    "Wordlist ETA: line count for %s bailed early at %llu lines (incomplete) — not cached\n",
+                    LineCountArgv[i], count);
+            }
         }
     }
-    if (db) sqlite3_close(db);
+    /* Finalize prepared statements before close so sqlite3_close()
+     * can succeed and run its WAL checkpoint + cleanup. Without this
+     * the close returns SQLITE_BUSY (silently — rc was historically
+     * dropped) and the .db-wal/.db-shm files persist after exit. */
+    if (LC_stmt_lookup) { sqlite3_finalize(LC_stmt_lookup); LC_stmt_lookup = NULL; }
+    if (LC_stmt_store)  { sqlite3_finalize(LC_stmt_store);  LC_stmt_store  = NULL; }
+    if (db) {
+        int crc = sqlite3_close(db);
+        if (crc != SQLITE_OK)
+            fprintf(stderr, "Warning: sqlite3_close(%s) returned %d (%s) — WAL/-shm may persist\n",
+                    LineCountCachePath, crc, sqlite3_errstr(crc));
+        LineCountDB = NULL;
+    }
     clock_gettime(CLOCK_MONOTONIC, &lc_end);
     double lc_secs = (lc_end.tv_sec - lc_start.tv_sec)
                    + (lc_end.tv_nsec - lc_start.tv_nsec) / 1e9;
     if (cache_hits > 0 || cache_misses > 0)
-        fprintf(stderr, "Line count: %d cached, %d counted, %llu total lines in %.2fs\n",
+        tsfprintf(stderr, "Line count: %d cached, %d counted, %llu total lines in %.2fs\n",
                 cache_hits, cache_misses, (unsigned long long)AutoCountTotalLines, lc_secs);
     __sync_synchronize();
     AutoCountDone = 1;
+}
+
+/* Persist the AUTHORITATIVE line count for `filepath` to the cache,
+ * overwriting any prior partial-count entry. Called from the main read
+ * loop after a wordlist has been fully consumed (Fileline = true total).
+ *
+ * Opens its own short-lived SQLite connection — WAL mode + busy_timeout
+ * provide concurrency vs the background linecount_thread. Atomic via
+ * single INSERT OR REPLACE inside an implicit transaction. WAL-checkpoint-
+ * truncate at close so the .db-wal file doesn't linger.
+ *
+ * No-op if MDXFIND_CACHE / -W auto wasn't used in this session
+ * (LineCountCachePath is empty). */
+static void linecount_cache_finalize(const char *filepath,
+                                     long long size, long long mtime,
+                                     unsigned long long actual_lines) {
+    if (!*LineCountCachePath) return;        /* cache not enabled this session */
+    sqlite3 *db = NULL;
+    if (sqlite3_open(LineCountCachePath, &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return;
+    }
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
+    /* Schema may not exist if linecount_thread didn't run — create defensively */
+    sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS linecount ("
+        "  filepath TEXT NOT NULL,"
+        "  filesize INTEGER NOT NULL,"
+        "  mtime INTEGER NOT NULL,"
+        "  lines INTEGER NOT NULL,"
+        "  cached_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),"
+        "  PRIMARY KEY (filepath, filesize, mtime)"
+        ");", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "INSERT OR REPLACE INTO linecount (filepath, filesize, mtime, lines) "
+            "VALUES (?, ?, ?, ?)", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text (st, 1, filepath, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(st, 2, size);
+        sqlite3_bind_int64(st, 3, mtime);
+        sqlite3_bind_int64(st, 4, (long long)actual_lines);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    /* Truncate the WAL into the main DB so we leave a single clean file. */
+    sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
+    int crc = sqlite3_close(db);
+    if (crc != SQLITE_OK) {
+        fprintf(stderr,
+            "Warning: linecount_cache_finalize: sqlite3_close(%s) returned %d (%s)\n",
+            LineCountCachePath, crc, sqlite3_errstr(crc));
+    }
+}
+
+/* Expunge a cached row when the runtime detection in the main read loop
+ * discovers that the cached line count is stale (Fileline > AutoCountTotalLines
+ * — the cached value was a partial count, almost certainly poisoned by a
+ * pre-1.375 mdxfind that crashed before EOF). After this DELETE the next
+ * session re-counts from scratch via linecount_thread; the natural
+ * linecount_cache_finalize at gzclose still writes the authoritative count
+ * if THIS session runs to completion. Idempotent — DELETE on missing row is
+ * a no-op. Same connection-lifecycle pattern as linecount_cache_finalize. */
+static void linecount_cache_delete(const char *filepath) {
+    if (!*LineCountCachePath || !filepath) return;
+    sqlite3 *db = NULL;
+    if (sqlite3_open(LineCountCachePath, &db) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return;
+    }
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;",  NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA busy_timeout=5000;", NULL, NULL, NULL);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db,
+            "DELETE FROM linecount WHERE filepath = ?", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, filepath, -1, SQLITE_STATIC);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE);", NULL, NULL, NULL);
+    int crc = sqlite3_close(db);
+    if (crc != SQLITE_OK) {
+        fprintf(stderr,
+            "Warning: linecount_cache_delete: sqlite3_close(%s) returned %d (%s)\n",
+            LineCountCachePath, crc, sqlite3_errstr(crc));
+    }
 }
 
 static void format_eta(double seconds, char *buf, size_t bufsz) {
@@ -36098,7 +38563,7 @@ MDXALIGN void ReportStats(void *dummy) {
   lastline = 0;
   while (1) {
     if (!MDXpause) {
-      MDXlowest_line = 0xFFFFFFFF; /* reset — threads will re-establish minimum */
+      atomic_store_explicit(&MDXlowest_line, ULLONG_MAX, memory_order_relaxed);
       MDXlowest_file = NULL;
     }
     for (x = 0; x < 15; x++) {
@@ -36133,10 +38598,10 @@ MDXALIGN void ReportStats(void *dummy) {
           { char tbuf[64];
             struct tm *tm = localtime(&pause_start);
             strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm);
-            { unsigned int restart = MDXlowest_line;
+            { unsigned long long restart = atomic_load_explicit(&MDXlowest_line, memory_order_relaxed);
               const char *rfile = (const char *)MDXlowest_file;
-              if (restart == 0xFFFFFFFF) restart = 0;
-              fprintf(stderr, "MDXfind process (%d) paused at %s, restart with -w %u on %s\n",
+              if (restart == ULLONG_MAX) restart = 0;
+              fprintf(stderr, "MDXfind process (%d) paused at %s, restart with -w %llu on %s\n",
                     (int)getpid(), tbuf, restart,
                     rfile ? rfile : "(unknown)");
             }
@@ -36186,9 +38651,28 @@ MDXALIGN void ReportStats(void *dummy) {
       pause_ticks = 0;
     }
 
-    /* EMA feedback: update per-algorithm CPU rates from accumulated hashes */
+    /* EMA feedback: update per-algorithm CPU rates from accumulated hashes.
+     *
+     * GPU-side correction: the rules-engine path (gpu/gpujob_opencl.c) bumps
+     * the global Tothash atomic but does NOT feed linehints[op].hashes_accum.
+     * Without this snapshot+delta, the EMA decays based only on the tiny
+     * (~0.007% on rockyou) FastRule CPU contribution from words > 55 chars
+     * that bypass the C2.2 GPU pack and fall through to the SIMD walker.
+     * Snapshot Tothash per tick and attribute the delta to JOB_MD5 (the only
+     * op the rules engine processes; gpu_rule_count > 0 implies op==JOB_MD5
+     * gates at mdxfind.c:9765 and 9979). Multi-op rules-engine workloads are
+     * not supported today; if added, this attribution becomes approximate.
+     */
+    if (linehints && gpu_rule_count > 0 && JOB_MD5 < linehints_count) {
+      static unsigned long long tothash_snapshot = 0;
+      unsigned long long tothash_now = atomic_load_explicit(&Tothash, memory_order_relaxed);
+      unsigned long long gpu_delta = tothash_now - tothash_snapshot;
+      tothash_snapshot = tothash_now;
+      if (gpu_delta > 0)
+        __sync_fetch_and_add(&linehints[JOB_MD5].hashes_accum, (long long)gpu_delta);
+    }
     if (linehints) {
-      unsigned int lowest_line = UINT_MAX;
+      unsigned long long lowest_line = ULLONG_MAX;
       for (x = 0; x < linehints_count; x++) {
         long long accum = __sync_lock_test_and_set(&linehints[x].hashes_accum, 0);
         if (accum > 0) {
@@ -36203,19 +38687,22 @@ MDXALIGN void ReportStats(void *dummy) {
         if (linehints[x].curline > 0 && linehints[x].curline < lowest_line)
           lowest_line = linehints[x].curline;
       }
-      if (lowest_line < UINT_MAX)
+      if (lowest_line < ULLONG_MAX)
         Lowline = lowest_line;
     }
 
     wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
     wtime -= stime;
     if (wtime <= 0.0) wtime = 1;
-    if (Totrules) {
-      lps = (double)(Totrules - lastline)/15.0;
-      lastline = Totrules;
-    } else {
-      lps = (double)((TotLines - lastline))/15.0;
-      lastline = TotLines;
+    {
+      unsigned long long total_rules = Totrules + atomic_load(&Totrules_gpu);
+      if (total_rules) {
+        lps = (double)(total_rules - lastline)/15.0;
+        lastline = total_rules;
+      } else {
+        lps = (double)((TotLines - lastline))/15.0;
+        lastline = TotLines;
+      }
     }
     format_rate((double)Tothash / wtime, &hps, &mult1);
     format_rate(lps, &lps, &mult);
@@ -36302,25 +38789,41 @@ MDXALIGN void ReportStats(void *dummy) {
           char *pmult2 = "", *tmult2 = "";
           format_rate(dprog, &dprog, &pmult2);
           format_rate(dtotal, &dtotal, &tmult2);
+          /* First comfort-line: emit the consolidated end-of-init pin
+           * summary. By the time we reach this point, all malloc_pinned
+           * call sites in the chokepoint hot path have either succeeded
+           * or fallen through to pin-on-demand fallback, so the summary
+           * is comprehensive. The earlier emit at "gpujob threads
+           * started" was empty (lazy alloc), so this is the right
+           * landmark. Once-only via static flag. */
+          {
+            static int _pin_summary_emitted = 0;
+            if (!_pin_summary_emitted) {
+              _pin_summary_emitted = 1;
+              tsfprintf_pin_summary();
+            }
+          }
 #ifdef GPU_ENABLED
           if (gpujob_available())
-            fprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
-                  Curfile, wq, gpujob_queue_depth(), gpujob_free_count(), dprog, pmult2, dtotal, tmult2,
+            tsfprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
+                  Curfile, wq, gpujob_queue_depth(), gpujob_free_count(), Fileline,
+                  dprog, pmult2, dtotal, tmult2,
                   100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
           else
 #endif
-            fprintf(stderr, "Working on %s, w=%ld, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
-                  Curfile, wq, dprog, pmult2, dtotal, tmult2,
+            tsfprintf(stderr, "Working on %s, w=%ld, line %llu, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
+                  Curfile, wq, Fileline,
+                  dprog, pmult2, dtotal, tmult2,
                   100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
         } else {
 #ifdef GPU_ENABLED
           if (gpujob_available())
-            fprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
-                  Curfile, peek_lock(WorkWaiting), gpujob_queue_depth(), gpujob_free_count(), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
+            tsfprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
+                  Curfile, peek_lock(WorkWaiting), gpujob_queue_depth(), gpujob_free_count(), Fileline, Totfound, hps, mult1, lps, mult);
           else
 #endif
-            fprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
-                  Curfile, peek_lock(WorkWaiting), (Lowline+LowSkip), Totfound, hps, mult1, lps, mult);
+            tsfprintf(stderr, "Working on %s, w=%ld, line %llu, Found=%llu, %.2f%sh/s, %.2f%sc/s\n",
+                  Curfile, peek_lock(WorkWaiting), Fileline, Totfound, hps, mult1, lps, mult);
         }
       }
     }
@@ -40859,7 +43362,7 @@ int main(int argc, char **argv) {
   struct stat sb, isb;
   struct job *job;
   unsigned long long Totalfiles, Totallines, Fsize;
-  unsigned long long StartIndex, Fileline, Numbers, Maxnumbers;
+  unsigned long long StartIndex, Numbers, Maxnumbers;
   unsigned long long SkipLine = 0;
   size_t MemSize;
   unsigned int maxinsize, wrap, val, order, log2, maxtype;
@@ -40889,7 +43392,8 @@ int main(int argc, char **argv) {
   pcre *regex;
   int ovec[30], pcre_erroff;
   const char *pcre_err;
-  unsigned int curline, numline, cacheindex, actjobs;
+  unsigned long long curline, numline;    /* widened — wordlist line positions can exceed 4.29B */
+  unsigned int cacheindex, actjobs;
   char *readbuf, *Oldkeys;
   struct LineInfo *readindex;
   unsigned int Linecount, Bcryptcnt, DEScryptcnt, ProgressEnccnt;
@@ -40913,6 +43417,13 @@ int main(int argc, char **argv) {
     printf("Mainline stack at %lx\n",&sb);
 */
   Memlock = new_lock(0);
+  TsfLock = new_lock(0);   /* tsfprintf() stderr serialization (startup-phase diagnostics) */
+  /* Seed the tsfprintf monotonic origin now so every later timestamp
+   * is relative to a known mdxfind-start point. Without this the
+   * first tsfprintf() (which may not happen for hundreds of ms during
+   * argv parsing) would establish T+0, distorting Phase A timing. */
+  clock_gettime(CLOCK_MONOTONIC, &tsfprintf_origin);
+  tsfprintf_origin_set = 1;
   ServerState = new_lock(0);
   for (maxtype=0; Types[maxtype]; maxtype++);
 
@@ -40965,7 +43476,8 @@ int main(int argc, char **argv) {
   Noremove = 0;
   Douniq = 0;
   Printsource = 0;
-  Totfound = Totalfiles = Totallines = 0;
+  atomic_store(&Totfound, (unsigned long long)0);
+  Totalfiles = Totallines = 0;
   maxinsize = 0;
   Maxiter = 1;
   maxt = get_nprocs();
@@ -41030,11 +43542,16 @@ int main(int argc, char **argv) {
                   x == JOB_MD5revMD5SALT || x == JOB_MD5sub8_24SALT ||
                   x == JOB_MD5SALTPASS || x == JOB_MD5PASSSALT ||
                   x == JOB_SHA256SALTPASS || x == JOB_SHA256PASSSALT ||
+                  /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS is
+                   * GPU-capable via the unified template path — advertise
+                   * the [GPU] tag in `mdxfind -h` output. */
+                  x == JOB_SHA224SALTPASS ||
                   x == JOB_MD5CRYPT || x == JOB_MD5_MD5SALTMD5PASS ||
                   x == JOB_SHA1SALTPASS || x == JOB_SHA1PASSSALT ||
                   x == JOB_SHA1DRU || x == JOB_PHPBB3 ||
-                  x == JOB_DESCRYPT || x == JOB_MD5 ||
-                  x == JOB_MD4 || x == JOB_NTLMH || x == JOB_NTLM ||
+                  x == JOB_DESCRYPT || x == JOB_MD5 || x == JOB_MD5UC ||
+                  /* JOB_NTLM (e369): permanently CPU-only — see need_gpu list comment. */
+                  x == JOB_MD4 || x == JOB_NTLMH ||
                   x == JOB_SHA1 ||
                   x == JOB_SHA224 || x == JOB_SHA256 ||
                   x == JOB_SHA384 || x == JOB_SHA512 ||
@@ -41062,7 +43579,10 @@ int main(int argc, char **argv) {
                   x == JOB_SHA384RAW || x == JOB_SHA512RAW ||
                   x == JOB_SQL5 || x == JOB_MYSQL3 ||
                   x == JOB_BCRYPT || x == JOB_RMD160 ||
+                  x == JOB_RMD320 ||
                   x == JOB_BLAKE2S256 ||
+                  /* B5 sub-batch 3: BLAKE2B-256 / BLAKE2B-512 GPU template. */
+                  x == JOB_BLAKE2B256 || x == JOB_BLAKE2B512 ||
                   x == JOB_SHA512CRYPTMD5 ||
                   x == JOB_MD4UTF16)
                 gpu = " [GPU]";
@@ -41271,6 +43791,15 @@ int main(int argc, char **argv) {
           fprintf(stderr, "GPU disabled\n");
           NoMetal = 1;
 #ifdef GPU_ENABLED
+        } else if (optarg[0] == 's' || optarg[0] == 'S') {
+          /* -G serial / -G s — disable Memo C parallel device init.
+           * Reverts gpu_opencl_init() to the prior single-threaded loop.
+           * Per-device set_compact_table / set_overflow / set_rules loops
+           * still parallelize (those are mdxfind.c-side, independent). */
+#if defined(OPENCL_GPU)
+          gpu_opencl_set_serial_init(1);
+          fprintf(stderr, "GPU init: serial mode (parallel-init disabled)\n");
+#endif
         } else if (optarg[0] == 'l' || optarg[0] == 'L') {
           fprintf(stderr, "Available GPU devices:\n");
 #if defined(OPENCL_GPU)
@@ -42405,17 +44934,248 @@ usage:
   wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
   wtime -= (double) starthash.tv_sec + (double) (starthash.tv_nsec) / 1000000000.0;
   if (wtime <= 0) wtime = 0.0;
-  fprintf(stderr, "Took %.2f seconds to read hashes\n", wtime);
+  tsfprintf(stderr, "Took %.2f seconds to read hashes\n", wtime);
 
   /* Build compact hash table from flat data */
   build_compact_table();
+
+#ifdef OPENCL_GPU
+  /* GPU rule engine — Layer 3 sub-commit A: classify the loaded rules
+   * into GPU-eligible vs CPU-only and upload the GPU subset to each
+   * device's __constant rule_program buffer. The kernel + classifier
+   * are already validated at 792/792 byte-exact and 99.99% HashMob.100k
+   * coverage; here we wire in the classification pass + per-device
+   * upload. Dispatch routing comes in sub-commits B/C/D.
+   *
+   * Placement: after build_compact_table(), because gpu_opencl_init()
+   * runs inside build_compact_table() — the rule-load block at line
+   * ~42437 fires before any GPU device exists, so set_rules() must
+   * happen here instead. Rules and Numrules are stable by this point. */
+  if (gpu_opencl_available()) {
+   if (Numrules == 0) {
+    /* Numrules == 0 path: synthesize a 1-byte rule program containing
+     * just `\0`. The kernel reads the leading NUL → is_no_rule = 1 →
+     * runs MD5+probe on the original word once (no rule applied). This
+     * is the implicit no-rule pass, foundational mdxfind semantics
+     * (feedback_no_rule_pass.md). Routes the iter-only / unsalted-no-
+     * rules-no-mask case through the rules-engine kernel, replacing
+     * the older slab path that hit CL_INVALID_KERNEL_ARGS /
+     * CL_OUT_OF_RESOURCES on Win+NVIDIA when mask_desc / salt_off /
+     * salt_len were never bound (GTX 1650 user crash). */
+    unsigned char *prog = malloc(1);
+    uint32_t      *offs = malloc(sizeof(uint32_t));
+    int           *orig = malloc(sizeof(int));
+    if (prog && offs && orig) {
+      prog[0] = 0;
+      offs[0] = 0;
+      orig[0] = -1;
+      int n_dev = gpu_opencl_num_devices();
+      int n_uploaded = 0;
+      {
+        struct srl_arg srl_args[64];
+        thread *srl_threads[64];
+        int nlaunched = (n_dev > 64) ? 64 : n_dev;
+        for (int dev = 0; dev < nlaunched; dev++) {
+          srl_args[dev].di       = dev;
+          srl_args[dev].prog     = prog;
+          srl_args[dev].prog_len = 1;
+          srl_args[dev].offs     = offs;
+          srl_args[dev].n_rules  = 1;
+          srl_args[dev].rc       = -1;
+          srl_threads[dev] = launch(srl_thread_fn, &srl_args[dev]);
+        }
+        for (int dev = 0; dev < nlaunched; dev++) join(srl_threads[dev]);
+        for (int dev = 0; dev < nlaunched; dev++)
+          if (srl_args[dev].rc == 0) n_uploaded++;
+      }
+      if (n_uploaded > 0) {
+        gpu_rule_program       = prog;
+        gpu_rule_offsets       = offs;
+        gpu_rule_origin        = orig;
+        gpu_rule_program_len   = 1;
+        gpu_rule_count         = 1;       /* synthetic `:` only */
+        gpu_rule_membership    = NULL;    /* no Numrules array — not needed when 0 user rules */
+        gpu_legacy_slot_unused = 1;       /* no CPU rules to walk; gate on Numrules in procjob */
+        gpu_rules_engine_active = 1;
+        /* synthetic-only no-rule pass upload progress emit retired 2026-05-09 —
+         * uniform behavior post-slab-retirement; the upload-failure paths below
+         * still emit since those represent actual user-visible problems. */
+        (void)n_uploaded;
+      } else {
+        free(prog); free(offs); free(orig);
+        fprintf(stderr,
+          "GPU rule engine: synthetic-only program upload failed on all %d device(s) — "
+          "no GPU acceleration for this workload\n", n_dev);
+      }
+    } else {
+      free(prog); free(offs); free(orig);
+      fprintf(stderr,
+        "GPU rule engine: malloc failed for synthetic-only program — "
+        "no GPU acceleration for this workload\n");
+    }
+   } else {
+    /* Walk the length-prefixed Rules buffer to build a char** array
+     * of bytecode pointers (skipping the 2-byte length prefix on each
+     * entry). classify_rules wants pointers to the raw bytecode. */
+    char **rule_ptrs = malloc(Numrules * sizeof(char *));
+    if (rule_ptrs) {
+      char *rp = Rules;
+      int rn = 0;
+      while (rn < Numrules) {
+        unsigned short int rlen = *((unsigned short int *)rp);
+        if (rlen == 0) break;       /* end-of-rules sentinel */
+        rule_ptrs[rn++] = rp + 2;   /* skip length prefix → bytecode */
+        rp += rlen + 2;
+      }
+      if (rn == Numrules) {
+        struct rule_lists rl;
+        if (classify_rules(rule_ptrs, Numrules, &rl) >= 0 && rl.ngpu > 0) {
+          /* Pack the GPU-eligible subset into a contiguous bytecode
+           * buffer + uint32 offset table. Each bytecode is already
+           * NUL-terminated in the source Rules buffer, so we copy
+           * including the trailing NUL. */
+          uint32_t prog_cap = 0;
+          for (int i = 0; i < rl.ngpu; i++) {
+            prog_cap += (uint32_t)(strlen(rl.gpu[i]) + 1);
+          }
+          /* +1 byte for the synthetic `:` no-rule pass: empty bytecode
+           * (just a NUL terminator). Kernel reads NUL → loop exits
+           * immediately → md5(original word) is computed. This makes
+           * the GPU produce the no-rule pass that mdxfind treats as
+           * foundational (feedback_no_rule_pass.md), so the legacy
+           * chokepoint can skip packing it for this workload. */
+          prog_cap += 1;
+          unsigned char *prog = malloc(prog_cap);
+          uint32_t      *offs = malloc((rl.ngpu + 1) * sizeof(uint32_t));
+          int           *orig = malloc((rl.ngpu + 1) * sizeof(int));
+          if (prog && offs && orig) {
+            uint32_t pos = 0;
+            for (int i = 0; i < rl.ngpu; i++) {
+              offs[i] = pos;
+              size_t blen = strlen(rl.gpu[i]) + 1;
+              memcpy(prog + pos, rl.gpu[i], blen);
+              pos += (uint32_t)blen;
+              /* Map gpu_rule_idx -> original Rules[] index. rl.gpu[i]
+               * is a pointer into Rules; we resolve to the original
+               * sequential index by matching against rule_ptrs[]. */
+              orig[i] = -1;
+              for (int j = 0; j < Numrules; j++) {
+                if (rule_ptrs[j] == rl.gpu[i]) { orig[i] = j; break; }
+              }
+            }
+            /* Synthetic `:` no-rule pass at gpu_rule_idx == rl.ngpu.
+             * Empty bytecode (one NUL byte). orig sentinel = -1 so
+             * the worker hit decoder knows to skip applyrule replay
+             * and use the original word as plaintext directly. */
+            offs[rl.ngpu] = pos;
+            prog[pos++] = 0;
+            orig[rl.ngpu] = -1;
+
+            int n_rules_with_synth = rl.ngpu + 1;
+            /* Upload to every available GPU device — Memo C parallel.
+             * Per-device clEnqueueWriteBuffer + bookkeeping fanned across
+             * yarn threads; rule data is shared read-only. */
+            int n_dev = gpu_opencl_num_devices();
+            int n_uploaded = 0;
+            {
+              struct srl_arg srl_args[64];
+              thread *srl_threads[64];
+              int nlaunched = (n_dev > 64) ? 64 : n_dev;
+              for (int dev = 0; dev < nlaunched; dev++) {
+                srl_args[dev].di       = dev;
+                srl_args[dev].prog     = prog;
+                srl_args[dev].prog_len = pos;
+                srl_args[dev].offs     = offs;
+                srl_args[dev].n_rules  = n_rules_with_synth;
+                srl_args[dev].rc       = -1;
+                srl_threads[dev] = launch(srl_thread_fn, &srl_args[dev]);
+              }
+              for (int dev = 0; dev < nlaunched; dev++) join(srl_threads[dev]);
+              for (int dev = 0; dev < nlaunched; dev++)
+                if (srl_args[dev].rc == 0) n_uploaded++;
+            }
+            if (n_uploaded > 0) {
+              gpu_rule_program     = prog;
+              gpu_rule_offsets     = offs;
+              gpu_rule_origin      = orig;
+              gpu_rule_program_len = pos;
+              gpu_rule_count       = n_rules_with_synth;  /* includes synthetic `:` */
+              gpu_rule_membership = calloc(Numrules, 1);
+              if (gpu_rule_membership) {
+                  int member_count = 0;
+                  for (int i = 0; i < rl.ngpu; i++) {
+                      if (orig[i] >= 0 && orig[i] < (int)Numrules) {
+                          gpu_rule_membership[orig[i]] = 1;
+                          member_count++;
+                      }
+                  }
+                  /* Sanity: member_count must equal rl.ngpu if orig[] map is correct.
+                   * Note: synthetic `:` (orig[rl.ngpu] = -1) is intentionally NOT
+                   * counted — it has no Rules[] entry to mark. */
+                  if (member_count != rl.ngpu)
+                      fprintf(stderr,
+                        "GPU rule engine: WARNING membership count %d != rl.ngpu %d\n",
+                        member_count, rl.ngpu);
+              }
+              /* If all original rules are GPU-eligible, the legacy jobg slot
+               * (my_jobg in the chokepoint) is never used: the no-rule pass
+               * is now handled by the synthetic `:` on the GPU, and there
+               * are no CPU-only rules to expand. Slot allocations can use
+               * the smaller GPUBATCH_RULES_*_SIZE constants for ~96x memory
+               * savings on the typical HashMob workload. */
+              gpu_legacy_slot_unused = (rl.ncpu == 0) ? 1 : 0;
+              gpu_rules_engine_active = 1;
+              tsfprintf(stderr,
+                "GPU rule engine: %d/%d rules eligible (%.1f%%), "
+                "%u-byte program uploaded to %d/%d device(s)%s\n",
+                rl.ngpu, Numrules,
+                100.0 * rl.ngpu / Numrules,
+                pos, n_uploaded, n_dev,
+                gpu_legacy_slot_unused ? "; legacy jobg slot bypass enabled" : "");
+            } else {
+              /* All uploads failed — likely __constant size limit hit
+               * (HashMob.100k ~500 KB > 64 KB on most NVIDIA). Free
+               * the host-side copies; sub-commit C will fall back to
+               * CPU rule expansion when gpu_rule_count == 0. */
+              free(prog); free(offs); free(orig);
+              fprintf(stderr,
+                "GPU rule engine: %d eligible rules but upload failed "
+                "on all %d device(s) — falling back to CPU rule path "
+                "(rule program %u bytes likely exceeds device "
+                "CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE)\n",
+                rl.ngpu, n_dev, pos);
+            }
+          } else {
+            free(prog); free(offs); free(orig);
+            fprintf(stderr,
+              "GPU rule engine: malloc failed for %d-rule program — "
+              "falling back to CPU rule path\n", rl.ngpu);
+          }
+          rule_lists_free(&rl);
+        }
+      }
+      free(rule_ptrs);
+    }
+   }  /* end Numrules > 0 branch */
+  }  /* end gpu_opencl_available() */
+
+  /* Pre-load overflow hashes to every GPU device NOW, before any
+   * procjob thread launches. The worker thread used to do this lazily
+   * on first dispatch; under heavy CPU contention from procjobs that
+   * inflated the upload from microseconds to seconds (3s observed on
+   * fpga 16-core, ~30s suspected on mmt 64-core via GAP DEBUG). Doing
+   * it at session start eliminates the contention. */
+  if (gpu_opencl_available()) {
+    gpujob_overflow_preload_all();
+  }
+#endif
 
   free(inhash1);
   free(inhash2);
 
 
 
-  fprintf(stderr, "Searching through %s unique hex hashes from %s\n", commify(Insize), infilename);
+  tsfprintf(stderr, "Searching through %s unique hex hashes from %s\n", commify(Insize), infilename);
   Bcryptcnt = 0;
   DEScryptcnt = 0;
   ProgressEnccnt = 0;
@@ -45233,7 +47993,7 @@ usage:
   if (Dupcnt)
     fprintf(stderr, "There were %s duplicate hashes on input\n", commify(Dupcnt));
 
-  fprintf(stderr, "Maximum hash chain depth is %u\n", Maxdepth);
+  tsfprintf(stderr, "Maximum hash chain depth is %u\n", Maxdepth);
   if (Maxdepth > 1 && Printall) {
     unsigned char *hptr;
     printf("Chain exploration (overflow entries)\n");
@@ -45256,8 +48016,8 @@ usage:
     }
   }
 
-  fprintf(stderr, "Minimum hash length is %u characters\n", Minhashlen);
-  fprintf(stderr, "Using %d cores\n", maxt);
+  tsfprintf(stderr, "Minimum hash length is %u characters\n", Minhashlen);
+  tsfprintf(stderr, "Using %d cores\n", maxt);
 
   if (Rotatehash > (Minhashlen + 1)) {
     Rotatehash = Minhashlen;
@@ -45316,7 +48076,7 @@ usage:
 	  case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam = 1u << FAM_MD5SALTPASS; break;
 	  case JOB_MD5: case JOB_MD5UC: fam = (1u << FAM_MD5SALT) | (1u << FAM_MD5UNSALTED); break;
 	  case JOB_MD5RAW: fam = 1u << FAM_MD5UNSALTED; break;
-	  case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: fam = 1u << FAM_MD4UNSALTED; break;
+	  case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: case JOB_MD4UTF16: fam = 1u << FAM_MD4UNSALTED; break;
 	  case JOB_SHA1: case JOB_SHA1RAW: fam = 1u << FAM_SHA1UNSALTED; break;
 	  case JOB_SHA256: case JOB_SHA256RAW: fam = 1u << FAM_SHA256UNSALTED; break;
 	  case JOB_SHA224: fam = 1u << FAM_SHA256UNSALTED; break;
@@ -45353,6 +48113,9 @@ usage:
 	  case JOB_MD5_MD5SALTMD5PASS: fam = 1u << FAM_MD5_MD5SALTMD5PASS; break;
 	  case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU: fam = 1u << FAM_SHA1; break;
 	  case JOB_SHA256PASSSALT: case JOB_SHA256SALTPASS: fam = 1u << FAM_SHA256; break;
+	  /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS uses sha256_block
+	   * compression, family is FAM_SHA256 (timing/family bookkeeping). */
+	  case JOB_SHA224SALTPASS: fam = 1u << FAM_SHA256; break;
 	  case JOB_SHA512PASSSALT: case JOB_SHA512SALTPASS: fam = 1u << FAM_HMAC_SHA512; break;
 	  case JOB_SHA512CRYPT: case JOB_SHA512CRYPTMD5:
 	    fam = 1u << FAM_SHA512CRYPT; break;
@@ -45383,17 +48146,22 @@ usage:
 #ifdef OPENCL_GPU
       /* Compile GPU kernel families for active hash types */
       { unsigned int fam = 0, finalfam = 0;
+        int probe_first_op = -1;
         lsi = 0;
         J1F(RC, Dohash, lsi);
         while (RC) {
+	  if (probe_first_op < 0) probe_first_op = (int)lsi;
 	  fam = 0;
           switch ((int)lsi) {
             case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:
             case JOB_MD5sub8_24SALT: fam |= 1u << FAM_MD5SALT; break;
             case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam |= 1u << FAM_MD5SALTPASS; break;
-            case JOB_MD5: case JOB_MD5UC: fam |= (1u << FAM_MD5ITER) | (1u << FAM_MD5MASK) | (1u << FAM_MD5UNSALTED); break;
+            /* B12 (2026-05-08): FAM_MD5ITER + FAM_MD5MASK slab kernels retired.
+             * FAM_MD5UNSALTED also retired in B9 — kept here as no-op for ABI
+             * stability of the FAM_* enum; family_source[] NULL-skips it. */
+            case JOB_MD5: case JOB_MD5UC: fam |= (1u << FAM_MD5UNSALTED); break;
             case JOB_MD5RAW: fam |= 1u << FAM_MD5UNSALTED; break;
-            case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: fam |= 1u << FAM_MD4UNSALTED; break;
+            case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: case JOB_MD4UTF16: fam |= 1u << FAM_MD4UNSALTED; break;
             case JOB_SHA1: case JOB_SHA1RAW: fam |= 1u << FAM_SHA1UNSALTED; break;
             case JOB_SHA256: case JOB_SHA256RAW: fam |= 1u << FAM_SHA256UNSALTED; break;
             case JOB_SHA224: fam |= 1u << FAM_SHA256UNSALTED; break;
@@ -45431,6 +48199,9 @@ usage:
             case JOB_MD5_MD5SALTMD5PASS: fam |= 1u << FAM_MD5_MD5SALTMD5PASS; break;
             case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU: fam |= 1u << FAM_SHA1; break;
             case JOB_SHA256PASSSALT: case JOB_SHA256SALTPASS: fam |= 1u << FAM_SHA256; break;
+            /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS uses sha256_block
+             * compression, family is FAM_SHA256 (timing/family bookkeeping). */
+            case JOB_SHA224SALTPASS: fam |= 1u << FAM_SHA256; break;
             case JOB_SHA512PASSSALT: case JOB_SHA512SALTPASS: fam |= 1u << FAM_HMAC_SHA512; break;
             case JOB_SHA512CRYPT: case JOB_SHA512CRYPTMD5:
               fam |= 1u << FAM_SHA512CRYPT; break;
@@ -45448,6 +48219,14 @@ usage:
           J1N(RC, Dohash, lsi);
         }
         if (finalfam) gpu_opencl_compile_families(finalfam);
+        /* Phase 6.2: kick the multi-GPU warm-probe as early as possible.
+         * gpu_opencl_warm_probe_async uses a synthetic compact table and
+         * synthetic ?l^8 mask when the real ones aren't uploaded yet, so
+         * the probe runs concurrently with the rest of mdxfind setup
+         * (mask parse, BF detection, set_mask). bf_partition_setup waits
+         * via gpu_opencl_warm_probe_wait() before polling rates. */
+        if (finalfam && probe_first_op >= 0)
+          gpu_opencl_warm_probe_async(probe_first_op);
       }
       /* Upload mask descriptor to GPU if mask mode is active (OpenCL) */
       if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpujob_available()) {
@@ -45582,6 +48361,14 @@ usage:
 #else
   win_pause_init();
 #endif
+  /* Validator harness phase boundary: rule loader test-applies (which run
+   * applyrule(rule,"Password",8,...) at -r/-R parse time, mdxfind.c:41928)
+   * fire BEFORE this point. Main word-processing fires AFTER. Harness drops
+   * everything before this marker so loader-time CPU records do not appear
+   * as CPU-only divergences against the GPU validator. Gated; production
+   * stderr is identical when MDXFIND_RULE_VALIDATOR is unset. */
+  if (getenv("MDXFIND_RULE_VALIDATOR") != NULL)
+    fprintf(stderr, "VALIDATE_PHASE_RUNTIME\n");
   launch(ReportStats, NULL);
 
   /* Auto-enable -W auto if MDXFIND_CACHE is set and -W was not specified */
@@ -45664,6 +48451,9 @@ usage:
           if (bf_ok && bf_napp > 0) {
 #if defined(OPENCL_GPU)
             gpu_opencl_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp);
+            /* Warm-probe was already kicked off right after
+             * gpu_opencl_compile_families (Phase 6.2). It is running with
+             * a synthetic mask; bf_partition_setup waits for it. */
 #elif defined(METAL_GPU)
             gpu_metal_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp);
 #endif
@@ -45671,13 +48461,12 @@ usage:
         }
 #endif
 
-        /* Dispatch brute-force: one job per algorithm type with full keyspace.
-         * GPU handles mask chunking internally. ReportStats tracks Tothash.
-         * Multi-GPU: activate atomic cursor mode so all GPUs share keyspace. */
-#if defined(OPENCL_GPU)
-        if (gpujob_available())
-          gpu_opencl_bf_start();
-#endif
+        /* BF Phase 3 (2026-05-10): bf_partition_setup retired. The multi-GPU
+         * atomic-cursor partition that this scaffolding fed is gone; per-op
+         * chunk-as-job production (below) feeds every active GPU via the
+         * normal rules-engine free-list — no pre-partitioning needed. RCS
+         * history retains the prior Dohash scan + bf_partition_setup call
+         * (mdxfind.c rev 1.449). */
         Totalfiles = 1;
         Curfile = argv[0];
         doneprint = 0;
@@ -45689,37 +48478,287 @@ usage:
           while (RC) {
             x = NextX;
             if (!Typedone[x]) {
-              possess(FreeWaiting);
-              wait_for(FreeWaiting, NOT_TO_BE, 0);
-              job = FreeHead;
-              if (!job) { fprintf(stderr, "Job null on freehead!\n"); exit(1); }
-              FreeHead = job->next;
-              job->next = NULL;
-              if (FreeHead == NULL) FreeTail = &FreeHead;
-              twist(FreeWaiting, BY, -1);
-
-              job->op = x;
-              job->flags = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE;
-              job->Numbers = 0;
-              job->digits = Dodigits;
-              job->MaskIndex = 0;
-              job->MaskCount = MaskTotal;
-              job->doneprint = &doneprint;
-              job->filename = argv[0];
-              job->startline = 0;
-              job->numline = 1;
-              job->readbuf = Readbuf;
-              job->readindex = Readindex;
-              possess(ReadBuf0);
-              twist(ReadBuf0, BY, +1);
-              if (ThreadCount < maxt) {
-                launch(procjob, NULL);
-                ThreadCount++;
+              /* BF chunk-as-job + Phase 1.4 adaptive servo (2026-05-10):
+               * for ALL GPU_CAT_MASK ops (unsalted + salted post-Phase-2),
+               * produce N chunk-jobs per op. Each chunk is sized via
+               * adaptive_bf_chunk_size — the rate-EMA servo reads per-
+               * device wall_us feedback (written by gpu/gpujob_opencl.c
+               * after each clFinish) and sizes the next chunk to target
+               * ~5s wall on the slowest active GPU. Warmup ramps target_-
+               * seconds 1s -> 5s over the first 10 chunks. Falls back to
+               * legacy per-op single-job activation for GPU-NONE ops or
+               * when sizing fails.
+               *
+               * Phase 2 (2026-05-10): unified path. Salted ops use the
+               * SAME chunk producer; the salt-axis cap inside adaptive_-
+               * bf_chunk_size keeps per-dispatch lanes
+               * (chunk_total * salts_per_page) under the 2^31 NDRange
+               * ceiling. Salt snapshot is built by gpujob worker from
+               * gpu_salt_judy(g->op); BF chunk synthetic plaintext flows
+               * through is_salted_pack pagination naturally. */
+              int use_bf_chunks = 0;
+              int num_devs_v = 1;
+#if defined(OPENCL_GPU)
+              if (gpujob_available() &&
+                  gpu_op_category(x) == GPU_CAT_MASK) {
+                num_devs_v = gpu_opencl_num_devices();
+                if (num_devs_v < 1) num_devs_v = 1;
+                /* Per-op servo reset: rate-EMA seed + chunk counter so
+                 * warmup ramp restarts. Different ops may have very
+                 * different rates (post-Phase-2 salted families slower);
+                 * stale rate from previous op would mis-size the first
+                 * chunk of the next op. */
+                bf_rate_ema = 1000000000ull;     /* 1 GH/s seed */
+                bf_chunks_produced = 0;
+                /* Phase 1.4b: per-op clear of the bootstrap-wait flag so
+                 * each new op blocks once for chunk-0 feedback before
+                 * sizing chunk 1. */
+                atomic_store_explicit(&bf_first_feedback_seen, 0,
+                                      memory_order_relaxed);
+                for (int _d = 0; _d < BF_MAX_GPU_SLOTS; _d++) {
+                    atomic_store_explicit(&bf_dev_wall_us[_d], 0,
+                                          memory_order_relaxed);
+                    atomic_store_explicit(&bf_dev_chunk_total[_d], 0,
+                                          memory_order_relaxed);
+                    /* Phase 1.7c: clear per-slot first-dispatch flag so
+                     * the JIT-contaminated wall_us of the first dispatch
+                     * per slot is excluded from the rate-EMA again on
+                     * each new BF op. */
+                    atomic_store_explicit(&bf_dev_first_dispatch_done[_d], 0,
+                                          memory_order_relaxed);
+                }
+                /* BF Phase 1.6 (2026-05-09): seed bf_rate_ema from
+                 * persisted per-(device, op) sidecar(s). MIN across all
+                 * device readings is conservative — under-seed grows fast
+                 * via EMA, over-seed risks oversize first chunk and big
+                 * retry penalties. Bootstrap wait is intentionally NOT
+                 * skipped (defensive: disk value might be stale; let the
+                 * first-feedback poll fire as usual; the EMA adjusts
+                 * upward from the disk seed within a few chunks). */
+                {
+                    uint64_t disk_min = 0;
+                    int hits = 0;
+                    for (int _d = 0; _d < num_devs_v && _d < BF_MAX_GPU_SLOTS; _d++) {
+                        char p[1024];
+                        if (bf_sidecar_path(_d, x, p, sizeof(p)) != 0) continue;
+                        uint64_t r = 0;
+                        if (bf_sidecar_read_rate(p, &r) != 0) continue;
+                        if (hits == 0 || r < disk_min) disk_min = r;
+                        hits++;
+                    }
+                    if (hits > 0 && disk_min >= BF_SIDECAR_RATE_MIN) {
+                        bf_rate_ema = disk_min;
+                        fprintf(stderr,
+                            "[bf-servo] sidecar seed: op=%d devs_seen=%d "
+                            "rate_ema_MHs=%.2f (MIN-of-disk)\n",
+                            x, hits, (double)bf_rate_ema / 1e6);
+                    }
+                }
+                use_bf_chunks = 1;
+                fprintf(stderr,
+                    "BF chunk producer (adaptive): op=%d mask_total=%llu "
+                    "num_devs=%d (Phase 1.4 rate-EMA servo)\n",
+                    x, (unsigned long long)MaskTotal, num_devs_v);
               }
-              possess(WorkWaiting);
-              *WorkTail = job;
-              WorkTail = &(job->next);
-              twist(WorkWaiting, BY, +1);
+#endif
+              if (use_bf_chunks) {
+                /* Produce one job per chunk; recompute chunk size before
+                 * each submission via the rate-EMA servo. Each chunk
+                 * advances the cursor by chunk_total candidates (clamped
+                 * on tail). */
+                uint64_t chunk_cursor = 0;
+                while (chunk_cursor < MaskTotal) {
+                  uint64_t this_chunk = 0;
+                  uint32_t this_nwords = 0;
+                  uint32_t this_mspw   = 0;
+                  uint32_t this_inner_iter = 1u;
+#if defined(OPENCL_GPU)
+                  if (adaptive_bf_chunk_size(MaskTotal, chunk_cursor,
+                                             num_devs_v, x,
+                                             &this_chunk,
+                                             &this_nwords,
+                                             &this_mspw,
+                                             &this_inner_iter) != 0 ||
+                      this_chunk == 0 || this_nwords == 0 || this_mspw == 0) {
+                    /* Sizing failed mid-stream — break and let the goto
+                     * bf_done logic flush the queue with what we already
+                     * submitted. */
+                    fprintf(stderr,
+                        "BF servo: adaptive_bf_chunk_size failed at "
+                        "cursor=%llu; halting chunk production for op=%d\n",
+                        (unsigned long long)chunk_cursor, x);
+                    break;
+                  }
+#endif
+
+                  possess(FreeWaiting);
+                  wait_for(FreeWaiting, NOT_TO_BE, 0);
+                  job = FreeHead;
+                  if (!job) { fprintf(stderr, "Job null on freehead!\n"); exit(1); }
+                  FreeHead = job->next;
+                  job->next = NULL;
+                  if (FreeHead == NULL) FreeTail = &FreeHead;
+                  twist(FreeWaiting, BY, -1);
+
+                  job->op = x;
+                  job->flags = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE |
+                               JOBFLAG_BF_CHUNK;
+                  job->Numbers = 0;
+                  job->digits = Dodigits;
+                  job->MaskIndex = chunk_cursor;     /* bf_mask_start */
+                  job->MaskCount = this_chunk;       /* chunk's candidate count */
+                  /* BF Phase 1.8 (2026-05-10): bf_offset_per_word is the
+                   * per-word total mask coverage (== mspw_per_iter * inner_iter).
+                   * bf_num_masks is the per-iter mask range (kernel mask_size).
+                   * For inner_iter==1 these match (bit-identical to pre-1.8). */
+                  job->bf_offset_per_word = this_mspw * this_inner_iter;
+                  job->bf_num_masks       = this_mspw;
+                  job->bf_inner_iter      = this_inner_iter;
+                  /* Phase 1.9 Tranche A1 (2026-05-10): pre-qualify this
+                   * BF chunk for the gpu_md5_bf.cl fast template kernel
+                   * if all conditions hold:
+                   *   - op == JOB_MD5 (unsalted MD5 only in A1)
+                   *   - Numrules <= 1 (no real user rules; synthetic
+                   *     NUL-only rule program is the "no-rule" pass)
+                   *   - unsalted (Typesalt[op] == NULL)
+                   *   - append-only mask: MaskPrependLen == 0 AND
+                   *     MaskAppendLen in [1, 8]
+                   *   - env override MDXFIND_GPU_FAST_DISABLE unset
+                   * The dispatch site (gpu_opencl_dispatch_md5_rules)
+                   * additionally requires the kernel resolver to land
+                   * on d->kern_template_phase0 (so it doesn't displace
+                   * a salted or non-MD5 kernel) and the BF-fast compile
+                   * + lazy to succeed; otherwise it silently keeps the
+                   * slow template kernel.
+                   *
+                   * A2-A4 widen this only via in-kernel optimizations;
+                   * the host-side gate stays this restrictive (BF +
+                   * unsalted MD5 + no real rules + small append mask is
+                   * the dominant raw-MD5 BF workload we are tuning). */
+                  {
+                      int _bf_fast_ok =
+                          (x == JOB_MD5) &&
+                          (Numrules <= 1) &&
+                          (Typesalt[x] == NULL) &&
+                          (MaskPrependLen == 0) &&
+                          (MaskAppendLen >= 1) && (MaskAppendLen <= 8);
+                      if (_bf_fast_ok &&
+                          getenv("MDXFIND_GPU_FAST_DISABLE") != NULL) {
+                          _bf_fast_ok = 0;
+                      }
+                      job->bf_fast_eligible = (unsigned int)(_bf_fast_ok ? 1 : 0);
+                  }
+                  /* num_words derived in procjob from MaskCount/bf_num_masks
+                   * (see procjob short-circuit); this_nwords is computed
+                   * by the servo for documentation/trace consistency. */
+                  (void)this_nwords;
+                  job->doneprint = &doneprint;
+                  job->filename = argv[0];
+                  job->startline = 0;
+                  job->numline = 1;
+                  job->readbuf = Readbuf;
+                  job->readindex = Readindex;
+                  possess(ReadBuf0);
+                  twist(ReadBuf0, BY, +1);
+                  if (ThreadCount < maxt) {
+                    launch(procjob, NULL);
+                    ThreadCount++;
+                  }
+                  possess(WorkWaiting);
+                  *WorkTail = job;
+                  WorkTail = &(job->next);
+                  twist(WorkWaiting, BY, +1);
+
+                  chunk_cursor += this_chunk;
+                }
+#if defined(OPENCL_GPU)
+                /* BF Phase 1.6 (2026-05-09): persist converged per-device
+                 * rate to sidecar so the next run cold-starts with a real
+                 * seed instead of the 1 GH/s default. Only write when the
+                 * servo has had time to converge (>= BF_SIDECAR_MIN_CHUNKS
+                 * dispatched). Per-device atomic samples are the LAST
+                 * completion observed; in-flight chunks at this point may
+                 * leave some devices stale, but we skip rate==0 cases
+                 * (no completion yet) and atomic-rename means partial
+                 * coverage is acceptable.
+                 *
+                 * OPENCL_GPU gate added 2026-05-10: pairs with the sidecar
+                 * READ block at ~line 48518 which is already guarded.
+                 * Without this guard, Win ARM64 / Metal-only builds fail to
+                 * link (BF_SIDECAR_MIN_CHUNKS, BF_SIDECAR_RATE_MIN/MAX,
+                 * bf_sidecar_path, bf_sidecar_write_rate undeclared). */
+                if (bf_chunks_produced > BF_SIDECAR_MIN_CHUNKS) {
+                    int wrote = 0;
+                    for (int _d = 0; _d < num_devs_v && _d < BF_MAX_GPU_SLOTS; _d++) {
+                        uint64_t w = atomic_load_explicit(&bf_dev_wall_us[_d],
+                                                         memory_order_relaxed);
+                        uint64_t c = atomic_load_explicit(&bf_dev_chunk_total[_d],
+                                                         memory_order_relaxed);
+                        if (w == 0 || c == 0) continue;
+                        /* rate_d = candidates / wall_seconds */
+                        double rate_d = (double)c * 1e6 / (double)w;
+                        if (rate_d <= 0.0) continue;
+                        uint64_t rate_u = (uint64_t)rate_d;
+                        if (rate_u < BF_SIDECAR_RATE_MIN ||
+                            rate_u > BF_SIDECAR_RATE_MAX) continue;
+                        char p[1024];
+                        if (bf_sidecar_path(_d, x, p, sizeof(p)) != 0) continue;
+                        if (bf_sidecar_write_rate(p, rate_u) == 0) wrote++;
+                    }
+                    if (wrote > 0) {
+                        fprintf(stderr,
+                            "[bf-servo] sidecar write: op=%d devs_written=%d "
+                            "chunks_produced=%u\n",
+                            x, wrote, bf_chunks_produced);
+                    }
+                }
+#endif
+              } else {
+                /* Legacy per-op single-job activation (non-GPU ops,
+                 * or sizing failure). Post-Phase-2 (2026-05-10) salted
+                 * GPU_CAT_MASK ops use the chunk producer above; this
+                 * arm now only fires when gpujob is unavailable, the
+                 * op has GPU_CAT_NONE, or adaptive_bf_chunk_size
+                 * failed. CPU procjob handles iteration. */
+                possess(FreeWaiting);
+                wait_for(FreeWaiting, NOT_TO_BE, 0);
+                job = FreeHead;
+                if (!job) { fprintf(stderr, "Job null on freehead!\n"); exit(1); }
+                FreeHead = job->next;
+                job->next = NULL;
+                if (FreeHead == NULL) FreeTail = &FreeHead;
+                twist(FreeWaiting, BY, -1);
+
+                job->op = x;
+                job->flags = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE;
+                job->Numbers = 0;
+                job->digits = Dodigits;
+                job->MaskIndex = 0;
+                job->MaskCount = MaskTotal;
+                job->bf_offset_per_word = 0;
+                job->bf_num_masks       = 0;
+                /* Phase 1.9 Tranche A1: legacy single-job arm (GPU
+                 * unavailable / sizing failed). CPU-only path; no GPU
+                 * dispatch happens here, so the flag is informational
+                 * only — kept zero for defensive consistency. */
+                job->bf_fast_eligible   = 0;
+                job->doneprint = &doneprint;
+                job->filename = argv[0];
+                job->startline = 0;
+                job->numline = 1;
+                job->readbuf = Readbuf;
+                job->readindex = Readindex;
+                possess(ReadBuf0);
+                twist(ReadBuf0, BY, +1);
+                if (ThreadCount < maxt) {
+                  launch(procjob, NULL);
+                  ThreadCount++;
+                }
+                possess(WorkWaiting);
+                *WorkTail = job;
+                WorkTail = &(job->next);
+                twist(WorkWaiting, BY, +1);
+              }
             }
             J1N(RC, Dohash, NextX);
           }
@@ -45762,10 +48801,71 @@ usage:
     Totalfiles++;
     Fileline = 0;
     LowSkip = Lowline = 0;
+    /* Per-file flag: fire the cache-expunge DELETE at most once per file even
+     * if the detection block below triggers across many cacheline batches.
+     * Reset on every new file (we want to expunge a poisoned row for each
+     * file we discover stale). */
+    int cache_expunged = 0;
+    /* Live byte-position tracking for ETA self-correction. CurfileBytesTotal
+     * = file size from stat above (sb is populated in the non-stdin branch);
+     * 0 for stdin since size is unknown. CurfileBytesRead is reset to 0 and
+     * accumulated by cacheline() as it reads chunks. */
+    {
+      unsigned long long fsize = 0;
+      if (Curfile && strcmp(Curfile, "stdin") != 0) fsize = (unsigned long long)sb.st_size;
+      atomic_store_explicit(&CurfileBytesTotal, fsize, memory_order_relaxed);
+      atomic_store_explicit(&CurfileBytesRead,  0,     memory_order_relaxed);
+    }
     while ((Linecount = cacheline(zfi, &readbuf, &readindex))) {
       curline = 0;
       Totallines += Linecount;
       Fileline += Linecount;
+      /* If we've passed the cached line-count estimate (poisoned partial
+       * count from a prior session), project a new estimate from byte
+       * position and bump the global so ReportStats's ETA stays sensible. */
+      {
+        unsigned long long auto_now = AutoCountTotalLines;
+        if (Fileline > auto_now) {
+          unsigned long long fsize = atomic_load_explicit(&CurfileBytesTotal, memory_order_relaxed);
+          unsigned long long fread = atomic_load_explicit(&CurfileBytesRead,  memory_order_relaxed);
+          unsigned long long projected;
+          if (fsize > 0 && fread > 0 && fread < fsize)
+            projected = (unsigned long long)((double)Fileline * (double)fsize / (double)fread);
+          else
+            projected = Fileline;   /* no byte info — at minimum we know there are Fileline lines */
+          /* CAS-loop: grow AutoCountTotalLines monotonically to at least `projected` */
+          while (1) {
+            unsigned long long old = AutoCountTotalLines;
+            if (projected <= old) break;
+            if (__sync_bool_compare_and_swap(&AutoCountTotalLines, old, projected)) break;
+          }
+          /* Expunge the poisoned cache row so the next session re-counts
+           * from scratch instead of reusing the stale value. Gated to fire
+           * once per file (cache_expunged sticky flag). Only acts when:
+           * (a) cache lookup succeeded in this session — i.e. auto_now > 0
+           *     (a fresh recompute path has auto_now == projected and
+           *     wouldn't reach this block);
+           * (b) the projection is materially larger (>= 2x) than the cached
+           *     value — avoids fluttering on near-equality;
+           * (c) Curfile is a real file path (not "stdin"). */
+          if (!cache_expunged && auto_now > 0 &&
+              projected >= 2ULL * auto_now &&
+              Curfile && strcmp(Curfile, "stdin") != 0) {
+            char resolved[PATH_MAX];
+#ifdef _WIN32
+            const char *expunge_path = _fullpath(resolved, Curfile, PATH_MAX) ? resolved : Curfile;
+#else
+            const char *expunge_path = realpath(Curfile, resolved) ? resolved : Curfile;
+#endif
+            linecount_cache_delete(expunge_path);
+            fprintf(stderr,
+                "linecount cache: row for %s expunged (stale: %llu cached vs %llu projected, %.1fx)\n",
+                expunge_path, auto_now, projected,
+                (double)projected / (double)auto_now);
+            cache_expunged = 1;
+          }
+        }
+      }
       if (SkipLine) {
         if (Fileline < SkipLine)
           continue;
@@ -45803,7 +48903,7 @@ reprocess:
 	  }
 	  if (linehints[x].gpu && !NoMetal && !Rules) {
 	    linehints[x].lineswanted = UINT_MAX;
-	    numline = UINT_MAX;
+	    numline = ULLONG_MAX;
 	  } else {
 	    linehints[x].lineswanted = linehints[x].rate;
 	    if (maxt > 1)
@@ -45884,6 +48984,21 @@ reprocess:
     }
     if (!Creader.gz_closed) gzclose(zfi);
     creader_reset();
+    /* Persist the AUTHORITATIVE line count (Fileline = total lines just
+     * consumed) to the SQLite cache, overwriting any prior partial-count
+     * entry. Skip stdin (no path/stat) and degenerate runs (Fileline==0). */
+    if (Fileline > 0 && Curfile && strcmp(Curfile, "stdin") != 0) {
+      char resolved[4096];
+#ifdef _WIN32
+      char *rp = _fullpath(resolved, argv[y], sizeof(resolved));
+#else
+      char *rp = realpath(argv[y], resolved);
+#endif
+      if (!rp) { strncpy(resolved, argv[y], sizeof(resolved) - 1); resolved[sizeof(resolved)-1] = 0; }
+      linecount_cache_finalize(resolved,
+                               (long long)sb.st_size, (long long)sb.st_mtime,
+                               Fileline);
+    }
   }
 bf_done:
   possess(FreeWaiting);
@@ -45900,9 +49015,8 @@ bf_done:
     twist(WorkWaiting, BY, +1);
 #ifdef GPU_ENABLED
     gpujob_shutdown(); /* wait for GPU to finish all work */
-#if defined(OPENCL_GPU)
-    gpu_opencl_bf_stop();
-#endif
+    /* BF Phase 3 (2026-05-10): gpu_opencl_bf_stop retired alongside the
+     * atomic-cursor BF machinery. Nothing to signal at shutdown anymore. */
 #endif
     possess(HashWaiting);
     twist(HashWaiting, TO, 1);  /* now signal ReportStats to exit */
@@ -45910,14 +49024,25 @@ bf_done:
 #ifdef OPENCL_GPU
     gpu_opencl_shutdown(); /* explicit — atexit races with NVIDIA driver teardown */
 #endif
+#if (defined(__APPLE__) && defined(METAL_GPU)) || defined(CUDA_GPU) || defined(OPENCL_GPU)
+    /* Per-device dispatch share — makes multi-GPU asymmetry obvious at
+     * a glance. Reads accumulated counters from gpujob_opencl.c. Safe to
+     * call after gpujob_shutdown(); does nothing on single-GPU runs. */
+    gpujob_print_share_line(stderr);
+#endif
     fprintf(stderr, "\nDone - %d threads caught\n", x - 1);
   }
   current_utc_time(&current);
   time(&end);
   start = end - start;
   fprintf(stderr, "%s lines processed in %llu seconds\n", commify(Totallines), (unsigned long long) start);
-  if (Totrules)
-    fprintf(stderr, "%s total rule-generated passwords tested\n", commify(Totrules + Totallines));
+  {
+    unsigned long long _gpu_rules_total = atomic_load(&Totrules_gpu);
+    if (Totrules || _gpu_rules_total) {
+      fprintf(stderr, "%s total rule-generated passwords tested\n",
+              commify(Totrules + Totallines + _gpu_rules_total));
+    }
+  }
   if (start == 0)
     start = 1;
   fprintf(stderr, "%.2f lines per second\n", (double) Totallines / (double) start);
