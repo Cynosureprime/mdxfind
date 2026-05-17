@@ -1,0 +1,44 @@
+# cl2metal overlay for sha512raw (gpu/gpu_sha512raw_core.cl -> gpu/metal_sha512raw_core.metal).
+#
+# Phase 2d.5.2 sha512raw -- second SHA-2/512 family Metal port. 16-uint32
+# digest emit, unsalted-only, 4 PSO variants. Sibling of sha512 (Phase
+# 2d.5.1 canary): same 64-bit ulong state, same sha512_block from
+# metal_common.metal, same EMIT_HIT_16. The only structural difference is
+# template_iterate body -- sha512raw re-feeds the BINARY 64-byte digest
+# (vs sha512 which re-feeds 128-char hex). Both share template_finalize.
+#
+# Two Apple-specific tweaks (identical pattern to sha512.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern shared with every prior SHA/MD core overlay).
+#
+#   2. skip_line_ranges: simple template_emit_hit macro
+#      OpenCL source lines 218-220 (3-line macro definition only; no
+#      preceding comment header in this file). The Metal hand-port keeps
+#      only the template_emit_hit_or_overflow dedup variant.
+#
+# Source order at JIT compile time (mirrors sha512):
+#   metal_common_str + metal_sha512raw_core_str + [metal_md5_rules_str if
+#   rules] + metal_template_str
+#
+# Pre-flight grep for sha512_block availability:
+#   $ grep -n "sha512_block" gpu/metal_common.metal
+# At Phase 2d.5.2 sha512_block + bswap64 + sha512_to_hex_lc +
+# EMIT_HIT_16 are already in metal_common.metal (added Phase 2d.5.1).
+# Token discipline per feedback_base_algo_token_match.md: helper named
+# `sha512_block` exactly in both source files.
+
+algo: sha512raw
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition. OpenCL source lines
+  # 218-220 (3 lines: #define + 2 continuations). No comment header for
+  # this file. Per sha512.yaml pattern, we drop only the simple form;
+  # the dedup variant (template_emit_hit_or_overflow) is preserved.
+  - start: 218
+    end:   220
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

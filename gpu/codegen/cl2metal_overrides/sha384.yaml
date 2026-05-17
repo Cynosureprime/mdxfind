@@ -1,0 +1,45 @@
+# cl2metal overlay for sha384 (gpu/gpu_sha384_core.cl -> gpu/metal_sha384_core.metal).
+#
+# Phase 2d.5.3 sha384 -- third SHA-2/512 family Metal port. 12-uint32
+# digest emit (vs sha512's 16), unsalted-only, 4 PSO variants. SHA-384
+# is a TRUNCATED SHA-512: same compression block (sha512_block), same
+# 80-round W schedule, same 128-byte block size + 128-bit length encoding.
+# Only differences vs sha512: SHA-384 IVs (different initial state) and
+# digest truncation (template_state_to_h emits state[0..5] = 6 ulong =
+# 12 uint32; state[6..7] dropped).
+#
+# Two Apple-specific tweaks (identical pattern to sha512.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern shared with every prior SHA/MD core overlay).
+#
+#   2. skip_line_ranges: simple template_emit_hit macro
+#      OpenCL source lines 269-273 (2-line comment header + 3-line macro).
+#      The Metal hand-port keeps only the template_emit_hit_or_overflow
+#      dedup variant.
+#
+# Source order at JIT compile time (mirrors sha512):
+#   metal_common_str + metal_sha384_core_str + [metal_md5_rules_str if
+#   rules] + metal_template_str
+#
+# Pre-flight grep for sha512_block + EMIT_HIT_12 availability:
+#   $ grep -n "sha512_block\|EMIT_HIT_12_DEDUP" gpu/metal_common.metal
+# At Phase 2d.5.3: sha512_block + bswap64 + sha512_to_hex_lc are already
+# in metal_common.metal (Phase 2d.5.1). EMIT_HIT_12_DEDUP_OR_OVERFLOW is
+# being ADDED to metal_common.metal as part of this dispatch (companion
+# edit). Token discipline per feedback_base_algo_token_match.md: helper
+# named `sha512_block` in both source files (sha384 uses sha512_block).
+
+algo: sha384
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro + 2-line comment header.
+  # OpenCL source: lines 269-273 (2 lines comment header at 269-270 +
+  # 3-line macro at 271-273). Mirrors sha512.yaml skip pattern.
+  - start: 269
+    end:   273
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

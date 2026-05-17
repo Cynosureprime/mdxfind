@@ -1,0 +1,73 @@
+# cl2metal overlay for hmac_streebog512
+# (gpu/gpu_hmac_streebog512_core.cl -> gpu/metal_hmac_streebog512_core.metal).
+#
+# Phase 2d.7d.3 HMAC-STREEBOG-512 carrier (Family K) -- FINAL HMAC family.
+# Hand-written Path A carrier kernel; two algo_modes (5=KSALT op=840,
+# 6=KPASS op=839). Sibling of HMAC-STREEBOG-256 (Phase 2d.7d.2) at
+# HASH_WORDS=16 (vs 8). Salted-only (GPU_TEMPLATE_HAS_SALT).
+# 16-uint32 LE digest = 64-byte output.
+#
+# Same TYPEOPT semantics as Family J: BOTH KSALT and KPASS use
+# TYPEOPT_NEEDSALT -- salt-data lives in Typesalt[op] for both ops via
+# gpu_salt_judy()'s Typesalt default arm.
+#
+# Streebog primitives (streebog_g + streebog_hash_priv) are per-kernel
+# (mirrors gpu_streebog512_core.cl unsalted Phase 2d.7c sibling). No
+# metal_common.metal additions.
+#
+# Translator support: identical to hmac_streebog256 -- cl2metal.py rev 1.8+
+# handles plain `void` fn-head matching + in-body uchar* cast rewrites +
+# dual_addr_space_helpers overlay knob for streebog_hash_priv.
+#
+# Apple-specific tweaks (mirror hmac_streebog256.yaml byte-for-byte except
+# line numbers):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#
+#   2. skip_line_ranges:
+#      a) `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around
+#         template_finalize signature (lines 890, 894) + body
+#         (lines 897, 1015).
+#      b) template_emit_hit (simple) macro definition + comment header
+#         at lines 1061-1065. (Note: source file has the macro body on a
+#         single physical line ending with `} while (0)`; comment header
+#         spans lines 1061-1064.)
+#
+# Source order at JIT compile time (mirrors streebog512 + hmac_streebog256):
+#   metal_common_str + metal_hmac_streebog512_core_str + metal_md5_rules_str
+#   + metal_template_str
+#
+# Pre-flight grep: same as hmac_streebog256 -- no metal_common.metal deps.
+
+algo: hmac_streebog512
+
+skip_line_ranges:
+  # Strip preproc guards around template_finalize signature.
+  - start: 890
+    end:   890
+    reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
+  - start: 894
+    end:   894
+    reason: "preproc guard around template_finalize salt args -- close"
+
+  # Strip preproc guards around HMAC body.
+  - start: 897
+    end:   897
+    reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
+  - start: 1015
+    end:   1015
+    reason: "preproc guard around HMAC body -- close"
+
+  # template_emit_hit (simple) macro definition + 4-line comment header.
+  # OpenCL source: lines 1061-1065 of gpu_hmac_streebog512_core.cl.
+  - start: 1061
+    end:   1065
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: streebog_hash_priv
+    arg: data

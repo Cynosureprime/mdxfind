@@ -1,0 +1,95 @@
+# cl2metal overlay for hmac_streebog256
+# (gpu/gpu_hmac_streebog256_core.cl -> gpu/metal_hmac_streebog256_core.metal).
+#
+# Phase 2d.7d.2 HMAC-STREEBOG-256 carrier (Family J). Hand-written Path A
+# carrier kernel; two algo_modes (5=KSALT op=838, 6=KPASS op=837). Both ops
+# share the SAME compiled kernel, dispatched via params.algo_mode runtime
+# branch. Salted-only (GPU_TEMPLATE_HAS_SALT). 8-uint32 LE digest = 32-byte
+# output.
+#
+# Per `feedback_hmac_salt_judy_typeopt.md`: BOTH KSALT and KPASS use
+# TYPEOPT_NEEDSALT -- salt-data lives in Typesalt[op] for both ops. The
+# host's gpu_salt_judy() falls through to the Typesalt default arm for
+# both. Distinct from Families A-H where KSALT routes via Typeuser.
+#
+# Streebog primitives (streebog_g + streebog_hash_priv + SBOB_SL64 16KB table
+# + SBOB_RC64 768B table + SBOG_LPS macro) are PER-KERNEL (not promoted to
+# metal_common.metal) -- mirrors gpu_streebog256_core.cl (Phase 2d.7c
+# unsalted sibling) where these live inline. No metal_common.metal additions.
+#
+# Translator support:
+#   - cl2metal.py rev 1.8+ `_FN_HEAD_RE` extension catches plain `void`
+#     declarations (streebog_g, streebog_hash_priv); body rewrites
+#     (rewrite_local_ptr_decls + rewrite_pointer_casts) fire automatically
+#     for in-body `uchar *NAME = (uchar *)expr;` cast sites.
+#   - dual_addr_space_helpers (Phase 2d.7b knob): streebog_hash_priv is
+#     called from BOTH template_iterate (thread-local hex_buf[]) AND
+#     template_finalize's defensive fallback (device-const slice of
+#     buf_scratch_pool via the `data` arg). Two overloads emitted.
+#     hmac_streebog256_run only calls with thread-local buffers (all msg/key
+#     staged into K_priv/msg_priv/ibuf/obuf private buffers up-front),
+#     so it does NOT need a dual overload.
+#
+# Apple-specific tweaks (identical pattern to streebog256.yaml +
+# hmac_blake2s.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      Hot-path slice from buf_scratch_pool. salt_bytes already carries
+#      __global which the translator maps to device const.
+#
+#   2. skip_line_ranges:
+#      a) Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around
+#         the template_finalize signature (lines 903, 907) and inside the
+#         body (lines 910, 1027). Metal JIT always defines HAS_SALT for
+#         this carrier; the bare preproc directives confuse the Metal
+#         parser (translator output produces `#ifdef ...,` extra-tokens
+#         warning then signature parse failure).
+#      b) template_emit_hit (simple) macro definition + comment header
+#         at lines 1073-1081. Metal hand-port keeps only the
+#         template_emit_hit_or_overflow form.
+#
+# Source order at JIT compile time (mirrors streebog256 + sha512saltpass
+# salted-only loaders):
+#   metal_common_str + metal_hmac_streebog256_core_str + metal_md5_rules_str
+#   + metal_template_str
+#
+# Pre-flight grep:
+#   $ grep -n "streebog_g\|streebog_hash_priv\|SBOB_SL64\|SBOG_LPS" \
+#       gpu/metal_common.metal  # expect: no matches (per-kernel only)
+
+algo: hmac_streebog256
+
+skip_line_ranges:
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around
+  # template_finalize signature. After strip, salt args are unconditional
+  # signature args -- matches sha1passsalt et al pattern.
+  - start: 903
+    end:   903
+    reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
+  - start: 907
+    end:   907
+    reason: "preproc guard around template_finalize salt args -- close"
+
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards inside the
+  # template_finalize body (HMAC algo_mode>=5u branch). HMAC body is always
+  # live on Metal; defensive fallback runs only if algo_mode != 5u.
+  - start: 910
+    end:   910
+    reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
+  - start: 1027
+    end:   1027
+    reason: "preproc guard around HMAC body -- close"
+
+  # template_emit_hit (simple) macro definition + 4-line comment header.
+  # OpenCL source: lines 1073-1081 of gpu_hmac_streebog256_core.cl.
+  - start: 1073
+    end:   1081
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: streebog_hash_priv
+    arg: data

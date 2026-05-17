@@ -1,0 +1,38 @@
+# cl2metal overlay for md5raw (gpu/gpu_md5raw_core.cl -> gpu/metal_md5raw_core.metal).
+#
+# Phase 2d.2.3 md5raw overlay. Mirrors the md4utf16 pattern (md4utf16.yaml)
+# with the task #250 arg_address_space tweak for template_finalize. Reason:
+# the kernel call site in metal_template.metal passes `device uchar *buf`
+# (per-lane scratch slice from the buf_scratch_pool MTLBuffer). Per
+# task #250 the per-lane buf is in device storage to keep the M2 Max PSO
+# register budget within bounds, so the helper signature must take
+# `device const uchar *data` rather than the translator's default
+# `thread const uchar *data` inference. Same pattern as md4utf16.yaml /
+# md4.yaml / md5salt.yaml.
+#
+# The OpenCL source declares `data` as unqualified pointer (defaults to
+# __private). The Metal call site passes a device buf, so the helper
+# signature MUST be `device const uchar *data`.
+#
+# md5raw differs from md5/md4/md4utf16 in ONLY template_iterate (re-feed
+# the 16-byte BINARY digest, not the hex-encoded 32-byte form). All other
+# helpers — template_init, template_transform, template_finalize,
+# template_digest_compare, template_emit_hit* — are byte-identical to
+# md5 (and to md4 modulo IV/compression-fn name). The translator output
+# therefore only needs the same arg_address_space tweak as md4 + md4utf16.
+
+algo: md5raw
+
+skip_line_ranges:
+  # template_emit_hit macro (4 lines: #define + 3 continuations).
+  # Mirrors md4utf16.yaml. The Metal hand-port pattern keeps only the
+  # template_emit_hit_or_overflow form. gpu_md5raw_core.cl has no
+  # comment header above the macro (the macro starts directly at
+  # line 187, mirroring md4utf16 not md4 which has 269-276).
+  - start: 187
+    end:   190
+    reason: "template_emit_hit macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

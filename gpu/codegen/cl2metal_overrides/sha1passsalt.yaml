@@ -1,0 +1,68 @@
+# cl2metal overlay for sha1passsalt (gpu/gpu_sha1passsalt_core.cl ->
+# gpu/metal_sha1passsalt_core.metal).
+#
+# Phase 2d.3.4 sha1passsalt overlay -- FIRST SHA-family salted port on the
+# cl2metal codegen path. SHA1PASSSALT (JOB_SHA1PASSSALT=405, hashcat -m 100,
+# mdxfind e405) = SHA-1(pass || salt) -- APPEND-shape salted SHA-1 variant.
+# Sibling of Phase 2d.2.4 md5passsalt (the FIRST salted family port; md5salt
+# Phase 2c was hand-ported).
+#
+# Compared to md5passsalt:
+#   - Same kernel shape (single template_finalize body, no algo_mode
+#     branches, no template_pre_salt/post for Phase 2e hoist, no
+#     salt_pack_uint helper). HEX_FEEDBACK iter loop (sha1(hex_lc(prev))
+#     with fresh IV; no salt re-application).
+#   - 5-word state (vs MD5's 4) -- same SHA-1 width path as Phase 2d.3.1
+#     sha1 / Phase 2d.3.2 sha1raw. metal_gpu_hash_words switch already
+#     covers JOB_SHA1PASSSALT (forward-staged in Phase 2d.3.2 by prior
+#     agent).
+#   - BIG-ENDIAN message word load (vs MD5's LE), inherits sha1_block /
+#     bswap32 / EMIT_HIT_5_DEDUP_OR_OVERFLOW from metal_common.metal
+#     (already present from Phase 2d.3.1).
+#
+# Two Apple-specific tweaks (per task #250 pattern, identical to md5passsalt
+# and sha1 family overlays):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      The OpenCL source declares `data` as unqualified pointer (defaults
+#      to __private); the Metal call site in metal_template.metal passes
+#      `device uchar *` from the per-lane buf_scratch_pool slice. salt_buf
+#      already carries __global which the translator maps to device const.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Mirror of md5passsalt.yaml / sha1.yaml / sha1raw.yaml -- the Metal
+#      hand-port keeps only the template_emit_hit_or_overflow form. The
+#      simple `template_emit_hit` macro lives at lines 306-320 of
+#      gpu_sha1passsalt_core.cl (4-line comment header + 11-line macro
+#      body).
+#
+# Source order at JIT compile time (mirrors md5passsalt / sha1 / sha1raw):
+#   metal_common_str + metal_md5_rules_str + metal_sha1passsalt_core_str
+#   + metal_template_str
+#
+# Pre-flight: sha1_block + EMIT_HIT_5_DEDUP_OR_OVERFLOW + bswap32 already
+# present in metal_common.metal from Phase 2d.3.1. No companion edit needed.
+#
+# Host-wiring forward-staged:
+#   - metal_gpu_hash_words(JOB_SHA1PASSSALT) returns 5 (forward-staged by
+#     Phase 2d.3.2 agent in gpu/gpujob_metal.m rev 1.11)
+#   - is_salted_op admits JOB_SHA1PASSSALT (forward-staged by Phase 2d.3.2
+#     agent in gpu/gpujob_metal.m rev 1.11)
+# Phase 2d.3.4 still must:
+#   - Widen use_salt predicate in gpu_metal.m dispatch path for
+#     JOB_SHA1PASSSALT (currently admits MD5SALT/MD5PASSSALT/MD5SALTPASS)
+
+algo: sha1passsalt
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + its 4-line comment header.
+  # OpenCL source: lines 306-320 of gpu_sha1passsalt_core.cl.
+  # Mirrors md5passsalt's skip pattern. The Metal hand-port keeps only the
+  # template_emit_hit_or_overflow dedup variant.
+  - start: 306
+    end:   320
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

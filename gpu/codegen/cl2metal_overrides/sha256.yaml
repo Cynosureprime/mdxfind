@@ -1,0 +1,58 @@
+# cl2metal overlay for sha256 (gpu/gpu_sha256_core.cl -> gpu/metal_sha256_core.metal).
+#
+# Phase 2d.4.1 sha256 (raw SHA-256) overlay -- FIRST SHA-2/256 family canary
+# on the cl2metal codegen path. 8-word state (vs MD4/MD5's 4-word and
+# SHA-1's 5-word) and BIG-ENDIAN message word load are the two main
+# differences from prior md5-family kernels. The translator (cl2metal.py
+# rev 1.4+, Phase 2d.3.1 ship) already registers sha256_block in
+# _BLOCK_HELPERS_POINTER_STATE so call-site `&st.h[0]` is preserved
+# verbatim. Two Apple-specific tweaks remain in this overlay:
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to md4/md4utf16/md5raw/md5passsalt/
+#      md5saltpass/sha1/sha1raw/sha1dru/sha1passsalt/sha1saltpass overlays).
+#      The OpenCL source declares `data` as unqualified pointer (defaults
+#      to __private); the Metal call site in metal_template.metal passes
+#      `device uchar *` from the per-lane buf_scratch_pool slice, so the
+#      helper signature must take `device const uchar *data` instead of
+#      the translator's default inference `thread const uchar *data`.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      The Metal hand-port pattern keeps only the
+#      template_emit_hit_or_overflow form (mirrors md5.yaml/md4.yaml/
+#      md4utf16.yaml/md5raw.yaml/md5passsalt.yaml/md5saltpass.yaml/
+#      sha1.yaml etc.). The simple `template_emit_hit` macro + its 8-line
+#      comment header live at lines 316-338 of gpu_sha256_core.cl.
+#
+# Source order at JIT compile time (mirrors sha1):
+#   metal_common_str + metal_sha256_core_str + [metal_md5_rules_str if rules]
+#   + metal_template_str
+#
+# Pre-flight grep for sha256_block availability:
+#   $ grep -n "sha256_block" gpu/metal_common.metal
+# At Phase 2d.4.1 sha256_block is being ADDED to metal_common.metal as
+# part of this dispatch (companion edit). The OpenCL twin gpu_common.cl
+# already carries it (line 909). Token discipline per
+# feedback_base_algo_token_match.md: the helper is named `sha256_block`
+# exactly in both source files.
+#
+# EMIT_HIT_8_DEDUP_OR_OVERFLOW is also being added to metal_common.metal
+# alongside the existing EMIT_HIT_4 and EMIT_HIT_5 macros (Phase 2d.3.1
+# canary added EMIT_HIT_5 for SHA-1).
+
+algo: sha256
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro + its 8-line comment header.
+  # OpenCL source: lines 316-338 of gpu_sha256_core.cl (8 lines of comment
+  # at 316-323 + macro definition 324-338). Mirrors sha1.yaml/md5passsalt
+  # skip pattern. The Metal hand-port keeps only the
+  # template_emit_hit_or_overflow dedup variant; the simple macro is
+  # dropped to match the unified template_emit_hit_or_overflow contract.
+  - start: 316
+    end:   338
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

@@ -1,0 +1,76 @@
+# cl2metal overlay for sha1dru (gpu/gpu_sha1dru_core.cl -> gpu/metal_sha1dru_core.metal).
+#
+# Phase 2d.3.3 sha1dru overlay -- second sibling of Phase 2d.3.1 sha1.yaml.
+# SHA1DRU = SHA-1(pass) followed by 1,000,000 iterations of
+# SHA-1(hex_lc(state) || pass); FIRST 1M-iteration algorithm on the unified
+# template path. ONE probe at the final state (max_iter=1 host-forced).
+# Same 5-word state, same BE message word load, same sha1_block helper from
+# metal_common.metal as sha1/sha1raw. The translator (cl2metal.py rev 1.4+)
+# handles the wider-state path; TWO Apple-specific tweaks require this
+# overlay, identical to sha1.yaml/sha1raw.yaml:
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to sha1.yaml/sha1raw.yaml). The OpenCL
+#      source declares `data` as unqualified pointer (defaults to __private);
+#      the Metal call site in metal_template.metal passes
+#      `device uchar *` from the per-lane buf_scratch_pool slice, so the
+#      helper signature must take `device const uchar *data` instead of
+#      the translator's default inference `thread const uchar *data`.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Mirror of sha1.yaml/sha1raw.yaml -- the Metal hand-port keeps only
+#      the template_emit_hit_or_overflow form. gpu_sha1dru_core.cl carries
+#      the simple `template_emit_hit` macro at lines 350-361 (1-line
+#      comment header + 11-line macro body). The skip range removes both
+#      the comment and the macro definition.
+#
+# ITER_COUNT macro: defaulted to 1000000 in the .cl source via
+#   #ifndef ITER_COUNT
+#   #define ITER_COUNT 1000000
+#   #endif
+# The Metal JIT path does NOT pass build-time -D flags (concat-source
+# pattern); the default in the source file takes effect. This matches the
+# OpenCL twin's defines_str of "ITER_COUNT=1000000" semantically (OpenCL
+# host passes -DITER_COUNT=1000000 explicitly; Metal relies on the
+# #ifndef-guarded default in the source). Either way the kernel emits a
+# 1M-iter inner loop in template_finalize.
+#
+# Host-side max_iter=1 forcing (per OpenCL twin gpu_opencl.c:10793):
+# JOB_SHA1DRU has its 1M iter loop INSIDE template_finalize, so the kernel's
+# OUTER iter loop in template_phase0 must run exactly ONCE. Without forcing
+# max_iter=1 host-side, user `-i N` would emit N redundant hits at iter
+# levels 1..N for the same final digest (different mask = 1u << (iter & 31)
+# values defeat the hashes_shown dedup). Implementation: per-op override
+# at gpu_metal.m dispatch sites where cache_max_iter feeds params->max_iter.
+#
+# Source order at JIT compile time (mirrors sha1):
+#   metal_common_str + metal_sha1dru_core_str + [metal_md5_rules_str if rules]
+#   + metal_template_str
+#
+# Pre-flight grep for sha1_block availability:
+#   $ grep -n "sha1_block" gpu/metal_common.metal
+# Already present from Phase 2d.3.1; no companion edit needed.
+
+algo: sha1dru
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + its 1-line comment header.
+  # OpenCL source: lines 350-361 of gpu_sha1dru_core.cl.
+  # Mirrors sha1's skip pattern. The Metal hand-port keeps only the
+  # template_emit_hit_or_overflow dedup variant.
+  - start: 350
+    end:   361
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+  # Inner helpers called by template_finalize must accept the same
+  # address-space-qualified pointer. The translator default of `thread
+  # const uchar *` would mismatch the device-qualified pointer passed
+  # from template_finalize at the call sites at lines 326 + 330 of the
+  # generated metal_sha1dru_core.metal.
+  sha1dru_init_finalize:
+    data: "device const"
+  sha1dru_iter_step:
+    pass: "device const"

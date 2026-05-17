@@ -23,6 +23,7 @@
 #include "job_types.h"
 #include "gpujob.h"
 #include "yarn.h"      /* launch()/join() for parallel device init (Memo C) */
+#include "gpu_debug.h" /* GPU_DEBUG_FPRINTF -- compile-time gated on -DMDXFIND_GPU_DEBUG */
 
 /* malloc_pinned() lives in mdxfind.c -- page-aligned + mlock helper for
  * GPU-upload host buffers. We don't pull in mdxfind.h (would drag the
@@ -2007,7 +2008,12 @@ static int device_allowed(int idx) {
 
 static cl_mem dev_buf(struct gpu_device *d, size_t size, cl_mem_flags flags) {
     cl_int err;
-    return clCreateBuffer(d->ctx, flags, size ? size : 4, NULL, &err);
+    size_t alloc = size ? size : 4;
+    cl_mem b = clCreateBuffer(d->ctx, flags, alloc, NULL, &err);
+    if (!b || err != CL_SUCCESS)
+        GPU_FATAL("dev_buf alloc size=%zu flags=0x%lx err=%d",
+                  alloc, (unsigned long)flags, err);
+    return b;
 }
 
 /* Allocate a cl_mem with a minimum allocation of MIN_BUFFER_BYTES.
@@ -2057,18 +2063,22 @@ static cl_mem create_min_buf(cl_context ctx, cl_command_queue q,
             /* clEnqueueFillBuffer can fail on some 1.1-era drivers even
              * when the symbol is loaded; fall through to host stage. */
             uint8_t *z = (uint8_t *)calloc(1, alloc);
-            if (z) {
-                clEnqueueWriteBuffer(q, buf, CL_TRUE, 0, alloc, z, 0, NULL, NULL);
-                free(z);
+            if (!z) GPU_FATAL("create_min_buf host-zero calloc(%zu) fallback failed", alloc);
+            {
+                cl_int _e = clEnqueueWriteBuffer(q, buf, CL_TRUE, 0, alloc, z, 0, NULL, NULL);
+                if (_e != CL_SUCCESS) GPU_FATAL("create_min_buf host-stage zero write (fill-failed path) alloc=%zu err=%d", alloc, _e);
             }
+            free(z);
         }
     } else {
         /* OpenCL 1.1 fallback: stage zero buffer */
         uint8_t *z = (uint8_t *)calloc(1, alloc);
-        if (z) {
-            clEnqueueWriteBuffer(q, buf, CL_TRUE, 0, alloc, z, 0, NULL, NULL);
-            free(z);
+        if (!z) GPU_FATAL("create_min_buf 1.1-fallback host-zero calloc(%zu) failed", alloc);
+        {
+            cl_int _e = clEnqueueWriteBuffer(q, buf, CL_TRUE, 0, alloc, z, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("create_min_buf host-stage zero write (1.1 path) alloc=%zu err=%d", alloc, _e);
         }
+        free(z);
     }
     /* Write actual data into the prefix. Blocking write so the buffer is
      * in its final state by the time we return — matches the prior
@@ -2772,10 +2782,17 @@ static int probe_max_dispatch(int di) {
     cl_mem b_sdata = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, max_salts, NULL, &err);
     cl_mem b_soff = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, max_salts * sizeof(uint32_t), NULL, &err);
     cl_mem b_slen = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, max_salts * sizeof(uint16_t), NULL, &err);
-    clEnqueueWriteBuffer(d->queue, b_sdata, CL_TRUE, 0, max_salts, salt_data, 0, NULL, NULL);
-    clEnqueueWriteBuffer(d->queue, b_soff, CL_TRUE, 0, max_salts * sizeof(uint32_t), salt_off, 0, NULL, NULL);
-    clEnqueueWriteBuffer(d->queue, b_slen, CL_TRUE, 0, max_salts * sizeof(uint16_t), salt_len, 0, NULL, NULL);
-    clFinish(d->queue);
+    {
+        cl_int _e;
+        _e = clEnqueueWriteBuffer(d->queue, b_sdata, CL_TRUE, 0, max_salts, salt_data, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch write b_sdata dev=%d bytes=%d err=%d", di, max_salts, _e);
+        _e = clEnqueueWriteBuffer(d->queue, b_soff, CL_TRUE, 0, max_salts * sizeof(uint32_t), salt_off, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch write b_soff dev=%d bytes=%zu err=%d", di, (size_t)max_salts * sizeof(uint32_t), _e);
+        _e = clEnqueueWriteBuffer(d->queue, b_slen, CL_TRUE, 0, max_salts * sizeof(uint16_t), salt_len, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch write b_slen dev=%d bytes=%zu err=%d", di, (size_t)max_salts * sizeof(uint16_t), _e);
+        _e = clFinish(d->queue);
+        if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch clFinish (initial salt upload) dev=%d err=%d", di, _e);
+    }
     free(salt_data); free(salt_off); free(salt_len);
 
     /* Set kernel args */
@@ -2810,12 +2827,19 @@ static int probe_max_dispatch(int di) {
 
         params.num_salts = nsalts;
         // params.salt_start = 0;
-        clEnqueueWriteBuffer(d->queue, b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
+        {
+            cl_int _e = clEnqueueWriteBuffer(d->queue, b_params, CL_TRUE, 0, sizeof(params), &params, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch write b_params dev=%d nsalts=%d err=%d", di, nsalts, _e);
+        }
 
         /* Zero hit counter */
         uint32_t zero = 0;
-        clEnqueueWriteBuffer(d->queue, b_hitcnt, CL_TRUE, 0, sizeof(zero), &zero, 0, NULL, NULL);
-        clFinish(d->queue);
+        {
+            cl_int _e = clEnqueueWriteBuffer(d->queue, b_hitcnt, CL_TRUE, 0, sizeof(zero), &zero, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch write b_hitcnt (zero) dev=%d nsalts=%d err=%d", di, nsalts, _e);
+            _e = clFinish(d->queue);
+            if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch clFinish (pre-NDRange) dev=%d nsalts=%d err=%d", di, nsalts, _e);
+        }
 
         size_t global = (size_t)32 * nsalts;  /* 32 words * nsalts */
         size_t local = 128;
@@ -2830,7 +2854,10 @@ static int probe_max_dispatch(int di) {
 
         /* Read hit count — should be exactly 32 (salt 0 matches for each of 32 words) */
         uint32_t nhits;
-        clEnqueueReadBuffer(d->queue, b_hitcnt, CL_TRUE, 0, sizeof(nhits), &nhits, 0, NULL, NULL);
+        {
+            cl_int _e = clEnqueueReadBuffer(d->queue, b_hitcnt, CL_TRUE, 0, sizeof(nhits), &nhits, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("probe_max_dispatch read b_hitcnt dev=%d nsalts=%d err=%d", di, nsalts, _e);
+        }
 
         if (nhits == 32 && finish_err == CL_SUCCESS) {
             max_good = nsalts;
@@ -3090,7 +3117,10 @@ void gpu_opencl_shutdown(void) {
     ocl_ready = 0;  /* prevent re-entry */
     for (int i = 0; i < num_gpu_devs; i++) {
         struct gpu_device *d = &gpu_devs[i];
-        if (d->queue) clFinish(d->queue);  /* drain any pending GPU work */
+        if (d->queue) {
+            cl_int _e = clFinish(d->queue);  /* drain any pending GPU work */
+            if (_e != CL_SUCCESS) GPU_FATAL("gpu_opencl_shutdown clFinish dev=%d err=%d", i, _e);
+        }
         /* Skip CL object releases — NVIDIA driver may have already torn
          * down internal state by this point, causing NULL dereference
          * inside clReleaseKernel.  Process exit reclaims everything. */
@@ -3397,34 +3427,41 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
     if (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) {
         /* word_stride=64 bytes = 16 uint32. Write M[14]=64 per block. */
         uint32_t *wbuf = (uint32_t *)calloc(1, words_size);
-        if (wbuf) {
-            for (int wi = 0; wi < num_words; wi++) {
-                /* M[2] = 0x80 byte in LE uint32: padding sentinel */
-                wbuf[wi * 16 + 2] = 0x00000080u;
-                /* M[14] = bit count = 8*8 = 64 */
-                wbuf[wi * 16 + 14] = 64;
-            }
-            clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, wbuf, 0, NULL, NULL);
-            free(wbuf);
+        if (!wbuf) GPU_FATAL("warm-probe wbuf calloc(%zu) failed dev=%d", words_size, dev_idx);
+        for (int wi = 0; wi < num_words; wi++) {
+            /* M[2] = 0x80 byte in LE uint32: padding sentinel */
+            wbuf[wi * 16 + 2] = 0x00000080u;
+            /* M[14] = bit count = 8*8 = 64 */
+            wbuf[wi * 16 + 14] = 64;
         }
+        {
+            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, wbuf, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexhashes (mask/unsalted seed) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
+        }
+        free(wbuf);
     } else if (p_clEnqueueFillBuffer) {
         unsigned char zb = 0;
-        clEnqueueFillBuffer(d->queue, d->b_hexhashes, &zb, sizeof(zb), 0, words_size, 0, NULL, NULL);
+        cl_int _e = clEnqueueFillBuffer(d->queue, d->b_hexhashes, &zb, sizeof(zb), 0, words_size, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe fill b_hexhashes (salted seed) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
     } else {
         unsigned char *zbuf = (unsigned char *)calloc(1, words_size);
-        if (zbuf) {
-            clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, zbuf, 0, NULL, NULL);
-            free(zbuf);
+        if (!zbuf) GPU_FATAL("warm-probe zbuf calloc(%zu) failed dev=%d (1.1 fallback)", words_size, dev_idx);
+        {
+            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, zbuf, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexhashes (1.1 zero stage) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
         }
+        free(zbuf);
     }
     /* Each entry length = 32 (a valid hex hash slot). Build host-side. */
     {
         uint16_t *lens = (uint16_t *)malloc(hexlens_upload);
-        if (lens) {
-            for (int i = 0; i < num_words; i++) lens[i] = 32;
-            clEnqueueWriteBuffer(d->queue, d->b_hexlens, CL_TRUE, 0, hexlens_upload, lens, 0, NULL, NULL);
-            free(lens);
+        if (!lens) GPU_FATAL("warm-probe hexlens malloc(%zu) failed dev=%d", hexlens_upload, dev_idx);
+        for (int i = 0; i < num_words; i++) lens[i] = 32;
+        {
+            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_hexlens, CL_TRUE, 0, hexlens_upload, lens, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexlens dev=%d size=%zu err=%d", dev_idx, hexlens_upload, _e);
         }
+        free(lens);
     }
 
     OCLParams params;
@@ -3447,11 +3484,16 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
     params.n_append        = use_n_append;
 
     uint32_t zero = 0;
-    if (p_clEnqueueFillBuffer)
-        clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero, sizeof(zero), 0, sizeof(zero), 0, NULL, NULL);
-    else
-        clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero), &zero, 0, NULL, NULL);
-    clFinish(d->queue);
+    {
+        cl_int _e;
+        if (p_clEnqueueFillBuffer)
+            _e = clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero, sizeof(zero), 0, sizeof(zero), 0, NULL, NULL);
+        else
+            _e = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero), &zero, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hit_count (pre-bind) dev=%d err=%d", dev_idx, _e);
+        _e = clFinish(d->queue);
+        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe clFinish (pre-bind) dev=%d err=%d", dev_idx, _e);
+    }
 
     /* Bind kernel args identically to dispatch_batch — but use the
      * synthetic compact/mask buffers when the real ones aren't loaded yet
@@ -3489,10 +3531,14 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
 
     for (int probe = 0; probe < 20; probe++) {
         uint32_t zero_hit = 0;
-        if (p_clEnqueueFillBuffer)
-            clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero_hit, sizeof(zero_hit), 0, sizeof(zero_hit), 0, NULL, NULL);
-        else
-            clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero_hit), &zero_hit, 0, NULL, NULL);
+        {
+            cl_int _e;
+            if (p_clEnqueueFillBuffer)
+                _e = clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero_hit, sizeof(zero_hit), 0, sizeof(zero_hit), 0, NULL, NULL);
+            else
+                _e = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero_hit), &zero_hit, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hit_count (iter %d) dev=%d err=%d", probe, dev_idx, _e);
+        }
 
         OCLParams probe_params = params;
         if (is_mask) {
@@ -3509,7 +3555,10 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
             probe_params.num_salts = ps;
             probe_params.salt_start = salt_start_base;
         }
-        clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(probe_params), &probe_params, 0, NULL, NULL);
+        {
+            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(probe_params), &probe_params, 0, NULL, NULL);
+            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_params (iter %d) dev=%d err=%d", probe, dev_idx, _e);
+        }
 
         size_t probe_global = is_mask
             ? (size_t)num_words * probe_params.num_masks
@@ -3520,7 +3569,10 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
         clock_gettime(CLOCK_MONOTONIC, &pt0);
         cl_int perr = clEnqueueNDRangeKernel(d->queue, kern, 1, NULL, &probe_global, &local, 0, NULL, NULL);
         if (perr != CL_SUCCESS) break;
-        clFinish(d->queue);
+        {
+            cl_int _e = clFinish(d->queue);
+            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe clFinish (post-NDRange iter %d) dev=%d err=%d", probe, dev_idx, _e);
+        }
         clock_gettime(CLOCK_MONOTONIC, &pt1);
         double pms = (pt1.tv_sec - pt0.tv_sec) * 1e3 + (pt1.tv_nsec - pt0.tv_nsec) / 1e6;
 
@@ -3573,10 +3625,14 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
         }
         if (reps > 1) {
             uint32_t zh = 0;
-            if (p_clEnqueueFillBuffer)
-                clEnqueueFillBuffer(d->queue, d->b_hit_count, &zh, sizeof(zh), 0, sizeof(zh), 0, NULL, NULL);
-            else
-                clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zh), &zh, 0, NULL, NULL);
+            {
+                cl_int _e;
+                if (p_clEnqueueFillBuffer)
+                    _e = clEnqueueFillBuffer(d->queue, d->b_hit_count, &zh, sizeof(zh), 0, sizeof(zh), 0, NULL, NULL);
+                else
+                    _e = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zh), &zh, 0, NULL, NULL);
+                if (_e != CL_SUCCESS) GPU_FATAL("warm-probe rescue zero b_hit_count dev=%d err=%d", dev_idx, _e);
+            }
             /* Re-establish probe_global from last iteration's params. */
             uint32_t last_pm = (params.num_masks > 0) ? params.num_masks : best_size;
             size_t resc_global = is_mask
@@ -3590,7 +3646,10 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
                     &resc_global, &local, 0, NULL, NULL);
                 if (re != CL_SUCCESS) { reps = r; break; }
             }
-            clFinish(d->queue);
+            {
+                cl_int _e = clFinish(d->queue);
+                if (_e != CL_SUCCESS) GPU_FATAL("warm-probe rescue clFinish dev=%d reps=%u err=%d", dev_idx, reps, _e);
+            }
             clock_gettime(CLOCK_MONOTONIC, &rt1);
             double total_ms = (rt1.tv_sec - rt0.tv_sec) * 1e3
                             + (rt1.tv_nsec - rt0.tv_nsec) / 1e6;
@@ -3828,10 +3887,17 @@ int gpu_opencl_set_salts(int dev_idx,
         d->salt_off_cap = need_off;
     }
 
-    clEnqueueWriteBuffer(d->queue, d->b_salt_data, CL_TRUE, 0, salts_size, salts, 0, NULL, NULL);
-    clEnqueueWriteBuffer(d->queue, d->b_salt_off, CL_TRUE, 0, num_salts * sizeof(uint32_t), salt_offsets, 0, NULL, NULL);
-    clEnqueueWriteBuffer(d->queue, d->b_salt_len, CL_TRUE, 0, num_salts * sizeof(uint16_t), salt_lens, 0, NULL, NULL);
-    clFinish(d->queue);
+    {
+        cl_int _e;
+        _e = clEnqueueWriteBuffer(d->queue, d->b_salt_data, CL_TRUE, 0, salts_size, salts, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("set_salts write b_salt_data dev=%d bytes=%zu nsalts=%d err=%d", dev_idx, salts_size, num_salts, _e);
+        _e = clEnqueueWriteBuffer(d->queue, d->b_salt_off, CL_TRUE, 0, num_salts * sizeof(uint32_t), salt_offsets, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("set_salts write b_salt_off dev=%d bytes=%zu nsalts=%d err=%d", dev_idx, (size_t)num_salts * sizeof(uint32_t), num_salts, _e);
+        _e = clEnqueueWriteBuffer(d->queue, d->b_salt_len, CL_TRUE, 0, num_salts * sizeof(uint16_t), salt_lens, 0, NULL, NULL);
+        if (_e != CL_SUCCESS) GPU_FATAL("set_salts write b_salt_len dev=%d bytes=%zu nsalts=%d err=%d", dev_idx, (size_t)num_salts * sizeof(uint16_t), num_salts, _e);
+        _e = clFinish(d->queue);
+        if (_e != CL_SUCCESS) GPU_FATAL("set_salts clFinish dev=%d nsalts=%d err=%d", dev_idx, num_salts, _e);
+    }
     d->salts_count = num_salts;
     return 0;
 }
@@ -9710,7 +9776,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
         if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES
             && !_first_dispatch_logged[dev_idx]) {
             _first_dispatch_logged[dev_idx] = 1;
-            tsfprintf(stderr, "OpenCL GPU[%d]: first dispatch issued\n", dev_idx);
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: first dispatch issued\n", dev_idx);
         }
     }
 
@@ -9843,7 +9909,10 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
                       "(global=%zu, n_words=%u, n_rules=%d)",
                       err, dev_idx, global_v, num_words, d->gpu_n_rules);
         }
-        clFinish(d->queue);
+        {
+            cl_int _e = clFinish(d->queue);
+            if (_e != CL_SUCCESS) GPU_FATAL("validator clFinish dev=%d global=%zu err=%d", dev_idx, global_v, _e);
+        }
 
         /* Read full records buffer back. For 200 words × 41 rules
          * × 258 B ≈ 2 MB — trivial. */
@@ -11103,7 +11172,10 @@ validator_skip:
                     err = -1;
                 }
             }
-            clFinish(d->queue);
+            {
+                cl_int _e = clFinish(d->queue);
+                if (_e != CL_SUCCESS) GPU_FATAL("hashes_shown zero-init clFinish dev=%d alloc=%zu err=%d", dev_idx, alloc_bytes, _e);
+            }
             clock_gettime(CLOCK_MONOTONIC, &_hs_t1);
             if (err != CL_SUCCESS) {
                 fprintf(stderr,

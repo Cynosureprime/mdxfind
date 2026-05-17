@@ -1,0 +1,35 @@
+# cl2metal overlay for sha512passsalt (gpu/gpu_sha512passsalt_core.cl ->
+# gpu/metal_sha512passsalt_core.metal).
+#
+# Phase 2d.5.5 sha512passsalt -- FIRST SALTED in the SHA-2/512 family on
+# the cl2metal codegen path. APPEND-shape: SHA-512(pass || salt). Sibling
+# of md5passsalt + sha1passsalt + sha256passsalt overlays.
+#
+# Reuses the entire SHA-512 infrastructure (sha512_block + bswap64 +
+# rotr64 + mtl_hex_byte_be64 + EMIT_HIT_16) added in Phase 2d.5.1. No new
+# metal_common.metal additions for this family.
+#
+# Two Apple-specific tweaks (identical pattern to sha512.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern shared with every prior SHA/MD core overlay).
+#
+#   2. skip_line_ranges: simple template_emit_hit macro
+#      OpenCL source lines 376-381 (3-line comment header + 3-line macro).
+#      The Metal hand-port keeps only the template_emit_hit_or_overflow
+#      dedup variant.
+#
+# Source order at JIT compile time (mirrors sha512):
+#   metal_common_str + metal_sha512passsalt_core_str + [metal_md5_rules_str
+#   if rules] + metal_template_str
+
+algo: sha512passsalt
+
+skip_line_ranges:
+  - start: 376
+    end:   381
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

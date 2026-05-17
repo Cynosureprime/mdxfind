@@ -1,0 +1,34 @@
+# cl2metal overlay for md5 (gpu/gpu_md5_core.cl -> gpu/metal_md5_core.metal).
+#
+# $Revision: 1.1 $
+# $Log: md5.yaml,v $
+# Revision 1.1  2026/05/15 16:26:09  dlr
+# Phase 2d.1 minimal md5 overlay. Skip template_emit_hit macro (lines 250-258) since hand-port keeps only template_emit_hit_or_overflow. No arg_address_space overrides needed for md5.
+#
+#
+# MD5 is the simplest test case for the translator: a pure mechanical port
+# with no Apple-specific tweaks beyond the standard 1:1 substitutions in
+# cl2metal.py. This overlay is effectively a stub -- it exists so the
+# translator can find a per-algo file under cl2metal_overrides/ (the
+# discovery path looks for <algo>.yaml).
+#
+# Hand-port reference: gpu/metal_md5_core.metal (RCS rev 1.1, 2026-05-12).
+#
+# No skip_blocks, no arg_address_space overrides. The template_emit_hit
+# macro that the OpenCL twin defines is REMOVED in the hand-port (only
+# template_emit_hit_or_overflow is kept) -- this is dropped via the
+# skip_functions list, even though it's a macro not a function (the
+# overlay treats #define lines as non-skippable; macro removal happens
+# via line ranges).
+
+algo: md5
+
+skip_line_ranges:
+  # template_emit_hit macro (3 lines: comment + #define + continuation).
+  # OpenCL line 250-258: `template_emit_hit: emit a hit ...` comment +
+  # the macro definition. The Metal hand-port replaces this with only
+  # template_emit_hit_or_overflow (different macro arg shape uses
+  # st_ref instead of st as the state arg name).
+  - start: 250
+    end:   258
+    reason: "template_emit_hit macro -- replaced by template_emit_hit_or_overflow"

@@ -1,0 +1,27 @@
+# cl2metal overlay for sha256saltpass (gpu/gpu_sha256saltpass_core.cl ->
+# gpu/metal_sha256saltpass_core.metal).
+#
+# Phase 2d.4.5 sha256saltpass overlay -- PREPEND-shape SHA-256 (mirror of
+# sha256passsalt's APPEND, digest = SHA-256(salt || pass)). Sibling of
+# md5saltpass.yaml + sha1saltpass.yaml.
+#
+# gpu_sha256saltpass_core.cl is a LARGE carrier (~50KB) hosting multiple
+# salted SHA-2 modes. The simple template_emit_hit macro lives at lines
+# 1087-1104 (later in the file than sha256passsalt's, which is at 316-333,
+# because saltpass carriers also contain HMAC primitives).
+#
+# Apple-specific tweaks (identical to sha256passsalt.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#   2. skip_line_ranges: template_emit_hit (simple) macro + comment header
+
+algo: sha256saltpass
+
+skip_line_ranges:
+  - start: 1087
+    end:   1104
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

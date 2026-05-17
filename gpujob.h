@@ -1,9 +1,8 @@
 /*
- * gpujob.h — Dedicated GPU worker thread for mdxfind Metal acceleration
+ * gpujob.h — Dedicated GPU worker thread for mdxfind GPU acceleration
  *
  * Receives batches of pre-hashed words from procjob() threads,
- * dispatches them to the GPU as a single Metal command.
- * Only available on Apple Silicon with METAL_GPU defined.
+ * dispatches them to the GPU as a single command.
  */
 
 #ifndef GPUJOB_H
@@ -184,7 +183,7 @@ struct jobg {
 };
 
 /* Initialize GPU work queue, allocate JOBG structs, launch gpujob thread.
- * Call from main() after metal_md5salt_init() and set_compact_table().
+ * Call from main() after the GPU backend's init + set_compact_table.
  * Returns 0 on success, -1 on failure. */
 int gpujob_init(int num_jobg);
 

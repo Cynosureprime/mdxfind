@@ -34,10 +34,24 @@ ifeq ($(UNAME_S),Darwin)
   ICONV = /opt/local/lib/libiconv.a
   LDEXTRA =
   INCEXTRA = -I/opt/local/include
-  # Metal GPU acceleration on macOS (Apple Silicon and x86_64 with discrete/integrated GPU)
-  METAL_GPU = 1
-  OSOPT += -DMETAL_GPU=1
-  LDEXTRA += -framework Metal -framework Foundation
+  # Metal GPU acceleration on macOS.
+  # Apple Silicon (arm64): auto-enabled. Tested on M1/M2 + macOS 14/15.
+  # Intel Mac (x86_64): disabled by default. Apple's MTLCompilerService is
+  # known to hang indefinitely when JIT-compiling Metal kernels on AMD GCN
+  # (Radeon Pro 580X, R9 family) under macOS Sequoia 15.x. CPU-only fallback
+  # is the safe default. Confirmed on local iMac (AMD Radeon Pro 580X) and
+  # nutshack (same GPU) at v1.475. See RELEASE_NOTES.md "Platform notes".
+  # Override: build with `make METAL=force` to enable anyway (NOT recommended
+  # unless you have a non-AMD discrete GPU on Intel Mac).
+  ifeq ($(UNAME_M),arm64)
+    METAL_GPU = 1
+    OSOPT += -DMETAL_GPU=1
+    LDEXTRA += -framework Metal -framework Foundation
+  else ifeq ($(METAL),force)
+    METAL_GPU = 1
+    OSOPT += -DMETAL_GPU=1
+    LDEXTRA += -framework Metal -framework Foundation
+  endif
 else ifeq ($(UNAME_S),FreeBSD)
   OSOPT =
   ICONV = /usr/local/lib/libiconv.a
@@ -68,7 +82,11 @@ ifneq ($(UNAME_S),Darwin)
   OSOPT += -fgnu89-inline
 endif
 
-CFLAGS = -fomit-frame-pointer -pthread -O3 $(ARCHOPT) $(OSOPT) $(INCEXTRA) -I.
+# Optional debug instrumentation:
+#   make CFLAGS_EXTRA="-DMDXFIND_GPU_DEBUG=1"
+# Enables compile-time-gated GPU debug emissions (see gpu/gpu_debug.h).
+# Off by default for release builds; ship binaries omit all debug traces.
+CFLAGS = -fomit-frame-pointer -pthread -O3 $(ARCHOPT) $(OSOPT) $(INCEXTRA) -I. $(CFLAGS_EXTRA)
 LDFLAGS = -pthread -O3
 
 # Static libraries (expected in current directory or subdirectories)
@@ -92,7 +110,7 @@ endif
 
 # Metal GPU objects (macOS only)
 ifdef METAL_GPU
-  MDXFIND_OBJS += gpu_metal.o gpujob_metal.o
+  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o
 endif
 
 # OpenCL GPU objects (Linux, FreeBSD, aarch64)
@@ -162,12 +180,23 @@ sha1_shani.o: sha1_shani.c
 gpu/%_str.h: gpu/%.cl gpu/cl2str.py
 	cd gpu && python3 cl2str.py $*.cl
 
-# Metal kernels: .metal → _str.h
-gpu/%_str.h: gpu/%.metal gpu/cl2str.py
-	cd gpu && python3 cl2str.py $*.metal
+# Metal kernels: .metal → _str.h (per-family _core.metal + common + template)
+gpu/metal_%_core_str.h: gpu/metal_%_core.metal gpu/metal2str.py
+	cd gpu && python3 metal2str.py metal_$*_core.metal
+
+gpu/metal_common_str.h: gpu/metal_common.metal gpu/metal2str.py
+	cd gpu && python3 metal2str.py metal_common.metal
+
+gpu/metal_template_str.h: gpu/metal_template.metal gpu/metal2str.py
+	cd gpu && python3 metal2str.py metal_template.metal
+
+gpu/metal_md5_rules_str.h: gpu/metal_md5_rules.metal gpu/metal2str.py
+	cd gpu && python3 metal2str.py metal_md5_rules.metal
 
 # ---- Precompiled Metal library (embedded in binary) ----
-METAL_SOURCES = $(wildcard gpu/metal_*.metal)
+# The md5 V_NONE path uses an embedded metallib for fastest startup.
+# All other Metal families are JIT-compiled at runtime via the shared loader.
+METAL_SOURCES = $(wildcard gpu/metal_*_core.metal) gpu/metal_template.metal gpu/metal_common.metal
 
 gpu/mdxfind.metallib: $(METAL_SOURCES) gpu/build_metallib.sh
 	gpu/build_metallib.sh
@@ -179,26 +208,23 @@ metallib: gpu/mdxfind_metallib.h
 
 # Metal GPU source files (Objective-C++)
 ifdef METAL_GPU
+# gpu_metal.o depends on every per-family _core_str.h (auto-derived from the
+# _core.metal sources via the pattern rule above) plus common + template + md5_rules.
+# gpu_fatal.h / gpu_debug.h are pure header dependencies (no compile rule).
 gpu_metal.o: gpu_metal.m gpu_metal.h gpujob.h job_types.h gpu/mdxfind_metallib.h \
-             gpu/metal_common_str.h gpu/metal_md5salt_str.h gpu/metal_md5saltpass_str.h \
-             gpu/metal_md5_md5saltmd5pass_str.h gpu/metal_sha256_str.h gpu/metal_phpbb3_str.h \
-             gpu/metal_descrypt_str.h gpu/metal_md5unsalted_str.h gpu/metal_md4unsalted_str.h \
-             gpu/metal_sha1unsalted_str.h gpu/metal_sha256unsalted_str.h gpu/metal_sha512unsalted_str.h \
-             gpu/metal_md6256unsalted_str.h gpu/metal_wrlunsalted_str.h gpu/metal_keccakunsalted_str.h \
-             gpu/metal_mysql3unsalted_str.h gpu/metal_hmac_sha512_str.h \
-             gpu/metal_hmac_rmd160_str.h gpu/metal_hmac_rmd320_str.h gpu/metal_hmac_blake2s_str.h \
-             gpu/metal_streebog_str.h gpu/metal_sha256crypt_str.h \
-             gpu/metal_rmd160unsalted_str.h gpu/metal_blake2s256unsalted_str.h \
-             gpu/metal_sha1_str.h gpu/metal_md5crypt_str.h \
-             gpu/metal_md5_packed_str.h gpu/metal_md4_packed_str.h \
-             gpu/metal_sha1_packed_str.h gpu/metal_sha256_packed_str.h gpu/metal_sha512_packed_str.h
+             $(wildcard gpu/metal_*_core.metal) \
+             gpu/metal_template.metal gpu/metal_common.metal \
+             $(patsubst gpu/metal_%_core.metal,gpu/metal_%_core_str.h,$(wildcard gpu/metal_*_core.metal)) \
+             gpu/metal_common_str.h gpu/metal_template_str.h \
+             gpu/gpu_fatal.h gpu/gpu_debug.h
 	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpu_metal.m
 
-gpujob_metal.o: gpujob_metal.m gpujob.h job_types.h gpu_metal.h mdxfind.h
+gpu/gpujob_metal.o: gpu/gpujob_metal.m gpujob.h job_types.h gpu_metal.h mdxfind.h \
+                    gpu/gpu_fatal.h gpu/gpu_debug.h
 ifeq ($(UNAME_M),x86_64)
-	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -include emmintrin.h -c gpujob_metal.m
+	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -include emmintrin.h -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
 else
-	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpujob_metal.m
+	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
 endif
 endif
 
@@ -238,7 +264,8 @@ gpu/gpu_opencl.o: gpu/gpu_opencl.c gpu/gpu_opencl.h gpu/gpu_kernel_cache.h gpujo
                   gpu/gpu_hmac_blake2s_core_str.h \
                   gpu/gpu_hmac_streebog256_core_str.h gpu/gpu_hmac_streebog512_core_str.h \
                   gpu/gpu_phpbb3_core_str.h gpu/gpu_md5crypt_core_str.h gpu/gpu_shacrypt_core_str.h \
-                  gpu/gpu_descrypt_core_str.h gpu/gpu_bcrypt_core_str.h
+                  gpu/gpu_descrypt_core_str.h gpu/gpu_bcrypt_core_str.h \
+                  gpu/gpu_fatal.h gpu/gpu_debug.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/gpu_opencl.c -o gpu/gpu_opencl.o
 
 gpu/gpujob_opencl.o: gpu/gpujob_opencl.c gpu/gpu_opencl.h gpujob.h job_types.h mdxfind.h
@@ -288,6 +315,8 @@ clean:
 	rm -f lm/*.o lm/lm.a
 	rm -f gosthash/*.o
 	rm -f gpu/*.o
+	rm -f gpu/mdxfind.metallib gpu/mdxfind_metallib.h
+	rm -f gpu/metal_*_core_str.h gpu/metal_common_str.h gpu/metal_template_str.h gpu/metal_md5_rules_str.h
 
 distclean: clean
 	rm -rf deps

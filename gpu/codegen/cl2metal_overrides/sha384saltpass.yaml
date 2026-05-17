@@ -1,0 +1,30 @@
+# cl2metal overlay for sha384saltpass (gpu/gpu_sha384saltpass_core.cl ->
+# gpu/metal_sha384saltpass_core.metal).
+#
+# Phase 2d.5.7 sha384saltpass -- LAST family in Phase 2d.5 SHA-2/512 fan-out.
+# PREPEND-shape SHA-384(salt || pass). 12-uint32 truncated digest emit (vs
+# sha512saltpass's 16). 4 SALTED PSO variants. Reuses sha512_block (with
+# SHA-384 IVs) + EMIT_HIT_12 (added Phase 2d.5.3) from metal_common.metal.
+# No new metal_common additions.
+#
+# Two Apple-specific tweaks (identical pattern to sha384.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#
+#   2. skip_line_ranges: simple template_emit_hit macro
+#      OpenCL source lines 968-973 (3-line comment header + 3-line macro).
+#
+# Source order at JIT compile time (mirrors sha384):
+#   metal_common_str + metal_sha384saltpass_core_str + metal_md5_rules_str
+#   + metal_template_str
+
+algo: sha384saltpass
+
+skip_line_ranges:
+  - start: 968
+    end:   973
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

@@ -33,6 +33,7 @@
 #include "gpu_opencl.h"
 #include "yarn.h"
 #include <Judy.h>
+#include "gpu_debug.h" /* GPU_DEBUG_FPRINTF -- compile-time gated on -DMDXFIND_GPU_DEBUG */
 
 extern int Printall, Maxiter;
 extern volatile int MDXpause, MDXpaused_count;
@@ -2694,10 +2695,10 @@ int gpujob_init(int num_jobg) {
     _n_gpujob_workers = n_workers;
     _gpujob_ready = 1;
     if (n_rules > 0)
-        tsfprintf(stderr, "OpenCL GPU: %d gpujob thread%s started (%d legacy + %d rules batch buffers)\n",
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU: %d gpujob thread%s started (%d legacy + %d rules batch buffers)\n",
                 n_workers, n_workers > 1 ? "s" : "", n_legacy, n_rules);
     else
-        tsfprintf(stderr, "OpenCL GPU: %d gpujob thread%s started (%d batch buffers)\n",
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU: %d gpujob thread%s started (%d batch buffers)\n",
                 n_workers, n_workers > 1 ? "s" : "", n_legacy);
     /* Pin summary is deferred to first comfort-line in mdxfind.c
      * ReportStats — by that point every malloc_pinned call site
@@ -2885,11 +2886,10 @@ void gpujob_print_share_line(FILE *fp) {
 }
 
 /* Internal: pull a slot from the free-list identified by `kind`. The
- * `filename` and `startline` args are part of the public API (Metal's
- * priority scheduler in gpujob_metal.m USES startline to prefer earlier
- * lines), but the OpenCL backend has a single shared work queue and
- * doesn't reorder, so they're ignored here. Keeping the parameters
- * preserves the cross-backend ABI. */
+ * `filename` and `startline` args were part of an earlier cross-backend
+ * ABI where another scheduler USED startline to prefer earlier lines;
+ * the OpenCL backend has a single shared work queue and doesn't reorder,
+ * so they're ignored here. Parameters retained for caller compatibility. */
 static struct jobg *_gpujob_get_free_kind(char *filename, unsigned long long startline,
                                           enum jobg_kind kind) {
     (void)filename;
@@ -3691,7 +3691,7 @@ int is_gpu_op(int op) {
 }
 
 /* Map JOB_* op code to FAM_* family index for timing state.
- * Derived from kernel_map[] in gpu_opencl.c / metal_kernel_map[] in gpu_metal.m. */
+ * Derived from kernel_map[] in gpu_opencl.c. */
 int gpu_op_family(int op) {
     switch (op) {
     case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:

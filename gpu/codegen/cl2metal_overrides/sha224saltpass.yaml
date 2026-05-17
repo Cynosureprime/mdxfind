@@ -1,0 +1,30 @@
+# cl2metal overlay for sha224saltpass (gpu/gpu_sha224saltpass_core.cl ->
+# gpu/metal_sha224saltpass_core.metal).
+#
+# Phase 2d.4.6 sha224saltpass overlay -- LAST family in Phase 2d.4 SHA-2/256
+# fan-out. PREPEND-shape SHA-224 (digest = SHA-224(salt || pass), 28-byte
+# 7-word digest). Combines sha224's 7-word output with sha256saltpass's
+# salt-prepend layout. Sibling of md5saltpass.yaml + sha1saltpass.yaml +
+# sha256saltpass.yaml + sha224.yaml.
+#
+# gpu_sha224saltpass_core.cl is a LARGE carrier (mirror of
+# gpu_sha256saltpass_core.cl). The simple template_emit_hit macro lives
+# at lines 1097-1112.
+#
+# Uses EMIT_HIT_7 (already added to metal_common.metal in Phase 2d.4.3).
+#
+# Apple-specific tweaks:
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+
+algo: sha224saltpass
+
+skip_line_ranges:
+  - start: 1097
+    end:   1112
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

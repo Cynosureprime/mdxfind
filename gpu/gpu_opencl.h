@@ -15,45 +15,16 @@
 #include <stdio.h>
 #include <stdlib.h>   /* _Exit */
 
+/* Phase D5a 2026-05-16 (Task #281): GPU_FATAL macro relocated to
+ * gpu/gpu_fatal.h so the Metal host code (gpu_metal.m, gpu/gpujob_metal.m)
+ * can share the same fail-fast primitive without dragging in the rest of
+ * the OpenCL public ABI. Backwards-compat: any existing GPU_FATAL caller
+ * (gpu/gpu_opencl.c sites) continues to compile unchanged. */
+#include "gpu_fatal.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* Fail-fast GPU error macro. Any cl_int != CL_SUCCESS in a production
- * (post-init) hot path triggers immediate process termination via _Exit(1).
- *
- * Rationale (mmt run #77, 2026-05-01): a CL_OUT_OF_RESOURCES on the first
- * dispatch was logged-and-ignored; the next dispatch then failed with
- * CL_INVALID_EVENT because the prior write event was corrupt; mdxfind
- * kept going and exited "successfully" with whatever cracks survived
- * non-failing paths. The same workload retried clean produces 21,289
- * cracks bit-exact (canonical truth). Some of the recent jitter
- * (21,285/21,287/21,288/21,289) was therefore silent dispatch failures,
- * not NVIDIA non-determinism.
- *
- * _Exit (NOT exit) bypasses atexit handlers and stdio buffered-output
- * flushes that could mask the failure or paper over partial state.
- * stdout is flushed first so any cracks emitted before the failure are
- * preserved on the consumer's side.
- *
- * Sites that legitimately retry (probe paths, init-time device skip,
- * device tuning) MUST NOT use this macro — they handle CL errors via
- * graceful early-return and document why retry is correct. Any new
- * caller of GPU_FATAL must be in a post-init production path where
- * a CL error genuinely indicates a corrupted GPU state.
- *
- * Async error callback usage: the OpenCL spec does not permit
- * longjmp-out-of-driver-thread, but _Exit is async-signal-safe and
- * terminates the process without stack unwinding — the driver's
- * internal state never gets a chance to corrupt anything else.
- */
-#define GPU_FATAL(fmt, ...) do {                                      \
-    fflush(stdout);                                                   \
-    fprintf(stderr, "FATAL: GPU error: " fmt "\n", ##__VA_ARGS__);    \
-    fprintf(stderr, "FATAL: at %s:%d\n", __FILE__, __LINE__);         \
-    fflush(stderr);                                                   \
-    _Exit(1);                                                         \
-} while (0)
 
 /* Host-side mirror of RULE_BUF_MAX in gpu/gpu_md5_rules.cl. MUST match
  * the kernel-side #define exactly. Bumping requires updating BOTH files

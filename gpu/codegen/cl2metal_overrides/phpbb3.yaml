@@ -1,0 +1,82 @@
+# cl2metal overlay for phpbb3 (gpu/gpu_phpbb3_core.cl ->
+# gpu/metal_phpbb3_core.metal).
+#
+# Phase 2d.8a.1 PHPBB3 CANARY (PHPBB3 + MD5CRYPT sub-phase). Hand-written
+# Path A carrier kernel; single algo_mode (0) -- no KPASS/KSALT split
+# (JOB_PHPBB3=455 is a single-mode iterated-MD5 algorithm). Salted-only
+# (GPU_TEMPLATE_HAS_SALT). 4-uint32 LE digest = 16-byte output (MD5 width).
+#
+# Iterated MD5 chain runs INSIDE template_finalize; iter count is decoded
+# from salt_bytes[3] via phpitoa64 reverse lookup (typically 128..2^30
+# iters). Host forces max_iter=1 at the rules-engine pack site so the
+# kernel's outer iter loop runs exactly once and template_iterate (a stub)
+# is never called. Mirrors SHA1DRU pattern (gpu_sha1dru_core.cl precedent).
+#
+# Apple-specific tweaks (identical pattern to sha1passsalt / sha256saltpass
+# / hmac_blake2s):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      Hot-path slice from buf_scratch_pool. salt_bytes already carries
+#      __global which the translator maps to device const.
+#
+#   2. skip_line_ranges: 3 ranges to strip preproc guards and the simple
+#      template_emit_hit form. See per-range reason fields below.
+#
+# Source order at JIT compile time (mirrors sha512saltpass / md5passsalt
+# salted-only loaders, with HAS_SALT macro at compile time):
+#   metal_common_str + metal_phpbb3_core_str + metal_md5_rules_str
+#   + metal_template_str
+#
+# NO dual_addr_space_helpers needed: template_finalize is the only consumer
+# of an addr-spaceable arg (data); md5crypt_oneshot-style helpers do NOT
+# exist in this core (PHPBB3 builds M[16] uint32 inline, no uchar staging
+# buffer crossing addr spaces). template_transform is unused (stub for
+# interface symmetry). phpitoa64 lookup table is __constant.
+
+algo: phpbb3
+
+skip_line_ranges:
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around the
+  # template_finalize signature (lines 172, 176). The Metal JIT always
+  # compiles this carrier with GPU_TEMPLATE_HAS_SALT defined; the bare
+  # `#ifdef`/`#endif` directives at column-N inside a function signature
+  # confuse the Metal preprocessor (translator output produced
+  # `#ifdef GPU_TEMPLATE_HAS_SALT,` which is parsed as a macro name with
+  # trailing comma -- extra-tokens warning then signature parse failure).
+  # After strip, the salt-arg lines become unconditional signature args,
+  # matching the metal signature shape of sha1passsalt et al. Mirrors
+  # hmac_blake2s.yaml Phase 2d.7d.1 pattern.
+  - start: 172
+    end:   172
+    reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
+  - start: 176
+    end:   176
+    reason: "preproc guard around template_finalize salt args -- close"
+
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#else` / `#endif` guards
+  # around the template_finalize BODY (lines 179, 275, 314). The Metal
+  # compile path always has HAS_SALT defined; the iter-MD5 chain is always
+  # live. The #else..#endif block (lines 275..314) holds the defensive
+  # !HAS_SALT fallback (computes plain MD5(data)) and is structurally
+  # unreachable in production -- we drop it entirely so the kernel keeps
+  # only the salted chain body.
+  - start: 179
+    end:   179
+    reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
+  - start: 275
+    end:   314
+    reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"
+
+  # template_emit_hit (simple) macro definition + 2-line comment header.
+  # OpenCL source: lines 347-352 of gpu_phpbb3_core.cl. The Metal hand-port
+  # pattern keeps only template_emit_hit_or_overflow form (mirrors md5.yaml
+  # / md4.yaml / md5salt.yaml / hmac_blake2s.yaml). The unfilled
+  # `(st)->h[i]` auto-rewrite in the simple form ages poorly through the
+  # codegen pipeline; the dedup form is the production path.
+  - start: 347
+    end:   352
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

@@ -1,0 +1,63 @@
+# cl2metal overlay for md5saltpass (gpu/gpu_md5saltpass_core.cl ->
+# gpu/metal_md5saltpass_core.metal).
+#
+# Phase 2d.2.5 md5saltpass overlay. md5saltpass is the LAST family in the
+# Phase 2d.2 md5-family fan-out (md4, md4utf16, md5raw, md5passsalt,
+# md5saltpass — 5 new families on top of md5+md5salt baselines).
+#
+# MD5SALTPASS (hashcat -m 20, mdxfind e394): MD5(salt || pass). Simple
+# PREPEND-salt MD5 — the salt is laid into M[] *before* the password,
+# unlike md5passsalt's APPEND shape (pass first, then salt). Same
+# salted-only 4-PSO resolver pattern as md5passsalt + md5salt:
+# {S, S|R, S|M, S|R|M}.
+#
+# Compared to md5passsalt (Phase 2d.2.4):
+#   - IDENTICAL kernel structure (single template_finalize, no
+#     algo_mode branches, no template_pre_salt / template_finalize_post
+#     for a Phase 2e hoist, no salt_pack_uint helper). The translator
+#     mechanical translation is near-verbatim.
+#   - The OpenCL source declares `salt_buf` as `__global const uchar *`
+#     (the translator maps to `device const`). The `data` arg is
+#     unqualified (translator default-infers `thread const`); per task
+#     #250 the Metal call site in metal_template.metal passes a device
+#     scratch-pool slice, so we override to `device const`. Same task
+#     #250 pattern as md5/md4/md4utf16/md5raw/md5salt/md5passsalt.
+#   - The only semantic difference vs md5passsalt is the inside of
+#     template_finalize: bytes are laid out with salt FIRST then pass
+#     (PREPEND); the layout-walking loops use `if (p < slen) salt else
+#     data[p - slen]` instead of md5passsalt's `if (p < len) data else
+#     salt[p - len]`. Translator preserves this verbatim.
+#
+# template_iterate has FRESH IV reinstall each iter (lines 147-151 of
+# the OpenCL source) — identical to unsalted MD5 / md5passsalt. The
+# translator output mirrors this byte-for-byte. No overlay needed for
+# the iter loop.
+#
+# Phase 2e (pre-salt hoist) is md5salt-specific Phase 2c+2e scaffolding;
+# md5saltpass has NO presalt hoist in this dispatch (the resolver in
+# gpu_metal.m will use only the 4 base salted variants; PRESALT is
+# folded inside md5salt's resolver only).
+#
+# skip_line_ranges:
+#   - template_emit_hit (simple form) macro at lines 173-176 of
+#     gpu_md5saltpass_core.cl. The Metal hand-port pattern keeps only
+#     the template_emit_hit_or_overflow form (mirrors md5.yaml/md4.yaml/
+#     md4utf16.yaml/md5raw.yaml/md5salt.yaml/md5passsalt.yaml). The
+#     unfilled `(st)->h[i]` auto-rewrite in the simple form ages poorly
+#     through the codegen pipeline; the dedup form is the production
+#     path.
+
+algo: md5saltpass
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro: 4 lines, no comment header above
+  # (the OpenCL source documents template_digest_compare + the
+  # template_emit_hit pair informally above the digest_compare
+  # definition; the macro itself is 4 lines starting at 173).
+  - start: 173
+    end:   176
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

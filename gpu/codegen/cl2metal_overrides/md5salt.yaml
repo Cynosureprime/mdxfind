@@ -1,0 +1,71 @@
+# cl2metal overlay for md5salt (gpu/gpu_md5salt_core.cl -> gpu/metal_md5salt_core.metal).
+#
+# $Revision: 1.1 $
+# $Log: md5salt.yaml,v $
+# Revision 1.1  2026/05/15 16:26:09  dlr
+# Phase 2d.1 md5salt overlay. Documents the hand-port reimpl divergence (38 percent smaller, mode-0-only). arg_address_space overrides for data and salt_buf to device const per task 250 buf-pool migration. Translator keeps salt_pack_uint and modes 1-6 in the generated output (faithful to source); the hand-port content pruning awaits a Phase 2d.2 overlay primitive.
+#
+#
+# MD5SALT is the stress-test case for the Phase 2d.1 translator. The Metal
+# hand-port (gpu/metal_md5salt_core.metal RCS 1.1, 2026-05-13) is a 38%-
+# smaller reimplementation of the OpenCL source (492 LOC vs 796 LOC), not a
+# pure translation:
+#
+#   - salt_pack_uint helper REMOVED (Pascal byte-RMW micro-opt unneeded on
+#     Apple Metal -- per metal_md5salt_core.metal:22-25). The hand-port
+#     inlines a byte-by-byte append loop where the OpenCL called
+#     salt_pack_uint.
+#   - template_finalize MODES 1-6 REMOVED (HMAC + variant-mode branches;
+#     Phase 2c port is algo_mode 0 only -- per the file's Phase 2c scope
+#     header). The hand-port keeps mode 0's inner-MD5 -> hex32 -> outer-MD5
+#     chain only.
+#   - template_emit_hit (simple) macro REMOVED (only the dedup variant
+#     ships).
+#
+# Translator scope (Phase 2d.1):
+#   - The translator handles MECHANICAL translation (address-space port,
+#     struct-decl form, state-ptr-to-ref). These are validated against md5
+#     (clean mechanical port) with the md5.yaml overlay.
+#   - For md5salt the translator faithfully translates the FULL OpenCL
+#     source. The overlay encodes the Apple-specific arg_address_space
+#     tweak (task #250 device-buf migration) and skips the salt_pack_uint
+#     helper that the hand-port elided.
+#   - We do NOT attempt to reproduce the hand-port's mode-1-6 content
+#     pruning -- that's a Phase 2c scope choice, not an Apple-specific
+#     tweak. A future overlay primitive ("replace_function_body" or
+#     "code_block_drop_with_decls") would handle it cleanly. Phase 2d.1
+#     ships the translator + documents the limit.
+#
+# arg_address_space overrides:
+#   template_finalize / template_pre_salt / template_finalize_post all
+#   take `data` as input. In the OpenCL source `data` is unqualified
+#   (defaults to __private). In the Metal hand-port `data` is `device const`
+#   (task #250 device-buf migration -- the per-lane buf slice in
+#   metal_template.metal lives in device storage). The translator's
+#   default-inference rule produces `thread` for unqualified pointers,
+#   so we need an explicit override here.
+
+algo: md5salt
+
+# salt_pack_uint helper -- the OpenCL Pascal-RMW micro-opt. The Metal
+# hand-port elides this function and inlines a byte-by-byte append loop
+# at the two call sites (template_finalize step 3). For Phase 2d.1 the
+# translator KEEPS salt_pack_uint in the generated file: the OpenCL
+# implementation translates cleanly to Metal (its only special token is
+# `__global const uchar *s` which the address-space substitution handles)
+# and the perf delta is negligible per the hand-port file header
+# (metal_md5salt_core.metal:22-25 -- "the few-cycle difference is
+# dominated by md5_block cost"). A future Phase 2d.2 overlay primitive
+# `replace_calls` could inline-expand salt_pack_uint to match the
+# hand-port's structure, but for Phase 2d.1's mechanical-translation
+# scope, keeping the helper is correct and compiles cleanly.
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+    salt_buf: "device const"
+  template_pre_salt:
+    data: "device const"
+  template_finalize_post:
+    data: "device const"
+    salt_buf: "device const"

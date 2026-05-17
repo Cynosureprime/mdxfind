@@ -1,0 +1,60 @@
+# cl2metal overlay for sha512 (gpu/gpu_sha512_core.cl -> gpu/metal_sha512_core.metal).
+#
+# Phase 2d.5.1 sha512 (raw SHA-512) overlay -- FIRST 64-bit-state family on
+# the Metal cl2metal codegen path. 8-word ulong state (vs SHA-256's 8 uint32,
+# SHA-1's 5 uint32, MD5's 4 uint32), 128-byte compression block (vs 64), and
+# 128-bit length encoding (vs 64) are the three structural differences from
+# the prior SHA-2/256 fan-out. The translator (cl2metal.py rev 1.4+) already
+# registers sha512_block in _BLOCK_HELPERS_POINTER_STATE so call-site
+# `&st.state[0]` is preserved verbatim. Two Apple-specific tweaks remain in
+# this overlay, identical pattern to sha256.yaml/sha1.yaml/md5*.yaml:
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to every prior SHA/MD core overlay).
+#      The OpenCL source declares `data` as unqualified pointer (defaults
+#      to __private); the Metal call site in metal_template.metal passes
+#      `device uchar *` from the per-lane buf_scratch_pool slice, so the
+#      helper signature must take `device const uchar *data` instead of
+#      the translator's default inference `thread const uchar *data`.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      The Metal hand-port pattern keeps only the
+#      template_emit_hit_or_overflow form (mirrors every prior *.yaml).
+#      The simple `template_emit_hit` macro + its 3-line comment header
+#      live at lines 309-314 of gpu_sha512_core.cl.
+#
+# Source order at JIT compile time (mirrors sha256):
+#   metal_common_str + metal_sha512_core_str + [metal_md5_rules_str if rules]
+#   + metal_template_str
+#
+# Pre-flight grep for sha512_block availability:
+#   $ grep -n "sha512_block" gpu/metal_common.metal
+# At Phase 2d.5.1 sha512_block + bswap64 + sha512_to_hex_lc +
+# EMIT_HIT_16_DEDUP_OR_OVERFLOW are being ADDED to metal_common.metal as
+# part of this dispatch (companion edit). The OpenCL twin gpu_common.cl
+# already carries them. Token discipline per
+# feedback_base_algo_token_match.md: the helper is named `sha512_block`
+# exactly in both source files.
+#
+# R2 (register pressure): SHA-512's W[80] schedule (80 x ulong = 640 bytes
+# private scratch per lane) is the largest in the family so far. Combined
+# with the 8-ulong state, expected priv_mem on Apple M1 may push close to
+# the budget; the gfx1201 OpenCL reading was 42,520 B (within 43,024 hard
+# gate). Monitor Phase D dev1 build for "exceeds available temporary
+# registers" errors per architect §5 / project_metal_phase2d_arch.md.
+
+algo: sha512
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro + its 3-line comment header.
+  # OpenCL source: lines 309-314 of gpu_sha512_core.cl (3 lines of comment
+  # at 309-311 + macro definition 312-314). Mirrors sha256.yaml skip pattern.
+  # The Metal hand-port keeps only the template_emit_hit_or_overflow dedup
+  # variant; the simple macro is dropped to match the unified contract.
+  - start: 309
+    end:   314
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

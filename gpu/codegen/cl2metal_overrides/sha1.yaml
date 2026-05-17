@@ -1,0 +1,64 @@
+# cl2metal overlay for sha1 (gpu/gpu_sha1_core.cl -> gpu/metal_sha1_core.metal).
+#
+# Phase 2d.3.1 sha1 (raw SHA-1) overlay — FIRST SHA-family canary on the
+# cl2metal codegen path. 5-word state (vs MD4/MD5's 4-word) and BIG-ENDIAN
+# message word load are the two main differences from prior md5-family
+# kernels; the translator (cl2metal.py rev 1.3+) handles both transparently
+# via runtime-inferred function rewrites, but TWO Apple-specific tweaks
+# require this overlay:
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to md4/md4utf16/md5raw/md5passsalt/
+#      md5saltpass overlays). The OpenCL source declares `data` as
+#      unqualified pointer (defaults to __private); the Metal call site
+#      in metal_template.metal passes `device uchar *` from the per-lane
+#      buf_scratch_pool slice, so the helper signature must take
+#      `device const uchar *data` instead of the translator's default
+#      inference `thread const uchar *data`.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      The Metal hand-port pattern keeps only the
+#      template_emit_hit_or_overflow form (mirrors md5.yaml/md4.yaml/
+#      md4utf16.yaml/md5raw.yaml/md5passsalt.yaml/md5saltpass.yaml).
+#      The simple `template_emit_hit` macro lives at lines 343-353 of
+#      gpu_sha1_core.cl (including the 10-line comment header).
+#
+# Translator-side note: cl2metal.py rev 1.3 (Phase 2d.3.1) introduced the
+# split between scalar-state `*_block` / `*_compress` helpers (md5_block,
+# md4_compress — call sites have `&` stripped) and pointer-state
+# helpers (sha1_block — `&st.h[0]` preserved verbatim). This split is
+# required because the Metal twin of sha1_block keeps the OpenCL
+# `void sha1_block(uint *state, uint *M)` shape (no per-element scalar
+# refs), so call-site arg shape is `&st.h[0]` not `st.h[0]`. NO overlay
+# entry needed for that — the discovery-via-_detect_scalar_ref_params
+# path covers md5_block (intra-file scalar refs) and md4_compress
+# (intra-file scalar refs); sha1_block has no in-file definition (lives
+# in metal_common.metal) so it's pointer-state by default.
+#
+# Source order at JIT compile time (mirrors md5raw / md4 / md4utf16):
+#   metal_common_str + metal_sha1_core_str + [metal_md5_rules_str if rules]
+#   + metal_template_str
+#
+# Pre-flight grep for sha1_block availability:
+#   $ grep -n "^[a-z_]*sha1_block\|void sha1_block" gpu/metal_common.metal
+# At Phase 2d.3.1 sha1_block is being ADDED to metal_common.metal as part
+# of this dispatch (companion edit). The OpenCL twin gpu_common.cl already
+# carries it. Token discipline per feedback_base_algo_token_match.md:
+# the helper is named `sha1_block` exactly in both source files.
+
+algo: sha1
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro + its 10-line comment header.
+  # OpenCL source: lines 335-353 of gpu_sha1_core.cl (10 lines of comment
+  # block at 335-342 + 4-line macro definition at 343-353). Mirrors
+  # md5passsalt's skip pattern. The Metal hand-port keeps only the
+  # template_emit_hit_or_overflow dedup variant; the simple macro is
+  # dropped to match the unified template_emit_hit_or_overflow contract.
+  - start: 335
+    end:   353
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

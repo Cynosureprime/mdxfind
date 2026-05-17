@@ -1,0 +1,62 @@
+# cl2metal overlay for streebog256 (gpu/gpu_streebog256_core.cl -> gpu/metal_streebog256_core.metal).
+#
+# Phase 2d.7c STREEBOG unsalted family CANARY. First family with PER-KERNEL
+# helper functions (streebog_g, streebog_hash_priv) declared as plain `void`
+# instead of `static inline` (per the OpenCL twin). Translator (cl2metal.py
+# rev 1.8) extended `_FN_HEAD_RE` to optionally accept the `static inline`
+# qualifier, so streebog_g and streebog_hash_priv are picked up by the body
+# rewrite pass (rewrite_local_ptr_decls + rewrite_pointer_casts). 7 in-body
+# `uchar *NAME = (uchar *)expr;` cast sites per file get rewritten to
+# `thread uchar *NAME = (thread uchar *)expr;` automatically.
+#
+# 8-uint32 LE digest (32 bytes), sibling shape to sha256 / keccak256 / blake2s256.
+# Streebog tables (SBOB_SL64 16 KB + SBOB_RC64 768 B) and SBOG_LPS macro
+# are per-kernel (NOT promoted to metal_common.metal) per WRL precedent.
+#
+# Translator support (cl2metal.py rev 1.8):
+#
+#   - _FN_HEAD_RE extended to accept BOTH `static inline <ret> <name>(` AND
+#     `<ret> <name>(` at column-0 (newline-anchored). This catches streebog_g
+#     and streebog_hash_priv which the OpenCL twin declares as plain `void`.
+#     Body rewrites (rewrite_local_ptr_decls + rewrite_pointer_casts) fire
+#     automatically once the fn-head is matched.
+#   - dual_addr_space_helpers (NEW use this phase): streebog_hash_priv is
+#     called from BOTH template_iterate (thread-local hex_buf[] buffer) AND
+#     template_finalize (device-const slice of buf_scratch_pool). Translator
+#     emits TWO overloads (thread-const + device-const on the `data` arg).
+#     Pattern documented in feedback_metal_dual_addrspace_overload.md +
+#     feedback_translator_dual_addr_space_overlay.md.
+#
+# Apple-specific tweaks (identical pattern to keccak256.yaml / blake2s256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to every prior unsalted core).
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#      OpenCL source lines 793-801: 4-line comment header + 5-line macro body.
+#
+# Source order at JIT compile time (mirrors keccak256 / blake2s256 / sha256):
+#   metal_common_str + metal_streebog256_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+#
+# Pre-flight grep: streebog has NO metal_common.metal dependencies (SBOB tables
+# + SBOG_LPS macro live in the per-kernel core file, NOT shared).
+#   $ grep -n "streebog\|SBOG_LPS" gpu/metal_common.metal  # expect: no matches
+
+algo: streebog256
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 4-line comment header.
+  # OpenCL source: lines 793-801 of gpu_streebog256_core.cl.
+  - start: 793
+    end:   801
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: streebog_hash_priv
+    arg: data

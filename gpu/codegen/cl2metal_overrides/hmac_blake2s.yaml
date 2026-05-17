@@ -1,0 +1,82 @@
+# cl2metal overlay for hmac_blake2s (gpu/gpu_hmac_blake2s_core.cl ->
+# gpu/metal_hmac_blake2s_core.metal).
+#
+# Phase 2d.7d.1 HMAC-BLAKE2S CANARY (HMAC siblings sub-phase). Hand-written
+# Path A carrier kernel; single algo_mode (5) only -- no KPASS/KSALT split
+# (mdxfind has only one HMAC-BLAKE2S op, JOB_HMAC_BLAKE2S=828). Salted-only
+# (GPU_TEMPLATE_HAS_SALT). 8-uint32 LE digest = 32-byte output.
+#
+# Shares the b2s_compress compression primitive (already in metal_common.metal
+# rev 1.17+, dual address-space overloads via MTL_B2S_COMPRESS_BODY) with
+# Phase 2d.7a blake2s256 unsalted family. No metal_common.metal additions.
+#
+# Translator support: cl2metal.py rev 1.7+ handles the dual_addr_space_helpers
+# overlay knob (Phase 2d.7b keccak), needed here because hmac_blake2s_run is
+# called from template_finalize with both `device const uchar *data` (caller's
+# arg, line 237) and `thread uchar *` private buffers (ibuf line 277, obuf
+# line 293). Two overloads emitted by the translator.
+#
+# Apple-specific tweaks (identical pattern to sha1passsalt / sha256saltpass):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      Hot-path slice from buf_scratch_pool. salt_bytes already carries
+#      __global which the translator maps to device const.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#      OpenCL source lines 392-396 of gpu_hmac_blake2s_core.cl:
+#      4-line comment header (392) + macro body (394-396).
+#
+# Source order at JIT compile time (mirrors sha512saltpass / md5passsalt
+# salted-only loaders, with HAS_SALT macro at compile time):
+#   metal_common_str + metal_hmac_blake2s_core_str + metal_md5_rules_str
+#   + metal_template_str
+#
+# Pre-flight grep for b2s_compress + MTL_B2S_IV / SIGMA availability:
+#   $ grep -n "b2s_compress\|MTL_B2S_IV" gpu/metal_common.metal
+# Both present in metal_common.metal rev 1.17+ (Phase 2d.7a Blake2 prep).
+
+algo: hmac_blake2s
+
+skip_line_ranges:
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around the
+  # template_finalize signature (lines 220, 224). The Metal JIT always
+  # compiles this carrier with GPU_TEMPLATE_HAS_SALT defined; the bare
+  # `#ifdef`/`#endif` directives at column-N inside a function signature
+  # confuse the Metal preprocessor (translator output produced
+  # `#ifdef GPU_TEMPLATE_HAS_SALT,` which is parsed as a macro name with
+  # trailing comma — extra-tokens warning then signature parse failure).
+  # After strip, the salt-arg lines become unconditional signature args,
+  # matching the metal signature shape of sha1passsalt et al.
+  - start: 220
+    end:   220
+    reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
+  - start: 224
+    end:   224
+    reason: "preproc guard around template_finalize salt args -- close /opening"
+
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards inside the
+  # template_finalize body (lines 227, 309). The Metal compile path always
+  # has HAS_SALT defined; the HMAC body is always live. The remaining
+  # defensive fallback runs only if algo_mode != 5u (structurally unreachable
+  # in production but kept for parity).
+  - start: 227
+    end:   227
+    reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
+  - start: 309
+    end:   309
+    reason: "preproc guard around HMAC body -- close"
+
+  # template_emit_hit (simple) macro definition + 2-line comment header.
+  # OpenCL source: lines 392-396 of gpu_hmac_blake2s_core.cl.
+  - start: 392
+    end:   396
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: hmac_blake2s_run
+    arg: data

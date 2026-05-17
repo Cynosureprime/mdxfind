@@ -1,0 +1,45 @@
+# cl2metal overlay for blake2b256 (gpu/gpu_blake2b256_core.cl -> gpu/metal_blake2b256_core.metal).
+#
+# Phase 2d.7a BLAKE2 unsalted family. Second BLAKE2-family Metal port
+# (after blake2s256 canary). 8-uint32 LE digest exposed via decomposed
+# h_ulong (32-byte truncated output of BLAKE2B). Distinct compression
+# primitive b2b_compress (in metal_common.metal rev 1.17+; sibling of
+# sha512_block / b2s_compress; uses 64-bit lanes throughout).
+#
+# Translator support (cl2metal.py rev 1.6):
+#
+#   - b2b_compress is registered in _BLOCK_HELPERS_POINTER_STATE so the
+#     call-site `&st.h_ulong[0]` is preserved verbatim (mirrors sha512_block
+#     call-site convention).
+#   - B2B_IV / B2B_SIGMA constants renamed to MTL_B2B_IV / MTL_B2B_SIGMA
+#     via 1:1 substitution table.
+#
+# Apple-specific tweaks (identical pattern to sha512.yaml / blake2s256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to every prior unsalted core).
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#      OpenCL source lines 260-265: 2-line comment header + macro body.
+#
+# Source order at JIT compile time (mirrors blake2s256):
+#   metal_common_str + metal_blake2b256_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+#
+# Pre-flight grep for b2b_compress + MTL_B2B_IV / SIGMA availability:
+#   $ grep -n "b2b_compress\|MTL_B2B_IV" gpu/metal_common.metal
+# Both added in metal_common.metal rev 1.17 (this dispatch).
+
+algo: blake2b256
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 2-line comment header.
+  # OpenCL source: lines 260-265 of gpu_blake2b256_core.cl.
+  - start: 260
+    end:   265
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

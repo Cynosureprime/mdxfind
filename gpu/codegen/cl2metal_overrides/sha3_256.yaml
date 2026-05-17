@@ -1,0 +1,33 @@
+# cl2metal overlay for sha3_256 (gpu/gpu_sha3_256_core.cl -> gpu/metal_sha3_256_core.metal).
+#
+# Phase 2d.7b Keccak/SHA-3 sponge family fan-out. Sibling of keccak256
+# (canary). 8-uint32 LE digest. Shares keccakf1600 + MTL_KECCAK_RC +
+# MTL_KECCAK_ROTC in metal_common.metal rev 1.18+ with the other 7 sponge
+# ops. Per-algo distinguishers (rate + domain-pad + output bytes) are baked
+# into the per-core .cl source via #define -- no overlay change required.
+#
+# Translator support (cl2metal.py rev 1.7):
+#
+#   - keccakf1600 in metal_common.metal: no _BLOCK_HELPERS_* registration.
+#   - KECCAK_RC -> MTL_KECCAK_RC + KECCAK_ROTC -> MTL_KECCAK_ROTC in 1:1
+#     substitution table.
+#   - dual_addr_space_helpers (Phase 2d.7b NEW): sha3_256_absorb_full and
+#     sha3_256_absorb_pad emit dual thread/device overloads. Same pattern as
+#     keccak256 canary.
+
+algo: sha3_256
+
+skip_line_ranges:
+  - start: 153
+    end:   156
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: sha3_256_absorb_full
+    arg: data
+  - name: sha3_256_absorb_pad
+    arg: data

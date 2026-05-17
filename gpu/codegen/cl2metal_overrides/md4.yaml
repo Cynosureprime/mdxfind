@@ -1,0 +1,28 @@
+# cl2metal overlay for md4 (gpu/gpu_md4_core.cl -> gpu/metal_md4_core.metal).
+#
+# Phase 2d.2.1b md4 overlay. Mirrors the md5 pattern with the addition of
+# the task #250 arg_address_space tweak for template_finalize. Reason:
+# the kernel call site in metal_template.metal passes `device uchar *buf`
+# (per-lane scratch slice from the buf_scratch_pool MTLBuffer). Per
+# task #250 the per-lane buf is in device storage to keep the M2 Max PSO
+# register budget within bounds, so the helper signature must take
+# `device const uchar *data` rather than the translator's default
+# `thread const uchar *data` inference. Same pattern as md5salt.yaml.
+#
+# The OpenCL source declares `data` as unqualified pointer (defaults to
+# __private). The Metal call site passes a device buf, so the helper
+# signature MUST be `device const uchar *data`.
+
+algo: md4
+
+skip_line_ranges:
+  # template_emit_hit macro (3 lines: comment + #define + continuation).
+  # Mirrors md5.yaml. The Metal hand-port pattern keeps only the
+  # template_emit_hit_or_overflow form.
+  - start: 269
+    end:   276
+    reason: "template_emit_hit macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

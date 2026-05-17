@@ -1,0 +1,39 @@
+# cl2metal overlay for sha256raw (gpu/gpu_sha256raw_core.cl -> gpu/metal_sha256raw_core.metal).
+#
+# Phase 2d.4.2 sha256raw (binary-digest re-feed unsalted) overlay -- second
+# SHA-2/256 family on the cl2metal codegen path. Mirrors sha256.yaml exactly;
+# only the skip_line_ranges differ (different line numbers for the simple
+# template_emit_hit macro).
+#
+# 8-word state + BIG-ENDIAN message-word load identical to sha256. The
+# translator (cl2metal.py rev 1.4+) registers sha256_block in
+# _BLOCK_HELPERS_POINTER_STATE so call-site `&st.h[0]` is preserved
+# verbatim.
+#
+# Apple-specific tweaks (identical to sha256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      OpenCL source declares data as unqualified pointer; Metal call site
+#      passes `device uchar *` from buf_scratch_pool slice.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#
+# Source order at JIT compile time (mirrors sha256):
+#   metal_common_str + metal_sha256raw_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+
+algo: sha256raw
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition.
+  # OpenCL source: lines 202-215 of gpu_sha256raw_core.cl. No 8-line comment
+  # header above (the macro is preceded by a blank line + the template_digest_compare
+  # closing brace), so only the macro definition itself is skipped.
+  - start: 202
+    end:   215
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

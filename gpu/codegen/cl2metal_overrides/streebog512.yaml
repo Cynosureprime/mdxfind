@@ -1,0 +1,36 @@
+# cl2metal overlay for streebog512 (gpu/gpu_streebog512_core.cl -> gpu/metal_streebog512_core.metal).
+#
+# Phase 2d.7c STREEBOG unsalted family fan-out (sibling of streebog256 canary).
+# Same translator support (cl2metal.py rev 1.8 _FN_HEAD_RE extension +
+# dual_addr_space_helpers); differs only in digest width (16 uint32 = 64 bytes
+# vs 8 uint32 = 32 bytes for streebog256) and IV fill byte (0x00 vs 0x01).
+#
+# Translator support (cl2metal.py rev 1.8):
+#
+#   - _FN_HEAD_RE catches plain-`void` streebog_g + streebog_hash_priv (same
+#     as streebog256). 7 in-body uchar* cast sites get rewritten automatically.
+#   - dual_addr_space_helpers: streebog_hash_priv called from BOTH paths.
+#
+# Apple-specific tweaks (identical pattern to streebog256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      OpenCL source lines 763-769: 2-line comment header + 5-line macro body.
+
+algo: streebog512
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 2-line comment header.
+  # OpenCL source: lines 763-769 of gpu_streebog512_core.cl.
+  - start: 763
+    end:   769
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: streebog_hash_priv
+    arg: data

@@ -1,0 +1,43 @@
+# cl2metal overlay for sha384raw (gpu/gpu_sha384raw_core.cl -> gpu/metal_sha384raw_core.metal).
+#
+# Phase 2d.5.4 sha384raw -- fourth SHA-2/512 family Metal port. Sibling of
+# sha384 (Phase 2d.5.3): same compression block (sha512_block), same SHA-384
+# IVs in template_init, same 12-uint32 truncated emit. The only structural
+# difference is template_iterate body -- sha384raw re-feeds the BINARY
+# 48-byte digest (vs sha384 which re-feeds 96-char hex). Both share
+# template_finalize.
+#
+# Two Apple-specific tweaks (identical pattern to sha384.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern shared with every prior SHA/MD core overlay).
+#
+#   2. skip_line_ranges: simple template_emit_hit macro
+#      OpenCL source lines 246-248 (3-line macro definition only; no
+#      preceding comment header). The Metal hand-port keeps only the
+#      template_emit_hit_or_overflow dedup variant.
+#
+# Source order at JIT compile time (mirrors sha384):
+#   metal_common_str + metal_sha384raw_core_str + [metal_md5_rules_str if
+#   rules] + metal_template_str
+#
+# Pre-flight grep for sha512_block + EMIT_HIT_12 availability:
+#   $ grep -n "sha512_block\|EMIT_HIT_12_DEDUP" gpu/metal_common.metal
+# At Phase 2d.5.4: all infrastructure already in metal_common.metal
+# (sha512_block + bswap64 + mtl_hex_byte_be64 from Phase 2d.5.1;
+# EMIT_HIT_12_DEDUP_OR_OVERFLOW from Phase 2d.5.3). No new metal_common
+# additions for this family.
+
+algo: sha384raw
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro. OpenCL source: 3-line macro
+  # definition only (no comment header). Per sha384.yaml pattern, drop
+  # only the simple form; the dedup variant is preserved.
+  - start: 246
+    end:   248
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

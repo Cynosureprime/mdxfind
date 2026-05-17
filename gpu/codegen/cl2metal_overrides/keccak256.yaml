@@ -1,0 +1,63 @@
+# cl2metal overlay for keccak256 (gpu/gpu_keccak256_core.cl -> gpu/metal_keccak256_core.metal).
+#
+# Phase 2d.7b Keccak/SHA-3 sponge family CANARY. First sponge-family Metal
+# port. 8 ops share keccakf1600 + KECCAK_RC + KECCAK_ROTC in
+# metal_common.metal (rev 1.18+); per-algo cores differ only by rate
+# (KECCAK_RATE) and domain-pad byte (KECCAK_DOMAIN_PAD = 0x01 plain
+# Keccak; SHA-3 uses 0x06). 8-uint32 LE digest for Keccak-256 (sibling
+# shape to sha256 / sha224 unsalted).
+#
+# Translator support (cl2metal.py rev 1.7):
+#
+#   - keccakf1600 is in metal_common.metal so no _BLOCK_HELPERS_*
+#     registration is needed (call site is `keccakf1600(sp)` without
+#     `&` prefix; default translator path leaves it alone).
+#   - KECCAK_RC -> MTL_KECCAK_RC + KECCAK_ROTC -> MTL_KECCAK_ROTC in 1:1
+#     substitution table (referenced by keccakf1600 in metal_common.metal,
+#     but the per-core .cl files don't reference these directly).
+#   - dual_addr_space_helpers (NEW Phase 2d.7b): keccak256_absorb_full and
+#     keccak256_absorb_pad are called from BOTH template_iterate
+#     (thread-local hex[KECCAK_OUT_BYTES*2] buffer) AND template_finalize
+#     (device-const slice of buf_scratch_pool). Metal forbids generic
+#     address-space pointers in function signatures; the translator now
+#     emits TWO overloads per helper (thread-const + device-const on the
+#     `data` arg). Pattern documented in
+#     feedback_metal_dual_addrspace_overload.md (caught Phase 2d.7a
+#     Blake2; codified as a translator feature in Phase 2d.7b).
+#
+# Apple-specific tweaks (identical pattern to sha512.yaml / blake2b256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to every prior unsalted core).
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#      OpenCL source lines 209-211 of gpu_keccak256_core.cl (3-line
+#      #define ending with backslash continuation off `EMIT_HIT_8(...)`).
+#
+# Source order at JIT compile time (mirrors sha256 / sha512 unsalted):
+#   metal_common_str + metal_keccak256_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+#
+# Pre-flight grep for keccakf1600 + MTL_KECCAK_RC / ROTC availability:
+#   $ grep -n "keccakf1600\|MTL_KECCAK_RC" gpu/metal_common.metal
+# Both added in metal_common.metal rev 1.18 (this dispatch).
+
+algo: keccak256
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 1-line comment header.
+  # OpenCL source lines 208-211 of gpu_keccak256_core.cl.
+  - start: 208
+    end:   211
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+dual_addr_space_helpers:
+  - name: keccak256_absorb_full
+    arg: data
+  - name: keccak256_absorb_pad
+    arg: data

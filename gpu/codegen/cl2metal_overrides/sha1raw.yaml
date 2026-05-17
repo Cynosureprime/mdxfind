@@ -1,0 +1,46 @@
+# cl2metal overlay for sha1raw (gpu/gpu_sha1raw_core.cl -> gpu/metal_sha1raw_core.metal).
+#
+# Phase 2d.3.2 sha1raw overlay — clone of Phase 2d.3.1 sha1.yaml. SHA1RAW
+# differs from SHA1 ONLY in template_iterate (re-feed 20-byte BINARY digest
+# instead of 40-byte hex-encoded form). Same 5-word state, same BE message
+# word load, same sha1_block helper from metal_common.metal. The translator
+# (cl2metal.py rev 1.4+) handles both transparently; TWO Apple-specific
+# tweaks require this overlay, identical to sha1.yaml:
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to sha1.yaml). The OpenCL source
+#      declares `data` as unqualified pointer (defaults to __private);
+#      the Metal call site in metal_template.metal passes
+#      `device uchar *` from the per-lane buf_scratch_pool slice, so the
+#      helper signature must take `device const uchar *data` instead of
+#      the translator's default inference `thread const uchar *data`.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Mirror of sha1.yaml — the Metal hand-port keeps only the
+#      template_emit_hit_or_overflow form. gpu_sha1raw_core.cl carries
+#      the simple `template_emit_hit` macro at lines 192-202 (no comment
+#      header, shorter than sha1's 343-353). The skip range removes only
+#      the macro definition.
+#
+# Source order at JIT compile time (mirrors sha1):
+#   metal_common_str + metal_sha1raw_core_str + [metal_md5_rules_str if rules]
+#   + metal_template_str
+#
+# Pre-flight grep for sha1_block availability:
+#   $ grep -n "sha1_block" gpu/metal_common.metal
+# Already present from Phase 2d.3.1; no companion edit needed.
+
+algo: sha1raw
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition.
+  # OpenCL source: lines 192-202 of gpu_sha1raw_core.cl (11-line macro
+  # body). Mirrors sha1's skip pattern. The Metal hand-port keeps only
+  # the template_emit_hit_or_overflow dedup variant.
+  - start: 192
+    end:   202
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

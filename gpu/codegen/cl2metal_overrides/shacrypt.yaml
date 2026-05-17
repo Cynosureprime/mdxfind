@@ -1,0 +1,119 @@
+# cl2metal overlay for shacrypt (gpu/gpu_shacrypt_core.cl ->
+# gpu/metal_shacrypt_core.metal).
+#
+# Phase 2d.8b SHACRYPT triple (SHA256CRYPT + SHA512CRYPT + SHA512CRYPTMD5).
+# Hand-written Path A SHARED carrier kernel; SAME .metal source instantiated
+# TWICE with different HASH_WORDS values (8 for SHA256CRYPT, 16 for
+# SHA512CRYPT + SHA512CRYPTMD5).
+#
+# CRITICAL per `feedback_defines_via_build_opts.md` (caught 2026-05-08
+# during Phase 3 SHA512CRYPT OpenCL ship): non-default HASH_WORDS values
+# MUST be passed via Metal preprocessorMacros at JIT time, NOT just through
+# cache-key disambiguation. The core's `#ifndef HASH_WORDS / #define
+# HASH_WORDS 8` default fallback is for SHA256CRYPT only; SHA512CRYPT and
+# SHA512CRYPTMD5 require explicit HASH_WORDS=16 + HASH_BLOCK_BYTES=128 via
+# `opts.preprocessorMacros = @{ @"HASH_WORDS": @16, @"HASH_BLOCK_BYTES":
+# @128 }` in the SHA512CRYPT loader. Single-width cores (everything Phase
+# 2d.2-2d.7) hide this trap because their `#define HASH_WORDS N` fallback
+# matches the only intended instantiation. SHACRYPT explicitly instantiates
+# the SAME source twice with DIFFERENT HASH_WORDS — symptom when missed:
+# priv_mem in band, GPU markers fire, but cracks=0 silently.
+#
+# Apple-specific tweaks (mirrors phpbb3 / md5crypt Phase 2d.8a pattern):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      Hot-path slice from buf_scratch_pool. salt_bytes already carries
+#      __global which the translator maps to device const.
+#
+#   2. skip_line_ranges: 4 ranges to strip preproc guards around the
+#      template_finalize signature (lines 401, 405) + body (line 408) and
+#      to drop the defensive !HAS_SALT fallback (lines 695..718). The
+#      template_emit_hit (simple) macros are inside #if HASH_WORDS == 16 /
+#      #else / #endif blocks and cannot be stripped without disrupting the
+#      width gate; they are unused (only template_emit_hit_or_overflow is
+#      called from gpu_template.cl) so they compile harmlessly as dead
+#      defines.
+#
+# NO dual_addr_space_helpers needed: template_finalize is the only consumer
+# of an addr-spaceable arg (data); sc_update / sc_update_g are wrappers
+# whose addr-space is fixed (sc_update takes private/thread; sc_update_g
+# takes __global/device). sc_update_g is unused in the SHA-crypt chain
+# (verified by inspection of template_finalize body — all sc_update calls
+# operate on private pw[] / raw_salt[] / digest_a[] / ctx_buf[] buffers)
+# but kept for source-level parity with the slab oracle. template_transform
+# is unused (stub for interface symmetry). template_iterate is a STUB
+# because host forces max_iter=1 (Mirror PHPBB3 / SHA1DRU / MD5CRYPT
+# pattern). template_emit_hit{,_or_overflow} are macros, not functions —
+# translator doesn't rewrite their bodies.
+#
+# Source order at JIT compile time (mirrors md5crypt / phpbb3 salted-only
+# loaders, with HAS_SALT macro at compile time + HASH_WORDS macro for
+# SHA512CRYPT variant):
+#   metal_common_str + metal_shacrypt_core_str + metal_md5_rules_str
+#   + metal_template_str
+
+algo: shacrypt
+
+skip_line_ranges:
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around the
+  # template_finalize signature (lines 401, 405). The Metal JIT always
+  # compiles this carrier with GPU_TEMPLATE_HAS_SALT defined; the bare
+  # `#ifdef`/`#endif` directives inside a function signature confuse the
+  # Metal preprocessor (translator output produces `#ifdef
+  # GPU_TEMPLATE_HAS_SALT,` which is parsed as a macro name with trailing
+  # comma -- extra-tokens warning then signature parse failure). After
+  # strip, the salt-arg lines become unconditional signature args, matching
+  # the metal signature shape of phpbb3 / md5crypt / hmac_blake2s. Mirrors
+  # phpbb3.yaml / md5crypt.yaml Phase 2d.8a pattern.
+  - start: 401
+    end:   401
+    reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
+  - start: 405
+    end:   405
+    reason: "preproc guard around template_finalize salt args -- close"
+
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` at the body start (line 408).
+  # The salted chain body is always live on Metal.
+  - start: 408
+    end:   408
+    reason: "preproc guard around SHA-crypt body -- Metal always has HAS_SALT"
+
+  # Strip the defensive `#else..#endif` no-salt fallback (lines 695..718).
+  # SHA-crypt always needs salt; the no-salt path computes plain SHA-256/
+  # SHA-512 of the data as a placeholder and is structurally unreachable
+  # in production. We drop it entirely so the kernel keeps only the salted
+  # chain body. The outer `#endif` (line 718) closes the `#ifdef
+  # GPU_TEMPLATE_HAS_SALT` from line 408; with the `#ifdef` stripped, the
+  # closing `#endif` is also dropped to keep balance.
+  - start: 695
+    end:   718
+    reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+# Phase 2d.8b: SHACRYPT scalar-ref typedefs. sc_counter_t (typedef'd to uint
+# at HASH_WORDS=8, ulong at HASH_WORDS=16) is used in sc_update/sc_update_g
+# helpers as a single-scalar-by-pointer arg (`sc_counter_t *counter` with
+# body `*counter += len`). The translator's _detect_scalar_ref_params hard-
+# codes a primitive-type list (uint/int/ulong/.../uchar) and does NOT
+# recognize typedefs of those primitives. Without this overlay,
+# `sc_counter_t *counter` stays as a `*counter` parameter, but the call-
+# site `&counter` gets stripped by rewrite_block_calls (because sc_update
+# is in discovered_scalar_state_helpers due to the sibling `int *bufpos`
+# being recognized) -- producing the compile error "no known conversion
+# from 'sc_counter_t' to 'sc_counter_t *' for 4th argument".
+#
+# Listing sc_counter_t here causes _detect_scalar_ref_params to ALSO
+# convert `sc_counter_t *counter` to `thread sc_counter_t &counter` --
+# matching the `int *bufpos` -> `thread int &bufpos` treatment so that
+# the call-site `&counter` strip correctly resolves against the reference
+# parameter.
+#
+# sc_word_t is the state-array typedef (uint at HASH_WORDS=8, ulong at 16).
+# It's used as ARRAY pointer (sc_word_t *state) NOT scalar-ref (body uses
+# state[i], not *state), so it correctly stays as a pointer. We do NOT
+# add it here.
+extra_scalar_ref_types:
+  - sc_counter_t

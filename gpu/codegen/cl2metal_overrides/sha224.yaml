@@ -1,0 +1,37 @@
+# cl2metal overlay for sha224 (gpu/gpu_sha224_core.cl -> gpu/metal_sha224_core.metal).
+#
+# Phase 2d.4.3 sha224 (raw SHA-224 unsalted, 7-word digest) overlay -- third
+# SHA-2/256 family on the cl2metal codegen path. Reuses SHA-256's
+# sha256_block compression function exactly; only digest output width
+# differs (HASH_WORDS=7 vs SHA256's HASH_WORDS=8) -- the state struct still
+# holds h[8] internally because sha256_block reads/writes 8 words per call.
+#
+# 8th internal state word (st.h[7]) is intentionally dropped by
+# template_emit_hit, which uses EMIT_HIT_7 (newly added to metal_common.metal
+# alongside this overlay in Phase 2d.4.3).
+#
+# Apple-specific tweaks (identical to sha256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      OpenCL source declares data as unqualified pointer; Metal call site
+#      passes `device uchar *` from buf_scratch_pool slice.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro + comment header
+#
+# Source order at JIT compile time (mirrors sha256):
+#   metal_common_str + metal_sha224_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+
+algo: sha224
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 4-line comment header.
+  # OpenCL source: lines 286-302 of gpu_sha224_core.cl (4 lines comment at
+  # 286-289 + macro definition 290-302).
+  - start: 286
+    end:   302
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

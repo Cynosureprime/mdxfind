@@ -1,0 +1,51 @@
+# cl2metal overlay for md5passsalt (gpu/gpu_md5passsalt_core.cl ->
+# gpu/metal_md5passsalt_core.metal).
+#
+# Phase 2d.2.4 md5passsalt overlay. md5passsalt is the FIRST salted family
+# added via the cl2metal codegen path (md5salt was hand-ported in Phase 2c).
+# MD5PASSSALT (hashcat -m 10): MD5(pass || salt). APPEND-shape salted variant,
+# 8 PSO variants in gpu_metal.m (none/R/M/RM x non-salt/salt; salted-S/SR/SM/SRM).
+#
+# Compared to md5salt:
+#   - SIMPLER kernel (single template_finalize body; no algo_mode branches,
+#     no template_pre_salt/template_finalize_post for Phase 2e hoist, no
+#     salt_pack_uint helper). The translator's mechanical translation is
+#     near-verbatim.
+#   - The OpenCL source declares `salt_buf` as `__global const uchar *`,
+#     which the translator correctly maps to `device const`. The `data` arg
+#     is unqualified (translator default-infers `thread const`); per task
+#     #250 the Metal call site in metal_template.metal passes a device
+#     scratch-pool slice, so we override to `device const`. Same task #250
+#     pattern as md5/md4/md4utf16/md5raw/md5salt.
+#
+# template_iterate has FRESH IV reinstall each iter (lines 168-171 of the
+# OpenCL source); the translator output mirrors this byte-for-byte. No
+# overlay needed for the iter loop.
+#
+# Phase 2e (pre-salt hoist) is md5salt-specific Phase 2c+2e scaffolding;
+# md5passsalt has NO presalt hoist in this dispatch (the resolver in
+# gpu_metal.m will use only the 8 base salted variants; PRESALT is folded
+# inside md5salt's resolver only).
+#
+# skip_line_ranges:
+#   - template_emit_hit (simple form) macro at lines 194-197 of
+#     gpu_md5passsalt_core.cl. The Metal hand-port pattern keeps only the
+#     template_emit_hit_or_overflow form (mirrors md5.yaml/md4.yaml/
+#     md4utf16.yaml/md5raw.yaml/md5salt.yaml). The unfilled `(st)->h[i]`
+#     auto-rewrite in the simple form ages poorly through the codegen
+#     pipeline; the dedup form is the production path.
+
+algo: md5passsalt
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro: 4 lines, no comment header above
+  # (the OpenCL source has a comment block at lines 174-193 documenting
+  # template_digest_compare + the template_emit_hit pair; the macro itself
+  # is 4 lines starting at 194).
+  - start: 194
+    end:   197
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

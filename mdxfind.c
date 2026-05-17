@@ -203,10 +203,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.463 2026/05/11 14:16:27 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.475 2026/05/16 17:52:07 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.463 2026/05/11 14:16:27 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.475 2026/05/16 17:52:07 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -224,6 +224,72 @@ static const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.475  2026/05/16 17:52:07  dlr
+ * Phase 2d.7a BLAKE2 unsalted family compile-families bitmap -- add JOB_BLAKE2B256 (845) and JOB_BLAKE2B512 (841) cases mapping to FAM_BLAKE2S256UNSALTED (coarse family-grouping signal for Metal eager-compile pre-compile speed-up; not a per-op dispatch key). Same pattern as JOB_RMD320 mapping to FAM_RMD160UNSALTED in Phase 2d.6.2. JOB_BLAKE2S256 already mapped pre-this-phase. The OpenCL twin gpu_family_for_op_internal does not route BLAKE2B-{256,512} either; both lazy-compile via gpu_opencl_template_resolve_kernel on first dispatch. Pre-flight audit confirmed Phase 2d.7a Blake2 ops already wired at 4 of 5 host-wiring sites (gpu_ops[] line 37979-37982; chokepoint admit line 10842-10843; (GPU) tag line 43680-43682); only the FAM_ bitmask switch needed the BLAKE2B-256/512 extension (per feedback_codegen_host_wiring_gaps.md).
+ *
+ * Revision 1.474  2026/05/16 16:43:13  dlr
+ * Phase 2d.6.2 RIPEMD-320 compile-families bitmap -- add JOB_RMD320 case to the family bitmask switch (lines around 48335), maps to FAM_RMD160UNSALTED for timing/family bookkeeping consistency with JOB_RMD160. Coarse family-grouping signal for pre-compile via gpu_opencl_compile_families/gpu_metal_compile_families; not a per-op dispatch key. The OpenCL twin lazy-compiles on first dispatch via gpu_opencl_template_resolve_kernel (default arm; gpu_family_for_op_internal does not map JOB_RMD320). The Metal twin compile_families iterates registered families and so admits this op regardless; this bitmask entry is a Metal eager-compile speed-up only.
+ *
+ * Revision 1.473  2026/05/16 06:30:46  dlr
+ * Phase 2d.5.7-followup: chokepoint admit JOB_SHA384SALTPASS (-m e812) for Metal. Metal scaffolding shipped Phase 2d.5.7 (kernel + host wiring + family registration + lazy creators + is_salted_op widening + use_salt widening + metal_gpu_hash_words=12) but silent CPU fallback observed because JOB_SHA384SALTPASS was missing from 5 mdxfind.c sites. Mirrors B6.9/B6.10 SHA512SALTPASS/SHA512PASSSALT admit pattern. Sites edited: (1) chokepoint admit OR-chain at line 11013 area, (2) nsalts_job > 0 guard at line 11416 area, (3) need_gpu activation gpu_ops[] array at line 37942 area, (4) [GPU] tag advertisement at line 43637 area, (5) FAM_HMAC_SHA512 bitmask switch at line 48291 area. SHA-384 shares sha512_block primitive (truncated to 12 uint32 digest); family is FAM_HMAC_SHA512. OpenCL side carries a SHA384SALTPASS-shaped carrier template kernel (Family E HMAC-SHA384 from 2026-05-08) but does not currently wire JOB_SHA384SALTPASS through gpu_op_category. OpenCL silently CPU-falls-back; Metal dispatches via metal_gpu_hash_words=12. Validated on dev1 M1: 18/18 cracks sort-identical CPU vs GPU; GPU markers fired (sha384saltpass-salt-variant library JIT-compiled, salts uploaded 4 entries 14 bytes, first dispatch issued op=812 salts=4).
+ *
+ * Revision 1.472  2026/05/15 15:26:55  dlr
+ * Phase 2e.1 followup experiment: env-gated MDXFIND_START_DELAY_SECS staggers second procjob launch when GPU is active. Improves jobg buffer ordering by letting T0 fill the queue with line-ordered buffers before sibling threads consume. Default unset = current behavior. Validates the work-shrinkage feedback loop hypothesis from project_launch_delay_experiment.md (per -t 1 empirical 58% wall reduction). 5 LOC at wordlist launch site only; BF launch sites untouched.
+ *
+ * Revision 1.471  2026/05/13 21:32:24  dlr
+ * Typesaltbytes alloc: int -> long long, matching 2765 declaration. Caught by macOS 26.3 clang -Wincompatible-pointer-types error.
+ *
+ * Revision 1.470  2026/05/13 18:58:48  dlr
+ * Phase 2c Metal linehints loop: set lineswanted=UINT_MAX + gpu=1 for JOB_MD5SALT to avoid 512-floor in else branch at lines 48995-49007. Fixes 65x regression at high-salt fixtures (BENCHMARK.md sm-saltfull).
+ *
+ * Revision 1.469  2026/05/13 04:43:10  dlr
+ * Fix ETA expected_total calculation to include mask cardinality. Reported by user: -n ?d?d?d display showed 1.0Gh/14.3Mh (100%) ETA finishing — denominator was wordlist size only, percent and ETA both broken. ReportStats expected_total formula at line 38818 multiplied by salt_mult, Numrules (if > 1), Maxiter (if > 1) but NOT MaskTotal. Adds: if (MaskTotal > 1) expected_total *= MaskTotal. Validated on dev1.local with -f 0_combined.txt -n ?d?d?d rockyou.txt: now shows 1.4Gh/14.6Gh (9.3%) ETA 2m28s then 3.5Gh/14.6Gh (24.1%) ETA 1m35s — correct denominator 14.3M words x 1000 mask combos. One-line edit; no other behavior change.
+ *
+ * Revision 1.468  2026/05/13 04:13:07  dlr
+ * Phase 2b mdxfind.c sites: add Metal mask classify+upload arm at the Phase 1 compile_families Metal block (parallel to OpenCL mask block at line 48301-48370; not restructuring the OPENCL_GPU outer gate at 48216 since that wraps OpenCL-specific family-compile + warm-probe machinery). Adds gpu_metal_set_mask call after Metal compile_families stub at line 48377. Also adds Metal arm to BF activation set_mask path at line 48538. Per project_metal_phase2b_arch.md sections 5+6. Mask classification logic duplicated 65 lines from OpenCL block — local statics m_sizes/m_tables to avoid name collision with OpenCL block. gpu_metal_set_mask provided by gpu_metal.m rev 1.51. Validation on dev1.local Apple M1: Gate 1 -n ?d?d 200/200 byte-exact CPU/Metal; Gate 2 -r best64 -n ?d RM cross 0/0; Gate 3 -n ?d?d?d completes no crash (resolves Phase 2a regression); Gate 4 -r best64 500/500 preserves Phase 2a md5sum 16a49930d1c1165e4311be7691447e34. All markers fire: Metal mask binding ... Metal GPU first dispatch issued rules=N mask=M ... Metal rules+mask-variant library JIT-compiled. Buffer gap-indexing risk MITIGATED Apple cold-JIT accepts buf 10,11 rules + 12,13 mask gapped layout. Phase 2b SHIPPED for Apple Silicon.
+ *
+ * Revision 1.467  2026/05/12 22:45:45  dlr
+ * Phase 2a-final: overflow chain upload to Metal. Two pieces: (1) port gpujob_overflow_preload_all() in gpu/gpujob_metal.m from stub to real impl mirroring gpu/gpujob_opencl.c:582-637 — walks JudyL OverflowHash, packs keys+hashes+offsets+lengths, calls gpu_metal_set_overflow(0, ...); also includes <Judy.h> at top. (2) mdxfind.c Metal init block (added Phase 2a-cont at ~line 45307) now calls gpujob_overflow_preload_all() after rule classify+pack — mirrors the OpenCL arm's call at line 45208. Diagnosis from mdx-debug: best64.rule + rockyou-500 produces 1 overflow-chain entry (md5 e6008aa6...:!))!!(*( ). Phase 2a-cont byte-exact dropped from 500 to 499 because the kernel's compact-table probe missed the overflow entry — Metal lazy-uploaded compact_fp/_idx but never overflow keys/hashes. Validation on dev1.local Apple M1 with -G force -M e1 -r best64.rule -f md5-500 wl-500: stderr now shows Metal: overflow preload (1 entries, 16 bytes) uploaded; byte-exact 500/500 CPU vs Metal, md5 16a49930d1c1165e4311be7691447e34 identical. Phase 2a SHIPPED.
+ *
+ * Revision 1.466  2026/05/12 21:58:59  dlr
+ * Phase 2a-cont: widen 5 mdxfind.c gates from OPENCL_GPU to OPENCL_GPU || METAL_GPU; add 80-line METAL_GPU rule init block. Widens at lines 10750 word_packed_by_rules_engine decl, 10762 outer rules-engine pack block (closes 11780), 11883 C2.3 rule-skip, 12258 gpu_skip_no_rule_pack (FastRule walker hazard), 36779 end-of-job flush. New METAL_GPU rule classify block after 45211 mirrors the OpenCL synth+classify+pack logic minus per-device upload threads (Metal lazy-uploads from gpu_metal.m on first dispatch). Sets gpu_rule_program/offsets/origin/program_len/count/membership/legacy_slot_unused/rules_engine_active globals; logs Metal: rule engine — N/M rules GPU-eligible. gpu_metal.m gets one-shot Metal GPU[0]: first dispatch issued stderr marker at top of dispatch_md5_rules per feedback_verify_gpu_fired_post_build.md. dev1.local validation: rules library JIT confirmed firing, 38922 hashes on GPU per batch, byte-exact 499/500 (one rule-output missing on GPU — follow-up bug, infrastructure works). Phase 2a-cont architecture proven; full byte-exact parity is a Phase 2a-final follow-up to debug the 1-word discrepancy in the FastRule walker or batching path.
+ *
+ * Revision 1.465  2026/05/12 14:42:46  dlr
+ * Phase 1 Metal port re-integration. Symmetric re-add of 7 #ifdef METAL_GPU sites that Phase 0 (rev 1.464) removed. New gpu_metal.h/m (rev 1.7/1.47, shipped by mdx-gpu) provides the 9-function API. Metal arms re-added: GPU_ENABLED macro guard + gpu_metal.h include cascade; gpu_metal_init + gpu_metal_set_compact_table (single device, dev_idx=0 hardcoded for Phase 1); -G list/L stub; gpu_metal_available; gpu_metal_compile_families stub (metallib loaded at init); gpu_metal_shutdown; multi-device share-line gate. 3 _set_mask sites stay COMMENTED for Phase 2 per memo non-goal (Phase 1 has no mask path). gpujob.h compile gate widened with || defined(METAL_GPU). Makefile re-adds Metal compile rules: gpu_metal.o (plain Obj-C, -fobjc-arc, no -x objective-c++ override); gpu/metal_%_str.h from .metal via metal2str.py; gpu/mdxfind.metallib via build_metallib.sh on dev1.local; gpu/mdxfind_metallib.h via xxd. Adds -DMETAL_GPU=1 to mdxfind.c compile + -framework Metal -framework Foundation to mdxfind link. Local build verified: clean compile + link on iMac Intel macOS 15.2 SDK + Apple clang 16. Binary rsync'd to dev1.local. GPU runtime test pending on dev1.local / nutshack.local per memo §7 byte-exact CPU/Metal parity gate.
+ *
+ * Revision 1.464  2026/05/12 07:22:05  dlr
+ * Phase 0: strip Metal GPU support, revert macOS to CPU-only.
+ *
+ * Removes the legacy monolithic-kernel Metal codebase as a clean-slate prerequisite
+ * for the eventual Metal port targeting the new template_phase0 + per-algorithm
+ * _core.cl architecture (task #220).
+ *
+ * Files deleted from working tree (RCS history retained):
+ * - top-level: gpu_metal.h, gpu_metal.m, gpujob_metal.m, test_metal.m
+ * - gpu/: 32 metal_*_str.h, 32 metal_*.metal, mdxfind_metallib.h,
+ *   build_metallib.sh, mdxfind.metallib
+ *
+ * Code edits this commit:
+ * - mdxfind.c: 7 #ifdef METAL_GPU sites removed (init + family-compile + mask-set
+ *   + BF mask-set + multi-GPU share-line + GPU_ENABLED preprocessor gate +
+ *   list-devices). gpu_metal_init/gpu_metal_set_compact_table/
+ *   gpu_metal_compile_families/gpu_metal_set_mask/gpu_metal_available call sites
+ *   all deleted. No #if 0 graveyards.
+ * - gpujob.h: METAL_GPU branches removed from compile gate + comment headers.
+ * - gpu/gpujob_opencl.c: 3 historical comment refs to gpu_metal updated.
+ * - Makefile: dropped -DMETAL_GPU=1 from mdxfind.c compile; deleted METAL_SOURCES,
+ *   mdxfind.metallib, mdxfind_metallib.h, metallib, gpu_metal.o, gpujob_metal.o,
+ *   gpu/metal_%_str.h rules; dropped 'gpu_metal.o gpujob_metal.o' from mdxfind
+ *   link prereqs + objects list; dropped -framework Metal -framework Foundation
+ *   -framework OpenCL from link command (macOS local build is now CPU-only).
+ *
+ * Build verified: 'make mdxfind' on local imac compiles clean (only pre-existing
+ * ld 'no platform load command' warnings for older static libs). Smoke: MD5x01
+ * cracks md5(test) byte-exact.
+ *
+ * No github release — CPU-only state lives in RCS as a fallback point per user
+ * direction. Phase 1+ (new Metal port) builds on top of this baseline.
+ *
  * Revision 1.463  2026/05/11 14:16:27  dlr
  * Phase 1.8 host-side neutralization (adaptive_bf_chunk_size CHUNK_HARD reduction): kernel revert (gpu_template.cl 1.16) removed the for-loop wrap; host servo still computes inner_iter > 1 for chunks > NDRANGE_HARD, which the kernel now ignores, causing ~1000× rate collapse via NDRange/chunk_total misalignment (caught during revert validation: V1 raw MD5 BF without MDXFIND_BF_INNER_ITER=1 env override showed 1.36 MH/s vs target 1.0 GH/s). Fix: CHUNK_HARD reduced from 2^35 to 2^31 (= NDRANGE_HARD). Step 4.6 unsalted branch `if (ndrange > NDRANGE_HARD)` is now structurally never true; inner_iter stays at the initial 1u. Salted branch already forced 1. Host-side Phase 1.8 servo machinery retained as dead-but-harmless (could be cleaned up in a separate pass; minimal-surgery revert keeps the OCLParams field, jobg field, env override, etc. as dormant infrastructure). Now binary works correctly without env override; servo never picks inner_iter > 1.
  *
@@ -10711,7 +10777,7 @@ while (1) {
     job->pass = job->line;
     currule = Rules;
     job->Ruleindex = 0;
-#ifdef OPENCL_GPU
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
     int word_packed_by_rules_engine = 0;  /* Set by the C2.2 hook below when this word's
                                            * original bytes get packed into my_jobg_rules.
                                            * The legacy chokepoint then knows the kernel
@@ -10723,7 +10789,7 @@ while (1) {
     fastcopy(d, s, len);
     d[len] = 0;
 
-#ifdef OPENCL_GPU
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
     /* Sub-commit C2: GPU rule engine — pack the ORIGINAL word into the rules_engine
      * slot. The kernel does the (word x rule) Cartesian product itself; CPU loop
      * below skips GPU-eligible rules (see C2.3). The implicit no-rule pass fires
@@ -10954,6 +11020,20 @@ while (1) {
           * post-this-change; the legacy slab dispatcher is structurally
           * unreachable. */
          job->op == JOB_SHA512SALTPASS ||
+         /* Phase 2d.5.7-followup (2026-05-13): JOB_SHA384SALTPASS
+          * (-m e812) chokepoint admit. Metal scaffolding for sha384saltpass
+          * shipped in Phase 2d.5.7 (kernel + host wiring + family
+          * registration + lazy creators); without the chokepoint admit
+          * here, dispatch silently CPU-falls-back even though Metal has
+          * the kernel ready. Mirrors B6.9 SHA512SALTPASS / B6.10
+          * SHA512PASSSALT admit pattern. SHA-384 shares sha512_block as
+          * the underlying compression primitive (truncated to 12 uint32
+          * digest); FAM_HMAC_SHA512 family. The OpenCL side carries a
+          * SHA384SALTPASS-shaped carrier template kernel (Family E HMAC-
+          * SHA384 from 2026-05-08) but does not currently wire JOB_SHA384
+          * SALTPASS through gpu_op_category — OpenCL silently CPU-falls-
+          * back; Metal dispatches via metal_gpu_hash_words=12. */
+         job->op == JOB_SHA384SALTPASS ||
          /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT
           * (-m 1720) — second 64-bit-state salted variant on the codegen
           * path. SHA512(pass || salt) (simple APPEND; mdxfind.c:14069-
@@ -11357,6 +11437,13 @@ while (1) {
            * time byte order differs (APPEND vs PREPEND), invisible at
            * the salt-snapshot level. FINAL B6 ladder step. */
           job->op != JOB_SHA512PASSSALT &&
+          /* Phase 2d.5.7-followup (2026-05-13): JOB_SHA384SALTPASS joins
+           * the salted-op set for this guard. Salt-snapshot precondition
+           * identical to SHA512SALTPASS — same sha512_block primitive
+           * width, only digest truncation (12 uint32 vs 16 uint32) and
+           * IV constants differ at the kernel side; salt buffer plumbing
+           * is identical. */
+          job->op != JOB_SHA384SALTPASS &&
           /* B6.6 (2026-05-06): MD5SALT family variants — same salt-snapshot
            * precondition as e31 MD5SALT. */
           job->op != JOB_MD5UCSALT &&
@@ -11741,7 +11828,7 @@ while (1) {
         }
       }
     }
-#endif /* OPENCL_GPU */
+#endif /* OPENCL_GPU || METAL_GPU */
     /* fall through: CPU loop handles no-rule pass and CPU-only rules (C2.3 skips GPU rules) */
 
     if (currule) {
@@ -11844,7 +11931,7 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
       if (*((unsigned short int *) currule) == 0)
         break;
       job->Ruleindex++;
-#ifdef OPENCL_GPU
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
       /* C2.3: skip CPU expansion for GPU-eligible rules — kernel handles them.
        * Ruleindex is 1-based after increment; bitmap is 0-indexed.
        * B7.1/B7.2: also skip when the chokepoint admitted a multi-
@@ -11870,7 +11957,7 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
         job->MaskIndex = 0;
         continue;
       }
-#endif /* OPENCL_GPU */
+#endif /* OPENCL_GPU || METAL_GPU */
       len = applyrule(tline, cur, orig_len, currule + 2, rule_ws);
       job->len = job->clen = len;
       currule += *((unsigned short int *) currule) + 2;
@@ -12219,7 +12306,7 @@ do {
      * B7.9 deletes the pack body but keeps the skip-then-goto on the
      * gpu_skip_no_rule_pack path because the FastRule walker hazard is
      * unchanged. */
-#ifdef OPENCL_GPU
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
     int gpu_skip_no_rule_pack = (was_pass0_zero && word_packed_by_rules_engine);
 #else
     int gpu_skip_no_rule_pack = 0;
@@ -36740,7 +36827,7 @@ gpu_packed_done: ;
      * permanently NULL post-Tranche-A. Only the rules-engine flush
      * remains. */
     /* C2.4: Flush rules-engine batch at end of job (NOT submit_bf — single-submit). */
-#ifdef OPENCL_GPU
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
     if (my_jobg_rules && my_jobg_rules->packed_count > 0) {
       gpujob_submit(my_jobg_rules);
       my_jobg_rules = NULL;
@@ -36748,7 +36835,7 @@ gpu_packed_done: ;
       gpujob_return_free(my_jobg_rules);
       my_jobg_rules = NULL;
     }
-#endif /* OPENCL_GPU */
+#endif /* OPENCL_GPU || METAL_GPU */
 #endif
     if (job->outlen) { fwrite(job->outbuf,job->outlen,1,stdout); fflush(stdout);}
     if (job->readbuf == Readbuf) {
@@ -37883,6 +37970,12 @@ void build_compact_table(void) {
                       JOB_HMAC_STREEBOG256_KPASS, JOB_HMAC_STREEBOG256_KSALT,
                       JOB_HMAC_STREEBOG512_KPASS, JOB_HMAC_STREEBOG512_KSALT,
                       JOB_SHA512PASSSALT, JOB_SHA512SALTPASS,
+                      /* Phase 2d.5.7-followup (2026-05-13): admit
+                       * JOB_SHA384SALTPASS to the need_gpu activation
+                       * set so Metal init runs when -m e812 is in
+                       * Dohash. Mirrors B6.9/B6.10 SHA512 sibling
+                       * admission. */
+                      JOB_SHA384SALTPASS,
                       JOB_SHA512CRYPT, JOB_SHA256CRYPT, JOB_SHA512CRYPTMD5,
                       JOB_MD5RAW, JOB_SHA1RAW, JOB_SHA384RAW, JOB_SHA512RAW,
                       JOB_SQL5, JOB_MYSQL3, JOB_DESCRYPT,
@@ -37920,7 +38013,10 @@ void build_compact_table(void) {
 #endif
     if (gpu_ok == 0 && CompactFP && HashDataBuf && HashDataOff && HashDataLen && CompactSize > 0) {
 #if defined(__APPLE__) && defined(METAL_GPU)
-      gpu_metal_set_compact_table(CompactFP, CompactIdx,
+      /* Phase 1 Metal: single-device only; dev_idx=0 always. The dev_idx
+       * arg exists in the gpu_metal_set_compact_table signature for
+       * future multi-device support + signature parity with OpenCL. */
+      gpu_metal_set_compact_table(0, CompactFP, CompactIdx,
           CompactSize, CompactMask,
           HashDataBuf, HashDataBufUsed,
           HashDataOff, HashDataCount, HashDataLen);
@@ -38770,6 +38866,7 @@ MDXALIGN void ReportStats(void *dummy) {
           unsigned long long expected_total = total_est * salt_mult;
           if (Numrules > 1) expected_total *= Numrules;
           if (Maxiter > 1) expected_total *= Maxiter;
+          if (MaskTotal > 1) expected_total *= MaskTotal;
           if (expected_total > 0 && Tothash > 0) {
             progress_frac = (double)Tothash / (double)expected_total;
             if (progress_frac > 1.0) progress_frac = 1.0;
@@ -43497,7 +43594,7 @@ int main(int argc, char **argv) {
   Typesalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "Typesalt");
   Typehashsalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "Typehashsalt");
   Typesaltcnt = (int *)malloc_lock(JOB_DONE * sizeof(int), "Typesaltcnt");
-  Typesaltbytes = (int *)malloc_lock(JOB_DONE * sizeof(int), "Typesaltbytes");
+  Typesaltbytes = (long long *)malloc_lock(JOB_DONE * sizeof(long long), "Typesaltbytes");
   Typesalt2 = (char **)malloc_lock(JOB_DONE * sizeof(char *), "Typesalt2");
   Typeuser = (void **)malloc_lock(JOB_DONE * sizeof(void *), "Typeuser");
   Typepepper = (char **)malloc_lock(JOB_DONE * sizeof(char *), "Typepepper");
@@ -43574,6 +43671,9 @@ int main(int argc, char **argv) {
                   x == JOB_HMAC_STREEBOG256_KPASS || x == JOB_HMAC_STREEBOG256_KSALT ||
                   x == JOB_HMAC_STREEBOG512_KPASS || x == JOB_HMAC_STREEBOG512_KSALT ||
                   x == JOB_SHA512PASSSALT || x == JOB_SHA512SALTPASS ||
+                  /* Phase 2d.5.7-followup (2026-05-13): SHA384SALTPASS
+                   * Metal scaffolding shipped Phase 2d.5.7. */
+                  x == JOB_SHA384SALTPASS ||
                   x == JOB_SHA512CRYPT || x == JOB_SHA256CRYPT ||
                   x == JOB_MD5RAW || x == JOB_SHA1RAW ||
                   x == JOB_SHA384RAW || x == JOB_SHA512RAW ||
@@ -43805,7 +43905,8 @@ int main(int argc, char **argv) {
 #if defined(OPENCL_GPU)
           gpu_opencl_list_devices();
 #elif defined(__APPLE__) && defined(METAL_GPU)
-          /* TODO: metal list */
+          /* Phase 1: single-device only — list the default Metal device */
+          fprintf(stderr, "  Metal device 0 (default)\n");
 #endif
           exit(0);
         } else if (optarg[0] == 'f' || optarg[0] == 'F') {
@@ -45166,6 +45267,102 @@ usage:
    * fpga 16-core, ~30s suspected on mmt 64-core via GAP DEBUG). Doing
    * it at session start eliminates the contention. */
   if (gpu_opencl_available()) {
+    gpujob_overflow_preload_all();
+  }
+#endif
+
+#if defined(__APPLE__) && defined(METAL_GPU)
+  /* Phase 2a-cont: Metal-side rule globals init. Mirrors the OpenCL block
+   * above (~44982) but strips the per-device upload threads — Metal is
+   * single-device and lazy-uploads from gpu_metal.m on first dispatch. */
+  if (gpu_metal_available()) {
+    if (Numrules == 0) {
+      /* Synthetic 1-byte no-rule pass; same semantics as OpenCL synth arm. */
+      unsigned char *prog = malloc(1);
+      uint32_t      *offs = malloc(sizeof(uint32_t));
+      int           *orig = malloc(sizeof(int));
+      if (prog && offs && orig) {
+        prog[0] = 0;
+        offs[0] = 0;
+        orig[0] = -1;
+        gpu_rule_program        = prog;
+        gpu_rule_offsets        = offs;
+        gpu_rule_origin         = orig;
+        gpu_rule_program_len    = 1;
+        gpu_rule_count          = 1;
+        gpu_rule_membership     = NULL;
+        gpu_legacy_slot_unused  = 1;
+        gpu_rules_engine_active = 1;
+      } else {
+        free(prog); free(offs); free(orig);
+      }
+    } else {
+      /* Numrules > 0: classify + pack the GPU-eligible subset. */
+      char **rule_ptrs = malloc(Numrules * sizeof(char *));
+      if (rule_ptrs) {
+        char *rp = Rules;
+        int rn = 0;
+        while (rn < Numrules) {
+          unsigned short int rlen = *((unsigned short int *)rp);
+          if (rlen == 0) break;
+          rule_ptrs[rn++] = rp + 2;
+          rp += rlen + 2;
+        }
+        if (rn == Numrules) {
+          struct rule_lists rl;
+          if (classify_rules(rule_ptrs, Numrules, &rl) >= 0 && rl.ngpu > 0) {
+            uint32_t prog_cap = 0;
+            for (int i = 0; i < rl.ngpu; i++) prog_cap += (uint32_t)(strlen(rl.gpu[i]) + 1);
+            prog_cap += 1; /* synthetic `:` */
+            unsigned char *prog = malloc(prog_cap);
+            uint32_t      *offs = malloc((rl.ngpu + 1) * sizeof(uint32_t));
+            int           *orig = malloc((rl.ngpu + 1) * sizeof(int));
+            if (prog && offs && orig) {
+              uint32_t pos = 0;
+              for (int i = 0; i < rl.ngpu; i++) {
+                offs[i] = pos;
+                size_t blen = strlen(rl.gpu[i]) + 1;
+                memcpy(prog + pos, rl.gpu[i], blen);
+                pos += (uint32_t)blen;
+                orig[i] = -1;
+                for (int j = 0; j < Numrules; j++) {
+                  if (rule_ptrs[j] == rl.gpu[i]) { orig[i] = j; break; }
+                }
+              }
+              offs[rl.ngpu] = pos;
+              prog[pos++] = 0;
+              orig[rl.ngpu] = -1;
+              int n_rules_with_synth = rl.ngpu + 1;
+              gpu_rule_program     = prog;
+              gpu_rule_offsets     = offs;
+              gpu_rule_origin      = orig;
+              gpu_rule_program_len = pos;
+              gpu_rule_count       = n_rules_with_synth;
+              gpu_rule_membership  = calloc(Numrules, 1);
+              if (gpu_rule_membership) {
+                for (int i = 0; i < rl.ngpu; i++) {
+                  if (orig[i] >= 0 && orig[i] < (int)Numrules) {
+                    gpu_rule_membership[orig[i]] = 1;
+                  }
+                }
+              }
+              gpu_legacy_slot_unused  = (rl.ncpu == 0) ? 1 : 0;
+              gpu_rules_engine_active = 1;
+              fprintf(stderr,
+                "Metal: rule engine — %d/%d rules GPU-eligible, "
+                "%u-byte program, %d total kernel rules (incl. synthetic ':')\n",
+                rl.ngpu, (int)Numrules, pos, n_rules_with_synth);
+            } else {
+              free(prog); free(offs); free(orig);
+            }
+          }
+          /* classify_rules allocates rl.gpu/rl.cpu internally — they're
+           * stable pointers into Rules, no free needed. */
+        }
+        free(rule_ptrs);
+      }
+    }
+    /* Pre-upload overflow chain to GPU — mirrors the OpenCL arm above. */
     gpujob_overflow_preload_all();
   }
 #endif
@@ -48063,78 +48260,6 @@ usage:
     int gpu_avail = 0;
 #if defined(__APPLE__) && defined(METAL_GPU)
     gpu_avail = gpu_metal_available();
-    if (gpu_avail) {
-      /* Mark GPU-capable algorithms and compile needed kernel families */
-      unsigned int fam = 0, finalfam = 0;
-      lsi = 0;
-      J1F(RC, Dohash, lsi);
-      while (RC) {
-	fam = 0;
-	switch ((int)lsi) {
-	  case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:
-	  case JOB_MD5sub8_24SALT: fam = 1u << FAM_MD5SALT; break;
-	  case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam = 1u << FAM_MD5SALTPASS; break;
-	  case JOB_MD5: case JOB_MD5UC: fam = (1u << FAM_MD5SALT) | (1u << FAM_MD5UNSALTED); break;
-	  case JOB_MD5RAW: fam = 1u << FAM_MD5UNSALTED; break;
-	  case JOB_MD4: case JOB_NTLMH: case JOB_NTLM: case JOB_MD4UTF16: fam = 1u << FAM_MD4UNSALTED; break;
-	  case JOB_SHA1: case JOB_SHA1RAW: fam = 1u << FAM_SHA1UNSALTED; break;
-	  case JOB_SHA256: case JOB_SHA256RAW: fam = 1u << FAM_SHA256UNSALTED; break;
-	  case JOB_SHA224: fam = 1u << FAM_SHA256UNSALTED; break;
-	  case JOB_SHA512: case JOB_SHA512RAW: fam = 1u << FAM_SHA512UNSALTED; break;
-	  case JOB_SHA384: case JOB_SHA384RAW: fam = 1u << FAM_SHA512UNSALTED; break;
-	  case JOB_WRL: fam = 1u << FAM_WRLUNSALTED; break;
-	  case JOB_MD6256: fam = 1u << FAM_MD6256UNSALTED; break;
-	  case JOB_KECCAK224: case JOB_KECCAK256: case JOB_KECCAK384: case JOB_KECCAK512:
-	  case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
-	    fam = 1u << FAM_KECCAKUNSALTED; break;
-	  case JOB_SQL5: fam = 1u << FAM_SHA1UNSALTED; break;
-	  case JOB_MYSQL3: fam = 1u << FAM_MYSQL3UNSALTED; break;
-	  case JOB_HMAC_MD5: case JOB_HMAC_MD5_KPASS:
-	    fam = 1u << FAM_MD5SALT; break;
-	  case JOB_HMAC_SHA1: case JOB_HMAC_SHA1_KPASS:
-	    fam = 1u << FAM_SHA1; break;
-	  case JOB_HMAC_SHA224: case JOB_HMAC_SHA224_KPASS:
-	  case JOB_HMAC_SHA256: case JOB_HMAC_SHA256_KPASS:
-	    fam = 1u << FAM_SHA256; break;
-	  case JOB_HMAC_SHA384: case JOB_HMAC_SHA384_KPASS:
-	  case JOB_HMAC_SHA512: case JOB_HMAC_SHA512_KPASS:
-	    fam = 1u << FAM_HMAC_SHA512; break;
-	  case JOB_HMAC_RMD160: case JOB_HMAC_RMD160_KPASS:
-	    fam = 1u << FAM_HMAC_RMD160; break;
-	  case JOB_HMAC_RMD320: case JOB_HMAC_RMD320_KPASS:
-	    fam = 1u << FAM_HMAC_RMD320; break;
-	  case JOB_HMAC_BLAKE2S: fam = 1u << FAM_HMAC_BLAKE2S; break;
-	  case JOB_STREEBOG_32: case JOB_STREEBOG_64:
-	  case JOB_HMAC_STREEBOG256_KPASS: case JOB_HMAC_STREEBOG256_KSALT:
-	  case JOB_HMAC_STREEBOG512_KPASS: case JOB_HMAC_STREEBOG512_KSALT:
-	    fam = 1u << FAM_STREEBOG; break;
-	  case JOB_PHPBB3: fam = 1u << FAM_PHPBB3; break;
-	  case JOB_MD5CRYPT: fam = 1u << FAM_MD5CRYPT; break;
-	  case JOB_MD5_MD5SALTMD5PASS: fam = 1u << FAM_MD5_MD5SALTMD5PASS; break;
-	  case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU: fam = 1u << FAM_SHA1; break;
-	  case JOB_SHA256PASSSALT: case JOB_SHA256SALTPASS: fam = 1u << FAM_SHA256; break;
-	  /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS uses sha256_block
-	   * compression, family is FAM_SHA256 (timing/family bookkeeping). */
-	  case JOB_SHA224SALTPASS: fam = 1u << FAM_SHA256; break;
-	  case JOB_SHA512PASSSALT: case JOB_SHA512SALTPASS: fam = 1u << FAM_HMAC_SHA512; break;
-	  case JOB_SHA512CRYPT: case JOB_SHA512CRYPTMD5:
-	    fam = 1u << FAM_SHA512CRYPT; break;
-	  case JOB_SHA256CRYPT: fam = 1u << FAM_SHA256CRYPT; break;
-	  case JOB_DESCRYPT: fam = 1u << FAM_DESCRYPT; break;
-	  case JOB_BCRYPT: fam = 1u << FAM_BCRYPT; break;
-	  case JOB_RMD160: fam = 1u << FAM_RMD160UNSALTED; break;
-	  case JOB_BLAKE2S256: fam = 1u << FAM_BLAKE2S256UNSALTED; break;
-	}
-	if (fam & FAM_MD5SALT) {
-	  linehints[lsi].lineswanted = UINT_MAX;
-	  linehints[lsi].gpu = 1;
-	}
-	finalfam |= fam;
-	J1N(RC, Dohash, lsi);
-      }
-      if (finalfam)
-        gpu_metal_compile_families(finalfam);
-    }
 #elif defined(CUDA_GPU)
     gpu_avail = cuda_md5salt_available();
 #elif defined(OPENCL_GPU)
@@ -48203,13 +48328,40 @@ usage:
              * compression, family is FAM_SHA256 (timing/family bookkeeping). */
             case JOB_SHA224SALTPASS: fam |= 1u << FAM_SHA256; break;
             case JOB_SHA512PASSSALT: case JOB_SHA512SALTPASS: fam |= 1u << FAM_HMAC_SHA512; break;
+            /* Phase 2d.5.7-followup (2026-05-13): SHA384SALTPASS uses
+             * sha512_block compression (truncated to 12 uint32 digest);
+             * family is FAM_HMAC_SHA512 for timing/family bookkeeping,
+             * matching SHA512SALTPASS / SHA512PASSSALT siblings. */
+            case JOB_SHA384SALTPASS: fam |= 1u << FAM_HMAC_SHA512; break;
             case JOB_SHA512CRYPT: case JOB_SHA512CRYPTMD5:
               fam |= 1u << FAM_SHA512CRYPT; break;
             case JOB_SHA256CRYPT: fam |= 1u << FAM_SHA256CRYPT; break;
             case JOB_DESCRYPT: fam |= 1u << FAM_DESCRYPT; break;
             case JOB_BCRYPT: fam |= 1u << FAM_BCRYPT; break;
             case JOB_RMD160: fam |= 1u << FAM_RMD160UNSALTED; break;
+            /* Phase 2d.6.2 (2026-05-16): JOB_RMD320 (816) maps to FAM_RMD160-
+             * UNSALTED for timing/family bookkeeping. RMD-160 and RMD-320
+             * share the RIPEMD compression family (rmd160_block / rmd320_block
+             * both live in metal_common.metal / gpu_common.cl); the bitmask
+             * is a coarse family-grouping signal for compile_families pre-
+             * compile, not a per-op dispatch key. The OpenCL twin's
+             * gpu_family_for_op_internal lets JOB_RMD320 fall through to
+             * default -> -1 (compiled lazily via gpu_opencl_template_resolve_-
+             * kernel on first dispatch); pre-compile via this bitmask is
+             * a Metal-side speed-up only. */
+            case JOB_RMD320: fam |= 1u << FAM_RMD160UNSALTED; break;
             case JOB_BLAKE2S256: fam |= 1u << FAM_BLAKE2S256UNSALTED; break;
+            /* Phase 2d.7a (2026-05-16): JOB_BLAKE2B256 (845) and JOB_BLAKE2B512
+             * (841) map to FAM_BLAKE2S256UNSALTED for compile-families
+             * bitmap bookkeeping. Same coarse-family-grouping pattern as
+             * JOB_RMD320 -> FAM_RMD160UNSALTED above: not a per-op dispatch
+             * key, just a Metal eager-compile pre-compile signal. The OpenCL
+             * twin's gpu_family_for_op_internal doesn't route either op
+             * (lazy-compiled via gpu_opencl_template_resolve_kernel on first
+             * dispatch); the Metal twin compile_families iterates registered
+             * families and admits both regardless. */
+            case JOB_BLAKE2B256: fam |= 1u << FAM_BLAKE2S256UNSALTED; break;
+            case JOB_BLAKE2B512: fam |= 1u << FAM_BLAKE2S256UNSALTED; break;
           }
 	  if (fam & FAM_MD5SALT) {
 	    linehints[lsi].lineswanted = UINT_MAX;
@@ -48295,57 +48447,86 @@ usage:
         if (gpu_mask_ok && (npre > 0 || napp > 0)) {
 #if defined(OPENCL_GPU)
           gpu_opencl_set_mask(mask_sizes, mask_tables, npre, napp);
-#elif defined(METAL_GPU)
-          gpu_metal_set_mask(mask_sizes, mask_tables, npre, napp);
 #endif
         }
       }
 #endif
-#ifdef METAL_GPU
-      /* Upload mask descriptor to Metal GPU if mask mode is active */
+#if defined(__APPLE__) && defined(METAL_GPU)
+      /* Phase 1 Metal: the metallib was loaded at gpu_metal_init(); no
+       * lazy family compile is needed. Call the stub for symmetry with
+       * the OpenCL path and to keep mdxfind.c's GPU init flow uniform. */
+      gpu_metal_compile_families((unsigned int)-1);
+      /* Phase 2c Metal: parallel linehints loop mirroring the OpenCL switch
+       * at lines 48225-48297. Without this, JOB_MD5SALT (e31) falls through
+       * to the rate/Livesalts floor of 512 words per dispatch (lines
+       * 48995-49007), capping batch at 512 instead of 16384 and causing
+       * ~32x dispatch overhead at high salt counts. Validated against
+       * BENCHMARK.md sm-saltfull (1M salts) 2026-05-13 — without this
+       * loop, dev3 M2 Max regressed from 2.65 G/s baseline to ~41 Mh/s.
+       * Extend ops list as Phase 2d+ salted siblings land. */
+      { Word_t lsi_mt = 0; int RC_mt;
+        J1F(RC_mt, Dohash, lsi_mt);
+        while (RC_mt) {
+          if ((int)lsi_mt == JOB_MD5SALT) {
+            linehints[lsi_mt].lineswanted = UINT_MAX;
+            linehints[lsi_mt].gpu = 1;
+          }
+          J1N(RC_mt, Dohash, lsi_mt);
+        }
+      }
+      /* Phase 2b Metal mask upload — mirrors the OpenCL mask classify+upload
+       * block at lines ~48301-48370. The classification logic is
+       * identical (MaskClasses → mask_sizes + mask_tables); only the
+       * final upload call differs (gpu_metal_set_mask vs gpu_opencl_set_mask).
+       * Kept as a parallel block rather than restructuring the OPENCL_GPU
+       * outer gate at line 48216, which wraps family-compile + warm-probe
+       * machinery that is OpenCL-only. */
       if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpujob_available()) {
-        int gpu_mask_ok = 1;
-        static uint8_t mask_sizes[MAX_MASK_POS * 2];
-        static uint8_t mask_tables[MAX_MASK_POS * 2][256];
+        int m_gpu_ok = 1;
+        static uint8_t m_sizes[MAX_MASK_POS * 2];
+        static uint8_t m_tables[MAX_MASK_POS * 2][256];
         int npre = 0, napp = 0;
-        for (int mi = 0; mi < MaskPrependLen && gpu_mask_ok; mi++) {
+        for (int mi = 0; mi < MaskPrependLen; mi++) {
           int cid = MaskPrependPattern[mi].classid;
           if (cid == MASK_LITERAL) {
-            mask_sizes[npre] = 1; memset(mask_tables[npre], 0, 256);
-            mask_tables[npre][0] = MaskPrependPattern[mi].literal; npre++;
+            m_sizes[npre] = 1; memset(m_tables[npre], 0, 256);
+            m_tables[npre][0] = MaskPrependPattern[mi].literal; npre++;
           } else if (cid >= 0 && cid < MASK_MAX_CLASSES && MaskClasses[cid].count > 0) {
-            mask_sizes[npre] = (uint8_t)MaskClasses[cid].count;
-            memcpy(mask_tables[npre], MaskClasses[cid].chars, 256); npre++;
-          } else gpu_mask_ok = 0;
+            m_sizes[npre] = (uint8_t)MaskClasses[cid].count;
+            memcpy(m_tables[npre], MaskClasses[cid].chars, 256); npre++;
+          } else { m_gpu_ok = 0; break; }
         }
-        for (int mi = 0; mi < MaskAppendLen && gpu_mask_ok; mi++) {
-          int ti = npre + napp;
-          int cid = MaskAppendPattern[mi].classid;
-          if (cid == MASK_LITERAL) {
-            mask_sizes[ti] = 1; memset(mask_tables[ti], 0, 256);
-            mask_tables[ti][0] = MaskAppendPattern[mi].literal; napp++;
-          } else if (cid >= 0 && cid < MASK_MAX_CLASSES && MaskClasses[cid].count > 0) {
-            mask_sizes[ti] = (uint8_t)MaskClasses[cid].count;
-            memcpy(mask_tables[ti], MaskClasses[cid].chars, 256); napp++;
-          } else gpu_mask_ok = 0;
+        if (m_gpu_ok) {
+          for (int mi = 0; mi < MaskAppendLen; mi++) {
+            int cid = MaskAppendPattern[mi].classid;
+            int ti = npre + napp;
+            if (cid == MASK_LITERAL) {
+              m_sizes[ti] = 1; memset(m_tables[ti], 0, 256);
+              m_tables[ti][0] = MaskAppendPattern[mi].literal; napp++;
+            } else if (cid >= 0 && cid < MASK_MAX_CLASSES && MaskClasses[cid].count > 0) {
+              m_sizes[ti] = (uint8_t)MaskClasses[cid].count;
+              memcpy(m_tables[ti], MaskClasses[cid].chars, 256); napp++;
+            } else { m_gpu_ok = 0; break; }
+          }
         }
-        if (gpu_mask_ok && npre == 0 && napp == 0 && MaskLen > 0) {
-          for (int mi = 0; mi < MaskLen && gpu_mask_ok; mi++) {
+        if (m_gpu_ok && npre == 0 && napp == 0 && MaskLen > 0) {
+          for (int mi = 0; mi < MaskLen; mi++) {
             int cid = MaskPattern[mi].classid;
             int ti = MaskPrepend ? npre : (npre + napp);
             if (cid == MASK_LITERAL) {
-              mask_sizes[ti] = 1; memset(mask_tables[ti], 0, 256);
-              mask_tables[ti][0] = MaskPattern[mi].literal;
+              m_sizes[ti] = 1; memset(m_tables[ti], 0, 256);
+              m_tables[ti][0] = MaskPattern[mi].literal;
               if (MaskPrepend) npre++; else napp++;
             } else if (cid >= 0 && cid < MASK_MAX_CLASSES && MaskClasses[cid].count > 0) {
-              mask_sizes[ti] = (uint8_t)MaskClasses[cid].count;
-              memcpy(mask_tables[ti], MaskClasses[cid].chars, 256);
+              m_sizes[ti] = (uint8_t)MaskClasses[cid].count;
+              memcpy(m_tables[ti], MaskClasses[cid].chars, 256);
               if (MaskPrepend) npre++; else napp++;
-            } else gpu_mask_ok = 0;
+            } else { m_gpu_ok = 0; break; }
           }
         }
-        if (gpu_mask_ok && (npre > 0 || napp > 0))
-          gpu_metal_set_mask(mask_sizes, mask_tables, npre, napp);
+        if (m_gpu_ok && (npre > 0 || napp > 0)) {
+          gpu_metal_set_mask(m_sizes, m_tables, npre, napp);
+        }
       }
 #endif
     }
@@ -48454,7 +48635,7 @@ usage:
             /* Warm-probe was already kicked off right after
              * gpu_opencl_compile_families (Phase 6.2). It is running with
              * a synthetic mask; bf_partition_setup waits for it. */
-#elif defined(METAL_GPU)
+#elif defined(__APPLE__) && defined(METAL_GPU)
             gpu_metal_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp);
 #endif
           }
@@ -48966,6 +49147,16 @@ reprocess:
             twist(ReadBuf1, BY, +1);
           }
           if (ThreadCount < maxt) {
+            /* Experimental: stagger second procjob() startup so the first
+             * thread fills jobg with line-ordered buffers before sibling
+             * threads start consuming. Env-gated, fires once when
+             * launching the second worker, gpu-active only. See
+             * project_launch_delay_experiment.md. */
+#ifdef GPU_ENABLED
+            if (ThreadCount == 1 && gpujob_available()) {
+              sleep(2);
+            }
+#endif
                       launch(procjob, NULL);
             ThreadCount++;
           }
@@ -49023,6 +49214,9 @@ bf_done:
     x = join_all();
 #ifdef OPENCL_GPU
     gpu_opencl_shutdown(); /* explicit — atexit races with NVIDIA driver teardown */
+#endif
+#if defined(__APPLE__) && defined(METAL_GPU)
+    gpu_metal_shutdown();
 #endif
 #if (defined(__APPLE__) && defined(METAL_GPU)) || defined(CUDA_GPU) || defined(OPENCL_GPU)
     /* Per-device dispatch share — makes multi-GPU asymmetry obvious at

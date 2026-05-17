@@ -1,0 +1,44 @@
+# cl2metal overlay for ripemd320 (gpu/gpu_ripemd320_core.cl -> gpu/metal_ripemd320_core.metal).
+#
+# Phase 2d.6 RIPEMD-320 -- SECOND RIPEMD-family Metal port. Sibling of
+# ripemd160 (Phase 2d.6 first ship). 10-uint32 LE digest (vs 5 for
+# RMD160); same dispatch shape with EMIT_HIT_10_DEDUP_OR_OVERFLOW for
+# the wider state. Distinct compression primitive rmd320_block
+# (cross-swap dual-pipeline, no merge at end of compression).
+#
+# Translator support (cl2metal.py rev 1.5):
+#
+#   - rmd320_block is registered in _BLOCK_HELPERS_POINTER_STATE so the
+#     call-site `&st.h[0]` is preserved verbatim.
+#   - hex_byte_lc -> mtl_hex_byte_lc rename already in 1:1 substitution
+#     table.
+#
+# Apple-specific tweaks (identical pattern to ripemd160.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern).
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#      OpenCL source lines 244-248 (3-line comment header + 3-line macro).
+#
+# Source order at JIT compile time (mirrors ripemd160):
+#   metal_common_str + metal_ripemd320_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+#
+# Pre-flight grep for rmd320_block + EMIT_HIT_10_DEDUP availability:
+#   $ grep -n "rmd320_block\|EMIT_HIT_10_DEDUP" gpu/metal_common.metal
+# Both added in metal_common.metal rev 1.16+ (this dispatch).
+
+algo: ripemd320
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 2-line comment header.
+  # OpenCL source: lines 244-248 of gpu_ripemd320_core.cl.
+  - start: 244
+    end:   248
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

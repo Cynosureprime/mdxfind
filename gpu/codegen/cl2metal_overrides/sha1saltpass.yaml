@@ -1,0 +1,69 @@
+# cl2metal overlay for sha1saltpass (gpu/gpu_sha1saltpass_core.cl ->
+# gpu/metal_sha1saltpass_core.metal).
+#
+# Phase 2d.3.5 sha1saltpass overlay -- LAST family in Phase 2d.3 SHA-1
+# fan-out. SHA1SALTPASS (JOB_SHA1SALTPASS=385, hashcat -m 110,
+# mdxfind e385) = SHA-1(salt || pass) -- PREPEND-shape salted SHA-1 variant.
+# Sibling of sha1passsalt (Phase 2d.3.4); mirror image (PREPEND vs APPEND).
+#
+# IMPORTANT: gpu_sha1saltpass_core.cl is a LARGE 50KB carrier that hosts
+# multiple HMAC families gated by HASH_WORDS at runtime:
+#   - HASH_WORDS == 5 + algo_mode == 0  -> raw SHA1SALTPASS (this Phase)
+#   - HASH_WORDS == 5 + algo_mode >= 5  -> HMAC-SHA1 (not Metal-wired)
+#   - HASH_WORDS == 7 + algo_mode >= 5  -> HMAC-SHA224 (not Metal-wired)
+#   - HASH_WORDS == 8 + algo_mode >= 5  -> HMAC-SHA256 (not Metal-wired)
+# All gates use RUNTIME if() (NOT preprocessor #if) per
+# feedback_runtime_gate_for_template_branches.md. The dead branches must
+# COMPILE in Metal but never execute when HASH_WORDS==5 + algo_mode=0.
+#
+# At Metal JIT compile time HASH_WORDS defaults to 5 in the source
+# (#ifndef HASH_WORDS / #define HASH_WORDS 5 / #endif), so the
+# HASH_WORDS==7/8 branches are runtime-dead. The HASH_WORDS==5 branches
+# (one HMAC-SHA1 block + the raw SHA1SALTPASS body) both compile; only
+# the raw SHA1SALTPASS body fires when algo_mode==0 (which is set by host
+# for non-HMAC ops). cache_gpu_op==JOB_SHA1SALTPASS leaves algo_mode=0.
+#
+# Two Apple-specific tweaks (per task #250 pattern, identical to
+# sha1passsalt.yaml / md5saltpass.yaml / md5passsalt.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      The OpenCL source declares `data` as unqualified pointer (defaults
+#      to __private); the Metal call site in metal_template.metal passes
+#      `device uchar *` from the per-lane buf_scratch_pool slice.
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Mirror of sha1passsalt.yaml / md5saltpass.yaml -- the Metal hand-
+#      port keeps only the template_emit_hit_or_overflow form.
+#      gpu_sha1saltpass_core.cl carries the simple `template_emit_hit`
+#      macro at lines 1077-1091 (4-line comment header + 11-line macro
+#      body); the dedup variant follows immediately.
+#
+# Source order at JIT compile time (mirrors sha1passsalt):
+#   metal_common_str + metal_sha1saltpass_core_str + metal_md5_rules_str
+#   + metal_template_str
+#
+# Pre-flight: sha1_block + EMIT_HIT_5_DEDUP_OR_OVERFLOW + bswap32 already
+# present in metal_common.metal from Phase 2d.3.1. No companion edit needed.
+#
+# Host-wiring forward-staged:
+#   - metal_gpu_hash_words(JOB_SHA1SALTPASS) returns 5 (forward-staged by
+#     Phase 2d.3.2 agent in gpu/gpujob_metal.m rev 1.11)
+#   - is_salted_op admits JOB_SHA1SALTPASS (forward-staged by Phase 2d.3.2
+#     agent in gpu/gpujob_metal.m rev 1.11)
+#   - use_salt predicate admits JOB_SHA1SALTPASS (shipped Phase 2d.3.4
+#     in gpu_metal.m rev 1.69)
+
+algo: sha1saltpass
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + its 4-line comment header.
+  # OpenCL source: lines 1077-1091 of gpu_sha1saltpass_core.cl.
+  # Mirrors sha1passsalt's skip pattern. The Metal hand-port keeps only
+  # the template_emit_hit_or_overflow dedup variant.
+  - start: 1077
+    end:   1091
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

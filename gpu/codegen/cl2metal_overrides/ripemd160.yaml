@@ -1,0 +1,45 @@
+# cl2metal overlay for ripemd160 (gpu/gpu_ripemd160_core.cl -> gpu/metal_ripemd160_core.metal).
+#
+# Phase 2d.6 RIPEMD-160 -- FIRST RIPEMD-family Metal port. Sibling of
+# sha1 (Phase 2d.3.1) in dispatch shape (HASH_WORDS=5, 5-uint32 digest,
+# in-place M[16] template_finalize) but distinct compression primitive:
+# rmd160_block (dual-pipeline 80-step) vs sha1_block (linear 80-step
+# W[80] schedule). Same byte-ordering convention as MD5 (LE).
+#
+# Translator support (cl2metal.py rev 1.5):
+#
+#   - rmd160_block is registered in _BLOCK_HELPERS_POINTER_STATE so the
+#     call-site `&st.h[0]` is preserved verbatim (matches sha1_block
+#     pattern from Phase 2d.3.1 canary).
+#   - hex_byte_lc -> mtl_hex_byte_lc rename already in 1:1 substitution
+#     table.
+#
+# Apple-specific tweaks (identical pattern to sha1.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      (task #250 pattern, identical to every prior unsalted core).
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro
+#      Metal hand-port keeps only template_emit_hit_or_overflow form.
+#      OpenCL source lines 274-281 (8-line comment header + macro body).
+#
+# Source order at JIT compile time (mirrors sha1):
+#   metal_common_str + metal_ripemd160_core_str + [metal_md5_rules_str if R|M]
+#   + metal_template_str
+#
+# Pre-flight grep for rmd160_block + EMIT_HIT_5_DEDUP availability:
+#   $ grep -n "rmd160_block\|EMIT_HIT_5_DEDUP" gpu/metal_common.metal
+# Both added in metal_common.metal rev 1.16+ (this dispatch).
+
+algo: ripemd160
+
+skip_line_ranges:
+  # template_emit_hit (simple) macro definition + 4-line comment header.
+  # OpenCL source: lines 274-281 of gpu_ripemd160_core.cl.
+  - start: 274
+    end:   281
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

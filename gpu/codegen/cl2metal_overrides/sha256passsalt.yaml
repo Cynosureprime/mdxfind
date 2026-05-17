@@ -1,0 +1,31 @@
+# cl2metal overlay for sha256passsalt (gpu/gpu_sha256passsalt_core.cl ->
+# gpu/metal_sha256passsalt_core.metal).
+#
+# Phase 2d.4.4 sha256passsalt (FIRST SALTED in the SHA-2/256 family on
+# the cl2metal codegen path) overlay. Sibling of md5passsalt.yaml +
+# sha1passsalt.yaml -- APPEND-shape salted SHA-256.
+#
+# Mirrors sha256.yaml structurally (arg_address_space identical) but
+# the simple template_emit_hit lives at different line numbers in the
+# OpenCL twin (316-333 here vs 316-338 in gpu_sha256_core.cl).
+#
+# Apple-specific tweaks (identical to sha256.yaml):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#
+#   2. skip_line_ranges: template_emit_hit (simple) macro + comment header
+#
+# Source order at JIT compile time (mirrors md5passsalt):
+#   metal_common_str + metal_sha256passsalt_core_str + metal_md5_rules_str
+#   + metal_template_str
+
+algo: sha256passsalt
+
+skip_line_ranges:
+  - start: 316
+    end:   333
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

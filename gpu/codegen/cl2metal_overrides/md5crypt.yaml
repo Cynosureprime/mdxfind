@@ -1,0 +1,78 @@
+# cl2metal overlay for md5crypt (gpu/gpu_md5crypt_core.cl ->
+# gpu/metal_md5crypt_core.metal).
+#
+# Phase 2d.8a.2 MD5CRYPT (PHPBB3 + MD5CRYPT sub-phase). Hand-written
+# Path A carrier kernel; single algo_mode (0) -- no KPASS/KSALT split
+# (JOB_MD5CRYPT=511 is a single-mode iterated-MD5 algorithm with FIXED
+# 1000 iteration count, vs PHPBB3's salt-carried variable count).
+# Salted-only (GPU_TEMPLATE_HAS_SALT). 4-uint32 LE digest = 16-byte
+# output (MD5 width).
+#
+# 3-step BSD $1$ md5crypt chain runs INSIDE template_finalize:
+#   Step 1: digest_b = MD5(pass || raw_salt || pass)
+#   Step 2: digest_a = MD5(pass || "$1$" || raw_salt || digest_b chunked
+#                          for plen bytes || bit-loop bytes)
+#   Step 3: 1000 iterations of variable-shape MD5(buf) per CPU at
+#           mdxfind.c:13057-13066.
+# Host forces max_iter=1 at the rules-engine pack site so the kernel's
+# outer iter loop runs exactly once and template_iterate (a stub) is
+# never called. Mirrors PHPBB3 / SHA1DRU pattern.
+#
+# Apple-specific tweaks (identical pattern to phpbb3 / hmac_blake2s):
+#
+#   1. arg_address_space: template_finalize.data -> "device const"
+#      Hot-path slice from buf_scratch_pool. salt_bytes already carries
+#      __global which the translator maps to device const.
+#
+#   2. skip_line_ranges: 3 ranges to strip preproc guards and the simple
+#      template_emit_hit form. See per-range reason fields below.
+#
+# Source order at JIT compile time:
+#   metal_common_str + metal_md5crypt_core_str + metal_md5_rules_str
+#   + metal_template_str
+#
+# NO dual_addr_space_helpers needed: template_finalize is the only consumer
+# of an addr-spaceable arg (data); md5crypt_oneshot takes `thread const
+# uchar *buf` (always called with private `buf[192]`) -- no cross-addr-
+# space call sites. template_transform is unused (stub for interface
+# symmetry).
+
+algo: md5crypt
+
+skip_line_ranges:
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around the
+  # template_finalize signature (lines 251, 255). The Metal JIT always
+  # compiles this carrier with GPU_TEMPLATE_HAS_SALT defined. Mirrors
+  # phpbb3.yaml / hmac_blake2s.yaml Phase 2d pattern.
+  - start: 251
+    end:   251
+    reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
+  - start: 255
+    end:   255
+    reason: "preproc guard around template_finalize salt args -- close"
+
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#else` / `#endif` guards
+  # around the template_finalize BODY (lines 258, 370, 409). The Metal
+  # compile path always has HAS_SALT defined; the 3-step BSD $1$ chain is
+  # always live. The #else..#endif block (lines 370..409) holds the
+  # defensive !HAS_SALT fallback (computes plain MD5(data)) and is
+  # structurally unreachable in production -- we drop it entirely so the
+  # kernel keeps only the salted chain body.
+  - start: 258
+    end:   258
+    reason: "preproc guard around BSD $1$ body -- Metal always has HAS_SALT"
+  - start: 370
+    end:   409
+    reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"
+
+  # template_emit_hit (simple) macro definition + 3-line comment header.
+  # OpenCL source: lines 441-447 of gpu_md5crypt_core.cl. The Metal hand-
+  # port pattern keeps only template_emit_hit_or_overflow form (mirrors
+  # md5.yaml / phpbb3.yaml / hmac_blake2s.yaml).
+  - start: 441
+    end:   447
+    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
