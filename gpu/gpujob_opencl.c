@@ -77,6 +77,10 @@ extern int build_salt_snapshot(void *snap, char *pool,
                 void *judy, char *keybuf, int printall);
 extern int *Typesaltcnt;
 extern long long *Typesaltbytes;
+/* word-retirement ETA: per-algorithm retirement counter updated on GPU job completion */
+extern struct Linehints *linehints;
+extern int linehints_count;
+extern volatile unsigned long long InflightLines;
 
 /* SHA256CRYPT carrier (2026-05-08) -- hit-replay helper.
  *
@@ -263,10 +267,16 @@ static int mask_decode(uint64_t mask_idx, int pos_offset, int npos, char *buf) {
 
 extern uint64_t gpu_mask_total;
 
-#define PV_DEC(pv) { unsigned long _old = *(pv); \
+/* Phase 2g 2026-05-18: extended to return retirement (1->0 transition)
+ * detection via GCC statement-expression. Returns 1 iff this CAS was the
+ * one that took PV from 1 to 0 (this salt just retired); 0 otherwise
+ * (PV already 0, or still >0 after DEC). Race-correct: only the winning
+ * CAS sees _old == 1 in the success branch. Mirrors gpujob_metal.m. */
+#define PV_DEC(pv) ({ unsigned long _old = *(pv); int _retired = 0; \
   while (_old > 0) { \
-    if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) break; \
-    _old = *(pv); } }
+    if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { \
+      _retired = (_old == 1); break; } \
+    _old = *(pv); } _retired; })
 
 struct saltentry {
     char *salt;
@@ -274,7 +284,79 @@ struct saltentry {
     int saltlen;
     char *hashsalt;
     int hashlen;
+    uint32_t iter;  /* internal iteration count; see mdxfind.c:struct saltentry */
 };
+
+extern unsigned char i64hex[];  /* base64url decode table from mdxfind.c */
+
+/* gpu_compute_iter_sum: compute the total internal iterations across all
+ * packed salts for GPU Tothash accounting. For iterated hash types each
+ * GPU kernel invocation runs N internal rounds per candidate, so Tothash
+ * must multiply by N (not 1) to reflect actual hash operations performed.
+ *
+ * Called at the accounting site in the GPU worker loop immediately before
+ * the _per_dispatch_hashes multiply. Uses saltsnap[pack_map[i]].salt to
+ * parse the per-salt iter count; for fixed-iter ops the salt string is
+ * not examined (iter derived from op alone). Falls back to 1 for any op
+ * not in the iterated set, preserving bit-identical accounting for all
+ * non-iterated types. Zero kernel changes.
+ *
+ * Supported ops and iter sources:
+ *   JOB_BCRYPT      : 1<<cost  (cost = atoi(salt[4..5]), salt="$2b$NN$...")
+ *   JOB_PHPBB3      : 1<<i64hex[(unsigned char)salt[3]]  (salt="$H$X...")
+ *   JOB_DESCRYPT    : 25  (fixed, per Unix DES crypt(3))
+ *   JOB_MD5CRYPT    : 1000  (fixed, per RFC 1321 md5crypt)
+ *   JOB_SHA256CRYPT : rounds=N$ prefix, default 5000
+ *   JOB_SHA512CRYPT : rounds=N$ prefix, default 5000
+ *   JOB_SHA512CRYPTMD5: same format as SHA512CRYPT (same $6$ salt)
+ *   JOB_SHA1DRU     : 1000000  (fixed, Drupal SHA1 1M-iter)
+ */
+static uint64_t gpu_compute_iter_sum(int op, struct saltentry *saltsnap,
+                                     int *pack_map, int nsalts_packed) {
+    if (nsalts_packed <= 0) return 1;
+    /* Fixed-iter ops: no need to inspect salt strings */
+    if (op == JOB_DESCRYPT)     return 25ULL * (uint64_t)nsalts_packed;
+    if (op == JOB_MD5CRYPT)     return 1000ULL * (uint64_t)nsalts_packed;
+    if (op == JOB_SHA1DRU)      return 1000000ULL * (uint64_t)nsalts_packed;
+    /* Variable-iter ops: parse per salt */
+    uint64_t sum = 0;
+    for (int i = 0; i < nsalts_packed; i++) {
+        int si = pack_map[i];
+        const char *s = saltsnap[si].salt;
+        int sl = saltsnap[si].saltlen;
+        uint32_t iter = 1;
+        if (op == JOB_BCRYPT) {
+            /* salt = "$2b$NN$22charsalt", cost at chars [4..5] */
+            if (sl >= 6 && s[0] == '$' && s[2] == '$' && s[3] == '$') {
+                int cost = (s[4] - '0') * 10 + (s[5] - '0');
+                if (cost >= 4 && cost <= 31)
+                    iter = 1u << cost;
+            }
+        } else if (op == JOB_PHPBB3) {
+            /* salt = "$H$X..." or "$P$X...", iter char at [3] */
+            if (sl >= 4) {
+                int idx = i64hex[(unsigned char)s[3]];
+                if (idx >= 7 && idx <= 30)
+                    iter = 1u << idx;
+            }
+        } else if (op == JOB_SHA256CRYPT || op == JOB_SHA512CRYPT ||
+                   op == JOB_SHA512CRYPTMD5) {
+            /* salt = "$5$[rounds=N$]rawsalt$" or "$6$..." */
+            iter = 5000;
+            const char *p = s + 3; /* skip "$5$" or "$6$" */
+            if (sl > 10 && strncmp(p, "rounds=", 7) == 0) {
+                int n = atoi(p + 7);
+                if (n >= 1000 && n <= 999999999)
+                    iter = (uint32_t)n;
+            }
+        } else {
+            /* Non-iterated op: iter = 1 (bit-identical to previous accounting) */
+            iter = 1;
+        }
+        sum += (uint64_t)iter;
+    }
+    return sum;
+}
 
 /* ---- GPU work queue ---- */
 struct jobg *GPUWorkHead, **GPUWorkTail;
@@ -697,6 +779,13 @@ void gpujob(void *arg) {
     int salt_hits_pending = 0; /* unused for now, reserved for adaptive refresh */
     int current_op = -1;
     int batch_count = 0;
+    /* Phase 2g 2026-05-18: hybrid salt-refresh trigger counters (per-worker,
+     * per-device). Refresh fires on (batch_count >= 10) OR (>=5% of salts
+     * retired since last refresh). Counter bumped by PV_DEC's 1->0 return
+     * value at each hit-replay site. Resets to 0 at each refresh along with
+     * batch_count. Mirrors gpujob_metal.m. */
+    int _salts_at_last_refresh       = 0;
+    int _salts_retired_since_refresh = 0;
     int my_overflow_loaded = 0;
 
     while (1) {
@@ -710,7 +799,7 @@ void gpujob(void *arg) {
 
         g->t_dispatched = gpu_now_us();
         if (gpu_pipe_trace_enabled == 1 && g->op != 2000 && g->t_added != 0) {
-            fprintf(stderr, "[pipe] g=%p queue_us=%llu dev=%d\n",
+            GPU_DEBUG_FPRINTF(stderr, "[pipe] g=%p queue_us=%llu dev=%d\n",
                     (void *)g,
                     (unsigned long long)(g->t_dispatched - g->t_added),
                     my_slot);
@@ -772,9 +861,16 @@ void gpujob(void *arg) {
         /* Rebuild salt snapshot on op change, periodically, or after hits found */
         if (needs_salt_snapshot) {
             batch_count++;
+            /* Phase 2g hybrid refresh: fire on op change, every 10 batches,
+             * SALTPASS-explicit signal, OR >=5% snapshot retired since last
+             * refresh. The retirement test uses int*20 >= total to skip
+             * float; 5% catches late-game churn where 10-batch waited
+             * against 10-20% dead snapshots. Mirrors gpujob_metal.m. */
+            int retirement_trigger = (_salts_at_last_refresh > 0 &&
+                _salts_retired_since_refresh * 20 >= _salts_at_last_refresh);
             if (g->op != current_op ||
                 (salt_refresh && op_cat == GPU_CAT_SALTPASS) ||
-                (batch_count >= 10 && nsalts_packed > 0)) {
+                ((batch_count >= 10 || retirement_trigger) && nsalts_packed > 0)) {
                 salt_refresh = 0;
                 if (g->op != current_op) {
                     current_op = g->op;
@@ -813,6 +909,10 @@ void gpujob(void *arg) {
                     gpu_opencl_set_salts(my_slot, salts_packed, soff, slen, nsalts_packed);
                 else
                     Typedone[g->op] = 1;
+                /* Phase 2g: reset retirement counter at refresh boundary;
+                 * bookmark just-uploaded snapshot size for next cycle's 5% test. */
+                _salts_at_last_refresh       = nsalts_packed;
+                _salts_retired_since_refresh = 0;
             }
         } else if (g->op != current_op) {
             current_op = g->op;
@@ -845,6 +945,9 @@ void gpujob(void *arg) {
             if (nsalts_packed == 0) {
                 goto return_jobg;
             }
+            /* Phase 2g: stale-rebuild also resets retirement counters. */
+            _salts_at_last_refresh       = nsalts_packed;
+            _salts_retired_since_refresh = 0;
         }
 
         /* Mask mode: set op on first batch */
@@ -1670,14 +1773,14 @@ void gpujob(void *arg) {
                         if (getenv("MDXFIND_GPU_DEBUG_DIGEST")) {
                             static __thread int _logged = 0;
                             if (_logged < 5) {
-                                fprintf(stderr, "[gpu-dbg] op=%d hexlen=%d widx=%u ridx=%u mask_idx=%u plain=\"%.*s\" digest=",
+                                GPU_DEBUG_FPRINTF(stderr, "[gpu-dbg] op=%d hexlen=%d widx=%u ridx=%u mask_idx=%u plain=\"%.*s\" digest=",
                                         g->op, hexlen, widx, ridx, mask_idx,
                                         out_len, synthetic_job.line);
                                 int dbytes = hexlen / 2;
                                 if (dbytes > 64) dbytes = 64;
                                 for (int b = 0; b < dbytes; b++)
-                                    fprintf(stderr, "%02x", curin.h[b]);
-                                fprintf(stderr, "\n");
+                                    GPU_DEBUG_FPRINTF(stderr, "%02x", curin.h[b]);
+                                GPU_DEBUG_FPRINTF(stderr, "\n");
                                 _logged++;
                             }
                         }
@@ -1998,7 +2101,7 @@ void gpujob(void *arg) {
                                                           &match_len, &match_flags);
                                     if (hf && *match_flags != (unsigned short)g->op) {
                                         *match_flags = g->op;
-                                        PV_DEC(salt_snap_entry->PV);
+                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
                                         int splen = salt_snap_entry->saltlen;
                                         char mdbuf[128];
@@ -2037,7 +2140,7 @@ void gpujob(void *arg) {
                                                           &match_len, &match_flags);
                                     if (hf && *match_flags != (unsigned short)g->op) {
                                         *match_flags = g->op;
-                                        PV_DEC(salt_snap_entry->PV);
+                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
                                         int splen = salt_snap_entry->saltlen;
                                         /* Typesalt[JOB_SHA256CRYPT] holds the
@@ -2134,7 +2237,7 @@ void gpujob(void *arg) {
                                                           &match_len, &match_flags);
                                     if (hf && *match_flags != (unsigned short)g->op) {
                                         *match_flags = g->op;
-                                        PV_DEC(salt_snap_entry->PV);
+                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
                                         int splen = salt_snap_entry->saltlen;
                                         /* Typesalt[op] (where op is either
@@ -2212,7 +2315,7 @@ void gpujob(void *arg) {
                                     JSLG(HPV, JudyJ[JOB_DESCRYPT],
                                          (unsigned char *)desbuf);
                                     if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
-                                        PV_DEC(salt_snap_entry->PV);
+                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         /* Q1 (2026-05-08): clamp display
                                          * password to 8 bytes for CPU
                                          * parity. The post-rule + post-
@@ -2328,7 +2431,7 @@ void gpujob(void *arg) {
                                     JSLG(HPV, JudyJ[JOB_BCRYPT],
                                          (unsigned char *)fullhash);
                                     if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
-                                        PV_DEC(salt_snap_entry->PV);
+                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         /* Q1 (2026-05-08): NO display
                                          * clamp. Render full post-rule
                                          * plaintext (CPU does NOT clamp
@@ -2352,7 +2455,7 @@ void gpujob(void *arg) {
                                                     &synthetic_job);
                             }
                             if (hit && salt_snap_entry) {
-                                PV_DEC(salt_snap_entry->PV);
+                                if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                             }
                         } else {
                             checkhash(&curin, hexlen, iter_num, &synthetic_job);
@@ -2367,13 +2470,6 @@ void gpujob(void *arg) {
                     synthetic_job.outlen = 0;
                 }
 
-                /* Salt fan-out: rules-engine path evaluates each (word, rule, mask)
-                 * candidate against ALL nsalts_packed salts; matches slab semantics
-                 * at gpujob_opencl.c slab arm (g->count × nsalts_packed × Maxiter).
-                 * Pre-2026-05-09 this site omitted nsalts_packed and under-counted
-                 * Tothash by the salt fan-out factor (~590K× for e31 MD5SALT real
-                 * workloads). Clamp ≥1 for unsalted ops sharing this path. */
-                uint32_t _nsalt_acct = (nsalts_packed > 0) ? (uint32_t)nsalts_packed : 1u;
                 /* BF chunk-as-job (2026-05-10): for BF chunks the kernel iterates
                  * bf_num_masks per word, NOT the full gpu_mask_total. Using
                  * b71_mask_size_acct (= gpu_mask_total) over-counts Tothash by
@@ -2394,11 +2490,23 @@ void gpujob(void *arg) {
                                              ? (uint64_t)g->bf_num_masks *
                                                  (uint64_t)_ii_acct
                                              : (uint64_t)b71_mask_size_acct;
+                /* Internal-iter accounting (2026-05-19): for iterated GPU
+                 * types (BCRYPT/PHPBB3/DESCRYPT/MD5CRYPT/SHACRYPT/SHA1DRU)
+                 * the kernel runs N internal rounds per candidate, so
+                 * Tothash must use iter_sum (sum of per-salt iter counts)
+                 * instead of bare salt count. For non-iterated types
+                 * gpu_compute_iter_sum returns nsalts_packed * 1, which
+                 * is bit-identical to the prior _nsalt_acct multiplier. */
+                uint64_t _iter_sum_acct =
+                    (nsalts_packed > 0)
+                    ? gpu_compute_iter_sum(g->op, saltsnap, pack_map,
+                                          nsalts_packed)
+                    : 1ULL;
                 uint64_t _per_dispatch_hashes =
                     (uint64_t)g->packed_count *
                     (uint64_t)(gpu_rule_count > 0 ? gpu_rule_count : 1) *
                     _mask_size_for_acct *
-                    (uint64_t)_nsalt_acct *
+                    _iter_sum_acct *
                     (uint64_t)Maxiter;
                 hashcnt += _per_dispatch_hashes;
                 if (my_slot < MAX_GPU_SLOTS) {
@@ -2410,6 +2518,15 @@ void gpujob(void *arg) {
                     hashcnt = 0;
                     found = 0;
                 }
+                /* word-retirement ETA: REMOVED 2026-05-18. procjob already
+                 * credits retired_line + InflightLines at job-return for ALL
+                 * words it pulls (CPU + GPU-handed-off). Crediting again here
+                 * double-counts GPU-routed words leading to 2x lines over-count
+                 * and apparent hash-rate undercount. Procjob's hand-off-time
+                 * credit is optimistic for GPU work by ~jobg_queue_depth times
+                 * per_job_time words (acceptable for ETA — small vs total).
+                 * Re-evaluate if running with very high rules/masks counts
+                 * where the GPU queue depth dominates wallclock. */
                 goto return_jobg;
             } /* end rules_engine */
 
@@ -2461,7 +2578,7 @@ void gpujob(void *arg) {
 return_jobg:
         g->t_return_start = gpu_now_us();
         if (gpu_pipe_trace_enabled == 1 && g->t_dispatched != 0) {
-            fprintf(stderr, "[pipe] g=%p disp_us=%llu dev=%d\n",
+            GPU_DEBUG_FPRINTF(stderr, "[pipe] g=%p disp_us=%llu dev=%d\n",
                     (void *)g,
                     (unsigned long long)(g->t_return_start - g->t_dispatched),
                     my_slot);
@@ -2505,7 +2622,7 @@ return_jobg:
             twist(GPULegacyFreeWaiting, BY, +1);
         }
         if (gpu_pipe_trace_enabled == 1) {
-            fprintf(stderr, "[pipe] g=%p ret_us=%llu dev=%d\n",
+            GPU_DEBUG_FPRINTF(stderr, "[pipe] g=%p ret_us=%llu dev=%d\n",
                     (void *)g,
                     (unsigned long long)(gpu_now_us() - g->t_return_start),
                     my_slot);
@@ -2686,7 +2803,7 @@ int gpujob_init(int num_jobg) {
     int n_workers = 0;
     for (int i = 0; i < _gpujob_count; i++) {
         if (gpu_opencl_device_disabled(i)) {
-            fprintf(stderr, "OpenCL GPU[%d]: gpujob worker NOT spawned (device disabled)\n", i);
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: gpujob worker NOT spawned (device disabled)\n", i);
             continue;
         }
         launch(gpujob, (void *)(intptr_t)i);
@@ -2937,7 +3054,7 @@ struct jobg *gpujob_get_free_rules(char *filename, unsigned long long startline)
 void gpujob_submit(struct jobg *g) {
     g->t_added = gpu_now_us();
     if (gpu_pipe_trace_enabled == 1 && g->t_acquired != 0) {
-        fprintf(stderr, "[pipe] g=%p fill_us=%llu pc=%u\n",
+        GPU_DEBUG_FPRINTF(stderr, "[pipe] g=%p fill_us=%llu pc=%u\n",
                 (void *)g,
                 (unsigned long long)(g->t_added - g->t_acquired),
                 g->packed_count);

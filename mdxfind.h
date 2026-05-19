@@ -1,5 +1,8 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.24  2026/05/19 01:20:01  dlr
+ * word-retirement ETA: move struct Linehints to mdxfind.h + add retired_line field + InflightLines global. CPU retirement updates at procjob mid-job checkpoint and job-return site. InflightLines increment at dispatch. Chunk-reset clears retired_line. 15s tick aggregator computes RetiredLines_rate. Display arm uses retirement-based ETA with bootstrap fallback to hash-rate until first tick fires.
+ *
  * Revision 1.23  2026/05/11 03:48:16  dlr
  * BF Phase 1.9 A1: struct job +unsigned char bf_fast_eligible after bf_inner_iter (~line 127). Host BF chunk producer populates; procjob short-circuit copies to jobg.
  *
@@ -171,6 +174,18 @@ struct Hashchain {
     unsigned char hash[1];
 };
 
+/* Per-algorithm dispatch hints (rate, EMA, line tracking, retirement).
+ * Defined here so gpujob_opencl.c can update retired_line on GPU completion. */
+struct Linehints {
+    /* 8-byte fields */
+    long long rate;
+    volatile long long hashes_accum;  /* per-algorithm hash counter for EMA feedback */
+    unsigned long long curline, numline;  /* widened from unsigned int -- wordlist line positions can exceed 4.29B */
+    volatile unsigned long long retired_line;  /* word-retirement ETA: monotonic per-op, reset at chunk start */
+    /* 4-byte fields */
+    unsigned int lineswanted, gpu;
+};
+
 #ifdef ARM
 union sse_value {
 #if ARM > 6
@@ -281,5 +296,8 @@ static inline int log2i(uint64_t n) {
 
 #define MAXLJOB (32)
 
-
+/* word-retirement ETA: linehints array (indexed by op) and inflight counter */
+extern struct Linehints *linehints;
+extern int linehints_count;
+extern volatile unsigned long long InflightLines;
 

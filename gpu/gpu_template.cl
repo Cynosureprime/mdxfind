@@ -1,6 +1,12 @@
 /*
- * $Revision: 1.16 $
+ * $Revision: 1.18 $
  * $Log: gpu_template.cl,v $
+ * Revision 1.18  2026/05/18 14:38:29  dlr
+ * Fix nested comment that broke OpenCL JIT compile. Inner '+'*' inside doc comment terminated the outer block, exposing prose as code (Pascal err -11). Symptom: e31 GPU dispatch fell back to CPU. Replace inline note with a second line outside the offending position.
+ *
+ * Revision 1.17  2026/05/18 14:31:02  dlr
+ * Phase 2h-A doc sync - template_pre_salt_state struct shape updated to match gpu_md5salt_core.cl rev 1.7. Doc-only edit; no code path changes here.
+ *
  * Revision 1.16  2026/05/11 14:16:27  dlr
  * Phase 1.8 kernel-side REVERT (gpu_template.cl): remove the runtime-bounded `for (uint iter_idx = 0u; iter_idx < inner_iter; iter_idx++)` wrap at line ~439 (and matching close at ~701). Caused 2.19× Pascal kernel regression (NVCC register pressure spike on inner_iter=1 codegen path; whole-kernel register allocator forced worst-case allocation). Confirmed via task #239 mdx-debug spike on JOB_MD5 BF (Phase 1.5 1.18 GH/s → Phase 1.8 0.54 GH/s on fpga 1080). User observed e31 regression which traced to same root cause — every algo using gpu_template.cl (incl JOB_MD5SALT) inherited the wrap. Phase 1.8c body-duplication attempt (Phase 0 defer) confirmed whole-kernel reg-alloc scoping was the issue. Also removed iter_idx variable, `if (iter_idx > 0u) { ... }` save/restore block, and Phase 1.8 mask_idx_abs += iter_idx*mask_size shift (now mask_idx_abs = mask_idx_abs_base directly). Combined_ridx unsalted encoding reverted to Phase 1.7 form `rule_idx * mask_size + mask_idx_local`. Phase 1.5 ulong widening of mask_idx_abs PRESERVED (correctness for >4G keyspaces). LOC delta -35 (769 → 734). Salted combined_ridx unchanged (host servo guards salted with inner_iter=1). Validated on fpga 1080: V1 raw MD5 BF 1.021 GH/s (restored Phase 1.7 baseline); V2 e31 MD5SALT 4-digit 3/3 cracks 0.03s; V3 non-BF wordlist 3/3; V4 10-digit BF (>4G keyspace) 3/3 cracks at 1.897 GH/s — Phase 1.5 widening preserved.
  *
@@ -105,7 +111,8 @@
  *
  * Hook signatures (defined by the algorithm core, e.g. gpu_md5salt_core.cl):
  *
- *   typedef struct { uint M[16]; uint inner_len; } template_pre_salt_state;
+ *   typedef struct { uint M[8]; uint a8,b8,c8,d8; uint inner_len; } template_pre_salt_state;
+ *                              -- shape changed in Phase 2h-A from M[16]+inner_len.
  *
  *   void template_pre_salt(uchar *buf, int new_len, uint algo_mode,
  *                          template_pre_salt_state *pre_state);

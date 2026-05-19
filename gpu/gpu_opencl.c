@@ -1139,7 +1139,7 @@ static void dynsize_ensure_loaded(struct gpu_device *d, int dev_idx) {
     if (dynsize_cache_load(uuid, &d->dynsize_md5salt) == 0) {
         d->dynsize_md5salt.loaded_from_cache = 1;
         if (dynsize_verbose()) {
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "[dynsize] dev=%d cache HIT uuid=%s N=%u spp=%u "
                 "spp_cap=%u ema=%.1f weight=%.3f conv=%u\n",
                 dev_idx, uuid,
@@ -1170,7 +1170,7 @@ static void dynsize_ensure_loaded(struct gpu_device *d, int dev_idx) {
         d->dynsize_md5salt.prev_nsalts_active = 0;
         d->dynsize_md5salt.loaded_from_cache = 0;
         if (dynsize_verbose()) {
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "[dynsize] dev=%d cache MISS uuid=%s — cold start "
                 "N=64 spp=8192\n", dev_idx, uuid);
         }
@@ -1279,7 +1279,7 @@ static size_t kern_get_local_size(struct gpu_kern *k) {
     if (k->tune_candidate >= TUNE_CANDIDATES) {
         k->tuned = 1;
         k->local_size = k->tune_best_size;
-        fprintf(stderr, "OpenCL GPU[%d]: autotuned work group size = %zu\n", k->dev_idx, k->local_size);
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: autotuned work group size = %zu\n", k->dev_idx, k->local_size);
         return k->local_size;
     }
     return tune_sizes[k->tune_candidate];
@@ -1303,7 +1303,7 @@ static void kern_record_time(struct gpu_kern *k, double ms) {
         if (k->tune_candidate >= TUNE_CANDIDATES) {
             k->tuned = 1;
             k->local_size = k->tune_best_size;
-            fprintf(stderr, "OpenCL GPU[%d]: autotuned work group size = %zu\n", k->dev_idx, k->local_size);
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: autotuned work group size = %zu\n", k->dev_idx, k->local_size);
         }
     }
 }
@@ -2495,7 +2495,7 @@ static int init_device(int di, cl_device_id dev_id) {
         const char *e = getenv("MDXFIND_OOO_QUEUE");
         if (e && *e && *e != '0') {
             qprops = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
-            if (di == 0) fprintf(stderr,
+            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: OOO queue enabled (MDXFIND_OOO_QUEUE=%s) — known to lose cracks on some NVIDIA drivers\n", e);
         }
     }
@@ -2510,7 +2510,7 @@ static int init_device(int di, cl_device_id dev_id) {
         const char *e = getenv("MDXFIND_KERNEL_TRACE");
         if (e && *e && *e != '0') {
             qprops |= CL_QUEUE_PROFILING_ENABLE;
-            if (di == 0) fprintf(stderr,
+            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: kernel-time profiling enabled (MDXFIND_KERNEL_TRACE=%s) — emits [kern] lines on dispatch\n", e);
         }
     }
@@ -2530,14 +2530,14 @@ static int init_device(int di, cl_device_id dev_id) {
     {
         struct timespec _kb_t0, _kb_t1;
         clock_gettime(CLOCK_MONOTONIC, &_kb_t0);
-        tsfprintf(stderr, "OpenCL GPU[%d]: kernel build START (common+selftest)\n", di);
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: kernel build START (common+selftest)\n", di);
         const char *sources[1] = { gpu_common_str };
         d->prog = gpu_kernel_cache_build_program(d->ctx, dev_id, 1, sources,
                                                  "-cl-std=CL1.2", &err);
         clock_gettime(CLOCK_MONOTONIC, &_kb_t1);
         double _kb_ms = (_kb_t1.tv_sec - _kb_t0.tv_sec) * 1e3
                       + (_kb_t1.tv_nsec - _kb_t0.tv_nsec) / 1e6;
-        tsfprintf(stderr, "OpenCL GPU[%d]: kernel build DONE in %.2fs (common+selftest)\n",
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: kernel build DONE in %.2fs (common+selftest)\n",
                   di, _kb_ms / 1e3);
     }
     if (!d->prog || err != CL_SUCCESS) {
@@ -2558,7 +2558,7 @@ static int init_device(int di, cl_device_id dev_id) {
     {
         struct timespec _kb2_t0, _kb2_t1;
         clock_gettime(CLOCK_MONOTONIC, &_kb2_t0);
-        tsfprintf(stderr, "OpenCL GPU[%d]: kernel build START (md5salt family)\n", di);
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: kernel build START (md5salt family)\n", di);
         const char *sources[2] = { gpu_common_str, family_source[FAM_MD5SALT] };
         d->fam_prog[FAM_MD5SALT] = gpu_kernel_cache_build_program(d->ctx, dev_id, 2, sources,
                                                                    "-cl-std=CL1.2", &err);
@@ -2566,7 +2566,7 @@ static int init_device(int di, cl_device_id dev_id) {
             clock_gettime(CLOCK_MONOTONIC, &_kb2_t1);
             double _kb2_ms = (_kb2_t1.tv_sec - _kb2_t0.tv_sec) * 1e3
                            + (_kb2_t1.tv_nsec - _kb2_t0.tv_nsec) / 1e6;
-            tsfprintf(stderr, "OpenCL GPU[%d]: kernel build DONE in %.2fs (md5salt family)\n",
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: kernel build DONE in %.2fs (md5salt family)\n",
                       di, _kb2_ms / 1e3);
         }
         if (!d->fam_prog[FAM_MD5SALT] || err != CL_SUCCESS) {
@@ -2602,7 +2602,7 @@ static int init_device(int di, cl_device_id dev_id) {
         d->max_batch = GPUBATCH_RULE_MAX;   /* 8+ CU: full 4192 */
     if (d->max_batch < 16) d->max_batch = 16;
     if (d->max_batch > GPUBATCH_RULE_MAX) d->max_batch = GPUBATCH_RULE_MAX;
-    tsfprintf(stderr, "OpenCL GPU[%d]: %u compute units, batch size %d\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: %u compute units, batch size %d\n",
             di, compute_units, d->max_batch);
 
     /* Per-device dispatch buffers */
@@ -2907,12 +2907,12 @@ static void init_one_device_full(void *payload) {
     /* Phase I: selftest = probe_max_dispatch's per-size dispatch sweep. */
     struct timespec _st_t0, _st_t1;
     clock_gettime(CLOCK_MONOTONIC, &_st_t0);
-    tsfprintf(stderr, "OpenCL GPU[%d]: selftest START\n", a->all_dev_idx);
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: selftest START\n", a->all_dev_idx);
     int max_disp = probe_max_dispatch(a->di);
     clock_gettime(CLOCK_MONOTONIC, &_st_t1);
     double _st_ms = (_st_t1.tv_sec - _st_t0.tv_sec) * 1e3
                   + (_st_t1.tv_nsec - _st_t0.tv_nsec) / 1e6;
-    tsfprintf(stderr, "OpenCL GPU[%d]: selftest DONE in %.2fs\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: selftest DONE in %.2fs\n",
               a->all_dev_idx, _st_ms / 1e3);
     /* Mali GPUs have a 17-bit salt dimension limit — silently drop work items
      * beyond 2^17 salts. Probe returns max_good in salts (not work items),
@@ -2925,9 +2925,9 @@ static void init_one_device_full(void *payload) {
     }
     a->max_dispatch = max_disp;
     if (max_disp == 0)
-        tsfprintf(stderr, "OpenCL GPU[%d]: selftest passed all sizes (no dispatch limit)\n", a->all_dev_idx);
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: selftest passed all sizes (no dispatch limit)\n", a->all_dev_idx);
     else
-        tsfprintf(stderr, "OpenCL GPU[%d]: dispatch limit = %d work items\n", a->all_dev_idx, max_disp);
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: dispatch limit = %d work items\n", a->all_dev_idx, max_disp);
 }
 
 int gpu_opencl_init(void) {
@@ -2983,7 +2983,7 @@ int gpu_opencl_init(void) {
             clGetDeviceInfo(devs[d], CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(mhz), &mhz, NULL);
 
             if (!device_allowed(all_dev_idx)) {
-                fprintf(stderr, "OpenCL GPU[%d]: %s - skipped\n", all_dev_idx, dname);
+                GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: %s - skipped\n", all_dev_idx, dname);
                 all_dev_idx++;
                 continue;
             }
@@ -3054,7 +3054,7 @@ int gpu_opencl_init(void) {
         return -1;
     }
 
-    tsfprintf(stderr, "OpenCL GPU: %d device%s initialized\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU: %d device%s initialized\n",
             num_gpu_devs, num_gpu_devs > 1 ? "s" : "");
     ocl_ready = 1;
     return 0;
@@ -3249,7 +3249,7 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
             (strstr(d->name, "AMD") || strstr(d->name, "Radeon") ||
              strncmp(d->name, "gfx", 3) == 0)) {
             if (!d->fam_timed[fam]) {
-                fprintf(stderr, "OpenCL GPU[%d]: warm-probe skipped (AMD device, task #44)\n", dev_idx);
+                GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: warm-probe skipped (AMD device, task #44)\n", dev_idx);
                 d->fam_timed[fam] = 1;   /* prevent re-entry */
             }
             return;
@@ -3664,7 +3664,7 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
     d->fam_timed[fam] = 1;
     if (final_ms >= 1.0 && d->fam_rate_hps[fam] == 0.0)
         d->fam_rate_hps[fam] = (double)total_work * 1000.0 / final_ms;
-    tsfprintf(stderr, "OpenCL GPU[%d]: warm-probed family %d: max_items=%u (%.1fms, %.1f Mh/s)\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: warm-probed family %d: max_items=%u (%.1fms, %.1f Mh/s)\n",
             dev_idx, fam, best_size, final_ms, d->fam_rate_hps[fam] / 1e6);
 
     /* Phase 6.2: release synthetic buffers (kernel arg state is irrelevant
@@ -3783,7 +3783,7 @@ int gpu_opencl_set_compact_table(int dev_idx,
      * for this device. */
     struct timespec _cu_t0, _cu_t1;
     clock_gettime(CLOCK_MONOTONIC, &_cu_t0);
-    tsfprintf(stderr, "OpenCL GPU[%d]: compact upload START %zuMB\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: compact upload START %zuMB\n",
               dev_idx, needed / (1024*1024));
     /* Allocate + upload via create_min_buf so per-target small workloads
      * (e.g. 6-hash compact table = 64 B fp/idx, ~96 B hash_data, 48 B
@@ -3824,7 +3824,7 @@ int gpu_opencl_set_compact_table(int dev_idx,
         double _cu_gbps = (_cu_ms > 0.001)
                         ? ((double)needed / (_cu_ms / 1e3) / (1024.0*1024*1024))
                         : 0.0;
-        tsfprintf(stderr, "OpenCL GPU[%d]: compact upload DONE in %.2fs (%.2f GB/s)\n",
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: compact upload DONE in %.2fs (%.2f GB/s)\n",
                   dev_idx, _cu_ms / 1e3, _cu_gbps);
     }
 
@@ -3845,7 +3845,7 @@ int gpu_opencl_set_compact_table(int dev_idx,
         }
     }
 
-    tsfprintf(stderr, "OpenCL GPU[%d]: compact table registered (%llu slots, %u hashes, %zuMB)\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: compact table registered (%llu slots, %u hashes, %zuMB)\n",
             dev_idx, (unsigned long long)compact_size, (unsigned)hash_data_count,
             needed / (1024*1024));
     return 0;
@@ -3944,7 +3944,7 @@ int gpu_opencl_set_overflow(int dev_idx,
             _ovfl_placeholder_zero, &err);
         free(_ovfl_placeholder_zero);
         _overflow_count = 0;
-        tsfprintf(stderr,
+        GPU_DEBUG_FPRINTF(stderr,
             "OpenCL GPU[%d]: overflow set to %dB zero-fill placeholder (count=0)\n",
             dev_idx, MIN_BUFFER_BYTES);
         return 0;
@@ -3966,7 +3966,7 @@ int gpu_opencl_set_overflow(int dev_idx,
                            + total
                            + count * sizeof(uint32_t)
                            + count * sizeof(uint16_t);
-    tsfprintf(stderr, "OpenCL GPU[%d]: overflow upload START (%d entries, %.2f KB)\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: overflow upload START (%d entries, %.2f KB)\n",
               dev_idx, count, _ov_total_bytes / 1024.0);
 
     clReleaseMemObject(d->b_overflow_keys);
@@ -3987,7 +3987,7 @@ int gpu_opencl_set_overflow(int dev_idx,
     {
         double _ov_ms = (_ov_t1.tv_sec - _ov_t0.tv_sec) * 1e3
                       + (_ov_t1.tv_nsec - _ov_t0.tv_nsec) / 1e6;
-        tsfprintf(stderr, "OpenCL GPU[%d]: overflow upload DONE in %.2fs\n",
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: overflow upload DONE in %.2fs\n",
                   dev_idx, _ov_ms / 1e3);
     }
     /* Read-back probes: first 64 bytes of each overflow buffer (and tail if large). */
@@ -4018,7 +4018,7 @@ int gpu_opencl_set_overflow(int dev_idx,
         gpu_readback_probe(dev_idx, d->queue, d->b_overflow_lengths, 0, l_head,
                            lengths, "set_overflow", "b_overflow_lengths[head]");
     }
-    tsfprintf(stderr, "OpenCL GPU[%d]: %d overflow entries loaded\n", dev_idx, count);
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: %d overflow entries loaded\n", dev_idx, count);
     return 0;
 }
 
@@ -4157,7 +4157,7 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
             }
         }
     }
-    fprintf(stderr, "OpenCL GPU: mask mode: %d prepend + %d append = %llu combinations\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU: mask mode: %d prepend + %d append = %llu combinations\n",
             npre, napp, (unsigned long long)gpu_mask_total);
     return 0;
 }
@@ -4270,7 +4270,7 @@ static int gpu_validator_enabled(void) {
     if (cached == -1) {
         cached = (getenv("MDXFIND_GPU_VALIDATOR") != NULL) ? 1 : 0;
         if (cached) {
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_VALIDATOR=1 — md5_rules dispatch will use "
                 "validator kernel and emit VALIDATE lines on stderr\n");
         }
@@ -4691,7 +4691,7 @@ static int gpu_template_enabled(void) {
         const char *e = getenv("MDXFIND_GPU_TEMPLATE");
         if (e && *e && *e != '0' && strcmp(e, "md5") == 0) {
             cached = GPU_TEMPLATE_MD5;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md5 — md5_rules dispatch will use "
                 "template_phase0 kernel from gpu_template.cl + gpu_md5_core.cl "
                 "(B2 structural prereq; production path remains "
@@ -4707,7 +4707,7 @@ static int gpu_template_enabled(void) {
              * work was retired in B7.9 (2026-05-07); SHA1 now dispatches
              * exclusively via dispatch_md5_rules under the template kernel. */
             cached = GPU_TEMPLATE_SHA1;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha1 — when SHA1 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_sha1_core.cl (B4 first-algorithm "
@@ -4715,7 +4715,7 @@ static int gpu_template_enabled(void) {
         } else if (e && *e && *e != '0' && strcmp(e, "sha256") == 0) {
             /* B4 fan-out: SHA256 template instantiation. */
             cached = GPU_TEMPLATE_SHA256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha256 — when SHA256 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_sha256_core.cl (B4 fan-out; chokepoint "
@@ -4724,7 +4724,7 @@ static int gpu_template_enabled(void) {
             /* B4 fan-out: SHA224 template instantiation. Same compression as
              * SHA256, different IV, output truncated to 7 of 8 state words. */
             cached = GPU_TEMPLATE_SHA224;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha224 — when SHA224 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_sha224_core.cl (B4 fan-out; chokepoint "
@@ -4733,7 +4733,7 @@ static int gpu_template_enabled(void) {
             /* B4 fan-out: MD4 template instantiation. Same digest geometry
              * as MD5 (4 LE uint32) but different compression function. */
             cached = GPU_TEMPLATE_MD4;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md4 — when MD4 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_md4_core.cl (B4 fan-out; chokepoint "
@@ -4743,7 +4743,7 @@ static int gpu_template_enabled(void) {
              * state + 128-bit length encoding algorithm. Output truncates
              * to 6 ulong = 12 uint32. */
             cached = GPU_TEMPLATE_SHA384;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha384 — when SHA384 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_sha384_core.cl (B5 fan-out; first "
@@ -4752,7 +4752,7 @@ static int gpu_template_enabled(void) {
             /* B5 sub-batch 1: SHA512 template instantiation. First 64-bit
              * state + 128-bit length encoding algorithm. 8 ulong = 16 uint32. */
             cached = GPU_TEMPLATE_SHA512;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha512 — when SHA512 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_sha512_core.cl (B5 fan-out; first "
@@ -4763,7 +4763,7 @@ static int gpu_template_enabled(void) {
              * 5-word-state algo (after SHA1) but LITTLE-ENDIAN per uint32
              * (like MD5; UNLIKE the SHA family). */
             cached = GPU_TEMPLATE_RIPEMD160;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=%s — when RIPEMD-160 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_ripemd160_core.cl (B5 fan-out; "
@@ -4774,7 +4774,7 @@ static int gpu_template_enabled(void) {
              * 10-word-state algo in the family — needed new EMIT_HIT_10
              * family macros in gpu_common.cl rev 1.12. */
             cached = GPU_TEMPLATE_RIPEMD320;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=%s — when RIPEMD-320 work reaches "
                 "dispatch_md5_rules, will use template_phase0 kernel from "
                 "gpu_template.cl + gpu_ripemd320_core.cl (B5 fan-out; "
@@ -4784,7 +4784,7 @@ static int gpu_template_enabled(void) {
              * BLAKE2 algorithm (counter + flag in state struct). 8 uint32
              * LE digest, 64-byte block, 10-round G compression. */
             cached = GPU_TEMPLATE_BLAKE2S256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=blake2s256 — when BLAKE2S-256 "
                 "work reaches dispatch_md5_rules, will use template_phase0 "
                 "kernel from gpu_template.cl + gpu_blake2s256_core.cl "
@@ -4796,7 +4796,7 @@ static int gpu_template_enabled(void) {
              * ulong → 8 uint32 LE truncated digest. New b2b_compress in
              * gpu_common.cl rev 1.13. */
             cached = GPU_TEMPLATE_BLAKE2B256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=blake2b256 — when BLAKE2B-256 "
                 "work reaches dispatch_md5_rules, will use template_phase0 "
                 "kernel from gpu_template.cl + gpu_blake2b256_core.cl "
@@ -4807,116 +4807,116 @@ static int gpu_template_enabled(void) {
              * compression as BLAKE2B-256, full 8-ulong = 16-uint32 LE
              * digest output. */
             cached = GPU_TEMPLATE_BLAKE2B512;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=blake2b512 — when BLAKE2B-512 "
                 "work reaches dispatch_md5_rules, will use template_phase0 "
                 "kernel from gpu_template.cl + gpu_blake2b512_core.cl "
                 "(B5 sub-batch 3; HASH_WORDS=16; full 64-byte digest).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "keccak224") == 0) {
             cached = GPU_TEMPLATE_KECCAK224;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=keccak224 — sponge construction; "
                 "rate=144, output=28, suffix=0x01 (B5 sub-batch 4).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "keccak256") == 0) {
             cached = GPU_TEMPLATE_KECCAK256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=keccak256 — sponge construction; "
                 "rate=136, output=32, suffix=0x01 (B5 sub-batch 4).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "keccak384") == 0) {
             cached = GPU_TEMPLATE_KECCAK384;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=keccak384 — sponge construction; "
                 "rate=104, output=48, suffix=0x01 (B5 sub-batch 4).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "keccak512") == 0) {
             cached = GPU_TEMPLATE_KECCAK512;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=keccak512 — sponge construction; "
                 "rate=72, output=64, suffix=0x01 (B5 sub-batch 4).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha3_224") == 0) {
             cached = GPU_TEMPLATE_SHA3_224;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_224 — sponge construction; "
                 "rate=144, output=28, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha3_256") == 0) {
             cached = GPU_TEMPLATE_SHA3_256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_256 — sponge construction; "
                 "rate=136, output=32, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha3_384") == 0) {
             cached = GPU_TEMPLATE_SHA3_384;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_384 — sponge construction; "
                 "rate=104, output=48, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha3_512") == 0) {
             cached = GPU_TEMPLATE_SHA3_512;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_512 — sponge construction; "
                 "rate=72, output=64, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha384raw") == 0) {
             cached = GPU_TEMPLATE_SHA384RAW;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha384raw — SHA384 compression "
                 "with binary-digest iter (48 bytes; B5 sub-batch 5a Tier 1).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha512raw") == 0) {
             cached = GPU_TEMPLATE_SHA512RAW;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha512raw — SHA512 compression "
                 "with binary-digest iter (64 bytes; B5 sub-batch 5a Tier 1).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "md5raw") == 0) {
             cached = GPU_TEMPLATE_MD5RAW;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md5raw — MD5 compression with "
                 "binary-digest iter (16 bytes; B5 sub-batch 6 Tier A).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha1raw") == 0) {
             cached = GPU_TEMPLATE_SHA1RAW;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha1raw — SHA1 compression with "
                 "binary-digest iter (20 bytes; B5 sub-batch 6 Tier A).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sha256raw") == 0) {
             cached = GPU_TEMPLATE_SHA256RAW;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha256raw — SHA256 compression "
                 "with binary-digest iter (32 bytes; B5 sub-batch 6 Tier A).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "sql5") == 0) {
             cached = GPU_TEMPLATE_SQL5;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sql5 — SHA1(SHA1(p)) with "
                 "UPPERCASE-hex iter feedback (B5 sub-batch 6 Tier C; "
                 "two SHA1 chains in template_state).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "ntlmh") == 0) {
             cached = GPU_TEMPLATE_NTLMH;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=ntlmh — MD4(UTF-16LE-zero-extend"
                 "(p)) (B5 sub-batch 6 Tier B; hashcat-compat; iconv variant "
                 "remains on CPU for non-ASCII inputs).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "md4utf16") == 0) {
             cached = GPU_TEMPLATE_MD4UTF16;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md4utf16 — MD4(UTF-16LE-zero-"
                 "extend(p)) with iter feedback hex(prev_digest) (B5 sub-batch "
                 "8; same hashcat-compat gap as NTLMH on non-ASCII inputs).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "mysql3") == 0) {
             cached = GPU_TEMPLATE_MYSQL3;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=mysql3 — legacy MySQL "
                 "OLD_PASSWORD() hash (B5 sub-batch 7; per-byte arithmetic "
                 "accumulator with 16-hex feedback iter step).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "wrl") == 0) {
             cached = GPU_TEMPLATE_WRL;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=wrl — Whirlpool 512-bit hash "
                 "(B5 sub-batch 6.5; Miyaguchi-Preneel; 64-byte BE block; "
                 "256-bit BE length encoding; 128-hex feedback iter step).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "streebog256") == 0) {
             cached = GPU_TEMPLATE_STREEBOG256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=streebog256 — GOST R 34.11-2012 "
                 "256-bit hash (B5 sub-batch 5b retry; LPS-keyed 12-round "
                 "compression; 16 KB __constant SBOB_SL64 with shift-then-mask "
                 "access pattern matching WRL_OP for RDNA4 compat).\n");
         } else if (e && *e && *e != '0' && strcmp(e, "streebog512") == 0) {
             cached = GPU_TEMPLATE_STREEBOG512;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=streebog512 — GOST R 34.11-2012 "
                 "512-bit hash (B5 sub-batch 5b retry; same compression as "
                 "streebog256, 64-byte digest output).\n");
@@ -4927,7 +4927,7 @@ static int gpu_template_enabled(void) {
              * (lines 21943-21974). Cache disambiguated from MD5SALTPASS
              * via SALT_POSITION=APPEND_TO_HEX32 in defines_str. */
             cached = GPU_TEMPLATE_MD5SALT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md5salt — MD5(hex32(MD5(p)) || "
                 "salt) double-MD5 chain (B6 salt-axis prereq; first salted "
                 "variant on the template path; SALT_POSITION=APPEND_TO_HEX32).\n");
@@ -4938,7 +4938,7 @@ static int gpu_template_enabled(void) {
              * disambiguated from MD5SALT via SALT_POSITION=PREPEND in
              * defines_str. */
             cached = GPU_TEMPLATE_MD5SALTPASS;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md5saltpass — MD5(salt || pass) "
                 "simple prepend salt (B6 salt-axis prereq; second salted "
                 "variant; SALT_POSITION=PREPEND).\n");
@@ -4950,7 +4950,7 @@ static int gpu_template_enabled(void) {
              * BASE_ALGO=sha1 in defines_str (SALT_POSITION=PREPEND
              * matches but the per-algorithm tokens differ). */
             cached = GPU_TEMPLATE_SHA1SALTPASS;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha1saltpass — SHA1(salt || pass) "
                 "simple prepend salt SHA1 (B6.1 SHA fan-out; first SHA-family "
                 "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=5).\n");
@@ -4963,7 +4963,7 @@ static int gpu_template_enabled(void) {
              * differ); from MD5SALTPASS via HASH_WORDS=8 + BASE_ALGO=
              * sha256 (both axes differ). */
             cached = GPU_TEMPLATE_SHA256SALTPASS;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha256saltpass — SHA256(salt || pass) "
                 "simple prepend salt SHA256 (B6.2 SHA fan-out; second SHA-family "
                 "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=8).\n");
@@ -4977,7 +4977,7 @@ static int gpu_template_enabled(void) {
              * sha256 (both axes differ); from MD5SALTPASS via HASH_WORDS=7
              * + BASE_ALGO=sha256 (both axes differ). */
             cached = GPU_TEMPLATE_SHA224SALTPASS;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha224saltpass — SHA224(salt || pass) "
                 "simple prepend salt SHA224 (B6.3 SHA fan-out; third SHA-family "
                 "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=7).\n");
@@ -4992,7 +4992,7 @@ static int gpu_template_enabled(void) {
              * future SHA-family APPEND variants reuse (modulo BE/LE
              * sibling). */
             cached = GPU_TEMPLATE_MD5PASSSALT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md5passsalt — MD5(pass || salt) "
                 "simple append salt MD5 (B6.4 fan-out; first APPEND-shape "
                 "salted variant; SALT_POSITION=APPEND, HASH_WORDS=4).\n");
@@ -5007,7 +5007,7 @@ static int gpu_template_enabled(void) {
              * fragment that future SHA-family APPEND variants
              * (SHA256PASSSALT) reuse without further fragment work. */
             cached = GPU_TEMPLATE_SHA1PASSSALT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha1passsalt — SHA1(pass || salt) "
                 "simple append salt SHA1 (B6.5 fan-out; first SHA-family "
                 "APPEND-shape salted variant; SALT_POSITION=APPEND, "
@@ -5023,7 +5023,7 @@ static int gpu_template_enabled(void) {
              * BASE_ALGO=sha256 + HASH_WORDS=8 axes. From SHA1PASSSALT via
              * HASH_WORDS=8 + BASE_ALGO=sha256 (both axes differ). */
             cached = GPU_TEMPLATE_SHA256PASSSALT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha256passsalt — SHA256(pass || salt) "
                 "simple append salt SHA256 (B6.7 fan-out; second SHA-family "
                 "APPEND-shape salted variant; SALT_POSITION=APPEND, "
@@ -5044,7 +5044,7 @@ static int gpu_template_enabled(void) {
              * SHA-256 versions. R2 risk on gfx1201 — unsalted SHA-512
              * already at 42,520 B priv_mem; HARD GATE 43,024 B. */
             cached = GPU_TEMPLATE_SHA512SALTPASS;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha512saltpass — SHA512(salt || pass) "
                 "simple prepend salt SHA-512 (B6.9 fan-out; first 64-bit-state "
                 "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=16, "
@@ -5067,7 +5067,7 @@ static int gpu_template_enabled(void) {
              * gfx1201 priv_mem; sibling SHA512SALTPASS reading was
              * 42,032 B (992 B headroom). */
             cached = GPU_TEMPLATE_SHA512PASSSALT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha512passsalt — SHA512(pass || salt) "
                 "simple append salt SHA-512 (B6.10 fan-out; FINAL B6 ladder step; "
                 "second 64-bit-state salted variant; SALT_POSITION=APPEND, "
@@ -5081,7 +5081,7 @@ static int gpu_template_enabled(void) {
              * 14285). 1M loop INSIDE template_finalize; max_iter=1 host-
              * forced. */
             cached = GPU_TEMPLATE_SHA1DRU;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha1dru — Drupal SHA1 "
                 "(B6.11 fan-out; first 1M-iteration algorithm on the unified "
                 "template path; HASH_WORDS=5, HASH_BLOCK_BYTES=64, "
@@ -5094,7 +5094,7 @@ static int gpu_template_enabled(void) {
              * SHA1DRU's max_iter=1 internal loop). Mirrors mdxfind.c
              * JOB_MD6256 (lines 25836-25855). */
             cached = GPU_TEMPLATE_MD6256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md6256 — MD6-256 "
                 "(B7.7b fan-out; final M5 closure; algorithmically-largest "
                 "single-compression unsalted algo on the template path; "
@@ -5108,7 +5108,7 @@ static int gpu_template_enabled(void) {
              * BLAKE2S(salt||pass) main body is structurally unreachable in
              * production. */
             cached = GPU_TEMPLATE_HMAC_BLAKE2S;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=hmac_blake2s — Family I "
                 "HMAC-BLAKE2S carrier (Path A hand-written; single algo_mode "
                 "5; HASH_WORDS=8, HASH_BLOCK_BYTES=64, BASE_ALGO=blake2s, "
@@ -5123,7 +5123,7 @@ static int gpu_template_enabled(void) {
              * and KPASS) and returns early. The mode-0 STREEBOG-256(salt||
              * pass) main body is structurally unreachable in production. */
             cached = GPU_TEMPLATE_HMAC_STREEBOG256;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=hmac_streebog256 — Family J "
                 "HMAC-STREEBOG-256 carrier (Path A hand-written; two algo_modes "
                 "5/6 for KSALT/KPASS; HASH_WORDS=8, HASH_BLOCK_BYTES=64, "
@@ -5139,7 +5139,7 @@ static int gpu_template_enabled(void) {
              * pass) main body is structurally unreachable in production.
              * Final HMAC family in the ladder. */
             cached = GPU_TEMPLATE_HMAC_STREEBOG512;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=hmac_streebog512 — Family K "
                 "HMAC-STREEBOG-512 carrier (Path A hand-written; two algo_modes "
                 "5/6 for KSALT/KPASS; HASH_WORDS=16, HASH_BLOCK_BYTES=64, "
@@ -5154,7 +5154,7 @@ static int gpu_template_enabled(void) {
              * FINAL state is probed. Mirrors mdxfind.c JOB_PHPBB3
              * (lines 13415-13628). */
             cached = GPU_TEMPLATE_PHPBB3;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=phpbb3 — PHPBB3 / phpass "
                 "(Path A hand-written; single algo_mode; iterated MD5 "
                 "chain in template_finalize with iter count from salt[3]; "
@@ -5169,7 +5169,7 @@ static int gpu_template_enabled(void) {
              * the FINAL state is probed. Mirrors mdxfind.c JOB_MD5CRYPT
              * (lines 13017-13117). Phase 1 of the Unix-crypt ladder. */
             cached = GPU_TEMPLATE_MD5CRYPT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=md5crypt -- MD5CRYPT / BSD $1$ "
                 "(Path A hand-written; single algo_mode; iterated MD5 chain "
                 "in template_finalize with FIXED 1000 iters; HASH_WORDS=4, "
@@ -5186,7 +5186,7 @@ static int gpu_template_enabled(void) {
              * crypt_round body at 12177-12290). Phase 2 of the Unix-
              * crypt ladder. */
             cached = GPU_TEMPLATE_SHA256CRYPT;
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=sha256crypt -- SHA256CRYPT / "
                 "glibc $5$ (Path A hand-written; single algo_mode; 5-step "
                 "chain in template_finalize with default 5000 iters via "
@@ -5194,7 +5194,7 @@ static int gpu_template_enabled(void) {
                 "BASE_ALGO=sha256crypt, HAS_SALT=1).\n");
         } else if (e && *e && *e != '0') {
             /* Unknown value: log once, default to off. */
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: MDXFIND_GPU_TEMPLATE=\"%s\" not recognized "
                 "(supported: \"md5\", \"sha1\", \"sha256\", \"sha224\", "
                 "\"md4\", \"sha384\", \"sha512\", \"ripemd160\"/\"rmd160\", "
@@ -8631,7 +8631,7 @@ int gpu_opencl_set_rules(int dev_idx,
      * devices upload successfully gpu_rule_count stays 0 → full CPU
      * rule-walk fallback. */
     if (d->device_disabled) {
-        fprintf(stderr, "OpenCL GPU[%d]: skipping rule program upload (device disabled)\n", dev_idx);
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: skipping rule program upload (device disabled)\n", dev_idx);
         return -1;
     }
 
@@ -8640,7 +8640,7 @@ int gpu_opencl_set_rules(int dev_idx,
     /* Phase E: time the rule-program + offset upload. */
     struct timespec _ru_t0, _ru_t1;
     clock_gettime(CLOCK_MONOTONIC, &_ru_t0);
-    tsfprintf(stderr, "OpenCL GPU[%d]: rule program upload START (%.2fMB, %d rules)\n",
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: rule program upload START (%.2fMB, %d rules)\n",
               dev_idx, prog_len / (1024.0 * 1024), n_rules);
 
     /* Grow / (re)create the rule_program buffer. __constant so the
@@ -8768,7 +8768,7 @@ int gpu_opencl_set_rules(int dev_idx,
     {
         double _ru_ms = (_ru_t1.tv_sec - _ru_t0.tv_sec) * 1e3
                       + (_ru_t1.tv_nsec - _ru_t0.tv_nsec) / 1e6;
-        tsfprintf(stderr, "OpenCL GPU[%d]: rule program upload DONE in %.2fs\n",
+        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: rule program upload DONE in %.2fs\n",
                   dev_idx, _ru_ms / 1e3);
     }
     return 0;
@@ -9812,7 +9812,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
             static int _warned = 0;
             if (!_warned) {
                 _warned = 1;
-                fprintf(stderr,
+                GPU_DEBUG_FPRINTF(stderr,
                     "OpenCL GPU[%d]: validator buffer %.1f MB exceeds 256 MB cap "
                     "(n_words=%u, n_rules=%d, RECORD_SZ=%zu) — falling through to "
                     "production walker without validator output for this dispatch. "
@@ -9824,12 +9824,12 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
             goto validator_skip;
         }
         if (gpu_opencl_validate_kernel_lazy(d, dev_idx) < 0) {
-            fprintf(stderr, "OpenCL GPU[%d]: validator kernel unavailable; "
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator kernel unavailable; "
                     "falling through to production walker\n", dev_idx);
             goto validator_skip;
         }
         if (!d->h_rule_program || !d->h_rule_offset) {
-            fprintf(stderr, "OpenCL GPU[%d]: validator host-side rule mirror not "
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator host-side rule mirror not "
                     "populated (set_rules called before MDXFIND_GPU_VALIDATOR was "
                     "set?); cannot stringify rulebytes — bypassing validator\n",
                     dev_idx);
@@ -9842,7 +9842,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
             d->b_validate_records = clCreateBuffer(d->ctx, CL_MEM_WRITE_ONLY,
                                                    records_bytes, NULL, &err);
             if (err != CL_SUCCESS || !d->b_validate_records) {
-                fprintf(stderr, "OpenCL GPU[%d]: validator records buf alloc "
+                GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator records buf alloc "
                         "failed (%zu bytes, err=%d)\n",
                         dev_idx, records_bytes, err);
                 d->b_validate_records = NULL;
@@ -9918,7 +9918,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
          * × 258 B ≈ 2 MB — trivial. */
         unsigned char *host_records = (unsigned char *)malloc(records_bytes);
         if (!host_records) {
-            fprintf(stderr, "OpenCL GPU[%d]: validator host buffer malloc "
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator host buffer malloc "
                     "(%zu bytes) failed\n", dev_idx, records_bytes);
             return NULL;
         }
@@ -9948,7 +9948,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
         char *rule_hex = (char *)malloc(hex_buf_sz);
         char *out_hex  = (char *)malloc(hex_buf_sz);
         if (!word_hex || !rule_hex || !out_hex) {
-            fprintf(stderr, "OpenCL GPU[%d]: validator hex-buf malloc "
+            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator hex-buf malloc "
                     "(3 × %zu bytes) failed\n", dev_idx, hex_buf_sz);
             free(word_hex); free(rule_hex); free(out_hex);
             free(host_records);
@@ -10005,7 +10005,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
                 }
                 out_hex[outlen_clamped * 2] = '\0';
 
-                fprintf(stderr,
+                GPU_DEBUG_FPRINTF(stderr,
                     "VALIDATE word=%s rulebytes=%s retlen=%d outlen=%d output=%s\n",
                     word_hex, rule_hex, retlen, outlen, out_hex);
             }
@@ -10130,7 +10130,7 @@ validator_skip:
                 long v = strtol(e, NULL, 0);
                 if (v > 0 && v < GPU_PACKED_MAX_HITS) {
                     _max_hits_override = (uint32_t)v;
-                    fprintf(stderr,
+                    GPU_DEBUG_FPRINTF(stderr,
                         "MDXFIND_MAX_HITS_OVERRIDE=%u: forcing GPU hit "
                         "buffer cap to %u (default %u). Cursor-restart "
                         "(B3) protocol exercised at this threshold.\n",
@@ -11087,7 +11087,7 @@ validator_skip:
             /* n_writes=1 is constant since 1.91 conversion to hashcat
              * pattern (one sync CL_TRUE write). Was tracking w_count under
              * the old async pattern; now hardcoded for the contract gate. */
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                     "[pipe] dev=%d path=rules n_writes=1 payload_bytes=%zu "
                     "params_bytes=%zu woff_bytes=%zu packed_bytes=%u\n",
                     dev_idx, payload_size,
@@ -11127,7 +11127,7 @@ validator_skip:
             struct timespec _hs_t0, _hs_t1;
             clock_gettime(CLOCK_MONOTONIC, &_hs_t0);
             if (_ht_trace_cached) {
-                tsfprintf(stderr,
+                GPU_DEBUG_FPRINTF(stderr,
                     "OpenCL GPU[%d]: hashes_shown alloc START %zuMB\n",
                     dev_idx, (need_slots * sizeof(uint32_t)) / (1024*1024));
             }
@@ -11191,11 +11191,11 @@ validator_skip:
             if (_ht_trace_cached) {
                 double _hs_ms = (_hs_t1.tv_sec - _hs_t0.tv_sec) * 1e3
                               + (_hs_t1.tv_nsec - _hs_t0.tv_nsec) / 1e6;
-                tsfprintf(stderr,
+                GPU_DEBUG_FPRINTF(stderr,
                     "OpenCL GPU[%d]: hashes_shown alloc DONE in %.2fs (%zu slots, %zuMB)\n",
                     dev_idx, _hs_ms / 1e3, need_slots, bytes / (1024*1024));
             }
-            tsfprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL GPU[%d]: hashes_shown allocated (%zu slots, %zuMB) - "
                 "on-GPU dedup active\n",
                 dev_idx, need_slots, bytes / (1024*1024));
@@ -11731,7 +11731,7 @@ validator_skip:
                         (buf_flags & CL_MEM_WRITE_ONLY) ? "WRITE_ONLY" :
                         (buf_flags & CL_MEM_READ_WRITE) ? "READ_WRITE" :
                                                           "(none)";
-                    fprintf(stderr,
+                    GPU_DEBUG_FPRINTF(stderr,
                         "[arg] dev=%d kern=md5_rules a=%d name=%s "
                         "buf_size=%zu flags=%s cl_mem=%p\n",
                         dev_idx, ai, _arg_names[ai],
@@ -12077,7 +12077,7 @@ validator_skip:
                     unsigned long long kern_ns   = (unsigned long long)(t_end    - t_start);
                     unsigned long long submit_ns = (unsigned long long)(t_start  - t_submit);
                     unsigned long long queued_ns = (unsigned long long)(t_submit - t_queued);
-                    fprintf(stderr,
+                    GPU_DEBUG_FPRINTF(stderr,
                         "[kern] dev=%d path=rules words=%u rules=%d hits=%u "
                         "queued_ns=%llu submit_ns=%llu kern_ns=%llu kern_us=%llu\n",
                         dev_idx, num_words, d->gpu_n_rules, raw_nhits,
@@ -12348,7 +12348,7 @@ validator_skip:
         e->convergence_count++;
 
         if (dynsize_verbose()) {
-            fprintf(stderr,
+            GPU_DEBUG_FPRINTF(stderr,
                 "[dynsize] dev=%d kern=md5salt N=%u spp=%u spp_cap=%u "
                 "obs_mhz=%.1f ema=%.1f weight=%.3f conv=%u "
                 "plateau=%u wall_ms=%llu pairs=%llu action=%s\n",

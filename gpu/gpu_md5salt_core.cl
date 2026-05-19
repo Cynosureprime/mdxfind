@@ -80,17 +80,26 @@ static inline void template_transform(template_state *st,
  * they retain full per-salt computation; this experiment focuses on
  * mode 0 only.
  *
- * NOTE: M is a 64-byte uint array (16 uints) not just 32 bytes — sized to
- * accept up to 64 inner bytes if a future mode wants to hoist a 64-byte
- * intermediate (e.g. mode 4 e367's salt-hex || pass-hex composite). Today
- * only the 32-byte hex form is used.
+ * Layout (Phase 2h-A, 2026-05-18): 52 bytes per lane (8+4+1 uints).
+ * Down from 68 bytes (M[16]+1). M[8..15] dropped because those slots
+ * are always-zero in pre_salt; template_finalize_post writes them
+ * locally from scratch.
+ *
+ * Phase 2h-A pre-roll: a8/b8/c8/d8 hold the outer MD5 state AFTER 8 FF
+ * rounds (rounds 1-8 of the outer chain). These 8 rounds depend ONLY on
+ * M[0..7] (the hex32) and are completely salt-independent — so we run
+ * them ONCE per (word, rule, mask) here and skip them in
+ * template_finalize_post (via md5_block_from8 in gpu_common.cl).
+ * Saves 8/64 = 12.5% of outer MD5 work per (word, salt). Mirrors
+ * gpu/metal_md5salt_core.metal rev 1.3 Phase 2h-A.
  *
  * The function bodies (template_pre_salt + template_finalize_post) are
  * defined AFTER template_finalize below so the sentinel-fallback path
  * can call template_finalize directly without a forward declaration. */
 typedef struct {
-    uint M[16];
-    uint inner_len;
+    uint M[8];          /* hex32 of inner MD5 (lowercase) */
+    uint a8, b8, c8, d8; /* Phase 2h-A: outer MD5 state after FF rounds 1-8 */
+    uint inner_len;     /* 32 (mode 0) or TEMPLATE_PRE_SALT_SENTINEL */
 } template_pre_salt_state;
 
 #define TEMPLATE_PRE_SALT_SENTINEL 0xFFFFFFFFu
@@ -662,14 +671,31 @@ static inline void template_pre_salt(const uchar *data, int len,
         md5_block(&h0, &h1, &h2, &h3, Mi);
     }
 
-    /* Hex-encode digest1 into pre->M[0..7]. Same canonical helper as
-     * the legacy template_finalize mode 0 branch.
-     * Note: pre->M[0..7] is fully overwritten by md5_to_hex_lc (plain `=`
-     * stores in gpu_common.cl); only pre->M[8..15] needs zeroing for the
-     * downstream salt-append + 0x80 + padding path. Saves 8 stores per
-     * call vs the prior `for (j = 0; j < 16)` loop. */
-    for (int j = 8; j < 16; j++) pre->M[j] = 0;
+    /* Hex-encode digest1 into pre->M[0..7] (Phase 2h-A: M[8..15] dropped
+     * from the carrier; template_finalize_post writes them from scratch). */
     md5_to_hex_lc(h0, h1, h2, h3, pre->M);
+
+    /* Phase 2h-A pre-roll: run outer MD5's first 8 FF rounds (rounds
+     * 1-8). These ONLY depend on M[0..7] (the hex32) — salt-independent
+     * — so amortise once per (word, rule, mask) instead of per-salt.
+     * Saves 8/64 = 12.5% of outer MD5 work in template_finalize_post.
+     * Mirrors gpu/metal_md5salt_core.metal rev 1.3 pre-roll. */
+    {
+        uint a = 0x67452301u, b = 0xEFCDAB89u,
+             c = 0x98BADCFEu, d = 0x10325476u;
+        FF(a,b,c,d,pre->M[0],(uint)7,0xd76aa478u);
+        FF(d,a,b,c,pre->M[1],(uint)12,0xe8c7b756u);
+        FF(c,d,a,b,pre->M[2],(uint)17,0x242070dbu);
+        FF(b,c,d,a,pre->M[3],(uint)22,0xc1bdceeeu);
+        FF(a,b,c,d,pre->M[4],(uint)7,0xf57c0fafu);
+        FF(d,a,b,c,pre->M[5],(uint)12,0x4787c62au);
+        FF(c,d,a,b,pre->M[6],(uint)17,0xa8304613u);
+        FF(b,c,d,a,pre->M[7],(uint)22,0xfd469501u);
+        pre->a8 = a;
+        pre->b8 = b;
+        pre->c8 = c;
+        pre->d8 = d;
+    }
     pre->inner_len = 32u;
 }
 
@@ -694,27 +720,42 @@ static inline void template_finalize_post(template_state *st,
     }
 
     /* Mode 0 hoisted path: pre->M[0..7] holds the 32-char lowercase hex
-     * of the inner MD5. Compute outer MD5(hex32 || salt) into st->h.
-     * Logic mirrors the "Step 3: outer MD5" block of the legacy mode-0
-     * template_finalize body verbatim — same total_len < 56 branch, same
-     * second-block fallback, same length-bits encoding. Only difference
-     * is M is initialised from pre->M instead of being freshly built. */
+     * of the inner MD5; pre->{a8,b8,c8,d8} hold outer MD5 state after
+     * FF rounds 1-8 (Phase 2h-A pre-roll). Compute outer MD5(hex32 || salt)
+     * into st->h, skipping rounds 1-8 via md5_block_from8.
+     *
+     * Phase 2h-B: M[8..15] written from scratch with explicit literal
+     * zeros so the OpenCL compiler sees compile-time-known zeros at
+     * M[9..13],M[15] when md5_block_from8 is inlined (it's noinline by
+     * default for Pascal register safety — see gpu_common.cl — so 2h-B
+     * folding bonus only fires when the JIT chooses to inline). */
     uint M[16];
-    for (int j = 0; j < 16; j++) M[j] = pre->M[j];
-    uint inner_len = pre->inner_len;
+    M[0] = pre->M[0]; M[1] = pre->M[1]; M[2] = pre->M[2]; M[3] = pre->M[3];
+    M[4] = pre->M[4]; M[5] = pre->M[5]; M[6] = pre->M[6]; M[7] = pre->M[7];
+    M[8] = 0u; M[9]  = 0u; M[10] = 0u; M[11] = 0u;
+    M[12] = 0u; M[13] = 0u; M[14] = 0u; M[15] = 0u;
+    uint inner_len = pre->inner_len;  /* always 32 in mode 0 */
 
     uint total_len = inner_len + slen;
     if (total_len < 56u) {
-        /* Salt + 0x80 packed via salt_pack_uint. */
+        /* Single-block fast path. Salt + 0x80 packed via salt_pack_uint.
+         * Phase 2h-A: md5_block_from8 picks up at round 9 using the
+         * pre-rolled state. h0..h3 inputs = original IV; epilogue adds
+         * IV to round-64 output. */
         salt_pack_uint(M, inner_len >> 2, salt_buf, slen, /*use_eom=*/1u);
         M[14] = total_len * 8u;
-        M[15] = 0u;
+        /* M[15] already 0u (literal init above) */
         st->h[0] = 0x67452301u;
         st->h[1] = 0xEFCDAB89u;
         st->h[2] = 0x98BADCFEu;
         st->h[3] = 0x10325476u;
-        md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
+        md5_block_from8(&st->h[0], &st->h[1], &st->h[2], &st->h[3],
+                        pre->a8, pre->b8, pre->c8, pre->d8, M);
     } else {
+        /* Two-block slow path (salt > 23 bytes for inner_len=32). The
+         * FIRST block has the same M[0..7] = hex32 prefix → still
+         * eligible for round-1-8 skip via md5_block_from8. The SECOND
+         * block has no shared prefix, uses plain md5_block. */
         uint first_chunk = 64u - inner_len;
         if (first_chunk > slen) first_chunk = slen;
         /* Salt-only pack; 0x80 lives in the second md5_block. */
@@ -723,7 +764,8 @@ static inline void template_finalize_post(template_state *st,
         st->h[1] = 0xEFCDAB89u;
         st->h[2] = 0x98BADCFEu;
         st->h[3] = 0x10325476u;
-        md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
+        md5_block_from8(&st->h[0], &st->h[1], &st->h[2], &st->h[3],
+                        pre->a8, pre->b8, pre->c8, pre->d8, M);
 
         for (int j = 0; j < 16; j++) M[j] = 0;
         uint rem_salt = slen - first_chunk;

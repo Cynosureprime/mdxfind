@@ -88,18 +88,18 @@ typedef    unsigned int 	dword;
 
 /* function prototypes */
 
-void static MDinit(dword *MDbuf);
+static void MDinit(dword *MDbuf);
 /*
  *  initializes MDbuffer to "magic constants"
  */
 
-void static compress(dword *MDbuf, dword *X);
+static void compress(dword *MDbuf, dword *X);
 /*
  *  the compression function.
  *  transforms MDbuf using message bytes X[0] through X[15]
  */
 
-void static MDfinish(dword *MDbuf, byte *strptr, dword lswlen, dword mswlen);
+static void MDfinish(dword *MDbuf, byte *strptr, dword lswlen, dword mswlen);
 /*
  *  puts bytes from strptr into X and pad out; appends length 
  *  and finally, compresses the last block(s)

@@ -1,6 +1,12 @@
 /*
- * $Revision: 1.19 $
+ * $Revision: 1.21 $
  * $Log: metal_common.metal,v $
+ * Revision 1.21  2026/05/19 13:48:43  dlr
+ * Fix MTL_SHA512_F0o and F1o: use arithmetic Ch/Maj forms (no bitselect) since Metal MSL lacks bitselect for scalars. Xcode 26 toolchain on dev1 rejects bitselect for ulong; Metal select takes bool not bitmask. Arithmetic forms are semantically identical.
+ *
+ * Revision 1.20  2026/05/19 13:36:35  dlr
+ * Step A Metal port: sha512_block flat-unrolled 80-step scalar body with MTL_SHA512_STEP_S and MTL_SHA512_EXPAND_S macros. Replaces W[80] array plus for-loop form; eliminates 640-byte stack allocation. Uses bitselect for Ch/Maj (Metal MSL native). Metal inlines and benefits -- no noinline attr. Mirrors gpu_common.cl rev 1.22 Step A pattern.
+ *
  * Revision 1.19  2026/05/17 01:32:23  dlr
  * Phase 2d.9b BCRYPT prep. Add EMIT_HIT_6_DEDUP_OR_OVERFLOW macro for 6-word (24-byte) digest emit. Sibling of EMIT_HIT_4/5/7/8/10/12/16. Hits buffer write loop iterates 0..5; tail-zero loop starts at _z=9u. FIRST 6-word Metal family is JOB_BCRYPT. Semantics IDENTICAL to OpenCL EMIT_HIT_6_DEDUP_OR_OVERFLOW.
  *
@@ -442,53 +448,215 @@ constant ulong MTL_SHA512_K[80] = {
     0x4cc5d4becb3e42b6UL, 0x597f299cfc657e2aUL, 0x5fcb6fab3ad6faecUL, 0x6c44198c4a475817UL
 };
 
+/* --- SHA-512 scalar helper macros for flat-unrolled sha512_block body.
+ * Step A Metal port (mirrors gpu_common.cl rev 1.22 MDX_SHA512_STEP_S pattern).
+ * Avoids W[80] array spill on GPU; Metal compiler benefits from inlining
+ * (opposite of Pascal NVIDIA noinline discipline -- per
+ * feedback_md5_block_noinline_pascal.md, Metal inlines and benefits).
+ *
+ * MTL_SHA512_S0_S/S1_S: big-sigma (compression). S2_S/S3_S: small-sigma (schedule).
+ * MTL_SHA512_F0o: Ch = (z)^((x)&((y)^(z))) -- arithmetic form (Metal lacks bitselect).
+ * MTL_SHA512_F1o: Maj = ((x)&(y))|((z)&((x)^(y))) -- arithmetic Maj.
+ * MTL_SHA512_STEP_S: one round; caller rotates arg order, not register names.
+ * MTL_SHA512_EXPAND_S: w[i] for i>=16 from four prior words. */
+#define MTL_SHA512_S0_S(x) (rotr64((x), 28u) ^ rotr64((x), 34u) ^ rotr64((x), 39u))
+#define MTL_SHA512_S1_S(x) (rotr64((x), 14u) ^ rotr64((x), 18u) ^ rotr64((x), 41u))
+#define MTL_SHA512_S2_S(x) (rotr64((x),  1u) ^ rotr64((x),  8u) ^ ((x) >> 7))
+#define MTL_SHA512_S3_S(x) (rotr64((x), 19u) ^ rotr64((x), 61u) ^ ((x) >> 6))
+#define MTL_SHA512_F0o(x,y,z) ((z) ^ ((x) & ((y) ^ (z))))
+#define MTL_SHA512_F1o(x,y,z) (((x) & (y)) | ((z) & ((x) ^ (y))))
+#define MTL_SHA512_STEP_S(a,b,c,d,e,f,g,h,x,K) \
+{ \
+    (h) += (K); \
+    (h) += (x); \
+    (h) += MTL_SHA512_S1_S(e); \
+    (h) += MTL_SHA512_F0o((e),(f),(g)); \
+    (d) += (h); \
+    (h) += MTL_SHA512_S0_S(a); \
+    (h) += MTL_SHA512_F1o((a),(b),(c)); \
+}
+#define MTL_SHA512_EXPAND_S(x,y,z,w) \
+    (MTL_SHA512_S3_S(x) + (y) + MTL_SHA512_S2_S(z) + (w))
+
 /* --- sha512_block: single 128-byte SHA-512 compress block.
  *
- * Mirrors gpu_common.cl::sha512_block (FIPS 180-4 §6.4) byte-for-byte:
- * K512 round constants, 80-round single loop with S0/S1/ch/maj using
- * rotr64. Message schedule W[80] built from M[0..15] with the standard
- * SHA-512 small-sigma recurrence.
+ * Step A Metal port: flat-unrolled 80-step scalar body replacing the
+ * W[80] array + for-loop form. 16 scalar w0_t..wf_t hold the message
+ * schedule; STEP_S + EXPAND_S macros inline each round. Eliminates
+ * the 640-byte W[] private-stack allocation entirely.
  *
- * Signature (Phase 2d.5.1 SHA-2/512 canary): POINTER-state shape
- * `thread ulong *state, thread const ulong *M`, matching sha1_block /
- * sha256_block but with ulong (64-bit) word type. The 8-word ulong
- * chaining state stays as a single pointer. State writes happen in-place
- * via `state[0] += a; ...; state[7] += h;` epilogue.
+ * Metal compiler inlining policy is the OPPOSITE of Pascal NVIDIA
+ * (per feedback_md5_block_noinline_pascal.md): Apple Metal benefits
+ * from inlining sha512_block. KEEP static inline; NO noinline attr.
+ * R2 register pressure on M-series is lower than Pascal because
+ * Apple Metal scheduler handles the flat scalar form well.
  *
- * Pattern 1: both pointer args explicitly thread-qualified.
- * Pattern 3: static inline (per-TU; no link collision).
- *
- * R2 register pressure: W[80] = 80 ulong = 640 bytes private stack per
- * lane -- LARGEST in the family so far (vs SHA-1 W[80] uint = 320 B,
- * SHA-256 W[64] uint = 256 B). Combined with 8-ulong state (64 B) +
- * 16-uint h[] (64 B) per per-lane template_state. Architect §5 R2 flagged
- * the SHA-512 family as the Apple M1 register-pressure risk; Phase D
- * dev1 build monitors for "exceeds available temporary registers"
- * errors. Production gate is the byte-exact CPU/Metal smoke.
- *
- * R1 mitigation preserved: single private buffer (M[] ulong + W[] ulong
- * on stack), no addrspace-cast helpers, no __private uchar* helpers. */
+ * Signature unchanged: thread ulong *state, thread const ulong *M.
+ * Pattern 1: both pointer args thread-qualified. Pattern 3: static inline. */
 static inline void sha512_block(thread ulong *state, thread const ulong *M)
 {
-    ulong W[80];
-    for (int i = 0; i < 16; i++) W[i] = M[i];
-    for (int i = 16; i < 80; i++) {
-        ulong s0 = rotr64(W[i-15], 1u)  ^ rotr64(W[i-15], 8u)  ^ (W[i-15] >> 7);
-        ulong s1 = rotr64(W[i-2],  19u) ^ rotr64(W[i-2],  61u) ^ (W[i-2]  >> 6);
-        W[i] = W[i-16] + s0 + W[i-7] + s1;
-    }
+    ulong w0_t = M[0];
+    ulong w1_t = M[1];
+    ulong w2_t = M[2];
+    ulong w3_t = M[3];
+    ulong w4_t = M[4];
+    ulong w5_t = M[5];
+    ulong w6_t = M[6];
+    ulong w7_t = M[7];
+    ulong w8_t = M[8];
+    ulong w9_t = M[9];
+    ulong wa_t = M[10];
+    ulong wb_t = M[11];
+    ulong wc_t = M[12];
+    ulong wd_t = M[13];
+    ulong we_t = M[14];
+    ulong wf_t = M[15];
     ulong a = state[0], b = state[1], c = state[2], d = state[3];
     ulong e = state[4], f = state[5], g = state[6], h = state[7];
-    for (int i = 0; i < 80; i++) {
-        ulong S1 = rotr64(e, 14u) ^ rotr64(e, 18u) ^ rotr64(e, 41u);
-        ulong ch = (e & f) ^ (~e & g);
-        ulong t1 = h + S1 + ch + MTL_SHA512_K[i] + W[i];
-        ulong S0 = rotr64(a, 28u) ^ rotr64(a, 34u) ^ rotr64(a, 39u);
-        ulong maj = (a & b) ^ (a & c) ^ (b & c);
-        ulong t2 = S0 + maj;
-        h = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
-    }
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, MTL_SHA512_K[0]);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, MTL_SHA512_K[1]);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, MTL_SHA512_K[2]);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, MTL_SHA512_K[3]);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, MTL_SHA512_K[4]);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, MTL_SHA512_K[5]);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, MTL_SHA512_K[6]);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, MTL_SHA512_K[7]);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, MTL_SHA512_K[8]);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, MTL_SHA512_K[9]);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, MTL_SHA512_K[10]);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, MTL_SHA512_K[11]);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, MTL_SHA512_K[12]);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, MTL_SHA512_K[13]);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, MTL_SHA512_K[14]);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, MTL_SHA512_K[15]);
+    w0_t = MTL_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, MTL_SHA512_K[16]);
+    w1_t = MTL_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, MTL_SHA512_K[17]);
+    w2_t = MTL_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, MTL_SHA512_K[18]);
+    w3_t = MTL_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, MTL_SHA512_K[19]);
+    w4_t = MTL_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, MTL_SHA512_K[20]);
+    w5_t = MTL_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, MTL_SHA512_K[21]);
+    w6_t = MTL_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, MTL_SHA512_K[22]);
+    w7_t = MTL_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, MTL_SHA512_K[23]);
+    w8_t = MTL_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, MTL_SHA512_K[24]);
+    w9_t = MTL_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, MTL_SHA512_K[25]);
+    wa_t = MTL_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, MTL_SHA512_K[26]);
+    wb_t = MTL_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, MTL_SHA512_K[27]);
+    wc_t = MTL_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, MTL_SHA512_K[28]);
+    wd_t = MTL_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, MTL_SHA512_K[29]);
+    we_t = MTL_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, MTL_SHA512_K[30]);
+    wf_t = MTL_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, MTL_SHA512_K[31]);
+    w0_t = MTL_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, MTL_SHA512_K[32]);
+    w1_t = MTL_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, MTL_SHA512_K[33]);
+    w2_t = MTL_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, MTL_SHA512_K[34]);
+    w3_t = MTL_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, MTL_SHA512_K[35]);
+    w4_t = MTL_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, MTL_SHA512_K[36]);
+    w5_t = MTL_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, MTL_SHA512_K[37]);
+    w6_t = MTL_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, MTL_SHA512_K[38]);
+    w7_t = MTL_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, MTL_SHA512_K[39]);
+    w8_t = MTL_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, MTL_SHA512_K[40]);
+    w9_t = MTL_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, MTL_SHA512_K[41]);
+    wa_t = MTL_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, MTL_SHA512_K[42]);
+    wb_t = MTL_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, MTL_SHA512_K[43]);
+    wc_t = MTL_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, MTL_SHA512_K[44]);
+    wd_t = MTL_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, MTL_SHA512_K[45]);
+    we_t = MTL_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, MTL_SHA512_K[46]);
+    wf_t = MTL_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, MTL_SHA512_K[47]);
+    w0_t = MTL_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, MTL_SHA512_K[48]);
+    w1_t = MTL_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, MTL_SHA512_K[49]);
+    w2_t = MTL_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, MTL_SHA512_K[50]);
+    w3_t = MTL_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, MTL_SHA512_K[51]);
+    w4_t = MTL_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, MTL_SHA512_K[52]);
+    w5_t = MTL_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, MTL_SHA512_K[53]);
+    w6_t = MTL_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, MTL_SHA512_K[54]);
+    w7_t = MTL_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, MTL_SHA512_K[55]);
+    w8_t = MTL_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, MTL_SHA512_K[56]);
+    w9_t = MTL_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, MTL_SHA512_K[57]);
+    wa_t = MTL_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, MTL_SHA512_K[58]);
+    wb_t = MTL_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, MTL_SHA512_K[59]);
+    wc_t = MTL_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, MTL_SHA512_K[60]);
+    wd_t = MTL_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, MTL_SHA512_K[61]);
+    we_t = MTL_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, MTL_SHA512_K[62]);
+    wf_t = MTL_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, MTL_SHA512_K[63]);
+    w0_t = MTL_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, MTL_SHA512_K[64]);
+    w1_t = MTL_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, MTL_SHA512_K[65]);
+    w2_t = MTL_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, MTL_SHA512_K[66]);
+    w3_t = MTL_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, MTL_SHA512_K[67]);
+    w4_t = MTL_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, MTL_SHA512_K[68]);
+    w5_t = MTL_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, MTL_SHA512_K[69]);
+    w6_t = MTL_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, MTL_SHA512_K[70]);
+    w7_t = MTL_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, MTL_SHA512_K[71]);
+    w8_t = MTL_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MTL_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, MTL_SHA512_K[72]);
+    w9_t = MTL_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MTL_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, MTL_SHA512_K[73]);
+    wa_t = MTL_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MTL_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, MTL_SHA512_K[74]);
+    wb_t = MTL_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MTL_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, MTL_SHA512_K[75]);
+    wc_t = MTL_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MTL_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, MTL_SHA512_K[76]);
+    wd_t = MTL_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MTL_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, MTL_SHA512_K[77]);
+    we_t = MTL_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MTL_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, MTL_SHA512_K[78]);
+    wf_t = MTL_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MTL_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, MTL_SHA512_K[79]);
     state[0] += a; state[1] += b; state[2] += c; state[3] += d;
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }

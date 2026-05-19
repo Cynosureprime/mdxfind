@@ -1,6 +1,12 @@
 /*
- * $Revision: 1.20 $
+ * $Revision: 1.22 $
  * $Log: gpu_common.cl,v $
+ * Revision 1.22  2026/05/19 05:45:13  dlr
+ * Phase 1 Step A: replace sha512_block with flat 80-step scalar body. Lifts hashcat flat-unrolled SHA-512 transform pattern: 16 scalar w0_t..wf_t instead of W[80] array, eliminating local-mem spill on Pascal NVIDIA. MDX_SHA512_STEP_S/EXPAND_S/F0o/F1o macros added with USE_BITSELECT gate. Function signature void sha512_block(ulong *state, ulong *M) unchanged. OpenCL only; Metal twin deferred.
+ *
+ * Revision 1.21  2026/05/18 14:30:46  dlr
+ * Phase 2h-A 2026-05-18 - add md5_block_from8 helper (noinline) that runs MD5 rounds 9-64 from a pre-rolled state. Symmetric with gpu_md5salt_core.cl template_pre_salt 8-round pre-roll. Saves 12.5 percent of outer MD5 work per salt for salted-MD5 chains. Same 64-round shape as md5_block; noinline matches Pascal register safety.
+ *
  * Revision 1.20  2026/05/11 05:22:01  dlr
  * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.
  *
@@ -581,6 +587,66 @@ __attribute__((noinline)) void md5_block(uint *h0, uint *h1, uint *h2, uint *h3,
     *h0 += a; *h1 += b; *h2 += c; *h3 += d;
 }
 
+/* md5_block_from8: Phase 2h-A 2026-05-18 — runs MD5 compression rounds 9-64
+ * starting from a pre-rolled state (a8,b8,c8,d8) that already reflects
+ * rounds 1-8 applied to message words M[0..7] starting from the IV.
+ *
+ * Use case: salted-MD5 chains where the same hex32 prefix (M[0..7]) is
+ * combined with many different salts (M[8..15]). The caller pre-rolls
+ * rounds 1-8 ONCE per (word, rule, mask) in template_pre_salt, then this
+ * helper finishes the remaining 56 rounds ONCE per salt. Saves 8/64 =
+ * 12.5% of outer MD5 work per (word, salt).
+ *
+ * h0..h3 inputs should be the original MD5 IV (0x67452301u etc) — the
+ * epilogue adds them to the final round-64 state, matching md5_block's
+ * `*h0 += a` semantics. (a8,b8,c8,d8) is the IV-relative round-8 output,
+ * NOT IV-added; the IV addition is the WHOLE-block-end accumulator.
+ *
+ * `noinline` matches md5_block to preserve Pascal register budget.
+ * Verified empirically 2026-05-18 fpga GTX 1080: removing noinline
+ * regressed e31 wall 454s → 510s, throughput 780 → 745 Mh/s. Even with
+ * the minimal kernel (gpu_md5salt_minimal.cl) reducing baseline register
+ * pressure 2.4x, post-inline reg pressure dropped occupancy enough to
+ * outweigh function-call savings. DO NOT REMOVE without re-testing. */
+__attribute__((noinline)) void md5_block_from8(uint *h0, uint *h1, uint *h2, uint *h3,
+                                                uint a8, uint b8, uint c8, uint d8,
+                                                uint *M) {
+    uint a = a8, b = b8, c = c8, d = d8;
+    /* Rounds 9-16 (FF, uses M[8..15]) */
+    FF(a,b,c,d,M[8],(uint)7,0x698098d8u);   FF(d,a,b,c,M[9],(uint)12,0x8b44f7afu);
+    FF(c,d,a,b,M[10],(uint)17,0xffff5bb1u); FF(b,c,d,a,M[11],(uint)22,0x895cd7beu);
+    FF(a,b,c,d,M[12],(uint)7,0x6b901122u);  FF(d,a,b,c,M[13],(uint)12,0xfd987193u);
+    FF(c,d,a,b,M[14],(uint)17,0xa679438eu); FF(b,c,d,a,M[15],(uint)22,0x49b40821u);
+    /* Rounds 17-32 (GG) */
+    GG(a,b,c,d,M[1],(uint)5,0xf61e2562u);   GG(d,a,b,c,M[6],(uint)9,0xc040b340u);
+    GG(c,d,a,b,M[11],(uint)14,0x265e5a51u); GG(b,c,d,a,M[0],(uint)20,0xe9b6c7aau);
+    GG(a,b,c,d,M[5],(uint)5,0xd62f105du);   GG(d,a,b,c,M[10],(uint)9,0x02441453u);
+    GG(c,d,a,b,M[15],(uint)14,0xd8a1e681u); GG(b,c,d,a,M[4],(uint)20,0xe7d3fbc8u);
+    GG(a,b,c,d,M[9],(uint)5,0x21e1cde6u);   GG(d,a,b,c,M[14],(uint)9,0xc33707d6u);
+    GG(c,d,a,b,M[3],(uint)14,0xf4d50d87u);  GG(b,c,d,a,M[8],(uint)20,0x455a14edu);
+    GG(a,b,c,d,M[13],(uint)5,0xa9e3e905u);  GG(d,a,b,c,M[2],(uint)9,0xfcefa3f8u);
+    GG(c,d,a,b,M[7],(uint)14,0x676f02d9u);  GG(b,c,d,a,M[12],(uint)20,0x8d2a4c8au);
+    /* Rounds 33-48 (HH) */
+    HH(a,b,c,d,M[5],(uint)4,0xfffa3942u);   HH(d,a,b,c,M[8],(uint)11,0x8771f681u);
+    HH(c,d,a,b,M[11],(uint)16,0x6d9d6122u); HH(b,c,d,a,M[14],(uint)23,0xfde5380cu);
+    HH(a,b,c,d,M[1],(uint)4,0xa4beea44u);   HH(d,a,b,c,M[4],(uint)11,0x4bdecfa9u);
+    HH(c,d,a,b,M[7],(uint)16,0xf6bb4b60u);  HH(b,c,d,a,M[10],(uint)23,0xbebfbc70u);
+    HH(a,b,c,d,M[13],(uint)4,0x289b7ec6u);  HH(d,a,b,c,M[0],(uint)11,0xeaa127fau);
+    HH(c,d,a,b,M[3],(uint)16,0xd4ef3085u);  HH(b,c,d,a,M[6],(uint)23,0x04881d05u);
+    HH(a,b,c,d,M[9],(uint)4,0xd9d4d039u);   HH(d,a,b,c,M[12],(uint)11,0xe6db99e5u);
+    HH(c,d,a,b,M[15],(uint)16,0x1fa27cf8u); HH(b,c,d,a,M[2],(uint)23,0xc4ac5665u);
+    /* Rounds 49-64 (II) */
+    II(a,b,c,d,M[0],(uint)6,0xf4292244u);   II(d,a,b,c,M[7],(uint)10,0x432aff97u);
+    II(c,d,a,b,M[14],(uint)15,0xab9423a7u); II(b,c,d,a,M[5],(uint)21,0xfc93a039u);
+    II(a,b,c,d,M[12],(uint)6,0x655b59c3u);  II(d,a,b,c,M[3],(uint)10,0x8f0ccc92u);
+    II(c,d,a,b,M[10],(uint)15,0xffeff47du); II(b,c,d,a,M[1],(uint)21,0x85845dd1u);
+    II(a,b,c,d,M[8],(uint)6,0x6fa87e4fu);   II(d,a,b,c,M[15],(uint)10,0xfe2ce6e0u);
+    II(c,d,a,b,M[6],(uint)15,0xa3014314u);  II(b,c,d,a,M[13],(uint)21,0x4e0811a1u);
+    II(a,b,c,d,M[4],(uint)6,0xf7537e82u);   II(d,a,b,c,M[11],(uint)10,0xbd3af235u);
+    II(c,d,a,b,M[2],(uint)15,0x2ad7d2bbu);  II(b,c,d,a,M[9],(uint)21,0xeb86d391u);
+    *h0 += a; *h1 += b; *h2 += c; *h3 += d;
+}
+
 /* MD5 compress for padding block of 64-byte message: M={0x80,0,..,0,512,0}.
  * All constants — zero memory access. Compiler folds M[g] into round constants. */
 void md5_block_pad64(uint *h0, uint *h1, uint *h2, uint *h3) {
@@ -928,6 +994,44 @@ void sha256_block(uint *state, uint *M) {
 
 /* ---- SHA512 block function ---- */
 
+// SHA-512 scalar helper macros for flat-unrolled body.
+// Avoids W[80] array spill to local memory on Pascal NVIDIA GPUs.
+// MDX_SHA512_S0_S/S1_S: big-sigma (compression). S2_S/S3_S: small-sigma (schedule).
+// MDX_SHA512_F0o/F1o: Ch/Maj with optional bitselect gate (USE_BITSELECT).
+// MDX_SHA512_STEP_S: one round; caller rotates arg order, not register names.
+// MDX_SHA512_EXPAND_S: w[i] for i>=16 from four prior words.
+#define MDX_SHA512_S0_S(x) (rotr64((x), 28) ^ rotr64((x), 34) ^ rotr64((x), 39))
+#define MDX_SHA512_S1_S(x) (rotr64((x), 14) ^ rotr64((x), 18) ^ rotr64((x), 41))
+#define MDX_SHA512_S2_S(x) (rotr64((x),  1) ^ rotr64((x),  8) ^ ((x) >> 7))
+#define MDX_SHA512_S3_S(x) (rotr64((x), 19) ^ rotr64((x), 61) ^ ((x) >> 6))
+
+#ifdef USE_BITSELECT
+#define MDX_SHA512_F0o(x,y,z) (bitselect((z),(y),(x)))
+#define MDX_SHA512_F1o(x,y,z) (bitselect((x),(y),((x)^(z))))
+#else
+#define MDX_SHA512_F0o(x,y,z) ((z) ^ ((x) & ((y) ^ (z))))
+#define MDX_SHA512_F1o(x,y,z) (((x) & (y)) | ((z) & ((x) ^ (y))))
+#endif
+
+// One SHA-512 compression round. Uses hashcat arg-rotation convention:
+// caller passes (a,b,c,d,e,f,g,h) cycling each step; h is the accumulator.
+#define MDX_SHA512_STEP_S(a,b,c,d,e,f,g,h,x,K)  \
+{                                                  \
+    (h) += (K);                                    \
+    (h) += (x);                                    \
+    (h) += MDX_SHA512_S1_S(e);                     \
+    (h) += MDX_SHA512_F0o((e),(f),(g));             \
+    (d) += (h);                                    \
+    (h) += MDX_SHA512_S0_S(a);                     \
+    (h) += MDX_SHA512_F1o((a),(b),(c));             \
+}
+
+// Message schedule expansion: w[i] = sigma1(w[i-2]) + w[i-7] + sigma0(w[i-15]) + w[i-16]
+// Args: (w[i-2], w[i-7], w[i-15], w[i-16])
+#define MDX_SHA512_EXPAND_S(x,y,z,w) \
+    (MDX_SHA512_S3_S(x) + (y) + MDX_SHA512_S2_S(z) + (w))
+
+
 __constant ulong K512[80] = {
     0x428a2f98d728ae22UL, 0x7137449123ef65cdUL, 0xb5c0fbcfec4d3b2fUL, 0xe9b5dba58189dbbcUL,
     0x3956c25bf348b538UL, 0x59f111f1b605d019UL, 0x923f82a4af194f9bUL, 0xab1c5ed5da6d8118UL,
@@ -952,25 +1056,170 @@ __constant ulong K512[80] = {
 };
 
 void sha512_block(ulong *state, ulong *M) {
-    ulong W[80];
-    for (int i = 0; i < 16; i++) W[i] = M[i];
-    for (int i = 16; i < 80; i++) {
-        ulong s0 = rotr64(W[i-15], 1) ^ rotr64(W[i-15], 8) ^ (W[i-15] >> 7);
-        ulong s1 = rotr64(W[i-2], 19) ^ rotr64(W[i-2], 61) ^ (W[i-2] >> 6);
-        W[i] = W[i-16] + s0 + W[i-7] + s1;
-    }
+    // Load message words as 16 scalar ulong registers (avoids W[80] local-mem spill).
+    // Flat-unrolled 80-step body; register rotation via arg-order cycling.
+    ulong w0_t = M[0];
+    ulong w1_t = M[1];
+    ulong w2_t = M[2];
+    ulong w3_t = M[3];
+    ulong w4_t = M[4];
+    ulong w5_t = M[5];
+    ulong w6_t = M[6];
+    ulong w7_t = M[7];
+    ulong w8_t = M[8];
+    ulong w9_t = M[9];
+    ulong wa_t = M[10];
+    ulong wb_t = M[11];
+    ulong wc_t = M[12];
+    ulong wd_t = M[13];
+    ulong we_t = M[14];
+    ulong wf_t = M[15];
     ulong a = state[0], b = state[1], c = state[2], d = state[3];
     ulong e = state[4], f = state[5], g = state[6], h = state[7];
-    for (int i = 0; i < 80; i++) {
-        ulong S1 = rotr64(e, 14) ^ rotr64(e, 18) ^ rotr64(e, 41);
-        ulong ch = (e & f) ^ (~e & g);
-        ulong t1 = h + S1 + ch + K512[i] + W[i];
-        ulong S0 = rotr64(a, 28) ^ rotr64(a, 34) ^ rotr64(a, 39);
-        ulong maj = (a & b) ^ (a & c) ^ (b & c);
-        ulong t2 = S0 + maj;
-        h = g; g = f; f = e; e = d + t1;
-        d = c; c = b; b = a; a = t1 + t2;
-    }
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, K512[0]);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, K512[1]);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, K512[2]);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, K512[3]);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, K512[4]);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, K512[5]);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, K512[6]);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, K512[7]);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, K512[8]);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, K512[9]);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, K512[10]);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, K512[11]);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, K512[12]);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, K512[13]);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, K512[14]);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, K512[15]);
+    w0_t = MDX_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, K512[16]);
+    w1_t = MDX_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, K512[17]);
+    w2_t = MDX_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, K512[18]);
+    w3_t = MDX_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, K512[19]);
+    w4_t = MDX_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, K512[20]);
+    w5_t = MDX_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, K512[21]);
+    w6_t = MDX_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, K512[22]);
+    w7_t = MDX_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, K512[23]);
+    w8_t = MDX_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, K512[24]);
+    w9_t = MDX_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, K512[25]);
+    wa_t = MDX_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, K512[26]);
+    wb_t = MDX_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, K512[27]);
+    wc_t = MDX_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, K512[28]);
+    wd_t = MDX_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, K512[29]);
+    we_t = MDX_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, K512[30]);
+    wf_t = MDX_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, K512[31]);
+    w0_t = MDX_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, K512[32]);
+    w1_t = MDX_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, K512[33]);
+    w2_t = MDX_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, K512[34]);
+    w3_t = MDX_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, K512[35]);
+    w4_t = MDX_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, K512[36]);
+    w5_t = MDX_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, K512[37]);
+    w6_t = MDX_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, K512[38]);
+    w7_t = MDX_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, K512[39]);
+    w8_t = MDX_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, K512[40]);
+    w9_t = MDX_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, K512[41]);
+    wa_t = MDX_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, K512[42]);
+    wb_t = MDX_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, K512[43]);
+    wc_t = MDX_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, K512[44]);
+    wd_t = MDX_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, K512[45]);
+    we_t = MDX_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, K512[46]);
+    wf_t = MDX_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, K512[47]);
+    w0_t = MDX_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, K512[48]);
+    w1_t = MDX_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, K512[49]);
+    w2_t = MDX_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, K512[50]);
+    w3_t = MDX_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, K512[51]);
+    w4_t = MDX_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, K512[52]);
+    w5_t = MDX_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, K512[53]);
+    w6_t = MDX_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, K512[54]);
+    w7_t = MDX_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, K512[55]);
+    w8_t = MDX_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, K512[56]);
+    w9_t = MDX_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, K512[57]);
+    wa_t = MDX_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, K512[58]);
+    wb_t = MDX_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, K512[59]);
+    wc_t = MDX_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, K512[60]);
+    wd_t = MDX_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, K512[61]);
+    we_t = MDX_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, K512[62]);
+    wf_t = MDX_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, K512[63]);
+    w0_t = MDX_SHA512_EXPAND_S(we_t, w9_t, w1_t, w0_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w0_t, K512[64]);
+    w1_t = MDX_SHA512_EXPAND_S(wf_t, wa_t, w2_t, w1_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w1_t, K512[65]);
+    w2_t = MDX_SHA512_EXPAND_S(w0_t, wb_t, w3_t, w2_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, w2_t, K512[66]);
+    w3_t = MDX_SHA512_EXPAND_S(w1_t, wc_t, w4_t, w3_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, w3_t, K512[67]);
+    w4_t = MDX_SHA512_EXPAND_S(w2_t, wd_t, w5_t, w4_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, w4_t, K512[68]);
+    w5_t = MDX_SHA512_EXPAND_S(w3_t, we_t, w6_t, w5_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, w5_t, K512[69]);
+    w6_t = MDX_SHA512_EXPAND_S(w4_t, wf_t, w7_t, w6_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, w6_t, K512[70]);
+    w7_t = MDX_SHA512_EXPAND_S(w5_t, w0_t, w8_t, w7_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, w7_t, K512[71]);
+    w8_t = MDX_SHA512_EXPAND_S(w6_t, w1_t, w9_t, w8_t);
+    MDX_SHA512_STEP_S(a, b, c, d, e, f, g, h, w8_t, K512[72]);
+    w9_t = MDX_SHA512_EXPAND_S(w7_t, w2_t, wa_t, w9_t);
+    MDX_SHA512_STEP_S(h, a, b, c, d, e, f, g, w9_t, K512[73]);
+    wa_t = MDX_SHA512_EXPAND_S(w8_t, w3_t, wb_t, wa_t);
+    MDX_SHA512_STEP_S(g, h, a, b, c, d, e, f, wa_t, K512[74]);
+    wb_t = MDX_SHA512_EXPAND_S(w9_t, w4_t, wc_t, wb_t);
+    MDX_SHA512_STEP_S(f, g, h, a, b, c, d, e, wb_t, K512[75]);
+    wc_t = MDX_SHA512_EXPAND_S(wa_t, w5_t, wd_t, wc_t);
+    MDX_SHA512_STEP_S(e, f, g, h, a, b, c, d, wc_t, K512[76]);
+    wd_t = MDX_SHA512_EXPAND_S(wb_t, w6_t, we_t, wd_t);
+    MDX_SHA512_STEP_S(d, e, f, g, h, a, b, c, wd_t, K512[77]);
+    we_t = MDX_SHA512_EXPAND_S(wc_t, w7_t, wf_t, we_t);
+    MDX_SHA512_STEP_S(c, d, e, f, g, h, a, b, we_t, K512[78]);
+    wf_t = MDX_SHA512_EXPAND_S(wd_t, w8_t, w0_t, wf_t);
+    MDX_SHA512_STEP_S(b, c, d, e, f, g, h, a, wf_t, K512[79]);
     state[0] += a; state[1] += b; state[2] += c; state[3] += d;
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }

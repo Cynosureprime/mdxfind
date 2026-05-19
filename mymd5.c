@@ -1,5 +1,11 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.33  2026/05/18 05:22:45  dlr
+ * mymd5.c: remove duplicate stdio.h, stdlib.h, string.h includes at line 3034 area (already included at file top); flagged by clangd unused-includes.
+ *
+ * Revision 1.32  2026/05/18 05:14:05  dlr
+ * Phase 3 ubuntu22 warning sweep: strip Wunused-variable j init_md5sse T mymd5salt r2 mysha1 y procsaltbb. Mark sha1_compress and sha1_compress_orig __attribute__((unused)) historical reference impls superseded by SHA-NI sha1_block_fn. Remove always-false size_t < 0 checks in PHS (Wtype-limits, 3 sites).
+ *
  * Revision 1.31  2026/04/26 21:33:38  dlr
  * Pomelo: portable pom_getlo64 for i686 (32-bit Intel). The intrinsic _mm_cvtsi128_si64 is only available in 64-bit x86 mode; on i686 it produces 'undefined reference' at link time. Gate the existing call on __x86_64__/_M_X64/_M_AMD64 and fall back to _mm_storel_epi64 (SSE2-portable, available in all x86 modes) on 32-bit. Caught by mdxfind-release's Linux i686 build at .207. macOS x86_64 sanity build clean; POMELO -z e429 still produces the canonical hash.
  *
@@ -1257,7 +1263,7 @@ void procsaltbb(uint32x4_t *SSEBUF, struct job *job, int pcnt, char *sbuf[], int
 #ifndef NOTINTEL
 
 void init_md5sse(unsigned char *message, int len, unsigned char *block) {
-  int i, j;
+  int i;
   uint32_t *s, *d, temp;
   __m128i *p, r1;
 
@@ -1375,7 +1381,6 @@ static inline __m128i rol_epi64(__m128i v, int s) {
 
 
 void mymd5salt(unsigned char *block, SVAL *hash) {
-  SVAL T;
   __m128i a, b, c, d;
   const SVAL *X = (SVAL *) block;
 
@@ -1761,11 +1766,11 @@ static inline uint32_t myf60(uint32_t x, uint32_t y, uint32_t z) {
   } while(0)
 
 
+/* Historical reference impl; unused — Intel SHA-NI path via sha1_block_fn supersedes it. */
+__attribute__((unused))
 static void sha1_compress(uint32_t* hash, const uint32_t *block){
   uint32_t W[80], W0, A, B, C, D, E, T;
-  uint32_t temp;
-  __m128i r1, r2, *p, *o, xr1, xr2, xr3, xr4;
-  SVAL mask, v1, v2, v3, v4;
+  __m128i r1, r2, *p, *o;
 
   A = hash[0];
   B = hash[1];
@@ -1963,6 +1968,8 @@ static void sha1_compress(uint32_t* hash, const uint32_t *block){
   hash[3] += B;
   hash[4] += C;
 }
+/* Historical reference impl; unused — superseded by sha1_compress / sha1_block_fn. */
+__attribute__((unused))
 static void sha1_compress_orig(uint32_t * hash, const uint32_t *block){
   int t;                 /* Loop counter */
   uint32_t temp;              /* Temporary word value */
@@ -2384,7 +2391,7 @@ static void sha1_block_init(uint32_t *hash, uint32_t *block) {
 
 void mysha1(unsigned char *message, int len, uint32_t *hash) {
   SVAL block[4];
-  __m128i *p, r1, r2;
+  __m128i *p, r1;
   int i, rem;
   uint8_t *byteBlock;
 
@@ -2435,7 +2442,7 @@ void procsaltbb(__m128i *SSEBUF, struct job *job, int pcnt, char *sbuf[], int my
   __m128i a, b, c, d;
   union HashU curin;
   const SVAL *X = (SVAL *) SSEBUF;
-  int x, y;
+  int x;
 
   if (pcnt <= 0 || pcnt > 4) return;
   curin.x[0] = _mm_setzero_si128();
@@ -3027,9 +3034,7 @@ void SHA(char *cur, int len, unsigned char *dest) {
 // For the machine today, it is recommended that: 5 <= t_cost + m_cost <= 25;
 // one may use the parameters: m_cost = 15; t_cost = 0; (256 MegaByte memory)
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+// stdio.h / stdlib.h / string.h already #include'd at top of file.
 
 // ============================================================
 // Platform detection and 128-bit vector abstraction
@@ -3284,8 +3289,8 @@ int PHS(void *out, size_t outlen, const void *in, size_t inlen,
 
   // Check the size of password, salt and output.
   // Password is at most 256 bytes; the salt is at most 64 bytes.
-  if (inlen > 256 || saltlen > 64 || outlen > 256 ||
-      inlen < 0 || saltlen < 0 || outlen < 0) return 1;
+  // (inlen/saltlen/outlen are size_t/unsigned — no need for < 0 checks.)
+  if (inlen > 256 || saltlen > 64 || outlen > 256) return 1;
 
   // Step 1: Initialize the state S
   state_size = 1ULL << (13 + m_cost);   // state size is 2**(13+m_cost) bytes

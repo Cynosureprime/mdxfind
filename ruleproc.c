@@ -3,11 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <limits.h>
 #include <time.h>
-#include <wctype.h>
 #include <sys/types.h>
-#include <errno.h>
 #include <stdint.h>
 
 #ifdef POWERPC
@@ -44,9 +41,15 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.29 2026/05/03 16:14:57 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.31 2026/05/18 05:22:32 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.31  2026/05/18 05:22:32  dlr
+ * ruleproc.c: remove unused includes (limits.h, wctype.h, errno.h) flagged by clangd; verified zero references in file.
+ *
+ * Revision 1.30  2026/05/18 05:14:07  dlr
+ * Phase 3 ubuntu22 warning sweep: mark Version static unused. parserules: mark lbuf (written by PARSEHEX macro, never read) and y unused. applyrule: remove genuinely unused s1 d1 q128 locals.
+ *
  * Revision 1.29  2026/05/03 16:14:57  dlr
  * h/H bug fix in CPU rule walker: applyrule's c=='H' test is now also c==RULE_OP_HEX_UPPER (0xc3) — the post-packrules opcode that the switch routes through. Previously H mode silently used lowercase Hextab because the post-switch test never matched. GPU walker (gpu_md5_rules.cl 1.25) now consistent with this fix.
  *
@@ -918,9 +921,13 @@ pack_op_done:
 #undef NEED_BYTES
 
 char * parserules(char *line) {
-  char *t, *s, c, lbuf[10240], n,c1;
+  /* lbuf is written by the PARSEHEX macro (line 311) but never read inside
+   * parserules — historical from when parserules emitted hex-decoded byte
+   * sequences via lbuf. Kept (and silenced) to preserve PARSEHEX's macro
+   * shape and parserules' parsing invariants. */
+  char *t, *s, c, lbuf[10240] __attribute__((unused)), n,c1;
   char *lastvalid;
-  int x, y, rulefail = 0;
+  int x, y __attribute__((unused)), rulefail = 0;
 
 
   lastvalid = s = line;
@@ -1314,10 +1321,9 @@ int applyrule(char *line, char *pass, int len, char *rule,
     char *s, *d, *t, r, *cpass;
     unsigned char c, c1;
     char *orule = rule;
-    unsigned long *s1, *d1;
     int x, y, z, clen, tlen;
 #ifndef NOTINTEL
-    __m128i *p128,*q128, a128,b128,c128,d128;
+    __m128i *p128, a128,b128,c128,d128;
 #endif
     char *Memory = ws->Memory;
     char *Base64buf = ws->Base64buf;

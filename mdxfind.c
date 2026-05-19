@@ -123,15 +123,9 @@ const struct Benchrates { int idx; long long rate; } bench_rates[] = {
 ,{INT_MAX,0}
 };
 
-struct  Linehints {
-	/* 8-byte fields */
-	long long rate;
-	volatile long long hashes_accum;  /* per-algorithm hash counter for EMA feedback */
-	unsigned long long curline, numline;  /* widened from unsigned int — wordlist line positions can exceed 4.29B */
-	/* 4-byte fields */
-	unsigned int lineswanted, gpu;
-} *linehints;
+struct Linehints *linehints;   /* defined in mdxfind.h, allocated at runtime */
 int linehints_count;  /* number of entries in linehints[] (highest op + 1) */
+volatile unsigned long long InflightLines = 0;  /* dispatched but not yet retired */
 
 /* arc4random_buf fallback for glibc < 2.36 and Windows */
 #if defined(_WIN32)
@@ -203,12 +197,12 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.475 2026/05/16 17:52:07 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.485 2026/05/19 17:04:25 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.475 2026/05/16 17:52:07 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.485 2026/05/19 17:04:25 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
-static const char *mdxfind_rev_string(void) {
+static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
     if (rev[0]) return rev;
     const char *p = strstr(Version, ",v ");
@@ -224,6 +218,36 @@ static const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.485  2026/05/19 17:04:25  dlr
+ * Add wordlist-perf instrumentation. Two new stderr emits: (1) linecount: <file> (N MB): scanned in Xms = Y MB/s, fired after each linecount_file cache-miss scan in linecount_thread. (2) -w skip: N lines (M MB) in Xms = Y MB/s, fired in main wordlist loop when SkipLine transitions to 0. Both report on-disk byte rate via stat sb.st_size and CurfileBytesRead atomic respectively. Cache-hit linecount lookups are not instrumented (zero file I-O). User-requested for wordlist throughput characterization.
+ *
+ * Revision 1.484  2026/05/19 03:04:05  dlr
+ * Two-bug fix for word-retirement ETA cross-chunk corruption. Bug A: chunk-reset at 49175 was clearing retired_line=0 per buffer chunk, breaking monotonicity (rate calc went negative, dropped to 0, fell to bootstrap). Removed that reset; retired_line now stays monotonic across chunks. Bug B: lasttick was updated unconditionally even when any_retired_op was 0 (brief chunk-reset window), setting lasttick=0 and making next tick compute rate as cumulative-since-start. Guard the update inside the any_retired_op branch. Caused intermittent 'ETA~finishing' ticks during long CPU SHA512CRYPT runs on rockyou.
+ *
+ * Revision 1.483  2026/05/19 02:53:54  dlr
+ * Internal-iter Tothash accounting: gpu_compute_iter_sum in OpenCL and Metal backends. Adds iter field to struct saltentry. For iterated GPU types (BCRYPT, PHPBB3, DESCRYPT, MD5CRYPT, SHA256CRYPT, SHA512CRYPT, SHA512CRYPTMD5, SHA1DRU) the Tothash multiplier now uses the per-salt iteration sum instead of bare salt count. Non-iterated types return nsalts_packed x 1, preserving prior accounting. Zero kernel changes. Builds clean on iMac, .205 Linux, dev1 ARM Metal.
+ *
+ * Revision 1.482  2026/05/19 01:49:02  dlr
+ * Filter inactive linehints slots from retired_line min-loop. linehints is sized to MAX_OP+1; inactive slots have curline==0 and retired_line==0. Without the filter the min returns 0 from inactive slots, RetiredLines_rate stays 0, ETA falls through to broken bootstrap path. Mirrors existing Lowline filter at 38828. Single-line fix for the v1.481 SHA512CRYPT display bug.
+ *
+ * Revision 1.481  2026/05/19 01:30:51  dlr
+ * Restore missing BF servo statics deleted in 1.477: bf_rate_ema + bf_chunks_produced + bf_first_feedback_seen as file-scope statics near bf_dev_first_dispatch_done. Restore num_devs_v as local in BF activation arm. Pre-existing .205 build failure, not introduced by retirement ETA change.
+ *
+ * Revision 1.480  2026/05/19 01:20:06  dlr
+ * word-retirement ETA: remove struct Linehints local def (now in header) + add InflightLines global + retired_line updates at mid-job checkpoint, job-return, chunk-reset. 15s tick min-loop computes RetiredLines_rate + RetiredLines_now_snap. Display arm: retirement-based ETA primary, hash-rate bootstrap fallback with tilde prefix. GPU dispatch increments InflightLines after job->numline set.
+ *
+ * Revision 1.479  2026/05/18 05:31:43  dlr
+ * mdxfind.c JOB_YAF_SHA1 line 27542 iconv fix: was checking wrong variable (x, stale loop counter always positive) instead of j (iconv return), so body always ran and hashed garbage on conversion failure. Now if (j < 0) break per D5a discipline; matches pattern at lines 19016 19073. Behavioral change: skip badly-formed or unconvertable inputs instead of hashing garbage.
+ *
+ * Revision 1.478  2026/05/18 05:13:59  dlr
+ * Phase 3 ubuntu22 warning sweep: function-scope pragma push pop in procjob (148 implicit-fallthrough + 36 stringop-truncation suppressed) and addfiles plus main strncpy length-prefix sites. Fix overlapping memcpy in JOB_MD5sub8_24SALT 2 sites to memmove (Wrestrict UB). Init pep p1 emaillen emailcur emailpow peplen hmac_type x y at decl as Wmaybe-uninitialized false positives. Init f9 array to NULL silences flow-insensitive false positive. Numbers Maxnumbers global init. Fix format specifier 48130 unsigned int Numsalts uses %u. Mark base32hex_alpha unused. Resize AWSSIGV4 tskey from 512 to MAXLINE salttmp re-indent three IPMI KRB5 misleading-indentation sites. clang guard for GCC-only diagnostic groups.
+ *
+ * Revision 1.477  2026/05/18 04:25:38  dlr
+ * Sweep ~140 mechanical compile warnings on ubuntu22-compile gcc-11: 1 parentheses (TACACS auth-reply mask), 6 old-style decl (rmd128 keyword reorder), 5 type-limits (unsigned-vs-zero in cacheline + curline; iconv() comparison hardened to == (size_t)-1 catching real bug where the check never fired), 5 unused-label (skipcheck/skipcheck1 with no goto refs), 12 unused-but-set (tot, slen[4] outer, lm-LMhash-result, tmemmax-debug-only, file_ver-parse-but-ignored, plus 7 main-scope vars: Fsize, maxinsize, Noremove, Douniq, str1, inhex, actjobs), 106 unused-variable (mostly checkhash dead boilerplate; jkey compound-block decls preserved as empty braces), 5 unused-function flagged __attribute__((unused)) per per-site judgment: mdxfind_rev_string (GPU cache stamp future use), base32hex_decode (RFC 4648 future use), geti64 (parity with sister tools), get32_scalar (ARM build path), parse_mask (legacy global-Mask wrapper). Five GPU-gated vars re-declared __attribute__((unused)) after ubuntu22 marked them unused but dev1 clang Metal build needs them: do_pack_gpu, gpu_maxlen, mswap, was_pass0_zero, gpu_batch_lines. v1.476 bundle pairs with gpu_opencl.c rev 1.172 and gpujob_opencl.c rev 1.139 (Task #315 OpenCL debug wrap from prior session). Build verified: iMac clean, dev1 (M1 Metal+clang) clean, ubuntu22-compile gcc-11 down from 346 to 206 (140 cleared).
+ *
+ * Revision 1.476  2026/05/18 03:03:23  dlr
+ * D5a lzma decoder unused-result fixes: 4 sites in creader_detect + linecount_file now fatal-on-error per feedback_external_failures_are_fatal. Prevents silent xz and zip-LZMA data drop on decoder init failure. Task 316.
+ *
  * Revision 1.475  2026/05/16 17:52:07  dlr
  * Phase 2d.7a BLAKE2 unsalted family compile-families bitmap -- add JOB_BLAKE2B256 (845) and JOB_BLAKE2B512 (841) cases mapping to FAM_BLAKE2S256UNSALTED (coarse family-grouping signal for Metal eager-compile pre-compile speed-up; not a per-op dispatch key). Same pattern as JOB_RMD320 mapping to FAM_RMD160UNSALTED in Phase 2d.6.2. JOB_BLAKE2S256 already mapped pre-this-phase. The OpenCL twin gpu_family_for_op_internal does not route BLAKE2B-{256,512} either; both lazy-compile via gpu_opencl_template_resolve_kernel on first dispatch. Pre-flight audit confirmed Phase 2d.7a Blake2 ops already wired at 4 of 5 host-wiring sites (gpu_ops[] line 37979-37982; chokepoint admit line 10842-10843; (GPU) tag line 43680-43682); only the FAM_ bitmask switch needed the BLAKE2B-256/512 extension (per feedback_codegen_host_wiring_gaps.md).
  *
@@ -2784,6 +2808,14 @@ struct saltentry {
     int saltlen;     /* cached strlen */
     char *hashsalt;  /* precomputed hex(MD5(salt)) from Typehashsalt, or NULL */
     int hashlen;     /* length of hashsalt string (typically 32) */
+    uint32_t iter;   /* internal iteration count for GPU Tothash accounting;
+                      * 0 = not set (gpu_compute_iter_sum falls back to
+                      * default_iter_for_op). Populated by gpu_compute_iter_sum
+                      * at GPU dispatch accounting time; not set by CPU paths
+                      * (unused there). For DESCRYPT/MD5CRYPT/SHA1DRU: fixed
+                      * constant; for SHACRYPT: parsed from rounds= prefix in
+                      * salt string; for BCRYPT: 1<<cost from salt prefix;
+                      * for PHPBB3: 1<<i64hex[salt[3]]. */
 };
 char **Typesalt2;
 void **Typeuser;
@@ -3231,6 +3263,7 @@ static const unsigned char theMagicArray[160] = {
 
 static const char lotus64[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+/";
 
+__attribute__((unused))
 static const char base32hex_alpha[] = "0123456789abcdefghijklmnopqrstuv";
 
 static const unsigned char pr2six[256] =
@@ -3363,7 +3396,7 @@ int php64_encode(char *clrstr, char *phpdst, int inlen) {
 
 /* Decode base32hex (RFC 4648 extended hex alphabet) to binary.
  * Alphabet: 0-9 = 0-9, a-v = 10-31 (case insensitive). Returns bytes decoded. */
-static int base32hex_decode(const char *in, unsigned char *out, int inlen) {
+static __attribute__((unused)) int base32hex_decode(const char *in, unsigned char *out, int inlen) {
   int i, j = 0, bits = 0;
   unsigned int buf = 0;
   for (i = 0; i < inlen; i++) {
@@ -3858,8 +3891,8 @@ unsigned char trhex[] = {
 
 
 
-static int geti64(char *iline, unsigned char *dest, int len) {
-  unsigned char c, c1, c2, c3, c4, *line = (unsigned char *)iline;
+static __attribute__((unused)) int geti64(char *iline, unsigned char *dest, int len) {
+unsigned char c1, c2, c3, c4, *line = (unsigned char *)iline;
   unsigned int cas;
   int cnt;
 
@@ -3896,7 +3929,7 @@ static int geti64(char *iline, unsigned char *dest, int len) {
  */
 
 /* Scalar implementation — works everywhere */
-static int get32_scalar(char *iline, unsigned char *dest, int len) {
+static __attribute__((unused)) int get32_scalar(char *iline, unsigned char *dest, int len) {
   unsigned char c1, c2, *line = (unsigned char *)iline;
   int cnt = 0;
   while (cnt < len) {
@@ -3926,7 +3959,6 @@ static int get32_sse2(char *iline, unsigned char *dest, int len) {
   const __m128i off_digit = _mm_set1_epi8('0');
   const __m128i off_upper = _mm_set1_epi8('A' - 10);
   const __m128i off_lower = _mm_set1_epi8('a' - 10);
-  const __m128i lomask = _mm_set1_epi8(0x0F);
 
   while (cnt + 8 <= len) {
       __m128i input = _mm_loadu_si128((const __m128i *)line);
@@ -7570,7 +7602,7 @@ static int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out,
 }
 
 /* Legacy wrapper for code that still uses the global MaskPattern */
-static int parse_mask(const char *s) {
+static __attribute__((unused)) int parse_mask(const char *s) {
     return parse_mask_into(s, MaskPattern, &MaskLen, &MaskTotal);
 }
 
@@ -7639,15 +7671,12 @@ atomic_ullong Totrules_gpu = 0;
 #define BF_MAX_GPU_SLOTS 64
 _Atomic uint64_t bf_dev_wall_us[BF_MAX_GPU_SLOTS];
 _Atomic uint64_t bf_dev_chunk_total[BF_MAX_GPU_SLOTS];
-static uint64_t bf_rate_ema = 1000000000ull;   /* initial 1 GH/s seed */
-static uint32_t bf_chunks_produced = 0;
 /* Phase 1.4b: producer-side bootstrap wait flag. Cleared at op start, set
  * once after the producer has observed the first device feedback. Until
  * then, after submitting chunk 0 the producer blocks at the top of
  * adaptive_bf_chunk_size until any device posts a non-zero wall_us; this
  * lets the EMA see real feedback before sizing chunk 1. After the flag
  * is set, every subsequent call races ahead with no wait. */
-static _Atomic int bf_first_feedback_seen = 0;
 /* Phase 1.7c (2026-05-09): per-slot first-dispatch flag. The very first BF
  * dispatch on a given slot's queue includes per-op template JIT inside
  * gpu_opencl_dispatch_md5_rules -> gpu_template_resolve_kernel
@@ -7658,6 +7687,10 @@ static _Atomic int bf_first_feedback_seen = 0;
  * first dispatch per slot and only stores wall_us on subsequent (clean)
  * dispatches. Cleared at op start alongside other servo state. */
 _Atomic int bf_dev_first_dispatch_done[BF_MAX_GPU_SLOTS];
+/* BF servo: per-op state, reset at each op start in main BF activation arm */
+static uint64_t bf_rate_ema = 1000000000ull;   /* initial 1 GH/s seed */
+static uint32_t bf_chunks_produced = 0;
+static _Atomic int bf_first_feedback_seen = 0;
 /* ETA progress tracking for ReportStats */
 static unsigned long long EstimatedTotalLines = 0;  /* from -W <count> */
 static volatile unsigned long long AutoCountTotalLines = 0;  /* from -W auto */
@@ -7670,7 +7703,6 @@ static char LineCountCachePath[4096] = "";  /* path to mdxfind.db */
 static int BruteForceMode = 0;
 static unsigned long long BruteForceTotal = 0;  /* total keyspace */
 static volatile unsigned long long BruteForceProgress = 0;  /* candidates dispatched so far */
-static char BruteForceCandidate[256];  /* current sample candidate for display */
 atomic_ullong *Totalfound[JOB_DONE], *RuleCnt;
 
 /* SIGUSR1 pauses, SIGUSR2 resumes (Unix); named events (Windows) */
@@ -7907,9 +7939,9 @@ static int compact_insert(void) {
 }
 
 static void gen_salts() {
-  int x, y, z, num, tot,  Dosalt[JOB_DONE];
+  int x, y, z, num, Dosalt[JOB_DONE];
   int Dosaltcnt=0;
-  char *cur,any=0;
+char any=0;
   unsigned char line[MAXLINE + 16];
   Word_t *PV, RC, ti;
   Pvoid_t lsalt = NULL;
@@ -7927,7 +7959,6 @@ static void gen_salts() {
   }
   if (!any) return;
 
-  tot = 5 * (96 * 96 * 96) + 4 * (96 * 96) + 6 * (10001);
   num = 0;
 
   for (x = ' '; x < 128; x++) {
@@ -8321,14 +8352,12 @@ int hybrid_check(const unsigned char *hashbytes, int len,
 
 
 int checkhashkey(union HashU *curin, int len, char *key, struct job *job) {
-  Word_t RC;
-  Word_t *PV, tr1, tr2;
   unsigned char *t;
-  int i, j, offset, rotval, dohex, ret, hlen, bit, index;
+  int i, j, offset, rotval, dohex;
   char newbuf[513], rotbuf[513];
   char keybuf[MAXLINE * 2];
-  union HashU *Origin, check, test;
-  struct Hashchain *next, found;
+  union HashU *Origin, test;
+struct Hashchain found;
   int hitcount = 0;
 
   Origin = curin;
@@ -8413,7 +8442,6 @@ release(FreeWaiting);
 	      job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:%s\n", rotval,  Types[job->op], rotbuf, key, job->pass);
           }
         }
-skipcheck1:
         if (offset == (len - Minhashlen))
           break;
         offset += Minhashlen;
@@ -8497,7 +8525,6 @@ release(FreeWaiting);
 	  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", Types[job->op], newbuf, key, job->pass);
       }
     }
-skipcheck:
     if (offset == (len - Minhashlen))
       break;
     offset += Minhashlen;
@@ -8747,13 +8774,11 @@ int checkhash_authme(union HashU *curin, int len, char *salt, int saltlen, struc
 }
 
 int checkhash(union HashU *curin, int len, int x, struct job *job) {
-  Word_t RC;
-  Word_t *PV, tr1, tr2;
   unsigned char *t;
-  int i, j, offset, rotval, dohex, ret, hlen, bit, index;
+  int i, j, offset, rotval, dohex;
   char newbuf[513], rotbuf[513];
-  union HashU *Origin, check, test, xor;
-  struct Hashchain *next, found;
+  union HashU *Origin, test, xor;
+struct Hashchain found;
   int hitcount = 0;
 
   if (job->clen > MAXLINE) { 
@@ -8967,7 +8992,6 @@ release(FreeWaiting);
 	  }
         }
       }
-skipcheck1:
       if (offset == (len - Minhashlen))
         break;
       offset += Minhashlen;
@@ -8980,14 +9004,12 @@ skipcheck1:
 }
 
 int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job) {
-  Word_t RC;
-  Word_t *PV, tr1, tr2;
   unsigned char *t;
-  int i, j, offset, rotval, dohex, ret, hlen, bit, index;
+  int i, j, offset, rotval, dohex;
   char newbuf[513], rotbuf[513];
   char saltbuf[MAXLINE * 2];
-  union HashU *Origin, check, test;
-  struct Hashchain *next, found;
+  union HashU *Origin, test;
+struct Hashchain found;
   int hitcount = 0;
 
   if (job->clen > MAXLINE) { 
@@ -9087,7 +9109,6 @@ release(FreeWaiting);
 	    }
           }
         }
-skipcheck1:
         if (offset == (len - Minhashlen))
           break;
         offset += Minhashlen;
@@ -9183,7 +9204,6 @@ release(FreeWaiting);
 	}
       }
     }
-skipcheck:
     if (offset == (len - Minhashlen))
       break;
     offset += Minhashlen;
@@ -9295,14 +9315,10 @@ release(FreeWaiting);
 }
 
 int checkhashbb(union HashU *curin, int len, char *salt, struct job *job) {
-  Word_t RC;
-  Word_t *PV, tr1, tr2;
-  unsigned char *t;
-  int i, j, offset, rotval, dohex, ret, hlen, bit, index;
+  int i, j, dohex;
   unsigned int cas;
   char newbuf[513];
-  union HashU *Origin, check, test;
-  struct Hashchain *next, found;
+struct Hashchain found;
   int hitcount = 0;
 
   if (job->clen > MAXLINE) {
@@ -10176,21 +10192,45 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
  * implementation (mdxfind.c rev 1.455). */
 #endif /* GPU_ENABLED */
 
+/* procjob's hash-type dispatch uses fixed-size pre-allocated thread-local
+ * buffers per the inventory documented in procjob.md (linebuf, mdbuf, newbuf,
+ * tsalt, wline, etc.). The strncpy calls into &linebuf[32], etc. intentionally
+ * truncate without NUL-terminating — the receiver writes additional bytes
+ * (hash hex prefix + payload) and tracks length explicitly via `len`.
+ * gcc-12+ -Wstringop-truncation cannot prove this discipline; suppress it
+ * for the function body.
+ *
+ * Likewise, procjob's case-label dispatch chains 100+ JOB_* variants whose
+ * intentional design is to fall through into a shared codepath (e.g.
+ * JOB_MD5MD5SALT -> JOB_MD5UCSALT/MD5SALT/MD5revMD5SALT/MD5sub8_24SALT all
+ * funnel into the MD5SALTstart label). Marking each fallthrough individually
+ * with __attribute__((fallthrough)) would be 148 mechanical edits with no
+ * semantic gain over the function-scope suppression. */
+#pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+#endif
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 MDXALIGN void procjob(void *dummy) {
 struct job *job;
-char *d, *s1, *s2, *s, *csalt, *dsalt, *cur, *keys, *curkey, eofsalt;
-char *pep, *p1, *Outbuf;
+char *d, *s1, *s2, *s, *csalt, *cur, *curkey, eofsalt;
+char *pep = NULL, *p1 = NULL, *Outbuf;
 char *currule, *ampass, *amuser, *amemail;
 char *sbuf[4], *acthash[4];
-int slen[4], actlen[4];
-unsigned char *lm;
-int done2, saltlen, maxsaltlen, maxsaltlens, pass0, emaillen, emailcur, emailpow, peplen;
-int do_pack_gpu = 0, gpu_maxlen = 55;
+int actlen[4];
+int done2, saltlen, maxsaltlen, maxsaltlens, pass0;
+/* The 4 email/pep locals are gated by run-time conditions GCC's flow
+ * analysis cannot prove out (see Email / pepper paths in procjob);
+ * the actual reads happen only when the same conditions guard the writes.
+ * Initialising silences the false positive without altering behaviour. */
+int emaillen = 0, emailcur = 0, emailpow = 0, peplen = 0;
+__attribute__((unused)) int do_pack_gpu = 0, gpu_maxlen = 55;
 int snap_valid, nsalts_job;
 unsigned int found, lineproc;
-unsigned long long mswap, rulecnt, hashcnt;
+__attribute__((unused)) unsigned long long mswap;
+unsigned long long rulecnt, hashcnt;
 union HashU md5buf, curin, *mdcur;
-int x, y, len, i, j, k, orig_len, number_iter, hmac_type, hmac_len;
+int x = 0, y = 0, len, i, j, k, orig_len, number_iter, hmac_type = 0, hmac_len;
 int Lfstate, pass_len, pass_len1, user_len, email_len;
 int rounds, cryptlen, crypt_prefix_len;
 Word_t RC;
@@ -10201,7 +10241,6 @@ void (*hashinit)(void *);
 void (*hashop)(void *, const void *, size_t);
 void (*hashfin)(void *, void *);
 unsigned long long curline, numline;     /* widened from unsigned int */
-unsigned long long tmemmax;
 void *desblock;
 #if ARM > 6
 uint32x4_t SSEBUF[16], SSEBUF2[16], SSEBUF3[32];
@@ -10219,7 +10258,7 @@ SSEBUF[15]=((vector unsigned int){0,0,0,0});
 __m128i SSEBUF[16], SSEBUF2[16], SSEBUF3[32];
 __m128i hashes[4];
 SSEBUF[15]=_mm_setzero_si128();
-SVAL *X, *X1, *R, *R1;
+SVAL *X, *X1, *R;
 #endif
 #ifdef AIX
 static uint32_t lastmask[5] = {0x0,0xff000000,0xffff0000,0xffffff00,0xffffffff};
@@ -10309,8 +10348,6 @@ saltpool = NULL;
     saltpool = malloc_lock((size_t)maxbytes + 16, memreason);
   }
 }
-
-tmemmax = memmax;
 
 TestVec = NULL;
 desblock = NULL;
@@ -10738,6 +10775,10 @@ while (1) {
       }
       if (found) Totfound += found;
       if (rulecnt) Totrules += rulecnt;
+      if (lineproc && linehints && job->op < linehints_count)
+        __sync_fetch_and_add(&linehints[job->op].retired_line, lineproc);
+      if (lineproc)
+        __sync_fetch_and_sub(&InflightLines, lineproc);
       lineproc = hashcnt = rulecnt = found = 0;
       ltime = current;
       release(FreeWaiting);
@@ -11884,7 +11925,7 @@ do {
  * the chokepoint site would always see 1 because line ~9972 mutates it
  * first, which silently broke the interlock and double-fired the no-rule
  * pass on every word for 100%-GPU-eligible workloads (task #46). */
-int was_pass0_zero = (pass0 == 0);
+__attribute__((unused)) int was_pass0_zero = (pass0 == 0);
 cur = job->line;
 len = orig_len;
 /* For mask with prepend, restore the original word each iteration.
@@ -15940,7 +15981,7 @@ sha1saltpass:
                     cur[x] = toupper(cur[x]);
                 }
                 cur[len] = 0;
-                lm = auth_LMhash(curin.h, cur, len);
+                (void)auth_LMhash(curin.h, cur, len);
                 if (job->op == JOB_LM) {
                   hashcnt++;
                   checkhash(&curin, 32, 1, job);
@@ -15977,7 +16018,7 @@ sha1saltpass:
                     linebuf[x] = cur[x];
                 }
                 linebuf[len] = 0;
-                lm = auth_LMhash(curin.h, linebuf, len);
+                (void)auth_LMhash(curin.h, linebuf, len);
                 cur = prmd5(curin.h, newbuf, 32);
                 prmd5(md5buf.h, newbuf + 32, 32);
                 len = 64;
@@ -17493,7 +17534,7 @@ sha1md51cap_done: ;
 		  prmd5(curin.h, linebuf+1024, 64);
 		}
                 memcpy(linebuf+256, linebuf+512, 64);
-                { char *jkey = (char *)wline1;
+                {
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                   Typesalt[job->op], tsalt, Printall);
@@ -17546,7 +17587,7 @@ sha1md51cap_done: ;
 		prmd5UC(curin.h, linebuf+512, 128);
 		prmd5UC(curin.h, linebuf+1024, 128);
                 memcpy(linebuf+256, linebuf+512, 128);
-                { char *jkey = (char *)wline1;
+                {
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                   Typesalt[job->op], tsalt, Printall);
@@ -17609,7 +17650,7 @@ sha1md51cap_done: ;
 		len = 32;
 sha1_truncsalt:
                 if (Typedone[job->op]) break;
-                { char *jkey = (char *)wline1;
+                {
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                   Typesalt[job->op], tsalt, Printall);
@@ -19406,7 +19447,7 @@ sha11saltmd5:
                 /* HMAC-SHA1(password, hex_decode(salt)) — iterate unique salts */
                 if (len > MAXLINE)
                   break;
-                  if (!snap_valid) {
+                if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                     Typesalt[job->op], tsalt, Printall);
                     snap_valid = 1;
@@ -19486,7 +19527,7 @@ sha11saltmd5:
                 /* HMAC-MD5(password, hex_decode(salt)) — iterate unique salts */
                 if (len > MAXLINE)
                   break;
-                  if (!snap_valid) {
+                if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                     Typesalt[job->op], tsalt, Printall);
                     snap_valid = 1;
@@ -19622,8 +19663,8 @@ sha11saltmd5:
                 /* Kerberos 5 AS-REQ Pre-Auth etype 23: NTLM -> HMAC-MD5 -> RC4 -> verify */
                 if (len > MAXLINE)
                   break;
-                  /* compute NTLM hash once for this password */
-                  to_utf16le(cur, (char *)wline, len);
+                /* compute NTLM hash once for this password */
+                to_utf16le(cur, (char *)wline, len);
                   MD4((char *)wline, len * 2, curin.h);
                   /* K1 = HMAC-MD5(ntlm, usage_type) — usage 1 = PA-ENC-TIMESTAMP */
                   { MHASH td;
@@ -22005,7 +22046,6 @@ sha11saltmd5:
                 if (len > 256) break;
                 { /* h1 = domino5_transform(password) — computed once per password */
                   domino5_transform((const unsigned char *)cur, len, curin.h);
-                  char d6_ts[32];
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                     Typesalt[job->op], tsalt, Printall);
@@ -22696,7 +22736,6 @@ sha11saltmd5:
                     aix_encode(curin.h, dlen, aix_enc);
                     { char jkey[256];
                       Word_t *PV2;
-                      int jklen = sprintf(jkey, "%02d$%.*s$%s", nn, asaltlen, asalt, aix_enc);
                       JSLG(PV2, *aixjudy, (unsigned char *)jkey);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         if (!Printall) {
@@ -22922,7 +22961,8 @@ sha1md5salt:
 	      case JOB_SHA1_MD5sub8_24SALT:
 		mymd5(cur, len, curin.h);
 		prmd5(curin.h, mdbuf,32);
-		memcpy(mdbuf,mdbuf+8,16);
+		/* Overlapping copy: mdbuf[0..16) <= mdbuf[8..24). Use memmove. */
+		memmove(mdbuf,mdbuf+8,16);
                 if (Typedone[job->op]) break;
                 if (!Typesalt[job->op]) break;
 		d = mdbuf+16;
@@ -23073,7 +23113,8 @@ MD5SALTstart:
 		switch(job->op) {
 		case JOB_MD5sub8_24SALT:
 		  cur = prmd5(curin.h, mdbuf,32);
-		  memcpy(mdbuf,mdbuf+8,16);
+		  /* Overlapping copy: mdbuf[0..16) <= mdbuf[8..24). Use memmove. */
+		  memmove(mdbuf,mdbuf+8,16);
 		  memset(mdbuf+16,0,16);
 		  len = 16;
 		  break;
@@ -24228,7 +24269,7 @@ nextsalt1:
 			  icin = s;
 			  icout = (char *)wline;
 			  ic_outleft = MAXLINE;
-			  if (iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft) < 0) {
+			  if (iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft) == (size_t)-1) {
 			    fprintf(stderr,"Bad conversion in MD4UTF16DESCRYPT\n");
 			    exit(1);
 			  }
@@ -25672,7 +25713,6 @@ md5sha256:
                       s = tsalt;
                       sbuf[ljobi] = tsalt;
                       pvbuf_am[ljobi] = PV;
-                      slen[ljobi] = mystrlen(tsalt);
                       d = ljob[ljobi].pass - 2;
                       i = 0;
                       while (*s && *s != ':') { s++; i++; }
@@ -26113,7 +26153,6 @@ md5sha256:
                       __m128i r1;
                       r1 = _mm_setzero_si128();
 #endif
-                  int nindex;
                   if (Maxiter > 1) {
                     init_md5sse(tsalt, 32, SSEBUF2);
                   }
@@ -27531,10 +27570,9 @@ sha1md5md5uc:
                 icout = (char *)wline;
                 ic_outleft = MAXLINE;
                 j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-                if (x >= 0) {
-                    len = MAXLINE - ic_outleft;
-		    cur = (char *)wline;
-		}
+                if (j < 0) break;   /* iconv failed: skip candidate per D5a; pre-fix check was wrong variable (x) and always-true, hashing garbage on conversion failure */
+                len = MAXLINE - ic_outleft;
+                cur = (char *)wline;
                 memmove(linebuf, cur, len);
                 /* iterate salts from Typesalt Judy */
                 if (!snap_valid) {
@@ -32849,7 +32887,7 @@ HAV256_5_start:
                       unsigned int flags = tc_pt[1];
                       unsigned int msg_len = ((unsigned int)tc_pt[2] << 8) | tc_pt[3];
                       unsigned int data_len = ((unsigned int)tc_pt[4] << 8) | tc_pt[5];
-                      if ((status >= 1 && status <= 7 || status == 0x21) &&
+                      if (((status >= 1 && status <= 7) || status == 0x21) &&
                           (flags == 0 || flags == 1) &&
                           6 + msg_len + data_len == (unsigned int)ct_binlen)
                         valid = 1;
@@ -33575,7 +33613,6 @@ HAV256_5_start:
                       unsigned int hmac_len = 0;
                       HMAC(EVP_sha1(), ki, keylen, fixed_ts, 44, curin.h, &hmac_len);
                       /* AES-CTS encrypt fixed_ts using ke */
-                      int nblocks = 3; /* 44 bytes → 3 blocks */
                       int partial_len = 44 - 32; /* 12 bytes in last block */
                       unsigned char *ct_out = (unsigned char *)wline;
                       /* CBC encrypt first 2 blocks (32 bytes) */
@@ -33874,7 +33911,6 @@ HAV256_5_start:
                 if (len != 64) break;
                 { int si;
                   unsigned char *wpa_pmk = (unsigned char *)newbuf;
-                  unsigned char *wpa_essid = (unsigned char *)tsalt;
                   unsigned char *wpa_pmkid_data = (unsigned char *)tsalt + 32;
                   unsigned char *wpa_pke = (unsigned char *)linebuf;
                   unsigned char *wpa_eapol = (unsigned char *)wline;
@@ -36885,6 +36921,10 @@ gpu_packed_done: ;
     }
     if (found) Totfound += found;
     if (rulecnt) Totrules += rulecnt;
+    if (lineproc && linehints && job->op > 0 && job->op < linehints_count)
+      __sync_fetch_and_add(&linehints[job->op].retired_line, lineproc);
+    if (lineproc)
+      __sync_fetch_and_sub(&InflightLines, lineproc);
     job->op = 0;
     job->next = NULL;
     if (FreeTail) {
@@ -36897,6 +36937,7 @@ gpu_packed_done: ;
     twist(FreeWaiting, BY, +1);
   }
 }
+#pragma GCC diagnostic pop
 
 unsigned int matchhash(char *src) {
   char *s, *t;
@@ -37152,7 +37193,14 @@ static int creader_detect(char *buf, size_t buflen) {
         Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
         if (Creader.fd < 0) return 0;
         memset(&Creader.xz, 0, sizeof(Creader.xz));
-        lzma_stream_decoder(&Creader.xz, UINT64_MAX, LZMA_CONCATENATED);
+        {
+            lzma_ret r = lzma_stream_decoder(&Creader.xz, UINT64_MAX, LZMA_CONCATENATED);
+            if (r != LZMA_OK) {
+                fprintf(stderr, "FATAL: %s:%d lzma_stream_decoder failed (ret=%d) for %s\n",
+                        __FILE__, __LINE__, (int)r, Creader.filename);
+                exit(1);
+            }
+        }
         Creader.xz.avail_in = 0;
         fprintf(stderr, "Detected XZ compressed input\n");
         return 1;
@@ -37212,7 +37260,14 @@ static int creader_detect(char *buf, size_t buflen) {
                 return 1;
             } else if (method == 14) {  /* LZMA */
                 memset(&Creader.xz, 0, sizeof(Creader.xz));
-                lzma_alone_decoder(&Creader.xz, UINT64_MAX);
+                {
+                    lzma_ret r = lzma_alone_decoder(&Creader.xz, UINT64_MAX);
+                    if (r != LZMA_OK) {
+                        fprintf(stderr, "FATAL: %s:%d lzma_alone_decoder failed (ret=%d) for %s\n",
+                                __FILE__, __LINE__, (int)r, Creader.filename);
+                        exit(1);
+                    }
+                }
                 Creader.xz.avail_in = 0;
                 Creader.zip_init = 2;
                 fprintf(stderr, "Detected ZIP input (LZMA)\n");
@@ -37261,7 +37316,6 @@ static void creader_reset(void) {
 
 unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
   char *curpos, *readbuf, *f;
-  static unsigned long long nextline;     /* widened — wordlist position counter, can exceed 4.29B */
   unsigned long long curline;             /* widened — derived from nextline */
   unsigned int dest, len, Linecount, rlen;
   struct LineInfo *readindex;
@@ -37269,7 +37323,7 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
   size_t readlen;
   static char *Lastleft;
   static int Lastcnt;
-  int curcnt, curindex, doneline, x;
+  int curcnt, curindex, doneline;
 
   cacheindex = Cacheindex;
   curpos = Readbuf;
@@ -37349,7 +37403,6 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
       if (len > 5 && strncmp(&curpos[curindex], "$HEX[", 5) == 0) {
         rlen = get32(&curpos[curindex + 5], (unsigned char *)&curpos[curindex], len - 6);
       }
-      if (rlen < 0) rlen = 0;
       readindex[Linecount].len = rlen;
       curpos[curindex + rlen] = 0;
       curindex += len + 1;
@@ -37357,8 +37410,6 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
       if ((Creader.detected && Creader.type != CMP_GZ) ? Creader.eof : gzeof(fi)) {
         curpos[curcnt] = '\n';
         rlen = len = (curcnt - curindex);
-        if (rlen < 0)
-          rlen = 0;
         if (rlen > 0 && curpos[curindex + rlen - 1] == '\n')
           rlen--;
         if (rlen > 0 && curpos[curindex + rlen - 1] == '\r')
@@ -37366,8 +37417,6 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
         if (len > 5 && strncmp(&curpos[curindex], "$HEX[", 5) == 0) {
           rlen = get32(&curpos[curindex + 5], (unsigned char *)&curpos[curindex], len - 6);
         }
-        if (rlen < 0)
-          rlen = 0;
         readindex[Linecount].len = rlen;
         if (rlen < MAXLINE) {
           Linecount++;
@@ -38276,7 +38325,14 @@ static unsigned long long linecount_file(const char *filename, int *complete) {
         if (fd < 0) goto linecount_done;
         LC_FADVISE(fd);
         lzma_stream xz = LZMA_STREAM_INIT;
-        lzma_stream_decoder(&xz, UINT64_MAX, LZMA_CONCATENATED);
+        {
+            lzma_ret r = lzma_stream_decoder(&xz, UINT64_MAX, LZMA_CONCATENATED);
+            if (r != LZMA_OK) {
+                fprintf(stderr, "FATAL: %s:%d lzma_stream_decoder failed (ret=%d) for %s\n",
+                        __FILE__, __LINE__, (int)r, filename);
+                exit(1);
+            }
+        }
         xz.avail_in = 0;
         int eof = 0;
         while (!eof) {
@@ -38400,7 +38456,14 @@ static unsigned long long linecount_file(const char *filename, int *complete) {
         } else if (method == 14) {
             /* LZMA in ZIP */
             lzma_stream xz = LZMA_STREAM_INIT;
-            lzma_alone_decoder(&xz, UINT64_MAX);
+            {
+                lzma_ret r = lzma_alone_decoder(&xz, UINT64_MAX);
+                if (r != LZMA_OK) {
+                    fprintf(stderr, "FATAL: %s:%d lzma_alone_decoder failed (ret=%d) for %s\n",
+                            __FILE__, __LINE__, (int)r, filename);
+                    exit(1);
+                }
+            }
             size_t remaining = comp_size;
             int eof = 0;
             lseek(fd, 4, SEEK_CUR);
@@ -38501,9 +38564,23 @@ MDXALIGN void linecount_thread(void *dummy) {
         }
 
         int complete = 0;
+        /* Per-file linecount perf instrumentation: time the actual file
+         * scan (cache-miss path) and emit MB/s based on on-disk byte
+         * size from stat above. For compressed inputs this is the
+         * compressed read rate — what end-users can measure externally. */
+        struct timespec lcf_start, lcf_end;
+        clock_gettime(CLOCK_MONOTONIC, &lcf_start);
         unsigned long long count = linecount_file(LineCountArgv[i], &complete);
+        clock_gettime(CLOCK_MONOTONIC, &lcf_end);
         if (count > 0) {
             __sync_fetch_and_add(&AutoCountTotalLines, count);
+            double lcf_ms = (lcf_end.tv_sec - lcf_start.tv_sec) * 1000.0
+                          + (lcf_end.tv_nsec - lcf_start.tv_nsec) / 1e6;
+            double mb = (double)sb.st_size / (1024.0 * 1024.0);
+            double mbps = (lcf_ms > 0.0) ? mb * 1000.0 / lcf_ms : 0.0;
+            tsfprintf(stderr,
+                "linecount: %s (%.2f MB): scanned in %.0fms = %.1f MB/s\n",
+                LineCountArgv[i], mb, lcf_ms, mbps);
             /* Only persist to cache if we counted to EOF — partial counts
              * from HashWaiting early-bail would poison future sessions. */
             if (complete) {
@@ -38649,6 +38726,8 @@ static void format_rate(double val, double *out, char **suffix) {
 MDXALIGN void ReportStats(void *dummy) {
   int x;
   double stime, wtime, lps, hps;
+  double RetiredLines_rate = 0.0;  /* words retired/sec, updated each 15s tick */
+  unsigned long long RetiredLines_now_snap = 0;  /* snapshot of lowest retired_line */
   char *mult, *mult1;
   unsigned long long lastline;
   int pause_state = 0;        /* 0=running, 1=just paused, 2=minutes, 3=hours */
@@ -38787,6 +38866,37 @@ MDXALIGN void ReportStats(void *dummy) {
         Lowline = lowest_line;
     }
 
+    /* word-retirement ETA: find lowest retired_line across active ops.
+     * Filter by curline > 0 (mirrors the existing Lowline filter at
+     * 38828) — `linehints` is sized to MAX_OP+1 so inactive slots have
+     * curline = retired_line = 0; without the filter the min returns 0
+     * from inactive slots and RetiredLines_rate stays 0 forever. */
+    { unsigned long long lowest_retired = ULLONG_MAX;
+      int any_retired_op = 0;
+      for (x = 0; x < linehints_count; x++) {
+        if (linehints[x].curline == 0) continue;   /* skip inactive slots */
+        if (Typedone[x]) continue;
+        unsigned long long r = linehints[x].retired_line;
+        if (r < lowest_retired) lowest_retired = r;
+        any_retired_op = 1;
+      }
+      static unsigned long long RetiredLines_lasttick = 0;
+      /* Only update lasttick when we observed a valid retirement frontier
+       * this tick. Otherwise we'd zero lasttick during brief any_retired_op==0
+       * windows (e.g. chunk reset with no dispatch yet), making the NEXT
+       * tick compute rate as cumulative-since-start instead of delta. */
+      if (any_retired_op && lowest_retired != ULLONG_MAX) {
+        unsigned long long RetiredLines_now = lowest_retired;
+        RetiredLines_rate = (RetiredLines_now > RetiredLines_lasttick)
+                            ? (double)(RetiredLines_now - RetiredLines_lasttick) / 15.0 : 0;
+        RetiredLines_now_snap = RetiredLines_now;
+        RetiredLines_lasttick = RetiredLines_now;
+      } else {
+        RetiredLines_rate = 0;
+        /* leave RetiredLines_now_snap and lasttick at prior values */
+      }
+    }
+
     wtime = (double) current.tv_sec + (double) (current.tv_nsec) / 1000000000.0;
     wtime -= stime;
     if (wtime <= 0.0) wtime = 1;
@@ -38845,54 +38955,58 @@ MDXALIGN void ReportStats(void *dummy) {
         if (!total_est && AutoCountTotalLines > 0)
           total_est = AutoCountTotalLines;
         if (total_est > 0 && TotLines > 0) {
-          /* Compute effective work multiplier: salts * rules * masks */
-          unsigned long long salt_mult = 0;
-          { Word_t ti = 0; int trc;
-            J1F(trc, Dohash, ti);
-            while (trc) {
-              unsigned int ns = Livesalts[ti];
-              salt_mult += (ns > 0) ? ns : 1;
-              J1N(trc, Dohash, ti);
-            }
-          }
-          if (salt_mult < 1) salt_mult = 1;
-          /* ETA from hash-based progress: Tothash / expected_total.
-           * expected_total = total_lines × salt_mult × rules × iterations.
-           * This gives accurate progress even when all lines are read but
-           * salted/iterated types are still being processed. */
           long wq = peek_lock(WorkWaiting);
+          char eta[64];
           double progress_frac;
           double remaining = 0;
-          unsigned long long expected_total = total_est * salt_mult;
-          if (Numrules > 1) expected_total *= Numrules;
-          if (Maxiter > 1) expected_total *= Maxiter;
-          if (MaskTotal > 1) expected_total *= MaskTotal;
-          if (expected_total > 0 && Tothash > 0) {
-            progress_frac = (double)Tothash / (double)expected_total;
+          char prefix;
+          /* Retirement-based ETA: each word is retired once all op-specific work
+           * (rules x masks x salts x iters) is complete. Immune to type count
+           * and iter shape. Bootstrap fallback uses hash-rate until first tick fires. */
+          if (RetiredLines_rate > 0 && total_est > 0) {
+            unsigned long long remaining_lines = (total_est > RetiredLines_now_snap)
+                                                   ? total_est - RetiredLines_now_snap : 0;
+            remaining = (RetiredLines_rate > 0) ? (double)remaining_lines / RetiredLines_rate : 0;
+            progress_frac = (total_est > 0) ? (double)RetiredLines_now_snap / (double)total_est : 0;
             if (progress_frac > 1.0) progress_frac = 1.0;
-            double hps_raw = (double)Tothash / wtime;
-            if (progress_frac > 0.001 && progress_frac < 1.0 && hps_raw > 0)
-              remaining = (double)(expected_total - Tothash) / hps_raw;
+            if (remaining <= 0 && wq > 0)
+              snprintf(eta, sizeof(eta), "finishing");
+            else
+              format_eta(remaining, eta, sizeof(eta));
+            prefix = ' ';
           } else {
-            progress_frac = 0;
+            /* Bootstrap: hash-rate fallback until retirement events fire.
+             * Compute effective work multiplier: salts x rules x masks x iters. */
+            unsigned long long salt_mult = 0;
+            { Word_t ti = 0; int trc;
+              J1F(trc, Dohash, ti);
+              while (trc) {
+                unsigned int ns = Livesalts[ti];
+                salt_mult += (ns > 0) ? ns : 1;
+                J1N(trc, Dohash, ti);
+              }
+            }
+            if (salt_mult < 1) salt_mult = 1;
+            unsigned long long expected_total = total_est * salt_mult;
+            if (Numrules > 1) expected_total *= Numrules;
+            if (Maxiter > 1) expected_total *= Maxiter;
+            if (MaskTotal > 1) expected_total *= MaskTotal;
+            if (expected_total > 0 && Tothash > 0) {
+              progress_frac = (double)Tothash / (double)expected_total;
+              if (progress_frac > 1.0) progress_frac = 1.0;
+              double hps_raw = (double)Tothash / wtime;
+              if (progress_frac > 0.001 && progress_frac < 1.0 && hps_raw > 0)
+                remaining = (double)(expected_total - Tothash) / hps_raw;
+            } else {
+              progress_frac = 0;
+            }
+            if (remaining <= 0 && wq > 0)
+              snprintf(eta, sizeof(eta), "finishing");
+            else
+              format_eta(remaining, eta, sizeof(eta));
+            prefix = (AutoCountRequested && !AutoCountDone) ? '~' : '~';  /* bootstrap provisional */
           }
-          char eta[64];
-          if (remaining <= 0 && wq > 0)
-            snprintf(eta, sizeof(eta), "finishing");
-          else
-            format_eta(remaining, eta, sizeof(eta));
-          char prefix = (AutoCountRequested && !AutoCountDone) ? '~' : ' ';
-          double dprog = (double)Tothash, dtotal = (double)expected_total;
-          char *pmult2 = "", *tmult2 = "";
-          format_rate(dprog, &dprog, &pmult2);
-          format_rate(dtotal, &dtotal, &tmult2);
-          /* First comfort-line: emit the consolidated end-of-init pin
-           * summary. By the time we reach this point, all malloc_pinned
-           * call sites in the chokepoint hot path have either succeeded
-           * or fallen through to pin-on-demand fallback, so the summary
-           * is comprehensive. The earlier emit at "gpujob threads
-           * started" was empty (lazy alloc), so this is the right
-           * landmark. Once-only via static flag. */
+          /* First comfort-line: emit the consolidated end-of-init pin summary. */
           {
             static int _pin_summary_emitted = 0;
             if (!_pin_summary_emitted) {
@@ -38902,16 +39016,18 @@ MDXALIGN void ReportStats(void *dummy) {
           }
 #ifdef GPU_ENABLED
           if (gpujob_available())
-            tsfprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
-                  Curfile, wq, gpujob_queue_depth(), gpujob_free_count(), Fileline,
-                  dprog, pmult2, dtotal, tmult2,
-                  100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
+            tsfprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, %.2f lines/s (%.1f%%), %.2f%sh/s, Found=%llu, ETA%c%s\n",
+                  Curfile, wq, gpujob_queue_depth(), gpujob_free_count(),
+                  RetiredLines_rate > 0 ? RetiredLines_now_snap : TotLines,
+                  RetiredLines_rate > 0 ? RetiredLines_rate : lps,
+                  100.0*progress_frac, hps, mult1, Totfound, prefix, eta);
           else
 #endif
-            tsfprintf(stderr, "Working on %s, w=%ld, line %llu, %.1f%sh/%.1f%sh (%.1f%%), Found=%llu, %.2f%sh/s, %.2f%sc/s, ETA%c%s\n",
-                  Curfile, wq, Fileline,
-                  dprog, pmult2, dtotal, tmult2,
-                  100.0*progress_frac, Totfound, hps, mult1, lps, mult, prefix, eta);
+            tsfprintf(stderr, "Working on %s, w=%ld, line %llu, %.2f lines/s (%.1f%%), %.2f%sh/s, Found=%llu, ETA%c%s\n",
+                  Curfile, wq,
+                  RetiredLines_rate > 0 ? RetiredLines_now_snap : TotLines,
+                  RetiredLines_rate > 0 ? RetiredLines_rate : lps,
+                  100.0*progress_frac, hps, mult1, Totfound, prefix, eta);
         } else {
 #ifdef GPU_ENABLED
           if (gpujob_available())
@@ -38999,6 +39115,13 @@ void addfiles(char *path) {
       perror(NULL);
       return;
     }
+    /* Both strncpy calls in this block intentionally omit a trailing NUL —
+     * the explicit cur[N] = 0 / cur[len+bufpathlen] = 0 below provides it.
+     * Suppress -Wstringop-truncation for this directory-walk path. */
+#pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+#endif
     strncpy(cur, path, bufpathlen);
     cur[bufpathlen] = 0;
     if (bufpathlen && cur[bufpathlen - 1] == '\\')
@@ -39020,6 +39143,7 @@ void addfiles(char *path) {
       }
     }
     closedir(dir);
+#pragma GCC diagnostic pop
   } else {
     new = strdup(path);
     JLI(PV, Files, Filecount);
@@ -39031,12 +39155,10 @@ void addfiles(char *path) {
 
 
 char **dirprocess(int *argcp, char **argvp) {
-  int myfiles = 0, myc;
-  char cur[10240], **ret;
-  Word_t filecount = 0, RC;
+int myc;
+char **ret;
+  Word_t filecount = 0;
   PWord_t PV;
-  struct stat bstat;
-  DIR *dir;
 
   Filecount = 0;
 
@@ -40169,7 +40291,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       while (sl > 0 && (line[sl-1] == '\r' || line[sl-1] == '\n'))
         line[--sl] = 0;
       /* Parse: WPA*TYPE*HASH32*MACAP12*MACSTA12*ESSID_hex*[ANONCE64*EAPOL_hex*MP] */
-      char *f[9]; /* up to 9 fields separated by * */
+      char *f[9] = {NULL}; /* up to 9 fields separated by * — init silences flow-insensitive false positive */
       int nf = 0;
       char *p = line;
       while (nf < 9 && p < line + sl) {
@@ -40625,11 +40747,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     if (lf[JOB_APPLE_IWORK] && len > 60 && strncmp(line, "$iwork$", 7) == 0) {
       char *p = line + 7;
       /* Parse: hash_ver$file_ver$1$iter$salt$iv$data */
-      int hash_ver = 0, file_ver = 0, fmt_ver = 0, iter = 0;
+      int hash_ver = 0, fmt_ver = 0, iter = 0;
       char *d1, *d2, *d3, *d4, *d5, *d6;
       d1 = strchr(p, '$'); /* after hash_ver */
       if (d1) { hash_ver = atoi(p); d2 = strchr(d1 + 1, '$'); }
-      if (d1 && d2) { file_ver = atoi(d1 + 1); d3 = strchr(d2 + 1, '$'); }
+      if (d1 && d2) { d3 = strchr(d2 + 1, '$'); }
       if (d1 && d2 && d3) { fmt_ver = atoi(d2 + 1); d4 = strchr(d3 + 1, '$'); }
       if (d1 && d2 && d3 && d4 && fmt_ver == 1) {
         iter = atoi(d3 + 1);
@@ -40721,7 +40843,6 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 hexkey[40] = 0;
                 JSLI(PV, JudyJ[JOB_MONGODB_SHA1], (unsigned char *)hexkey);
                 /* Decode user and salt for Typesalt */
-                int ub64len = s1 - user_b64;
                 char userbuf[128];
                 int userlen = b64_decode(user_b64, userbuf, &b64ic);
                 if (userlen < 0) userlen = 0;
@@ -42065,10 +42186,21 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 for (x = 0; x < 64; x++) judykey[x] = tolower(aws_digest[x]);
                 judykey[64] = 0;
                 JSLI(PV, JudyJ[JOB_AWSSIGV4], (unsigned char *)judykey);
-                /* Typesalt = "longdate:region:service:canonical" */
-                char tskey[512];
-                snprintf(tskey, sizeof(tskey), "%s:%s:%s:%s", aws_longdate, aws_region, aws_service, aws_canonical);
-                JSLI(PV, Typesalt[JOB_AWSSIGV4], (unsigned char *)tskey);
+                /* Typesalt = "longdate:region:service:canonical".
+                 * Reuse the thread-local salttmp (MAXLINE+16) so the canonical
+                 * request payload (which can be ~40 KB for AWS V4) is not
+                 * truncated into a 512-byte stack buffer.
+                 * aws_canonical itself comes from upstream parsing bounded by
+                 * MAXLINE, so the joined string is realistically <= MAXLINE in
+                 * the AWS V4 input shapes mdxfind handles. snprintf bounds
+                 * regardless; the upper-bound informational warning is OK. */
+#pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
+                snprintf(salttmp, MAXLINE, "%s:%s:%s:%s", aws_longdate, aws_region, aws_service, aws_canonical);
+#pragma GCC diagnostic pop
+                JSLI(PV, Typesalt[JOB_AWSSIGV4], (unsigned char *)salttmp);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_AWSSIGV4]++; }
                 Foundcnt[JOB_AWSSIGV4]++;
                 continue;
@@ -42361,7 +42493,6 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (brace) {
         int sh_iter = atoi(line + 13);
         if (sh_iter >= 1) {
-          int b64len = len - (int)(brace + 1 - line);
           unsigned char sh_dec[400];
           int incount;
           int sh_dlen = b64_decode(brace + 1, (char *)sh_dec, &incount);
@@ -42543,8 +42674,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   int b64hlen = b64_encode((char *)hashbin, b64hash, hblen);
                   while (b64hlen > 0 && b64hash[b64hlen-1] == '=') b64hlen--;
                   b64hash[b64hlen] = 0;
+                  /* b64salt + b64hash here are bounded by the upstream salt/hash hex parse
+                   * (typically <= 256 bytes each for Argon2 inputs); the MAXLINE-704
+                   * destination far exceeds the realistic worst case. snprintf is bounded
+                   * regardless — suppress the upper-bound informational warning. */
+#pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+#endif
                   snprintf(salttmp + 704, MAXLINE - 704, "$argon2id$v=19$m=%d,t=%d,p=1$%s$%s",
                            mg_m, mg_t, b64salt, b64hash);
+#pragma GCC diagnostic pop
                   JSLI(PV, JudyJ[JOB_ARGON2], (unsigned char *)(salttmp + 704));
                   Foundcnt[JOB_ARGON2]++;
                   { size_t needed = (size_t)mg_m * 1024;
@@ -42816,7 +42956,6 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (brace) {
         int sh_iter = atoi(line + 10);
         if (sh_iter >= 1) {
-          int b64len = len - (int)(brace + 1 - line);
           unsigned char sh_dec[256];
           int incount;
           int sh_dlen = b64_decode(brace + 1, (char *)sh_dec, &incount);
@@ -43456,31 +43595,29 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
 void *Stack;
 
 int main(int argc, char **argv) {
-  struct stat sb, isb;
+  struct stat sb;
   struct job *job;
-  unsigned long long Totalfiles, Totallines, Fsize;
-  unsigned long long StartIndex, Numbers, Maxnumbers;
+  unsigned long long Totalfiles, Totallines;
+unsigned long long Numbers = 0, Maxnumbers = 0;
   unsigned long long SkipLine = 0;
   size_t MemSize;
-  unsigned int maxinsize, wrap, val, order, log2, maxtype;
-  int len, x, y, z, cret, indexfi, ch, Noremove, Printsource, maxt;
-  int cryptlen;
-  char *tok, *str1, *save1, *s, *d, c;
-  int doneprint, Douniq, donedashh, Addlf, Lfstate, Dodigits, Dighex;
-  int totcsalt = 0, HashesLoaded = 0;
-  unsigned int offset, mylines, inhex, Doip;
+unsigned int val, maxtype;
+  int len, x, y, z, ch, Printsource, maxt;
+  char *tok, *s, *d;
+  int doneprint, donedashh, Addlf, Dodigits, Dighex;
+int HashesLoaded = 0;
+unsigned int Doip;
   FILE *fi;
   gzFile input, zfi;
   int isstdin, isdone;
   Word_t lsi;
-  char line[MAXLINE + 16], last[MAXLINE + 16], *cur, *ofile, *nfile;
+  char line[MAXLINE + 16], last[MAXLINE + 16], *cur;
   char workline[MAXLINE + 16];
   struct rule_workspace main_rule_ws;
-  char *pass, *infilename;
+char *infilename;
   char *Prog = argv[0];
-  off_t ret;
-  union HashU md5buf, curin;
-  time_t start, end, worktime;
+union HashU curin;
+  time_t start, end;
   Word_t RC, NextX;
   Word_t *PV = NULL, CurHash;
   /* Dohash, Doload, SaltArray, UserArray, KeyArray, RuleArray, NRuleArray,
@@ -43490,14 +43627,13 @@ int main(int argc, char **argv) {
   int ovec[30], pcre_erroff;
   const char *pcre_err;
   unsigned long long curline, numline;    /* widened — wordlist line positions can exceed 4.29B */
-  unsigned int cacheindex, actjobs;
-  char *readbuf, *Oldkeys;
+  char *readbuf;
   struct LineInfo *readindex;
   unsigned int Linecount, Bcryptcnt, DEScryptcnt, ProgressEnccnt;
-  int gpu_batch_lines = 0;
-  struct Hashchain *chain, *next, *prev;
+  __attribute__((unused)) int gpu_batch_lines = 0;
+  struct Hashchain *chain;
   int Recurse = 0;
-  double wtime, wcount;
+  double wtime;
   struct RuleHist *rulehist;
   int DoCustom;
 
@@ -43570,12 +43706,9 @@ int main(int argc, char **argv) {
   input = NULL;
   isstdin = 0;
   Debug = 0;
-  Noremove = 0;
-  Douniq = 0;
   Printsource = 0;
   atomic_store(&Totfound, (unsigned long long)0);
   Totalfiles = Totallines = 0;
-  maxinsize = 0;
   Maxiter = 1;
   maxt = get_nprocs();
   if (maxt < 1) maxt = 1;
@@ -43960,11 +44093,9 @@ int main(int argc, char **argv) {
       case 'u':
       case 'k':
       case 'j':
-        inhex = 0;
         goto Keys_start;
 
       case 'x':
-        inhex = 1;
         Hexkey = 1;
       Keys_start:
         fi = fopen(optarg, "rb");
@@ -43974,10 +44105,8 @@ int main(int argc, char **argv) {
           exit(1);
         }
         fseek(fi, 0, SEEK_END);
-        Fsize = ftell(fi);
         fseek(fi, 0, SEEK_SET);
         line[MAXLINE] = 0;
-        str1 = Keys;
         x = 0;
         y = 0;
         while (fgets(line, MAXLINE, fi)) {
@@ -44411,8 +44540,11 @@ badrule:
             J1S(RC, Doload, y);
           }
         } else {
-          /* regex pattern(s), comma-separated, with ! for negation */
+          /* regex pattern(s), comma-separated, with ! for negation.
+           * Initialise y here so the post-loop "!matched && !y" check
+           * is well-defined even if the loop never executes (empty -M arg). */
           int matched = 0;
+          y = 0;
           tok = strtok(s, ",");
           while (tok) {
             y = 0;
@@ -44684,7 +44816,6 @@ badrule:
     fprintf(stderr, "No hash types specified, exiting\n");
     exit(0);
   }
-  actjobs = y;
 
   line[0] = 0;
   JSLF(PV, PepperArray, (unsigned char *)line);
@@ -44751,7 +44882,6 @@ badrule:
   if (RC == 0)
     J1T(RC, Dohash, JOB_LEET);
   if (x) {
-    char *s;
     Word_t *UPV;
     /* Build UseridJudy from UserArray with PV=1000000 */
     line[0] = 0;
@@ -44811,7 +44941,13 @@ badrule:
         } else {
           if (y > 255)
             y = 255;
+          /* Pascal-style length-prefix copy: *s = y; bytes follow. No NUL. */
+#pragma GCC diagnostic push
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+#endif
           strncpy(s + 1, line, y);
+#pragma GCC diagnostic pop
           *s = y;
           s += y + 1;
         }
@@ -48119,7 +48255,7 @@ usage:
         JSLF(PV, Typesalt[ti], (unsigned char *)line);
         while (PV) {
           if (salt_progress && (cnt % 100000) == 0 && cnt > 0)
-            fprintf(stderr, "Preparing salts for %s: %d of %ld\r", Types[ti], cnt, Numsalts);
+            fprintf(stderr, "Preparing salts for %s: %d of %u\r", Types[ti], cnt, Numsalts);
           /* Precompute MD5(salt) for types that need it */
           if (ti == JOB_MD5_MD5SALTMD5PASS || ti == JOB_SHA1_MD5_MD5SALTMD5PASS ||
               ti == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT || ti == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) {
@@ -48678,7 +48814,7 @@ usage:
                * gpu_salt_judy(g->op); BF chunk synthetic plaintext flows
                * through is_salted_pack pagination naturally. */
               int use_bf_chunks = 0;
-              int num_devs_v = 1;
+              int num_devs_v = 1;  /* restored: deleted in rev 1.477, re-added 1.481 */
 #if defined(OPENCL_GPU)
               if (gpujob_available() &&
                   gpu_op_category(x) == GPU_CAT_MASK) {
@@ -48982,6 +49118,16 @@ usage:
     Totalfiles++;
     Fileline = 0;
     LowSkip = Lowline = 0;
+    /* -w skip-N-lines perf instrumentation: capture start timestamp at file
+     * open if SkipLine > 0; emit elapsed + read rate when SkipLine drops
+     * to 0 inside the cacheline read loop. Bytes read via CurfileBytesRead
+     * (atomic, accumulated by cacheline). */
+    struct timespec skip_start_ts = {0};
+    int skip_was_active = 0;
+    if (SkipLine) {
+        clock_gettime(CLOCK_MONOTONIC, &skip_start_ts);
+        skip_was_active = 1;
+    }
     /* Per-file flag: fire the cache-expunge DELETE at most once per file even
      * if the detection block below triggers across many cacheline batches.
      * Reset on every new file (we want to expunge a poisoned row for each
@@ -49052,10 +49198,24 @@ usage:
           continue;
         Totallines -= SkipLine;
         curline = SkipLine - (Fileline - Linecount);
-        if (curline < 0 || curline > Linecount)
+        if (curline > Linecount)
           curline = 0;
 	LowSkip = SkipLine;
         SkipLine = 0;
+        if (skip_was_active) {
+          struct timespec skip_end_ts;
+          clock_gettime(CLOCK_MONOTONIC, &skip_end_ts);
+          double skip_ms = (skip_end_ts.tv_sec - skip_start_ts.tv_sec) * 1000.0
+                         + (skip_end_ts.tv_nsec - skip_start_ts.tv_nsec) / 1e6;
+          unsigned long long bytes = atomic_load_explicit(&CurfileBytesRead,
+                                                          memory_order_relaxed);
+          double mb = (double)bytes / (1024.0 * 1024.0);
+          double mbps = (skip_ms > 0.0) ? mb * 1000.0 / skip_ms : 0.0;
+          tsfprintf(stderr,
+              "-w skip: %llu lines (%.2f MB) in %.0fms = %.1f MB/s\n",
+              LowSkip, mb, skip_ms, mbps);
+          skip_was_active = 0;
+        }
       }
       Numbers = 0;
 
@@ -49064,6 +49224,11 @@ usage:
       J1F(RC, Dohash, lsi);
       while (RC) {
 	linehints[lsi].curline = 0;
+	/* NOTE: retired_line is NOT reset here — it must remain monotonic across
+	 * chunks for the rate calculation in the 15s tick at 38866 to work
+	 * (rate = (now - lasttick)/15s would go negative on reset, dropping to
+	 * 0 and falling through to the broken bootstrap path). Reset only
+	 * happens implicitly at start-of-run when malloc_lock zero-inits. */
 	J1N(RC, Dohash, lsi);
       }
       Lowline = 0;
@@ -49083,8 +49248,15 @@ reprocess:
 	    continue; 
 	  }
 	  if (linehints[x].gpu && !NoMetal && !Rules) {
-	    linehints[x].lineswanted = UINT_MAX;
-	    numline = ULLONG_MAX;
+	    /* Phase 2f experiment 2026-05-18: cap numline at 32K for GPU+salted
+	     * to preserve in-order jobg slot packing. Was ULLONG_MAX (one big
+	     * job per chunk → procjob #2 picks up the NEXT chunk concurrently,
+	     * breaking line order in jobg). 32K matches jobg slot size so each
+	     * procjob job produces exactly one ordered slot. Per user 2026-05-18
+	     * dispatch goal: approach 1000s on dev1 e31+sm-saltfull+rockyou
+	     * (baseline ~2400s). */
+	    linehints[x].lineswanted = 32768;
+	    numline = 32768;
 	  } else {
 	    linehints[x].lineswanted = linehints[x].rate;
 	    if (maxt > 1)
@@ -49137,6 +49309,7 @@ reprocess:
           job->filename = argv[y];
           job->startline = curline;
           job->numline = numline;
+          __sync_fetch_and_add(&InflightLines, numline);  /* word-retirement: job inflight */
           job->readindex = readindex;
           job->readbuf = readbuf;
           if (readbuf == Readbuf) {

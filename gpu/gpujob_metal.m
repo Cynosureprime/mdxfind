@@ -476,6 +476,7 @@ extern int   build_salt_snapshot(void *snap, char *pool, void *judy,
 extern Pvoid_t *Typehashsalt;
 extern int   build_hashsalt_snapshot(struct saltentry *, char *,
                                      Pvoid_t, char *, int);
+extern unsigned char i64hex[];  /* base64url decode table from mdxfind.c */
 
 /* Type-data extents for sizing the per-worker salt-snapshot scratch.
  * Mirrors gpujob_opencl.c statics at lines 440-441 + the init loop at
@@ -489,10 +490,16 @@ extern long long *Typesaltbytes;
 /* PV_DEC macro mirrors gpu/gpujob_opencl.c line 265-268. PV is the
  * Judy-keyed pending-count; we decrement on a confirmed hit so the
  * matching salt drops out of subsequent dispatches. */
-#define MTL_PV_DEC(pv) { unsigned long _old = *(pv); \
+/* Phase 2g 2026-05-18: extended to return retirement (1->0 transition)
+ * detection via GCC/clang statement-expression. Returns 1 iff this CAS
+ * was the one that took PV from 1 to 0 (this salt just retired);
+ * 0 otherwise (PV already 0, or still >0 after DEC). Race-correct:
+ * only the winning CAS sees _old == 1 in the success branch. */
+#define MTL_PV_DEC(pv) ({ unsigned long _old = *(pv); int _retired = 0; \
   while (_old > 0) { \
-    if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) break; \
-    _old = *(pv); } }
+    if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { \
+      _retired = (_old == 1); break; } \
+    _old = *(pv); } _retired; })
 
 /* struct saltentry mirror. The original lives in mdxfind.c at line 2763;
  * gpu/gpujob_opencl.c carries a redeclaration at line 270 (same layout
@@ -505,6 +512,7 @@ struct saltentry {
     int saltlen;
     char *hashsalt;
     int hashlen;
+    uint32_t iter;  /* internal iteration count; see mdxfind.c:struct saltentry */
 };
 
 /* gpu_salt_judy(op): resolve the per-op salt Judy index.
@@ -540,6 +548,51 @@ static void *gpu_salt_judy(int op) {
     default:
         return Typesalt ? Typesalt[op] : NULL;
     }
+}
+
+/* gpu_compute_iter_sum: Metal twin of the same function in
+ * gpu/gpujob_opencl.c. Computes the total internal iterations across
+ * all packed salts for GPU Tothash accounting. See the OpenCL version
+ * for full documentation. */
+static uint64_t gpu_compute_iter_sum(int op, struct saltentry *saltsnap,
+                                     int *pack_map, int nsalts_packed) {
+    if (nsalts_packed <= 0) return 1;
+    if (op == JOB_DESCRYPT)     return 25ULL * (uint64_t)nsalts_packed;
+    if (op == JOB_MD5CRYPT)     return 1000ULL * (uint64_t)nsalts_packed;
+    if (op == JOB_SHA1DRU)      return 1000000ULL * (uint64_t)nsalts_packed;
+    uint64_t sum = 0;
+    for (int i = 0; i < nsalts_packed; i++) {
+        int si = pack_map[i];
+        const char *s = saltsnap[si].salt;
+        int sl = saltsnap[si].saltlen;
+        uint32_t iter = 1;
+        if (op == JOB_BCRYPT) {
+            if (sl >= 6 && s[0] == '$' && s[2] == '$' && s[3] == '$') {
+                int cost = (s[4] - '0') * 10 + (s[5] - '0');
+                if (cost >= 4 && cost <= 31)
+                    iter = 1u << cost;
+            }
+        } else if (op == JOB_PHPBB3) {
+            if (sl >= 4) {
+                int idx = i64hex[(unsigned char)s[3]];
+                if (idx >= 7 && idx <= 30)
+                    iter = 1u << idx;
+            }
+        } else if (op == JOB_SHA256CRYPT || op == JOB_SHA512CRYPT ||
+                   op == JOB_SHA512CRYPTMD5) {
+            iter = 5000;
+            const char *p = s + 3;
+            if (sl > 10 && strncmp(p, "rounds=", 7) == 0) {
+                int n = atoi(p + 7);
+                if (n >= 1000 && n <= 999999999)
+                    iter = (uint32_t)n;
+            }
+        } else {
+            iter = 1;
+        }
+        sum += (uint64_t)iter;
+    }
+    return sum;
 }
 
 /* gpu_pack_salts_op: Metal twin of the static helper in
@@ -849,6 +902,13 @@ static void gpujob_metal_worker(void *arg) {
     int nsalts_packed = 0;
     int current_op = -1;
     int batch_count = 0;
+    /* Phase 2g 2026-05-18: hybrid salt-refresh trigger counters. Refresh
+     * fires on (batch_count >= 10) OR (>=5% of salts retired since the
+     * last refresh). Counter is bumped by MTL_PV_DEC's 1->0 transition
+     * return value at each hit-replay site. Resets to 0 at each refresh
+     * along with batch_count. Per-worker scope (single-thread Metal). */
+    int _salts_at_last_refresh    = 0;
+    int _salts_retired_since_refresh = 0;
     char tsalt[8192];
     tsalt[0] = 0;
 
@@ -920,8 +980,16 @@ static void gpujob_metal_worker(void *arg) {
 
         if (needs_salt_snapshot) {
             batch_count++;
+            /* Phase 2g hybrid refresh trigger: fire on op change, every 10
+             * batches (existing cadence), OR when >= 5% of the last-uploaded
+             * snapshot has retired (MTL_PV_DEC 1->0 transitions counted at
+             * hit-replay sites). The retirement test uses int*20 >= total to
+             * avoid float; 5% catches late-game salt churn where the 10-batch
+             * cadence would compute against 10-20% dead snapshots. */
+            int retirement_trigger = (_salts_at_last_refresh > 0 &&
+                _salts_retired_since_refresh * 20 >= _salts_at_last_refresh);
             if (g->op != current_op ||
-                (batch_count >= 10 && nsalts_packed > 0)) {
+                ((batch_count >= 10 || retirement_trigger) && nsalts_packed > 0)) {
                 if (g->op != current_op) {
                     current_op = g->op;
                     gpu_metal_set_op(0, g->op);
@@ -944,6 +1012,10 @@ static void gpujob_metal_worker(void *arg) {
                     gpu_metal_set_salt(salts_packed, soff, slen, nsalts_packed);
                 else
                     Typedone[g->op] = 1;
+                /* Reset retirement counter at refresh boundary; bookmark
+                 * the just-uploaded snapshot size for next cycle's 5% test. */
+                _salts_at_last_refresh    = nsalts_packed;
+                _salts_retired_since_refresh = 0;
             }
         } else if (g->op != current_op) {
             current_op = g->op;
@@ -970,6 +1042,9 @@ static void gpujob_metal_worker(void *arg) {
             if (nsalts_packed == 0) {
                 goto return_jobg;
             }
+            /* Phase 2g: stale-rebuild also resets retirement counters. */
+            _salts_at_last_refresh    = nsalts_packed;
+            _salts_retired_since_refresh = 0;
         }
 
         /* --- Packed dispatch (rules-engine only Phase 2a) ---
@@ -1480,7 +1555,7 @@ static void gpujob_metal_worker(void *arg) {
                                                       &match_len, &match_flags);
                                 if (hf && *match_flags != (unsigned short)g->op) {
                                     *match_flags = g->op;
-                                    MTL_PV_DEC(salt_snap_entry->PV);
+                                    if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
                                     int splen = salt_snap_entry->saltlen;
                                     char mdbuf[128];
@@ -1527,7 +1602,7 @@ static void gpujob_metal_worker(void *arg) {
                                                       &match_len, &match_flags);
                                 if (hf && *match_flags != (unsigned short)g->op) {
                                     *match_flags = g->op;
-                                    MTL_PV_DEC(salt_snap_entry->PV);
+                                    if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
                                     int splen = salt_snap_entry->saltlen;
                                     char mdbuf[128];
@@ -1589,7 +1664,7 @@ static void gpujob_metal_worker(void *arg) {
                                                       &match_len, &match_flags);
                                 if (hf && *match_flags != (unsigned short)g->op) {
                                     *match_flags = g->op;
-                                    MTL_PV_DEC(salt_snap_entry->PV);
+                                    if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
                                     int splen = salt_snap_entry->saltlen;
                                     char mdbuf[128];
@@ -1683,7 +1758,7 @@ static void gpujob_metal_worker(void *arg) {
                                 JSLG(HPV, JudyJ[JOB_BCRYPT],
                                      (unsigned char *)fullhash);
                                 if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
-                                    MTL_PV_DEC(salt_snap_entry->PV);
+                                    if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     /* Q1 (2026-05-08): NO display clamp
                                      * (DIFFERENT from DESCRYPT's
                                      * 8-byte cap). Render full post-
@@ -1747,7 +1822,7 @@ static void gpujob_metal_worker(void *arg) {
                                 JSLG(HPV, JudyJ[JOB_DESCRYPT],
                                      (unsigned char *)desbuf);
                                 if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
-                                    MTL_PV_DEC(salt_snap_entry->PV);
+                                    if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     /* Q1 (2026-05-08): clamp display
                                      * password to 8 bytes for CPU parity.
                                      * out_len is the post-rule + post-
@@ -1770,7 +1845,7 @@ static void gpujob_metal_worker(void *arg) {
                                                 &synthetic_job);
                         }
                         if (hit && salt_snap_entry) {
-                            MTL_PV_DEC(salt_snap_entry->PV);
+                            if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                         }
                     } else {
                         /* Phase 2a/2b: unsalted MD5 -> checkhash. */
@@ -1787,19 +1862,25 @@ static void gpujob_metal_worker(void *arg) {
             }
 
             /* Hash accounting: packed_count * gpu_rule_count * mask_size
-             * * nsalts * Maxiter. Phase 2c adds the nsalts fan-out
-             * (mirrors gpujob_opencl.c:2375). For Phase 2a/2b (no salt
-             * snapshot built) nsalts_packed is 0, so _nsalt_acct=1 and
-             * accounting is bit-identical to the pre-2c layout. */
+             * * iter_sum * Maxiter. Phase 2c adds the nsalts fan-out.
+             * 2026-05-19: replace bare _nsalt_acct with _iter_sum_acct
+             * (gpu_compute_iter_sum) so iterated GPU types (BCRYPT/
+             * PHPBB3/DESCRYPT/MD5CRYPT/SHACRYPT/SHA1DRU) multiply by
+             * actual rounds rather than salt count alone. For non-iterated
+             * types the function returns nsalts_packed*1, bit-identical
+             * to the prior accounting. */
             uint64_t _mask_size_acct =
                 (gpu_mask_total > 1) ? gpu_mask_total : 1ull;
-            uint64_t _nsalt_acct =
-                (nsalts_packed > 0) ? (uint64_t)nsalts_packed : 1ull;
+            uint64_t _iter_sum_acct =
+                (nsalts_packed > 0)
+                ? gpu_compute_iter_sum(g->op, saltsnap, pack_map,
+                                       nsalts_packed)
+                : 1ULL;
             uint64_t _per_dispatch_hashes =
                 (uint64_t)g->packed_count *
                 (uint64_t)(gpu_rule_count > 0 ? gpu_rule_count : 1) *
                 _mask_size_acct *
-                _nsalt_acct *
+                _iter_sum_acct *
                 (uint64_t)Maxiter;
             hashcnt += _per_dispatch_hashes;
             _gpu_rules_hashes += _per_dispatch_hashes;

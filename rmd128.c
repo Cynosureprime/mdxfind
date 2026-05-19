@@ -18,15 +18,13 @@
 \********************************************************************/
 
 /*  header files */
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include "rmd128.h"      
+#include "rmd128.h"
 #define RMDsize 128
 
 /********************************************************************/
 
-void static MDinit(dword *MDbuf)
+static void MDinit(dword *MDbuf)
 {
    MDbuf[0] = 0x67452301UL;
    MDbuf[1] = 0xefcdab89UL;
@@ -38,7 +36,7 @@ void static MDinit(dword *MDbuf)
 
 /********************************************************************/
 
-void static compress(dword *MDbuf, dword *X)
+static void compress(dword *MDbuf, dword *X)
 {
    dword aa = MDbuf[0],  bb = MDbuf[1],  cc = MDbuf[2],  dd = MDbuf[3];
    dword aaa = MDbuf[0], bbb = MDbuf[1], ccc = MDbuf[2], ddd = MDbuf[3];
@@ -199,7 +197,7 @@ void static compress(dword *MDbuf, dword *X)
 
 /********************************************************************/
 
-void static MDfinish(dword *MDbuf, byte *strptr, dword lswlen, dword mswlen)
+static void MDfinish(dword *MDbuf, byte *strptr, dword lswlen, dword mswlen)
 {
    unsigned int i;                                 /* counter       */
    dword        X[16];                             /* message words */

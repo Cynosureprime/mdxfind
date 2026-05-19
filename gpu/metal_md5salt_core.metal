@@ -85,16 +85,28 @@ struct template_state {
  * inner-MD5+hex32 evaluation amortises across SALT_BATCH outer-MD5
  * evaluations.
  *
- * Layout: 68 bytes per lane (16 uints + 1 uint sentinel). Lives in
- * `thread` storage; written once by template_pre_salt(), read repeatedly
- * by template_finalize_post() inside the inner salt loop.
+ * Layout (Phase 2h-A, 2026-05-18): 52 bytes per lane (8+4+1 uints).
+ * Down from Phase 2e's 68 bytes (16+1) — M[8..15] dropped because those
+ * slots are always-zero in pre_salt; finalize_post writes them locally
+ * from scratch + Phase 2h-B explicit-literal zeros for compiler folding.
+ *
+ * Phase 2h-A pre-roll: a8/b8/c8/d8 hold the outer MD5 state AFTER 8 FF
+ * rounds (rounds 1-8 of the outer chain). These 8 rounds depend ONLY on
+ * M[0..7] (the hex32) and are completely salt-independent — so we run
+ * them ONCE per (word, rule, mask) here and skip them in finalize_post,
+ * saving 8/64 = 12.5% of outer MD5 work per (word, salt). Mirrors
+ * hashcat's "salt-independent prefix hoist" optimization for m10.
+ *
+ * Lives in `thread` storage; written once by template_pre_salt(), read
+ * repeatedly by template_finalize_post() inside the inner salt loop.
  *
  * Sentinel: inner_len == 0xFFFFFFFFu means "fall back to legacy
  * template_finalize" (for algo_modes other than 0; Phase 2e only hoists
  * mode 0, modes 1-6 remain on the per-salt full-finalize path). */
 struct template_pre_salt_state {
-    uint M[16];
-    uint inner_len;
+    uint M[8];          /* hex32 of inner MD5 (lowercase, M[0..7] in 16-uint addressing) */
+    uint a8, b8, c8, d8; /* Phase 2h-A: outer MD5 (a,b,c,d) state after FF rounds 1-8 */
+    uint inner_len;     /* 32 (mode 0) or TEMPLATE_PRE_SALT_SENTINEL */
 };
 
 #define TEMPLATE_PRE_SALT_SENTINEL 0xFFFFFFFFu
@@ -335,12 +347,28 @@ static inline void template_pre_salt(device const uchar *data, int len,
         md5_block(h0, h1, h2, h3, Mi);
     }
 
-    /* Hex-encode digest1 into pre.M[0..7]; zero pre.M[8..15] so the
-     * salt-append + 0x80 + length-bits path lands in clean memory. The
-     * md5_to_hex_lc helper uses plain `=` stores so pre.M[0..7] is fully
-     * overwritten -- only the upper half needs explicit zeroing. */
-    for (int j = 8; j < 16; j++) pre.M[j] = 0u;
+    /* Hex-encode digest1 into pre.M[0..7] (Phase 2h-A: M[8..15] dropped
+     * from the carrier; finalize_post writes them from scratch). */
     md5_to_hex_lc(h0, h1, h2, h3, pre.M);
+
+    /* Phase 2h-A pre-roll: run outer MD5's first 8 FF rounds (rounds
+     * 1-8). These ONLY depend on M[0..7] (the hex32) — salt-independent
+     * — so amortise once per (word, rule, mask) instead of per-salt.
+     * Saves 8/64 = 12.5% of outer MD5 work in finalize_post fast path. */
+    uint a = 0x67452301u, b = 0xEFCDAB89u,
+         c = 0x98BADCFEu, d = 0x10325476u;
+    MTL_MD5_FF(a,b,c,d,pre.M[0], 7,0xd76aa478u);
+    MTL_MD5_FF(d,a,b,c,pre.M[1],12,0xe8c7b756u);
+    MTL_MD5_FF(c,d,a,b,pre.M[2],17,0x242070dbu);
+    MTL_MD5_FF(b,c,d,a,pre.M[3],22,0xc1bdceeeu);
+    MTL_MD5_FF(a,b,c,d,pre.M[4], 7,0xf57c0fafu);
+    MTL_MD5_FF(d,a,b,c,pre.M[5],12,0x4787c62au);
+    MTL_MD5_FF(c,d,a,b,pre.M[6],17,0xa8304613u);
+    MTL_MD5_FF(b,c,d,a,pre.M[7],22,0xfd469501u);
+    pre.a8 = a;
+    pre.b8 = b;
+    pre.c8 = c;
+    pre.d8 = d;
     pre.inner_len = 32u;
 }
 
@@ -368,13 +396,25 @@ static inline void template_finalize_post(thread template_state &st,
     }
 
     /* Mode 0 hoisted path: pre.M[0..7] holds the 32-char lowercase hex
-     * of the inner MD5. Compute outer MD5(hex32 || salt) into st.h. */
+     * of the inner MD5. Compute outer MD5(hex32 || salt) into st.h.
+     *
+     * Phase 2h-B: M[8..15] written from scratch with explicit literals so
+     * the Metal compiler sees compile-time-known zeros at M[9..13],M[15]
+     * and can fold them out of MD5 round inputs (`+ M[k]` becomes `+ 0`
+     * → elided). M[0..7] still come from pre.M[] (computed once per word
+     * in template_pre_salt; consumed per-salt here). */
     uint M[16];
-    for (int j = 0; j < 16; j++) M[j] = pre.M[j];
-    uint inner_len = pre.inner_len;
+    M[0] = pre.M[0]; M[1] = pre.M[1]; M[2] = pre.M[2]; M[3] = pre.M[3];
+    M[4] = pre.M[4]; M[5] = pre.M[5]; M[6] = pre.M[6]; M[7] = pre.M[7];
+    M[8] = 0u; M[9]  = 0u; M[10] = 0u; M[11] = 0u;
+    M[12] = 0u; M[13] = 0u; M[14] = 0u; M[15] = 0u;
+    uint inner_len = pre.inner_len;  /* always 32 in mode 0 */
 
     uint total_len = inner_len + slen;
     if (total_len < 56u) {
+        /* Single-block fast path. Typical for short salts (e31 sm-saltfull
+         * uses 3/6 byte salts). Inline rounds 9-64 from pre-rolled state
+         * (a8,b8,c8,d8) — Phase 2h-A skips rounds 1-8 (salt-independent). */
         for (uint i = 0u; i < slen; i++) {
             uint pos_byte = inner_len + i;
             uint v = (uint)salt_buf[i];
@@ -385,13 +425,62 @@ static inline void template_finalize_post(thread template_state &st,
             M[eom_pos >> 2] |= (uint)0x80u << ((eom_pos & 3) * 8);
         }
         M[14] = total_len * 8u;
-        M[15] = 0u;
-        st.h[0] = 0x67452301u;
-        st.h[1] = 0xEFCDAB89u;
-        st.h[2] = 0x98BADCFEu;
-        st.h[3] = 0x10325476u;
-        md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
+        /* M[15] already 0u (literal init above) */
+
+        /* Phase 2h-A: start outer MD5 at round 9 from pre-rolled state.
+         * Rounds 1-8 (which would use M[0..7] = hex32, all known after
+         * pre_salt) were precomputed once per word in template_pre_salt
+         * and saved into pre.{a8,b8,c8,d8}. */
+        uint a = pre.a8, b = pre.b8, c = pre.c8, d = pre.d8;
+
+        /* Rounds 9-16 (FF, uses M[8..15] = salt + 0x80 + length-bits) */
+        MTL_MD5_FF(a,b,c,d,M[8], 7,0x698098d8u);
+        MTL_MD5_FF(d,a,b,c,M[9],12,0x8b44f7afu);
+        MTL_MD5_FF(c,d,a,b,M[10],17,0xffff5bb1u);
+        MTL_MD5_FF(b,c,d,a,M[11],22,0x895cd7beu);
+        MTL_MD5_FF(a,b,c,d,M[12], 7,0x6b901122u);
+        MTL_MD5_FF(d,a,b,c,M[13],12,0xfd987193u);
+        MTL_MD5_FF(c,d,a,b,M[14],17,0xa679438eu);
+        MTL_MD5_FF(b,c,d,a,M[15],22,0x49b40821u);
+        /* Rounds 17-32 (GG, mixed M[] indices spanning hex + salt halves) */
+        MTL_MD5_GG(a,b,c,d,M[1], 5,0xf61e2562u);  MTL_MD5_GG(d,a,b,c,M[6], 9,0xc040b340u);
+        MTL_MD5_GG(c,d,a,b,M[11],14,0x265e5a51u); MTL_MD5_GG(b,c,d,a,M[0],20,0xe9b6c7aau);
+        MTL_MD5_GG(a,b,c,d,M[5], 5,0xd62f105du);  MTL_MD5_GG(d,a,b,c,M[10], 9,0x02441453u);
+        MTL_MD5_GG(c,d,a,b,M[15],14,0xd8a1e681u); MTL_MD5_GG(b,c,d,a,M[4],20,0xe7d3fbc8u);
+        MTL_MD5_GG(a,b,c,d,M[9], 5,0x21e1cde6u);  MTL_MD5_GG(d,a,b,c,M[14], 9,0xc33707d6u);
+        MTL_MD5_GG(c,d,a,b,M[3],14,0xf4d50d87u);  MTL_MD5_GG(b,c,d,a,M[8],20,0x455a14edu);
+        MTL_MD5_GG(a,b,c,d,M[13], 5,0xa9e3e905u); MTL_MD5_GG(d,a,b,c,M[2], 9,0xfcefa3f8u);
+        MTL_MD5_GG(c,d,a,b,M[7],14,0x676f02d9u);  MTL_MD5_GG(b,c,d,a,M[12],20,0x8d2a4c8au);
+        /* Rounds 33-48 (HH) */
+        MTL_MD5_HH(a,b,c,d,M[5], 4,0xfffa3942u);  MTL_MD5_HH(d,a,b,c,M[8],11,0x8771f681u);
+        MTL_MD5_HH(c,d,a,b,M[11],16,0x6d9d6122u); MTL_MD5_HH(b,c,d,a,M[14],23,0xfde5380cu);
+        MTL_MD5_HH(a,b,c,d,M[1], 4,0xa4beea44u);  MTL_MD5_HH(d,a,b,c,M[4],11,0x4bdecfa9u);
+        MTL_MD5_HH(c,d,a,b,M[7],16,0xf6bb4b60u);  MTL_MD5_HH(b,c,d,a,M[10],23,0xbebfbc70u);
+        MTL_MD5_HH(a,b,c,d,M[13], 4,0x289b7ec6u); MTL_MD5_HH(d,a,b,c,M[0],11,0xeaa127fau);
+        MTL_MD5_HH(c,d,a,b,M[3],16,0xd4ef3085u);  MTL_MD5_HH(b,c,d,a,M[6],23,0x04881d05u);
+        MTL_MD5_HH(a,b,c,d,M[9], 4,0xd9d4d039u);  MTL_MD5_HH(d,a,b,c,M[12],11,0xe6db99e5u);
+        MTL_MD5_HH(c,d,a,b,M[15],16,0x1fa27cf8u); MTL_MD5_HH(b,c,d,a,M[2],23,0xc4ac5665u);
+        /* Rounds 49-64 (II) */
+        MTL_MD5_II(a,b,c,d,M[0], 6,0xf4292244u);  MTL_MD5_II(d,a,b,c,M[7],10,0x432aff97u);
+        MTL_MD5_II(c,d,a,b,M[14],15,0xab9423a7u); MTL_MD5_II(b,c,d,a,M[5],21,0xfc93a039u);
+        MTL_MD5_II(a,b,c,d,M[12], 6,0x655b59c3u); MTL_MD5_II(d,a,b,c,M[3],10,0x8f0ccc92u);
+        MTL_MD5_II(c,d,a,b,M[10],15,0xffeff47du); MTL_MD5_II(b,c,d,a,M[1],21,0x85845dd1u);
+        MTL_MD5_II(a,b,c,d,M[8], 6,0x6fa87e4fu);  MTL_MD5_II(d,a,b,c,M[15],10,0xfe2ce6e0u);
+        MTL_MD5_II(c,d,a,b,M[6],15,0xa3014314u);  MTL_MD5_II(b,c,d,a,M[13],21,0x4e0811a1u);
+        MTL_MD5_II(a,b,c,d,M[4], 6,0xf7537e82u);  MTL_MD5_II(d,a,b,c,M[11],10,0xbd3af235u);
+        MTL_MD5_II(c,d,a,b,M[2],15,0x2ad7d2bbu);  MTL_MD5_II(b,c,d,a,M[9],21,0xeb86d391u);
+
+        /* Add original IV (not pre-rolled state) to round-64 output to
+         * match md5_block epilogue semantics. */
+        st.h[0] = 0x67452301u + a;
+        st.h[1] = 0xEFCDAB89u + b;
+        st.h[2] = 0x98BADCFEu + c;
+        st.h[3] = 0x10325476u + d;
     } else {
+        /* Two-block slow path (salt > 23 bytes). Phase 2h-A pre-roll
+         * skipped here for simplicity — slow path is rare for short-salt
+         * workloads (sm-saltfull benchmark never triggers it). Falls back
+         * to the standard md5_block helper for both blocks. */
         uint first_chunk = 64u - inner_len;
         if (first_chunk > slen) first_chunk = slen;
         for (uint i = 0u; i < first_chunk; i++) {
@@ -414,13 +503,11 @@ static inline void template_finalize_post(thread template_state &st,
         M[rem_salt >> 2] |= (uint)0x80u << ((rem_salt & 3) * 8);
         if (rem_salt < 56u) {
             M[14] = total_len * 8u;
-            M[15] = 0u;
             md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
         } else {
             md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
             for (int j = 0; j < 16; j++) M[j] = 0u;
             M[14] = total_len * 8u;
-            M[15] = 0u;
             md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
         }
     }

@@ -1,8 +1,11 @@
 /* gpu_shacrypt_core.cl — SHACRYPT shared template core (SHA256CRYPT,
  * SHA512CRYPT, SHA512CRYPTMD5). Hand-written Path A.
  *
- * $Revision: 1.3 $
+ * $Revision: 1.4 $
  * $Log: gpu_shacrypt_core.cl,v $
+ * Revision 1.4  2026/05/19 12:32:42  dlr
+ * Phase 2 Step C: SHA512CRYPT inner-loop wpc optimization. Replace per-iter sc_init+sc_update+sc_final (byte-RMW plus state-machine) with direct block-construction approach for HASH_WORDS==16. Precompute pu[8] (p_bytes as BE ulong) once before loop; track curin as cu[8] ulong across iterations (no per-iter pack/unpack). Boolean-cube pc = (r and 1) + ((r mod 3)?2:0) + ((r mod 7)?4:0) selects 8 message layouts, matching hashcat m01800 j1+j3+j7 index. SC5_APPEND_CU uses word-copy fast paths (pos==0: direct assign; pos 8-aligned: offset copy; else: bit-extract loop). SHA256CRYPT (HW=8) keeps original sc_update path; hashcat SHA256CRYPT optimized also uses per-iter inline construction. Two-block fallback handles plen > 24 correctly. Metal twin deferred.
+ *
  * Revision 1.3  2026/05/08 19:48:00  dlr
  * Phase 4 SHA512CRYPTMD5: kernel-side algo_mode=1 MD5-preprocess branch in template_finalize. SHA512CRYPTMD5 reuses the SHA512CRYPT kernel program (slot 56 alias); algo_mode discriminates at runtime. Prepares 32-byte MD5 hex of post-rule password and feeds it as the SHA-crypt-2 chain input, matching CPU semantics at mdxfind.c:12225-12232.
  *
@@ -629,7 +632,194 @@ static inline void template_finalize(template_state *st,
     for (int i = 0; i < saltlen; i++)
         s_bytes[i] = digest_b[i];
 
-    /* ---- STEP 5: rounds main loop ---- */
+    /* ---- STEP 5: rounds main loop ----
+     *
+     * Optimized inner loop for SHA512CRYPT (HASH_WORDS == 16):
+     * Replaces per-iter sc_init/sc_update/sc_final (byte-RMW + state-
+     * machine overhead) with a direct block-construction approach.
+     * Mirrors hashcat m01800 wpc[8][16] pattern extended for plen > 15.
+     *
+     * Key changes vs the old loop:
+     *   - curin tracked as ulong cu[8] (BE-encoded) throughout the rounds;
+     *     no per-iter byte-pack/unpack into curin[].
+     *   - p_bytes and s_bytes pre-packed into pu[8] / su[2] ulong arrays
+     *     once before the loop (eliminating repeated byte traversal for
+     *     constant-per-iteration segments).
+     *   - Block constructed via bit-manipulation RMW (same as
+     *     sc_buf_set_byte) but WITHOUT the sc_update circular-buffer state
+     *     machine (no bufpos branch per byte, no counter arithmetic, no
+     *     sc_init IV reset, no sc_final padding helper call).
+     *   - sha512_block called directly with IV-init and the padded block.
+     *   - Single-block (msg < 112B) or two-block (msg >= 112B) handled
+     *     inline; threshold is 112B = 128B block - 16B length field.
+     *
+     * Boolean-cube template index (matches hashcat j1+j3+j7 naming):
+     *   pc = (r&1) + ((r%3)?2:0) + ((r%7)?4:0)
+     *   pc bit 0: r&1  — 0=curin-first, 1=p-first
+     *   pc bit 1: r%3  — 0=no salt,     1=insert s after first seg
+     *   pc bit 2: r%7  — 0=no middle-p, 1=insert extra p after salt
+     * Mapping to mdxfind 4-update branch combination (old code order:
+     * update1 | salt? | midp? | update4):
+     *   pc=0: curin | p           (r%3=0, r%7=0, r&1=0)
+     *   pc=1: p | curin           (r%3=0, r%7=0, r&1=1)
+     *   pc=2: curin | s | p       (r%3=1, r%7=0, r&1=0)
+     *   pc=3: p | s | curin       (r%3=1, r%7=0, r&1=1)
+     *   pc=4: curin | p | p       (r%3=0, r%7=1, r&1=0)
+     *   pc=5: p | p | curin       (r%3=0, r%7=1, r&1=1)
+     *   pc=6: curin | s | p | p   (r%3=1, r%7=1, r&1=0)
+     *   pc=7: p | s | p | curin   (r%3=1, r%7=1, r&1=1)
+     * Semantics are identical to the 4-branch nested if/else above.
+     *
+     * SHA256CRYPT (HASH_WORDS == 8) keeps the original sc_update path:
+     * SHA256's 32B digest in a 64B block has different size constraints;
+     * the 2-block boundary logic differs, and hashcat's SHA256CRYPT
+     * optimized kernel (m07400) also uses per-iter inline construction
+     * rather than a precomputed wpc table.  No speedup regression — the
+     * SHA256CRYPT inner-loop bottleneck is dominated by sha256_block
+     * call count (same as before). Step C explicitly targets SHA512CRYPT.
+     */
+#if HASH_WORDS == 16
+    {
+        /* Pre-pack p_bytes[plen] into pu[8] BE ulong (zeros beyond plen). */
+        ulong pu[8];
+        for (int i = 0; i < 8; i++) pu[i] = 0UL;
+        for (int i = 0; i < plen; i++) {
+            int wi = i >> 3, bi = (7 - (i & 7)) << 3;
+            pu[wi] |= (ulong)(uchar)p_bytes[i] << bi;
+        }
+
+        /* Pack initial curin[64] into cu[8] BE ulong. */
+        ulong cu[8];
+        for (int i = 0; i < 8; i++) {
+            int b = i * 8;
+            cu[i] = ((ulong)curin[b+0] << 56) | ((ulong)curin[b+1] << 48)
+                  | ((ulong)curin[b+2] << 40) | ((ulong)curin[b+3] << 32)
+                  | ((ulong)curin[b+4] << 24) | ((ulong)curin[b+5] << 16)
+                  | ((ulong)curin[b+6] <<  8) | ((ulong)curin[b+7]);
+        }
+
+        for (int r = 0; r < rounds; r++) {
+            int pc = (r & 1) + ((r % 3) ? 2 : 0) + ((r % 7) ? 4 : 0);
+
+            /* blk[16]: first 128-byte message block (primary).
+             * bl2[16]: second 128-byte block (used only when msg >= 112B). */
+            ulong blk[16];
+            ulong bl2[16];
+            for (int i = 0; i < 16; i++) { blk[i] = 0UL; bl2[i] = 0UL; }
+
+            /* pos: byte offset of next byte to write (across blk+bl2 space,
+             * max 256B total). All segments fit within 256B:
+             * max = 64(curin) + 64(p) + 16(s) + 64(p) + 64(p) ... but
+             * actual max per-iter = 64 + 64 + 16 + 64 = 208B < 256B. */
+            int pos = 0;
+
+/* Helper: append N bytes from uchar src[] at byte offset pos in blk/bl2.
+ * Uses bit-manipulation RMW (same discipline as sc_buf_set_byte). */
+#define SC5_APPEND(src, len) \
+            for (int _i = 0; _i < (len); _i++, pos++) { \
+                int _wi = pos >> 3, _bi = (7 - (pos & 7)) << 3; \
+                ulong _v = (ulong)(uchar)(src)[_i] << _bi; \
+                if (_wi < 16) blk[_wi] |= _v; else bl2[_wi - 16] |= _v; \
+            }
+
+/* Helper: append cu[8] ulong BE array (64 bytes) at current pos.
+ * cu[] is updated each iteration — NEVER use the stale curin[] uchar
+ * array here.  Three cases:
+ *   pos==0: blk[] is zero-init; direct ulong assignment (fastest).
+ *   pos word-aligned (pos%8==0, pos!=0): ulong copy with idx offset.
+ *   pos not word-aligned: byte-extract from cu[] with bit-shifts. */
+#define SC5_APPEND_CU() \
+            if (pos == 0) { \
+                for (int _i = 0; _i < 8; _i++) blk[_i] = cu[_i]; \
+                pos = 64; \
+            } else if ((pos & 7) == 0) { \
+                int _bw = pos >> 3; \
+                for (int _i = 0; _i < 8; _i++) { \
+                    int _idx = _bw + _i; \
+                    if (_idx < 16) blk[_idx] |= cu[_i]; \
+                    else bl2[_idx - 16] |= cu[_i]; \
+                } \
+                pos += 64; \
+            } else { \
+                for (int _i = 0; _i < 64; _i++, pos++) { \
+                    int _wi = pos >> 3, _bi = (7 - (pos & 7)) << 3; \
+                    int _ci = _i >> 3, _cbi = (7 - (_i & 7)) * 8; \
+                    ulong _v = ((cu[_ci] >> _cbi) & 0xffUL) << _bi; \
+                    if (_wi < 16) blk[_wi] |= _v; else bl2[_wi-16] |= _v; \
+                } \
+            }
+
+/* Helper: append pu[8] ulong BE array (plen bytes).
+ * Word-aligned fast path when pos is word-aligned and plen is word-aligned;
+ * otherwise byte loop via SC5_APPEND. */
+#define SC5_APPEND_PU() \
+            if ((pos & 7) == 0 && (plen & 7) == 0) { \
+                int _bw = pos >> 3, _nw = plen >> 3; \
+                for (int _i = 0; _i < _nw; _i++) { \
+                    int _idx = _bw + _i; \
+                    if (_idx < 16) blk[_idx] |= pu[_i]; \
+                    else bl2[_idx - 16] |= pu[_i]; \
+                } \
+                pos += plen; \
+            } else { SC5_APPEND(p_bytes, plen) }
+
+            /* Build message segments according to pc index. */
+            if (pc & 1) { SC5_APPEND_PU() } else { SC5_APPEND_CU() }
+            if (pc & 2) { SC5_APPEND(s_bytes, saltlen) }
+            if (pc & 4) { SC5_APPEND_PU() }
+            if (pc & 1) { SC5_APPEND_CU() } else { SC5_APPEND_PU() }
+
+#undef SC5_APPEND
+#undef SC5_APPEND_CU
+#undef SC5_APPEND_PU
+
+            /* Insert SHA512 Merkle-Damgard padding:
+             *   0x80 byte at pos, zeros until length field,
+             *   128-bit BE length at [112..127] (1 block) or [240..255] (2 blocks).
+             * Single-block threshold: pos <= 111 (so 0x80 at 111, length at 112).
+             * Two-block: pos >= 112. */
+            int totbytes = pos;
+            {
+                int _wi = pos >> 3, _bi = (7 - (pos & 7)) << 3;
+                ulong _v = 0x80UL << _bi;
+                if (_wi < 16) blk[_wi] |= _v; else bl2[_wi - 16] |= _v;
+            }
+            ulong bitlen = (ulong)totbytes * 8UL;
+
+            ulong ns[8];
+            ns[0] = SC_IV0_64; ns[1] = SC_IV1_64;
+            ns[2] = SC_IV2_64; ns[3] = SC_IV3_64;
+            ns[4] = SC_IV4_64; ns[5] = SC_IV5_64;
+            ns[6] = SC_IV6_64; ns[7] = SC_IV7_64;
+
+            if (totbytes < 112) {
+                /* Single block: length at blk[14..15] (high=0, low=bitlen). */
+                blk[15] = bitlen;
+                sha512_block(ns, blk);
+            } else {
+                /* Two blocks: length at bl2[14..15]. */
+                bl2[15] = bitlen;
+                sha512_block(ns, blk);
+                sha512_block(ns, bl2);
+            }
+
+            /* Update cu[] = new curin (already in ulong BE form). */
+            for (int i = 0; i < 8; i++) cu[i] = ns[i];
+        }
+
+        /* Extract final curin from cu[8] back into curin[64] for the pack step. */
+        for (int i = 0; i < 8; i++) {
+            ulong w = cu[i];
+            int b = i * 8;
+            curin[b+0] = (uchar)(w >> 56); curin[b+1] = (uchar)(w >> 48);
+            curin[b+2] = (uchar)(w >> 40); curin[b+3] = (uchar)(w >> 32);
+            curin[b+4] = (uchar)(w >> 24); curin[b+5] = (uchar)(w >> 16);
+            curin[b+6] = (uchar)(w >>  8); curin[b+7] = (uchar)(w);
+        }
+    }
+#else
+    /* SHA256CRYPT (HASH_WORDS == 8): keep original sc_update path.
+     * See STEP 5 comment above for rationale (wpc not used for SHA256). */
     for (int r = 0; r < rounds; r++) {
         sc_init(state);
         for (int j = 0; j < 16; j++) ctx_buf[j] = 0;
@@ -659,6 +849,7 @@ static inline void template_finalize(template_state *st,
 
         sc_final(state, ctx_buf, ctx_bufpos, ctx_counter, curin);
     }
+#endif
 
     /* ---- Pack final digest into st->h for compare/emit ----
      *
