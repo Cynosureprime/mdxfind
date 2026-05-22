@@ -30,6 +30,7 @@ Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://j
 mdxfind supports GPU acceleration via OpenCL (NVIDIA, AMD) and Metal (Apple Silicon), using multiple GPUs simultaneously. GPU-accelerated operations include:
 
 - **Salted hashes**: MD5SALT, MD5SALTPASS/PASSSALT, SHA1/SHA256/SHA512 salted variants, HMAC types, DES crypt, MD5 crypt, SHA256/SHA512 crypt, PHPBB3
+- **Composed salted hashes via hx codegen**: MD5MD5SALT (e347) and family. Kernels are emitted in-process from the hx algorithm spec and JIT-compiled on first dispatch, then cached. Apple M2 Max processes a 1M-pair fixture in 0.25s; Pascal GTX 1080 in 1.05s.
 - **Bcrypt**: Full eksblowfish implementation — 620 h/s on RTX 4070 Ti Super (faster than hashcat)
 - **Unsalted iteration** (`-i`): MD5, SHA1, SHA256, MD4/NTLM, SHA512 with GPU hex-iteration loops
 - **RAW binary iteration** (`-i`): MD5RAW, SHA1RAW, SHA256RAW, SHA384RAW, SHA512RAW — binary re-hash (not hex) on GPU
