@@ -1,6 +1,15 @@
 /*
- * $Revision: 1.21 $
+ * $Revision: 1.24 $
  * $Log: metal_common.metal,v $
+ * Revision 1.24  2026/05/23 05:23:01  dlr
+ * sub-phase 5a.4 lift md4_block primitive into metal_common.metal mirror of gpu_common.cl md4_block byte-for-byte Metal twin pointer-state convention thread uint pointer to state plus thread const uint pointer to M same MD4_F G H round functions same round-2 constant 0x5A827999u round-3 constant 0x6ED9EBA1u namespaced via MTL_ prefix per Pattern 2 LE-schedule no byte-swap output sibling to existing rmd160_block sha1_block sha256_block sha512_block validated PASS 8 of 8 on Apple M2 Max Metal byte-exact for e122 MD4MD5PASS family member
+ *
+ * Revision 1.23  2026/05/21 12:41:00  dlr
+ * Phase 1 sub-phase 1a.2 D9.1.b rename overflow_first_rule to num_rules at offset 108 OCLParams field repurposed for kernel A1 A3 source rule count B3 path stops using slot host writes 1 when not applicable update prose comments accordingly
+ *
+ * Revision 1.22  2026/05/21 04:56:55  dlr
+ * Phase 1a sub-phase 1a.1b-continued: claimed reserved32 slots as base_word_idx (80) and packed_size (84) named fields. Added typedef MetalParams OCLParams bridge for translator-driven Metal sources.
+ *
  * Revision 1.21  2026/05/19 13:48:43  dlr
  * Fix MTL_SHA512_F0o and F1o: use arithmetic Ch/Maj forms (no bitselect) since Metal MSL lacks bitselect for scalars. Xcode 26 toolchain on dev1 rejects bitselect for ulong; Metal select takes bool not bitmask. Arithmetic forms are semantically identical.
  *
@@ -156,17 +165,35 @@ struct MetalParams {
     uint  n_prepend;           /*  68: prepend mask positions (-N) */
     uint  n_append;            /*  72: append mask positions (-n) */
     uint  iter_count;          /*  76: per-dispatch iteration (PHPBB3) */
-    uint  reserved32[2];       /*  80-87: reserved (packed kernels reuse) */
+    /* Phase 1a sub-phase 1a.1b-continued (2026-05-20): claim reserved32[2]
+     * as named fields for the two-kernel pipeline. Mirrors OpenCL
+     * gpu/gpu_common.cl rev 1.23. Standard dispatcher leaves these zero;
+     * kernel A1 reads packed_size as output buffer capacity (bytes) and
+     * base_word_idx as kernel A source word index (hit-attribution).
+     * Per feedback_rename_reserved_slots.md: rename in same commit. */
+    uint  base_word_idx;       /*  80-83: kernel A source word index */
+    uint  packed_size;         /*  84-87: kernel A output buffer capacity */
     uint  input_cursor_start;  /*  88: B3 input cursor */
     uint  rule_cursor_start;   /*  92: B3 rule cursor */
     uint  inner_iter;          /*  96: BF inner iteration count */
     uint  overflow_first_set;  /* 100: B3 first-overflow flag */
     uint  overflow_first_word; /* 104: B3 word_idx CAS-min target */
-    uint  overflow_first_rule; /* 108: B3 rule_idx CAS-min target */
+    uint  num_rules;           /* 108: source rule count for kernel A1/A3;
+                                *      reads as 1 when not applicable */
     ulong num_salts_per_page;  /* 112: B6 salt-axis paging */
     uint  algo_mode;           /* 120: B6.6 per-algorithm runtime variant */
     uint  mask_offset_per_word;/* 124: BF chunk word stride; 0 == not BF */
 };
+
+/* Phase 1a sub-phase 1a.1b-continued (2026-05-20): OCLParams typedef
+ * bridge for translator-driven sources. cl2metal.py emits the source-
+ * level type name `OCLParams` (matches the upstream OpenCL .cl source);
+ * Metal's hand-written shared infrastructure uses MetalParams. The two
+ * structs are byte-identical (enforced by static_asserts below + host-
+ * side _Static_asserts in gpu_metal.m). Translator-driven .metal files
+ * include metal_common (which provides MetalParams + this typedef) so
+ * `OCLParams params; params.field;` works without source rewrites. */
+typedef MetalParams OCLParams;
 
 /* Note: Metal does NOT expose `offsetof` from <cstddef> in shader sources;
  * we use the compiler builtin `__builtin_offsetof` which Apple's metal
@@ -210,6 +237,55 @@ static inline uint rotl32(uint x, uint n) {
 #define MTL_MD5_GG(a,b,c,d,m,s,k) { a += ((d&b)|(~d&c)) + m + k; a = b + rotl32(a, (uint)s); }
 #define MTL_MD5_HH(a,b,c,d,m,s,k) { a += (b^c^d) + m + k;        a = b + rotl32(a, (uint)s); }
 #define MTL_MD5_II(a,b,c,d,m,s,k) { a += (c^(~d|b)) + m + k;     a = b + rotl32(a, (uint)s); }
+
+/* --- md4_block: single 64-byte MD4 compress block (RFC 1320).
+ *
+ * Lifted 2026-05-23 from metal_md4_core.metal::md4_compress for the
+ * hx codegen sub-phase 5a.4 e122 MD4MD5PASS family emit. Mirrors
+ * gpu_common.cl::md4_block byte-for-byte (constants match; round
+ * order matches). Same IV as MD5; message schedule is 16 uint32 LE
+ * words (caller packs the 64-byte block into M[0..15] little-endian).
+ * Three rounds of 16 steps each (F/G/H), round-2 constant
+ * 0x5A827999u, round-3 constant 0x6ED9EBA1u, round-1 constant 0.
+ *
+ * Signature uses pointer-state convention `thread uint *state`
+ * matching sha1_block / sha256_block (cl2metal.py rev preserves
+ * call-site addr-of via _BLOCK_HELPERS_POINTER_STATE). The OpenCL
+ * twin uses 4 separate `uint *h0..h3` args; this Metal version takes
+ * a single 4-uint state pointer for register-pressure parity with
+ * other BE-family blocks. The hx family emit body (Metal) calls
+ * md4_block via the pointer-state convention.
+ *
+ * Output is LE; NO byte-swap needed before compact_fp probe. */
+static inline void md4_block(thread uint *state, thread const uint *M)
+{
+    uint a = state[0], b = state[1], c = state[2], d = state[3];
+#define MTL_MD4_F(x,y,z) (((x)&(y)) | ((~(x))&(z)))
+#define MTL_MD4_G(x,y,z) (((x)&(y)) | ((x)&(z)) | ((y)&(z)))
+#define MTL_MD4_H(x,y,z) ((x)^(y)^(z))
+#define MTL_MD4_R1(a,b,c,d,k,s) a = rotl32(a + MTL_MD4_F(b,c,d) + M[k], (uint)(s))
+#define MTL_MD4_R2(a,b,c,d,k,s) a = rotl32(a + MTL_MD4_G(b,c,d) + M[k] + 0x5A827999u, (uint)(s))
+#define MTL_MD4_R3(a,b,c,d,k,s) a = rotl32(a + MTL_MD4_H(b,c,d) + M[k] + 0x6ED9EBA1u, (uint)(s))
+    MTL_MD4_R1(a,b,c,d, 0, 3); MTL_MD4_R1(d,a,b,c, 1, 7); MTL_MD4_R1(c,d,a,b, 2,11); MTL_MD4_R1(b,c,d,a, 3,19);
+    MTL_MD4_R1(a,b,c,d, 4, 3); MTL_MD4_R1(d,a,b,c, 5, 7); MTL_MD4_R1(c,d,a,b, 6,11); MTL_MD4_R1(b,c,d,a, 7,19);
+    MTL_MD4_R1(a,b,c,d, 8, 3); MTL_MD4_R1(d,a,b,c, 9, 7); MTL_MD4_R1(c,d,a,b,10,11); MTL_MD4_R1(b,c,d,a,11,19);
+    MTL_MD4_R1(a,b,c,d,12, 3); MTL_MD4_R1(d,a,b,c,13, 7); MTL_MD4_R1(c,d,a,b,14,11); MTL_MD4_R1(b,c,d,a,15,19);
+    MTL_MD4_R2(a,b,c,d, 0, 3); MTL_MD4_R2(d,a,b,c, 4, 5); MTL_MD4_R2(c,d,a,b, 8, 9); MTL_MD4_R2(b,c,d,a,12,13);
+    MTL_MD4_R2(a,b,c,d, 1, 3); MTL_MD4_R2(d,a,b,c, 5, 5); MTL_MD4_R2(c,d,a,b, 9, 9); MTL_MD4_R2(b,c,d,a,13,13);
+    MTL_MD4_R2(a,b,c,d, 2, 3); MTL_MD4_R2(d,a,b,c, 6, 5); MTL_MD4_R2(c,d,a,b,10, 9); MTL_MD4_R2(b,c,d,a,14,13);
+    MTL_MD4_R2(a,b,c,d, 3, 3); MTL_MD4_R2(d,a,b,c, 7, 5); MTL_MD4_R2(c,d,a,b,11, 9); MTL_MD4_R2(b,c,d,a,15,13);
+    MTL_MD4_R3(a,b,c,d, 0, 3); MTL_MD4_R3(d,a,b,c, 8, 9); MTL_MD4_R3(c,d,a,b, 4,11); MTL_MD4_R3(b,c,d,a,12,15);
+    MTL_MD4_R3(a,b,c,d, 2, 3); MTL_MD4_R3(d,a,b,c,10, 9); MTL_MD4_R3(c,d,a,b, 6,11); MTL_MD4_R3(b,c,d,a,14,15);
+    MTL_MD4_R3(a,b,c,d, 1, 3); MTL_MD4_R3(d,a,b,c, 9, 9); MTL_MD4_R3(c,d,a,b, 5,11); MTL_MD4_R3(b,c,d,a,13,15);
+    MTL_MD4_R3(a,b,c,d, 3, 3); MTL_MD4_R3(d,a,b,c,11, 9); MTL_MD4_R3(c,d,a,b, 7,11); MTL_MD4_R3(b,c,d,a,15,15);
+#undef MTL_MD4_F
+#undef MTL_MD4_G
+#undef MTL_MD4_H
+#undef MTL_MD4_R1
+#undef MTL_MD4_R2
+#undef MTL_MD4_R3
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+}
 
 /* --- md5_block: single 64-byte MD5 compress block.
  *

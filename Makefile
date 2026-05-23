@@ -110,13 +110,23 @@ endif
 
 # Metal GPU objects (macOS only)
 ifdef METAL_GPU
-  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o
+  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o gpu/gpu_codegen_eligible.o
 endif
 
 # OpenCL GPU objects (Linux, FreeBSD, aarch64)
 ifdef OPENCL_GPU
-  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o
+  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o gpu/gpu_codegen_eligible.o
   CFLAGS += -Igpu
+endif
+
+# hx in-process codegen pipeline (used by both OpenCL and Metal builds)
+# Pulled from codegen/Makefile.frag. Defines CODEGEN_OBJS and CODEGEN_HDRS.
+# codegen/hx_specs_data.c is shipped as a pre-generated build artifact in
+# this repository (regenerated on the iMac via tools/hx8_to_c from hx.8);
+# external builds compile it directly without needing hx.8 or the tool.
+ifneq ($(or $(METAL_GPU),$(OPENCL_GPU)),)
+  include codegen/Makefile.frag
+  MDXFIND_OBJS += $(CODEGEN_OBJS)
 endif
 
 # argon2 fill-block selection: SSE on x86_64, portable ref elsewhere
@@ -216,11 +226,15 @@ gpu_metal.o: gpu_metal.m gpu_metal.h gpujob.h job_types.h gpu/mdxfind_metallib.h
              gpu/metal_template.metal gpu/metal_common.metal \
              $(patsubst gpu/metal_%_core.metal,gpu/metal_%_core_str.h,$(wildcard gpu/metal_*_core.metal)) \
              gpu/metal_common_str.h gpu/metal_template_str.h \
+             gpu/metal_kernel_a_rules_str.h gpu/metal_kernel_a_masks_str.h \
+             gpu/metal_kernel_a_rules_masks_str.h gpu/metal_kernel_a_bruteforce_str.h \
+             gpu/gpu_codegen_eligible.h \
+             codegen/hx_spec.h codegen/hx_walker.h codegen/hx_spec_entry.h hx_vm.h hx_ast.h \
              gpu/gpu_fatal.h gpu/gpu_debug.h
-	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpu_metal.m
+	$(CC) -x objective-c++ $(CFLAGS) -Icodegen -std=c++11 -c gpu_metal.m
 
 gpu/gpujob_metal.o: gpu/gpujob_metal.m gpujob.h job_types.h gpu_metal.h mdxfind.h \
-                    gpu/gpu_fatal.h gpu/gpu_debug.h
+                    gpu/gpu_codegen_eligible.h gpu/gpu_fatal.h gpu/gpu_debug.h
 ifeq ($(UNAME_M),x86_64)
 	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -include emmintrin.h -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
 else
@@ -265,11 +279,16 @@ gpu/gpu_opencl.o: gpu/gpu_opencl.c gpu/gpu_opencl.h gpu/gpu_kernel_cache.h gpujo
                   gpu/gpu_hmac_streebog256_core_str.h gpu/gpu_hmac_streebog512_core_str.h \
                   gpu/gpu_phpbb3_core_str.h gpu/gpu_md5crypt_core_str.h gpu/gpu_shacrypt_core_str.h \
                   gpu/gpu_descrypt_core_str.h gpu/gpu_bcrypt_core_str.h \
+                  gpu/gpu_kernel_a_rules_str.h gpu/gpu_kernel_a_masks_str.h \
+                  gpu/gpu_kernel_a_rules_masks_str.h gpu/gpu_kernel_a_bruteforce_str.h \
+                  gpu/gpu_codegen_eligible.h \
+                  codegen/hx_spec.h codegen/hx_walker.h codegen/hx_spec_entry.h hx_vm.h hx_ast.h \
                   gpu/gpu_fatal.h gpu/gpu_debug.h
-	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/gpu_opencl.c -o gpu/gpu_opencl.o
+	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu -Icodegen $(INCEXTRA) -O3 -pthread -c gpu/gpu_opencl.c -o gpu/gpu_opencl.o
 
-gpu/gpujob_opencl.o: gpu/gpujob_opencl.c gpu/gpu_opencl.h gpujob.h job_types.h mdxfind.h
-	$(CC) -DOPENCL_GPU=1 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/gpujob_opencl.c -o gpu/gpujob_opencl.o
+gpu/gpujob_opencl.o: gpu/gpujob_opencl.c gpu/gpu_opencl.h gpujob.h job_types.h mdxfind.h \
+                     gpu/gpu_codegen_eligible.h gpu/gpu_fatal.h gpu/gpu_debug.h
+	$(CC) -DOPENCL_GPU=1 -I. -Igpu -Icodegen $(INCEXTRA) -O3 -pthread -c gpu/gpujob_opencl.c -o gpu/gpujob_opencl.o
 
 gpu/opencl_dynload.o: gpu/opencl_dynload.c gpu/opencl_dynload.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/opencl_dynload.c -o gpu/opencl_dynload.o
@@ -277,6 +296,13 @@ gpu/opencl_dynload.o: gpu/opencl_dynload.c gpu/opencl_dynload.h
 gpu/gpu_kernel_cache.o: gpu/gpu_kernel_cache.c gpu/gpu_kernel_cache.h
 	$(CC) -DOPENCL_GPU=1 -DCL_TARGET_OPENCL_VERSION=120 -I. -Igpu $(INCEXTRA) -O3 -pthread -c gpu/gpu_kernel_cache.c -o gpu/gpu_kernel_cache.o
 endif
+
+# gpu_codegen_eligible: pure C, used by both OpenCL and Metal builds for
+# the gpu_codegen_kernelb_family_md5pass_eligible admit-predicate helper.
+# No OpenCL/Metal header dependencies; compiled with neither -DOPENCL_GPU
+# nor -DMETAL_GPU.
+gpu/gpu_codegen_eligible.o: gpu/gpu_codegen_eligible.c gpu/gpu_codegen_eligible.h job_types.h
+	$(CC) $(CFLAGS) -c gpu/gpu_codegen_eligible.c -o gpu/gpu_codegen_eligible.o
 
 # _str.h files are pre-generated on the dev machine and committed directly.
 # The .cl/.metal kernel sources are NOT published to this repository.

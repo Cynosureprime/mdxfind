@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.1 $
+ * $Revision: 1.2 $
  * $Log: gpujob_metal.m,v $
+ * Revision 1.2  2026/05/22 00:00:00  dlr
+ * Phase 4 sub-phase 4a.2b wire gpu_metal_kernelb_dispatch_proto into the JOB_MD5MD5SALT route gate. New branch fires after the harness-mode A1 A2 A3 A4 arms when MDXFIND_KERNEL_A_VARIANT is not set so developer-set harness invocations still take precedence. No env-flag gate codegen kernel B is production for e347 on Metal post-4a.2b. Mirrors OpenCL twin gpujob_opencl.c JOB_MD5MD5SALT route which calls gpu_opencl_kernelb_dispatch_proto unconditionally. Underlying dispatcher internally runs kernel A1 cand_rules_phase0 then codegen kernelb_hx_e347_phase0 returns h_hits with nhits set. MDXFIND_HX_CODEGEN equal 0 opt out not supported on Metal underlying dispatcher FATAL exits no legacy hand written kernel B path exists. Standard dispatch fallback at gpu_metal_dispatch_md5_rules reached only when proto path is not fired non e347 ops.
+ *
  * Revision 1.1  2026/05/12 16:23:33  dlr
  * Initial check-in: Phase 2a Metal port GPU worker thread. Single-device gpujob_metal.m, mirrors gpu_gpujob_opencl.c structurally (~3844 LOC OpenCL twin); 784 LOC here strips multi-device, BF telemetry, slab dispatcher, salt-snapshot, hashcat-style mask, and trace-channel scaffolding (memo Phase 2a sections 3-4). Surface: gpujob_init/_shutdown/_available/_batch_max/_queue_depth/_free_count/_print_share_line/_get_free/_get_free_rules/_try_get_free/_submit/_return_free/_overflow_preload_all, gpu_op_category. JOB_MD5 unsalted-with-rules only (rules-engine sole producer of packed slots; slab path retired). Hit-replay collapses 3-axis OpenCL decompose to 1-axis (mask_size=1, nsalts=1). Sentinel op==2000 shutdown protocol matches OpenCL twin. Plain Objective-C (NOT Obj-C++); -fobjc-arc; matches gpu_metal.m build flags. Isolated compile passes on iMac AMD Radeon Pro 580X. Symbols replace Phase 1 stubs at end of gpu_metal.m.
  *
@@ -95,6 +98,18 @@
 #include "gpujob.h"
 #include "gpu_metal.h"
 #include "yarn.h"
+/* Sub-phase 5a.5 (2026-05-22): family admit-predicate helper for the
+ * JOB_MD5MD5SALT route-gate widening to the seven 5a-eligible
+ * MAKE_MD5PASS family JOB enums. */
+#include "gpu_codegen_eligible.h"
+
+/* Sub-phase 5a.5 (2026-05-22): CPU full-digest recompute helper used by
+ * the standard hit-replay path for unsalted family JOBs whose digest
+ * exceeds 16 bytes (probe width). Defined in mdxfind.c just above the
+ * validate harness (was static prior to 5a.5; de-staticized for
+ * cross-TU access). Returns digest length in bytes or -1 on error. */
+extern int oracle_compute_md5pass_family(int job_enum, const char *pass,
+                                         int plen, unsigned char *out);
 
 /* User directive 2026-05-17: debug stderr emissions in GPU paths MUST NOT
  * live in the shipped binary. See gpu/gpu_debug.h. */
@@ -147,6 +162,9 @@ extern int      gpu_mask_n_prepend;
 extern int      gpu_mask_n_append;
 extern uint64_t gpu_mask_total;
 extern uint8_t  gpu_mask_sizes[];
+/* Phase 1a sub-phase 1a.2 (2026-05-21): MaskTotal extern for A2 dispatch
+ * arm in the chokepoint. Defined in mdxfind.c line 7482. */
+extern unsigned long long MaskTotal;
 /* Charset rows live in the MTLBuffer owned by gpu_metal.m; the host-side
  * descriptor for hit-replay reconstruction needs the actual character
  * tables, so gpujob_metal.m would need a pointer to them. Phase 2b
@@ -391,6 +409,15 @@ static int metal_gpu_hash_words(int op)
     case JOB_SHA1PASSSALT: /* Phase 2d.3.4: 5 uint32 (sha1(pass||salt)) */
     case JOB_SHA1SALTPASS: /* Phase 2d.3.5: 5 uint32 (sha1(salt||pass)) */
     case JOB_RMD160:      /* Phase 2d.6.1: 5 uint32 (RIPEMD-160 LE; FIRST RIPEMD-family) */
+    /* Sub-phase 5a.5 (2026-05-22): family hit-replay width. The codegen
+     * family kernel emits only 4 uint32 hash words to the hit record
+     * (probe uses first 16 bytes for compact_fp), but checkhash needs
+     * the algorithm's true hexlen for output formatting. checkhash's
+     * full-digest verification against HashDataBuf uses the FULL stored
+     * hash; the 4-uint probe match plus full-width compare correctly
+     * filters false positives for digest widths > 16 bytes. */
+    case JOB_RMD160MD5PASS: /* e159: rmd160(hex32(md5(pass))||pass) = 20 bytes = 5 uint32 */
+    case JOB_SHA1MD5PASS:   /* e161: sha1(hex32(md5(pass))||pass)   = 20 bytes = 5 uint32 */
         return 5;
     case JOB_RMD320:      /* Phase 2d.6.2: 10 uint32 (RIPEMD-320 LE; widest mask-category digest) */
         return 10;
@@ -398,6 +425,7 @@ static int metal_gpu_hash_words(int op)
     case JOB_SHA224SALTPASS:   /* Forward-stage 2d.4.x: 7 uint32 (sha224(salt||pass)) */
     case JOB_KECCAK224:        /* Phase 2d.7b.2: 7 uint32 (Keccak-224 = 28-byte LE digest) */
     case JOB_SHA3_224:         /* Phase 2d.7b.5: 7 uint32 (SHA3-224 = 28-byte LE digest) */
+    case JOB_SHA224MD5PASS:    /* Sub-phase 5a.5: e163 = 28 bytes = 7 uint32 (family codegen) */
         return 7;
     case JOB_SHA256:           /* Phase 2d.4.1: 8 uint32 (raw SHA-256, 32-byte digest) -- CANARY */
     case JOB_SHA256RAW:        /* Forward-stage 2d.4.x: 8 uint32 (binary-digest re-feed) */
@@ -412,12 +440,14 @@ static int metal_gpu_hash_words(int op)
     case JOB_HMAC_STREEBOG256_KSALT: /* Phase 2d.7d.2: 8 uint32 (HMAC-STREEBOG-256 KSALT = 32-byte LE digest) */
     case JOB_HMAC_STREEBOG256_KPASS: /* Phase 2d.7d.2: 8 uint32 (HMAC-STREEBOG-256 KPASS = 32-byte LE digest; shares kernel with KSALT) */
     case JOB_SHA256CRYPT:      /* Phase 2d.8b: 8 uint32 (SHA-256 crypt = 32-byte LE digest; SHACRYPT shared core at HASH_WORDS=8) -- canary for the SHACRYPT triple */
+    case JOB_SHA256MD5PASS:    /* Sub-phase 5a.5: e165 = 32 bytes = 8 uint32 (family codegen) */
         return 8;
     case JOB_SHA384:           /* Forward-stage 2d.5.x: 12 uint32 (48-byte digest) */
     case JOB_SHA384RAW:        /* Forward-stage 2d.5.x: 12 uint32 (binary-digest re-feed) */
     case JOB_SHA384SALTPASS:   /* Forward-stage 2d.5.x: 12 uint32 (sha384(salt||pass)) */
     case JOB_KECCAK384:        /* Phase 2d.7b.3: 12 uint32 (Keccak-384 = 48-byte LE digest) */
     case JOB_SHA3_384:         /* Phase 2d.7b.7: 12 uint32 (SHA3-384 = 48-byte LE digest) */
+    case JOB_SHA384MD5PASS:    /* Sub-phase 5a.5: e167 = 48 bytes = 12 uint32 (family codegen) */
         return 12;
     case JOB_SHA512:           /* Phase 2d.5.1: 16 uint32 (raw SHA-512, 64-byte digest) -- CANARY (FIRST 64-bit-state family) */
     case JOB_SHA512RAW:        /* Forward-stage 2d.5.x: 16 uint32 (binary-digest re-feed) */
@@ -431,6 +461,7 @@ static int metal_gpu_hash_words(int op)
     case JOB_HMAC_STREEBOG512_KPASS: /* Phase 2d.7d.3: 16 uint32 (HMAC-STREEBOG-512 KPASS = 64-byte LE digest; shares kernel with KSALT) */
     case JOB_SHA512CRYPT:      /* Phase 2d.8b: 16 uint32 (SHA-512 crypt = 64-byte LE digest; SHACRYPT shared core at HASH_WORDS=16) */
     case JOB_SHA512CRYPTMD5:   /* Phase 2d.8b: 16 uint32 (SHA-512 crypt with MD5-preprocess = 64-byte LE digest; SHACRYPT shared core at HASH_WORDS=16; algo_mode=1u) */
+    case JOB_SHA512MD5PASS:    /* Sub-phase 5a.5: e169 = 64 bytes = 16 uint32 (family codegen) */
         return 16;
     case JOB_MD5:         /* 128-bit MD5 / MD4 / MD5RAW / MD4UTF16 = 4 uint32 */
     case JOB_MD4:
@@ -1062,6 +1093,191 @@ static void gpujob_metal_worker(void *arg) {
             uint64_t _disp_t0 = gpu_now_us();
             if (_gpu_first_us == 0) _gpu_first_us = _disp_t0;
 
+            /* Phase 1a sub-phase 1a.1b-continued (2026-05-20): A1 proto
+             * branch. Mirrors gpu/gpujob_opencl.c:983-1075 but A1-only
+             * (kernel B not wired in this Metal sub-phase). Gated on
+             * JOB_MD5MD5SALT + (MDXFIND_KERNEL_B_PROTO env OR
+             * gpu_metal_kernel_a_proto_enabled() == 1).
+             *
+             * On proto fire: dispatcher writes the buffer-quadruple to
+             * MDXFIND_KERNEL_A_TRACE files (zero overhead when unset),
+             * returns non-NULL with nhits=0; we set _proto_fired so the
+             * standard dispatch is skipped (no real cracks emitted in
+             * this sub-phase; harness validates via trace files). */
+            int _proto_fired = 0;
+
+            /* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force)
+             * dispatch arm. Mirrors gpu/gpujob_opencl.c twin. Routes BF
+             * chunks (g->bf_chunk == 1) to cand_bruteforce_phase0 when
+             * MDXFIND_KERNEL_A_VARIANT=4. Placed BEFORE A3/A2/A1 arms
+             * per spec R12 ordering. A4 gate (g->bf_chunk) is structurally
+             * mutually exclusive with A2/A3 gates (!g->bf_chunk). v1
+             * ship: harness-mode (dispatcher dumps the buffer-quadruple
+             * via MDXFIND_KERNEL_A_TRACE; no real cracks; _proto_fired
+             * short-circuits the A3/A2/A1 paths below). NOTE: A4 fires
+             * for ANY op carrying a BF chunk, not just JOB_MD5MD5SALT. */
+            if (g->bf_chunk &&
+                gpu_metal_kernel_a_active_variant() == 4) {
+                int _a4n = 0;
+                uint32_t *_a4res = gpu_metal_kernelA_bruteforce_dispatch(
+                    0 /* dev_idx */, g, &_a4n);
+                if (_a4res != NULL) {
+                    _proto_fired = 1;
+                    nhits = _a4n;       /* always 0 in A4 v1 ship */
+                    hits  = _a4res;     /* non-NULL signal only */
+                }
+            }
+
+            /* Phase 1a sub-phase 1a.3 (2026-05-21): A3 (rules + masks)
+             * dispatch arm. Mirrors gpu/gpujob_opencl.c twin. Routes
+             * JOB_MD5MD5SALT to cand_rules_masks_phase0 when
+             * MDXFIND_KERNEL_A_VARIANT=3 AND BOTH rules and masks are
+             * active. Placed BEFORE the A2 + A1 arms per spec R5. v1
+             * ship: harness-mode (dispatcher dumps the buffer-quadruple
+             * via MDXFIND_KERNEL_A_TRACE; no real cracks; _proto_fired
+             * short-circuits the A2/A1 paths below). */
+            if (g->op == JOB_MD5MD5SALT &&
+                gpu_metal_kernel_a_active_variant() == 3 &&
+                gpu_rule_count > 0 && MaskTotal > 0) {
+                int _a3n = 0;
+                uint32_t *_a3res = gpu_metal_kernelA_rules_masks_dispatch(
+                    0 /* dev_idx */,
+                    g->packed_buf, g->packed_pos,
+                    g->word_offset, g->packed_count,
+                    g->op, &_a3n);
+                if (_a3res != NULL) {
+                    _proto_fired = 1;
+                    nhits = _a3n;       /* always 0 in A3 v1 ship */
+                    hits  = _a3res;     /* non-NULL signal only */
+                }
+            }
+
+            /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only)
+             * dispatch arm. Mirrors gpu/gpujob_opencl.c twin (rev 1.148
+             * post-Phase-4-5). Routes JOB_MD5MD5SALT to
+             * cand_masks_phase0 when MDXFIND_KERNEL_A_VARIANT=2 AND
+             * masks are active. v1 ship: harness-mode (dispatcher dumps
+             * the buffer-quadruple via MDXFIND_KERNEL_A_TRACE; no real
+             * cracks; _proto_fired short-circuits the A1 path below). */
+            if (!_proto_fired &&
+                g->op == JOB_MD5MD5SALT &&
+                gpu_metal_kernel_a_active_variant() == 2 &&
+                MaskTotal > 0) {
+                int _a2n = 0;
+                uint32_t *_a2res = gpu_metal_kernelA_masks_dispatch(
+                    0 /* dev_idx */,
+                    g->packed_buf, g->packed_pos,
+                    g->word_offset, g->packed_count,
+                    g->op, &_a2n);
+                if (_a2res != NULL) {
+                    _proto_fired = 1;
+                    nhits = _a2n;       /* always 0 in A2 v1 ship */
+                    hits  = _a2res;     /* non-NULL signal only */
+                }
+            }
+
+            if (!_proto_fired && g->op == JOB_MD5MD5SALT &&
+                (getenv("MDXFIND_KERNEL_B_PROTO") != NULL ||
+                 gpu_metal_kernel_a_proto_enabled())) {
+                int _pn = 0;
+                uint32_t *_pres = gpu_metal_kernelA_dispatch_proto(
+                    0 /* dev_idx */,
+                    g->packed_buf, g->packed_pos,
+                    g->word_offset, g->packed_count,
+                    g->op, &_pn);
+                if (_pres != NULL) {
+                    _proto_fired = 1;
+                    nhits = _pn;        /* always 0 in A1-only ship */
+                    hits  = _pres;      /* non-NULL signal only */
+                }
+            }
+            /* Phase 4 sub-phase 4a.2b (2026-05-22): Metal kernel-B
+             * production dispatcher. Routes default JOB_MD5MD5SALT
+             * traffic through gpu_metal_kernelb_dispatch_proto which
+             * internally runs (a) kernel A1 cand_rules_phase0 to
+             * produce packed candidates from the (word, rule) cross
+             * product and (b) the codegen-emitted kernelb_hx_e347_phase0
+             * to consume those candidates and emit hits. Mirrors the
+             * OpenCL twin's gpujob_opencl.c JOB_MD5MD5SALT route which
+             * calls gpu_opencl_kernelb_dispatch_proto unconditionally.
+             *
+             * This branch fires AFTER the harness-mode A1/A2/A3/A4
+             * arms above so developer-set MDXFIND_KERNEL_A_VARIANT=N
+             * harness invocations still take precedence (they short-
+             * circuit via _proto_fired and skip both the new kernel-B
+             * production path and the standard dispatch fallback).
+             *
+             * No env-flag gate: the codegen path IS production for
+             * e347 on Metal post-4a.2b. MDXFIND_HX_CODEGEN=0 opt-out
+             * is NOT supported on Metal (no legacy hand-written kernel
+             * B path exists); the dispatcher FATAL-exits if invoked
+             * with the opt-out env var set. */
+            if (!_proto_fired
+                && (g->op == JOB_MD5MD5SALT
+                    || gpu_codegen_kernelb_family_md5pass_eligible(g->op))) {
+                /* Phase 4 sub-phase 4a.2b (2026-05-22) salt snapshot:
+                 * JOB_MD5MD5SALT has op_cat == GPU_CAT_NONE on Metal
+                 * (no family registered), so the needs_salt_snapshot
+                 * path above never fires for this op. Build + upload
+                 * the salt snapshot here once per op-change or first
+                 * dispatch -- the production dispatcher REQUIRES salts
+                 * (the codegen kernel B indexes salt_offsets[salt_start
+                 * + salt_local] every thread). Mirrors OpenCL twin
+                 * gpujob_opencl.c lines 1157-1175.
+                 *
+                 * Sub-phase 5a.5 (2026-05-22): the seven 5a-eligible
+                 * MAKE_MD5PASS family JOB enums route through this same
+                 * branch. The family is unsalted; a 1-byte zero
+                 * placeholder salt is uploaded so the 16-arg kernel
+                 * signature binds cleanly (the family body ignores salt
+                 * contents). Mirrors gpujob_opencl.c family-arm and the
+                 * 5a.3 validate harness pattern at mdxfind.c:38406. */
+                int _is_family =
+                    gpu_codegen_kernelb_family_md5pass_eligible(g->op);
+                if (_is_family) {
+                    if (g->op != current_op || nsalts_packed == 0) {
+                        current_op = g->op;
+                        gpu_metal_set_op(0, g->op);
+                        char _zsalt[1] = { 0 };
+                        uint32_t _zoff = 0;
+                        uint16_t _zlen = 1;
+                        gpu_metal_set_salt(_zsalt, &_zoff, &_zlen, 1);
+                        nsalts_packed = 1;
+                    }
+                } else if (g->op != current_op || nsalts_packed == 0) {
+                    current_op = g->op;
+                    gpu_metal_set_op(0, g->op);
+                    tsalt[0] = 0;
+                    int _pnsalts = build_salt_snapshot(saltsnap, saltpool,
+                                    gpu_salt_judy(g->op), tsalt, Printall);
+                    if (_pnsalts > 0) {
+                        nsalts_packed = gpu_pack_salts_op(saltsnap, _pnsalts,
+                                            salts_packed, soff, slen, pack_map,
+                                            0, g->op);
+                        if (nsalts_packed > 0)
+                            gpu_metal_set_salt(salts_packed, soff, slen,
+                                               nsalts_packed);
+                    }
+                }
+                if (nsalts_packed > 0) {
+                    int _kbn = 0;
+                    uint32_t *_kbres = gpu_metal_kernelb_dispatch_proto(
+                        0 /* dev_idx */,
+                        g->packed_buf, g->packed_pos,
+                        g->word_offset, g->packed_count,
+                        g->op, &_kbn);
+                    if (_kbres != NULL) {
+                        _proto_fired = 1;
+                        nhits = _kbn;
+                        hits  = _kbres;
+                    }
+                }
+                /* If nsalts_packed == 0: no salts available; skip proto
+                 * and fall through to the standard rules-engine path
+                 * (which will also no-op due to the salt guard upstream
+                 * in procjob). */
+            }
+            if (!_proto_fired) {
             hits = gpu_metal_dispatch_md5_rules(
                 0 /* dev_idx */,
                 g->packed_buf, g->packed_pos,
@@ -1072,6 +1288,7 @@ static void gpujob_metal_worker(void *arg) {
                 0 /* bf_num_masks */,
                 0 /* inner_iter */,
                 0 /* bf_fast_eligible */);
+            }
 
             uint64_t _disp_t1 = gpu_now_us();
             _gpu_words      += g->packed_count;
@@ -1848,7 +2065,30 @@ static void gpujob_metal_worker(void *arg) {
                             if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                         }
                     } else {
-                        /* Phase 2a/2b: unsalted MD5 -> checkhash. */
+                        /* Phase 2a/2b: unsalted MD5 -> checkhash.
+                         *
+                         * Sub-phase 5a.5 (2026-05-22): family hit-replay
+                         * recompute. The codegen family kernel emits only
+                         * 4 uint32 hash words to the hit record (probe
+                         * width). For family digests > 16 bytes (sha1+
+                         * rmd160+sha224+sha256+sha384+sha512 outers)
+                         * checkhash's hybrid_check needs the FULL digest
+                         * to verify against HashDataBuf via the hlen
+                         * memcmp. Recompute the full digest from the
+                         * matched plaintext via the CPU oracle in
+                         * mdxfind.c. The 4-uint probe + full-width
+                         * memcmp combination filters false positives
+                         * structurally. */
+                        if (gpu_codegen_kernelb_family_md5pass_eligible(g->op)
+                            && hexlen > 32) {
+                            unsigned char _fulldigest[64];
+                            int _fdlen = oracle_compute_md5pass_family(
+                                g->op, synthetic_job.line,
+                                (int)synthetic_job.clen, _fulldigest);
+                            if (_fdlen > 0 && _fdlen <= 64) {
+                                memcpy(curin.h, _fulldigest, (size_t)_fdlen);
+                            }
+                        }
                         checkhash(&curin, hexlen, iter_num, &synthetic_job);
                     }
                 }

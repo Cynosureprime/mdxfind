@@ -166,8 +166,46 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 #include "gpu_opencl.h"
 #include "gpu_kernel_cache.h"
 #endif
+/* hx codegen sub-phase 2a.1 (2026-05-21): in-process P4 state-machine
+ * walker + trivial-spec harness. OpenCL only at 2a.1; Metal harness
+ * arrived in 2a.4 so the codegen headers are now included on BOTH
+ * GPU-enabled backend builds (they are pure C; no backend symbols). */
+#if defined(OPENCL_GPU) || (defined(__APPLE__) && defined(METAL_GPU))
+#include "codegen/hx_spec.h"
+#include "codegen/hx_walker.h"
+#include "codegen/hx_spec_entry.h"
+/* hx codegen sub-phase 5a.5 (2026-05-22): family admit-predicate helper
+ * for routing the seven 5a-eligible MAKE_MD5PASS family JOB enums through
+ * the production kernel-B codegen dispatcher. Pure C; usable from both
+ * OpenCL and Metal backend builds. */
+#include "gpu/gpu_codegen_eligible.h"
+#endif
 #define NO_JOB_TYPES 1
 #include "gpujob.h"
+
+/* Phase 1a sub-phase 1a.1b Phase 0 (2026-05-20): backend-shim for the
+ * kernel A1 proto enable gate. Rev 1.488 introduced two unconditional
+ * call sites that compile on BOTH backends (chokepoint admit at line
+ * ~11450, need_gpu override at line ~38077) but call the OpenCL-only
+ * symbol gpu_opencl_kernel_a_proto_enabled. This breaks the Metal build
+ * at link time. The shim dispatches by backend macro and is the single
+ * source of truth for both call sites — keep them lockstep via this
+ * helper.
+ *
+ * On CUDA the legacy MDXFIND_KERNEL_B_PROTO env flag is the only gate;
+ * the kernel A1 dispatcher has no CUDA backend (the A1 dispatch lives
+ * in gpu/gpu_opencl.c only, with a Metal twin under construction in
+ * sub-phase 1a.1b). */
+static inline int mdx_kernel_a_proto_enabled(void)
+{
+#if defined(__APPLE__) && defined(METAL_GPU)
+    return gpu_metal_kernel_a_proto_enabled();
+#elif defined(OPENCL_GPU)
+    return gpu_opencl_kernel_a_proto_enabled();
+#else
+    return 0;
+#endif
+}
 #endif
 
 
@@ -197,10 +235,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.485 2026/05/19 17:04:25 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.501 2026/05/23 06:28:15 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.485 2026/05/19 17:04:25 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.501 2026/05/23 06:28:15 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -218,6 +256,54 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.501  2026/05/23 06:28:15  dlr
+ * Sub-phase 5a.5 part B: de-staticize oracle_compute_md5pass_family for gpu/gpujob_opencl.c gpu/gpujob_metal.m hit-replay full-digest recompute (family digests > 16 bytes); widen chokepoint admit OR-chain and need_gpu Dohash override for 7 family JOBs e122 e159 e161 e163 e165 e167 e169 via shared gpu_codegen_kernelb_family_md5pass_eligible helper; salt requirement check preserves natural unsalted-op behavior for family enums no negation needed
+ *
+ * Revision 1.500  2026/05/23 05:23:47  dlr
+ * sub-phase 5a.4 widen MAKE_MD5PASS family validation harness oracle_compute_md5pass_family adds 6 new switch arms beyond e161 SHA1MD5PASS computes outer hash digests via MD4 RIPEMD160 sph_sha224_init sph_sha256 mysha256 sph_sha384_init sph_sha384 mysha512 return digest widths 16 20 28 32 48 64 e123 MD5MD5PASS remains FATAL as outlier multi-emit deferred dlen lookup widened from JOB_SHA1MD5PASS only to switch on all 7 family members compact_fp probe still uses first 16 bytes regardless of full digest width target_job gate widened from target_job equal 161 only to OR-chain across JOB_MD4MD5PASS JOB_RMD160MD5PASS JOB_SHA1MD5PASS JOB_SHA224MD5PASS JOB_SHA256MD5PASS JOB_SHA384MD5PASS JOB_SHA512MD5PASS on both OpenCL backend_id 0 and Metal backend_id 1 dispatch arms cross-arch validated 14 cells PASS on NVIDIA GTX 1080 Pascal 7 cells plus Apple M2 Max dev3 7 cells all 8 of 8 byte-exact
+ *
+ * Revision 1.499  2026/05/23 03:22:11  dlr
+ * sub-phase 5a.3 mdxfind family validate harness Metal branch wires e161 SHA1MD5PASS through hx_family_md5pass_validate_run_shared with backend_id 1 selecting Metal arm; widened function guard from OPENCL_GPU-only to OPENCL_GPU or APPLE and METAL_GPU mirroring hx_e347_validate_run_shared pattern; backend_id 0 OpenCL backend_id 1 Metal both supported with switching on set_compact_table set_salts/set_salt JIT compile via per-backend with_common_keep wrapper dispatch via per-backend kernelb_family_validate_dispatch release pair; added e161 zone setup in Metal harness branch parallel to OpenCL e161 with has_rules 0 unsalted per-thread topology; ran clean Metal e161 smoke PASS 8 of 8 byte-exact on dev3 Apple M2 Max sample digests match Python oracle and OpenCL twin output exactly e347 production and harness regressions on dev3 still PASS e347 OpenCL production on fpga GTX 1080 still finds hit OpenCL e161 regression on fpga still PASS 8 of 8
+ *
+ * Revision 1.498  2026/05/23 02:03:19  dlr
+ * sub-phase 5a.2 family MD5PASS validate harness branch dispatches e161 SHA1MD5PASS to hx_family_md5pass_validate_run_shared parallel sibling to hx_e347_validate_run_shared parses PASS-only fixture lines salt lines silently ignored computes oracle via oracle_compute_md5pass_family switching on job_enum 5a.2 implements e161 only other 5a-supported primitives FATAL with 5a.4 deferred diagnostic plants full-width 20-byte SHA1 oracle into compact table via gpu_opencl_set_compact_table and 1-byte salt placeholder via set_salts kernel ignores; JIT family kernel via with_common_keep using kernelb_hx_codegen_phase0 entry name dispatches via gpu_opencl_kernelb_family_validate_dispatch; diff compares first 4 uints of digest h0 to h3 ignoring sidx slot[1] which is always 0 in family kernel emit; updated all hx_emit_kernel callers in OpenCL and Metal harness branches to pass entry argument per walker signature change byte-exact validated 8 of 8 fixture passes PASS on Pascal GTX 1080 zero diff e347 production regression PASS plaintext found via per-JOB slot map slot=0 entry kernelb_hx_e347_phase0
+ *
+ * Revision 1.497  2026/05/22 05:56:59  dlr
+ * *** empty log message ***
+ *
+ * Revision 1.496  2026/05/22 04:00:31  dlr
+ * sub-phase 2a6 refactor extracts the 2a5 inline harness body into a static helper hx_e347_validate_run_shared at file scope just above build_compact_table backend_id 0 selects OpenCL backend_id 1 selects Metal and the helper handles fixture parsing CPU oracle build compact table plant candidate pack JIT compile via per backend keep wrapper dispatch via per backend e347_validate_dispatch helper and diff in one place so the OpenCL block shrinks from 270 LOC to one call site and the Metal harness branch under METAL_GPU adds the parallel call site instead of copy pasting the body two refactor goals avoid drift between backends and let the Metal validation reuse 100 percent of host side logic includes 2a6 envelope gating MDXFIND_HX_CODEGEN_VALIDATE with backend specific dispatch arms inside the helper helper never returns exits 0 PASS or 1 FAIL after diff print closes Phase 3 cross arch byte exact
+ *
+ * Revision 1.495  2026/05/22 03:33:57  dlr
+ * sub-phase 2a.5 byte-exact validation harness for e347 codegen kernel B inside MDXFIND_HX_CODEGEN block; when MDXFIND_HX_CODEGEN_VALIDATE=1 and target_job=347 and MDXFIND_HX_CODEGEN_FIXTURE set the harness parses fixture lines PASS colon plaintext and SALT colon text computes oracle digests via mymd5 plus prmd5 chaining MD5 hex32 MD5 hex32 MD5 to match case JOB_MD5MD5SALT at mdxfind.c line 23174 plants n_pairs oracle digests into a synthetic compact table allocates a contiguous salt buffer uploads via gpu_opencl_set_compact_table and gpu_opencl_set_salts JIT-compiles codegen kernel via gpu_opencl_jit_compile_source_with_common_keep dispatches via gpu_opencl_e347_validate_dispatch sorts and diffs hits against expected (pi,si) pair set reports PASS or FAIL with up to 10 missing pairs plus 10 digest mismatches plus 3-5 sample byte-exact tuples on success and exits 0 or 1; preserves existing 2a.3 JIT only harness behavior when validate flag is unset
+ *
+ * Revision 1.494  2026/05/22 02:53:32  dlr
+ * sub-phase 2a.4 Metal harness branch alongside OpenCL; mirrors structure exactly; calls hx_emit_kernel with HX_BACKEND_METAL and gpu_metal_jit_compile_source_with_common; widens codegen header includes to cover both OpenCL and METAL_GPU builds
+ *
+ * Revision 1.493  2026/05/22 02:13:49  dlr
+ * sub-phase 2a.3 harness extensions for e347 pattern path. When target_job is 347 populate has_rules=1 and salt_count_regime=BATCH_64 and salt_minlen=1 and salt_maxlen=64 so the tp0 emitter sees a realistic specialization. Route the JIT call through gpu_opencl_jit_compile_source_with_common since the e347 emitter calls OCLParams and md5_block and EMIT_HIT_4_DEDUP_OR_OVERFLOW and probe_compact_idx from gpu_common.cl which must be prepended at clCreateProgramWithSource. Other targets keep the trivial JIT path. Validated on Pascal GTX 1080 fpga.local with e1 e31 e123 e286 regression and e347 new tp0 pattern emission. 12867 bytes dump JIT clean.
+ *
+ * Revision 1.492  2026/05/21 23:23:30  dlr
+ * sub-phase 2a.2: include hx_spec_entry.h for the auto-generated hx_specs_data array. Harness mode replaces the hardcoded trivial 2-op spec with a lookup via hx_specs_lookup(MDXFIND_HX_CODEGEN_JOB or default JOB_MD5). Walker drives off the real production hx_program; JIT validated on Pascal GTX 1080.
+ *
+ * Revision 1.491  2026/05/21 21:32:27  dlr
+ * hx codegen 2a.1: harness mode. Include codegen headers under OPENCL_GPU. Add MDXFIND_HX_CODEGEN env-flag override in need_gpu block so GPU init fires regardless of selected hash types. After GPU init succeeds, drive walker with a trivial 2-op spec (OP_PUSH_PASS plus OP_EMIT_DIGEST), optionally dump via MDXFIND_HX_CODEGEN_DUMP, JIT-compile on dev[0] via gpu_opencl_jit_compile_source (FATAL on failure), and exit(0). Not wired to runtime dispatch path in 2a.1.
+ *
+ * Revision 1.490  2026/05/21 17:59:59  dlr
+ * Sub-phase 1a.4 (A4 brute-force) Phase 6-7 env-flag fixture mode. MDXFIND_KERNEL_A_FIXTURE_BF parses num_words,bf_mask_start,bf_offset_per_word,bf_num_masks after GPU init and -n mask parsing. Synthesizes jobg with bf_chunk=1 plus geometry fields, calls gpu_opencl_kernel_a_bruteforce_dispatch or gpu_metal_kernelA_bruteforce_dispatch directly, exits. Bypasses the BF chunk producer gap on Metal (BF producer at this file line 48890 is gated by ifdef OPENCL_GPU). Both backends exercise identical code path under harness invocation. ~95 LOC inserted between mask-upload block and signal-handler install.
+ *
+ * Revision 1.489  2026/05/21 03:37:21  dlr
+ * Phase 1a sub-phase 1a.1b Phase 0 (latent bug fix). Backend-shim mdx_kernel_a_proto_enabled() dispatches to gpu_metal_kernel_a_proto_enabled (Metal stub returning 0 — Phase 2 of 1a.1b ships the real impl) or gpu_opencl_kernel_a_proto_enabled (existing OpenCL). Both call sites at chokepoint admit and need_gpu override updated. Rev 1.488 introduced an OpenCL-only symbol call that broke the Metal build on dev1.local at link time. Verified clean build on dev1.local Apple M-series.
+ *
+ * Revision 1.488  2026/05/21 02:49:20  dlr
+ * extend chokepoint admit and GPU init gates with gpu_opencl_kernel_a_proto_enabled per sub-phase 1a.1 spec D3.b
+ *
+ * Revision 1.487  2026/05/20 12:38:09  dlr
+ * Fix -w skip-handling: propagate chunk_skip_offset to linehints (Bug 2); add LowSkip to ETA-branch line displays + progress_frac numerator (Bug 1). See memory/project_w_skip_bugs_2026-05-20.md for full analysis. Repro -w 14341564 on rockyou.txt now produces 0 hashes.
+ *
+ * Revision 1.486  2026/05/20 03:43:11  dlr
+ * Phase 4 (2026-05-19): two-kernel pipeline host wiring in mdxfind.c. (1) Chokepoint admit: JOB_MD5MD5SALT added to rules-engine OR-chain when MDXFIND_KERNEL_B_PROTO env flag is set. Not added to gpu_ops[]. (2) Salt guard: JOB_MD5MD5SALT added to nsalts_job negation list (TYPEOPT_NEEDSALT; dispatch is structural no-op without salts). (3) GPU init gate: when MDXFIND_KERNEL_B_PROTO is set and JOB_MD5MD5SALT is in Dohash, force need_gpu=1 so gpu_opencl_init fires even though MD5MD5SALT is not in gpu_ops[]. Validated on fpga GTX 1080: GPU init OK, salt upload OK, proto dispatch fires.
+ *
  * Revision 1.485  2026/05/19 17:04:25  dlr
  * Add wordlist-perf instrumentation. Two new stderr emits: (1) linecount: <file> (N MB): scanned in Xms = Y MB/s, fired after each linecount_file cache-miss scan in linecount_thread. (2) -w skip: N lines (M MB) in Xms = Y MB/s, fired in main wordlist loop when SkipLine transitions to 0. Both report on-disk byte rate via stat sb.st_size and CurfileBytesRead atomic respectively. Cache-hit linecount lookups are not instrumented (zero file I-O). User-requested for wordlist throughput characterization.
  *
@@ -11428,7 +11514,34 @@ while (1) {
           * (e967) remain CPU-only via gpu_op_category default fall-
           * through; only JOB_BCRYPT singleton is admitted here. Phase 6
           * of the slab-retirement ladder (final major slab kernel). */
-         job->op == JOB_BCRYPT) &&
+         job->op == JOB_BCRYPT ||
+         /* Phase 4 sub-phase 4a.1 (2026-05-21): JOB_MD5MD5SALT admitted
+          * unconditionally as production GPU path. The codegen-emitted
+          * kernel B is the production default; legacy hand-written
+          * kernel reachable via MDXFIND_HX_CODEGEN=0 inside the
+          * dispatcher's kernel-selection block. JOB_MD5MD5SALT is still
+          * NOT in gpu_ops[] (the need_gpu override at ~line 38555
+          * activates GPU init specifically for this op). Dispatch routes
+          * through gpujob_opencl.c proto branch which calls
+          * gpu_opencl_kernelb_dispatch_proto. Prior to 4a.1 this admit
+          * was gated on MDXFIND_KERNEL_B_PROTO || mdx_kernel_a_proto_-
+          * enabled so default `-m e347 -G 0` CPU-fell-back; that gate
+          * has been removed.
+          *
+          * Sub-phase 5a.5 (2026-05-22): the seven 5a-eligible
+          * MAKE_MD5PASS family JOB enums (e122 MD4MD5PASS, e159
+          * RMD160MD5PASS, e161 SHA1MD5PASS, e163 SHA224MD5PASS, e165
+          * SHA256MD5PASS, e167 SHA384MD5PASS, e169 SHA512MD5PASS) join
+          * JOB_MD5MD5SALT in the admit OR-chain via the shared
+          * gpu_codegen_kernelb_family_md5pass_eligible() helper. Like
+          * JOB_MD5MD5SALT they are absent from gpu_ops[] (separate
+          * need_gpu override at ~line 39078 activates GPU init for any
+          * family JOB present in Dohash[]). The proto dispatch helper
+          * lazy-JITs per JOB via the per-JOB slot map established in
+          * 5a.2 (OpenCL) and 5a.3 (Metal). e123 MD5MD5PASS is excluded
+          * (multi-emit outlier; deferred to a future codegen sub-phase). */
+         (job->op == JOB_MD5MD5SALT
+          || gpu_codegen_kernelb_family_md5pass_eligible(job->op))) &&
         mask_b71_eligible &&
         !Email && !Keys &&
         !Printall &&
@@ -11690,7 +11803,18 @@ while (1) {
            * gpu_opencl_dispatch_md5_rules early-exits on this_page_-
            * salts==0). Phase 6 of the slab-retirement ladder (final
            * major slab kernel). */
-          job->op != JOB_BCRYPT) ||
+          job->op != JOB_BCRYPT &&
+          /* Phase 4 proto (2026-05-19): JOB_MD5MD5SALT has TYPEOPT_NEEDSALT;
+           * require nsalts_job > 0 or dispatch is a structural no-op. */
+          job->op != JOB_MD5MD5SALT
+          /* Sub-phase 5a.5 (2026-05-22): the seven MAKE_MD5PASS family
+           * JOBs are UNSALTED; they are NATURALLY admitted by this
+           * negation list (family enums don't match any of the salted-op
+           * constants above), so NO edit needed here. The codegen family
+           * kernel ignores salt buffers entirely; a 1-byte zero
+           * placeholder is uploaded by the gpujob_*.c proto route gate
+           * downstream so the 16-arg kernel binding succeeds. */
+          ) ||
          nsalts_job > 0) &&
         len > 0 && len <= GPU_RULES_MAX_INPUT_LEN) {
       /* Maxiter > 1 is now handled by the iter loop inside
@@ -37596,6 +37720,946 @@ static void srl_thread_fn(void *payload) {
 }
 #endif
 
+/* hx codegen sub-phase 2a.6 (2026-05-22): shared validation helper. Both
+ * the OpenCL and Metal harness branches in build_compact_table() call
+ * this function with backend_id = 0 (OpenCL) or 1 (Metal). The function
+ * parses the fixture, computes the CPU oracle for every (pass,salt) pair,
+ * plants the oracle digests into a synthetic compact-fp table, uploads
+ * the table + salts + planted hashes to the GPU via the per-backend
+ * set_compact_table/set_salts entry points, packs candidates, JIT-compiles
+ * the codegen-emitted kernel B via the per-backend _keep wrapper,
+ * dispatches via the per-backend e347_validate_dispatch helper, sorts +
+ * diffs hits against the expected pair set, and exits with code 0 on
+ * byte-exact PASS or code 1 on FAIL.
+ *
+ * The function NEVER RETURNS -- it exits() at the end of the diff stage.
+ * That mirrors the 2a.5 harness behavior: each invocation of mdxfind with
+ * MDXFIND_HX_CODEGEN_VALIDATE=1 runs one validation cell and exits.
+ *
+ * Refactor rationale: ~270 LOC of fixture-parse + oracle-build + compact-
+ * table-plant + candidate-pack + hits-diff was identical between the two
+ * backends; only the JIT entry point name + dispatch function name + a
+ * handful of release calls differ. Extracting the shared logic eliminates
+ * copy-paste drift; the per-backend diff is now ~25 LOC each. */
+#if defined(OPENCL_GPU) || (defined(__APPLE__) && defined(METAL_GPU))
+static void hx_e347_validate_run_shared(int backend_id, char *hxsrc,
+                                        const char *fixture_env,
+                                        const char *hxhost)
+{
+    const char *backend_name = (backend_id == 0) ? "OpenCL" : "Metal";
+
+    if (!fixture_env || !*fixture_env) {
+        fprintf(stderr,
+            "FATAL: %s:%d hx codegen 2a.6 validate (%s): "
+            "MDXFIND_HX_CODEGEN_FIXTURE not set on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    FILE *ff = fopen(fixture_env, "r");
+    if (!ff) {
+        fprintf(stderr,
+            "FATAL: %s:%d hx codegen 2a.6 validate (%s): cannot open "
+            "fixture '%s' on %s (errno=%d)\n",
+            __FILE__, __LINE__, backend_name, fixture_env, hxhost, errno);
+        exit(1);
+    }
+
+    /* --- Parse fixture: PASS:<text> / SALT:<text> / # comments --- */
+    char **passes = NULL; size_t n_pass = 0, cap_pass = 0;
+    char **salts  = NULL; size_t n_salt = 0, cap_salt = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), ff)) {
+        size_t L = strlen(line);
+        while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) {
+            line[--L] = '\0';
+        }
+        if (L == 0 || line[0] == '#') continue;
+        if (L > 5 && memcmp(line, "PASS:", 5) == 0) {
+            if (n_pass == cap_pass) {
+                cap_pass = cap_pass ? cap_pass * 2 : 16;
+                passes = realloc(passes, cap_pass * sizeof(char *));
+            }
+            passes[n_pass++] = strdup(line + 5);
+        } else if (L > 5 && memcmp(line, "SALT:", 5) == 0) {
+            if (n_salt == cap_salt) {
+                cap_salt = cap_salt ? cap_salt * 2 : 16;
+                salts = realloc(salts, cap_salt * sizeof(char *));
+            }
+            salts[n_salt++] = strdup(line + 5);
+        }
+    }
+    fclose(ff);
+    if (n_pass == 0 || n_salt == 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d 2a.6 validate (%s): fixture %s has no PASS "
+            "(n=%zu) or SALT (n=%zu) lines on %s\n",
+            __FILE__, __LINE__, backend_name, fixture_env,
+            n_pass, n_salt, hxhost);
+        exit(1);
+    }
+    size_t n_pairs = n_pass * n_salt;
+    fprintf(stderr,
+        "hx codegen 2a.6 (%s): fixture %s parsed n_pass=%zu n_salt=%zu "
+        "n_pairs=%zu on %s\n",
+        backend_name, fixture_env, n_pass, n_salt, n_pairs, hxhost);
+
+    /* --- Compute CPU oracle digests for every (pass, salt) pair.
+     * Chain: MD5( hex32(MD5(hex32(MD5(pass)))) || salt ) */
+    unsigned char *oracle = (unsigned char *)malloc(n_pairs * 16);
+    if (!oracle) {
+        fprintf(stderr,
+            "FATAL: %s:%d 2a.6 validate (%s): malloc(oracle %zu B) "
+            "failed on %s\n",
+            __FILE__, __LINE__, backend_name, n_pairs * 16, hxhost);
+        exit(1);
+    }
+    for (size_t pi = 0; pi < n_pass; pi++) {
+        unsigned char inner1[16], inner2[16];
+        char hex32a[33], hex32b[33];
+        mymd5((void *)passes[pi], (int)strlen(passes[pi]), inner1);
+        prmd5(inner1, hex32a, 32);
+        hex32a[32] = '\0';
+        mymd5((void *)hex32a, 32, inner2);
+        prmd5(inner2, hex32b, 32);
+        hex32b[32] = '\0';
+
+        for (size_t si = 0; si < n_salt; si++) {
+            size_t slen = strlen(salts[si]);
+            char *concat = (char *)malloc(32 + slen + 1);
+            memcpy(concat, hex32b, 32);
+            memcpy(concat + 32, salts[si], slen);
+            concat[32 + slen] = '\0';
+            unsigned char outd[16];
+            mymd5((void *)concat, (int)(32 + slen), outd);
+            memcpy(oracle + (pi * n_salt + si) * 16, outd, 16);
+            free(concat);
+        }
+    }
+    fprintf(stderr,
+        "hx codegen 2a.6 (%s): oracle digests computed for %zu pairs\n",
+        backend_name, n_pairs);
+
+    /* --- Build synthetic compact-hash table sized for n_pairs. */
+    uint64_t cap_pow2 = 1;
+    while (cap_pow2 < n_pairs * 2) cap_pow2 <<= 1;
+    if (cap_pow2 < 64) cap_pow2 = 64;
+    uint64_t cmask = cap_pow2 - 1;
+    uint32_t *cfp  = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
+    uint32_t *cidx = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
+    unsigned char *hbuf = (unsigned char *)malloc(n_pairs * 16);
+    size_t *hoff = (size_t *)malloc(n_pairs * sizeof(size_t));
+    unsigned short *hlen = (unsigned short *)malloc(n_pairs * sizeof(unsigned short));
+    if (!cfp || !cidx || !hbuf || !hoff || !hlen) {
+        fprintf(stderr,
+            "FATAL: %s:%d 2a.6 validate (%s): alloc compact buffers "
+            "failed on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    for (size_t i = 0; i < n_pairs; i++) {
+        memcpy(hbuf + i * 16, oracle + i * 16, 16);
+        hoff[i] = i * 16;
+        hlen[i] = 16;
+        uint32_t hx = ((uint32_t *)(oracle + i * 16))[0];
+        uint32_t hy = ((uint32_t *)(oracle + i * 16))[1];
+        uint64_t key = ((uint64_t)hy << 32) | hx;
+        uint32_t fp = (uint32_t)(key >> 32);
+        if (fp == 0) fp = 1;
+        uint64_t pos = (key ^ (key >> 32)) & cmask;
+        for (int probe = 0; probe < 256; probe++) {
+            uint64_t p = (pos + probe) & cmask;
+            if (cfp[p] == 0) {
+                cfp[p] = fp;
+                cidx[p] = (uint32_t)i;
+                break;
+            }
+        }
+    }
+    fprintf(stderr,
+        "hx codegen 2a.6 (%s): compact table built cap=%llu mask=0x%llx\n",
+        backend_name,
+        (unsigned long long)cap_pow2, (unsigned long long)cmask);
+
+    /* --- Upload compact table + salts to GPU dev[0] via per-backend
+     * entry points. */
+    if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+        if (gpu_opencl_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
+                hbuf, n_pairs * 16, hoff, n_pairs, hlen) != 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d 2a.6 validate (OpenCL): "
+                "set_compact_table failed on %s dev[0]\n",
+                __FILE__, __LINE__, hxhost);
+            exit(1);
+        }
+#endif
+    } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+        if (gpu_metal_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
+                hbuf, n_pairs * 16, hoff, n_pairs, hlen) != 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d 2a.6 validate (Metal): "
+                "set_compact_table failed on %s dev[0]\n",
+                __FILE__, __LINE__, hxhost);
+            exit(1);
+        }
+#endif
+    }
+
+    /* Pack salts: contiguous buffer + offsets + lens (uint16). */
+    {
+        size_t sbytes = 0;
+        for (size_t si = 0; si < n_salt; si++)
+            sbytes += strlen(salts[si]);
+        char *sbuf = (char *)malloc(sbytes + 16);
+        uint32_t *soff = (uint32_t *)malloc(n_salt * sizeof(uint32_t));
+        uint16_t *slens = (uint16_t *)malloc(n_salt * sizeof(uint16_t));
+        if (!sbuf || !soff || !slens) {
+            fprintf(stderr,
+                "FATAL: %s:%d 2a.6 validate (%s): alloc salt buffers "
+                "failed on %s\n",
+                __FILE__, __LINE__, backend_name, hxhost);
+            exit(1);
+        }
+        size_t pos = 0;
+        for (size_t si = 0; si < n_salt; si++) {
+            size_t L = strlen(salts[si]);
+            memcpy(sbuf + pos, salts[si], L);
+            soff[si]  = (uint32_t)pos;
+            slens[si] = (uint16_t)L;
+            pos += L;
+        }
+        int set_rc = -1;
+        if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+            set_rc = gpu_opencl_set_salts(0, sbuf, soff, slens, (int)n_salt);
+#endif
+        } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+            set_rc = gpu_metal_set_salt(sbuf, soff, slens, (int)n_salt);
+#endif
+        }
+        if (set_rc != 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d 2a.6 validate (%s): set_salts failed "
+                "on %s dev[0] rc=%d\n",
+                __FILE__, __LINE__, backend_name, hxhost, set_rc);
+            exit(1);
+        }
+        free(sbuf); free(soff); free(slens);
+    }
+
+    /* --- Pack candidates: [len_u8][bytes] per word. */
+    size_t pack_bytes = 0;
+    for (size_t pi = 0; pi < n_pass; pi++)
+        pack_bytes += 1 + strlen(passes[pi]);
+    unsigned char *packed = (unsigned char *)malloc(pack_bytes + 16);
+    uint32_t *woff = (uint32_t *)malloc(n_pass * sizeof(uint32_t));
+    if (!packed || !woff) {
+        fprintf(stderr,
+            "FATAL: %s:%d 2a.6 validate (%s): alloc packed words "
+            "failed on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    {
+        size_t pos = 0;
+        for (size_t pi = 0; pi < n_pass; pi++) {
+            size_t L = strlen(passes[pi]);
+            if (L > 255) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.6 validate (%s): pass %zu length "
+                    "%zu > 255 on %s\n",
+                    __FILE__, __LINE__, backend_name, pi, L, hxhost);
+                exit(1);
+            }
+            woff[pi] = (uint32_t)pos;
+            packed[pos++] = (unsigned char)L;
+            memcpy(packed + pos, passes[pi], L);
+            pos += L;
+        }
+        pack_bytes = pos;
+    }
+
+    /* --- JIT codegen kernel via _keep wrapper + dispatch via per-backend
+     * e347_validate_dispatch helper. */
+    int max_hits = (int)n_pairs;
+    if (max_hits < 16) max_hits = 16;
+    uint32_t *vhits = (uint32_t *)calloc((size_t)max_hits * 19, sizeof(uint32_t));
+    int vn_hits = 0;
+    if (!vhits) {
+        fprintf(stderr,
+            "FATAL: %s:%d 2a.6 validate (%s): alloc vhits failed on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+
+    void *jit_handle_a = NULL;   /* OpenCL: cl_program; Metal: MTLLibrary */
+    void *jit_handle_b = NULL;   /* OpenCL: cl_kernel ; Metal: MTLComputePipelineState */
+
+    if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+        struct _cl_program *vprog = NULL;
+        struct _cl_kernel  *vkern = NULL;
+        gpu_opencl_jit_compile_source_with_common_keep(
+            0, hxsrc, "-cl-std=CL1.2",
+            "kernelb_hx_e347_phase0", &vprog, &vkern);
+        jit_handle_a = (void *)vprog;
+        jit_handle_b = (void *)vkern;
+        gpu_opencl_e347_validate_dispatch(
+            0, vkern,
+            packed, (uint32_t)pack_bytes, woff, (uint32_t)n_pass,
+            (uint32_t)n_salt,
+            vhits, &vn_hits, max_hits);
+#endif
+    } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+        gpu_metal_jit_compile_source_with_common_keep(
+            0, hxsrc, "kernelb_hx_e347_phase0",
+            &jit_handle_a, &jit_handle_b);
+        gpu_metal_e347_validate_dispatch(
+            0, jit_handle_b,
+            packed, (uint32_t)pack_bytes, woff, (uint32_t)n_pass,
+            (uint32_t)n_salt,
+            vhits, &vn_hits, max_hits);
+#endif
+    }
+
+    fprintf(stderr,
+        "hx codegen 2a.6 (%s): dispatch returned vn_hits=%d (expected %zu)\n",
+        backend_name, vn_hits, n_pairs);
+
+    /* --- Diff: every (pi, si) pair should appear exactly once. */
+    unsigned char *seen = (unsigned char *)calloc(n_pairs, 1);
+    int extras = 0, mismatches = 0;
+    size_t first_mismatch_print = 0;
+    for (int h = 0; h < vn_hits; h++) {
+        uint32_t *slot = vhits + (size_t)h * 19;
+        uint32_t widx = slot[0];
+        uint32_t sidx = slot[1];
+        if (widx >= n_pass || sidx >= n_salt) {
+            extras++;
+            if (first_mismatch_print < 10) {
+                fprintf(stderr,
+                    "  HIT-EXTRA #%d widx=%u sidx=%u (out of range)\n",
+                    h, widx, sidx);
+                first_mismatch_print++;
+            }
+            continue;
+        }
+        size_t pid = (size_t)widx * n_salt + (size_t)sidx;
+        uint32_t exp0 = ((uint32_t *)(oracle + pid * 16))[0];
+        uint32_t exp1 = ((uint32_t *)(oracle + pid * 16))[1];
+        uint32_t exp2 = ((uint32_t *)(oracle + pid * 16))[2];
+        uint32_t exp3 = ((uint32_t *)(oracle + pid * 16))[3];
+        if (slot[3] != exp0 || slot[4] != exp1 ||
+            slot[5] != exp2 || slot[6] != exp3)
+        {
+            mismatches++;
+            if (first_mismatch_print < 10) {
+                fprintf(stderr,
+                    "  HIT-DIFF #%d (pi=%u si=%u) "
+                    "exp=%08x%08x%08x%08x got=%08x%08x%08x%08x\n",
+                    h, widx, sidx,
+                    exp0, exp1, exp2, exp3,
+                    slot[3], slot[4], slot[5], slot[6]);
+                first_mismatch_print++;
+            }
+        }
+        if (!seen[pid]) seen[pid] = 1;
+    }
+    size_t matched = 0, missing = 0;
+    for (size_t i = 0; i < n_pairs; i++)
+        if (seen[i]) matched++; else missing++;
+    int miss_print = 0;
+    if (missing > 0) {
+        fprintf(stderr, "  Missing pairs (showing first 10):\n");
+        for (size_t i = 0; i < n_pairs && miss_print < 10; i++) {
+            if (!seen[i]) {
+                size_t pi = i / n_salt;
+                size_t si = i % n_salt;
+                fprintf(stderr,
+                    "    pid=%zu pi=%zu si=%zu pass=\"%s\" salt=\"%s\"\n",
+                    i, pi, si, passes[pi], salts[si]);
+                miss_print++;
+            }
+        }
+    }
+
+    int pass_ok = (mismatches == 0 && extras == 0 &&
+                   matched == n_pairs && vn_hits == (int)n_pairs);
+    fprintf(stderr,
+        "hx codegen 2a.6 (%s) RESULT on %s: %s  n_pairs=%zu vn_hits=%d "
+        "matched=%zu missing=%zu extras=%d digest_mismatches=%d\n",
+        backend_name, hxhost,
+        pass_ok ? "PASS" : "FAIL",
+        n_pairs, vn_hits, matched, missing, extras, mismatches);
+
+    if (pass_ok) {
+        fprintf(stderr,
+            "hx codegen 2a.6 (%s) sample byte-exact tuples:\n",
+            backend_name);
+        size_t sample = vn_hits < 5 ? (size_t)vn_hits : 5;
+        for (size_t s = 0; s < sample; s++) {
+            uint32_t *slot = vhits + s * 19;
+            uint32_t widx = slot[0];
+            uint32_t sidx = slot[1];
+            size_t pid = (size_t)widx * n_salt + (size_t)sidx;
+            uint32_t e0 = ((uint32_t *)(oracle + pid * 16))[0];
+            uint32_t e1 = ((uint32_t *)(oracle + pid * 16))[1];
+            uint32_t e2 = ((uint32_t *)(oracle + pid * 16))[2];
+            uint32_t e3 = ((uint32_t *)(oracle + pid * 16))[3];
+            fprintf(stderr,
+                "  [%zu] pass=\"%s\" salt=\"%s\" "
+                "oracle=%08x%08x%08x%08x codegen=%08x%08x%08x%08x\n",
+                s, passes[widx], salts[sidx],
+                e0, e1, e2, e3,
+                slot[3], slot[4], slot[5], slot[6]);
+        }
+    }
+
+    /* Per-backend cleanup. */
+    if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+        gpu_opencl_jit_release_keep(
+            (struct _cl_program *)jit_handle_a,
+            (struct _cl_kernel  *)jit_handle_b);
+#endif
+    } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+        gpu_metal_jit_release_keep(jit_handle_a, jit_handle_b);
+#endif
+    }
+    free(vhits); free(seen);
+    free(packed); free(woff);
+    free(cfp); free(cidx); free(hbuf); free(hoff); free(hlen);
+    free(oracle);
+    for (size_t i = 0; i < n_pass; i++) free(passes[i]);
+    for (size_t i = 0; i < n_salt; i++) free(salts[i]);
+    free(passes); free(salts);
+    free(hxsrc);
+
+    exit(pass_ok ? 0 : 1);
+}
+#endif /* OPENCL_GPU || (APPLE && METAL_GPU) */
+
+/* Sub-phase 5a.2 (2026-05-22): MAKE_MD5PASS family validate harness.
+ * Sibling to hx_e347_validate_run_shared above. Differences from e347:
+ *
+ *   - Fixture has PASS lines only (no SALT lines); family is unsalted.
+ *     Oracle is computed per pass (not per pass*salt cartesian).
+ *   - Oracle dispatch: switches on job_enum so the harness can validate
+ *     any 5a-supported family member by changing only the env. For 5a.2
+ *     only e161 SHA1MD5PASS is implemented; other GPU-eligible algos
+ *     route to the FATAL "5a.4 implements <primitive>" branch.
+ *   - Digest width is per-primitive (e161 SHA1 = 20 bytes). The CPU
+ *     oracle stores the FULL digest into HashDataBuf so any future
+ *     full-width round-trip readback works; the compact_fp probe still
+ *     uses only first 8 bytes (key = h0/h1 64-bit) and EMIT_HIT_4_DEDUP
+ *     emits h0..h3 (16 bytes) -- diff compares those 16 bytes against
+ *     the first 16 bytes of the oracle.
+ *   - Dispatch: gpu_opencl_kernelb_family_validate_dispatch (sibling to
+ *     gpu_opencl_e347_validate_dispatch). For Metal, 5a.3 ships its
+ *     own sibling.
+ *
+ * Sub-phase 5a.3 (2026-05-22): Metal twin enabled. backend_id=0 selects
+ * OpenCL; backend_id=1 selects Metal. Shared front matter (fixture parse,
+ * oracle build, compact-table plant, candidate pack, diff) is identical
+ * between backends; only the JIT compile entry-point + dispatch helper +
+ * release call differ. Function guard widened to include METAL_GPU
+ * mirroring hx_e347_validate_run_shared's pattern.
+ *
+ * Exits 0 on PASS, 1 on FAIL; never returns. */
+#if defined(OPENCL_GPU) || (defined(__APPLE__) && defined(METAL_GPU))
+
+/* Compute oracle digest for a single (pass) per job_enum. Returns
+ * digest length in bytes (e161=20). FATAL on unsupported job_enum.
+ *
+ * Sub-phase 5a.5 (2026-05-22): de-staticized so gpu/gpujob_opencl.c and
+ * gpu/gpujob_metal.m hit-replay paths can call it to recompute the FULL
+ * digest from the matched plaintext (the family kernel emits only the
+ * first 4 uints to the hit record; checkhash for digests > 16 bytes
+ * needs the full digest to verify against HashDataBuf). */
+int
+oracle_compute_md5pass_family(int job_enum, const char *pass, int plen,
+                              unsigned char *out)
+{
+    if (!pass || !out || plen < 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d oracle_compute_md5pass_family: bad args "
+            "(job=%d pass=%p plen=%d out=%p)\n",
+            __FILE__, __LINE__, job_enum, (void*)pass, plen, (void*)out);
+        exit(1);
+    }
+    /* Common prefix: MD5(pass) -> hex32 -> concat with pass. */
+    unsigned char inner[16];
+    mymd5((void *)pass, plen, inner);
+    /* Build hex32(inner) || pass into a private buffer. */
+    int total = 32 + plen;
+    unsigned char *buf = (unsigned char *)malloc((size_t)total + 1);
+    if (!buf) {
+        fprintf(stderr,
+            "FATAL: %s:%d oracle_compute_md5pass_family: malloc(%d) "
+            "failed\n", __FILE__, __LINE__, total + 1);
+        exit(1);
+    }
+    /* prmd5 writes 32 hex chars (no NUL) into linebuf -- it returns a
+     * char* but signature matches what e347 oracle uses. */
+    prmd5(inner, (char *)buf, 32);
+    memcpy(buf + 32, pass, plen);
+
+    switch (job_enum) {
+    case JOB_SHA1MD5PASS:        /* e161 */
+        mysha1((char *)buf, total, out);
+        free(buf);
+        return 20;
+    case JOB_MD4MD5PASS:         /* e122 */
+        MD4((char *)buf, total, out);
+        free(buf);
+        return 16;
+    case JOB_RMD160MD5PASS:      /* e159 */
+        RIPEMD160((char *)buf, total, out);
+        free(buf);
+        return 20;
+    case JOB_SHA224MD5PASS:      /* e163 */
+        {
+            sph_sha224_context c224;
+            sph_sha224_init(&c224);
+            sph_sha224(&c224, buf, total);
+            sph_sha224_close(&c224, out);
+        }
+        free(buf);
+        return 28;
+    case JOB_SHA256MD5PASS:      /* e165 */
+        mysha256((char *)buf, total, out);
+        free(buf);
+        return 32;
+    case JOB_SHA384MD5PASS:      /* e167 */
+        {
+            sph_sha384_context c384;
+            sph_sha384_init(&c384);
+            sph_sha384(&c384, buf, total);
+            sph_sha384_close(&c384, out);
+        }
+        free(buf);
+        return 48;
+    case JOB_SHA512MD5PASS:      /* e169 */
+        mysha512((char *)buf, total, out);
+        free(buf);
+        return 64;
+    /* e123 MD5MD5PASS is outlier (multi-emit, deferred). */
+    case JOB_MD5MD5PASS:
+        fprintf(stderr,
+            "FATAL: %s:%d oracle_compute_md5pass_family: e123 MD5MD5PASS "
+            "is multi-emit (canonical + colon variant); ships in a "
+            "separate sub-phase. CPU continues to handle e123.\n",
+            __FILE__, __LINE__);
+        free(buf);
+        exit(1);
+    default:
+        fprintf(stderr,
+            "FATAL: %s:%d oracle_compute_md5pass_family: e%d not in "
+            "MAKE_MD5PASS family (or in 5b-deferred set).\n",
+            __FILE__, __LINE__, job_enum);
+        free(buf);
+        exit(1);
+    }
+}
+
+static void hx_family_md5pass_validate_run_shared(
+    int backend_id, char *hxsrc, const char *fixture_env,
+    const char *hxhost, int job_enum)
+{
+    const char *backend_name = (backend_id == 0) ? "OpenCL" : "Metal";
+
+    if (backend_id != 0 && backend_id != 1) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a family validate: unknown backend %d "
+            "(0=OpenCL, 1=Metal)\n",
+            __FILE__, __LINE__, backend_id);
+        exit(1);
+    }
+    if (!fixture_env || !*fixture_env) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): "
+            "MDXFIND_HX_CODEGEN_FIXTURE not set on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    FILE *ff = fopen(fixture_env, "r");
+    if (!ff) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): cannot open fixture "
+            "'%s' on %s (errno=%d)\n",
+            __FILE__, __LINE__, backend_name, fixture_env, hxhost, errno);
+        exit(1);
+    }
+
+    /* Parse fixture: PASS:<text> only (family is unsalted; SALT lines
+     * are accepted but ignored for diagnostic clarity). */
+    char **passes = NULL; size_t n_pass = 0, cap_pass = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), ff)) {
+        size_t L = strlen(line);
+        while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) {
+            line[--L] = '\0';
+        }
+        if (L == 0 || line[0] == '#') continue;
+        if (L > 5 && memcmp(line, "PASS:", 5) == 0) {
+            if (n_pass == cap_pass) {
+                cap_pass = cap_pass ? cap_pass * 2 : 16;
+                passes = realloc(passes, cap_pass * sizeof(char *));
+            }
+            passes[n_pass++] = strdup(line + 5);
+        }
+        /* SALT lines silently ignored (family is unsalted). */
+    }
+    fclose(ff);
+    if (n_pass == 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): fixture %s has no "
+            "PASS lines on %s\n",
+            __FILE__, __LINE__, backend_name, fixture_env, hxhost);
+        exit(1);
+    }
+    fprintf(stderr,
+        "hx codegen 5a.2 (%s) e%d: fixture %s parsed n_pass=%zu on %s\n",
+        backend_name, job_enum, fixture_env, n_pass, hxhost);
+
+    /* Compute oracle digests per pass. Width depends on primitive.
+     * Store full width into oracle buffer so round-trip readback works;
+     * planted compact-table entries use the full width too (HashDataBuf
+     * stores full digest; compact_fp is the 64-bit key derived from
+     * first 8 bytes). Sub-phase 5a.4 (2026-05-23) widens from e161-only
+     * to all 7 wired family members.
+     *
+     * MD4=16, RMD160=20, SHA1=20, SHA224=28, SHA256=32, SHA384=48, SHA512=64. */
+    int dlen = 0;
+    switch (job_enum) {
+        case JOB_MD4MD5PASS:    dlen = 16; break;
+        case JOB_RMD160MD5PASS: dlen = 20; break;
+        case JOB_SHA1MD5PASS:   dlen = 20; break;
+        case JOB_SHA224MD5PASS: dlen = 28; break;
+        case JOB_SHA256MD5PASS: dlen = 32; break;
+        case JOB_SHA384MD5PASS: dlen = 48; break;
+        case JOB_SHA512MD5PASS: dlen = 64; break;
+        default: break;
+    }
+    if (dlen == 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a family validate: digest width unknown for "
+            "e%d on %s (5a.4 wires 7 family members; e123 outlier)\n",
+            __FILE__, __LINE__, job_enum, hxhost);
+        exit(1);
+    }
+    unsigned char *oracle = (unsigned char *)malloc((size_t)n_pass * dlen);
+    if (!oracle) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): malloc(oracle %zu B) "
+            "failed on %s\n",
+            __FILE__, __LINE__, backend_name,
+            (size_t)n_pass * dlen, hxhost);
+        exit(1);
+    }
+    for (size_t pi = 0; pi < n_pass; pi++) {
+        int rdlen = oracle_compute_md5pass_family(
+                        job_enum, passes[pi], (int)strlen(passes[pi]),
+                        oracle + pi * dlen);
+        if (rdlen != dlen) {
+            fprintf(stderr,
+                "FATAL: %s:%d 5a.2 family validate: oracle returned "
+                "rdlen=%d (expected %d) for pi=%zu pass=\"%s\"\n",
+                __FILE__, __LINE__, rdlen, dlen, pi, passes[pi]);
+            exit(1);
+        }
+    }
+    fprintf(stderr,
+        "hx codegen 5a.2 (%s) e%d: oracle digests computed (%d bytes each) "
+        "for %zu passes\n",
+        backend_name, job_enum, dlen, n_pass);
+
+    /* Build synthetic compact-hash table sized for n_pass. */
+    uint64_t cap_pow2 = 1;
+    while (cap_pow2 < (uint64_t)n_pass * 2) cap_pow2 <<= 1;
+    if (cap_pow2 < 64) cap_pow2 = 64;
+    uint64_t cmask = cap_pow2 - 1;
+    uint32_t *cfp  = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
+    uint32_t *cidx = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
+    unsigned char *hbuf = (unsigned char *)malloc((size_t)n_pass * dlen);
+    size_t *hoff = (size_t *)malloc(n_pass * sizeof(size_t));
+    unsigned short *hlen =
+        (unsigned short *)malloc(n_pass * sizeof(unsigned short));
+    if (!cfp || !cidx || !hbuf || !hoff || !hlen) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): alloc compact "
+            "buffers failed on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    for (size_t i = 0; i < n_pass; i++) {
+        memcpy(hbuf + i * dlen, oracle + i * dlen, dlen);
+        hoff[i] = i * dlen;
+        hlen[i] = (unsigned short)dlen;
+        uint32_t hx = ((uint32_t *)(oracle + i * dlen))[0];
+        uint32_t hy = ((uint32_t *)(oracle + i * dlen))[1];
+        uint64_t key = ((uint64_t)hy << 32) | hx;
+        uint32_t fp = (uint32_t)(key >> 32);
+        if (fp == 0) fp = 1;
+        uint64_t pos = (key ^ (key >> 32)) & cmask;
+        for (int probe = 0; probe < 256; probe++) {
+            uint64_t p = (pos + probe) & cmask;
+            if (cfp[p] == 0) {
+                cfp[p] = fp;
+                cidx[p] = (uint32_t)i;
+                break;
+            }
+        }
+    }
+    fprintf(stderr,
+        "hx codegen 5a.2 (%s) e%d: compact table built cap=%llu "
+        "mask=0x%llx\n",
+        backend_name, job_enum,
+        (unsigned long long)cap_pow2, (unsigned long long)cmask);
+
+    /* Upload compact table + a single 1-byte salt placeholder (kernel
+     * ignores salts but the buffer slot must bind; both backends'
+     * set_salts/set_salt reject zero-length entries because
+     * clEnqueueWriteBuffer / newBufferWithBytes refuse 0 bytes). */
+    if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+        if (gpu_opencl_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
+                hbuf, (size_t)n_pass * dlen, hoff, n_pass, hlen) != 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d 5a.2 family validate (OpenCL): "
+                "set_compact_table failed on %s dev[0]\n",
+                __FILE__, __LINE__, hxhost);
+            exit(1);
+        }
+        {
+            char zsalt[1] = { 0 };
+            uint32_t zoff = 0;
+            uint16_t zlen = 1;
+            if (gpu_opencl_set_salts(0, zsalt, &zoff, &zlen, 1) != 0) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 5a.2 family validate (OpenCL): set_salts "
+                    "(zero-placeholder) failed on %s dev[0]\n",
+                    __FILE__, __LINE__, hxhost);
+                exit(1);
+            }
+        }
+#endif
+    } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+        if (gpu_metal_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
+                hbuf, (size_t)n_pass * dlen, hoff, n_pass, hlen) != 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d 5a.3 family validate (Metal): "
+                "set_compact_table failed on %s dev[0]\n",
+                __FILE__, __LINE__, hxhost);
+            exit(1);
+        }
+        {
+            char zsalt[1] = { 0 };
+            uint32_t zoff = 0;
+            uint16_t zlen = 1;
+            if (gpu_metal_set_salt(zsalt, &zoff, &zlen, 1) != 0) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 5a.3 family validate (Metal): set_salt "
+                    "(1-byte placeholder) failed on %s dev[0]\n",
+                    __FILE__, __LINE__, hxhost);
+                exit(1);
+            }
+        }
+#endif
+    }
+
+    /* Pack candidates [len_u8][bytes] per word. */
+    size_t pack_bytes = 0;
+    for (size_t pi = 0; pi < n_pass; pi++)
+        pack_bytes += 1 + strlen(passes[pi]);
+    unsigned char *packed = (unsigned char *)malloc(pack_bytes + 16);
+    uint32_t *woff = (uint32_t *)malloc(n_pass * sizeof(uint32_t));
+    if (!packed || !woff) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): alloc packed "
+            "words failed on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    {
+        size_t pos = 0;
+        for (size_t pi = 0; pi < n_pass; pi++) {
+            size_t L = strlen(passes[pi]);
+            if (L > 255) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 5a.2 family validate (%s): pass %zu "
+                    "length %zu > 255 on %s\n",
+                    __FILE__, __LINE__, backend_name, pi, L, hxhost);
+                exit(1);
+            }
+            woff[pi] = (uint32_t)pos;
+            packed[pos++] = (unsigned char)L;
+            memcpy(packed + pos, passes[pi], L);
+            pos += L;
+        }
+        pack_bytes = pos;
+    }
+
+    /* JIT family kernel via _keep wrapper + dispatch via family validate
+     * sibling. Family kernel entry-point is kernelb_hx_codegen_phase0. */
+    int max_hits = (int)n_pass;
+    if (max_hits < 16) max_hits = 16;
+    uint32_t *vhits =
+        (uint32_t *)calloc((size_t)max_hits * 19, sizeof(uint32_t));
+    int vn_hits = 0;
+    if (!vhits) {
+        fprintf(stderr,
+            "FATAL: %s:%d 5a.2 family validate (%s): alloc vhits failed "
+            "on %s\n",
+            __FILE__, __LINE__, backend_name, hxhost);
+        exit(1);
+    }
+    /* JIT handles: per-backend opaque pointers held across dispatch +
+     * released at function exit. */
+    void *fam_jit_a = NULL;   /* OpenCL: cl_program; Metal: MTLLibrary */
+    void *fam_jit_b = NULL;   /* OpenCL: cl_kernel ; Metal: MTLComputePipelineState */
+
+    if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+        struct _cl_program *vprog = NULL;
+        struct _cl_kernel  *vkern = NULL;
+        gpu_opencl_jit_compile_source_with_common_keep(
+            0, hxsrc, "-cl-std=CL1.2",
+            "kernelb_hx_codegen_phase0", &vprog, &vkern);
+        fam_jit_a = (void *)vprog;
+        fam_jit_b = (void *)vkern;
+        gpu_opencl_kernelb_family_validate_dispatch(
+            0, vkern,
+            packed, (uint32_t)pack_bytes, woff, (uint32_t)n_pass,
+            vhits, &vn_hits, max_hits);
+#endif
+    } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+        gpu_metal_jit_compile_source_with_common_keep(
+            0, hxsrc, "kernelb_hx_codegen_phase0",
+            &fam_jit_a, &fam_jit_b);
+        gpu_metal_kernelb_family_validate_dispatch(
+            0, fam_jit_b,
+            packed, (uint32_t)pack_bytes, woff, (uint32_t)n_pass,
+            vhits, &vn_hits, max_hits);
+#endif
+    }
+
+    fprintf(stderr,
+        "hx codegen 5a.2 (%s) e%d: dispatch returned vn_hits=%d "
+        "(expected %zu)\n",
+        backend_name, job_enum, vn_hits, n_pass);
+
+    /* Diff: every pi should appear exactly once. */
+    unsigned char *seen = (unsigned char *)calloc(n_pass, 1);
+    int extras = 0, mismatches = 0;
+    size_t first_mismatch_print = 0;
+    for (int h = 0; h < vn_hits; h++) {
+        uint32_t *slot = vhits + (size_t)h * 19;
+        uint32_t widx = slot[0];
+        /* sidx (slot[1]) is always 0 in family kernel emit. */
+        if (widx >= n_pass) {
+            extras++;
+            if (first_mismatch_print < 10) {
+                fprintf(stderr,
+                    "  HIT-EXTRA #%d widx=%u (out of range, n_pass=%zu)\n",
+                    h, widx, n_pass);
+                first_mismatch_print++;
+            }
+            continue;
+        }
+        uint32_t exp0 = ((uint32_t *)(oracle + widx * dlen))[0];
+        uint32_t exp1 = ((uint32_t *)(oracle + widx * dlen))[1];
+        uint32_t exp2 = ((uint32_t *)(oracle + widx * dlen))[2];
+        uint32_t exp3 = ((uint32_t *)(oracle + widx * dlen))[3];
+        if (slot[3] != exp0 || slot[4] != exp1 ||
+            slot[5] != exp2 || slot[6] != exp3)
+        {
+            mismatches++;
+            if (first_mismatch_print < 10) {
+                fprintf(stderr,
+                    "  HIT-DIFF #%d (pi=%u) exp=%08x%08x%08x%08x "
+                    "got=%08x%08x%08x%08x\n",
+                    h, widx,
+                    exp0, exp1, exp2, exp3,
+                    slot[3], slot[4], slot[5], slot[6]);
+                first_mismatch_print++;
+            }
+        }
+        if (!seen[widx]) seen[widx] = 1;
+    }
+    size_t matched = 0, missing = 0;
+    for (size_t i = 0; i < n_pass; i++)
+        if (seen[i]) matched++; else missing++;
+    int miss_print = 0;
+    if (missing > 0) {
+        fprintf(stderr, "  Missing passes (showing first 10):\n");
+        for (size_t i = 0; i < n_pass && miss_print < 10; i++) {
+            if (!seen[i]) {
+                fprintf(stderr, "    pi=%zu pass=\"%s\"\n", i, passes[i]);
+                miss_print++;
+            }
+        }
+    }
+
+    int pass_ok = (mismatches == 0 && extras == 0 &&
+                   matched == n_pass && vn_hits == (int)n_pass);
+    fprintf(stderr,
+        "hx codegen 5a.2 (%s) e%d RESULT on %s: %s  n_pass=%zu vn_hits=%d "
+        "matched=%zu missing=%zu extras=%d digest_mismatches=%d\n",
+        backend_name, job_enum, hxhost,
+        pass_ok ? "PASS" : "FAIL",
+        n_pass, vn_hits, matched, missing, extras, mismatches);
+
+    if (pass_ok) {
+        fprintf(stderr,
+            "hx codegen 5a.2 (%s) e%d sample byte-exact tuples:\n",
+            backend_name, job_enum);
+        size_t sample = vn_hits < 5 ? (size_t)vn_hits : 5;
+        for (size_t s = 0; s < sample; s++) {
+            uint32_t *slot = vhits + s * 19;
+            uint32_t widx = slot[0];
+            uint32_t e0 = ((uint32_t *)(oracle + widx * dlen))[0];
+            uint32_t e1 = ((uint32_t *)(oracle + widx * dlen))[1];
+            uint32_t e2 = ((uint32_t *)(oracle + widx * dlen))[2];
+            uint32_t e3 = ((uint32_t *)(oracle + widx * dlen))[3];
+            fprintf(stderr,
+                "  [%zu] pass=\"%s\" oracle[0..15]=%08x%08x%08x%08x "
+                "codegen=%08x%08x%08x%08x\n",
+                s, passes[widx],
+                e0, e1, e2, e3,
+                slot[3], slot[4], slot[5], slot[6]);
+        }
+    }
+
+    if (backend_id == 0) {
+#if defined(OPENCL_GPU)
+        gpu_opencl_jit_release_keep(
+            (struct _cl_program *)fam_jit_a,
+            (struct _cl_kernel  *)fam_jit_b);
+#endif
+    } else {
+#if defined(__APPLE__) && defined(METAL_GPU)
+        gpu_metal_jit_release_keep(fam_jit_a, fam_jit_b);
+#endif
+    }
+    free(vhits); free(seen);
+    free(packed); free(woff);
+    free(cfp); free(cidx); free(hbuf); free(hoff); free(hlen);
+    free(oracle);
+    for (size_t i = 0; i < n_pass; i++) free(passes[i]);
+    free(passes);
+    free(hxsrc);
+
+    exit(pass_ok ? 0 : 1);
+}
+#endif /* OPENCL_GPU || (APPLE && METAL_GPU) */
+
 void build_compact_table(void) {
   size_t i;
   uint64_t tsize;
@@ -38038,6 +39102,64 @@ void build_compact_table(void) {
       J1T(grc, Dohash, gpu_ops[gi]);
       if (grc) { need_gpu = 1; break; }
     }
+    /* Phase 4 sub-phase 4a.1 (2026-05-21): JOB_MD5MD5SALT need_gpu
+     * override is now unconditional on Dohash membership. JOB_MD5MD5SALT
+     * remains absent from gpu_ops[] (the existing list of "by default
+     * activate GPU init" ops); per feedback_gpu_init_gate_for_non_gpu_-
+     * ops_dispatch.md the codegen production path still requires this
+     * explicit override to trigger gpu_opencl_init, otherwise the proto
+     * dispatch silently no-ops. Prior to 4a.1 this override was gated
+     * on MDXFIND_KERNEL_B_PROTO || mdx_kernel_a_proto_enabled; that
+     * gate has been removed.
+     *
+     * Sub-phase 5a.5 (2026-05-22): the seven 5a-eligible MAKE_MD5PASS
+     * family JOB enums (e122/e159/e161/e163/e165/e167/e169) join e347
+     * in the override. Like e347 they are absent from gpu_ops[] (kept
+     * out so their being "advertised" as production GPU support
+     * remains scoped to deliberate codegen routing); per
+     * feedback_gpu_init_gate_for_non_gpu_ops_dispatch.md without this
+     * override the GPU subsystem never initializes and the chokepoint
+     * admit silently no-ops. We linear-scan the 7-element family table
+     * via the eligibility helper; first hit forces need_gpu=1. */
+    if (!need_gpu) {
+        Word_t _grc_md5md5salt;
+        J1T(_grc_md5md5salt, Dohash, JOB_MD5MD5SALT);
+        if (_grc_md5md5salt) need_gpu = 1;
+    }
+    if (!need_gpu) {
+        static const int _family_ops[] = {
+            JOB_MD4MD5PASS,    /* e122 */
+            JOB_RMD160MD5PASS, /* e159 */
+            JOB_SHA1MD5PASS,   /* e161 */
+            JOB_SHA224MD5PASS, /* e163 */
+            JOB_SHA256MD5PASS, /* e165 */
+            JOB_SHA384MD5PASS, /* e167 */
+            JOB_SHA512MD5PASS, /* e169 */
+        };
+        for (size_t _fi = 0;
+             _fi < sizeof(_family_ops) / sizeof(_family_ops[0]); _fi++) {
+            Word_t _grc_fam;
+            J1T(_grc_fam, Dohash, (Word_t)_family_ops[_fi]);
+            if (_grc_fam) { need_gpu = 1; break; }
+        }
+    }
+    /* hx codegen sub-phase 2a.1 (2026-05-21): force need_gpu=1 when the
+     * harness mode is explicitly requested via MDXFIND_HX_CODEGEN_JOB or
+     * MDXFIND_HX_CODEGEN_VALIDATE so gpu_opencl_init fires and the
+     * harness can JIT-compile.
+     *
+     * Phase 4 sub-phase 4a.1 (2026-05-21): the gate was previously
+     * `getenv("MDXFIND_HX_CODEGEN")` (presence). That collided with the
+     * 4a.1 production opt-out semantics where MDXFIND_HX_CODEGEN=0 means
+     * "force legacy hand-written kernel for e347" (production dispatch),
+     * NOT "fire harness". Narrowing the harness gate to require an
+     * explicit harness-specific env (_JOB or _VALIDATE) preserves all
+     * existing harness invocations (they all set one of these) and lets
+     * MDXFIND_HX_CODEGEN=0 work as the production opt-out. */
+    if (!need_gpu && (getenv("MDXFIND_HX_CODEGEN_JOB")
+                      || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
+        need_gpu = 1;
+    }
     if (!need_gpu) NoMetal = 1;
   }
   if (Printall) {
@@ -38101,6 +39223,675 @@ void build_compact_table(void) {
     } else if (gpu_ok == 0) {
       fprintf(stderr, "GPU: compact table not ready, GPU disabled\n");
     }
+#if defined(OPENCL_GPU)
+    /* hx codegen sub-phase 2a.1 (2026-05-21): harness mode. When the
+     * env flag is set, drive the in-process P4 state-machine walker
+     * with a TRIVIAL HARDCODED SPEC (2-op pass-through:
+     * OP_PUSH_PASS + OP_EMIT_DIGEST). Optionally dump emitted source
+     * via MDXFIND_HX_CODEGEN_DUMP=/tmp/...  Then JIT-compile the
+     * result against dev[0] (FATAL on any failure per
+     * feedback_external_failures_are_fatal.md) and exit(0).
+     *
+     * 2a.1 is harness-mode only -- codegen is NOT wired to the runtime
+     * dispatch path. Full e347 (MD5MD5SALT) tp0 emission arrives with
+     * sub-phase 2a.3; Metal twin with 2a.4.
+     *
+     * Phase 4 sub-phase 4a.1 (2026-05-21): harness gate narrowed from
+     * `getenv("MDXFIND_HX_CODEGEN")` (presence) to require an explicit
+     * harness-specific env (_JOB or _VALIDATE). Avoids collision with
+     * MDXFIND_HX_CODEGEN=0 production opt-out semantics. */
+    if (gpu_ok == 0
+        && (getenv("MDXFIND_HX_CODEGEN_JOB")
+            || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
+        char hxhost[256] = "unknown";
+        gethostname(hxhost, sizeof(hxhost) - 1);
+
+        /* Sub-phase 2a.2: look up e1 MD5 in the auto-generated
+         * hx_specs_data[] (replaces 2a.1's hardcoded trivial spec).
+         * MDXFIND_HX_CODEGEN_JOB env var overrides the default eN. */
+        int target_job = 1; /* e1 MD5 default */
+        const char *job_env = getenv("MDXFIND_HX_CODEGEN_JOB");
+        if (job_env && *job_env) target_job = atoi(job_env);
+
+        const struct hx_spec_entry *entry = hx_specs_lookup(target_job);
+        if (!entry) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx_specs_lookup(%d) returned NULL on %s "
+                "(check codegen/hx_specs_data.c)\n",
+                __FILE__, __LINE__, target_job, hxhost);
+            exit(1);
+        }
+        if (entry->is_outlier || entry->compile_failed || !entry->program) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen: e%d %s is %s on %s -- routes to "
+                "override path, not codegen\n",
+                __FILE__, __LINE__, entry->job_enum, entry->name,
+                entry->is_outlier ? "outlier" :
+                entry->compile_failed ? "compile_failed" : "no-program",
+                hxhost);
+            exit(1);
+        }
+        fprintf(stderr,
+            "hx codegen: 2a.2 harness using e%d %s `%s` (ncode=%d nvars=%d)\n",
+            entry->job_enum, entry->name, entry->expression,
+            entry->program->ncode, entry->program->nvars);
+
+        struct hx_specialization zone;
+        memset(&zone, 0, sizeof(zone));
+        zone.iter_count_if_fixed = 1;
+        zone.has_rules           = 0;
+        zone.has_masks           = 0;
+        zone.has_bf              = 0;
+        zone.salt_minlen         = 0;
+        zone.salt_maxlen         = 0;
+        zone.salt_count_regime   = HX_SALT_SINGLE;
+        zone.iter_shape          = HX_ITER_NONE;
+        zone.digest_endianness   = HX_DIGEST_LE;
+        zone.emit_width          = 16;
+
+        /* Sub-phase 2a.3 (2026-05-21): for e347 the harness pre-fills
+         * specialization fields that drive the tp0 emitter:
+         *   has_rules=1, salt_count_regime=BATCH_64
+         *   salt_minlen/maxlen left at 0 (the emitted code reads salt
+         *   lengths at runtime from payload->salt_lens[]; baking them
+         *   constant is a later micro-opt).
+         * 2a.5 will exercise edge cases. */
+        if (target_job == 347) {
+            zone.has_rules         = 1;
+            zone.salt_count_regime = HX_SALT_BATCH_64;
+            zone.salt_minlen       = 1;
+            zone.salt_maxlen       = 64;
+        }
+
+        char *hxsrc = NULL;
+        size_t hxcap = 0;
+        /* Sub-phase 5a.2 (2026-05-22): walker signature takes entry so
+         * family emitters can reach the per-program callnames sidecar. */
+        int hxrc = hx_emit_kernel(entry->program, &zone,
+                                  HX_BACKEND_OPENCL, entry,
+                                  &hxsrc, &hxcap);
+        if (hxrc != 0 || !hxsrc) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen walker failed (rc=%d) on %s for e%d %s\n",
+                __FILE__, __LINE__, hxrc, hxhost,
+                entry->job_enum, entry->name);
+            exit(1);
+        }
+        if (hx_dump_source(hxsrc, "MDXFIND_HX_CODEGEN_DUMP") < 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen source dump failed on %s\n",
+                __FILE__, __LINE__, hxhost);
+            exit(1);
+        }
+        /* Sub-phase 2a.5 (2026-05-21): byte-exact validation harness.
+         *
+         * When MDXFIND_HX_CODEGEN_VALIDATE=1 AND target_job==347, drive
+         * the full dispatch-and-diff path: parse fixture, compute CPU
+         * oracle digests, plant them into a synthetic compact table,
+         * JIT codegen kernel via _keep wrapper, dispatch, read hits,
+         * sort + diff against expected (pass,salt) pair set.
+         *
+         * Exits 0 on PASS (zero diff), exits 1 on FAIL.
+         *
+         * Otherwise (validate flag unset OR job != 347): preserve the
+         * 2a.3 JIT-only harness behavior.
+         *
+         * CPU oracle: mdxfind's mymd5 + prmd5 (declared in mdxfind.c
+         * head) implement the canonical chain
+         *     MD5( hex32(MD5(hex32(MD5(pass)))) || salt )
+         * which matches case JOB_MD5MD5SALT: at line 23174 above. */
+        const char *validate_env = getenv("MDXFIND_HX_CODEGEN_VALIDATE");
+        const char *fixture_env  = getenv("MDXFIND_HX_CODEGEN_FIXTURE");
+        int validate_on = (validate_env && *validate_env &&
+                           *validate_env != '0');
+
+        if (target_job == 347 && validate_on) {
+            /* Sub-phase 2a.6 (2026-05-22) refactor: parser + oracle +
+             * diff body extracted into hx_e347_validate_run_shared so the
+             * Metal branch below reuses 100% of the host-side logic. The
+             * helper exits with the validation result code (0 PASS, 1
+             * FAIL) and never returns. */
+            hx_e347_validate_run_shared(0, hxsrc, fixture_env, hxhost);
+            /* NOTREACHED */
+        }
+        /* Sub-phase 5a.4 (2026-05-23): MAKE_MD5PASS family harness
+         * dispatch widened to 7 family members (e122 e159 e161 e163
+         * e165 e167 e169). e123 MD5MD5PASS remains outlier (multi-emit
+         * deferred). The 5a.5 production dispatcher will widen the
+         * admit predicate similarly. */
+        if ((target_job == JOB_MD4MD5PASS    ||
+             target_job == JOB_RMD160MD5PASS ||
+             target_job == JOB_SHA1MD5PASS   ||
+             target_job == JOB_SHA224MD5PASS ||
+             target_job == JOB_SHA256MD5PASS ||
+             target_job == JOB_SHA384MD5PASS ||
+             target_job == JOB_SHA512MD5PASS) && validate_on) {
+            hx_family_md5pass_validate_run_shared(
+                0, hxsrc, fixture_env, hxhost, target_job);
+            /* NOTREACHED */
+        }
+#if 0  /* === 2a.5 inline harness body removed in 2a.6; logic moved to ===
+        * === hx_e347_validate_run_shared above (refactor). Kept inside ===
+        * === a #if 0 block to preserve the original LOC anchors during ===
+        * === git/RCS history review; will be deleted in 2a.7 cleanup.  === */
+        if (target_job == 347 && validate_on) {
+            FILE *ff = fopen(fixture_env, "r");
+            if (!ff) {
+                fprintf(stderr,
+                    "FATAL: %s:%d hx codegen 2a.5 validate: cannot open "
+                    "fixture '%s' on %s (errno=%d)\n",
+                    __FILE__, __LINE__, fixture_env, hxhost, errno);
+                exit(1);
+            }
+            /* --- Parse fixture: PASS:<text> / SALT:<text> / # comments --- */
+            char **passes = NULL; size_t n_pass = 0, cap_pass = 0;
+            char **salts  = NULL; size_t n_salt = 0, cap_salt = 0;
+            char line[4096];
+            while (fgets(line, sizeof(line), ff)) {
+                size_t L = strlen(line);
+                while (L > 0 && (line[L-1] == '\n' || line[L-1] == '\r')) {
+                    line[--L] = '\0';
+                }
+                if (L == 0 || line[0] == '#') continue;
+                if (L > 5 && memcmp(line, "PASS:", 5) == 0) {
+                    if (n_pass == cap_pass) {
+                        cap_pass = cap_pass ? cap_pass * 2 : 16;
+                        passes = realloc(passes, cap_pass * sizeof(char *));
+                    }
+                    passes[n_pass++] = strdup(line + 5);
+                } else if (L > 5 && memcmp(line, "SALT:", 5) == 0) {
+                    if (n_salt == cap_salt) {
+                        cap_salt = cap_salt ? cap_salt * 2 : 16;
+                        salts = realloc(salts, cap_salt * sizeof(char *));
+                    }
+                    salts[n_salt++] = strdup(line + 5);
+                }
+            }
+            fclose(ff);
+            if (n_pass == 0 || n_salt == 0) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.5 validate: fixture %s has no PASS "
+                    "(n=%zu) or SALT (n=%zu) lines on %s\n",
+                    __FILE__, __LINE__, fixture_env,
+                    n_pass, n_salt, hxhost);
+                exit(1);
+            }
+            size_t n_pairs = n_pass * n_salt;
+            fprintf(stderr,
+                "hx codegen 2a.5: fixture %s parsed n_pass=%zu n_salt=%zu "
+                "n_pairs=%zu on %s\n",
+                fixture_env, n_pass, n_salt, n_pairs, hxhost);
+
+            /* --- Compute CPU oracle digests for every (pass, salt) pair.
+             * Chain: MD5( hex32(MD5(hex32(MD5(pass)))) || salt )
+             * Order: outer-major iter over passes; inner iter over salts.
+             * Per-pair plant index == pi * n_salt + si. */
+            unsigned char *oracle =
+                (unsigned char *)malloc(n_pairs * 16);
+            if (!oracle) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.5 validate: malloc(oracle %zu B) "
+                    "failed on %s\n",
+                    __FILE__, __LINE__, n_pairs * 16, hxhost);
+                exit(1);
+            }
+            for (size_t pi = 0; pi < n_pass; pi++) {
+                unsigned char inner1[16], inner2[16];
+                char hex32a[33], hex32b[33];
+                /* MD5(pass) -> inner1 */
+                mymd5((void *)passes[pi], (int)strlen(passes[pi]),
+                      inner1);
+                /* hex32(inner1) -> hex32a */
+                prmd5(inner1, hex32a, 32);
+                hex32a[32] = '\0';
+                /* MD5(hex32a) -> inner2 */
+                mymd5((void *)hex32a, 32, inner2);
+                /* hex32(inner2) -> hex32b */
+                prmd5(inner2, hex32b, 32);
+                hex32b[32] = '\0';
+
+                for (size_t si = 0; si < n_salt; si++) {
+                    size_t slen = strlen(salts[si]);
+                    /* concat hex32b (32) + salt (slen) into temp */
+                    char *concat = (char *)malloc(32 + slen + 1);
+                    memcpy(concat, hex32b, 32);
+                    memcpy(concat + 32, salts[si], slen);
+                    concat[32 + slen] = '\0';
+                    unsigned char outd[16];
+                    mymd5((void *)concat, (int)(32 + slen), outd);
+                    memcpy(oracle + (pi * n_salt + si) * 16, outd, 16);
+                    free(concat);
+                }
+            }
+            fprintf(stderr,
+                "hx codegen 2a.5: oracle digests computed for %zu pairs\n",
+                n_pairs);
+
+            /* --- Build synthetic compact-hash table sized for n_pairs. */
+            uint64_t cap_pow2 = 1;
+            while (cap_pow2 < n_pairs * 2) cap_pow2 <<= 1;
+            if (cap_pow2 < 64) cap_pow2 = 64;
+            uint64_t cmask = cap_pow2 - 1;
+            uint32_t *cfp  = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
+            uint32_t *cidx = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
+            unsigned char *hbuf =
+                (unsigned char *)malloc(n_pairs * 16);
+            size_t *hoff = (size_t *)malloc(n_pairs * sizeof(size_t));
+            unsigned short *hlen =
+                (unsigned short *)malloc(n_pairs * sizeof(unsigned short));
+            if (!cfp || !cidx || !hbuf || !hoff || !hlen) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.5 validate: alloc compact buffers "
+                    "failed on %s\n",
+                    __FILE__, __LINE__, hxhost);
+                exit(1);
+            }
+            for (size_t i = 0; i < n_pairs; i++) {
+                memcpy(hbuf + i * 16, oracle + i * 16, 16);
+                hoff[i] = i * 16;
+                hlen[i] = 16;
+                uint32_t hx = ((uint32_t *)(oracle + i * 16))[0];
+                uint32_t hy = ((uint32_t *)(oracle + i * 16))[1];
+                uint64_t key = ((uint64_t)hy << 32) | hx;
+                uint32_t fp = (uint32_t)(key >> 32);
+                if (fp == 0) fp = 1;
+                /* compact_mix == k ^ (k >> 32) */
+                uint64_t pos = (key ^ (key >> 32)) & cmask;
+                for (int probe = 0; probe < 256; probe++) {
+                    uint64_t p = (pos + probe) & cmask;
+                    if (cfp[p] == 0) {
+                        cfp[p] = fp;
+                        cidx[p] = (uint32_t)i;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr,
+                "hx codegen 2a.5: compact table built cap=%llu mask=0x%llx\n",
+                (unsigned long long)cap_pow2,
+                (unsigned long long)cmask);
+
+            /* --- Upload compact table + salts to GPU dev[0]. */
+            if (gpu_opencl_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
+                    hbuf, n_pairs * 16, hoff, n_pairs, hlen) != 0) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.5 validate: set_compact_table "
+                    "failed on %s dev[0]\n",
+                    __FILE__, __LINE__, hxhost);
+                exit(1);
+            }
+            /* Pack salts: contiguous buffer + offsets + lens (uint16). */
+            {
+                size_t sbytes = 0;
+                for (size_t si = 0; si < n_salt; si++)
+                    sbytes += strlen(salts[si]);
+                char *sbuf = (char *)malloc(sbytes + 16);
+                uint32_t *soff =
+                    (uint32_t *)malloc(n_salt * sizeof(uint32_t));
+                uint16_t *slens =
+                    (uint16_t *)malloc(n_salt * sizeof(uint16_t));
+                if (!sbuf || !soff || !slens) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d 2a.5 validate: alloc salt buffers "
+                        "failed on %s\n",
+                        __FILE__, __LINE__, hxhost);
+                    exit(1);
+                }
+                size_t pos = 0;
+                for (size_t si = 0; si < n_salt; si++) {
+                    size_t L = strlen(salts[si]);
+                    memcpy(sbuf + pos, salts[si], L);
+                    soff[si]  = (uint32_t)pos;
+                    slens[si] = (uint16_t)L;
+                    pos += L;
+                }
+                if (gpu_opencl_set_salts(0, sbuf, soff, slens,
+                                          (int)n_salt) != 0) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d 2a.5 validate: set_salts failed "
+                        "on %s dev[0]\n",
+                        __FILE__, __LINE__, hxhost);
+                    exit(1);
+                }
+                free(sbuf); free(soff); free(slens);
+            }
+
+            /* --- Pack candidates: [len_u8][bytes] per word.
+             * word_offset[pi] = byte index of word pi in the packed buf. */
+            size_t pack_bytes = 0;
+            for (size_t pi = 0; pi < n_pass; pi++)
+                pack_bytes += 1 + strlen(passes[pi]);
+            unsigned char *packed = (unsigned char *)malloc(pack_bytes + 16);
+            uint32_t *woff = (uint32_t *)malloc(n_pass * sizeof(uint32_t));
+            if (!packed || !woff) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.5 validate: alloc packed words "
+                    "failed on %s\n",
+                    __FILE__, __LINE__, hxhost);
+                exit(1);
+            }
+            {
+                size_t pos = 0;
+                for (size_t pi = 0; pi < n_pass; pi++) {
+                    size_t L = strlen(passes[pi]);
+                    if (L > 255) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d 2a.5 validate: pass %zu length "
+                            "%zu > 255 on %s\n",
+                            __FILE__, __LINE__, pi, L, hxhost);
+                        exit(1);
+                    }
+                    woff[pi] = (uint32_t)pos;
+                    packed[pos++] = (unsigned char)L;
+                    memcpy(packed + pos, passes[pi], L);
+                    pos += L;
+                }
+                pack_bytes = pos;
+            }
+
+            /* --- JIT codegen kernel via _keep wrapper. --- */
+            struct _cl_program *vprog = NULL;
+            struct _cl_kernel  *vkern = NULL;
+            gpu_opencl_jit_compile_source_with_common_keep(
+                0, hxsrc, "-cl-std=CL1.2",
+                "kernelb_hx_e347_phase0", &vprog, &vkern);
+
+            /* --- Allocate hit buffer (cap = n_pairs slots). --- */
+            int max_hits = (int)n_pairs;
+            if (max_hits < 16) max_hits = 16;
+            uint32_t *vhits =
+                (uint32_t *)calloc((size_t)max_hits * 19,
+                                    sizeof(uint32_t));
+            int vn_hits = 0;
+            if (!vhits) {
+                fprintf(stderr,
+                    "FATAL: %s:%d 2a.5 validate: alloc vhits failed on %s\n",
+                    __FILE__, __LINE__, hxhost);
+                exit(1);
+            }
+
+            /* --- Dispatch. --- */
+            gpu_opencl_e347_validate_dispatch(
+                0, vkern,
+                packed, (uint32_t)pack_bytes, woff, (uint32_t)n_pass,
+                (uint32_t)n_salt,
+                vhits, &vn_hits, max_hits);
+
+            fprintf(stderr,
+                "hx codegen 2a.5: dispatch returned vn_hits=%d (expected %zu)\n",
+                vn_hits, n_pairs);
+
+            /* --- Diff: every (pi, si) pair should appear exactly once. */
+            unsigned char *seen =
+                (unsigned char *)calloc(n_pairs, 1);
+            int extras = 0, mismatches = 0;
+            size_t first_mismatch_print = 0;
+            for (int h = 0; h < vn_hits; h++) {
+                uint32_t *slot = vhits + (size_t)h * 19;
+                uint32_t widx = slot[0];
+                uint32_t sidx = slot[1];
+                /* iter at slot[2]; digest at slot[3..6] */
+                if (widx >= n_pass || sidx >= n_salt) {
+                    extras++;
+                    if (first_mismatch_print < 10) {
+                        fprintf(stderr,
+                            "  HIT-EXTRA #%d widx=%u sidx=%u (out of range)\n",
+                            h, widx, sidx);
+                        first_mismatch_print++;
+                    }
+                    continue;
+                }
+                size_t pid = (size_t)widx * n_salt + (size_t)sidx;
+                /* Validate digest matches oracle exactly. */
+                uint32_t exp0 = ((uint32_t *)(oracle + pid * 16))[0];
+                uint32_t exp1 = ((uint32_t *)(oracle + pid * 16))[1];
+                uint32_t exp2 = ((uint32_t *)(oracle + pid * 16))[2];
+                uint32_t exp3 = ((uint32_t *)(oracle + pid * 16))[3];
+                if (slot[3] != exp0 || slot[4] != exp1 ||
+                    slot[5] != exp2 || slot[6] != exp3)
+                {
+                    mismatches++;
+                    if (first_mismatch_print < 10) {
+                        fprintf(stderr,
+                            "  HIT-DIFF #%d (pi=%u si=%u) "
+                            "exp=%08x%08x%08x%08x got=%08x%08x%08x%08x\n",
+                            h, widx, sidx,
+                            exp0, exp1, exp2, exp3,
+                            slot[3], slot[4], slot[5], slot[6]);
+                        first_mismatch_print++;
+                    }
+                }
+                if (!seen[pid]) seen[pid] = 1;
+            }
+            size_t matched = 0, missing = 0;
+            for (size_t i = 0; i < n_pairs; i++)
+                if (seen[i]) matched++; else missing++;
+            int miss_print = 0;
+            if (missing > 0) {
+                fprintf(stderr,
+                    "  Missing pairs (showing first 10):\n");
+                for (size_t i = 0; i < n_pairs && miss_print < 10; i++) {
+                    if (!seen[i]) {
+                        size_t pi = i / n_salt;
+                        size_t si = i % n_salt;
+                        fprintf(stderr,
+                            "    pid=%zu pi=%zu si=%zu pass=\"%s\" salt=\"%s\"\n",
+                            i, pi, si, passes[pi], salts[si]);
+                        miss_print++;
+                    }
+                }
+            }
+
+            int pass = (mismatches == 0 && extras == 0 &&
+                        matched == n_pairs && vn_hits == (int)n_pairs);
+            fprintf(stderr,
+                "hx codegen 2a.5 validate RESULT on %s: "
+                "%s  n_pairs=%zu vn_hits=%d matched=%zu missing=%zu "
+                "extras=%d digest_mismatches=%d\n",
+                hxhost,
+                pass ? "PASS" : "FAIL",
+                n_pairs, vn_hits, matched, missing, extras, mismatches);
+
+            /* --- Print 3-5 byte-exact tuples for the report. */
+            if (pass) {
+                fprintf(stderr,
+                    "hx codegen 2a.5 sample byte-exact tuples:\n");
+                size_t sample = vn_hits < 5 ? (size_t)vn_hits : 5;
+                for (size_t s = 0; s < sample; s++) {
+                    uint32_t *slot = vhits + s * 19;
+                    uint32_t widx = slot[0];
+                    uint32_t sidx = slot[1];
+                    size_t pid = (size_t)widx * n_salt + (size_t)sidx;
+                    uint32_t e0 = ((uint32_t *)(oracle + pid * 16))[0];
+                    uint32_t e1 = ((uint32_t *)(oracle + pid * 16))[1];
+                    uint32_t e2 = ((uint32_t *)(oracle + pid * 16))[2];
+                    uint32_t e3 = ((uint32_t *)(oracle + pid * 16))[3];
+                    fprintf(stderr,
+                        "  [%zu] pass=\"%s\" salt=\"%s\" "
+                        "oracle=%08x%08x%08x%08x codegen=%08x%08x%08x%08x\n",
+                        s, passes[widx], salts[sidx],
+                        e0, e1, e2, e3,
+                        slot[3], slot[4], slot[5], slot[6]);
+                }
+            }
+
+            /* Cleanup. */
+            gpu_opencl_jit_release_keep(vprog, vkern);
+            free(vhits); free(seen);
+            free(packed); free(woff);
+            free(cfp); free(cidx); free(hbuf); free(hoff); free(hlen);
+            free(oracle);
+            for (size_t i = 0; i < n_pass; i++) free(passes[i]);
+            for (size_t i = 0; i < n_salt; i++) free(salts[i]);
+            free(passes); free(salts);
+            free(hxsrc);
+
+            exit(pass ? 0 : 1);
+        }
+#endif  /* end 2a.5 inline-harness #if 0 block; logic now in hx_e347_validate_run_shared */
+
+        /* JIT against dev[0]. FATAL on failure (function exits internally).
+         *
+         * Sub-phase 2a.3 (2026-05-21): pattern-recognized fast-paths emit
+         * source that depends on gpu_common.cl symbols (OCLParams,
+         * md5_block, EMIT_HIT_4_DEDUP_OR_OVERFLOW, probe_compact_idx).
+         * Route those through the with-common JIT helper which prepends
+         * gpu_common_str at clCreateProgramWithSource. Other (generic-
+         * dispatch placeholder) emissions remain on the original helper. */
+        if (target_job == 347) {
+            gpu_opencl_jit_compile_source_with_common(0, hxsrc, "-cl-std=CL1.2");
+        } else {
+            gpu_opencl_jit_compile_source(0, hxsrc, "-cl-std=CL1.2");
+        }
+        free(hxsrc);
+        fprintf(stderr,
+            "hx codegen: sub-phase 2a.3 harness complete on %s (e%d %s JIT ok) -- exiting\n",
+            hxhost, entry->job_enum, entry->name);
+        exit(0);
+    }
+#endif
+#if defined(__APPLE__) && defined(METAL_GPU)
+    /* hx codegen sub-phase 2a.4 (2026-05-21): Metal harness branch.
+     * Mirrors the OpenCL harness block above exactly; the only differences
+     * are the backend enum, the JIT helper called, and the stderr log
+     * markers. Both branches are independently gated on MDXFIND_HX_CODEGEN
+     * so a single build can exercise both backends (mutually exclusive at
+     * runtime since each backend's GPU init is platform-conditional).
+     *
+     * Phase 4 sub-phase 4a.1 (2026-05-21): harness gate narrowed from
+     * `getenv("MDXFIND_HX_CODEGEN")` (presence) to require an explicit
+     * harness-specific env (_JOB or _VALIDATE). Avoids collision with
+     * MDXFIND_HX_CODEGEN=0 production opt-out semantics. */
+    if (gpu_ok == 0
+        && (getenv("MDXFIND_HX_CODEGEN_JOB")
+            || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
+        char hxhost[256] = "unknown";
+        gethostname(hxhost, sizeof(hxhost) - 1);
+
+        int target_job = 1;
+        const char *job_env = getenv("MDXFIND_HX_CODEGEN_JOB");
+        if (job_env && *job_env) target_job = atoi(job_env);
+
+        const struct hx_spec_entry *entry = hx_specs_lookup(target_job);
+        if (!entry) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx_specs_lookup(%d) returned NULL on %s "
+                "(check codegen/hx_specs_data.c)\n",
+                __FILE__, __LINE__, target_job, hxhost);
+            exit(1);
+        }
+        if (entry->is_outlier || entry->compile_failed || !entry->program) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen: e%d %s is %s on %s -- routes to "
+                "override path, not codegen\n",
+                __FILE__, __LINE__, entry->job_enum, entry->name,
+                entry->is_outlier ? "outlier" :
+                entry->compile_failed ? "compile_failed" : "no-program",
+                hxhost);
+            exit(1);
+        }
+        fprintf(stderr,
+            "hx codegen: 2a.4 Metal harness using e%d %s `%s` "
+            "(ncode=%d nvars=%d)\n",
+            entry->job_enum, entry->name, entry->expression,
+            entry->program->ncode, entry->program->nvars);
+
+        struct hx_specialization zone;
+        memset(&zone, 0, sizeof(zone));
+        zone.iter_count_if_fixed = 1;
+        zone.has_rules           = 0;
+        zone.has_masks           = 0;
+        zone.has_bf              = 0;
+        zone.salt_minlen         = 0;
+        zone.salt_maxlen         = 0;
+        zone.salt_count_regime   = HX_SALT_SINGLE;
+        zone.iter_shape          = HX_ITER_NONE;
+        zone.digest_endianness   = HX_DIGEST_LE;
+        zone.emit_width          = 16;
+
+        if (target_job == 347) {
+            zone.has_rules         = 1;
+            zone.salt_count_regime = HX_SALT_BATCH_64;
+            zone.salt_minlen       = 1;
+            zone.salt_maxlen       = 64;
+        }
+        /* Sub-phase 5a.3 (2026-05-22): MAKE_MD5PASS family Metal
+         * specialization. Same shape as the OpenCL e161 path: has_rules
+         * is unset (family kernel is per-thread, no SALT_BATCH outer
+         * loop), salts are placeholder-only. The emit-stage uses
+         * salt_minlen/maxlen=1/64 to mirror e347 for byte-identical
+         * banner output (the family kernel body ignores both fields). */
+        if (target_job == 161) {
+            zone.has_rules         = 0;
+            zone.salt_count_regime = HX_SALT_BATCH_64;
+            zone.salt_minlen       = 1;
+            zone.salt_maxlen       = 64;
+        }
+
+        char *hxsrc = NULL;
+        size_t hxcap = 0;
+        /* Sub-phase 5a.2 (2026-05-22): walker signature takes entry. */
+        int hxrc = hx_emit_kernel(entry->program, &zone,
+                                  HX_BACKEND_METAL, entry,
+                                  &hxsrc, &hxcap);
+        if (hxrc != 0 || !hxsrc) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen Metal walker failed (rc=%d) on %s "
+                "for e%d %s\n",
+                __FILE__, __LINE__, hxrc, hxhost,
+                entry->job_enum, entry->name);
+            exit(1);
+        }
+        if (hx_dump_source(hxsrc, "MDXFIND_HX_CODEGEN_DUMP") < 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen Metal source dump failed on %s\n",
+                __FILE__, __LINE__, hxhost);
+            exit(1);
+        }
+
+        /* Sub-phase 2a.6 (2026-05-22): Metal byte-exact validation harness.
+         * Mirrors the OpenCL branch above. When MDXFIND_HX_CODEGEN_VALIDATE
+         * =1 AND target_job==347, drive the full dispatch-and-diff path via
+         * the shared helper hx_e347_validate_run_shared (defined above the
+         * function). backend_id=1 selects the Metal dispatch arm. The helper
+         * exits with code 0 (PASS) or 1 (FAIL); never returns. */
+        const char *m_validate_env = getenv("MDXFIND_HX_CODEGEN_VALIDATE");
+        const char *m_fixture_env  = getenv("MDXFIND_HX_CODEGEN_FIXTURE");
+        int m_validate_on = (m_validate_env && *m_validate_env &&
+                             *m_validate_env != '0');
+        if (target_job == 347 && m_validate_on) {
+            hx_e347_validate_run_shared(1, hxsrc, m_fixture_env, hxhost);
+            /* NOTREACHED */
+        }
+        /* Sub-phase 5a.4 (2026-05-23): Metal twin widened to 7 family
+         * members (e122 e159 e161 e163 e165 e167 e169). e123 outlier. */
+        if ((target_job == JOB_MD4MD5PASS    ||
+             target_job == JOB_RMD160MD5PASS ||
+             target_job == JOB_SHA1MD5PASS   ||
+             target_job == JOB_SHA224MD5PASS ||
+             target_job == JOB_SHA256MD5PASS ||
+             target_job == JOB_SHA384MD5PASS ||
+             target_job == JOB_SHA512MD5PASS) && m_validate_on) {
+            hx_family_md5pass_validate_run_shared(
+                1, hxsrc, m_fixture_env, hxhost, target_job);
+            /* NOTREACHED */
+        }
+
+        /* JIT against dev[0]. FATAL on failure (function exits internally).
+         * The Metal codegen-emitted source for the e347 pattern references
+         * metal_common.metal symbols (md5_block, OCLParams via typedef,
+         * EMIT_HIT_4_DEDUP_OR_OVERFLOW, probe_compact_idx); route through
+         * the with-common JIT helper which prepends metal_common_str at
+         * newLibraryWithSource. */
+        gpu_metal_jit_compile_source_with_common(0, hxsrc);
+        free(hxsrc);
+        fprintf(stderr,
+            "hx codegen: sub-phase 2a.4 Metal harness complete on %s "
+            "(e%d %s JIT ok) -- exiting\n",
+            hxhost, entry->job_enum, entry->name);
+        exit(0);
+    }
+#endif
   }
 #endif
 }
@@ -38964,10 +40755,14 @@ MDXALIGN void ReportStats(void *dummy) {
            * (rules x masks x salts x iters) is complete. Immune to type count
            * and iter shape. Bootstrap fallback uses hash-rate until first tick fires. */
           if (RetiredLines_rate > 0 && total_est > 0) {
-            unsigned long long remaining_lines = (total_est > RetiredLines_now_snap)
-                                                   ? total_est - RetiredLines_now_snap : 0;
+            /* Bug 1 (2026-05-20): include LowSkip in numerator so progress/ETA
+             * remain consistent with no-ETA branches (which display Fileline,
+             * skip-inclusive) and so percent reaches 100% at completion under -w. */
+            unsigned long long retired_inclusive = RetiredLines_now_snap + LowSkip;
+            unsigned long long remaining_lines = (total_est > retired_inclusive)
+                                                   ? total_est - retired_inclusive : 0;
             remaining = (RetiredLines_rate > 0) ? (double)remaining_lines / RetiredLines_rate : 0;
-            progress_frac = (total_est > 0) ? (double)RetiredLines_now_snap / (double)total_est : 0;
+            progress_frac = (total_est > 0) ? (double)retired_inclusive / (double)total_est : 0;
             if (progress_frac > 1.0) progress_frac = 1.0;
             if (remaining <= 0 && wq > 0)
               snprintf(eta, sizeof(eta), "finishing");
@@ -39018,14 +40813,14 @@ MDXALIGN void ReportStats(void *dummy) {
           if (gpujob_available())
             tsfprintf(stderr, "Working on %s, w=%ld, gq=%d/%d, line %llu, %.2f lines/s (%.1f%%), %.2f%sh/s, Found=%llu, ETA%c%s\n",
                   Curfile, wq, gpujob_queue_depth(), gpujob_free_count(),
-                  RetiredLines_rate > 0 ? RetiredLines_now_snap : TotLines,
+                  (RetiredLines_rate > 0 ? RetiredLines_now_snap : TotLines) + LowSkip,
                   RetiredLines_rate > 0 ? RetiredLines_rate : lps,
                   100.0*progress_frac, hps, mult1, Totfound, prefix, eta);
           else
 #endif
             tsfprintf(stderr, "Working on %s, w=%ld, line %llu, %.2f lines/s (%.1f%%), %.2f%sh/s, Found=%llu, ETA%c%s\n",
                   Curfile, wq,
-                  RetiredLines_rate > 0 ? RetiredLines_now_snap : TotLines,
+                  (RetiredLines_rate > 0 ? RetiredLines_now_snap : TotLines) + LowSkip,
                   RetiredLines_rate > 0 ? RetiredLines_rate : lps,
                   100.0*progress_frac, hps, mult1, Totfound, prefix, eta);
         } else {
@@ -48668,6 +50463,139 @@ usage:
     }
   }
 #endif
+
+  /* Phase 1a sub-phase 1a.4 (2026-05-21): kernel A4 (brute-force)
+   * harness fixture env-mode. Per feedback_metal_bf_chunk_producer_gap.md,
+   * the BF chunk producer at line 48890 is gated #if defined(OPENCL_GPU),
+   * so the normal `mdxfind -n "?d?d"` CLI invocation cannot exercise A4
+   * end-to-end on Metal builds (g->bf_chunk never gets set). This shim
+   * synthesizes a jobg with bf_chunk=1 + geometry, then calls the
+   * backend dispatcher DIRECTLY. Bypasses the producer entirely so the
+   * Python harness sees identical behavior on both backends.
+   *
+   * Env var: MDXFIND_KERNEL_A_FIXTURE_BF=<num_words>,<bf_mask_start>,
+   *          <bf_offset_per_word>,<bf_num_masks>
+   *
+   * Preconditions when this fires:
+   *   - MDXFIND_KERNEL_A_PROTO=1 + MDXFIND_KERNEL_A_VARIANT=4
+   *   - -n "<mask>" was parsed during getopt -> MaskAppendPattern + Mask-
+   *     Classes[] populated
+   *   - GPU subsystem initialized (build_compact_table ran during getopt
+   *     processing)
+   *   - gpu_*_set_mask uploaded MaskAppendPattern to the slab-style
+   *     buffers (used by template kernels, not by A4; A4 uses its own
+   *     b_kern_a_mask_* buffers via gpu_opencl_kernel_a_upload_mask_buffers
+   *     which lazy-uploads from MaskAppendPattern directly)
+   *
+   * Behavior: synthesize jobg, dispatch, exit. NO wordlist reading, NO
+   * hash file parsing, NO procjob threads. The kernel writes to the
+   * MDXFIND_KERNEL_A_TRACE files; harness picks up from there. */
+#ifdef GPU_ENABLED
+  {
+    const char *bf_fixture = getenv("MDXFIND_KERNEL_A_FIXTURE_BF");
+    if (bf_fixture != NULL && *bf_fixture != '\0') {
+      uint32_t fx_num_words = 0;
+      uint64_t fx_bf_start  = 0;
+      uint32_t fx_bf_off    = 0;
+      uint32_t fx_bf_nmasks = 0;
+      if (sscanf(bf_fixture, "%u,%llu,%u,%u",
+                 &fx_num_words,
+                 (unsigned long long *)&fx_bf_start,
+                 &fx_bf_off, &fx_bf_nmasks) != 4) {
+        fprintf(stderr,
+            "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF parse error: '%s' "
+            "(expected num_words,bf_mask_start,bf_offset_per_word,bf_num_masks)\n",
+            __FILE__, __LINE__, bf_fixture);
+        exit(1);
+      }
+      if (MaskAppendLen == 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF requires -n <mask> "
+            "(MaskAppendLen=0)\n",
+            __FILE__, __LINE__);
+        exit(1);
+      }
+      fprintf(stderr,
+          "[fixture-bf] env-mode: num_words=%u bf_mask_start=%llu "
+          "bf_offset_per_word=%u bf_num_masks=%u MaskAppendLen=%d\n",
+          fx_num_words, (unsigned long long)fx_bf_start,
+          fx_bf_off, fx_bf_nmasks, MaskAppendLen);
+
+      /* Acquire a jobg slot. gpujob_get_free_rules blocks until the
+       * pool has a free slot; called once here so no contention. */
+      struct jobg *fxg = gpujob_get_free_rules("fixture-bf", 0);
+      if (fxg == NULL) {
+        fprintf(stderr,
+            "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF: gpujob_get_free_rules "
+            "returned NULL\n",
+            __FILE__, __LINE__);
+        exit(1);
+      }
+      if (fxg->packed_buf == NULL) {
+        fxg->packed_buf = (char *)calloc(1, fxg->packed_buf_size);
+        if (fxg->packed_buf == NULL) {
+          fprintf(stderr, "FATAL: %s:%d fixture-bf packed_buf calloc failed\n",
+                  __FILE__, __LINE__);
+          exit(1);
+        }
+        fxg->word_offset = (uint32_t *)calloc(fxg->word_offset_entries,
+                                              sizeof(uint32_t));
+        if (fxg->word_offset == NULL) {
+          fprintf(stderr, "FATAL: %s:%d fixture-bf word_offset calloc failed\n",
+                  __FILE__, __LINE__);
+          exit(1);
+        }
+      }
+      /* Synthetic single empty plaintext (mirrors procjob short-circuit
+       * at mdxfind.c:10487). All lanes point at the same zero-length
+       * slot; A4 ignores packed_buf/word_offset entirely (BF candidate
+       * IS the mask expansion). */
+      fxg->packed_buf[0]    = 0;
+      if (fx_num_words > fxg->word_offset_entries) {
+        fprintf(stderr,
+            "FATAL: %s:%d fixture-bf num_words=%u exceeds word_offset_entries=%u\n",
+            __FILE__, __LINE__, fx_num_words, fxg->word_offset_entries);
+        exit(1);
+      }
+      for (uint32_t i = 0; i < fx_num_words; i++) fxg->word_offset[i] = 0;
+      fxg->packed_count     = fx_num_words;
+      fxg->packed_pos       = 1;
+      fxg->op               = JOB_MD5;          /* arbitrary; A4 ignores */
+      fxg->filename         = "fixture-bf";
+      fxg->flags            = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE | JOBFLAG_BF_CHUNK;
+      fxg->doneprint        = &doneprint;
+      fxg->packed           = 1;
+      fxg->rules_engine     = 1;
+      fxg->bf_chunk            = 1;
+      fxg->bf_mask_start       = fx_bf_start;
+      fxg->bf_offset_per_word  = fx_bf_off;
+      fxg->bf_num_masks        = fx_bf_nmasks;
+      fxg->bf_inner_iter       = 1;             /* A4 v1 invariant */
+      fxg->bf_fast_eligible    = 0;             /* A4 path, not BF-fast */
+
+      int fx_nhits = 0;
+      uint32_t *fx_res = NULL;
+#if defined(__APPLE__) && defined(METAL_GPU)
+      fx_res = gpu_metal_kernelA_bruteforce_dispatch(0, fxg, &fx_nhits);
+#elif defined(OPENCL_GPU)
+      fx_res = gpu_opencl_kernel_a_bruteforce_dispatch(0, fxg, &fx_nhits);
+#else
+      fprintf(stderr, "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF: no GPU backend compiled in\n",
+              __FILE__, __LINE__);
+      exit(1);
+#endif
+      fprintf(stderr,
+          "[fixture-bf] dispatch returned res=%p nhits=%d (trace=%s)\n",
+          (void *)fx_res, fx_nhits,
+          getenv("MDXFIND_KERNEL_A_TRACE") ?
+              getenv("MDXFIND_KERNEL_A_TRACE") : "(unset)");
+      /* Clean exit. The trace files have been written by the dispatcher's
+       * gpu_*_kernel_a_trace_dump() call. */
+      exit(0);
+    }
+  }
+#endif
+
 #ifndef _WIN32
   signal(SIGUSR1, sig_pause);
   signal(SIGUSR2, sig_resume);
@@ -49144,6 +51072,7 @@ usage:
       atomic_store_explicit(&CurfileBytesRead,  0,     memory_order_relaxed);
     }
     while ((Linecount = cacheline(zfi, &readbuf, &readindex))) {
+      unsigned long long chunk_skip_offset = 0;
       curline = 0;
       Totallines += Linecount;
       Fileline += Linecount;
@@ -49197,9 +51126,9 @@ usage:
         if (Fileline < SkipLine)
           continue;
         Totallines -= SkipLine;
-        curline = SkipLine - (Fileline - Linecount);
-        if (curline > Linecount)
-          curline = 0;
+        chunk_skip_offset = SkipLine - (Fileline - Linecount);
+        if (chunk_skip_offset > Linecount)
+          chunk_skip_offset = Linecount;
 	LowSkip = SkipLine;
         SkipLine = 0;
         if (skip_was_active) {
@@ -49223,7 +51152,7 @@ usage:
       lsi = 0;
       J1F(RC, Dohash, lsi);
       while (RC) {
-	linehints[lsi].curline = 0;
+	linehints[lsi].curline = chunk_skip_offset;
 	/* NOTE: retired_line is NOT reset here — it must remain monotonic across
 	 * chunks for the rate calculation in the 15s tick at 38866 to work
 	 * (rate = (now - lasttick)/15s would go negative on reset, dropping to

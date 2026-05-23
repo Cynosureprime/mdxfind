@@ -1,6 +1,15 @@
 /*
- * $Revision: 1.22 $
+ * $Revision: 1.25 $
  * $Log: gpu_common.cl,v $
+ * Revision 1.25  2026/05/23 05:22:54  dlr
+ * sub-phase 5a.4 lift md4_block primitive into gpu_common.cl from gpu_md4_core.cl md4_compress for the family MD5PASS hx codegen e122 emit body byte-for-byte mirror of gpu_md4_core.cl md4_compress 3 rounds 16 steps F G H round-2 constant 0x5A827999u round-3 constant 0x6ED9EBA1u round-1 constant 0 same IV as MD5 noinline matches md5_block signature uint pointer to 4 chaining values plus uint M[16] LE-schedule byte pack output is LE so no byte-swap before compact_fp probe needed wired in 5a.4 e122 MD4MD5PASS Metal twin lifts md4_block into metal_common.metal in same commit family MD5PASS gains MD4 outer primitive support validated PASS 8 of 8 on Pascal GTX 1080 OpenCL byte-exact
+ *
+ * Revision 1.24  2026/05/21 12:40:52  dlr
+ * Phase 1 sub-phase 1a.2 D9.1.b rename overflow_first_rule to num_rules at offset 108 OCLParams field repurposed for kernel A1 A3 source rule count B3 path stops using slot host writes 1 when not applicable update prose comments accordingly
+ *
+ * Revision 1.23  2026/05/19 21:25:09  dlr
+ * Phase 1 two-kernel pipeline: rename OCLParams reserved32[2] to base_word_idx + packed_size. ABI preserved bit-exactly - same offsets 80-87, same 128-byte struct. No live kernel reads either field (packed kernels retired B7.9). Named fields communicate actual purpose to Phase 2 implementing agents. Comment block updated to reference retirement. OpenCL only; Metal twin deferred.
+ *
  * Revision 1.22  2026/05/19 05:45:13  dlr
  * Phase 1 Step A: replace sha512_block with flat 80-step scalar body. Lifts hashcat flat-unrolled SHA-512 transform pattern: 16 scalar w0_t..wf_t instead of W[80] array, eliminating local-mem spill on Pascal NVIDIA. MDX_SHA512_STEP_S/EXPAND_S/F0o/F1o macros added with USE_BITSELECT gate. Function signature void sha512_block(ulong *state, ulong *M) unchanged. OpenCL only; Metal twin deferred.
  *
@@ -19,9 +28,9 @@
  * Memo B B1 (2026-05-03): cursor skeleton fields added at offsets 88-111
  * for two-cursor overflow restart (project_memo_b_dispatch_template.md §2).
  * Rules kernel does NOT use these in B1 (cursor=0 == today's behavior is the
- * locked contract; B3 wires read+CAS-min on overflow). reserved32[0..1] at
- * offsets 80-87 are still claimed by gpu_md5_packed.cl etc. for word_start
- * and packed_size (see gpu_opencl.c gpu_opencl_dispatch_packed).
+ * locked contract; B3 wires read+CAS-min on overflow). base_word_idx + packed_size
+ * (formerly reserved32[0..1]) at offsets 80-87. Packed kernels retired B7.9;
+ * these slots are now named base_word_idx + packed_size per Phase 1 rename.
  *
  * B6 salt-axis (2026-05-06): num_salts_per_page at offset 112 (was reserved64[0])
  * communicates salt-page size to the kernel for combined_ridx packing.
@@ -50,7 +59,14 @@ typedef struct {
     uint  n_prepend;          /* 68: prepend mask positions (-N) */
     uint  n_append;           /* 72: append mask positions (-n) */
     uint  iter_count;         /* 76: per-dispatch iteration (PHPBB3) */
-    uint  reserved32[2];      /* 80-87: reserved (packed kernels: word_start, packed_size) */
+    uint  base_word_idx;      /* 80-83: source word index this dispatch operates on.
+                             *        Packed kernels (retired B7.9): was reserved32[0] / word_start.
+                             *        Two-kernel pipeline (Phase 2+): kernel A source word;
+                             *        kernel B prefix-cache key when candidates share base. */
+    uint  packed_size;        /* 84-87: bytes in the packed candidate data.
+                             *        Packed kernels (retired B7.9): was reserved32[1].
+                             *        Two-kernel pipeline (Phase 2+): total bytes in
+                             *        b_packed_buf for this dispatch. */
     /* B1 cursor skeleton — rules kernel reads as 0 in B1, B3 will wire. */
     uint  input_cursor_start; /* 88: B3 input cursor (lanes < cursor early-return) */
     uint  rule_cursor_start;  /* 92: B3 rule cursor */
@@ -65,7 +81,8 @@ typedef struct {
                                *      only; salted path forces inner_iter=1. */
     uint  overflow_first_set; /* 100: B3 kernel sets to 1 on first overflow lane */
     uint  overflow_first_word;/* 104: B3 word_idx CAS-min target */
-    uint  overflow_first_rule;/* 108: B3 rule_idx CAS-min target */
+    uint  num_rules;          /* 108: source rule count for kernel A1/A3;
+                               *      reads as 1 when not applicable */
     ulong num_salts_per_page; /* 112: B6 salt-axis paging (was reserved64[0]) */
     uint  algo_mode;          /* 120: B6.6 per-algorithm runtime variant flag (was reserved64[1] high half) */
     uint  mask_offset_per_word; /* 124: BF chunk: word stride per BF chunk; 0 == not a BF chunk. Default 0 = today's behavior. */
@@ -182,9 +199,10 @@ typedef struct {
  *
  * Host re-derives word_cursor = overflow_gid % n_words,
  *               rule_cursor = overflow_gid / n_words.
- * The OCLParams.overflow_first_rule field is unused in B3 (kept for
- * forward-compat; host writes 0). Kernel CAS-min is on
- * overflow_first_word interpreted as the lane gid.
+ * The OCLParams.num_rules field at offset 108 (formerly
+ * overflow_first_rule, unused in B3) is repurposed for sub-phase 1a.2:
+ * kernel A1/A3 source rule count; B3 host writes 1 when not applicable.
+ * Kernel CAS-min is on overflow_first_word interpreted as the lane gid.
  *
  * Sentinel: host inits overflow_first_word to 0xFFFFFFFFu (never a
  * valid lane gid). First overflowing lane wins the CAS-min unconditionally.
@@ -549,6 +567,49 @@ __constant uint K[64] = {
 #define GG(a,b,c,d,m,s,k) { a += ((d&b)|(~d&c)) + m + k; a = b + rotate(a,s); }
 #define HH(a,b,c,d,m,s,k) { a += (b^c^d) + m + k; a = b + rotate(a,s); }
 #define II(a,b,c,d,m,s,k) { a += (c^(~d|b)) + m + k; a = b + rotate(a,s); }
+
+/* ---- MD4 block function (lifted from gpu_md4_core.cl 2026-05-23 for
+ *      hx codegen sub-phase 5a.4 e122 MD4MD5PASS family emit).
+ *
+ * RFC 1320 MD4. Same IV as MD5. State is 4 uint32 LE chaining values.
+ * Message schedule is 16 uint32 LE words; caller packs the 64-byte
+ * block into M[0..15] little-endian. Three rounds of 16 steps each;
+ * F/G/H round functions; round-2 constant 0x5A827999u; round-3
+ * constant 0x6ED9EBA1u; round-1 constant 0.
+ *
+ * Signature mirrors md5_block (uint *h0..h3 + uint *M). Caller may
+ * reuse the same M[16] buffer used by md5_block since the schedule
+ * convention (LE-packed bytes) is identical.
+ *
+ * Output is LE; NO byte-swap needed before compact_fp probe. */
+__attribute__((noinline)) void md4_block(uint *h0, uint *h1, uint *h2, uint *h3, uint *M) {
+    uint a = *h0, b = *h1, c = *h2, d = *h3;
+#define MD4_F(x,y,z) (((x)&(y)) | ((~(x))&(z)))
+#define MD4_G(x,y,z) (((x)&(y)) | ((x)&(z)) | ((y)&(z)))
+#define MD4_H(x,y,z) ((x)^(y)^(z))
+#define MD4_R1(a,b,c,d,k,s) a = rotate(a + MD4_F(b,c,d) + M[k], (uint)(s))
+#define MD4_R2(a,b,c,d,k,s) a = rotate(a + MD4_G(b,c,d) + M[k] + 0x5A827999u, (uint)(s))
+#define MD4_R3(a,b,c,d,k,s) a = rotate(a + MD4_H(b,c,d) + M[k] + 0x6ED9EBA1u, (uint)(s))
+    MD4_R1(a,b,c,d, 0, 3); MD4_R1(d,a,b,c, 1, 7); MD4_R1(c,d,a,b, 2,11); MD4_R1(b,c,d,a, 3,19);
+    MD4_R1(a,b,c,d, 4, 3); MD4_R1(d,a,b,c, 5, 7); MD4_R1(c,d,a,b, 6,11); MD4_R1(b,c,d,a, 7,19);
+    MD4_R1(a,b,c,d, 8, 3); MD4_R1(d,a,b,c, 9, 7); MD4_R1(c,d,a,b,10,11); MD4_R1(b,c,d,a,11,19);
+    MD4_R1(a,b,c,d,12, 3); MD4_R1(d,a,b,c,13, 7); MD4_R1(c,d,a,b,14,11); MD4_R1(b,c,d,a,15,19);
+    MD4_R2(a,b,c,d, 0, 3); MD4_R2(d,a,b,c, 4, 5); MD4_R2(c,d,a,b, 8, 9); MD4_R2(b,c,d,a,12,13);
+    MD4_R2(a,b,c,d, 1, 3); MD4_R2(d,a,b,c, 5, 5); MD4_R2(c,d,a,b, 9, 9); MD4_R2(b,c,d,a,13,13);
+    MD4_R2(a,b,c,d, 2, 3); MD4_R2(d,a,b,c, 6, 5); MD4_R2(c,d,a,b,10, 9); MD4_R2(b,c,d,a,14,13);
+    MD4_R2(a,b,c,d, 3, 3); MD4_R2(d,a,b,c, 7, 5); MD4_R2(c,d,a,b,11, 9); MD4_R2(b,c,d,a,15,13);
+    MD4_R3(a,b,c,d, 0, 3); MD4_R3(d,a,b,c, 8, 9); MD4_R3(c,d,a,b, 4,11); MD4_R3(b,c,d,a,12,15);
+    MD4_R3(a,b,c,d, 2, 3); MD4_R3(d,a,b,c,10, 9); MD4_R3(c,d,a,b, 6,11); MD4_R3(b,c,d,a,14,15);
+    MD4_R3(a,b,c,d, 1, 3); MD4_R3(d,a,b,c, 9, 9); MD4_R3(c,d,a,b, 5,11); MD4_R3(b,c,d,a,13,15);
+    MD4_R3(a,b,c,d, 3, 3); MD4_R3(d,a,b,c,11, 9); MD4_R3(c,d,a,b, 7,11); MD4_R3(b,c,d,a,15,15);
+#undef MD4_F
+#undef MD4_G
+#undef MD4_H
+#undef MD4_R1
+#undef MD4_R2
+#undef MD4_R3
+    *h0 += a; *h1 += b; *h2 += c; *h3 += d;
+}
 
 __attribute__((noinline)) void md5_block(uint *h0, uint *h1, uint *h2, uint *h3, uint *M) {
     uint a = *h0, b = *h1, c = *h2, d = *h3;

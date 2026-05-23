@@ -1,6 +1,15 @@
 /*
- * $Revision: 1.8 $
+ * $Revision: 1.12 $
  * $Log: gpu_metal.h,v $
+ * Revision 1.11  2026/05/22 00:00:00  dlr
+ * Phase 4 sub-phase 4a.2b declare gpu_metal_kernelb_dispatch_proto Metal twin of gpu_opencl_kernelb_dispatch_proto. Two-kernel pipeline JOB_MD5MD5SALT only. Kernel A1 cand_rules_phase0 producer plus codegen-emitted kernelb_hx_e347_phase0 consumer. Returns persistent h_hits on dispatch fire NULL on early gate. nhits_out set to kernel B hit count. MDXFIND_HX_CODEGEN equal 0 opt out FATAL on Metal no legacy kernel B path exists. All failure modes FATAL per feedback_external_failures_are_fatal.md. Lazy-allocates persistent buf_hashes_shown plus mtl_buf_kernelb_ovr_set plus mtl_buf_kernelb_ovr_gid. Wired into gpu/gpujob_metal.m route gate for default mdxfind -m e347 -G 0 invocation. Header rev 1.57 to 1.58.
+ *
+ * Revision 1.10  2026/05/22 04:30:00  dlr
+ * sub-phase 2a.6 declare three new Metal entry points for the e347 byte-exact validation harness; gpu_metal_jit_compile_source_with_common_keep returns the MTLLibrary and MTLComputePipelineState as opaque void pointers so the caller can dispatch against real data; gpu_metal_e347_validate_dispatch binds the kernel arg-list mirroring the OpenCL twin sets up MTLBuffers uploads packed candidates and chunk_index payload reuses device-resident salt and compact buffers from set_salt and set_compact_table dispatches via MTLCommandBuffer and reads hits back; gpu_metal_jit_release_keep tears down the retained handles idempotent on NULL; all three FATAL on any error per external-failures-are-fatal; Metal twin of OpenCL gpu_opencl_jit_compile_source_with_common_keep and gpu_opencl_e347_validate_dispatch in gpu_opencl.c rev 1.189
+ *
+ * Revision 1.9  2026/05/21 23:23:29  dlr
+ * sub-phase 2a.4 declare gpu_metal_jit_compile_source_with_common for hx codegen Metal twin of OpenCL sister wrapper; FATAL on init or compile failure; harness mode only no PSO retained; called from mdxfind.c harness block under METAL_GPU guard.
+ *
  * Revision 1.8  2026/05/12 18:00:00  dlr
  * Phase 2a row 5: additive declaration of gpu_metal_template_pso_lazy_md5_rules. Mirrors gpu_metal_template_pso_lazy_md5 signature (zero args, int return; 0 success, -1 failure). Caller (gpu_metal_dispatch_md5_rules in gpu_metal.m) invokes the new lazy creator on first dispatch when gpu_rule_count > 0; it JIT-compiles a second MTLLibrary from metal_common_str + metal_md5_core_str + metal_md5_rules_str + metal_template_str with preprocessorMacros = GPU_TEMPLATE_HAS_RULES=1, then creates the rules-variant PSO. No-rules PSO + embedded metallib path stays unchanged. No other API surface change.
  *
@@ -423,6 +432,259 @@ int gpu_metal_op_variant_admitted(int op, uint8_t variant_bits_mask);
  *
  * Returns 0 before gpu_metal_compile_families has been called. */
 int gpu_metal_admitted_family_count(void);
+
+/* Phase 1a sub-phase 1a.1b (2026-05-20): Metal twin of
+ * gpu_opencl_kernel_a_proto_enabled() declared in gpu/gpu_opencl.h.
+ *
+ * Phase 0 of 1a.1b ships this as a STUB returning 0 so mdxfind.c (which
+ * calls this symbol from BOTH backend-shared chokepoint admit and
+ * need_gpu override sites at lines 11448-11450 and 38075-38081
+ * respectively) links cleanly on Metal builds. Without the stub the
+ * Metal build on dev1.local fails with "undefined reference to
+ * gpu_opencl_kernel_a_proto_enabled" — the unconditional call landed
+ * in mdxfind.c rev 1.488 (2026-05-19) under the assumption that the
+ * symbol was backend-shared; it is OpenCL-only.
+ *
+ * Phase 2 of 1a.1b replaces the stub with the real variant validator
+ * (port of gpu/gpu_opencl.c:9847-9880): reads MDXFIND_KERNEL_A_PROTO +
+ * MDXFIND_KERNEL_A_VARIANT, caches the decision, emits a one-time
+ * stderr advisory on first call. */
+int gpu_metal_kernel_a_proto_enabled(void);
+
+/* Phase 1a sub-phase 1a.1b-continued (2026-05-20): Metal twin of
+ * gpu_opencl_kernelb_dispatch_proto (declared in gpu/gpu_opencl.h).
+ *
+ * A1-only sub-phase ship: dispatches kernel A1 (cand_rules_phase0) to
+ * produce candidate plaintexts for the harness trace channel. Kernel B
+ * is NOT wired here (separate follow-on sub-phase). Returns a non-NULL
+ * pointer on dispatch fire, NULL when env-gate unset / not-ready.
+ * *nhits_out is always 0 in this sub-phase (no hit-replay surface).
+ *
+ * Gated on (getenv("MDXFIND_KERNEL_B_PROTO") || gpu_metal_kernel_a_proto_-
+ * enabled()) and op == JOB_MD5MD5SALT, matching OpenCL twin. */
+uint32_t *gpu_metal_kernelA_dispatch_proto(int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, int *nhits_out);
+
+/* Phase 1a sub-phase 1a.2 (2026-05-21): sibling of _proto_enabled per
+ * D9.4.a. Returns numeric variant int (1/2/3/4) when proto enabled, 0
+ * otherwise. Mirrors gpu_opencl_kernel_a_active_variant. */
+int gpu_metal_kernel_a_active_variant(void);
+
+/* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only) top-level
+ * dispatch entry. Metal twin of gpu_opencl_kernel_a_masks_dispatch.
+ * Returns non-NULL on dispatch fire, NULL when variant != 2, no active
+ * mask, build/upload fails, or device not ready. *nhits_out is always
+ * 0 in this v1 ship (harness mode via MDXFIND_KERNEL_A_TRACE; no
+ * kernel B wired for A2 yet). */
+uint32_t *gpu_metal_kernelA_masks_dispatch(int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, int *nhits_out);
+
+/* Phase 1a sub-phase 1a.3 (2026-05-21): A3 (rules + masks) top-level
+ * dispatch entry. Metal twin of gpu_opencl_kernel_a_rules_masks_dispatch.
+ * Compositional product of A1+A2 (cand_rules_masks_phase0 PSO, 10-arg
+ * signature). Returns non-NULL on dispatch fire, NULL when variant != 3,
+ * no active rules, no active mask, build/upload fails, or device not
+ * ready. *nhits_out is always 0 in this v1 ship (harness mode; no
+ * kernel B wired for A3 yet). */
+uint32_t *gpu_metal_kernelA_rules_masks_dispatch(int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, int *nhits_out);
+
+/* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force) top-level
+ * dispatch entry. Metal twin of gpu_opencl_kernel_a_bruteforce_dispatch.
+ * Pure BF; no rule axis, no prepend mask axis (BF invariant
+ * MaskPrependLen == 0 enforced). Routes to cand_bruteforce_phase0 (8-arg
+ * PSO byte-identical to A2 signature; mask_pattern_prepend slot bound to
+ * the zeroed mtl_buf_kern_a_mask_prepend buffer).
+ *
+ * Signature differs from A1/A2/A3: takes struct jobg *g directly (no
+ * packed_words / word_offset / num_words args). Reads g->bf_chunk,
+ * g->bf_mask_start, g->bf_offset_per_word, g->bf_num_masks,
+ * g->packed_count + global MaskAppendLen + MaskAppendPattern +
+ * MaskClasses[]. Reuses the 4 mask buffers already uploaded by A2/A3
+ * (D11.2.a); zero new persistent buffers.
+ *
+ * Single-shot per dispatch (host pre-sized chunk via adaptive_bf_chunk_-
+ * size servo). Host caps max_packed at 256 MB and FATAL-exits on
+ * overflow.
+ *
+ * v1 ship is harness-mode: returns non-NULL on dispatch fire, NULL when
+ * variant != 4, no active append mask, build/upload fails, or device
+ * not ready. *nhits_out is always 0 (no kernel B wired). */
+struct jobg;
+uint32_t *gpu_metal_kernelA_bruteforce_dispatch(int dev_idx,
+    struct jobg *g, int *nhits_out);
+
+/* hx codegen sub-phase 2a.4 (2026-05-21): Metal twin of
+ * gpu_opencl_jit_compile_source_with_common. Concatenate metal_common_str
+ * + caller-provided emitted Metal source and JIT-compile via
+ * -[MTLDevice newLibraryWithSource:options:error:]. Look up the known
+ * entry point `kernelb_hx_e347_phase0` to verify the library contains
+ * the expected kernel function. FATAL on any error per
+ * feedback_external_failures_are_fatal.md. Harness mode only -- the
+ * compiled library is released before return; no PSO retained (Phase 4
+ * dispatcher will retain).
+ *
+ * dev_idx must be 0 (Phase 1 Metal is single-device). src must be
+ * non-NULL. Returns 0 on success (only return path; failure paths
+ * exit(1) before returning). */
+int gpu_metal_jit_compile_source_with_common(int dev_idx, const char *src);
+
+/* hx codegen sub-phase 2a.6 (2026-05-22): retain-the-PSO variant of the
+ * 2a.4 JIT helper. Mirrors gpu_opencl_jit_compile_source_with_common_keep
+ * shape but Metal-specific: prepends metal_common_str + emitted Metal
+ * source, JIT-compiles via -[MTLDevice newLibraryWithSource:options:error:],
+ * then creates an MTLComputePipelineState for `entry_point_name`. Returns
+ * the MTLLibrary and MTLComputePipelineState as opaque void* through
+ * out_library / out_pso so non-Objective-C TUs (mdxfind.c) can hold them
+ * across the dispatch. Caller MUST invoke gpu_metal_jit_release_keep when
+ * done. FATAL on any error per feedback_external_failures_are_fatal.md. */
+int gpu_metal_jit_compile_source_with_common_keep(
+    int dev_idx, const char *src, const char *entry_point_name,
+    void **out_library, void **out_pso);
+
+/* hx codegen sub-phase 2a.6 (2026-05-22): byte-exact validation dispatch
+ * for the codegen-emitted e347 (MD5MD5SALT) Metal kernel. Metal twin of
+ * gpu_opencl_e347_validate_dispatch.
+ *
+ * Caller must FIRST:
+ *  - gpu_metal_init (during normal mdxfind startup)
+ *  - gpu_metal_set_compact_table(...) with planted-hash compact table
+ *  - gpu_metal_set_salt(...) with fixture salt table
+ *  - gpu_metal_jit_compile_source_with_common_keep(..., "kernelb_hx_e347_phase0", ..., &lib, &pso)
+ *
+ * This function then allocates short-lived MTLBuffers for packed
+ * candidates + word offsets + payload + hits, binds them along with the
+ * device-resident compact/salt/overflow buffers, dispatches the kernel,
+ * waits for completion, and copies hits back into out_hits
+ * (GPU_HIT_STRIDE u32 per hit, up to max_hits). Returns 0 on success;
+ * FATAL on any error. */
+int gpu_metal_e347_validate_dispatch(
+    int dev_idx, void *pso,
+    const unsigned char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    uint32_t num_salts,
+    uint32_t *out_hits, int *out_n_hits, int max_hits);
+
+/* hx codegen sub-phase 2a.6 (2026-05-22): cleanup pair for the keep
+ * variant. Releases the MTLLibrary + MTLComputePipelineState that
+ * gpu_metal_jit_compile_source_with_common_keep returned. Safe with NULL
+ * inputs (idempotent). */
+void gpu_metal_jit_release_keep(void *library, void *pso);
+
+/* Phase 4 sub-phase 4a.2 (2026-05-21): D13.3.a opt-out accessor for the
+ * hx codegen production path on Metal. Mirrors gpu_opencl_hx_codegen_-
+ * enabled in gpu/gpu_opencl.h (rev 1.39).
+ *
+ * Returns 1 when MDXFIND_HX_CODEGEN is unset or set to any value other
+ * than the literal "0"; returns 0 when MDXFIND_HX_CODEGEN equals the
+ * literal "0".
+ *
+ * The Metal twin of the codegen production path is staged here in 4a.2
+ * (PSO statics + lazy JIT helper) but the kernel-B dispatch wrapper
+ * that the OpenCL twin embeds inside gpu_opencl_kernelb_dispatch_proto
+ * does not exist on Metal yet -- prior sub-phases (1a.1b-continued
+ * through 1a.4) shipped kernel A1/A2/A3/A4 only; no Metal kernel B
+ * dispatch wrapper was wired. The 4a.2 ship therefore lays the codegen
+ * scaffolding (accessor + statics + lazy JIT) so the Metal kernel-B
+ * dispatcher (separate follow-on sub-phase) can swap in the codegen
+ * PSO via the same shape as the OpenCL twin's swap in 4a.1.
+ *
+ * Sunsets in Phase 5 along with the hand-written kernel files. */
+int gpu_metal_hx_codegen_enabled(void);
+
+/* Phase 4 sub-phase 4a.2 (2026-05-21): lazy-init helper that returns the
+ * cached MTLComputePipelineState for the hx-codegen-emitted Metal kernel
+ * `kernelb_hx_e347_phase0` on the requested device. On first call per
+ * (device, process) the function runs the hx walker with the e347
+ * specialization (iter=1, has_rules=1, SALT_BATCH=64, etc.), JIT-
+ * compiles the emitted Metal source via gpu_metal_jit_compile_source_-
+ * with_common_keep, and caches the resulting MTLLibrary + PSO in
+ * module-local statics. On subsequent calls returns the cached PSO
+ * pointer (as an opaque void *; cast back to id<MTLComputePipelineState>
+ * at the call site).
+ *
+ * Returns non-NULL on success; FATAL on any failure (hx spec lookup,
+ * walker, JIT, PSO creation) per feedback_external_failures_are_fatal.md.
+ * A non-fatal source dump is written to /tmp/mdxfind-codegen-e347-<pid>-
+ * dev<N>.metal so post-mortem inspection is possible. The cache is
+ * process-lifetime; no explicit release entry point is exposed (process
+ * exit reclaims). Apple driver does its own opaque PSO caching across
+ * processes; the codegen-side cache here saves walker+dump+compile cost
+ * for second-and-later dispatches in the same process. */
+void *gpu_metal_kernelb_codegen_pso(int dev_idx);
+
+/* Sub-phase 5a.3 (2026-05-22): per-JOB parameterized variant of
+ * gpu_metal_kernelb_codegen_pso. Mirror of OpenCL twin
+ * gpu_opencl_kernelb_codegen_kernel_for. Lazy-init on miss, linear scan
+ * over the 16-slot module-local mtl_codegen_slots[] cache; FATAL on cap
+ * exhaustion. job_enum selects the kernel + entry point:
+ *   JOB_MD5MD5SALT  -> kernelb_hx_e347_phase0 (e347 hand-tuned chain)
+ *   JOB_*MD5PASS    -> kernelb_hx_codegen_phase0 (family emit; SHA1 in
+ *                      5a.3, other primitives 5a.4+)
+ * Returns the cached PSO as opaque void *. FATAL on any failure. */
+void *gpu_metal_kernelb_codegen_pso_for(int dev_idx, int job_enum);
+
+/* hx codegen sub-phase 5a.3 (2026-05-22): byte-exact validation dispatch
+ * for the codegen-emitted MAKE_MD5PASS family Metal kernel. Metal sibling
+ * of gpu_opencl_kernelb_family_validate_dispatch.
+ *
+ * Differences from gpu_metal_e347_validate_dispatch:
+ *   - num_salts implicitly 1 (kernel ignores; harness still calls
+ *     gpu_metal_set_salt with a placeholder so the buffer slots bind).
+ *   - Per-thread topology (no SALT_BATCH loop); grid sized to num_words
+ *     padded up to tg_size=64 multiple.
+ *   - Kernel signature is identical to e347 (18 args at the same
+ *     [[buffer(N)]] indices); only the kernel BODY differs.
+ *
+ * Returns 0 on success; FATAL on any failure. */
+int gpu_metal_kernelb_family_validate_dispatch(
+    int dev_idx, void *pso,
+    const unsigned char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    uint32_t *out_hits, int *out_n_hits, int max_hits);
+
+/* Phase 4 sub-phase 4a.2b (2026-05-22): Metal kernel-B production
+ * dispatcher. Metal twin of gpu_opencl_kernelb_dispatch_proto
+ * (gpu/gpu_opencl.h rev 1.39). Two-kernel pipeline for JOB_MD5MD5SALT:
+ * kernel A1 (cand_rules_phase0) produces packed candidates from the
+ * (word, rule) cross product; codegen-emitted kernelb_hx_e347_phase0
+ * consumes the kernel-A output and emits hits via
+ * EMIT_HIT_4_DEDUP_OR_OVERFLOW.
+ *
+ * Caller contract (parallel to OpenCL twin):
+ *   - gpu_metal_init succeeded and the device is ready
+ *   - gpu_metal_set_compact_table populated buf_compact_fp / buf_compact_idx /
+ *     buf_hash_data / buf_hash_data_off
+ *   - gpu_metal_set_salt populated buf_salt_data / buf_salt_off / buf_salt_lens
+ *   - gpu_rule_count > 0 and gpu_rule_program / gpu_rule_offsets are non-NULL
+ *   - op == JOB_MD5MD5SALT (other ops return NULL)
+ *
+ * Returns the persistent h_hits buffer on dispatch fire (caller does
+ * NOT free); NULL when an early gate rejects the call (mismatched op,
+ * not-ready, missing rule program). *nhits_out is set to the kernel B
+ * hit count (0..GPU_MAX_HITS).
+ *
+ * MDXFIND_HX_CODEGEN=0 opt-out is NOT supported on Metal -- the Metal
+ * dispatcher FATAL-exits with a documented message ("opt-out is not
+ * supported on Metal -- no legacy kernel B path exists"). On Metal
+ * the codegen IS the kernel B implementation.
+ *
+ * All failure modes (PSO acquire, ensure_proto_bufs, kernel A/B
+ * cmdbuffer error, buffer alloc) are FATAL per feedback_external_-
+ * failures_are_fatal.md. Lazy-allocates persistent buf_hashes_shown
+ * (per feedback_proto_dispatch_lazy_alloc_dependency.md) plus two
+ * persistent atomic_uint scratch buffers (ovr_set / ovr_gid) on first
+ * dispatch; reuses on subsequent dispatches. */
+uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, int *nhits_out);
 
 #ifdef __cplusplus
 }

@@ -1,3 +1,68 @@
+# mdxfind v1.502 — Phase 4 + Phase 5a hx codegen (e347 + 7 MAKE_MD5PASS family GPU acceleration)
+
+Source: mdxfind.c rev 1.501, gpu/gpu_opencl.c rev 1.194, gpu/gpu_opencl.h rev 1.41, gpu/gpujob_opencl.c rev 1.152, gpu_metal.m rev 1.117, gpu_metal.h rev 1.59, gpu/gpujob_metal.m rev 1.32, gpu/gpu_common.cl rev 1.25, gpu/metal_common.metal rev 1.24, gpu/gpu_codegen_eligible.{c,h} rev 1.1 (NEW), codegen/ tree (NEW: ~15 files, in-process hx P4 state-machine codegen), tools/hx8_to_c (NEW: build-time hx.8 → C-literal serializer).
+
+Window: 2026-05-20 through 2026-05-23.
+
+## Phase 4 — Production GPU dispatch for e347 (MD5(MD5(MD5(pass)).salt)) via codegen
+
+A new in-process hx codegen pipeline produces JIT-compiled kernel B for `JOB_MD5MD5SALT` (e347) on both OpenCL (Pascal and newer) and Apple Metal. The codegen walker reads the `hx_program` bytecode for the algorithm, applies a pattern detector (`HX_PATTERN_E347_MD5MD5MD5SALT`) that recognizes the hand-tunable shape, and emits a specialized kernel source tuned to that shape (per-thread serial SALT_BATCH=64 inner loop, register-held pre-state, salt-axis amortization — the `tp0` pattern that empirically wins on Pascal salted-MD5; see `feedback_tp0_pattern_is_correct_for_pascal_salted_md5.md`).
+
+Cross-arch byte-exact validated against the CPU oracle on 1,048,576-pair fixtures (smoke / medium / large × 2 backends):
+
+- Apple M2 Max (dev3.local): 0.25 s end-to-end on the large fixture; zero diff
+- Pascal GTX 1080 (fpga.local): 1.05 s end-to-end on the large fixture; zero diff
+
+The hand-written `gpu_kernelb_md5md5salt_nocache.cl` (previously the e347 production path) is **retired**. The hand-written kernel carried a long-standing chain-drift bug for non-trivial salt cardinalities; codegen output is byte-exact against both the CPU implementation and `hashpipe` (independent reference). The legacy file has been deleted from the working tree (the v1.485 deletion remains; this release confirms the swap to codegen as the only production path).
+
+`MDXFIND_HX_CODEGEN=0` is the (now-deprecated) opt-out env var. Setting it on a Phase-4+ build is **FATAL** with a deprecation message — the legacy hand-written code path is gone, there is nothing to fall back to.
+
+## Phase 5a — MAKE_MD5PASS family GPU acceleration via codegen
+
+Seven new algorithms GPU-accelerated by the same codegen pipeline, each computing `outer_hash(md5_hex(pass) . pass)`:
+
+| eN  | Name           | Outer    | Digest width |
+|----:|----------------|----------|-------------:|
+| 122 | MD4MD5PASS     | MD4      |     16 bytes |
+| 159 | RMD160MD5PASS  | RIPEMD160 |    20 bytes |
+| 161 | SHA1MD5PASS    | SHA-1    |     20 bytes |
+| 163 | SHA224MD5PASS  | SHA-224  |     28 bytes |
+| 165 | SHA256MD5PASS  | SHA-256  |     32 bytes |
+| 167 | SHA384MD5PASS  | SHA-384  |     48 bytes |
+| 169 | SHA512MD5PASS  | SHA-512  |     64 bytes |
+
+Codegen uses a per-primitive emit dispatch table (`codegen/hx_emit_primitives.c`, new in sub-phase 5a.2) so each family member shares the inner-hash + concat scaffolding and differs only in the outer-hash primitive selection.
+
+Full 70-cell cross-arch validation matrix (7 algorithms × 5 fixtures × 2 backends) — all PASS, all byte-exact. See `codegen/tests/family_md5pass/MATRIX_RESULTS.md` in the iMac source tree for the per-cell record.
+
+Usage: `./mdxfind -m e<N> -G 0 -F hashes -M <NAME> wordlist` selects GPU dispatch automatically for any of the 7 family members above. The `gpu_codegen_kernelb_family_md5pass_eligible()` admit-predicate helper (new file `gpu/gpu_codegen_eligible.{c,h}`) widens the chokepoint OR-chain to admit these JOBs.
+
+Twenty-two additional MAKE_MD5PASS family members (MD2, GOST family, Haval ×15, RMD128, Tiger, Whirlpool, Snefru-256/512) remain CPU-only pending Phase 5b — their block primitives need lifting into `gpu/gpu_common.cl` first. e123 MD5MD5PASS (multi-emit canonical + colon variant) stays CPU-only until multi-emit codegen lands in a future sub-phase.
+
+## Documentation
+
+- `hx.8` (Appendix A of the hx manual on the iMac troff tree at `~/Documents/troff/mdxfind/hx.8`) audit and 32 doc-fix corrections: MAKE_MD5PASS family had missing concat operators in the canonical expressions; MD5MD5USER had user/pass argument transposition.
+- Multi-emit families now annotated in `hx.8` Note [24] — 28 entries gained `(see Note [24])` markers identifying mdxfind's multi-output emission patterns.
+
+The `hx.8` troff source is not shipped in this public repository; the canonical hx language manual lives in the upstream `hashpipe` distribution.
+
+## Build / infrastructure
+
+- New `codegen/` directory containing the in-process P4 state-machine codegen — `hx_walker.c` (state machine + bytecode dispatch), `hx_emit_opencl.c` + `hx_emit_metal.c` (per-backend emit helpers), `hx_patterns.c` (pattern detector for hand-tunable shapes), `hx_emit_primitives.c` (per-primitive outer-hash dispatch), `hx_dump.c` (env-flag source dump), and `hx_specs_data.c` (the compiled `hx_program` table, ~28 KLOC of generated C literals).
+- New `tools/hx8_to_c.c` build-time tool that converts `hx.8` to `codegen/hx_specs_data.c`. Shipped here for completeness, but it requires the upstream `hashpipe` source tree to compile (it links the hx parser library). External users build directly against the pre-generated `codegen/hx_specs_data.c` checked in here; that file is regenerated on the iMac when `hx.8` changes.
+- New `gpu/gpu_codegen_eligible.{c,h}` — pure-C admit-predicate helper used by both OpenCL and Metal builds.
+- New `hx_vm.h` and `hx_ast.h` — header-only types shared by codegen and the upstream hx VM (no implementation files; codegen consumes the compiled `hx_program` data).
+- New kernel A variants under `gpu/` — `gpu_kernel_a_{rules,masks,rules_masks,bruteforce}.{cl,_str.h}` plus their Metal twins `metal_kernel_a_*.{metal,_str.h}` — hand-written rule / mask / brute-force producers from Phase 1a, used by the two-kernel pipeline for e347 and the family ops.
+- `MDXFIND_HX_CODEGEN_DUMP=/tmp/x.cl` env var dumps the emitted codegen kernel source to the named path for post-mortem inspection.
+- `MDXFIND_HX_CODEGEN_VALIDATE=1` + `MDXFIND_HX_CODEGEN_FIXTURE=<path>` env vars exercise the byte-exact validation harness against a fixture file (developer mode; exits 0 / 1 based on diff vs CPU oracle).
+
+## Known issues / scope
+
+- Codegen `kernelb_hx_codegen_phase0` ships the canonical e347 + 7 MAKE_MD5PASS family members. All other GPU ops continue to use the existing template-kernel infrastructure (unchanged from v1.485).
+- e123 MD5MD5PASS remains CPU-only — multi-emit codegen is a future sub-phase.
+- bcrypt, yescrypt, argon2, descrypt all remain hand-written kernels (out of codegen scope by design — they don't fit the hx expression model).
+- The hand-port kernel A variants are unchanged from Phase 1a; Phase 1b "template kernel migration to codegen" is a low-priority follow-on (no perf or correctness motivation to rush it).
+
 # mdxfind v1.485 — Word-retirement ETA + GPU iter accounting + SHA512CRYPT perf
 
 Source: mdxfind.c rev 1.485, mdxfind.h rev 1.24, gpu/gpu_common.cl rev 1.22, gpu/gpu_md5salt_core.cl rev 1.7, gpu/gpu_opencl.c rev 1.172, gpu/gpu_shacrypt_core.cl rev 1.4, gpu/gpu_template.cl rev 1.18, gpu/gpujob_opencl.c rev 1.142, gpu/gpujob_metal.m rev 1.26, gpu/metal_common.metal rev 1.21, gpu/metal_md5salt_core.metal rev 1.3, gpu/metal_shacrypt_core.metal rev 1.3.
