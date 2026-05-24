@@ -6,14 +6,14 @@ Window: 2026-05-20 through 2026-05-23.
 
 ## Phase 4 — Production GPU dispatch for e347 (MD5(MD5(MD5(pass)).salt)) via codegen
 
-A new in-process hx codegen pipeline produces JIT-compiled kernel B for `JOB_MD5MD5SALT` (e347) on both OpenCL (Pascal and newer) and Apple Metal. The codegen walker reads the `hx_program` bytecode for the algorithm, applies a pattern detector (`HX_PATTERN_E347_MD5MD5MD5SALT`) that recognizes the hand-tunable shape, and emits a specialized kernel source tuned to that shape (per-thread serial SALT_BATCH=64 inner loop, register-held pre-state, salt-axis amortization — the `tp0` pattern that empirically wins on Pascal salted-MD5; see `feedback_tp0_pattern_is_correct_for_pascal_salted_md5.md`).
+A new in-process hx codegen pipeline produces JIT-compiled kernel B for `JOB_MD5MD5SALT` (e347) on both OpenCL (Pascal and newer) and Apple Metal. The codegen walker reads the `hx_program` bytecode for the algorithm, applies a pattern detector (`HX_PATTERN_E347_MD5MD5MD5SALT`) that recognizes the hand-tunable shape, and emits a specialized kernel source tuned to that shape (per-thread serial SALT_BATCH=64 inner loop, register-held pre-state, salt-axis amortization — the tp0 pattern that empirically wins on Pascal salted-MD5).
 
 Cross-arch byte-exact validated against the CPU oracle on 1,048,576-pair fixtures (smoke / medium / large × 2 backends):
 
-- Apple M2 Max (dev3.local): 0.25 s end-to-end on the large fixture; zero diff
-- Pascal GTX 1080 (fpga.local): 1.05 s end-to-end on the large fixture; zero diff
+- Apple M2 Max: 0.25 s end-to-end on the large fixture; zero diff
+- Pascal GTX 1080: 1.05 s end-to-end on the large fixture; zero diff
 
-The hand-written `gpu_kernelb_md5md5salt_nocache.cl` (previously the e347 production path) is **retired**. The hand-written kernel carried a long-standing chain-drift bug for non-trivial salt cardinalities; codegen output is byte-exact against both the CPU implementation and `hashpipe` (independent reference). The legacy file has been deleted from the working tree (the v1.485 deletion remains; this release confirms the swap to codegen as the only production path).
+The hand-written `gpu_kernelb_md5md5salt_nocache.cl` (previously the e347 production path) is **retired**. The hand-written kernel carried a long-standing chain-drift bug for non-trivial salt cardinalities; codegen output is byte-exact against both the CPU implementation and hashpipe (independent reference). The legacy file has been deleted from the working tree.
 
 `MDXFIND_HX_CODEGEN=0` is the (now-deprecated) opt-out env var. Setting it on a Phase-4+ build is **FATAL** with a deprecation message — the legacy hand-written code path is gone, there is nothing to fall back to.
 
@@ -33,7 +33,7 @@ Seven new algorithms GPU-accelerated by the same codegen pipeline, each computin
 
 Codegen uses a per-primitive emit dispatch table (`codegen/hx_emit_primitives.c`, new in sub-phase 5a.2) so each family member shares the inner-hash + concat scaffolding and differs only in the outer-hash primitive selection.
 
-Full 70-cell cross-arch validation matrix (7 algorithms × 5 fixtures × 2 backends) — all PASS, all byte-exact. See `codegen/tests/family_md5pass/MATRIX_RESULTS.md` in the iMac source tree for the per-cell record.
+Full 70-cell cross-arch validation matrix (7 algorithms × 5 fixtures × 2 backends) — all PASS, all byte-exact.
 
 Usage: `./mdxfind -m e<N> -G 0 -F hashes -M <NAME> wordlist` selects GPU dispatch automatically for any of the 7 family members above. The `gpu_codegen_kernelb_family_md5pass_eligible()` admit-predicate helper (new file `gpu/gpu_codegen_eligible.{c,h}`) widens the chokepoint OR-chain to admit these JOBs.
 
@@ -41,15 +41,13 @@ Twenty-two additional MAKE_MD5PASS family members (MD2, GOST family, Haval ×15,
 
 ## Documentation
 
-- `hx.8` (Appendix A of the hx manual on the iMac troff tree at `~/Documents/troff/mdxfind/hx.8`) audit and 32 doc-fix corrections: MAKE_MD5PASS family had missing concat operators in the canonical expressions; MD5MD5USER had user/pass argument transposition.
-- Multi-emit families now annotated in `hx.8` Note [24] — 28 entries gained `(see Note [24])` markers identifying mdxfind's multi-output emission patterns.
-
-The `hx.8` troff source is not shipped in this public repository; the canonical hx language manual lives in the upstream `hashpipe` distribution.
+- The hx algorithm spec (Appendix A of the hx manual) audit and 32 doc-fix corrections: MAKE_MD5PASS family had missing concat operators in the canonical expressions; MD5MD5USER had user/pass argument transposition. Multi-emit families now annotated with Note [24] markers — 28 entries identifying mdxfind's multi-output emission patterns.
+- The canonical hx language manual is published at <https://www.mdxfind.com/hx.pdf>. The hx parser + algorithm catalog source live in the upstream hashpipe project: <https://github.com/Cynosureprime/hashpipe>.
 
 ## Build / infrastructure
 
 - New `codegen/` directory containing the in-process P4 state-machine codegen — `hx_walker.c` (state machine + bytecode dispatch), `hx_emit_opencl.c` + `hx_emit_metal.c` (per-backend emit helpers), `hx_patterns.c` (pattern detector for hand-tunable shapes), `hx_emit_primitives.c` (per-primitive outer-hash dispatch), `hx_dump.c` (env-flag source dump), and `hx_specs_data.c` (the compiled `hx_program` table, ~28 KLOC of generated C literals).
-- New `tools/hx8_to_c.c` build-time tool that converts `hx.8` to `codegen/hx_specs_data.c`. Shipped here for completeness, but it requires the upstream `hashpipe` source tree to compile (it links the hx parser library). External users build directly against the pre-generated `codegen/hx_specs_data.c` checked in here; that file is regenerated on the iMac when `hx.8` changes.
+- New `tools/hx8_to_c.c` build-time tool that converts the hx algorithm catalog to `codegen/hx_specs_data.c`. Shipped here for completeness, but requires the upstream hashpipe source tree to compile (it links the hx parser library). External users build directly against the pre-generated `codegen/hx_specs_data.c` checked in here; that file is regenerated upstream when the hx catalog changes.
 - New `gpu/gpu_codegen_eligible.{c,h}` — pure-C admit-predicate helper used by both OpenCL and Metal builds.
 - New `hx_vm.h` and `hx_ast.h` — header-only types shared by codegen and the upstream hx VM (no implementation files; codegen consumes the compiled `hx_program` data).
 - New kernel A variants under `gpu/` — `gpu_kernel_a_{rules,masks,rules_masks,bruteforce}.{cl,_str.h}` plus their Metal twins `metal_kernel_a_*.{metal,_str.h}` — hand-written rule / mask / brute-force producers from Phase 1a, used by the two-kernel pipeline for e347 and the family ops.
@@ -62,110 +60,104 @@ The `hx.8` troff source is not shipped in this public repository; the canonical 
 - e123 MD5MD5PASS remains CPU-only — multi-emit codegen is a future sub-phase.
 - bcrypt, yescrypt, argon2, descrypt all remain hand-written kernels (out of codegen scope by design — they don't fit the hx expression model).
 - The hand-port kernel A variants are unchanged from Phase 1a; Phase 1b "template kernel migration to codegen" is a low-priority follow-on (no perf or correctness motivation to rush it).
+# mdxfind v1.475 — Metal coverage expansion + shared-loader refactor
 
-# mdxfind v1.485 — Word-retirement ETA + GPU iter accounting + SHA512CRYPT perf
+Source: mdxfind.c rev 1.475, gpu_metal.m rev 1.100, gpu_metal.h rev 1.49, gpu/gpu_opencl.c rev 1.171, gpu/gpujob_metal.m rev 1.25, gpu/gpujob_opencl.c rev 1.138, gpu/codegen/cl2metal.py rev 1.9.
 
-Source: mdxfind.c rev 1.485, mdxfind.h rev 1.24, gpu/gpu_common.cl rev 1.22, gpu/gpu_md5salt_core.cl rev 1.7, gpu/gpu_opencl.c rev 1.172, gpu/gpu_shacrypt_core.cl rev 1.4, gpu/gpu_template.cl rev 1.18, gpu/gpujob_opencl.c rev 1.142, gpu/gpujob_metal.m rev 1.26, gpu/metal_common.metal rev 1.21, gpu/metal_md5salt_core.metal rev 1.3, gpu/metal_shacrypt_core.metal rev 1.3.
+Window: 2026-05-16 through 2026-05-17.
 
-Window: 2026-05-18 through 2026-05-19.
+## Metal coverage: 25 → 52 families
 
-## Word-retirement ETA (architectural inversion)
+Apple Metal GPU acceleration extended from 25 to 52 algorithm families. New this release, grouped by phase:
 
-Replaces the previous "absolute-hash-operation-rate" ETA basis, which used a denominator (total expected hash ops) that was unknowable for iterated hash types where the per-hash iteration count is parsed from the hash itself (SHA512CRYPT `rounds=N$`, BCRYPT `$2b$NN$`, PHPBB3 `$H$X`, etc.). Symptoms included "100% complete" displayed within 15 seconds of starting an hour-long run, "ETA finishing" / "ETA done" while real work continued, and inflated hash-rate displays.
+- **Phase 2d.6** — RIPEMD: ripemd160 (e17), ripemd320 (e816)
+- **Phase 2d.7a** — Blake2: blake2s256 (e844), blake2b256 (e845), blake2b512 (e841)
+- **Phase 2d.7b** — Keccak + SHA-3: keccak{224,256,384,512} (e84-e87), sha3_{224,256,384,512} (e88-e91)
+- **Phase 2d.7c** — Streebog: streebog256 (e430), streebog512 (e431)
+- **Phase 2d.7d** — HMAC siblings: hmac_blake2s (e828), hmac_streebog256 (e837 KPASS / e838 KSALT), hmac_streebog512 (e839 KPASS / e840 KSALT)
+- **Phase 2d.8a** — Iter-loop: phpbb3 (e455), md5crypt (e511)
+- **Phase 2d.8b** — SHACRYPT: sha256crypt (e512), sha512crypt (e513), sha512cryptmd5 (e538)
+- **Phase 2d.9a** — Feistel hand-port: descrypt (e500)
+- **Phase 2d.9b** — Eksblowfish hand-port: bcrypt (e450)
 
-New mechanism:
+All 52 families verified byte-exact CPU/Metal parity on dev1 (M1) + dev3 (M2 Max). Admission summary: 52 families admitted, 208/208 variants admitted, 0 prunes, 0 CPU-only.
 
-- Each input word is "retired" when every active hash type has completed all of its work (rules × masks × salts × internal iterations) for that word.
-- Per-op `retired_line` counter, monotonic across the entire run; minimum across active ops gives `RetiredLines_now`.
-- 15-second rate window: `words/sec = (RetiredLines_now − RetiredLines_lasttick) / 15`.
-- ETA = `(TotalLines − RetiredLines_now) / words_per_second`.
+## Shared-loader refactor (gpu_metal.m −79.6%)
 
-Display now reads:
+Per-family hand-cloned scaffolding replaced with a generic loader driven by an extended `struct gpu_metal_family`. New fields: `core_str`, `base_macros`, `dispatch_tg_size`, `fam_idx`. Parallel arrays `metal_family_libs[CAP][8]` + `metal_family_psos[CAP][8]` hidden in the .m so the .h stays pure C.
+
+| Component                | Pre-refactor | Post-refactor | Delta            |
+|--------------------------|-------------:|--------------:|-----------------:|
+| gpu_metal.m              |       20,764 |         4,242 | −16,522 (−79.6%) |
+| gpu_metal.h              |        1,002 |           432 |    −570 (−56.9%) |
+
+47 families use `metal_pso_for_variant_default` (generic). 5 families keep custom resolvers:
+
+- **md5salt** — PRESALT V_S|V_R fold; V_S, V_S|V_M, V_S|V_R|V_M route through generic
+- **sha512cryptmd5** — aliases sha512crypt's compiled PSO at dispatch
+- **hmac_streebog256_kpass / _ksalt** — dual-struct entries share one PSO via canonical fam_idx
+- **hmac_streebog512_kpass / _ksalt** — same dual-struct pattern
+- **bcrypt** — `dispatch_tg_size=8` struct override (replaces hardcoded `op == JOB_BCRYPT` check)
+
+## External-failure-fatal discipline
+
+New headers `gpu/gpu_fatal.h` + `gpu/gpu_debug.h`. Approximately 57 silent-failure sites converted across gpu_metal.m, gpu/gpujob_metal.m, gpu/gpu_opencl.c, gpu/gpujob_opencl.c. Runtime failures (PSO create, buffer alloc, dispatch error, clEnqueue errors) now call `GPU_FATAL` / `MTL_FATAL_NSERR` with file:line + op + error string and `_Exit(1)`.
+
+Init-time eager-compile failures route through the admission-prune path (capability check, not runtime failure). Query `gpu_metal_op_variant_admitted()` exposed for host-side gpu_ops[] consumption (deferred).
+
+## Debug emissions compile-time gated
+
+`MDXFIND_GPU_DEBUG` macro in `gpu/gpu_debug.h`. Default builds omit:
+
+- Per-(family, variant) JIT-compiled / PSO-created-lazily markers
+- Per-run trace (`salts uploaded`, `first dispatch issued`, `buf_scratch_pool allocated`, `salt-chunked dispatch`)
+- Init chatter
+- `STDERR: GPU admission` summary line
+
+Debug builds restore all markers:
 
 ```
-[T+ 15.020s] Working on rockyou.txt, w=496, line 70396, 4693.07 lines/s (0.5%), 23.46Mh/s, Found=0, ETA 50m40s
+make CFLAGS_EXTRA="-DMDXFIND_GPU_DEBUG=1" mdxfind
 ```
 
-Immune to per-hash iteration count, salt retirement timing, rule cardinality, mask cardinality, and CPU/GPU asymmetry. Salt-retirement acceleration (per-word time shrinks as salts retire late in a run) is captured automatically because the rate window catches it as it happens.
+Verified via `strings | grep` that the production binary physically omits the debug strings from `.rodata`. Kept unconditional in production: `GPU_FATAL` / `MTL_FATAL_NSERR` runtime errors, device identity line, per-pruned-combo prune lines, end-of-job per-device stats.
 
-Bootstrap fallback path for the first 15 seconds (before the first retirement-rate sample) uses the legacy hash-rate denominator and prefixes the ETA with `~` to indicate provisional.
+## Breaking changes (operator-facing)
 
-Tradeoff documented: retirement is credited at procjob hand-off time (not actual GPU completion), so under very high rule-set or mask workloads where the GPU work queue depth is large, the displayed retirement frontier runs slightly ahead of true GPU completion. Visible mostly on rule-processed BF runs with deep queues; ETA stays accurate, percentage runs slightly optimistic.
+1. **Stderr format**. Operators previously grepping per-(family, variant) markers (`Metal: sha512-variant library JIT-compiled` and similar) must either rebuild with `-DMDXFIND_GPU_DEBUG=1` or re-target their grep to end-of-job per-device stats. `STDERR: GPU admission: N families admitted ...` is also debug-only now.
+2. **Marker format**. When a debug build is active, generic-loader markers use the form `(generic vbits=0x... rules=N mask=N salt=N)` rather than the pre-refactor per-family fixed format. Backward-compatible substring `library JIT-compiled` still matches both.
 
-## GPU iter-aware Tothash accounting (correctness fix)
+## Platform notes
 
-The GPU per-dispatch hash count formula at `gpujob_opencl.c` previously multiplied (words × rules × masks × salts × external_iter) — omitting the per-algorithm **internal** iteration count entirely. For iterated GPU types this caused Tothash to undercount by the iter multiplier:
+A pre-existing Apple Metal compiler bug in macOS Ventura 13.7.x affected SHA-2/512-family PSO creation on M2 Max. Fixed upstream in macOS 26.5 / Xcode 26.5. M2 Max users should upgrade for SHA-2/512-family GPU acceleration. M1 hosts on macOS 14+ are unaffected throughout.
 
-| Type | Default iter | Prior undercount |
-|------|------:|------:|
-| MD5CRYPT (e511) | 1000 | 1000× |
-| SHA256CRYPT (e512) | 5000 | 5000× |
-| SHA512CRYPT (e513) | 5000 | 5000× |
-| SHA512CRYPTMD5 (e538) | 5000 | 5000× |
-| BCRYPT (e450) | 2^cost | up to 2^31× |
-| PHPBB3 (e455) | 2^count | up to 2^30× |
-| DESCRYPT (e500) | 25 | 25× |
-| SHA1DRU (e404) | 1,000,000 | 1,000,000× |
+### Intel Mac (macOS)
 
-New `gpu_compute_iter_sum()` helper in both OpenCL and Metal backends parses iter at accounting time from the packed salt string (fixed-constant or `rounds=N$` / cost-char), sums across all packed salts (correctly handles mixed-iter loads where different hashes carry different `rounds=` values), and folds into the per-dispatch multiplier. Zero kernel changes; affects ~30 LOC across `gpujob_opencl.c` + `gpujob_metal.m`.
+Metal GPU acceleration is **disabled at compile time** on Intel Mac. Apple's `MTLCompilerService` XPC daemon hangs on JIT PSO creation for AMD GCN GPUs (e.g., Radeon Pro 580X) on macOS Sequoia 15.x — confirmed on iMac and nutshack at rev 1.475. The hang is in Apple's driver and not fixable from mdxfind. Intel Mac users get CPU mode (or OpenCL if their Makefile enables it). Apple Silicon Macs (M-series) are unaffected; Metal GPU acceleration is fully supported on ARM macOS.
 
-Symptom example: GTX 1080 SHA512CRYPT previously displayed `332 h/s` declining — actually ~1.66 Mh/s of SHA-512 round operations. Now matches CPU semantics.
+## Deferred
 
-## SHA512CRYPT performance — Steps A + C (ported from hashcat)
+- Host-side `gpu_ops[]` consumption of the new `gpu_metal_op_variant_admitted()` query (defense-in-depth)
+- mdxfind source-side `-h REGEX` runaway guard
+- OpenCL shared-loader refactor parallel to Metal (estimated ~3K LOC savings)
+- Phase 2e Dynsize Task #226 (long-standing backlog)
+- OpenCL init-tier debug emissions (~285 ambiguous sites left as production pending adjudication)
 
-`sha512_block` (Step A, `gpu_common.cl` + `metal_common.metal`) — replaced the loop-based 80-round body with hashcat's flat-unrolled pattern: 16 scalar `ulong w0_t..wf_t` (no W[80] array), source-inlined steps with macro-rotated argument order, bitselect-based Ch/Maj on platforms supporting it. Affects 81 call sites across 8 SHA-512 / SHA-384 / HMAC-SHA-512 kernel files — all byte-exact regression PASS on Pascal, Maxwell, Ada, RDNA4, and Apple M1/M2 Max.
+## Files
 
-Metal twin caught one Xcode 26 toolchain regression mid-port: `bitselect()` for scalar `ulong` is not supported (only vector overloads). Switched to arithmetic Ch/Maj forms — semantically identical, no perf cost, more portable.
+Added:
 
-SHACRYPT digest chain (Step C, `gpu_shacrypt_core.cl` + `metal_shacrypt_core.metal`) — replaced the per-iter `sc_init`/`sc_update`/`sc_final` byte-RMW chain with hashcat's pre-computed `wpc[8][16]` template + 8-template boolean-cube index pattern. The mdxfind `if (r&1) / if (r%3) / if (r%7)` 4-branch sequence is algebraically identical to `pc = (r&1) + ((r%3)?2:0) + ((r%7)?4:0)` (verified by hand for all 8 cases). Replaces dozens of read-modify-write byte operations per iteration with 16 ulong copies + 1 conditional byte splice. Affects all three SHACRYPT variants (e512, e513, e538) byte-exact.
+- `gpu/gpu_fatal.h` (rev 1.1)
+- `gpu/gpu_debug.h` (rev 1.1)
+- `gpu/metal_*_core.metal` + paired `_str.h` for each Phase 2d.6–2d.9 family
+- `gpu/codegen/cl2metal_overrides/*.yaml` for each translated family
 
-Measured on fpga GTX 1080, e513 SHA512CRYPT:
-- Pre-Step-A baseline: ~2,400 H/s
-- Post-Step-A: ~2,652 H/s (+10%)
-- Post-Step-C: ~3,226 H/s (+34% cumulative)
+Heavily modified:
 
-Hashcat m1800 reference on the same GPU is ~12,646 H/s. Remaining gap is structural — mdxfind's `template_phase0` kernel carries rule walker, mask decomposer, B7 mask shift, and cursor logic in every dispatch; closing it would require either a SHACRYPT-specialised kernel or a state-machine codegen of the kernel per dispatch shape. Out of scope this release.
-
-## Phase 2h MD5SALT Metal pre-roll (M-series perf)
-
-`gpu/metal_md5salt_core.metal` — added a "pre-salt hoist" that pre-rolls the outer MD5's first 8 FF rounds (which depend only on the salt-independent hex32 of the inner MD5) once per word, saving 12.5% of outer-MD5 work per (word, salt) pair. Carrier struct shrunk from 17 uints to 13 uints. Symmetric OpenCL port (`gpu/gpu_md5salt_core.cl`) added for parity — measured zero perf delta on NVIDIA Pascal (NVCC already CSE-hoists rounds 1-8 across the SALT_BATCH loop), +14.5% wall reduction on Apple M1 (1546s → 1322s on the canonical e31 sm-saltfull rockyou benchmark).
-
-## Phase 2g salt-refresh hybrid trigger
-
-`gpu/gpujob_opencl.c` + `gpu/gpujob_metal.m` — extended the salt-snapshot refresh trigger from "every 10 batches" to "every 10 batches OR ≥5% of salts retired since last refresh". Symmetric across both backends. Net win when combined with Phase 2h's per-hash cost reduction; quiescent overhead when not.
-
-## Phase 2f wordlist in-order ordering for GPU-salted ops
-
-`mdxfind.c` — capped per-procjob `numline` request at 32K for GPU+salted-hash combinations (was `ULLONG_MAX`). Matches the jobg slot size so each procjob produces exactly one ordered slot, preserving wordlist in-order processing across the double-buffer concurrent procjob workers. Measured ~40% wall reduction on M1 dev1 e31 sm-saltfull (~2400s → 1440s).
-
-## Wordlist throughput instrumentation
-
-Two new stderr emits for wordlist-performance characterization, both dead code when not active:
-
-- `linecount: <file> (N MB): scanned in Xms = Y MB/s` — fires after each cache-miss fresh scan in `linecount_thread`. On-disk byte rate, derived from stat `sb.st_size`. Cache hits skip the emit.
-- `-w skip: N lines (M MB) in Xms = Y MB/s` — fires in the main wordlist loop when SkipLine transitions to 0. Bytes via `CurfileBytesRead` atomic; only fires when `-w` is active.
-
-## Other fixes
-
-- **Nested block comment in `gpu/gpu_template.cl`** broke NVIDIA OpenCL JIT compile (silent CPU fallback). Inner `/* */` annotation inside an outer doc block terminated the outer block early, exposing prose as code. Fixed; new memory rule documented internally.
-- **Double-credit retirement on GPU completion path** — both procjob and GPU dispatch were crediting `retired_line` for the same words, causing 2× over-count visible as apparent hash-rate undercount. Removed the GPU-side credit; procjob hand-off is now the sole authority.
-- **Cross-chunk retirement reset** — `retired_line` was being zeroed at every `cacheline()` chunk boundary, breaking monotonicity. Now reset only at process start (implicit via `calloc`).
-- **BF servo statics restoration** — `bf_rate_ema`, `bf_chunks_produced`, `bf_first_feedback_seen`, `num_devs_v` were inadvertently deleted in 1.477 during the warning sweep, breaking .205 / .209 builds. Restored.
-
-## Cross-platform validation
-
-Steps A + C + iter accounting + word-retirement ETA validated byte-exact on:
-
-- NVIDIA Pascal (GTX 1080, Linux)
-- NVIDIA Maxwell (GTX 960, Linux)
-- NVIDIA Ada (RTX 4070 Ti, Linux)
-- AMD RDNA4 (RX 9070 / gfx1201, Linux ROCm)
-- Apple M1 (Metal, macOS)
-- Apple M2 Max (Metal, macOS)
-
-Windows NVIDIA preflight intentionally deferred to natural post-release testing.
-
-## Caveats
-
-- Word-retirement ETA percentage runs slightly optimistic under high rules / high masks workloads where the GPU work queue depth dominates per-job time (retirement credited at procjob hand-off, not GPU completion). Architecturally correct alternative (per-job CPU-vs-GPU classification at procjob completion) is documented in the source comment at the credit site for future revisit.
-- mdxfind GPU SHA512CRYPT remains ~3.9× slower than hashcat m1800 on the same hardware. Remaining gap is the `template_phase0` rule/mask/cursor scaffolding that fires per-dispatch even when not needed.
+- `gpu_metal.m` rev 1.93 → 1.100 (refactor + debug gating + admission summary)
+- `gpu_metal.h` rev 1.47 → 1.49
+- `gpu/gpujob_metal.m` rev 1.22 → 1.25
+- `gpu/gpu_opencl.c` rev 1.169 → 1.171 (D5b FATAL conversion + debug gating)
+- `gpu/gpujob_opencl.c` rev 1.137 → 1.138
+- `mdxfind.c` rev 1.473 → 1.475 (Phase 2d.5.7 + 2d.7a host-wiring fixes)
+- `gpu/codegen/cl2metal.py` rev 1.5 → 1.9 (pointer-state helpers, dual_addr_space_helpers overlay, _rewrite_local_uchar_casts, _FN_HEAD_RE widening, extra_scalar_ref_types overlay)
