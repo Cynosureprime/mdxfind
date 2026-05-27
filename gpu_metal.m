@@ -460,8 +460,16 @@ extern int            gpu_rule_count;
 #ifndef MASK_LITERAL_CPU
 #define MASK_LITERAL_CPU (-1)
 #endif
+/* 2026-05-26: raised from 16 to 256 to match mdxfind.c MAX_MASK_POS.
+ * The extern decls below MUST mirror the storage definition in mdxfind.c
+ * (currently MaskAppendPattern[256] etc.). Existing call sites here in
+ * gpu_metal.m iterate MIN(MaskPrependLen, KERN_A_PATTERN_LEN_CAP=16)
+ * for kernel A2 wire-format upload; the kernel-side per-side cap of 16
+ * is enforced upstream in mdxfind.c by the GPU upload guards plus the
+ * kernel-internal `if (npre > 16) npre = 16` clamps in
+ * metal_template.metal / metal_kernel_a_*. */
 #ifndef MAX_MASK_POS_CPU
-#define MAX_MASK_POS_CPU 16
+#define MAX_MASK_POS_CPU 256
 #endif
 #ifndef MASK_MAX_CLASSES_CPU
 #define MASK_MAX_CLASSES_CPU 16
@@ -5247,7 +5255,14 @@ static int gpu_metal_kernelA_upload_mask_buffers(void)
         GPU_FATAL("Metal: kernel A2 mask upload called with device=nil");
     }
 
-    const size_t pattern_bytes  = (size_t)MAX_MASK_POS_CPU * 2u;          /* 32 */
+    /* 2026-05-26: pattern_bytes stays at 32 bytes (16 positions * 2)
+     * regardless of MAX_MASK_POS_CPU (256 on CPU side). The kernel A2
+     * private scratch is uchar[16] and the metal_template internally
+     * clamps n_prepend/n_append to 16. The mdxfind.c upload guards
+     * refuse longer masks upstream; KERN_A_PATTERN_LEN_CAP defends in
+     * depth. */
+    const size_t KERN_A_PATTERN_LEN_CAP = 16u;
+    const size_t pattern_bytes  = KERN_A_PATTERN_LEN_CAP * 2u;            /* 32 */
     const size_t charsets_bytes = (size_t)MASK_MAX_CLASSES_CPU * 256u;    /* 4096 */
     const size_t counts_bytes   = (size_t)MASK_MAX_CLASSES_CPU * sizeof(uint32_t); /* 64 */
 
@@ -5287,14 +5302,14 @@ static int gpu_metal_kernelA_upload_mask_buffers(void)
     memset(charsets_p,   0, alloc_charsets);
     memset(counts_p,     0, alloc_counts);
 
-    for (int i = 0; i < MaskPrependLen && i < MAX_MASK_POS_CPU; i++) {
+    for (int i = 0; i < MaskPrependLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
         int cid = MaskPrependPattern[i].classid;
         prepend_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
                                   ? 0xffu
                                   : (unsigned char)(cid & 0xff);
         prepend_wire[i * 2 + 1] = MaskPrependPattern[i].literal;
     }
-    for (int i = 0; i < MaskAppendLen && i < MAX_MASK_POS_CPU; i++) {
+    for (int i = 0; i < MaskAppendLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
         int cid = MaskAppendPattern[i].classid;
         append_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
                                  ? 0xffu

@@ -1383,8 +1383,18 @@ extern uint64_t gpu_mask_total;
 #ifndef MASK_LITERAL_CPU
 #define MASK_LITERAL_CPU (-1)
 #endif
+/* 2026-05-26: raised from 16 to 256 to match mdxfind.c MAX_MASK_POS.
+ * Customer mask "?d?d?d?d?d?d?d?d?d?d@myecou.com" (21 positions) was
+ * being silently truncated to 16 at parse time. The CPU mask iterator
+ * now supports up to 256 positions; this extern array size MUST equal
+ * the storage definition in mdxfind.c (currently MaskAppendPattern[256]
+ * etc.) or pointer arithmetic across TUs goes UB. Existing call sites
+ * here in gpu_opencl.c iterate MIN(MaskPrependLen, MAX_MASK_POS_CPU)
+ * for safety; the kernel-side per-side cap of 16 is enforced by the
+ * mdxfind.c upload guards plus the kernel-internal `if (npre > 16) npre
+ * = 16` clamps. */
 #ifndef MAX_MASK_POS_CPU
-#define MAX_MASK_POS_CPU 16
+#define MAX_MASK_POS_CPU 256
 #endif
 #ifndef MASK_MAX_CLASSES_CPU
 #define MASK_MAX_CLASSES_CPU 16
@@ -11018,7 +11028,18 @@ static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev
     if (d->b_kern_a_mask_allocated) return 0;
 
     cl_int err = CL_SUCCESS;
-    const size_t pattern_bytes  = (size_t)MAX_MASK_POS_CPU * 2u;          /* 32 */
+    /* 2026-05-26: GPU per-side cap is 16 (MAX_MASK_POS_GPU_SIDE in
+     * mdxfind.c) -- the kernel A2 private scratch is uchar[16] and the
+     * template kernel internally clamps n_prepend/n_append to 16. The
+     * cl_mem buffer + host staging arrays stay sized at 32 bytes
+     * (16 positions * 2 bytes) regardless of MAX_MASK_POS_CPU (256 on
+     * CPU side). The mdxfind.c upload guards refuse the upload entirely
+     * when MaskPrependLen or MaskAppendLen exceeds 16, so this site
+     * never sees a longer mask in practice; iterating with the
+     * MIN(MaskPrependLen, KERN_A_PATTERN_LEN_CAP) bound below stays
+     * defensive. */
+    const size_t KERN_A_PATTERN_LEN_CAP = 16u;
+    const size_t pattern_bytes  = KERN_A_PATTERN_LEN_CAP * 2u;            /* 32 */
     const size_t charsets_bytes = (size_t)MASK_MAX_CLASSES_CPU * 256u;    /* 4096 */
     const size_t counts_bytes   = (size_t)MASK_MAX_CLASSES_CPU * sizeof(uint32_t); /* 64 */
 
@@ -11057,9 +11078,11 @@ static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev
         exit(1);
     }
 
-    /* Compose host staging arrays. */
-    unsigned char prepend_wire[MAX_MASK_POS_CPU * 2];
-    unsigned char append_wire[MAX_MASK_POS_CPU * 2];
+    /* Compose host staging arrays. 32-byte wire format (16 positions *
+     * 2 bytes) is fixed by the kernel A2 signature; iteration is bounded
+     * by KERN_A_PATTERN_LEN_CAP. */
+    unsigned char prepend_wire[16 * 2];
+    unsigned char append_wire[16 * 2];
     unsigned char charsets_flat[MASK_MAX_CLASSES_CPU * 256];
     uint32_t      counts_flat[MASK_MAX_CLASSES_CPU];
     memset(prepend_wire,  0, sizeof(prepend_wire));
@@ -11068,14 +11091,14 @@ static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev
     memset(counts_flat,   0, sizeof(counts_flat));
 
     /* D9.2.a: encode classid -1 as byte 0xff. */
-    for (int i = 0; i < MaskPrependLen && i < MAX_MASK_POS_CPU; i++) {
+    for (int i = 0; i < MaskPrependLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
         int cid = MaskPrependPattern[i].classid;
         prepend_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
                                   ? 0xffu
                                   : (unsigned char)(cid & 0xff);
         prepend_wire[i * 2 + 1] = MaskPrependPattern[i].literal;
     }
-    for (int i = 0; i < MaskAppendLen && i < MAX_MASK_POS_CPU; i++) {
+    for (int i = 0; i < MaskAppendLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
         int cid = MaskAppendPattern[i].classid;
         append_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
                                  ? 0xffu

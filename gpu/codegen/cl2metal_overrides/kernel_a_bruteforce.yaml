@@ -1,0 +1,50 @@
+# cl2metal overlay for kernel_a_bruteforce
+# (gpu/gpu_kernel_a_bruteforce.cl -> gpu/metal_kernel_a_bruteforce.metal).
+#
+# $Revision: $
+# $Log: $
+#
+#
+# Phase 1a sub-phase 1a.4 (2026-05-21): translator overlay for the kernel A4
+# (brute-force) production candidate-producer kernel. Mirrors the shape of
+# the kernel_a_masks.yaml sister overlay -- both share the mask-helper
+# address-space discipline (mask_expand_into_gpu + mask_pattern_total each
+# accept `device const uchar *pattern` / `device const uchar *mask_charsets`
+# / `device const uint *mask_class_counts` plus a `thread uchar *outbuf` for
+# the expander). The translator's arg_address_space knob constructs
+# `<override> <type> <stars> <name>` and cannot synthesize a full type
+# substitution like `device volatile uint *X` -> `device atomic_uint *X`,
+# so the b_kernelA_state arg type rewrite + the four atomic_add / atomic_or
+# call sites + the `get_global_id(0)` -> thread_position_in_grid rewrite
+# are handled by the companion post-edit script gpu/codegen/post_kernel_a_-
+# metal.py which runs after cl2metal.py and is shared across the kernel-A
+# family (R1-R6 are family-generic; A4 reuses unchanged).
+#
+# A4-specific note: R1 (apply_rule -> apply_rule_thread) is a NO-OP for A4
+# because A4 has no rule walker. The rewrite_atomics + retype_b_kernelA_-
+# state + metalify_global_id + metalify_vector_casts + disable_simd_heads
+# rewrites all apply trivially (idempotent on non-matching sources).
+#
+# Hand-port reference: gpu/codegen/cl2metal_overrides/kernel_a_masks.yaml
+# (sister overlay for A2; A4 reuses the mask helpers verbatim and shares
+# the same arg-address-space discipline).
+
+algo: kernel_a_bruteforce
+
+# No skip_functions, no skip_line_ranges.
+#
+# No dual_addr_space_helpers: mask_expand_into_gpu accepts `__global const
+# uchar *pattern` / `__global const uchar *mask_charsets` / `__global const
+# uint *mask_class_counts` plus a `thread uchar *outbuf` (private). One
+# call site in cand_bruteforce_phase0 (once for the append-side mask). No
+# second overload needed; Metal's overload resolution is unambiguous here.
+#
+# mask_pattern_total has identical address-space discipline (global pattern
+# + global counts only, returns ulong). Single overload sufficient. A4
+# does not invoke mask_pattern_total in the kernel body -- the host
+# supplies bf_num_masks directly via OCLParams.num_masks -- but the helper
+# is kept for translator stability and Phase 1b hoist consistency.
+#
+# arg_address_space deliberately empty: the b_kernelA_state full type
+# replacement is performed by the post-edit script because cl2metal.py's
+# arg_override values are address-space prefixes, not full type strings.

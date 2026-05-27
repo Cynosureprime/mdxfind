@@ -1,0 +1,30 @@
+# cl2metal overlay for kernel_a_rules
+# (gpu/gpu_kernel_a_rules.cl -> gpu/metal_kernel_a_rules.metal).
+#
+# $Revision: $
+# $Log: $
+#
+#
+# Phase 1a sub-phase 1a.1b (2026-05-20): translator overlay for the kernel
+# A1 production candidate-producer kernel. Mirrors gpu/codegen/cl2metal_-
+# overrides/md5.yaml in shape (minimal stub) but identifies extra post-
+# translation manual edits documented in the README footer comment block
+# below — the translator's arg_address_space knob constructs
+# `<override> <type> <stars> <name>` and cannot synthesize a full type
+# substitution like `device volatile uint *X` -> `device atomic_uint *X`,
+# so the b_kernelA_state arg type rewrite + the four atomic_add/atomic_or
+# call sites + the apply_rule -> apply_rule_thread rename are handled by
+# the companion post-edit script gpu/codegen/post_kernel_a_metal.py which
+# runs after cl2metal.py.
+#
+# Hand-port reference: none -- this is the FIRST kernel-A Metal port.
+
+algo: kernel_a_rules
+
+# No skip_functions, no skip_line_ranges, no dual_addr_space_helpers
+# (apply_rule is renamed wholesale to apply_rule_thread by the post-edit
+# script per D2; no dual overload needed).
+#
+# arg_address_space deliberately empty: the b_kernelA_state full type
+# replacement is performed by the post-edit script because cl2metal.py's
+# arg_override values are address-space prefixes, not full type strings.

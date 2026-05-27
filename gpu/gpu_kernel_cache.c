@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.6 2026/05/04 07:54:59 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.7 2026/05/19 20:57:57 dlr Exp dlr $
  *
  * Implementation. See gpu_kernel_cache.h for the design overview.
  */
@@ -250,7 +250,7 @@ static void cache_version_check_and_invalidate(void) {
 
     if (!have || strcmp(on_disk, MdxRev) != 0) {
         /* Mismatch (or first-ever cache here). Sweep entries and rewrite
-         * version. We only delete *.bin and *.meta (not the lock file
+         * version. We delete *.bin, *.meta, and *.cl (not the lock file
          * we hold, not anything else a peer might have stashed). */
 #ifdef _WIN32
         char glob[4096];
@@ -262,9 +262,10 @@ static void cache_version_check_and_invalidate(void) {
                 size_t nlen = strlen(fd.cFileName);
                 int is_bin  = (nlen >= 4 && strcmp(fd.cFileName + nlen - 4, ".bin")  == 0);
                 int is_meta = (nlen >= 5 && strcmp(fd.cFileName + nlen - 5, ".meta") == 0);
+                int is_cl   = (nlen >= 3 && strcmp(fd.cFileName + nlen - 3, ".cl")   == 0);
                 int is_lock = (nlen >= 5 && strcmp(fd.cFileName + nlen - 5, ".lock") == 0
                                && strcmp(fd.cFileName, ".cache.lock") != 0);
-                if (is_bin || is_meta || is_lock) {
+                if (is_bin || is_meta || is_cl || is_lock) {
                     char full[4096];
                     cache_path(full, sizeof(full), fd.cFileName);
                     UNLINK(full);
@@ -280,9 +281,10 @@ static void cache_version_check_and_invalidate(void) {
                 size_t nlen = strlen(de->d_name);
                 int is_bin  = (nlen >= 4 && strcmp(de->d_name + nlen - 4, ".bin")  == 0);
                 int is_meta = (nlen >= 5 && strcmp(de->d_name + nlen - 5, ".meta") == 0);
+                int is_cl   = (nlen >= 3 && strcmp(de->d_name + nlen - 3, ".cl")   == 0);
                 int is_lock = (nlen >= 5 && strcmp(de->d_name + nlen - 5, ".lock") == 0
                                && strcmp(de->d_name, ".cache.lock") != 0);
-                if (is_bin || is_meta || is_lock) {
+                if (is_bin || is_meta || is_cl || is_lock) {
                     char full[4096];
                     cache_path(full, sizeof(full), de->d_name);
                     UNLINK(full);
@@ -543,10 +545,12 @@ static cl_program try_load(const char *key, cl_context ctx, cl_device_id dev,
 }
 
 /* After successful source-compile + clBuildProgram, store the binary
- * to <key>.bin + sidecar to <key>.meta. */
+ * to <key>.bin + sidecar to <key>.meta, and write the concatenated kernel
+ * source to <key>.cl for static inspection. The .cl write is advisory
+ * (failure logs a warning but does not abort the store). */
 static void store_entry(const char *key, cl_program prog, cl_device_id dev,
                         const char *device_name, const char *driver_version,
-                        const char *cl_version) {
+                        const char *cl_version, const char *full_src) {
     /* Get binary size + bytes for our (single) device. */
     size_t bin_size = 0;
     cl_int err = clGetProgramInfo(prog, CL_PROGRAM_BINARY_SIZES,
@@ -606,6 +610,29 @@ static void store_entry(const char *key, cl_program prog, cl_device_id dev,
     fflush(fp);
     fclose(fp);
     if (RENAME_REPL(metp_tmp, metp) != 0) { UNLINK(metp_tmp); return; }
+
+    /* Write .cl source dump atomically (debug artifact — non-fatal on failure). */
+    if (full_src && full_src[0] != '\0') {
+        char clp[4096], clp_tmp[4096];
+        snprintf(clp,     sizeof(clp),     "%s%c%s.cl",     CacheDir, DIRSEP_NATIVE, key);
+        snprintf(clp_tmp, sizeof(clp_tmp), "%s%c%s.cl.tmp.%d", CacheDir, DIRSEP_NATIVE, key,
+                 (int)getpid());
+        FILE *clp_fp = fopen(clp_tmp, "w");
+        if (clp_fp) {
+            size_t slen = strlen(full_src);
+            size_t clwr = fwrite(full_src, 1, slen, clp_fp);
+            fflush(clp_fp);
+            fclose(clp_fp);
+            if (clwr != slen || RENAME_REPL(clp_tmp, clp) != 0) {
+                UNLINK(clp_tmp);
+                fprintf(stderr,
+                    "GPU kernel cache: warning: could not write source dump %s\n", clp);
+            }
+        } else {
+            fprintf(stderr,
+                "GPU kernel cache: warning: could not open source dump %s\n", clp_tmp);
+        }
+    }
 }
 
 /* ============================================================
@@ -712,7 +739,19 @@ cl_program gpu_kernel_cache_build_program_ex(
     }
     err = clBuildProgram(prog, 1, &dev, build_opts ? build_opts : "", NULL, NULL);
     if (err == CL_SUCCESS) {
-        store_entry(key, prog, dev, device_name, driver_version, cl_version);
+        /* Concatenate all source segments for the .cl debug dump. */
+        size_t total_src_len = 0;
+        for (cl_uint si = 0; si < n_sources; si++)
+            total_src_len += strlen(sources[si]);
+        char *full_src = (char *)malloc(total_src_len + 1);
+        if (full_src) {
+            full_src[0] = '\0';
+            for (cl_uint si = 0; si < n_sources; si++)
+                strcat(full_src, sources[si]);
+        }
+        store_entry(key, prog, dev, device_name, driver_version, cl_version,
+                    full_src ? full_src : "");
+        free(full_src);
     }
     lock_release(lk);
     if (err_out) *err_out = err;

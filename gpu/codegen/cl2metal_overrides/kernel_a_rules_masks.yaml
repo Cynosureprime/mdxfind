@@ -1,0 +1,45 @@
+# cl2metal overlay for kernel_a_rules_masks
+# (gpu/gpu_kernel_a_rules_masks.cl -> gpu/metal_kernel_a_rules_masks.metal).
+#
+# $Revision: $
+# $Log: $
+#
+#
+# Phase 1a sub-phase 1a.3 (2026-05-21): translator overlay for the kernel A3
+# (rules + masks composition) production candidate-producer kernel. A3 is
+# structurally the textual merge of A1 (rule walker) + A2 (mask expander),
+# so this overlay mirrors the shape of both sister overlays:
+#  - kernel_a_rules.yaml  -- A1 (sister) for the apply_rule -> apply_rule_-
+#                            thread rename, b_kernelA_state atomic retype,
+#                            and atomic call-site rewrites.
+#  - kernel_a_masks.yaml  -- A2 (sister) for the mask helpers' address-
+#                            space discipline (single overload each).
+#
+# The translator's arg_address_space knob constructs `<override> <type>
+# <stars> <name>` and cannot synthesize a full type substitution like
+# `device volatile uint *X` -> `device atomic_uint *X`, so the b_kernelA_-
+# state arg type rewrite + the four atomic_add/atomic_or call sites + the
+# `get_global_id(0)` -> thread_position_in_grid rewrite + the apply_rule
+# -> apply_rule_thread rename are handled by the companion post-edit
+# script gpu/codegen/post_kernel_a_metal.py which runs after cl2metal.py
+# and is shared across the kernel-A family (R1-R6 are family-generic;
+# A3 reuses unchanged).
+#
+# Hand-port reference: gpu/codegen/cl2metal_overrides/kernel_a_rules.yaml
+# + gpu/codegen/cl2metal_overrides/kernel_a_masks.yaml.
+
+algo: kernel_a_rules_masks
+
+# No skip_functions, no skip_line_ranges.
+#
+# No dual_addr_space_helpers: both apply_rule (private thread buf) and
+# mask_expand_into_gpu (global pattern + private thread outbuf) have
+# single-overload address-space discipline. apply_rule_thread rename is
+# performed wholesale by post_kernel_a_metal.py R1. mask_expand_into_gpu
+# is called twice in the kernel body (prepend + append) with identical
+# address-space mix; one overload sufficient. mask_pattern_total likewise
+# (single overload).
+#
+# arg_address_space deliberately empty: the b_kernelA_state full type
+# replacement is performed by the post-edit script because cl2metal.py's
+# arg_override values are address-space prefixes, not full type strings.

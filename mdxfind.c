@@ -235,10 +235,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.501 2026/05/23 06:28:15 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.505 2026/05/27 00:29:53 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.501 2026/05/23 06:28:15 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.505 2026/05/27 00:29:53 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -256,6 +256,15 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.505  2026/05/27 00:29:53  dlr
+ * Raise MAX_MASK_POS from 16 to 256; add MAX_MASK_POS_GPU_SIDE=16 for GPU per-side cap; FATAL on overlong masks. Customer mask 21-char ?d?d?d?d?d?d?d?d?d?d@myecou.com was silently truncated to 16 positions causing wrong hashes. parse_mask_into now exits with diagnostic on overflow. GPU upload sites at lines ~50390, ~50510, ~50780 now check input mask against GPU per-side cap and skip upload + warn when exceeded so CPU path handles long masks. Validated on fpga.local GTX 1080 - customer hash a7cd8421ed4f949af68b68a3b116ede1 cracked at 2399938728@myecou.com over 10e10 keyspace in 194s at 51 Mh per second with 17 threads.
+ *
+ * Revision 1.504  2026/05/26 22:45:15  dlr
+ * Fix two limitations in -n mask attack mode. Limitation 1 number_iter declared int caused signed-int overflow at exactly 2-to-31 candidates terminating the loop prematurely. Widen number_iter and loop_bound from int to unsigned long long. Drop int cast on job-MaskCount. Limitation 2 seed-file path submitted exactly one job per algo-per-line which only spawned one procjob worker thread regardless of -t value. Add mask-iteration chunking around the job submission site so when a mask is configured AND MaskTotal is at or above maxt times 65536 AND maxt is more than 1 AND Numrules is at most 1 the job is split into maxt sub-jobs covering disjoint MaskIndex ranges. Each sub-job triggers a launch up to maxt enabling true parallelism. Gated on Numrules at most 1 because the per-rule MaskIndex reset to zero at line 12147 would corrupt chunk ranges when real rules are walked. Verified on fpga.local Pascal GTX 1080 16 cores. Full 10-to-10 keyspace sweep at 60 megahashes per second using 16 threads completes in 166 seconds cracking target plaintext 9999988888 at MaskIndex near 10-to-10 well past the prior 2-to-31 cap. Previous behavior 466 seconds 4.6 megahashes per second on 1 thread and only 2-to-31 candidates covered. Regression check short-mask 1000-candidate sweep unaffected single-thread path preserved when below chunking threshold.
+ *
+ * Revision 1.503  2026/05/26 15:48:06  dlr
+ * Revert JOB_SQL5MD5 e997 and case label - duplicate of JOB_MYSQL5MD5 e539
+ *
  * Revision 1.501  2026/05/23 06:28:15  dlr
  * Sub-phase 5a.5 part B: de-staticize oracle_compute_md5pass_family for gpu/gpujob_opencl.c gpu/gpujob_metal.m hit-replay full-digest recompute (family digests > 16 bytes); widen chokepoint admit OR-chain and need_gpu Dohash override for 7 family JOBs e122 e159 e161 e163 e165 e167 e169 via shared gpu_codegen_kernelb_family_md5pass_eligible helper; salt requirement check preserves natural unsalted-op behavior for family enums no negation needed
  *
@@ -7507,8 +7516,33 @@ unsigned long Iter_Count[] = {0, 10, 10, 100, 100, 1000, 1000, 1000, 1000, 10000
 
 char *NumbersFmt;
 
-/* Mask-based hybrid attack support */
-#define MAX_MASK_POS 16
+/* Mask-based hybrid attack support.
+ *
+ * MAX_MASK_POS is the CPU per-pattern position cap (one side: -n or -N
+ * alone, or one side of -N + -n combined). Raised from 16 to 256 on
+ * 2026-05-26 to accommodate long literal-suffixed customer masks such
+ * as "?d?d?d?d?d?d?d?d?d?d@myecou.com" (21 positions). Memory cost is
+ * negligible: each struct MaskPos is 8 bytes; the 3 pattern arrays
+ * grow from 128 B to 2 KB total.
+ *
+ * MAX_MASK_POS_GPU_SIDE is the per-side hard limit enforced by all
+ * GPU kernel paths today (template_phase0, kernel_a_masks, kernel_a_-
+ * rules_masks, kernel_a_bruteforce, and the Metal twins). The kernels
+ * themselves clamp npre/napp to 16 internally (gpu_template.cl:442-
+ * 443, metal_template.metal:455-456) and the per-thread private
+ * scratch arrays are sized [16] (gpu_kernel_a_*.cl, metal_kernel_a_-
+ * *.metal). Raising this requires coordinated source changes in every
+ * .cl/.metal file plus cl2str.py regeneration of the _str.h string
+ * literals plus widening of the OCLParams n_prepend/n_append fields
+ * if they ever exceed uchar. Deferred until a customer needs >16
+ * positions per side on the GPU.
+ *
+ * The GPU upload sites (mdxfind.c ~50324, ~50424, ~50686) skip the
+ * upload and emit a one-time warning when an input mask exceeds
+ * MAX_MASK_POS_GPU_SIDE, falling back to the CPU mask iterator
+ * (which has the larger MAX_MASK_POS cap). */
+#define MAX_MASK_POS 256
+#define MAX_MASK_POS_GPU_SIDE 16
 #define MASK_LITERAL -1
 #define MASK_CLASS_d 0
 #define MASK_CLASS_l 1
@@ -7629,9 +7663,19 @@ static int parse_char_class(const char *p, struct MaskClass *mc) {
     return (int)(p - start);
 }
 
-/* Parse mask string into a target pattern array. Returns 0 on success, -1 on error. */
+/* Parse mask string into a target pattern array. Returns 0 on success, -1 on error.
+ *
+ * 2026-05-26: replaced the silent-truncation behavior with a FATAL exit
+ * when the input mask exceeds MAX_MASK_POS positions. Pre-fix the loop
+ * stopped consuming characters once plen reached MAX_MASK_POS (then 16)
+ * and reported success with a truncated pattern, causing wrong hashes
+ * for masks like "?d?d?d?d?d?d?d?d?d?d@myecou.com" (21 positions) which
+ * were silently shortened to "?d?d?d?d?d?d?d?d?d?d@myeco". Per
+ * feedback_external_failures_are_fatal.md: external/input failures must
+ * never silently degrade. */
 static int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out,
                            unsigned long long *total_out) {
+    const char *orig = s;
     int plen = 0;
     unsigned long long total = 1;
     while (*s && plen < MAX_MASK_POS) {
@@ -7677,6 +7721,41 @@ static int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out,
             pattern[plen].literal = *s++;
         }
         plen++;
+    }
+    if (*s) {
+        /* Loop exited because we hit MAX_MASK_POS with characters still
+         * left in the input. Count remaining positions for the diagnostic.
+         * No silent truncation -- per feedback_external_failures_are_fatal.md
+         * we exit(1) and tell the operator what they need to change. */
+        int remaining_positions = 0;
+        const char *t = s;
+        while (*t) {
+            if (*t == '?') {
+                t++;
+                if (*t == '\0') break;
+                if (*t == '[') {
+                    /* Skip to end of custom class for accurate count. */
+                    t++;
+                    while (*t && *t != ']') t++;
+                    if (*t == ']') t++;
+                } else {
+                    t++;
+                }
+            } else {
+                t++;
+            }
+            remaining_positions++;
+        }
+        fprintf(stderr,
+            "FATAL: %s:%d mask pattern '%s' exceeds MAX_MASK_POS (%d) -- "
+            "consumed %d positions, %d more remain (raise MAX_MASK_POS and "
+            "rebuild to handle longer masks; GPU per-side cap is "
+            "MAX_MASK_POS_GPU_SIDE=%d so masks over %d per side fall back "
+            "to CPU only)\n",
+            __FILE__, __LINE__, orig, MAX_MASK_POS, plen,
+            remaining_positions, MAX_MASK_POS_GPU_SIDE,
+            MAX_MASK_POS_GPU_SIDE);
+        exit(1);
     }
     if (plen == 0) {
         fprintf(stderr, "Empty mask pattern\n");
@@ -10316,7 +10395,8 @@ unsigned int found, lineproc;
 __attribute__((unused)) unsigned long long mswap;
 unsigned long long rulecnt, hashcnt;
 union HashU md5buf, curin, *mdcur;
-int x = 0, y = 0, len, i, j, k, orig_len, number_iter, hmac_type = 0, hmac_len;
+int x = 0, y = 0, len, i, j, k, orig_len, hmac_type = 0, hmac_len;
+unsigned long long number_iter;  /* widened from int -- mask sweeps can exceed 2^31 (overflow caused premature exit at exactly 2^31 candidates) */
 int Lfstate, pass_len, pass_len1, user_len, email_len;
 int rounds, cryptlen, crypt_prefix_len;
 Word_t RC;
@@ -11989,7 +12069,7 @@ while (1) {
             MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
             MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
             (MaskPrependLen + MaskAppendLen) >= 1) {
-          number_iter = (int)job->MaskCount;  /* loop bottom: !(number_iter < MaskCount) */
+          number_iter = (unsigned long long)job->MaskCount;  /* loop bottom: !(number_iter < MaskCount) */
         }
       }
     }
@@ -12070,9 +12150,9 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
  * uses MaskCount when -n with mask syntax, else Iter_Count[digits] for
  * legacy -n N numeric iteration. For neither, value is 1 (no iteration). */
 {
-  int loop_bound = (job->flags & JOBFLAG_NUMBERS)
-      ? (job->MaskCount ? (int)job->MaskCount : Iter_Count[job->digits])
-      : 1;
+  unsigned long long loop_bound = (job->flags & JOBFLAG_NUMBERS)
+      ? (job->MaskCount ? (unsigned long long)job->MaskCount : (unsigned long long)Iter_Count[job->digits])
+      : 1ULL;
 
   if (pass0 == 0) {
     /* No-rule pass: stash the original word into rule_base so subsequent
@@ -50311,12 +50391,31 @@ usage:
         if (finalfam && probe_first_op >= 0)
           gpu_opencl_warm_probe_async(probe_first_op);
       }
-      /* Upload mask descriptor to GPU if mask mode is active (OpenCL) */
+      /* Upload mask descriptor to GPU if mask mode is active (OpenCL).
+       *
+       * 2026-05-26: per-side cap is MAX_MASK_POS_GPU_SIDE (=16), the
+       * hard limit of every live GPU kernel path. If the parsed mask
+       * exceeds that on either side we skip the upload entirely; the
+       * job then dispatches via CPU only (which honors the larger
+       * MAX_MASK_POS=256 cap). Pre-fix the staging arrays were sized
+       * MAX_MASK_POS*2 and the loop silently overran the GPU kernel's
+       * fixed cap of 16 per side. */
       if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpujob_available()) {
         int gpu_mask_ok = 1;
-        static uint8_t mask_sizes[MAX_MASK_POS * 2];
-        static uint8_t mask_tables[MAX_MASK_POS * 2][256];
+        if (MaskPrependLen > MAX_MASK_POS_GPU_SIDE ||
+            MaskAppendLen > MAX_MASK_POS_GPU_SIDE ||
+            MaskLen > MAX_MASK_POS_GPU_SIDE) {
+          fprintf(stderr,
+            "Mask exceeds GPU per-side cap (MaskPrependLen=%d MaskAppendLen=%d "
+            "MaskLen=%d, GPU per-side cap=%d). Mask-mode job will run on CPU "
+            "only.\n",
+            MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
+          gpu_mask_ok = 0;
+        }
+        static uint8_t mask_sizes[MAX_MASK_POS_GPU_SIDE * 2];
+        static uint8_t mask_tables[MAX_MASK_POS_GPU_SIDE * 2][256];
         int npre = 0, napp = 0;
+        if (gpu_mask_ok) {
 
         /* Build prepend tables from MaskClasses */
         for (int mi = 0; mi < MaskPrependLen; mi++) {
@@ -50380,6 +50479,7 @@ usage:
           gpu_opencl_set_mask(mask_sizes, mask_tables, npre, napp);
 #endif
         }
+        }  /* end if (gpu_mask_ok) — 2026-05-26 outer guard for GPU per-side cap */
       }
 #endif
 #if defined(__APPLE__) && defined(METAL_GPU)
@@ -50414,10 +50514,20 @@ usage:
        * machinery that is OpenCL-only. */
       if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpujob_available()) {
         int m_gpu_ok = 1;
-        static uint8_t m_sizes[MAX_MASK_POS * 2];
-        static uint8_t m_tables[MAX_MASK_POS * 2][256];
+        if (MaskPrependLen > MAX_MASK_POS_GPU_SIDE ||
+            MaskAppendLen > MAX_MASK_POS_GPU_SIDE ||
+            MaskLen > MAX_MASK_POS_GPU_SIDE) {
+          fprintf(stderr,
+            "Mask exceeds Metal GPU per-side cap (MaskPrependLen=%d "
+            "MaskAppendLen=%d MaskLen=%d, GPU per-side cap=%d). Mask-mode "
+            "job will run on CPU only.\n",
+            MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
+          m_gpu_ok = 0;
+        }
+        static uint8_t m_sizes[MAX_MASK_POS_GPU_SIDE * 2];
+        static uint8_t m_tables[MAX_MASK_POS_GPU_SIDE * 2][256];
         int npre = 0, napp = 0;
-        for (int mi = 0; mi < MaskPrependLen; mi++) {
+        if (m_gpu_ok) for (int mi = 0; mi < MaskPrependLen; mi++) {
           int cid = MaskPrependPattern[mi].classid;
           if (cid == MASK_LITERAL) {
             m_sizes[npre] = 1; memset(m_tables[npre], 0, 256);
@@ -50673,14 +50783,27 @@ usage:
           BruteForceTotal = 1;
         }
 
-        /* Set up GPU mask tables if GPU is available */
+        /* Set up GPU mask tables if GPU is available.
+         *
+         * 2026-05-26: per-side cap enforced. If the brute-force append
+         * mask exceeds MAX_MASK_POS_GPU_SIDE, skip the upload entirely
+         * and route via CPU. The CPU iterator handles up to
+         * MAX_MASK_POS=256 per pattern. */
 #ifdef GPU_ENABLED
         if (gpujob_available()) {
-          static uint8_t bf_mask_sizes[MAX_MASK_POS * 2];
-          static uint8_t bf_mask_tables[MAX_MASK_POS * 2][256];
+          static uint8_t bf_mask_sizes[MAX_MASK_POS_GPU_SIDE * 2];
+          static uint8_t bf_mask_tables[MAX_MASK_POS_GPU_SIDE * 2][256];
           int bf_napp = 0;
           int bf_ok = 1;
-          for (int mi = 0; mi < MaskAppendLen; mi++) {
+          if (MaskAppendLen > MAX_MASK_POS_GPU_SIDE) {
+            fprintf(stderr,
+              "Brute-force mask exceeds GPU per-side cap "
+              "(MaskAppendLen=%d, GPU per-side cap=%d). BF job will run "
+              "on CPU only.\n",
+              MaskAppendLen, MAX_MASK_POS_GPU_SIDE);
+            bf_ok = 0;
+          }
+          if (bf_ok) for (int mi = 0; mi < MaskAppendLen; mi++) {
             int cid = MaskAppendPattern[mi].classid;
             if (cid == MASK_LITERAL) {
               bf_mask_sizes[bf_napp] = 1;
@@ -51206,66 +51329,98 @@ reprocess:
 	    numline = Linecount - curline;
 	  linehints[x].curline += numline;
 	  isdone = 0;
-          possess(FreeWaiting);
-          wait_for(FreeWaiting, NOT_TO_BE, 0);
-          job = FreeHead;
-          if (!job) {
-            fprintf(stderr, "Job null on freehead!\n");
-            exit(1);
-	  }
-          FreeHead = job->next;
-          job->next = NULL;
-          if (FreeHead == NULL)
-            FreeTail = &FreeHead;
-          twist(FreeWaiting, BY, -1);
-
-          job->op = x;
-          job->flags = (Printsource | Addlf);
-          if (Dodigits)
-            job->flags |= JOBFLAG_NUMBERS;
-          if (Doip)
-            job->flags |= JOBFLAG_IP;
-          if (MaskPrepend || MaskPrependLen > 0)
-            job->flags |= JOBFLAG_PREPEND;
-          job->Numbers = Numbers;
-          job->digits = Dodigits;
-          job->MaskIndex = (MaskLen || MaskPrependLen || MaskAppendLen) ? 0 : Numbers;
-          if (MaskLen || MaskPrependLen || MaskAppendLen) {
-            job->MaskCount = MaskTotal;
-          } else
-            job->MaskCount = 0;
-          job->doneprint = &doneprint;
-          job->filename = argv[y];
-          job->startline = curline;
-          job->numline = numline;
-          __sync_fetch_and_add(&InflightLines, numline);  /* word-retirement: job inflight */
-          job->readindex = readindex;
-          job->readbuf = readbuf;
-          if (readbuf == Readbuf) {
-            possess(ReadBuf0);
-            twist(ReadBuf0, BY, +1);
-          } else {
-            possess(ReadBuf1);
-            twist(ReadBuf1, BY, +1);
-          }
-          if (ThreadCount < maxt) {
-            /* Experimental: stagger second procjob() startup so the first
-             * thread fills jobg with line-ordered buffers before sibling
-             * threads start consuming. Env-gated, fires once when
-             * launching the second worker, gpu-active only. See
-             * project_launch_delay_experiment.md. */
-#ifdef GPU_ENABLED
-            if (ThreadCount == 1 && gpujob_available()) {
-              sleep(2);
+          /* Mask-iteration thread fanout (2026-05-26): when a mask is configured
+           * AND MaskTotal is large AND maxt > 1 AND no real rules are active, split
+           * the per-line job into N chunked sub-jobs covering disjoint MaskIndex
+           * ranges. Each launches its own procjob worker (up to maxt), enabling
+           * true parallelism for large -n/-N sweeps. Without chunking, a 1-line
+           * seed-file sweep produces 1 job and only 1 worker thread runs the
+           * entire MaskTotal sequentially (the -t flag is structurally ignored
+           * because additional launches happen only on additional job submits).
+           * Chunking is gated on Numrules<=1 because per-rule MaskIndex reset at
+           * line 12147 would corrupt chunk ranges when real rules are walked. */
+          {
+            unsigned long long _chunks = 1ULL;
+            unsigned long long _chunk_threshold = (unsigned long long)maxt * 65536ULL;
+            if ((MaskLen || MaskPrependLen || MaskAppendLen) &&
+                MaskTotal >= _chunk_threshold &&
+                maxt > 1 && Numrules <= 1) {
+              _chunks = (unsigned long long)maxt;
             }
+            unsigned long long _base_size = MaskTotal / _chunks;
+            unsigned long long _remainder = MaskTotal - (_base_size * _chunks);
+            unsigned long long _chunk_start = 0ULL;
+            unsigned long long _ci;
+            for (_ci = 0; _ci < _chunks; _ci++) {
+              unsigned long long _chunk_size = _base_size + (_ci < _remainder ? 1ULL : 0ULL);
+              possess(FreeWaiting);
+              wait_for(FreeWaiting, NOT_TO_BE, 0);
+              job = FreeHead;
+              if (!job) {
+                fprintf(stderr, "Job null on freehead!\n");
+                exit(1);
+              }
+              FreeHead = job->next;
+              job->next = NULL;
+              if (FreeHead == NULL)
+                FreeTail = &FreeHead;
+              twist(FreeWaiting, BY, -1);
+
+              job->op = x;
+              job->flags = (Printsource | Addlf);
+              if (Dodigits)
+                job->flags |= JOBFLAG_NUMBERS;
+              if (Doip)
+                job->flags |= JOBFLAG_IP;
+              if (MaskPrepend || MaskPrependLen > 0)
+                job->flags |= JOBFLAG_PREPEND;
+              job->Numbers = Numbers;
+              job->digits = Dodigits;
+              if (MaskLen || MaskPrependLen || MaskAppendLen) {
+                job->MaskIndex = _chunk_start;
+                job->MaskCount = (_chunks > 1ULL) ? _chunk_size : MaskTotal;
+              } else {
+                job->MaskIndex = Numbers;
+                job->MaskCount = 0;
+              }
+              job->doneprint = &doneprint;
+              job->filename = argv[y];
+              job->startline = curline;
+              job->numline = numline;
+              /* word-retirement: only first sub-job counts the line as inflight;
+               * later chunks share the same seed line(s). */
+              if (_ci == 0ULL)
+                __sync_fetch_and_add(&InflightLines, numline);
+              job->readindex = readindex;
+              job->readbuf = readbuf;
+              if (readbuf == Readbuf) {
+                possess(ReadBuf0);
+                twist(ReadBuf0, BY, +1);
+              } else {
+                possess(ReadBuf1);
+                twist(ReadBuf1, BY, +1);
+              }
+              if (ThreadCount < maxt) {
+                /* Experimental: stagger second procjob() startup so the first
+                 * thread fills jobg with line-ordered buffers before sibling
+                 * threads start consuming. Env-gated, fires once when
+                 * launching the second worker, gpu-active only. See
+                 * project_launch_delay_experiment.md. */
+#ifdef GPU_ENABLED
+                if (ThreadCount == 1 && gpujob_available()) {
+                  sleep(2);
+                }
 #endif
-                      launch(procjob, NULL);
-            ThreadCount++;
+                launch(procjob, NULL);
+                ThreadCount++;
+              }
+              possess(WorkWaiting);
+              *WorkTail = job;
+              WorkTail = &(job->next);
+              twist(WorkWaiting, BY, +1);
+              _chunk_start += _chunk_size;
+            }
           }
-          possess(WorkWaiting);
-          *WorkTail = job;
-          WorkTail = &(job->next);
-          twist(WorkWaiting, BY, +1);
           J1N(RC, Dohash, NextX);
         }
         if (Dodigits && !(MaskLen || MaskPrependLen || MaskAppendLen)) {

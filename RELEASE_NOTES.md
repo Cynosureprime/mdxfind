@@ -1,3 +1,40 @@
+# mdxfind v1.503 — Mask iteration scale fixes + hx.8 catalog doc corrections
+
+Source: mdxfind.c rev 1.505, gpu/gpu_opencl.c rev 1.195, gpu_metal.m rev 1.118, hx.8 rev 1.12, hashpipe.c rev 1.90.
+
+Window: 2026-05-26.
+
+## Mask iterator scale fixes
+
+The mask iterator's progress counter and per-thread loop bound were both 32-bit signed. With keyspaces commonly exceeding 2^31 (e.g., `?d?d?d?d?d?d?d?d?d?d` = 10^10 ≈ 2.3 × 2^32), the iterator would silently wrap, exit early, or produce incorrect candidate counts. Both `number_iter` and `loop_bound` are now `uint64_t` end-to-end; full 10^10+ keyspaces traverse correctly.
+
+Multi-thread mask attacks now actually use the requested thread count. The previous chunking math computed the per-thread range using the (overflow-prone) 32-bit counter, which on large keyspaces collapsed all work onto thread 0 while the other workers spun idle. The chunker has been rewritten over the widened 64-bit counter so each worker takes a proportional non-overlapping slice; `-T N` scales as expected on long mask runs.
+
+## MAX_MASK_POS raised (CPU 16 → 256; GPU stays at 16 with explicit cap symbol)
+
+`MAX_MASK_POS` (CPU-side per-side mask position cap) raised from 16 to 256. The GPU per-side cap is now an explicit, separately named symbol `MAX_MASK_POS_GPU_SIDE = 16` documenting what the bundled GPU kernels actually support (the kernels' unrolled per-position state still hard-codes 16, and raising that requires a coordinated multi-file kernel edit — see Known issues below).
+
+Previously, masks longer than 16 positions on either side were silently truncated by the parser, producing a much smaller keyspace than the user asked for with no diagnostic. The parser now emits a **FATAL** message naming the offending mask, its position count, and the active per-side cap, then exits non-zero.
+
+GPU upload sites in both OpenCL (`gpu/gpu_opencl.c`) and Metal (`gpu_metal.m`) gained a runtime guard: when a mask attack on a GPU target exceeds `MAX_MASK_POS_GPU_SIDE`, the run is gracefully demoted to CPU with a one-line warning naming the mask and the per-side cap. No crash, no silent truncation.
+
+## hx.8 catalog doc corrections
+
+Three entries in the hx algorithm catalog (manual page `hx(8)`) carried stale expressions that didn't match what mdxfind actually computes. Corrected this release:
+
+- `e232 MD5BASE64` — was `base64(md5_bin(pass))`, now `md5(base64(pass))`
+- `e539 MYSQL5MD5` — was `"*" . upper(sha1(sha1_bin(md5(pass))))`, now `sha1(sha1_bin(md5(pass)))`
+- `e993 WPBCRYPT` — was `bcrypt(pass, salt, 10)`, now `bcrypt(base64(hmac_sha384_bin(pass, "wp-sha384")), salt, N)` (matches hashcat m35500)
+
+No compute changes — only the documented expressions were drifted. CPU and GPU dispatch were always computing the corrected forms above; the manual now reflects reality.
+
+The canonical hx language manual is published at <https://www.mdxfind.com/hx.pdf>. The hx parser and algorithm catalog source live in the upstream hashpipe project: <https://github.com/Cynosureprime/hashpipe>.
+
+## Known issues / scope
+
+- The GPU per-side mask cap stays at 16 this release. Raising it requires coordinated edits across eight kernel sources, their header companions, the `cl2str.py` / `cl2metal.py` string-literal serializers, and the host upload enums. The work is straightforward but mechanical, and not blocking; deferred to a future release with a real driver. Customers needing mask attacks with more than 16 positions per side run on CPU — the parser and iterator now support up to 256 CPU-side positions.
+- `hashpipe.c` ships with no net source-functionality change vs v1.502; the file's revision counter advanced because intermediate experimental work was added and then reverted. Behavior is identical to v1.502 hashpipe.
+
 # mdxfind v1.502 — Phase 4 + Phase 5a hx codegen (e347 + 7 MAKE_MD5PASS family GPU acceleration)
 
 Source: mdxfind.c rev 1.501, gpu/gpu_opencl.c rev 1.194, gpu/gpu_opencl.h rev 1.41, gpu/gpujob_opencl.c rev 1.152, gpu_metal.m rev 1.117, gpu_metal.h rev 1.59, gpu/gpujob_metal.m rev 1.32, gpu/gpu_common.cl rev 1.25, gpu/metal_common.metal rev 1.24, gpu/gpu_codegen_eligible.{c,h} rev 1.1 (NEW), codegen/ tree (NEW: ~15 files, in-process hx P4 state-machine codegen), tools/hx8_to_c (NEW: build-time hx.8 → C-literal serializer).
@@ -80,7 +117,7 @@ Apple Metal GPU acceleration extended from 25 to 52 algorithm families. New this
 - **Phase 2d.9a** — Feistel hand-port: descrypt (e500)
 - **Phase 2d.9b** — Eksblowfish hand-port: bcrypt (e450)
 
-All 52 families verified byte-exact CPU/Metal parity on dev1 (M1) + dev3 (M2 Max). Admission summary: 52 families admitted, 208/208 variants admitted, 0 prunes, 0 CPU-only.
+All 52 families verified byte-exact CPU/Metal parity on Apple M1 and M2 Max. Admission summary: 52 families admitted, 208/208 variants admitted, 0 prunes, 0 CPU-only.
 
 ## Shared-loader refactor (gpu_metal.m −79.6%)
 

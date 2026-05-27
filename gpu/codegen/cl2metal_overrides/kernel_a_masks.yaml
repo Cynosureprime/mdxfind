@@ -1,0 +1,39 @@
+# cl2metal overlay for kernel_a_masks
+# (gpu/gpu_kernel_a_masks.cl -> gpu/metal_kernel_a_masks.metal).
+#
+# $Revision: $
+# $Log: $
+#
+#
+# Phase 1a sub-phase 1a.2 (2026-05-21): translator overlay for the kernel A2
+# (masks-only) production candidate-producer kernel. Mirrors the kernel_a_-
+# rules.yaml structure -- both are kernel-A-family producers with the same
+# b_kernelA_state atomic-counter triple. The translator's arg_address_space
+# knob constructs `<override> <type> <stars> <name>` and cannot synthesize a
+# full type substitution like `device volatile uint *X` -> `device atomic_-
+# uint *X`, so the b_kernelA_state arg type rewrite + the four atomic_add/
+# atomic_or call sites + the `get_global_id(0)` -> thread_position_in_grid
+# rewrite are handled by the companion post-edit script gpu/codegen/post_-
+# kernel_a_metal.py which runs after cl2metal.py and is shared between A1
+# and A2 (R1-R6 are family-generic; A2 reuses unchanged).
+#
+# Hand-port reference: gpu/codegen/cl2metal_overrides/kernel_a_rules.yaml
+# (sister overlay for A1; identical knob set).
+
+algo: kernel_a_masks
+
+# No skip_functions, no skip_line_ranges.
+#
+# No dual_addr_space_helpers: mask_expand_into_gpu accepts `__global const
+# uchar *pattern` / `__global const uchar *mask_charsets` / `__global const
+# uint *mask_class_counts` plus a `thread uchar *outbuf` (private). Only one
+# call site in cand_masks_phase0 (twice -- once for prepend, once for
+# append), both with identical address-space mix. No second overload
+# needed; Metal's overload resolution is unambiguous here.
+#
+# mask_pattern_total has identical address-space discipline (global pattern
+# + global counts only, returns ulong). Single overload sufficient.
+#
+# arg_address_space deliberately empty: the b_kernelA_state full type
+# replacement is performed by the post-edit script because cl2metal.py's
+# arg_override values are address-space prefixes, not full type strings.

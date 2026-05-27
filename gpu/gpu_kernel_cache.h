@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.h,v 1.3 2026/05/04 07:54:52 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.h,v 1.4 2026/05/19 20:57:52 dlr Exp dlr $
  *
  * gpu_kernel_cache — bare-files cache for OpenCL device-binary programs.
  *
@@ -9,14 +9,18 @@
  *   <key>.bin              kernel binary (raw clGetProgramInfo output)
  *   <key>.meta             provenance text + binary SHA-256, also the lock
  *                          target for compile-and-cache deduplication.
+ *   <key>.cl               concatenated kernel source that was JIT'd (debug
+ *                          artifact; written on every cache-miss compile;
+ *                          statically inspectable without rerunning mdxfind).
  *
  * Cache key (24 hex chars): first 12 bytes of
  *   SHA-256(source || device_name || driver_version || cl_platform_version || mdxfind_rev)
  *
  * Eviction policies:
- *   1. Cache-wide: mdxfind rev change → rm *.bin *.meta + write fresh cache.version.
+ *   1. Cache-wide: mdxfind rev change -> rm *.bin *.meta *.cl + write fresh cache.version.
  *   2. Per-entry: file load failure, SHA-256 mismatch, clCreateProgramWithBinary
- *      failure, or clBuildProgram-on-binary failure → unlink that entry.
+ *      failure, or clBuildProgram-on-binary failure -> unlink that entry
+ *      (only .bin and .meta; .cl is left as-is for post-mortem inspection).
  *
  * Concurrency: flock(LOCK_EX) on <key>.meta brackets the compile-and-store
  * window so concurrent mdxfind processes don't duplicate the JIT work.
@@ -64,7 +68,7 @@ int gpu_kernel_cache_enabled(void);
  *   2. try cache load (with self-healing eviction on file/checksum/binary
  *      load/build failure)
  *   3. on miss: lock <key>.meta, recheck (peer may have just finished),
- *      compile from source, store binary + meta atomically, unlock
+ *      compile from source, store binary + meta + source atomically, unlock
  *   4. return the built program object
  *
  * Build options string passed to both clBuildProgram paths.
@@ -77,6 +81,12 @@ int gpu_kernel_cache_enabled(void);
  * the key, a cache hit could return the wrong-algorithm binary. Pass
  * NULL or "" for non-template builds — the cache key is bit-identical
  * to the pre-B2 key in that case (no eviction of existing cache).
+ *
+ * Source dump: on every cache-miss compile, the concatenated kernel
+ * source is written to <key>.cl alongside the binary. This makes
+ * JIT'd source statically inspectable on disk without rerunning the
+ * binary. Failure to write the source file does NOT abort the cache
+ * store — only .bin and .meta are load-bearing.
  *
  * On any failure (including disabled cache), falls back to plain
  * clCreateProgramWithSource + clBuildProgram. The caller can then
@@ -97,7 +107,8 @@ cl_program gpu_kernel_cache_build_program(
  * key. The plain build_program() above is implemented as a thin wrapper
  * passing defines_str=NULL so existing call sites keep their current
  * cache keys. New template-instantiation call sites use this entry
- * point with their HASH_WORDS / HASH_BLOCK_BYTES defines string. */
+ * point with their HASH_WORDS / HASH_BLOCK_BYTES defines string.
+ * Both variants write the source dump (<key>.cl) on cache-miss compile. */
 cl_program gpu_kernel_cache_build_program_ex(
     cl_context ctx, cl_device_id dev,
     cl_uint n_sources, const char **sources,
