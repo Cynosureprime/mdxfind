@@ -1,6 +1,12 @@
 /*
- * $Revision: 1.25 $
+ * $Revision: 1.27 $
  * $Log: gpu_common.cl,v $
+ * Revision 1.27  2026/05/27 17:45:05  dlr
+ * sub-phase 5b1b1 lift rmd128_block primitive into gpu_common.cl from rmd128.c compress lines 39-196 Bosselaers 1996 reference 4-uint state vs rmd160 5-uint dual pipeline left line F1 F2 F3 F4 right line F4 F3 F2 F1 Bosselaers Table 4 R2 ordering with inline comments citing rmd128.c lines 117-186 right pipeline ordering reuses RMD_F1 through F4 macros from rmd160 section above defines local RMD128_STEP 4-arg variant without E and without C-rotation matching rmd128.h FF GG HH II macro shape directly LL1 through LL4 left line round-K macros RR1 through RR4 right line round-K macros K constants 0x50a28be6 0x5c4dd124 0x6d703ef3 0 LE schedule packing matches BYTES_TO_DWORD rmd128.h convention output hash 0 to 3 LE uint32 chaining values CPU oracle RIPEMD128 byte-exact match noinline per feedback_md5_block_noinline_pascal R5 cross-mix at end mirrors rmd128.c lines 188-193 with hash 1 to 3 written before hash 0 overwritten R7 no nested block comments donor stripped uses line comments only inserted between rmd160_block and rmd320_block keeping RMD family clustered used by emit_outer_rmd128_concat_then_hash 5b1b3 family helper
+ *
+ * Revision 1.26  2026/05/27 16:57:21  dlr
+ * sub-phase 5b1a1 lift md2_block primitive into gpu_common.cl from md2 md2.c md2_transform B-Con and sph_md2 reference 16-byte data block 48-byte state 16-byte checksum 256-byte MD2_PI S-box in __constant address space 18-round state transform plus per-block checksum update R3 copy-paste S-box from md2 md2.c lines 17-34 no retype R5 noinline discipline R4 __constant S-box no premature __local cache R7 no nested block comments inner update_checksum flag selects per-data-block checksum update versus final-call skip per RFC errata signature uchar state plus uchar checksum plus const uchar data plus int update_checksum used by emit_outer_md2_concat_then_hash family helper
+ *
  * Revision 1.25  2026/05/23 05:22:54  dlr
  * sub-phase 5a.4 lift md4_block primitive into gpu_common.cl from gpu_md4_core.cl md4_compress for the family MD5PASS hx codegen e122 emit body byte-for-byte mirror of gpu_md4_core.cl md4_compress 3 rounds 16 steps F G H round-2 constant 0x5A827999u round-3 constant 0x6ED9EBA1u round-1 constant 0 same IV as MD5 noinline matches md5_block signature uint pointer to 4 chaining values plus uint M[16] LE-schedule byte pack output is LE so no byte-swap before compact_fp probe needed wired in 5a.4 e122 MD4MD5PASS Metal twin lifts md4_block into metal_common.metal in same commit family MD5PASS gains MD4 outer primitive support validated PASS 8 of 8 on Pascal GTX 1080 OpenCL byte-exact
  *
@@ -567,6 +573,92 @@ __constant uint K[64] = {
 #define GG(a,b,c,d,m,s,k) { a += ((d&b)|(~d&c)) + m + k; a = b + rotate(a,s); }
 #define HH(a,b,c,d,m,s,k) { a += (b^c^d) + m + k; a = b + rotate(a,s); }
 #define II(a,b,c,d,m,s,k) { a += (c^(~d|b)) + m + k; a = b + rotate(a,s); }
+
+/* ---- MD2 S-box pi_subst[256] (RFC 1319 Table T; identical to sph_md2's
+ *      sph_md2_PI table and B-Con md2.c s[]). Copy-paste-no-retype from
+ *      md2/md2.c lines 17-34 (Tier 1 risk R3 mitigation). Used by
+ *      md2_block compression and md2_checksum_update below. Placed in
+ *      __constant address space per Tier 1 risk R4. */
+__constant uchar MD2_PI[256] = {
+    41, 46, 67, 201, 162, 216, 124, 1, 61, 54, 84, 161, 236, 240, 6,
+    19, 98, 167, 5, 243, 192, 199, 115, 140, 152, 147, 43, 217, 188,
+    76, 130, 202, 30, 155, 87, 60, 253, 212, 224, 22, 103, 66, 111, 24,
+    138, 23, 229, 18, 190, 78, 196, 214, 218, 158, 222, 73, 160, 251,
+    245, 142, 187, 47, 238, 122, 169, 104, 121, 145, 21, 178, 7, 63,
+    148, 194, 16, 137, 11, 34, 95, 33, 128, 127, 93, 154, 90, 144, 50,
+    39, 53, 62, 204, 231, 191, 247, 151, 3, 255, 25, 48, 179, 72, 165,
+    181, 209, 215, 94, 146, 42, 172, 86, 170, 198, 79, 184, 56, 210,
+    150, 164, 125, 182, 118, 252, 107, 226, 156, 116, 4, 241, 69, 157,
+    112, 89, 100, 113, 135, 32, 134, 91, 207, 101, 230, 45, 168, 2, 27,
+    96, 37, 173, 174, 176, 185, 246, 28, 70, 97, 105, 52, 64, 126, 15,
+    85, 71, 163, 35, 221, 81, 175, 58, 195, 92, 249, 206, 186, 197,
+    234, 38, 44, 83, 13, 110, 133, 40, 132, 9, 211, 223, 205, 244, 65,
+    129, 77, 82, 106, 220, 55, 200, 108, 193, 171, 250, 36, 225, 123,
+    8, 12, 189, 177, 74, 120, 136, 149, 139, 227, 99, 232, 109, 233,
+    203, 213, 254, 59, 0, 29, 57, 242, 239, 183, 14, 102, 88, 208, 228,
+    166, 119, 114, 248, 235, 117, 75, 10, 49, 68, 80, 180, 143, 237,
+    31, 26, 219, 153, 141, 51, 159, 17, 131, 20
+};
+
+/* ---- MD2 block compression (lifted from md2/md2.c md2_transform 2026-05-27
+ *      for hx codegen sub-phase 5b.1a e120 MD2MD5PASS family emit).
+ *
+ * RFC 1319 (with errata applied; matches sph_md2 + B-Con md2.c). MD2
+ * is byte-oriented: 16-byte data block, 48-byte state, 16-byte
+ * checksum. Compression mutates BOTH state and checksum in place
+ * (the checksum update is per-data-block AND uses the running
+ * checksum's last byte as the initial t -- a key spec subtlety).
+ *
+ * Signature: state and checksum are pointer-to-uchar (48 + 16 bytes
+ * respectively). data is pointer-to-uchar (16 bytes). Caller manages
+ * the 16-byte fill buffer + checksum carry across update calls. The
+ * "final" step calls md2_block once with the PKCS-padded last block,
+ * then once more with checksum-as-block (and passes a NULL or unused
+ * checksum pointer the second time -- but per RFC errata the checksum
+ * IS NOT updated on the second call; caller distinguishes via the
+ * update_checksum flag).
+ *
+ * 18-round state transform + per-data-block checksum update. The
+ * checksum carry-byte t persists across blocks; caller stores it in
+ * checksum[15] between calls (matches B-Con md2.c md2_transform body).
+ *
+ * R5 noinline discipline per feedback_md5_block_noinline_pascal.md
+ * (Pascal register budget; mirrors md4_block / md5_block / rmd160_block).
+ * R7 NO nested block comments: all donor block comments stripped during
+ * port; this header uses only the surrounding outer block. */
+__attribute__((noinline)) void md2_block(uchar *state, uchar *checksum,
+                                         const uchar *data,
+                                         int update_checksum) {
+    int j, k;
+    uint t;
+
+    // Spec step 1: copy block into state[16..31]; xor into state[32..47].
+    for (j = 0; j < 16; j++) {
+        state[j + 16] = data[j];
+        state[j + 32] = (uchar)(state[j + 16] ^ state[j]);
+    }
+
+    // Spec step 2: 18 rounds of state transform.
+    t = 0;
+    for (j = 0; j < 18; j++) {
+        for (k = 0; k < 48; k++) {
+            state[k] = (uchar)(state[k] ^ MD2_PI[t]);
+            t = state[k];
+        }
+        t = (t + (uint)j) & 0xFFu;
+    }
+
+    // Spec step 3: per-block checksum update (uses MD2_PI[data[j] ^ prev]).
+    // Skipped on the final checksum-block call (per RFC errata: the
+    // checksum block itself is NOT folded back into the checksum).
+    if (update_checksum) {
+        t = checksum[15];
+        for (j = 0; j < 16; j++) {
+            checksum[j] = (uchar)(checksum[j] ^ MD2_PI[data[j] ^ t]);
+            t = checksum[j];
+        }
+    }
+}
 
 /* ---- MD4 block function (lifted from gpu_md4_core.cl 2026-05-23 for
  *      hx codegen sub-phase 5a.4 e122 MD4MD5PASS family emit).
@@ -1370,6 +1462,111 @@ void rmd160_block(uint *hash, const uint *X) {
     R5(E,A,B,C,D,X[0],15);R5(D,E,A,B,C,X[3],13);R5(C,D,E,A,B,X[9],11);R5(B,C,D,E,A,X[11],11);
     D += c1 + hash[1]; hash[1] = hash[2] + d1 + E; hash[2] = hash[3] + e1 + A;
     hash[3] = hash[4] + a1 + B; hash[4] = hash[0] + b1 + C; hash[0] = D;
+}
+
+/* ---- RIPEMD-128 block function ---- */
+/* RIPEMD-128 single 64-byte block compression. Ported from rmd128.c
+ * compress() (Bosselaers 1996, lines 39-196). 4-uint state (vs the
+ * 5-uint state of rmd160_block). Dual pipeline: left line uses
+ * F1->F2->F3->F4; right line uses F4->F3->F2->F1 -- per Bosselaers
+ * Table 4 (RMD-128 right line is F4 F3 F2 F1, NOT F5 F4 F3 F2 F1 as
+ * in RMD-160). Anyone porting "by analogy to rmd160_block" will get
+ * the right-line ordering wrong silently -- spec R2 callout.
+ *
+ * Reuses RMD_F1..RMD_F4 from gpu_common.cl rmd160 section above
+ * (RMD_F5 is unused by RMD-128). Defines local RMD128_STEP (4-arg
+ * variant without the +E and without the C-rotation that
+ * rmd160_block's RMD_STEP carries) so this body matches rmd128.h's
+ * FF/GG/HH/II macro shape directly. Right-line K constants:
+ *   III  = RMD_F4 with K=0x50a28be6
+ *   HHH  = RMD_F3 with K=0x5c4dd124
+ *   GGG  = RMD_F2 with K=0x6d703ef3
+ *   FFF  = RMD_F1 with K=0
+ *
+ * Schedule packing is LE (rmd128.h BYTES_TO_DWORD is LE); caller
+ * packs the 64-byte block into X[0..15] LE. Output: hash[0..3] is
+ * 4 LE uint32 chaining values; caller writes them as 16 LE bytes
+ * to form the 128-bit digest. CPU oracle RIPEMD128() writes bytes
+ * LE too -- byte-exact match.
+ *
+ * noinline per feedback_md5_block_noinline_pascal.md (spec R5) --
+ * empirically required for Pascal register-budget; same discipline
+ * as md5_block / md4_block / rmd160_block. */
+#define RMD128_STEP(FUNC, A, B, C, D, X, S, K) \
+    (A) += FUNC((B), (C), (D)) + (X) + K; \
+    (A) = rotate((A), (uint)(S));
+
+#define LL1(A,B,C,D,X,S) RMD128_STEP(RMD_F1,A,B,C,D,X,S,0u)
+#define LL2(A,B,C,D,X,S) RMD128_STEP(RMD_F2,A,B,C,D,X,S,0x5a827999u)
+#define LL3(A,B,C,D,X,S) RMD128_STEP(RMD_F3,A,B,C,D,X,S,0x6ed9eba1u)
+#define LL4(A,B,C,D,X,S) RMD128_STEP(RMD_F4,A,B,C,D,X,S,0x8f1bbcdcu)
+/* Right line: F4 F3 F2 F1 ordering -- Bosselaers Table 4. */
+#define RR1(A,B,C,D,X,S) RMD128_STEP(RMD_F4,A,B,C,D,X,S,0x50a28be6u)
+#define RR2(A,B,C,D,X,S) RMD128_STEP(RMD_F3,A,B,C,D,X,S,0x5c4dd124u)
+#define RR3(A,B,C,D,X,S) RMD128_STEP(RMD_F2,A,B,C,D,X,S,0x6d703ef3u)
+#define RR4(A,B,C,D,X,S) RMD128_STEP(RMD_F1,A,B,C,D,X,S,0u)
+
+__attribute__((noinline))
+void rmd128_block(uint *hash, const uint *X) {
+    uint A = hash[0], B = hash[1], C = hash[2], D = hash[3];
+    uint a1, b1, c1, d1;
+    /* left round 1 (F1) */
+    LL1(A,B,C,D,X[ 0],11); LL1(D,A,B,C,X[ 1],14); LL1(C,D,A,B,X[ 2],15); LL1(B,C,D,A,X[ 3],12);
+    LL1(A,B,C,D,X[ 4], 5); LL1(D,A,B,C,X[ 5], 8); LL1(C,D,A,B,X[ 6], 7); LL1(B,C,D,A,X[ 7], 9);
+    LL1(A,B,C,D,X[ 8],11); LL1(D,A,B,C,X[ 9],13); LL1(C,D,A,B,X[10],14); LL1(B,C,D,A,X[11],15);
+    LL1(A,B,C,D,X[12], 6); LL1(D,A,B,C,X[13], 7); LL1(C,D,A,B,X[14], 9); LL1(B,C,D,A,X[15], 8);
+    /* left round 2 (F2) */
+    LL2(A,B,C,D,X[ 7], 7); LL2(D,A,B,C,X[ 4], 6); LL2(C,D,A,B,X[13], 8); LL2(B,C,D,A,X[ 1],13);
+    LL2(A,B,C,D,X[10],11); LL2(D,A,B,C,X[ 6], 9); LL2(C,D,A,B,X[15], 7); LL2(B,C,D,A,X[ 3],15);
+    LL2(A,B,C,D,X[12], 7); LL2(D,A,B,C,X[ 0],12); LL2(C,D,A,B,X[ 9],15); LL2(B,C,D,A,X[ 5], 9);
+    LL2(A,B,C,D,X[ 2],11); LL2(D,A,B,C,X[14], 7); LL2(C,D,A,B,X[11],13); LL2(B,C,D,A,X[ 8],12);
+    /* left round 3 (F3) */
+    LL3(A,B,C,D,X[ 3],11); LL3(D,A,B,C,X[10],13); LL3(C,D,A,B,X[14], 6); LL3(B,C,D,A,X[ 4], 7);
+    LL3(A,B,C,D,X[ 9],14); LL3(D,A,B,C,X[15], 9); LL3(C,D,A,B,X[ 8],13); LL3(B,C,D,A,X[ 1],15);
+    LL3(A,B,C,D,X[ 2],14); LL3(D,A,B,C,X[ 7], 8); LL3(C,D,A,B,X[ 0],13); LL3(B,C,D,A,X[ 6], 6);
+    LL3(A,B,C,D,X[13], 5); LL3(D,A,B,C,X[11],12); LL3(C,D,A,B,X[ 5], 7); LL3(B,C,D,A,X[12], 5);
+    /* left round 4 (F4) */
+    LL4(A,B,C,D,X[ 1],11); LL4(D,A,B,C,X[ 9],12); LL4(C,D,A,B,X[11],14); LL4(B,C,D,A,X[10],15);
+    LL4(A,B,C,D,X[ 0],14); LL4(D,A,B,C,X[ 8],15); LL4(C,D,A,B,X[12], 9); LL4(B,C,D,A,X[ 4], 8);
+    LL4(A,B,C,D,X[13], 9); LL4(D,A,B,C,X[ 3],14); LL4(C,D,A,B,X[ 7], 5); LL4(B,C,D,A,X[15], 6);
+    LL4(A,B,C,D,X[14], 8); LL4(D,A,B,C,X[ 5], 6); LL4(C,D,A,B,X[ 6], 5); LL4(B,C,D,A,X[ 2],12);
+    /* save left line, restart with IV for right line */
+    a1 = A; b1 = B; c1 = C; d1 = D;
+    A = hash[0]; B = hash[1]; C = hash[2]; D = hash[3];
+    /* right round 1 (F4) -- Bosselaers Table 4 RMD-128 right line F4 F3 F2 F1 */
+    RR1(A,B,C,D,X[ 5], 8); RR1(D,A,B,C,X[14], 9); RR1(C,D,A,B,X[ 7], 9); RR1(B,C,D,A,X[ 0],11);
+    RR1(A,B,C,D,X[ 9],13); RR1(D,A,B,C,X[ 2],15); RR1(C,D,A,B,X[11],15); RR1(B,C,D,A,X[ 4], 5);
+    RR1(A,B,C,D,X[13], 7); RR1(D,A,B,C,X[ 6], 7); RR1(C,D,A,B,X[15], 8); RR1(B,C,D,A,X[ 8],11);
+    RR1(A,B,C,D,X[ 1],14); RR1(D,A,B,C,X[10],14); RR1(C,D,A,B,X[ 3],12); RR1(B,C,D,A,X[12], 6);
+    /* right round 2 (F3) */
+    RR2(A,B,C,D,X[ 6], 9); RR2(D,A,B,C,X[11],13); RR2(C,D,A,B,X[ 3],15); RR2(B,C,D,A,X[ 7], 7);
+    RR2(A,B,C,D,X[ 0],12); RR2(D,A,B,C,X[13], 8); RR2(C,D,A,B,X[ 5], 9); RR2(B,C,D,A,X[10],11);
+    RR2(A,B,C,D,X[14], 7); RR2(D,A,B,C,X[15], 7); RR2(C,D,A,B,X[ 8],12); RR2(B,C,D,A,X[12], 7);
+    RR2(A,B,C,D,X[ 4], 6); RR2(D,A,B,C,X[ 9],15); RR2(C,D,A,B,X[ 1],13); RR2(B,C,D,A,X[ 2],11);
+    /* right round 3 (F2) */
+    RR3(A,B,C,D,X[15], 9); RR3(D,A,B,C,X[ 5], 7); RR3(C,D,A,B,X[ 1],15); RR3(B,C,D,A,X[ 3],11);
+    RR3(A,B,C,D,X[ 7], 8); RR3(D,A,B,C,X[14], 6); RR3(C,D,A,B,X[ 6], 6); RR3(B,C,D,A,X[ 9],14);
+    RR3(A,B,C,D,X[11],12); RR3(D,A,B,C,X[ 8],13); RR3(C,D,A,B,X[12], 5); RR3(B,C,D,A,X[ 2],14);
+    RR3(A,B,C,D,X[10],13); RR3(D,A,B,C,X[ 0],13); RR3(C,D,A,B,X[ 4], 7); RR3(B,C,D,A,X[13], 5);
+    /* right round 4 (F1) */
+    RR4(A,B,C,D,X[ 8],15); RR4(D,A,B,C,X[ 6], 5); RR4(C,D,A,B,X[ 4], 8); RR4(B,C,D,A,X[ 1],11);
+    RR4(A,B,C,D,X[ 3],14); RR4(D,A,B,C,X[11],14); RR4(C,D,A,B,X[15], 6); RR4(B,C,D,A,X[ 0],14);
+    RR4(A,B,C,D,X[ 5], 6); RR4(D,A,B,C,X[12], 9); RR4(C,D,A,B,X[ 2],12); RR4(B,C,D,A,X[13], 9);
+    RR4(A,B,C,D,X[ 9],12); RR4(D,A,B,C,X[ 7], 5); RR4(C,D,A,B,X[10],15); RR4(B,C,D,A,X[14], 8);
+    /* combine: mirrors rmd128.c lines 188-193 with left = a1..d1 saved
+     * vars and right = current A..D. Cross-mix pattern:
+     *   ddd += cc + MDbuf[1];   -> D += c1 + hash[1]   (new hash[0])
+     *   MDbuf[1] = MDbuf[2] + dd + aaa;  -> hash[1] = hash[2] + d1 + A
+     *   MDbuf[2] = MDbuf[3] + aa + bbb;  -> hash[2] = hash[3] + a1 + B
+     *   MDbuf[3] = MDbuf[0] + bb + ccc;  -> hash[3] = hash[0] + b1 + C
+     *   MDbuf[0] = ddd;                  -> hash[0] = D
+     * Note the ordering: hash[1..3] must be written before hash[0] is
+     * overwritten -- the temporaries cover this. */
+    D += c1 + hash[1];
+    hash[1] = hash[2] + d1 + A;
+    hash[2] = hash[3] + a1 + B;
+    hash[3] = hash[0] + b1 + C;
+    hash[0] = D;
 }
 
 /* RIPEMD-320 compression. Mirrors gpu_hmac_rmd320.cl rmd320_block exactly,

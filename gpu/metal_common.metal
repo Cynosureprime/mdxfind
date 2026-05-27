@@ -1,6 +1,12 @@
 /*
- * $Revision: 1.24 $
+ * $Revision: 1.26 $
  * $Log: metal_common.metal,v $
+ * Revision 1.26  2026/05/27 17:46:13  dlr
+ * sub-phase 5b1b2 Metal twin lift rmd128_block primitive into metal_common.metal mirror of gpu_common.cl rev 1.27 rmd128_block byte-for-byte 4-uint state dual pipeline left line F1 F2 F3 F4 right line F4 F3 F2 F1 per Bosselaers Table 4 R2 inline comments preserved reuses RMD_F1 through F4 round functions defined above for rmd160_block RMD_F5 unused defines local RMD128_STEP_METAL 4-arg variant without E and without C-rotation matching rmd128.h FF GG HH II macro shape LL1M through LL4M left line round-K macros RR1M through RR4M right line round-K macros M suffix avoids collision with rmd160 LL1 LL5 R1 R5 names pointer-state convention thread uint hash thread const uint X matches rmd160_block sha1_block sha256_block static inline Pattern 3 R6 not applicable XOR AND OR NOT only no bitselect R7 no nested block comments inserted between rmd160_block and rmd320_block keeping RMD family clustered used by emit_outer_rmd128_concat_then_hash_metal 5b1b3 family helper
+ *
+ * Revision 1.25  2026/05/27 16:58:18  dlr
+ * sub-phase 5b1a2 Metal twin lift md2_block primitive into metal_common.metal mirror of gpu_common.cl rev 1.26 md2_block byte-for-byte same RFC 1319 with errata MD2_PI 256-byte S-box namespaced MTL_MD2_PI per Pattern 2 thread uchar state plus thread uchar checksum plus thread const uchar data plus int update_checksum signature 18-round state transform plus per-data-block checksum update update_checksum flag skips on final checksum block per RFC errata R3 byte-identical S-box no retype R5 static inline Pattern 3 R7 no nested block comments R6 not applicable XOR only no bitselect family helper outer_md2_concat_then_hash_metal in 5b1a3 will call md2_block via thread-local state plus checksum scratch
+ *
  * Revision 1.24  2026/05/23 05:23:01  dlr
  * sub-phase 5a.4 lift md4_block primitive into metal_common.metal mirror of gpu_common.cl md4_block byte-for-byte Metal twin pointer-state convention thread uint pointer to state plus thread const uint pointer to M same MD4_F G H round functions same round-2 constant 0x5A827999u round-3 constant 0x6ED9EBA1u namespaced via MTL_ prefix per Pattern 2 LE-schedule no byte-swap output sibling to existing rmd160_block sha1_block sha256_block sha512_block validated PASS 8 of 8 on Apple M2 Max Metal byte-exact for e122 MD4MD5PASS family member
  *
@@ -237,6 +243,79 @@ static inline uint rotl32(uint x, uint n) {
 #define MTL_MD5_GG(a,b,c,d,m,s,k) { a += ((d&b)|(~d&c)) + m + k; a = b + rotl32(a, (uint)s); }
 #define MTL_MD5_HH(a,b,c,d,m,s,k) { a += (b^c^d) + m + k;        a = b + rotl32(a, (uint)s); }
 #define MTL_MD5_II(a,b,c,d,m,s,k) { a += (c^(~d|b)) + m + k;     a = b + rotl32(a, (uint)s); }
+
+/* --- MTL_MD2_PI[256]: MD2 S-box (RFC 1319 Table T; copy-paste-no-retype
+ *      from md2/md2.c lines 17-34). MTL_ prefix per Pattern 2 (collision
+ *      avoidance across TUs). Used by md2_block below.
+ *      R3 mitigation: byte-identical to gpu_common.cl MD2_PI[256]. */
+constant uchar MTL_MD2_PI[256] = {
+    41, 46, 67, 201, 162, 216, 124, 1, 61, 54, 84, 161, 236, 240, 6,
+    19, 98, 167, 5, 243, 192, 199, 115, 140, 152, 147, 43, 217, 188,
+    76, 130, 202, 30, 155, 87, 60, 253, 212, 224, 22, 103, 66, 111, 24,
+    138, 23, 229, 18, 190, 78, 196, 214, 218, 158, 222, 73, 160, 251,
+    245, 142, 187, 47, 238, 122, 169, 104, 121, 145, 21, 178, 7, 63,
+    148, 194, 16, 137, 11, 34, 95, 33, 128, 127, 93, 154, 90, 144, 50,
+    39, 53, 62, 204, 231, 191, 247, 151, 3, 255, 25, 48, 179, 72, 165,
+    181, 209, 215, 94, 146, 42, 172, 86, 170, 198, 79, 184, 56, 210,
+    150, 164, 125, 182, 118, 252, 107, 226, 156, 116, 4, 241, 69, 157,
+    112, 89, 100, 113, 135, 32, 134, 91, 207, 101, 230, 45, 168, 2, 27,
+    96, 37, 173, 174, 176, 185, 246, 28, 70, 97, 105, 52, 64, 126, 15,
+    85, 71, 163, 35, 221, 81, 175, 58, 195, 92, 249, 206, 186, 197,
+    234, 38, 44, 83, 13, 110, 133, 40, 132, 9, 211, 223, 205, 244, 65,
+    129, 77, 82, 106, 220, 55, 200, 108, 193, 171, 250, 36, 225, 123,
+    8, 12, 189, 177, 74, 120, 136, 149, 139, 227, 99, 232, 109, 233,
+    203, 213, 254, 59, 0, 29, 57, 242, 239, 183, 14, 102, 88, 208, 228,
+    166, 119, 114, 248, 235, 117, 75, 10, 49, 68, 80, 180, 143, 237,
+    31, 26, 219, 153, 141, 51, 159, 17, 131, 20
+};
+
+/* --- md2_block: single 16-byte MD2 compress block (RFC 1319 with errata).
+ *
+ * Lifted 2026-05-27 from md2/md2.c md2_transform for the hx codegen
+ * sub-phase 5b.1a e120 MD2MD5PASS family emit. Mirrors
+ * gpu_common.cl::md2_block byte-for-byte (S-box matches; 18-round
+ * structure matches; update_checksum flag matches).
+ *
+ * Signature: state (thread uchar* 48 bytes), checksum (thread uchar*
+ * 16 bytes), data (thread const uchar* 16 bytes). update_checksum
+ * selects per-data-block checksum update (1) or skip (0) -- the final
+ * checksum-block call uses 0 per RFC errata.
+ *
+ * R7 NO nested block comments in donor port.
+ * Pattern 3: static inline (per-TU; no link collision). */
+static inline void md2_block(thread uchar *state, thread uchar *checksum,
+                             thread const uchar *data,
+                             int update_checksum)
+{
+    int j, k;
+    uint t;
+
+    // Spec step 1: copy block into state[16..31]; xor into state[32..47].
+    for (j = 0; j < 16; j++) {
+        state[j + 16] = data[j];
+        state[j + 32] = (uchar)(state[j + 16] ^ state[j]);
+    }
+
+    // Spec step 2: 18 rounds of state transform.
+    t = 0;
+    for (j = 0; j < 18; j++) {
+        for (k = 0; k < 48; k++) {
+            state[k] = (uchar)(state[k] ^ MTL_MD2_PI[t]);
+            t = state[k];
+        }
+        t = (t + (uint)j) & 0xFFu;
+    }
+
+    // Spec step 3: per-data-block checksum update (skipped on final
+    // checksum-block call per RFC errata).
+    if (update_checksum) {
+        t = checksum[15];
+        for (j = 0; j < 16; j++) {
+            checksum[j] = (uchar)(checksum[j] ^ MTL_MD2_PI[data[j] ^ t]);
+            t = checksum[j];
+        }
+    }
+}
 
 /* --- md4_block: single 64-byte MD4 compress block (RFC 1320).
  *
@@ -841,6 +920,91 @@ static inline void rmd160_block(thread uint *hash, thread const uint *X) {
     R5(E,A,B,C,D,X[0],15);R5(D,E,A,B,C,X[3],13);R5(C,D,E,A,B,X[9],11);R5(B,C,D,E,A,X[11],11);
     D += c1 + hash[1]; hash[1] = hash[2] + d1 + E; hash[2] = hash[3] + e1 + A;
     hash[3] = hash[4] + a1 + B; hash[4] = hash[0] + b1 + C; hash[0] = D;
+}
+
+/* --- rmd128_block: single 64-byte RIPEMD-128 compress block.
+ *
+ * Mirrors gpu_common.cl::rmd128_block byte-for-byte. 4-uint state.
+ * Dual pipeline: left line F1->F2->F3->F4; right line F4->F3->F2->F1
+ * per Bosselaers Table 4 (RMD-128 right line is F4 F3 F2 F1, NOT
+ * F5 F4 F3 F2 F1 as in RMD-160) -- R2 callout. Reuses RMD_F1..RMD_F4
+ * round-functions defined above for rmd160_block; RMD_F5 is unused
+ * by RMD-128. Defines local RMD128_STEP_METAL (4-arg variant without
+ * the +E and without C-rotation that RMD_STEP carries) so this body
+ * matches rmd128.h's FF/GG/HH/II macro shape directly.
+ *
+ * R6 (Metal scalar bitselect failure mode): not applicable here --
+ * RMD_F1..F4 are XOR/AND/OR/NOT compositions; no bitselect used.
+ *
+ * Pointer-state convention (thread uint *hash, thread const uint *X)
+ * matches rmd160_block / sha1_block / sha256_block. */
+#define RMD128_STEP_METAL(FUNC, A, B, C, D, X, S, K) \
+    (A) += FUNC((B), (C), (D)) + (X) + K; \
+    (A) = rotl32((A), (uint)(S));
+
+#define LL1M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F1,A,B,C,D,X,S,0u)
+#define LL2M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F2,A,B,C,D,X,S,0x5a827999u)
+#define LL3M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F3,A,B,C,D,X,S,0x6ed9eba1u)
+#define LL4M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F4,A,B,C,D,X,S,0x8f1bbcdcu)
+/* Right line: F4 F3 F2 F1 ordering -- Bosselaers Table 4. */
+#define RR1M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F4,A,B,C,D,X,S,0x50a28be6u)
+#define RR2M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F3,A,B,C,D,X,S,0x5c4dd124u)
+#define RR3M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F2,A,B,C,D,X,S,0x6d703ef3u)
+#define RR4M(A,B,C,D,X,S) RMD128_STEP_METAL(RMD_F1,A,B,C,D,X,S,0u)
+
+static inline void rmd128_block(thread uint *hash, thread const uint *X) {
+    uint A = hash[0], B = hash[1], C = hash[2], D = hash[3];
+    uint a1, b1, c1, d1;
+    /* left round 1 (F1) */
+    LL1M(A,B,C,D,X[ 0],11); LL1M(D,A,B,C,X[ 1],14); LL1M(C,D,A,B,X[ 2],15); LL1M(B,C,D,A,X[ 3],12);
+    LL1M(A,B,C,D,X[ 4], 5); LL1M(D,A,B,C,X[ 5], 8); LL1M(C,D,A,B,X[ 6], 7); LL1M(B,C,D,A,X[ 7], 9);
+    LL1M(A,B,C,D,X[ 8],11); LL1M(D,A,B,C,X[ 9],13); LL1M(C,D,A,B,X[10],14); LL1M(B,C,D,A,X[11],15);
+    LL1M(A,B,C,D,X[12], 6); LL1M(D,A,B,C,X[13], 7); LL1M(C,D,A,B,X[14], 9); LL1M(B,C,D,A,X[15], 8);
+    /* left round 2 (F2) */
+    LL2M(A,B,C,D,X[ 7], 7); LL2M(D,A,B,C,X[ 4], 6); LL2M(C,D,A,B,X[13], 8); LL2M(B,C,D,A,X[ 1],13);
+    LL2M(A,B,C,D,X[10],11); LL2M(D,A,B,C,X[ 6], 9); LL2M(C,D,A,B,X[15], 7); LL2M(B,C,D,A,X[ 3],15);
+    LL2M(A,B,C,D,X[12], 7); LL2M(D,A,B,C,X[ 0],12); LL2M(C,D,A,B,X[ 9],15); LL2M(B,C,D,A,X[ 5], 9);
+    LL2M(A,B,C,D,X[ 2],11); LL2M(D,A,B,C,X[14], 7); LL2M(C,D,A,B,X[11],13); LL2M(B,C,D,A,X[ 8],12);
+    /* left round 3 (F3) */
+    LL3M(A,B,C,D,X[ 3],11); LL3M(D,A,B,C,X[10],13); LL3M(C,D,A,B,X[14], 6); LL3M(B,C,D,A,X[ 4], 7);
+    LL3M(A,B,C,D,X[ 9],14); LL3M(D,A,B,C,X[15], 9); LL3M(C,D,A,B,X[ 8],13); LL3M(B,C,D,A,X[ 1],15);
+    LL3M(A,B,C,D,X[ 2],14); LL3M(D,A,B,C,X[ 7], 8); LL3M(C,D,A,B,X[ 0],13); LL3M(B,C,D,A,X[ 6], 6);
+    LL3M(A,B,C,D,X[13], 5); LL3M(D,A,B,C,X[11],12); LL3M(C,D,A,B,X[ 5], 7); LL3M(B,C,D,A,X[12], 5);
+    /* left round 4 (F4) */
+    LL4M(A,B,C,D,X[ 1],11); LL4M(D,A,B,C,X[ 9],12); LL4M(C,D,A,B,X[11],14); LL4M(B,C,D,A,X[10],15);
+    LL4M(A,B,C,D,X[ 0],14); LL4M(D,A,B,C,X[ 8],15); LL4M(C,D,A,B,X[12], 9); LL4M(B,C,D,A,X[ 4], 8);
+    LL4M(A,B,C,D,X[13], 9); LL4M(D,A,B,C,X[ 3],14); LL4M(C,D,A,B,X[ 7], 5); LL4M(B,C,D,A,X[15], 6);
+    LL4M(A,B,C,D,X[14], 8); LL4M(D,A,B,C,X[ 5], 6); LL4M(C,D,A,B,X[ 6], 5); LL4M(B,C,D,A,X[ 2],12);
+    /* save left line, restart with IV for right line */
+    a1 = A; b1 = B; c1 = C; d1 = D;
+    A = hash[0]; B = hash[1]; C = hash[2]; D = hash[3];
+    /* right round 1 (F4) -- Bosselaers Table 4 RMD-128 right line F4 F3 F2 F1 */
+    RR1M(A,B,C,D,X[ 5], 8); RR1M(D,A,B,C,X[14], 9); RR1M(C,D,A,B,X[ 7], 9); RR1M(B,C,D,A,X[ 0],11);
+    RR1M(A,B,C,D,X[ 9],13); RR1M(D,A,B,C,X[ 2],15); RR1M(C,D,A,B,X[11],15); RR1M(B,C,D,A,X[ 4], 5);
+    RR1M(A,B,C,D,X[13], 7); RR1M(D,A,B,C,X[ 6], 7); RR1M(C,D,A,B,X[15], 8); RR1M(B,C,D,A,X[ 8],11);
+    RR1M(A,B,C,D,X[ 1],14); RR1M(D,A,B,C,X[10],14); RR1M(C,D,A,B,X[ 3],12); RR1M(B,C,D,A,X[12], 6);
+    /* right round 2 (F3) */
+    RR2M(A,B,C,D,X[ 6], 9); RR2M(D,A,B,C,X[11],13); RR2M(C,D,A,B,X[ 3],15); RR2M(B,C,D,A,X[ 7], 7);
+    RR2M(A,B,C,D,X[ 0],12); RR2M(D,A,B,C,X[13], 8); RR2M(C,D,A,B,X[ 5], 9); RR2M(B,C,D,A,X[10],11);
+    RR2M(A,B,C,D,X[14], 7); RR2M(D,A,B,C,X[15], 7); RR2M(C,D,A,B,X[ 8],12); RR2M(B,C,D,A,X[12], 7);
+    RR2M(A,B,C,D,X[ 4], 6); RR2M(D,A,B,C,X[ 9],15); RR2M(C,D,A,B,X[ 1],13); RR2M(B,C,D,A,X[ 2],11);
+    /* right round 3 (F2) */
+    RR3M(A,B,C,D,X[15], 9); RR3M(D,A,B,C,X[ 5], 7); RR3M(C,D,A,B,X[ 1],15); RR3M(B,C,D,A,X[ 3],11);
+    RR3M(A,B,C,D,X[ 7], 8); RR3M(D,A,B,C,X[14], 6); RR3M(C,D,A,B,X[ 6], 6); RR3M(B,C,D,A,X[ 9],14);
+    RR3M(A,B,C,D,X[11],12); RR3M(D,A,B,C,X[ 8],13); RR3M(C,D,A,B,X[12], 5); RR3M(B,C,D,A,X[ 2],14);
+    RR3M(A,B,C,D,X[10],13); RR3M(D,A,B,C,X[ 0],13); RR3M(C,D,A,B,X[ 4], 7); RR3M(B,C,D,A,X[13], 5);
+    /* right round 4 (F1) */
+    RR4M(A,B,C,D,X[ 8],15); RR4M(D,A,B,C,X[ 6], 5); RR4M(C,D,A,B,X[ 4], 8); RR4M(B,C,D,A,X[ 1],11);
+    RR4M(A,B,C,D,X[ 3],14); RR4M(D,A,B,C,X[11],14); RR4M(C,D,A,B,X[15], 6); RR4M(B,C,D,A,X[ 0],14);
+    RR4M(A,B,C,D,X[ 5], 6); RR4M(D,A,B,C,X[12], 9); RR4M(C,D,A,B,X[ 2],12); RR4M(B,C,D,A,X[13], 9);
+    RR4M(A,B,C,D,X[ 9],12); RR4M(D,A,B,C,X[ 7], 5); RR4M(C,D,A,B,X[10],15); RR4M(B,C,D,A,X[14], 8);
+    /* combine: mirrors rmd128.c lines 188-193. Write hash[1..3] before
+     * overwriting hash[0]; temporaries cover the ordering dependency. */
+    D += c1 + hash[1];
+    hash[1] = hash[2] + d1 + A;
+    hash[2] = hash[3] + a1 + B;
+    hash[3] = hash[0] + b1 + C;
+    hash[0] = D;
 }
 
 /* --- rmd320_block: single 64-byte RIPEMD-320 compress block.

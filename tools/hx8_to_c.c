@@ -51,6 +51,31 @@
 
 #include "../hx_vm.h"
 
+/*
+ * WARN(...) -- stream-ordering hygiene macro for all stderr writes.
+ *
+ * Belt-and-suspenders fix for the 2026-05-26 corruption incident where
+ * an ad-hoc regen used `tools/hx8_to_c hx.8 > out.c 2>&1`, merging
+ * stderr diagnostics into the C source output and breaking the v1.503
+ * release build deep inside struct initializers (compiled cleanly to
+ * grep, FAILED at cc).
+ *
+ * The discipline (NEVER 2>&1) is documented in operator memo
+ * feedback_hx8_to_c_no_stderr_merge.md. This macro adds source-side
+ * protection: every stderr write flushes stdout's in-flight buffer
+ * BEFORE writing, and flushes stderr immediately after. Even if an
+ * operator accidentally uses 2>&1, the merged output should at least
+ * be deterministic and not interleaved mid-line with in-flight stdout
+ * struct-initializer bytes.
+ *
+ * Use WARN(fmt, ...) in place of every fprintf(stderr, fmt, ...).
+ */
+#define WARN(...) do { \
+    fflush(stdout); \
+    fprintf(stderr, __VA_ARGS__); \
+    fflush(stderr); \
+} while (0)
+
 /* Forward declarations of hx library entry points we link against. */
 extern hx_program *hx_compile_expr(const char *expr, const char *script_file);
 
@@ -150,8 +175,8 @@ static char *slurp(const char *path, size_t *out_len)
 {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        fprintf(stderr, "FATAL: hx8_to_c: cannot open %s: %s\n",
-                path, strerror(errno));
+        WARN("FATAL: hx8_to_c: cannot open %s: %s\n",
+             path, strerror(errno));
         exit(2);
     }
     if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
@@ -402,15 +427,15 @@ static int parse_row(const char *line,
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s path/to/hx.8 > codegen/hx_specs_data.c\n",
-                argv[0]);
+        WARN("usage: %s path/to/hx.8 > codegen/hx_specs_data.c\n",
+             argv[0]);
         return 2;
     }
 
     size_t inlen = 0;
     char *input = slurp(argv[1], &inlen);
     if (!input) {
-        fprintf(stderr, "FATAL: hx8_to_c: read failed\n");
+        WARN("FATAL: hx8_to_c: read failed\n");
         return 2;
     }
 
@@ -496,8 +521,8 @@ int main(int argc, char **argv)
                 if (!prog) {
                     cf = 1;
                     compile_failed++;
-                    fprintf(stderr, "hx8_to_c: line %d e%d %s: compile failed for `%s`\n",
-                            lineno, type, name, clean);
+                    WARN("hx8_to_c: line %d e%d %s: compile failed for `%s`\n",
+                         lineno, type, name, clean);
                 }
             }
             if (is_out) outlier_n++;
@@ -635,8 +660,7 @@ int main(int argc, char **argv)
     free(meta);
     free(input);
 
-    fprintf(stderr,
-"hx8_to_c: total=%d non_outlier=%d outlier=%d compile_failed=%d\n",
-            total, non_outlier, outlier_n, compile_failed);
+    WARN("hx8_to_c: total=%d non_outlier=%d outlier=%d compile_failed=%d\n",
+         total, non_outlier, outlier_n, compile_failed);
     return 0;
 }

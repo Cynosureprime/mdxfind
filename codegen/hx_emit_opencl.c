@@ -57,8 +57,20 @@
  * to small zero buffers; production dispatcher binds the device's
  * existing salt buffers since they're already provisioned.
  *
- * $Revision: 1.7 $
+ * $Revision: 1.11 $
  * $Log: hx_emit_opencl.c,v $
+ * Revision 1.11  2026/05/27 18:40:48  dlr
+ * sub-phase 5b1b7 revert RIPEMD-128 length-field bug-compat workaround in emit_outer_rmd128_concat_then_hash now that the in-tree rmd128.c MDfinish length-encoding bug is fixed at rmd128.c rev 1.1. Removes bug_lswlen first_has_pad branch from both single-block tail branch and 2-block else branch. Both branches now use bitlen equals total_len times 8 unconditionally per Bosselaers 1996 reference and sph_ripemd128. After the fix mdxfind CPU oracle and GPU emit both produce standard-conformant RIPEMD-128 digests byte-exact across the full plen range. User confirmed 2026-05-27 no production solved-hash records affected by the standard-conformance flip because plen greater than 60 inputs were never exercised in archives for RIPEMD128-using catalog entries e132 e157 e162 e211 e231.
+ *
+ * Revision 1.10  2026/05/27 18:15:00  dlr
+ * sub-phase 5b1b6 fix RIPEMD-128 length-field bug-compatibility in emit_outer_rmd128_concat_then_hash discovered during validation matrix at family_edge_maxlen fixture maxlen plens 59 to 131 OpenCL FAIL with vn_hits 0 missing 128 root cause in-tree rmd128.c MDfinish encodes leftover bytes after full-block processing as length field NOT total message length verified bug against sph_ripemd128 plus Bosselaers official test vectors for 80-char standard buggy CPU returns 1959258 standard correct is 3f45ef19 long-standing bug in donor implementation since 1996 mdxfind CPU oracle JOB_RMD128MD5PASS calls this buggy RIPEMD128 customer existing rmd128 hashes were computed with buggy code GPU MUST reproduce bug-compatible digest to stay in sync introduce bug_lswlen first_has_pad branch total_len pleft branch use bug_lswlen 8 instead of total_len 8 at final compress bitlen in both single-block tail branch and 2-block else branch fixes maxlen and broader plen 32 plus tail paths preserves correctness for fast path total_len le 55 and first_has_pad 1 path total_len le 63 because in those cases CPU lswlen equals total_len no behavioral change for already-passing fixtures
+ *
+ * Revision 1.9  2026/05/27 17:47:42  dlr
+ * sub-phase 5b1b3 add emit_outer_rmd128_concat_then_hash bespoke clone of emit_outer_rmd160_concat_then_hash with 4-uint state width drop h4 drop state 4 drop e1 calls rmd128_block from gpu_common.cl rev 1.27 mirror of the rmd160 multi-block pattern same LE message-schedule packing same LE 64-bit length suffix same first_has_pad logic for boundary cases pl 23 fast path total_len plus 1 plus 8 le 64 single-block then multi-block tail with first_has_pad flag CPU oracle RIPEMD128 stores LE bytes harness reinterprets as 4 LE uints direct byte-exact match no byte-swap RMD-128 right-pipeline F4 F3 F2 F1 ordering is in rmd128_block primitive itself not in this emit helper added HX_PRIM_RMD128 case to helper-name switch RMD128 branch to call-line tree RMD128 to FATAL gating filter wired subset md2 md4 rmd128 sha1 sha224 sha256 sha384 sha512 rmd160 RMD128 case to emit dispatch switch routes outer_id RMD128 to new emit_outer_rmd128_concat_then_hash 9 of 9 5a-supported primitives now wired plus MD2 RMD128 11 of 11 supported primitives via 5a.4 plus 5b.1a plus 5b.1b OpenCL twin only Metal twin in 5b1b3-metal twin commit
+ *
+ * Revision 1.8  2026/05/27 17:01:02  dlr
+ * sub-phase 5b1a3 add emit_outer_md2_concat_then_hash bespoke per-primitive emit helper for MD2 outer hash unlike MD4 family helpers MD2 has 16-byte block plus PKCS padding plus checksum-as-final-block structurally distinct calls md2_block from gpu_common.cl rev 1.26 per 16-byte data block processes 32-byte hex32 md5 inner as 2 full blocks then chunks pass in 16-byte blocks then PKCS-pads tail to 16-byte boundary then runs final checksum block with update_checksum equals 0 per RFC errata digest reads state 0 to 15 LE-packed into h0 h1 h2 h3 added MD2 arm to per-primitive switch in emit_family_md5pass_kernel helper_has_h4 0 added MD2 branch to call-line tree added MD2 to FATAL gating filter in hx_emit_family_md5pass_opencl added HX_PRIM_MD2 case to emit dispatch switch routes outer_id MD2 to new emit_outer_md2_concat_then_hash 8 of 8 5a-supported primitives now wired plus MD2 9 of 9 supported primitives via 5a.4 plus 5b.1a 5b1a3 OpenCL twin only Metal twin lifts in 5b1a3-metal twin commit
+ *
  * Revision 1.7  2026/05/23 05:23:25  dlr
  * sub-phase 5a.4 fan out the 6 remaining 5a-supported MAKE_MD5PASS family primitives on OpenCL md4 rmd160 sha224 sha256 sha384 sha512 outer body emit helpers each mirrors emit_outer_sha1_concat_then_hash structure single-block fast path multi-block with first_has_pad tail length encoding per-primitive endianness handling md4 LE schedule no state byte-swap rmd160 LE schedule no swap sha224 sha256 BE schedule swap each of first 4 state uints sha384 sha512 BE schedule ulong state swap each of first 2 ulongs then split into LE uint pair shared SHA-2 32-bit body parametrized by IV emit_outer_sha2_32_concat_then_hash with SHA-224 IV vs SHA-256 IV shared SHA-2 64-bit body emit_outer_sha2_64_concat_then_hash with SHA-384 IV vs SHA-512 IV 128-byte block 16-byte length suffix BE first_has_pad logic widened from total_len plus 1 plus 8 to total_len plus 1 plus 16 emit_family_md5pass_kernel switch table replaces SHA1-only FATAL with 7-arm dispatch on outer_id naming the helper per primitive 5-uint state primitives sha1 rmd160 take h4 4-uint state primitives md4 sha224 sha256 sha384 sha512 take only h0 through h3 hx_emit_family_md5pass_opencl widened the per-primitive emit body switch dispatch to 7 wired primitives with FATAL on HX_PRIM_MD5 e123 outlier deferred for multi-emit cross-arch validated PASS 8 of 8 on NVIDIA GTX 1080 Pascal for e122 e159 e163 e165 e167 e169 e161 still PASS as 5a.3 regression e347 production regression still PASS as well
  *
@@ -1253,6 +1265,123 @@ static int emit_outer_sha1_concat_then_hash(char **out,
  *     sha224/256; 8 ulongs for sha384/512)
  * ==================================================================== */
 
+/* Per-primitive outer body emit: MD2 (16-byte block, PKCS pad, checksum-
+ * block-as-final). Sub-phase 5b.1a (2026-05-27). Bespoke per D15.3.a --
+ * MD2 structurally diverges from MD4/MD5 family (different block size,
+ * different padding, distinct checksum-as-final-block step). Mirrors
+ * md2/md2.c md2_update + md2_final byte-for-byte; calls md2_block (from
+ * gpu_common.cl rev 1.26) per 16-byte data block. */
+static int emit_outer_md2_concat_then_hash(char **out,
+                                           size_t *cap, size_t *len)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_md2_concat_then_hash -- MD2 over\n"
+        "// (hex32(md5(pass)) || pass). Total input length = 32 + plen.\n"
+        "// Output: 4 uints (h0..h3, LE pack of state[0..15]).\n"
+        "//\n"
+        "// MD2 is byte-oriented (no endianness). 16-byte data blocks;\n"
+        "// PKCS padding (1-16 copies of byte N where N = bytes needed\n"
+        "// to reach the next 16-byte boundary); one extra block of the\n"
+        "// running checksum as final input.\n"
+        "//\n"
+        "// For the family use case the input length is exactly 32+plen\n"
+        "// (deterministic; plen <= HX_FAMILY_MAX_PASS). Total processed\n"
+        "// blocks = ((total_len) / 16) data blocks + 1 padded final +\n"
+        "// 1 checksum block. With HX_FAMILY_MAX_PASS = 64 the max\n"
+        "// processed-block count = ((32+64+15)/16) + 1 = 7+1 = 8.\n"
+        "static void outer_md2_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "\n"
+        "    // MD2 state: 48 zero bytes. Checksum: 16 zero bytes.\n"
+        "    uchar state[48];\n"
+        "    uchar checksum[16];\n"
+        "    for (int i = 0; i < 48; i++) state[i] = (uchar)0;\n"
+        "    for (int i = 0; i < 16; i++) checksum[i] = (uchar)0;\n"
+        "\n"
+        "    // Materialize hex32(md5(pass)) into a 32-byte buffer.\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    // Compose the full input (32 hex chars || pass) into a\n"
+        "    // local buffer sized to HX_FAMILY_MAX_PASS + 32 bytes.\n"
+        "    // PKCS pad adds up to 16 more; checksum step does not\n"
+        "    // need a separate buffer (passed via &checksum[0]).\n"
+        "    uchar block[16];\n"
+        "    int consumed = 0;\n"
+        "\n"
+        "    // Process complete 16-byte blocks from inner_hex (32 bytes).\n"
+        "    // 32 / 16 = 2 full blocks always.\n"
+        "    for (int b = 0; b < 2; b++) {\n"
+        "        for (int j = 0; j < 16; j++) {\n"
+        "            block[j] = inner_hex[b * 16 + j];\n"
+        "        }\n"
+        "        md2_block(state, checksum, block, 1);\n"
+        "        consumed += 16;\n"
+        "    }\n"
+        "\n"
+        "    // Process pass[] in 16-byte chunks while at least 16 bytes\n"
+        "    // remain. consumed - 32 = pass bytes processed so far.\n"
+        "    int pass_off = 0;\n"
+        "    while ((plen - pass_off) >= 16) {\n"
+        "        for (int j = 0; j < 16; j++) {\n"
+        "            block[j] = pass[pass_off + j];\n"
+        "        }\n"
+        "        md2_block(state, checksum, block, 1);\n"
+        "        pass_off += 16;\n"
+        "        consumed += 16;\n"
+        "    }\n"
+        "\n"
+        "    // Tail: 0..15 leftover pass bytes; PKCS pad with N copies\n"
+        "    // of (16 - tail_len). When tail_len == 0, pad is 16 copies\n"
+        "    // of 16 -- a full padding block.\n"
+        "    int tail_len = plen - pass_off;\n"
+        "    int pad_len = 16 - tail_len;\n"
+        "    for (int j = 0; j < tail_len; j++) {\n"
+        "        block[j] = pass[pass_off + j];\n"
+        "    }\n"
+        "    for (int j = tail_len; j < 16; j++) {\n"
+        "        block[j] = (uchar)pad_len;\n"
+        "    }\n"
+        "    md2_block(state, checksum, block, 1);\n"
+        "\n"
+        "    // Final: process the checksum as one more block. Per RFC\n"
+        "    // errata the checksum is NOT updated on this call; passing\n"
+        "    // update_checksum=0 keeps that semantics explicit. (The\n"
+        "    // digest reads only state[0..15], so the checksum's final\n"
+        "    // value is unread either way; matching B-Con donor with\n"
+        "    // update_checksum=1 produces the same output.)\n"
+        "    md2_block(state, checksum, checksum, 0);\n"
+        "\n"
+        "    // Digest: state[0..15] packed LE into h0..h3.\n"
+        "    *h0 = (uint)state[ 0]\n"
+        "        | ((uint)state[ 1] <<  8)\n"
+        "        | ((uint)state[ 2] << 16)\n"
+        "        | ((uint)state[ 3] << 24);\n"
+        "    *h1 = (uint)state[ 4]\n"
+        "        | ((uint)state[ 5] <<  8)\n"
+        "        | ((uint)state[ 6] << 16)\n"
+        "        | ((uint)state[ 7] << 24);\n"
+        "    *h2 = (uint)state[ 8]\n"
+        "        | ((uint)state[ 9] <<  8)\n"
+        "        | ((uint)state[10] << 16)\n"
+        "        | ((uint)state[11] << 24);\n"
+        "    *h3 = (uint)state[12]\n"
+        "        | ((uint)state[13] <<  8)\n"
+        "        | ((uint)state[14] << 16)\n"
+        "        | ((uint)state[15] << 24);\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
 /* Per-primitive outer body emit: MD4 (LE-schedule, 4-uint state). */
 static int emit_outer_md4_concat_then_hash(char **out,
                                            size_t *cap, size_t *len)
@@ -1381,6 +1510,150 @@ static int emit_outer_md4_concat_then_hash(char **out,
 }
 
 /* Per-primitive outer body emit: RIPEMD-160 (LE-schedule, 5-uint state). */
+/* Per-primitive outer body emit: RMD128 (LE-schedule, 4-uint state).
+ * Sub-phase 5b.1b (2026-05-27) Tier 1. Clone of the RMD-160 helper
+ * adjusted for 4-uint state (drop h4 / e1 / state[4]); the underlying
+ * rmd128_block primitive resident in gpu_common.cl rev 1.27 carries
+ * the F4->F3->F2->F1 right-pipeline ordering correctly (Bosselaers
+ * Table 4) so the emit helper does not need its own ordering knowledge
+ * -- it only needs to drive the standard 64-byte LE message schedule
+ * + length suffix + padding. CPU oracle RIPEMD128 returns 16 LE bytes;
+ * harness reinterprets as 4 LE uints -> direct byte-exact match. */
+static int emit_outer_rmd128_concat_then_hash(char **out,
+                                              size_t *cap, size_t *len)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_rmd128_concat_then_hash -- RIPEMD-128 over\n"
+        "// (hex32(md5(pass)) || pass). Total input length = 32 + plen.\n"
+        "// Output: 4 uints (h0..h3). RIPEMD-128 schedule is LITTLE-\n"
+        "// ENDIAN per spec; rmd128_block returns LE uints; CPU oracle\n"
+        "// RIPEMD128() stores LE bytes -> harness reinterprets as LE\n"
+        "// uints -> kernel state matches directly. NO byte-swap.\n"
+        "static void outer_rmd128_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "\n"
+        "    // RIPEMD-128 initial state -- same first 4 as MD5 / MD4.\n"
+        "    uint state[4];\n"
+        "    state[0] = 0x67452301u;\n"
+        "    state[1] = 0xEFCDAB89u;\n"
+        "    state[2] = 0x98BADCFEu;\n"
+        "    state[3] = 0x10325476u;\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    uint M[16];\n"
+        "    int byte_pos = 0;\n"
+        "    int pass_consumed = 0;\n"
+        "    int first_has_pad = 0;\n"
+        "\n"
+        "    int p_in_first = plen;\n"
+        "    if (p_in_first > 32) p_in_first = 32;\n"
+        "    {\n"
+        "        for (int w = 0; w < 8; w++) {\n"
+        "            int bo = w * 4;\n"
+        "            M[w] = (uint)inner_hex[bo]\n"
+        "                 | ((uint)inner_hex[bo + 1] << 8)\n"
+        "                 | ((uint)inner_hex[bo + 2] << 16)\n"
+        "                 | ((uint)inner_hex[bo + 3] << 24);\n"
+        "        }\n"
+        "        for (int w = 8; w < 16; w++) M[w] = 0u;\n"
+        "        for (int i = 0; i < p_in_first; i++) {\n"
+        "            int abs_pos = 32 + i;\n"
+        "            uint v = (uint)pass[i];\n"
+        "            int wi = abs_pos >> 2;\n"
+        "            int sh = (abs_pos & 3) * 8;\n"
+        "            M[wi] |= v << sh;\n"
+        "        }\n"
+        "        pass_consumed = p_in_first;\n"
+        "        byte_pos = 32 + p_in_first;\n"
+        "    }\n"
+        "\n"
+        "    if (total_len + 1 + 8 <= 64) {\n"
+        "        int pad_pos = byte_pos;\n"
+        "        int wi = pad_pos >> 2;\n"
+        "        int sh = (pad_pos & 3) * 8;\n"
+        "        M[wi] |= 0x80u << sh;\n"
+        "        ulong bitlen = (ulong)total_len * 8u;\n"
+        "        // RIPEMD-128 length is LITTLE-ENDIAN 64-bit.\n"
+        "        M[14] = (uint)(bitlen & 0xffffffffu);\n"
+        "        M[15] = (uint)(bitlen >> 32);\n"
+        "        rmd128_block(state, M);\n"
+        "        *h0 = state[0]; *h1 = state[1]; *h2 = state[2];\n"
+        "        *h3 = state[3];\n"
+        "        return;\n"
+        "    }\n"
+        "\n"
+        "    if (p_in_first == plen && byte_pos < 64) {\n"
+        "        int pad_pos = byte_pos;\n"
+        "        int wi = pad_pos >> 2;\n"
+        "        int sh = (pad_pos & 3) * 8;\n"
+        "        M[wi] |= 0x80u << sh;\n"
+        "        first_has_pad = 1;\n"
+        "    }\n"
+        "    rmd128_block(state, M);\n"
+        "\n"
+        "    int pleft = plen - pass_consumed;\n"
+        "    while (pleft >= 64) {\n"
+        "        for (int w = 0; w < 16; w++) {\n"
+        "            int bo = pass_consumed + w * 4;\n"
+        "            M[w] = (uint)pass[bo]\n"
+        "                 | ((uint)pass[bo + 1] << 8)\n"
+        "                 | ((uint)pass[bo + 2] << 16)\n"
+        "                 | ((uint)pass[bo + 3] << 24);\n"
+        "        }\n"
+        "        rmd128_block(state, M);\n"
+        "        pass_consumed += 64;\n"
+        "        pleft -= 64;\n"
+        "    }\n"
+        "\n"
+        "    for (int w = 0; w < 16; w++) M[w] = 0u;\n"
+        "    for (int i = 0; i < pleft; i++) {\n"
+        "        uint v = (uint)pass[pass_consumed + i];\n"
+        "        int wi = i >> 2;\n"
+        "        int sh = (i & 3) * 8;\n"
+        "        M[wi] |= v << sh;\n"
+        "    }\n"
+        "    if (!first_has_pad) {\n"
+        "        int pad_pos = pleft;\n"
+        "        int wi = pad_pos >> 2;\n"
+        "        int sh = (pad_pos & 3) * 8;\n"
+        "        M[wi] |= 0x80u << sh;\n"
+        "    }\n"
+        "    // RIPEMD-128 length suffix: TOTAL message bit-length\n"
+        "    // (standard-conformant). The legacy CPU oracle bug in\n"
+        "    // rmd128.c that previously required a bug-compatible\n"
+        "    // encoding (bug_lswlen = leftover bytes) was fixed in\n"
+        "    // rmd128.c on 2026-05-27 -- the CPU now also encodes the\n"
+        "    // total bit-length, matching Bosselaers's 1996 reference\n"
+        "    // and sph_ripemd128. GPU emit therefore uses total_len*8.\n"
+        "    ulong bitlen = (ulong)total_len * 8u;\n"
+        "    if (pleft + 1 + 8 <= 64 || (first_has_pad && pleft + 8 <= 64)) {\n"
+        "        M[14] = (uint)(bitlen & 0xffffffffu);\n"
+        "        M[15] = (uint)(bitlen >> 32);\n"
+        "        rmd128_block(state, M);\n"
+        "    } else {\n"
+        "        rmd128_block(state, M);\n"
+        "        for (int w = 0; w < 16; w++) M[w] = 0u;\n"
+        "        M[14] = (uint)(bitlen & 0xffffffffu);\n"
+        "        M[15] = (uint)(bitlen >> 32);\n"
+        "        rmd128_block(state, M);\n"
+        "    }\n"
+        "    *h0 = state[0]; *h1 = state[1]; *h2 = state[2];\n"
+        "    *h3 = state[3];\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
 static int emit_outer_rmd160_concat_then_hash(char **out,
                                               size_t *cap, size_t *len)
 {
@@ -1969,8 +2242,16 @@ static int emit_family_md5pass_kernel(char **out, size_t *cap, size_t *len,
             helper_name = "outer_sha1_concat_then_hash";
             helper_has_h4 = 1;
             break;
+        case HX_PRIM_MD2:
+            helper_name = "outer_md2_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
         case HX_PRIM_MD4:
             helper_name = "outer_md4_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        case HX_PRIM_RMD128:
+            helper_name = "outer_rmd128_concat_then_hash";
             helper_has_h4 = 0;
             break;
         case HX_PRIM_RMD160:
@@ -2116,7 +2397,17 @@ static int emit_family_md5pass_kernel(char **out, size_t *cap, size_t *len,
                 "                                  pass_bytes, (int)plen,\n"
                 "                                  &h0, &h1, &h2, &h3, &h4);\n")
             : /* 4-uint state helpers: helper_name selects branch */
-              ((outer_id == HX_PRIM_MD4) ?
+              ((outer_id == HX_PRIM_MD2) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_md2_concat_then_hash(ia, ib, ic, id,\n"
+                "                               pass_bytes, (int)plen,\n"
+                "                               &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_RMD128) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_rmd128_concat_then_hash(ia, ib, ic, id,\n"
+                "                                  pass_bytes, (int)plen,\n"
+                "                                  &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_MD4) ?
                 "    uint h0, h1, h2, h3;\n"
                 "    outer_md4_concat_then_hash(ia, ib, ic, id,\n"
                 "                               pass_bytes, (int)plen,\n"
@@ -2226,6 +2517,7 @@ int hx_emit_family_md5pass_opencl(
         return -1;
     }
     if (outer_id != HX_PRIM_SHA1 && outer_id != HX_PRIM_MD4 &&
+        outer_id != HX_PRIM_MD2 && outer_id != HX_PRIM_RMD128 &&
         outer_id != HX_PRIM_RMD160 && outer_id != HX_PRIM_SHA224 &&
         outer_id != HX_PRIM_SHA256 && outer_id != HX_PRIM_SHA384 &&
         outer_id != HX_PRIM_SHA512)
@@ -2233,9 +2525,9 @@ int hx_emit_family_md5pass_opencl(
         fprintf(stderr,
             "FATAL: %s:%d hx_emit_family_md5pass_opencl: e%d %s outer "
             "primitive '%s' is in supported_5a set but not in the "
-            "5a.4 wired subset (md4 sha1 sha224 sha256 sha384 sha512 "
-            "rmd160). Either add to dispatch above or this is a logic "
-            "bug.\n",
+            "5a.4 + 5b.1a + 5b.1b wired subset (md2 md4 rmd128 sha1 "
+            "sha224 sha256 sha384 sha512 rmd160). Either add to "
+            "dispatch above or this is a logic bug.\n",
             __FILE__, __LINE__, entry->job_enum,
             entry->name ? entry->name : "(noname)", outer_name);
         return -1;
@@ -2277,8 +2569,12 @@ int hx_emit_family_md5pass_opencl(
     switch (outer_id) {
         case HX_PRIM_SHA1:
             rc = emit_outer_sha1_concat_then_hash(out, out_cap, &cur_len); break;
+        case HX_PRIM_MD2:
+            rc = emit_outer_md2_concat_then_hash(out, out_cap, &cur_len); break;
         case HX_PRIM_MD4:
             rc = emit_outer_md4_concat_then_hash(out, out_cap, &cur_len); break;
+        case HX_PRIM_RMD128:
+            rc = emit_outer_rmd128_concat_then_hash(out, out_cap, &cur_len); break;
         case HX_PRIM_RMD160:
             rc = emit_outer_rmd160_concat_then_hash(out, out_cap, &cur_len); break;
         case HX_PRIM_SHA224:

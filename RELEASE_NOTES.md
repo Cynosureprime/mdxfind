@@ -1,3 +1,101 @@
+# mdxfind v1.504 — Phase 5b Tier 1: MD2 / RMD128 MAKE_MD5PASS family GPU acceleration + RIPEMD-128 / RIPEMD-160 standard-conformance bug fix
+
+Source: mdxfind.c rev 1.507, rmd128.c rev 1.1 (NEW; bug fix), rmd160.c rev 1.1 (NEW; bug fix), gpu/gpu_common.cl rev 1.27, gpu/gpu_common_str.h rev 1.19, gpu/metal_common.metal rev 1.26, gpu/metal_common_str.h rev 1.5, gpu/gpu_codegen_eligible.c rev 1.3, codegen/hx_emit_primitives.c rev 1.3, codegen/hx_emit_opencl.c rev 1.11, codegen/hx_emit_metal.c rev 1.10, codegen/tests/run_validation_family_md5pass.sh rev 1.4, codegen/tests/family_md5pass/e120_smoke.txt rev 1.1 (NEW 5b.1a), codegen/tests/family_md5pass/e157_smoke.txt rev 1.1 (NEW 5b.1b), codegen/tests/test_rmd128_bosselaers.c rev 1.1 (NEW; regression), codegen/tests/test_rmd160_bosselaers.c rev 1.1 (NEW; regression).
+
+Window: 2026-05-27.
+
+Phase 5b Tier 1 lifts two MAKE_MD5PASS outer primitives — MD2 and RMD128 — into the shared GPU helper sources and wires them into the family codegen pipeline. After Tier 1 the family has 9 GPU-eligible members; 20 remain CPU-only pending Tier 2-4 primitive lifts (tiger, wrl, haval×15, gost, gost_crypto, sne128, sne256). During Tier 1 validation a long-standing standard-conformance bug in the in-tree RIPEMD-128 implementation was discovered and fixed; subsequent inspection found the identical bug pattern in the in-tree RIPEMD-160 implementation and that is fixed in the same release. See the "Bug fix" section below.
+
+## Bug fix — RIPEMD-128 / RIPEMD-160 length-encoding standard-conformance
+
+A pair of long-standing length-encoding bugs in the in-tree RIPEMD-128 (`rmd128.c`) and RIPEMD-160 (`rmd160.c`) implementations (both Bosselaers ESAT-COSIC 1996 donor lineage) are fixed this release. The bug pattern is identical in both files: the `RIPEMDxxx()` wrapper's per-block consumer loop modifies the local `len` parameter, and the final `MDfinish()` call was passing the post-loop residual byte count instead of the original total length. Because `MDfinish()` encodes its `lswlen` argument as the message bit-length in the standard MD-family length suffix, the digest of any message longer than 63 bytes was non-standard — the encoded length was `(total_bytes mod 64) * 8` instead of `total_bytes * 8`. The `MDfinish()` header docstring in `rmd128.h` and `rmd160.h` had always documented the intended semantics (`lswlen` is the TOTAL byte length; only `lswlen mod 64` bytes remain in `strptr`), so the bug was solely in the callers.
+
+After the fix, the in-tree RIPEMD-128 and RIPEMD-160 implementations match Bosselaers's 1996 reference values byte-for-byte, including the canonical test vectors:
+
+### RIPEMD-128 (`rmd128.c` rev 1.1)
+
+| Input                                              | Expected (Bosselaers)              | Pre-fix mdxfind                    | Post-fix mdxfind                   |
+|----------------------------------------------------|------------------------------------|------------------------------------|------------------------------------|
+| empty string                                       | `cdf26213a150dc3ecb610f18f6b38b46` | (unchanged — single-block)         | `cdf26213a150dc3ecb610f18f6b38b46` |
+| `"a"`                                              | `86be7afa339d0fc7cfc785e72f578d33` | (unchanged — single-block)         | `86be7afa339d0fc7cfc785e72f578d33` |
+| `"abc"`                                            | `c14a12199c66e4ba84636b0f69144c77` | (unchanged — single-block)         | `c14a12199c66e4ba84636b0f69144c77` |
+| `"message digest"`                                 | `9e327b3d6e523062afc1132d7df9d1b8` | (unchanged — single-block)         | `9e327b3d6e523062afc1132d7df9d1b8` |
+| `a..z` (26 bytes)                                  | `fd2aa607f71dc8f510714922b371834e` | (unchanged — single-block)         | `fd2aa607f71dc8f510714922b371834e` |
+| `A..Z+a..z+0..9` (62 bytes)                        | `d1e959eb179c911faea4624c60c5c702` | (unchanged — single-block)         | `d1e959eb179c911faea4624c60c5c702` |
+| `"1234567890"` × 8 (80 bytes)                      | `3f45ef194732c2dbb2c4a2c769795fa3` | `1959258deca4645654950534f3537250` | `3f45ef194732c2dbb2c4a2c769795fa3` |
+| `"a"` × 1,000,000                                  | `4a7f5723f954eba1216c9d8f6320431f` | (non-conformant)                   | `4a7f5723f954eba1216c9d8f6320431f` |
+
+All 8 RIPEMD-128 vectors PASS post-fix on the standalone regression test `codegen/tests/test_rmd128_bosselaers.c` (rev 1.1 NEW). After the fix, the in-tree `RIPEMD128()` agrees with `sph_ripemd128` (sphlib-3.0), and with every other standard implementation.
+
+### RIPEMD-160 (`rmd160.c` rev 1.1)
+
+| Input                                              | Expected (Bosselaers)                        | Pre-fix in-tree                              | Post-fix in-tree                             |
+|----------------------------------------------------|----------------------------------------------|----------------------------------------------|----------------------------------------------|
+| empty string                                       | `9c1185a5c5e9fc54612808977ee8f548b2258d31`   | (unchanged — single-block)                   | `9c1185a5c5e9fc54612808977ee8f548b2258d31`   |
+| `"a"`                                              | `0bdc9d2d256b3ee9daae347be6f4dc835a467ffe`   | (unchanged — single-block)                   | `0bdc9d2d256b3ee9daae347be6f4dc835a467ffe`   |
+| `"abc"`                                            | `8eb208f7e05d987a9b044a8e98c6b087f15a0bfc`   | (unchanged — single-block)                   | `8eb208f7e05d987a9b044a8e98c6b087f15a0bfc`   |
+| `"message digest"`                                 | `5d0689ef49d2fae572b881b123a85ffa21595f36`   | (unchanged — single-block)                   | `5d0689ef49d2fae572b881b123a85ffa21595f36`   |
+| `a..z` (26 bytes)                                  | `f71c27109c692c1b56bbdceb5b9d2865b3708dbc`   | (unchanged — single-block)                   | `f71c27109c692c1b56bbdceb5b9d2865b3708dbc`   |
+| `A..Z+a..z+0..9` (62 bytes)                        | `b0e20b6e3116640286ed3a87a5713079b21f5189`   | (unchanged — single-block)                   | `b0e20b6e3116640286ed3a87a5713079b21f5189`   |
+| `"1234567890"` × 8 (80 bytes)                      | `9b752e45573d4b39f4dbd3323cab82bf63326bfb`   | `5f7ffbbfd70ae0b9ad611b7961a32a7646f9c384`   | `9b752e45573d4b39f4dbd3323cab82bf63326bfb`   |
+| `"a"` × 1,000,000                                  | `52783243c1697bdbe16d37f97f68f08325dc1528`   | `eb56500397007b3e6e07fe58db85a7ceaa78d37f`   | `52783243c1697bdbe16d37f97f68f08325dc1528`   |
+
+All 8 RIPEMD-160 vectors PASS post-fix on the standalone regression test `codegen/tests/test_rmd160_bosselaers.c` (rev 1.1 NEW). After the fix, the in-tree `RIPEMD160()` agrees with `sph_ripemd160` (sphlib-3.0) and OpenSSL's `RIPEMD160`, and with every other standard implementation.
+
+### Scope and fix shape
+
+Both fixes are confined to the `RIPEMDxxx()` wrapper functions in `rmd128.c` and `rmd160.c`: each saves the original message length into local `total_lswlen` and `total_mswlen` before the per-block consumer loop, then passes those totals to `MDfinish()`. No signature changes; `MDfinish()` is unchanged in either file.
+
+**Scope of RIPEMD-128 behavior change**: every `mdxfind` catalog entry that calls `RIPEMD128()` (e16 RMD128, e156 RMD128MD5, e157 RMD128MD5PASS, e210 HMAC-RMD128, e231 RMD128MD5MD5, e498 RMD128MD4, e714 SHA1RMD128) produces different output post-fix for any RIPEMD-128 input longer than 63 bytes. For inputs ≤ 63 bytes (single-block, no consumer-loop iterations) the digest is byte-identical to pre-fix.
+
+**Scope of RIPEMD-160 behavior change**: the in-tree `RIPEMD160()` symbol is shadowed at link time by OpenSSL's `libcrypto.a` `RIPEMD160` in the `mdxfind` binary (the in-tree `rmd160.o` is only linked into the separate `mdxocl` target). The `mdxfind` binary therefore was already using a standard-conformant RIPEMD-160; the fix to `rmd160.c` restores the in-tree implementation to standard conformance for any caller that links it directly (including `mdxocl`, the standalone Bosselaers regression test, and any future build target that links `rmd160.o`). The five `mdxfind` catalog entries that mention `RIPEMD160()` in their case bodies (e17 RMD160, e158 RMD160MD5, e159 RMD160MD5PASS, e196 MD5RMD160, e746 SHA1RMD160TRUNC) and the `oracle_compute_md5pass_family()` arm for e159 all resolve `RIPEMD160` to the OpenSSL implementation in the production binary, so their behavior is unchanged. HMAC paths (e211 HMAC-RMD160, e798 HMAC-RMD160 KPASS) use the `mhash` library's `MHASH_RIPEMD160` and are likewise unchanged.
+
+The user has confirmed (2026-05-27) that no production solved-hash archives include RIPEMD-128 or RIPEMD-160 computations on inputs longer than 60 bytes for any catalog entry, so neither fix orphans any existing cracking workflow.
+
+The GPU codegen emit helpers (`emit_outer_rmd128_concat_then_hash` in `hx_emit_opencl.c` rev 1.11 and `emit_outer_rmd128_concat_then_hash_metal` in `hx_emit_metal.c` rev 1.10) had carried a `bug_lswlen` workaround introduced during the initial 5b.1b validation pass to keep the GPU output byte-exact with the (then-buggy) CPU oracle. That workaround is reverted this release: the length suffix in both backends now uses `total_len * 8` unconditionally, matching the now-conformant CPU oracle.
+
+The corresponding RMD-160 GPU codegen emit helpers (`emit_outer_rmd160_concat_then_hash` / `emit_outer_rmd160_concat_then_hash_metal`) never carried a `bug_lswlen` workaround — they were always standard-correct because the production `mdxfind` binary's `RIPEMD160` was already coming from OpenSSL. No emit-helper revert is required for RMD-160; no GPU file changes for the RMD-160 fix.
+
+## Sub-phase 5b.1a — MD2MD5PASS (e120) GPU acceleration
+
+`e120 MD2MD5PASS` (`md2(md5_hex(pass) . pass)`) joins the 7 Phase 5a family members on GPU. Eighth GPU-eligible member of the 30-entry MAKE_MD5PASS family.
+
+The MD2 outer-hash primitive (`md2_block`) is new to both `gpu/gpu_common.cl` and `gpu/metal_common.metal` this sub-phase. The 256-byte MD2 S-box (RFC 1319 Table T) lives in `__constant` address space on OpenCL and `constant` address space on Metal. The block compression matches B-Con and sph_md2 reference byte-for-byte (18 rounds × 48-byte state + 16-byte checksum). The emit helper (`emit_outer_md2_concat_then_hash`) is bespoke because MD2's structure diverges from the MD4/MD5 family (16-byte block, PKCS padding, checksum-as-final-block).
+
+## Sub-phase 5b.1b — RMD128MD5PASS (e157) GPU acceleration
+
+`e157 RMD128MD5PASS` (`rmd128(md5_hex(pass) . pass)`) becomes the ninth GPU-eligible member of the family.
+
+The RMD-128 outer-hash primitive (`rmd128_block`) is new to both `gpu/gpu_common.cl` (4-uint state, dual pipeline, reuses RMD_F1..F4 macros from the existing RMD-160 helper, defines local RMD128_STEP / LL1..LL4 / RR1..RR4 round-K macros) and `gpu/metal_common.metal` (Metal twin via hand-port; same structure with RMD128_STEP_METAL / LL1M..LL4M / RR1M..RR4M). The dual pipeline runs **left line F1->F2->F3->F4 and right line F4->F3->F2->F1** per Bosselaers Table 4 — the right-line ordering is inverted relative to RMD-160 (which uses F5->F4->F3->F2->F1) and is the highest-risk transcription point per spec R2.
+
+The emit helper (`emit_outer_rmd128_concat_then_hash`) clones the existing RMD-160 helper with state width adjusted from 5 uints to 4 uints. The standard-conformant length suffix (`total_len * 8`) is encoded directly; see the "Bug fix" section above for the resolution of the temporary `bug_lswlen` workaround that was carried during the initial 5b.1b validation pass.
+
+## Validation matrix
+
+Sub-phase 5b.1a (MD2) 10-cell Tier 1 matrix: 5 fixtures × 2 backends (OpenCL Pascal GTX 1080 + Metal Apple M2 Max) × e120 → 10/10 PASS, 2,097,792 password-digest verifications byte-exact vs CPU oracle.
+
+Sub-phase 5b.1b (RMD128) 10-cell Tier 1 matrix: same shape × e157 → 10/10 PASS, 2,099,728 password-digest verifications byte-exact vs CPU oracle (verified with the rmd128.c bug fix and the matching emit-helper revert in place; the previously-failing `family_edge_maxlen` cell — 128 plaintexts with plens 56-128 exercising the multi-block path — now passes on both backends with zero diffs).
+
+Aggregate 90-cell post-Tier-1 family regression (9 family members × 5 fixtures × 2 backends): 90/90 PASS. Zero regressions on the 7 Phase 5a members (e122 e159 e161 e163 e165 e167 e169); e120 and e157 admit cleanly without disturbing any of them. None of the non-RMD128 family entries are affected by the RIPEMD-128 bug fix.
+
+Phase 4 e347 production-dispatcher regression (2 fixtures × 2 backends): 4/4 PASS, byte-exact unchanged. e347 (MD5MD5SALT) does not use RIPEMD-128, and the e347 regression confirms no collateral damage from the rmd128.c edit.
+
+| Fixture / Backend     | OpenCL e120 | OpenCL e157 | Metal e120 | Metal e157 |
+|-----------------------|-------------|-------------|------------|------------|
+| family_smoke (8)      | PASS        | PASS        | PASS       | PASS       |
+| family_medium (1024)  | PASS        | PASS        | PASS       | PASS       |
+| family_large (1048576)| PASS        | PASS        | PASS       | PASS       |
+| family_edge_minlen    | PASS        | PASS        | PASS       | PASS       |
+| family_edge_maxlen    | PASS        | PASS        | PASS       | PASS       |
+
+The `gpu_codegen_kernelb_family_md5pass_eligible()` admit-predicate widens from 7 arms (Phase 5a) to 9 arms (adding case 120 and case 157). The aggregate runner `run_validation_family_md5pass.sh` widens its `FAMILY_JOBS` list from 7 entries to 9 (numeric-sorted: `120 122 157 159 161 163 165 167 169`).
+
+## Coming in Tier 2-4 (future releases)
+
+Tier 2 (tiger + wrl), Tier 3 (haval × 15 variants), Tier 4 (snefru + gost + gost_crypto) ship per their corresponding `<primitive>_block` lifts into `gpu_common.cl` and `metal_common.metal`. The Phase 5b scoping memo lays out per-tier priority and per-family architect spec discipline.
+
+---
+
 # mdxfind v1.503 — Mask iteration scale fixes + hx.8 catalog doc corrections
 
 Source: mdxfind.c rev 1.505, gpu/gpu_opencl.c rev 1.195, gpu_metal.m rev 1.118, hx.8 rev 1.12, hashpipe.c rev 1.90.

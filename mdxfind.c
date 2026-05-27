@@ -235,10 +235,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.505 2026/05/27 00:29:53 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.507 2026/05/27 17:50:57 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.505 2026/05/27 00:29:53 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.507 2026/05/27 17:50:57 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -256,6 +256,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.507  2026/05/27 17:50:57  dlr
+ * sub-phase 5b1b4 mdxfind admit oracle plus dlen plus harness gates extended for RMD128MD5PASS e157 oracle_compute_md5pass_family adds JOB_RMD128MD5PASS arm calls RIPEMD128 on hex32 md5 pass concat pass buffer returns 16-byte digest hx_family_md5pass_validate_run_shared dlen switch adds JOB_RMD128MD5PASS dlen 16 byte chokepoint admit family_ops list widens from 8 to 9 entries adds JOB_RMD128MD5PASS between MD4 and RMD160 numeric sort OpenCL harness gate at hx_family_md5pass_validate_run_shared OpenCL backend dispatch widens from 8 to 9 OR-chain entries adds JOB_RMD128MD5PASS Metal harness gate parallel widens from 8 to 9 OR-chain entries adds JOB_RMD128MD5PASS RIPEMD128 extern already declared at mdxfind.c line 2210 implementation in rmd128.c line 230 no new header includes needed
+ *
+ * Revision 1.506  2026/05/27 17:05:15  dlr
+ * sub-phase 5b1a4 mdxfind admit oracle plus dlen plus harness gates extended for MD2MD5PASS e120 oracle_compute_md5pass_family adds JOB_MD2MD5PASS arm calls sph_md2_init plus sph_md2 plus sph_md2_close on hex32 md5 pass concat pass buffer returns 16-byte digest hx_family_md5pass_validate_run_shared dlen switch adds JOB_MD2MD5PASS dlen 16 byte chokepoint admit family_ops list widens from 7 to 8 entries adds JOB_MD2MD5PASS leading e120 OpenCL harness gate at hx_family_md5pass_validate_run_shared OpenCL backend dispatch widens from 7 to 8 OR-chain entries adds JOB_MD2MD5PASS Metal harness gate parallel widens from 7 to 8 OR-chain entries adds JOB_MD2MD5PASS sph_md2_h header already included at mdxfind.c line 83 from existing JOB_MD2 plus JOB_MD5MD2 plus JOB_SHA1MD2 paths no new include needed
+ *
  * Revision 1.505  2026/05/27 00:29:53  dlr
  * Raise MAX_MASK_POS from 16 to 256; add MAX_MASK_POS_GPU_SIDE=16 for GPU per-side cap; FATAL on overlong masks. Customer mask 21-char ?d?d?d?d?d?d?d?d?d?d@myecou.com was silently truncated to 16 positions causing wrong hashes. parse_mask_into now exits with diagnostic on overflow. GPU upload sites at lines ~50390, ~50510, ~50780 now check input mask against GPU per-side cap and skip upload + warn when exceeded so CPU path handles long masks. Validated on fpga.local GTX 1080 - customer hash a7cd8421ed4f949af68b68a3b116ede1 cracked at 2399938728@myecou.com over 10e10 keyspace in 194s at 51 Mh per second with 17 threads.
  *
@@ -38293,8 +38299,21 @@ oracle_compute_md5pass_family(int job_enum, const char *pass, int plen,
         mysha1((char *)buf, total, out);
         free(buf);
         return 20;
+    case JOB_MD2MD5PASS:         /* e120 -- 5b.1a Tier 1 */
+        {
+            sph_md2_context cmd2;
+            sph_md2_init(&cmd2);
+            sph_md2(&cmd2, buf, total);
+            sph_md2_close(&cmd2, out);
+        }
+        free(buf);
+        return 16;
     case JOB_MD4MD5PASS:         /* e122 */
         MD4((char *)buf, total, out);
+        free(buf);
+        return 16;
+    case JOB_RMD128MD5PASS:      /* e157 -- 5b.1b Tier 1 */
+        RIPEMD128((char *)buf, total, out);
         free(buf);
         return 16;
     case JOB_RMD160MD5PASS:      /* e159 */
@@ -38416,7 +38435,9 @@ static void hx_family_md5pass_validate_run_shared(
      * MD4=16, RMD160=20, SHA1=20, SHA224=28, SHA256=32, SHA384=48, SHA512=64. */
     int dlen = 0;
     switch (job_enum) {
+        case JOB_MD2MD5PASS:    dlen = 16; break;  /* 5b.1a Tier 1 */
         case JOB_MD4MD5PASS:    dlen = 16; break;
+        case JOB_RMD128MD5PASS: dlen = 16; break;  /* 5b.1b Tier 1 */
         case JOB_RMD160MD5PASS: dlen = 20; break;
         case JOB_SHA1MD5PASS:   dlen = 20; break;
         case JOB_SHA224MD5PASS: dlen = 28; break;
@@ -39208,7 +39229,9 @@ void build_compact_table(void) {
     }
     if (!need_gpu) {
         static const int _family_ops[] = {
+            JOB_MD2MD5PASS,    /* e120 -- 5b.1a Tier 1 */
             JOB_MD4MD5PASS,    /* e122 */
+            JOB_RMD128MD5PASS, /* e157 -- 5b.1b Tier 1 */
             JOB_RMD160MD5PASS, /* e159 */
             JOB_SHA1MD5PASS,   /* e161 */
             JOB_SHA224MD5PASS, /* e163 */
@@ -39439,7 +39462,9 @@ void build_compact_table(void) {
          * e165 e167 e169). e123 MD5MD5PASS remains outlier (multi-emit
          * deferred). The 5a.5 production dispatcher will widen the
          * admit predicate similarly. */
-        if ((target_job == JOB_MD4MD5PASS    ||
+        if ((target_job == JOB_MD2MD5PASS    ||  /* 5b.1a Tier 1 */
+             target_job == JOB_MD4MD5PASS    ||
+             target_job == JOB_RMD128MD5PASS ||  /* 5b.1b Tier 1 */
              target_job == JOB_RMD160MD5PASS ||
              target_job == JOB_SHA1MD5PASS   ||
              target_job == JOB_SHA224MD5PASS ||
@@ -39945,7 +39970,9 @@ void build_compact_table(void) {
         }
         /* Sub-phase 5a.4 (2026-05-23): Metal twin widened to 7 family
          * members (e122 e159 e161 e163 e165 e167 e169). e123 outlier. */
-        if ((target_job == JOB_MD4MD5PASS    ||
+        if ((target_job == JOB_MD2MD5PASS    ||  /* 5b.1a Tier 1 */
+             target_job == JOB_MD4MD5PASS    ||
+             target_job == JOB_RMD128MD5PASS ||  /* 5b.1b Tier 1 */
              target_job == JOB_RMD160MD5PASS ||
              target_job == JOB_SHA1MD5PASS   ||
              target_job == JOB_SHA224MD5PASS ||

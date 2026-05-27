@@ -17,6 +17,14 @@
  *
 \********************************************************************/
 
+/*
+ * $Revision: 1.1 $
+ * $Log: rmd128.c,v $
+ * Revision 1.1  2026/05/27 18:40:16  dlr
+ * Standard-conformance fix in RIPEMD128 length encoding. Previously rmd128.c RIPEMD128 passed post-loop residual byte count to MDfinish as lswlen which made the encoded bit-length field equal to total_bytes mod 64 instead of total_bytes for any message longer than 63 bytes. Output disagreed with Bosselaers 1996 reference sph_ripemd128 openssl and every other conforming implementation. Fix preserves the ORIGINAL message length into total_lswlen plus total_mswlen before the per-block consumer loop then passes the total to MDfinish. No signature changes. MDfinish header docstring in rmd128.h already documented the intended semantics that lswlen is total bytes and only lswlen mod 64 remain in strptr the bug was solely in the caller. Verified PASS against all 8 Bosselaers test vectors including 80 char 1234567890 x8 canary and 1 million a stress vector. User confirmed no production solved hash records affected because rmd128 long messages were not exercised in archives. Also adds RCS keyword stanza to satisfy global rule for hand authored source.
+ *
+ */
+
 /*  header files */
 #include <string.h>
 #include "rmd128.h"
@@ -231,6 +239,20 @@ void RIPEMD128(unsigned char *src, int len, unsigned char *dest)
 {
       dword MDbuf[RMDsize/8], X[16];
       int i;
+      /* Standard-conformance fix (2026-05-27): preserve the ORIGINAL
+       * message length so MDfinish() can encode the correct total
+       * bit-length suffix. The legacy code passed the post-loop
+       * residual to MDfinish() which made the length-field encode
+       * (total_bytes mod 64) instead of total_bytes for any message
+       * longer than 63 bytes -- producing non-standard digests that
+       * disagree with Bosselaers's 1996 reference, sph_ripemd128,
+       * and every other conforming implementation. The MDfinish()
+       * header comment in rmd128.h already documented the intended
+       * semantics: lswlen is the TOTAL byte length and only
+       * (lswlen mod 64) bytes remain in strptr. The bug was solely
+       * in this caller. */
+      dword total_lswlen = (dword)len;
+      dword total_mswlen = 0;
 
       MDinit(MDbuf);
 
@@ -243,8 +265,8 @@ void RIPEMD128(unsigned char *src, int len, unsigned char *dest)
       compress(MDbuf, X);
    }                                    /* length mod 64 bytes left */
 
-   /* finish: */
-   MDfinish(MDbuf, src, len, 0);
+   /* finish: pass TOTAL length, not residual. */
+   MDfinish(MDbuf, src, total_lswlen, total_mswlen);
 
    for (i=0; i<RMDsize/8; i+=4) {
       dest[i]   =  MDbuf[i>>2];         /* implicit cast to byte  */

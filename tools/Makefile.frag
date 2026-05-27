@@ -43,6 +43,24 @@ tools/hx8_to_c: tools/hx8_to_c.c hx_vm.h hx.c hx_ast.c hx_compile.c hx_vm.c \
 	    hx.tab.c hx.lex.c myprogress.c \
 	    -L/opt/local/lib -lssl -lcrypto /opt/local/lib/libiconv.a
 
+# tools/hx_dedup_check -- standalone CLI that catches "this proposed hx
+# expression already exists in the catalog under a different name." Per
+# architect spec project_hx_dedup_check_spec_2026-05-26.md (Tier 1).
+#
+# Same link surface as tools/hx8_to_c (HX_STANDALONE + prescan stubs),
+# plus codegen/hx_specs_data.o for the catalog the tool compares against.
+# codegen/hx_specs_data.c is built earlier in the pipeline by tools/hx8_to_c
+# itself; we don't list it as a prerequisite here because regenerating it
+# every time the dedup tool is rebuilt would needlessly run hx8_to_c again.
+tools/hx_dedup_check: tools/hx_dedup_check.c hx_vm.h hx.c hx_ast.c \
+                hx_compile.c hx_vm.c hx_func.c hx.tab.c hx.lex.c \
+                myprogress.c codegen/hx_specs_data.c codegen/hx_spec_entry.h
+	cc -DHX_STANDALONE -DHX_NO_MAIN -O3 -I. -I/opt/local/include \
+	    -o tools/hx_dedup_check \
+	    tools/hx_dedup_check.c hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c \
+	    hx.tab.c hx.lex.c myprogress.c codegen/hx_specs_data.c \
+	    -L/opt/local/lib -lssl -lcrypto /opt/local/lib/libiconv.a
+
 # Regenerate codegen/hx_specs_data.c from hx.8 via the build-time tool.
 # Path to hx.8 is via HX8_PATH; defaults to ~/Documents/troff/mdxfind/hx.8
 # on the iMac (matches user's troff source tree layout).
