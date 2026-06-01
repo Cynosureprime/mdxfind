@@ -216,11 +216,15 @@
 #define KERNELA_STATE_OVERFLOW_FLAG  8u
 #define KERNELA_STATE_BYTES         12u
 
-/* Mask wire encoding sentinel: classid byte == 0xff means MASK_LITERAL.
- * Verbatim from gpu_kernel_a_masks.cl rev 1.3. */
+/* 2026-05-30 long-mask amendment (Metal A3): descriptor wire format. */
+#define GPU_MASK_DESC_TAG_LIT   0x00u
+#define GPU_MASK_DESC_TAG_VAR   0x01u
+#define GPU_MASK_DESC_TAG_END   0xFFu
+#define GPU_MASK_VAR_CAP        16
+#define GPU_MASK_LIT_BYTES_CAP  224
+#define GPU_MASK_DESC_BYTES_CAP 320
+#define GPU_MASK_SIDE_EXPANDED_CAP (GPU_MASK_LIT_BYTES_CAP + GPU_MASK_VAR_CAP)
 #define MASK_LITERAL_SENTINEL  0xffu
-
-/* Hard cap on mask positions per side. Mirrors mdxfind.c MAX_MASK_POS=16. */
 #define MAX_MASK_POS_GPU       16
 
 /* Final candidate length cap (uchar [len] slot). */
@@ -852,43 +856,63 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
  *
  * Phase 1b TODO: hoist alongside apply_rule_thread into shared header.
  */
-static inline void mask_expand_into_gpu(ulong index,
-                                device const uchar *pattern,
-                                uint patlen,
-                                device const uchar *mask_charsets,
-                                device const uint  *mask_class_counts,
-                                thread uchar *outbuf)
+/* 2026-05-30 amendment: descriptor walker (replaces mask_expand_into_gpu). */
+static int mask_expand_run_into_gpu(ulong idx,
+                                    device const uchar *desc,
+                                    uint desc_bytes,
+                                    device const uchar *mask_charsets,
+                                    device const uint  *mask_class_counts,
+                                    thread uchar *outbuf)
 {
-    for (int i = (int)patlen - 1; i >= 0; i--) {
-        uchar cid = pattern[i * 2];
-        if (cid == MASK_LITERAL_SENTINEL) {
-            outbuf[i] = pattern[i * 2 + 1];
-        } else {
-            uint cc = mask_class_counts[(uint)cid];
-            outbuf[i] = mask_charsets[(uint)cid * MASK_CHARSET_STRIDE
-                                      + (uint)(index % (ulong)cc)];
-            index /= (ulong)cc;
-        }
+    uchar var_classids[GPU_MASK_VAR_CAP];
+    uint  var_outpos[GPU_MASK_VAR_CAP];
+    int   n_vars = 0, out_len = 0; uint p = 0;
+    while (p < desc_bytes) {
+        uchar tag = desc[p++];
+        if (tag == GPU_MASK_DESC_TAG_END) break;
+        if (tag == GPU_MASK_DESC_TAG_LIT) {
+            if (p + 2u > desc_bytes) break;
+            uint lit_len = (uint)desc[p] | ((uint)desc[p + 1u] << 8);
+            p += 2u;
+            if (p + lit_len > desc_bytes) break;
+            for (uint i = 0; i < lit_len; i++) outbuf[out_len + (int)i] = desc[p + i];
+            out_len += (int)lit_len; p += lit_len;
+        } else if (tag == GPU_MASK_DESC_TAG_VAR) {
+            if (p + 1u > desc_bytes) break;
+            uchar cid = desc[p++];
+            if (n_vars >= GPU_MASK_VAR_CAP) break;
+            var_classids[n_vars] = cid; var_outpos[n_vars] = (uint)out_len;
+            outbuf[out_len] = 0; out_len++; n_vars++;
+        } else break;
     }
+    for (int i = n_vars - 1; i >= 0; i--) {
+        uint cid = (uint)var_classids[i];
+        uint cc  = mask_class_counts[cid]; if (cc == 0u) cc = 1u;
+        outbuf[var_outpos[i]] = mask_charsets[cid * MASK_CHARSET_STRIDE
+                                              + (uint)(idx % (ulong)cc)];
+        idx /= (ulong)cc;
+    }
+    return out_len;
 }
 
-/* ==== Total-cardinality helper =========================================
- *
- * VERBATIM COPY of mask_pattern_total from gpu_kernel_a_masks.cl rev 1.3
- * (lines 195-208). See A2 source for full doc comment.
- *
- * Phase 1b TODO: hoist alongside apply_rule_thread into shared header.
- */
-static inline ulong mask_pattern_total(device const uchar *pattern,
-                                uint patlen,
-                                device const uint  *mask_class_counts)
+/* Cardinality helper for descriptor streams. */
+static ulong mask_pattern_total_run(device const uchar *desc, uint desc_bytes,
+                                    device const uint  *mask_class_counts)
 {
-    ulong total = 1ul;
-    for (uint i = 0; i < patlen; i++) {
-        uchar cid = pattern[i * 2];
-        if (cid != MASK_LITERAL_SENTINEL) {
-            total *= (ulong)mask_class_counts[(uint)cid];
-        }
+    ulong total = 1ul; uint p = 0;
+    while (p < desc_bytes) {
+        uchar tag = desc[p++];
+        if (tag == GPU_MASK_DESC_TAG_END) break;
+        if (tag == GPU_MASK_DESC_TAG_LIT) {
+            if (p + 2u > desc_bytes) break;
+            uint lit_len = (uint)desc[p] | ((uint)desc[p + 1u] << 8);
+            p += 2u + lit_len;
+        } else if (tag == GPU_MASK_DESC_TAG_VAR) {
+            if (p + 1u > desc_bytes) break;
+            uchar cid = desc[p++];
+            uint cc = mask_class_counts[(uint)cid];
+            if (cc > 0u) total *= (ulong)cc;
+        } else break;
     }
     return total;
 }
@@ -939,8 +963,8 @@ void cand_rules_masks_phase0(device uchar         *payload,
     uint n_input_rules  = params.num_rules;
     uint n_total_rules  = n_input_rules + 1u;   /* +1 for implicit no-rule pass */
     uint n_masks        = params.num_masks;     /* per-dispatch mask upper bound */
-    uint pre_len        = params.n_prepend;
-    uint app_len        = params.n_append;
+    uint prep_dbytes    = params.n_prepend;  /* descriptor stream byte length */
+    uint app_dbytes     = params.n_append;
     uint word_cursor    = params.input_cursor_start;
     uint rule_cursor    = params.rule_cursor_start;
     ulong mask_cursor   = (ulong)params.mask_start;
@@ -1011,12 +1035,12 @@ void cand_rules_masks_phase0(device uchar         *payload,
     /* Compute mask-side cardinality. Uniform across the workgroup; both
      * pattern arrays + the counts vector are read repeatedly and cache
      * trivially. */
-    ulong append_total = mask_pattern_total(mask_pattern_append, app_len,
-                                            mask_class_counts);
+    ulong append_total = mask_pattern_total_run(mask_pattern_append, app_dbytes,
+                                                mask_class_counts);
 
-    /* Per-thread private mask scratch. MAX_MASK_POS_GPU bytes each side. */
-    uchar prebuf[MAX_MASK_POS_GPU];
-    uchar appbuf[MAX_MASK_POS_GPU];
+    /* Per-thread expanded-mask scratch (240 B post-amendment). */
+    uchar prebuf[GPU_MASK_SIDE_EXPANDED_CAP];
+    uchar appbuf[GPU_MASK_SIDE_EXPANDED_CAP];
 
     /* --- Inline mask iteration ------------------------------------- *
      * Iterate the mask axis from the host-set mask_cursor (params.mask_-
@@ -1046,12 +1070,16 @@ void cand_rules_masks_phase0(device uchar         *payload,
             prepend_idx = mask_idx;
         }
 
-        mask_expand_into_gpu(prepend_idx, mask_pattern_prepend, pre_len,
-                             mask_charsets, mask_class_counts, prebuf);
-        mask_expand_into_gpu(append_idx,  mask_pattern_append,  app_len,
-                             mask_charsets, mask_class_counts, appbuf);
+        int prelen = mask_expand_run_into_gpu(prepend_idx,
+                                              mask_pattern_prepend, prep_dbytes,
+                                              mask_charsets, mask_class_counts,
+                                              prebuf);
+        int applen = mask_expand_run_into_gpu(append_idx,
+                                              mask_pattern_append,  app_dbytes,
+                                              mask_charsets, mask_class_counts,
+                                              appbuf);
 
-        uint final_len = pre_len + (uint)rule_len + app_len;
+        uint final_len = (uint)prelen + (uint)rule_len + (uint)applen;
         if (final_len > MASK_FINAL_LEN_LIMIT) continue;
 
         /* --- Reserve a candidate slot ---------------------------------
@@ -1080,9 +1108,9 @@ void cand_rules_masks_phase0(device uchar         *payload,
          * Layout: [final_len][prebuf...][rule_out...][appbuf...] */
         b_packed_buf[byte_off] = (uchar)final_len;
         uint p = byte_off + 1u;
-        for (uint i = 0; i < pre_len;         i++) b_packed_buf[p++] = prebuf[i];
+        for (int  i = 0; i < prelen;          i++) b_packed_buf[p++] = prebuf[i];
         for (uint i = 0; i < (uint)rule_len;  i++) b_packed_buf[p++] = buf[i];
-        for (uint i = 0; i < app_len;         i++) b_packed_buf[p++] = appbuf[i];
+        for (int  i = 0; i < applen;          i++) b_packed_buf[p++] = appbuf[i];
 
         /* --- Write per-slot byte offset -------------------------------
          * Per contract S7.1, no parallel (rule_idx, mask_idx) sidecar.

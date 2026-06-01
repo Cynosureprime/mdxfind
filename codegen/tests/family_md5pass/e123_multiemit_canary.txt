@@ -1,0 +1,25 @@
+# e123 MD5MD5PASS MULTI-EMIT dual-hash canary fixture.
+# Sub-phase 5c.2 (2026-05-27) -- THE multi-emit correctness gate (G1b).
+#
+# For each password P below the validation harness plants BOTH variant
+# digests as separate loaded-hash candidates:
+#   A = md5( hex32(md5(P)) . P )         (variant 0, canonical)
+#   B = md5( hex32(md5(P)) . ':' . P )   (variant 1, colon)
+# A != B by construction (the ':' shifts the outer message, so the two
+# MD5 inputs differ -> distinct digests; a collision would require an
+# actual MD5 collision, not constructible). The GPU multi-emit kernel
+# MUST emit BOTH cracks for the single password P: one probe+emit for
+# variant 0 against loaded slot A, one for variant 1 against slot B,
+# each deduplicating on its own matched loaded-hash slot. If the GPU
+# emits only ONE crack per password, the per-variant probe/emit is
+# broken and this canary FAILS (vn_hits != n_rows = 2*n_pass).
+#
+# Matches the CPU oracle exactly (mdxfind.c:25181-25204: linebuf is
+# variant 0, linebuf2 is variant 1, both checkhash()ed independently).
+#
+# 4 deliberately short distinct plaintexts (single-block outer message
+# for all variants; total_len <= 55 so the helper takes the fast path).
+PASS:password
+PASS:hello
+PASS:a
+PASS:test123

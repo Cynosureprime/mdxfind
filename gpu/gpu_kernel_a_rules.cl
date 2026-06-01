@@ -89,6 +89,35 @@
  * rules walker section of md5_rules_phase0 has no salt-axis fan-out
  * (verified by reading lines 1064-1153 of gpu_md5_rules.cl rev 1.30);
  * salts feed into the trailing MD5+probe block which kernel A omits.
+ *
+ * ====================================================================
+ * KNOB G (2026-05-29) -- coalesced uint4 (16-byte) candidate writes.
+ * --------------------------------------------------------------------
+ * Build-gated by -DKNOBG_VEC_WRITE=1 (host env-flag MDXFIND_EXPERIMENT_-
+ * RULES_CODEGEN_VEC_WRITE=1 + parent ..._MD5=1). When the macro is
+ * defined, the per-byte write loop that emits [len][bytes] into
+ * b_packed_buf is replaced by uint4 (16-byte) stores from a private
+ * 16-aligned staging buffer. Each slot's atomic byte-claim is rounded
+ * UP to a multiple of 16 (need_aligned = (need_bytes + 15) & ~15), so
+ * every slot starts on a 16-byte boundary and consumes a 16-byte
+ * multiple of bytes. Pad bytes inside each slot's padded tail are
+ * undefined; the consumer reads only [len] bytes (plen) and never
+ * accesses padding -- bit-perfect equivalence with the legacy path.
+ *
+ * Invariant (proof by induction): the candidate buffer base is
+ * 16-byte aligned by OpenCL guarantee; first byte_off=0 (16-aligned);
+ * every subsequent claim adds a multiple of 16 -> every byte_off is a
+ * multiple of 16. Aligned uint4 stores into the slot region are legal.
+ *
+ * Capacity: cap_packed sizing (host: cap_slots * 256) is unchanged.
+ * 256 is the max need_aligned (need_bytes max = 256 = 1+255). Knob G
+ * shifts ACTUAL bytes consumed per slot from emit_len+1 to
+ * 16*ceil((emit_len+1)/16) ~ +3.8 B/slot on rockyou-1m mean (still
+ * well under the cap; bounded halve-K retry handles the impossible-
+ * by-construction overflow case unchanged).
+ *
+ * Authoritative spec: project_rules_codegen_knob_g_spec_2026-05-29.md.
+ * ====================================================================
  */
 
 /* ==== Opcode definitions (must match ruleproc.c RULE_OP_* exactly) ==== */
@@ -184,6 +213,15 @@ static inline uchar case_flip_mask(uchar c) {
  */
 static int apply_rule(__global const uchar *prog, uchar *buf, int len)
 {
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 3
+    /* V3 (PROFILE_VARIANT=3): stub apply_rule — return input length
+     * unchanged; suppress the huge opcode switch entirely. The walker
+     * still runs (word read into buf), the atomic claim still happens,
+     * the per-byte write still happens; only the apply_rule body is
+     * stubbed. Used to isolate the cost of the rule-walker switch.
+     * Compile-time: this `if`-true block is the entire function body. */
+    return len;
+#else
     int k = 0;
     int orig_len = len;
 
@@ -823,6 +861,7 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
         }
     }
     return len;
+#endif  /* PROFILE_VARIANT == 3 stub guard */
 }
 
 /* ---- Kernel A1 (rules-only) production kernel --------------------
@@ -872,24 +911,63 @@ void cand_rules_phase0(
     __global const OCLParams *params_buf = (__global const OCLParams *)payload;
     OCLParams params = *params_buf;
     uint n_words = params.num_words;
-    uint n_rules = params.num_rules;
-    uint total   = n_words * n_rules;
+    /* RULE-AXIS CHUNKING (Option A, 2026-05-29): params.num_rules carries the
+     * per-chunk rule COUNT (rule_count) and params.rule_cursor_start carries
+     * the per-chunk rule BASE (rule_start) into rule_offset[]. The host loops
+     * disjoint rule sub-ranges [rule_start, rule_start+rule_count) so the
+     * candidate buffer for one dispatch is bounded to n_words*rule_count*256
+     * <= cap. When the whole ruleset fits one chunk (e347 / small rule count)
+     * the host sets rule_start=0 and rule_count=n_rules, making this decode
+     * BYTE-IDENTICAL to the pre-chunking geometry (rule_idx = gid / n_words).
+     * The legacy B3 overflow-cursor early-return is REMOVED from this A1 path:
+     * with chunking the per-chunk buffer cannot overflow by construction
+     * (host caps K), and overloading rule_cursor_start with two meanings
+     * (chunk base vs overflow-restart cursor) would corrupt the chunk decode.
+     * Overflow is now handled host-side by a bounded halve-K retry. */
+    uint rule_start = params.rule_cursor_start;  /* chunk base into rule_offset[] */
+    uint n_rules    = params.num_rules;           /* this chunk's rule_count */
+    uint total      = n_words * n_rules;
 
     uint gid = get_global_id(0);
+
     if (gid >= total) return;
 
-    uint word_idx = gid % n_words;
-    uint rule_idx = gid / n_words;
+    /* ==== PROFILE_VARIANT scaffolding (2026-05-29, perf decomposition) =====
+     * When the kernel is JIT-built with -DPROFILE_VARIANT=N (N in 1..5), the
+     * per-lane kernel body is progressively stubbed to attribute kernel_a_us
+     * to its components. V0 (default; macro undefined) = byte-identical to
+     * the production path. ALL variants leave b_kernelA_state untouched
+     * (slot_counter = 0, byte_counter = 0) so the host sees actual_slots=0
+     * and skips kernel B; kernel_a_us is captured by the existing CL
+     * profiling event before kernel B runs (host site
+     * gpu_opencl.c:13059 `if (actual_slots == 0) ... continue` already exists).
+     * Crack-parity is INTENTIONALLY NOT preserved for V1..V5; results are
+     * throwaway, this is timing-only profiling infrastructure.
+     *
+     *   V1 = no atomic claim (per-lane deterministic offset gid*256 instead
+     *        of atomic_add; per-byte write still happens; apply_rule still
+     *        runs). Measures: atomic_add cost share.
+     *   V2 = no candidate write (atomic_add still happens but per-byte
+     *        write loop is no-op'd; index store skipped). Measures: per-byte
+     *        write loop cost share (BUT note V2 lets atomic still fire so
+     *        slot_counter would advance; we force it back to 0 below via
+     *        an end-of-kernel reset by lane 0 to keep host-side
+     *        actual_slots=0 invariant).
+     *   V3 = stub apply_rule (returns wlen unchanged; rule walker walks
+     *        but switch body is gone). Measures: apply_rule switch cost.
+     *   V4 = walker only — read word into buf, then return. NO apply_rule,
+     *        NO atomic, NO write. Measures: word-read + apply_rule + write
+     *        in aggregate (delta from V5).
+     *   V5 = empty kernel — return immediately. Measures: dispatch overhead
+     *        + chunk-loop overhead + kernel launch latency.
+     *
+     * V5 must short-circuit BEFORE the word-read; place gate here. */
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 5
+    return;
+#endif
 
-    /* B3 cursor check (mirrors md5_rules_phase0). On a re-issue dispatch
-     * the host sets input_cursor_start + rule_cursor_start to the (word,
-     * rule) coordinate of the first overflowing lane from the prior
-     * dispatch; lanes whose (rule, word) lex-precedes that early-return. */
-    if (params.input_cursor_start > 0u || params.rule_cursor_start > 0u) {
-        if (rule_idx < params.rule_cursor_start) return;
-        if (rule_idx == params.rule_cursor_start &&
-            word_idx < params.input_cursor_start) return;
-    }
+    uint word_idx = gid % n_words;
+    uint rule_idx = rule_start + (gid / n_words);  /* GLOBAL rule index */
 
     /* Deterministic sub-buffer pointers from params.num_words (identical
      * to md5_rules_phase0). The compiler hoists since they depend only on
@@ -903,37 +981,154 @@ void cand_rules_phase0(
     /* Private buffer (16-byte aligned, matches md5_rules_phase0). */
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
 
-    uint wpos = word_offset[word_idx];
-    int wlen = (int)words[wpos++];
-    if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
-    for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
+    /* Per-lane emit state. Populated for in-range lanes only. */
+    int should_emit = 0;
+    uint emit_len = 0u;
+    uint need_bytes = 0u;
+    uint wpos = 0u;
 
-    uint rpos = rule_offset[rule_idx];
-    int is_no_rule = (rule_program[rpos] == 0);
-    int new_len = apply_rule(rule_program + rpos, buf, wlen);
+    /* Walk the rule. */
+    {
+        wpos = word_offset[word_idx];
+        int wlen = (int)words[wpos++];
+        if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
+        for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
 
-    /* Rejection sentinel: no slot reserved, no buffer write. */
-    if (new_len < 0) return;
-
-    /* No-op detection: synthetic ":" no-rule pass already covered this
-     * candidate; skip slot emission. Foundational mdxfind behavior
-     * (feedback_no_rule_pass.md). Matches md5_rules_phase0 exactly. */
-    if (!is_no_rule && new_len == wlen) {
-        int changed = 0;
-        for (int i = 0; i < wlen; i++) {
-            if (buf[i] != words[wpos + i]) { changed = 1; break; }
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 4
+        /* V4 (walker only): stop here. word_read into buf is done; skip
+         * apply_rule, atomic claim, per-byte write, index store. The
+         * compiler must not dead-strip the buf write — `buf` is private
+         * stack; force a fence by reading it back into a sink. */
+        if (buf[0] == 0xffu) {
+            /* unreachable on real data (wlen>0 by construction); inserted
+             * to keep the buf write in the live range so the compiler does
+             * not strip the read into buf. */
+            atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u);
         }
-        if (!changed) return;
+        return;
+#endif
+
+        uint rpos = rule_offset[rule_idx];
+        int is_no_rule = (rule_program[rpos] == 0);
+        int new_len = apply_rule(rule_program + rpos, buf, wlen);
+
+        if (new_len >= 0) {
+            /* No-op detection: synthetic ":" no-rule pass already covered
+             * this candidate; skip slot emission. Foundational mdxfind
+             * behavior (feedback_no_rule_pass.md). Matches md5_rules_phase0
+             * exactly. */
+            int suppress_noop = 0;
+            if (!is_no_rule && new_len == wlen) {
+                int changed = 0;
+                for (int i = 0; i < wlen; i++) {
+                    if (buf[i] != words[wpos + i]) { changed = 1; break; }
+                }
+                if (!changed) suppress_noop = 1;
+            }
+            if (!suppress_noop) {
+                /* Clamp new_len to fit in the [len] byte. RULE_BUF_LIMIT <
+                 * 65536 so caller-side capacity ensures it; defensive guard
+                 * for the uchar length-byte slot. */
+                uint elen = (uint)new_len;
+                if (elen > 255u) elen = 255u;
+                emit_len = elen;
+                need_bytes = 1u + elen;   /* [len][bytes] */
+                should_emit = 1;
+            }
+        }
     }
 
-    /* Clamp new_len to fit in the [len] byte. RULE_BUF_LIMIT < 65536 so
-     * caller-side capacity ensures it; defensive guard for the uchar
-     * length-byte slot. */
-    uint emit_len = (uint)new_len;
-    if (emit_len > 255u) emit_len = 255u;
+    /* Per-lane global atomic_add slot/byte reservation. */
+    if (!should_emit) return;
 
-    /* --- Reserve a candidate slot --------------------------------- */
-    uint need_bytes = 1u + emit_len;   /* [len][bytes] */
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 1
+    /* V1 (no atomic claim): substitute deterministic per-lane offsets for
+     * the atomic_add slot/byte reservation. Per-byte write still happens
+     * (so V0 - V1 attributes the atomic_add cost). slot_counter +
+     * byte_counter stay at zero, so host sees actual_slots=0 and skips
+     * kernel B. The fake byte_off (gid * 256) keeps writes within the
+     * pre-allocated packed buffer for any gid covered by the host's K-cap
+     * (worst-case K*num_words slots, 256 B/slot = cap). */
+    uint byte_off = gid * 256u;
+    uint slot     = gid;
+    if (byte_off + need_bytes > params.packed_size) return;
+    if (slot >= total) return;
+    b_packed_buf[byte_off] = (uchar)emit_len;
+    for (uint i = 0; i < emit_len; i++) {
+        b_packed_buf[byte_off + 1u + i] = buf[i];
+    }
+    b_chunk_index[slot] = byte_off;
+#elif defined(PROFILE_VARIANT) && PROFILE_VARIANT == 2
+    /* V2 (no candidate write): atomic claim still runs (so V0 - V2
+     * attributes the per-byte write loop). Per-byte memcpy + index store
+     * are removed. We INTENTIONALLY do not write slot_counter — we use a
+     * private read-write of the byte_counter to keep the atomic_add live
+     * (compiler must not fold; the result `byte_off` is unused). To prevent
+     * the host from running kernel B with non-zero actual_slots, we leave
+     * slot_counter alone (it stays 0). */
+    uint byte_off = atomic_add(
+        &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+        need_bytes);
+    /* Keep byte_off live so the compiler doesn't drop the atomic; cheap
+     * side-effect via overflow flag (ored with 0 = no-op functionally). */
+    if (byte_off == 0xffffffffu) {
+        atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u);
+    }
+    /* Slot-counter NOT incremented (intentional — host actual_slots=0 ->
+     * kernel B skipped). Per-byte write loop omitted (the measured target). */
+#elif defined(PROFILE_VARIANT) && PROFILE_VARIANT == 6
+    /* V6 (Knob G micro-benchmark; D4 in knob_g_spec): V0 baseline with
+     * the Knob G vectorized write loop FORCED ON, regardless of
+     * KNOBG_VEC_WRITE. Used to measure V0-vs-V6 kernel_a_us delta in
+     * the same harness that motivated Knob G -- closes the prediction-
+     * verification loop. Slot/byte claim semantics + crack output are
+     * IDENTICAL to V0 with KNOBG_VEC_WRITE=1; the only reason V6
+     * exists separately is so the operator can toggle just this leg
+     * of the cost share via MDXFIND_PROFILE_VARIANT=6 without setting
+     * MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE. */
+    {
+        uint need_aligned = (need_bytes + 15u) & ~15u;
+        uint byte_off = atomic_add(
+            &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+            need_aligned);
+        if (byte_off + need_aligned > params.packed_size) {
+            atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
+            return;
+        }
+        uint slot = atomic_add(
+            &b_kernelA_state[KERNELA_STATE_SLOT_COUNTER / 4u], 1u);
+        if (slot >= total) {
+            atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
+            return;
+        }
+        __private uchar __attribute__((aligned(16))) stage[256];
+        stage[0] = (uchar)emit_len;
+        for (uint i = 0; i < emit_len; i++) stage[1u + i] = buf[i];
+        uint nvec = need_aligned / 16u;
+        __global uint4 *dst = (__global uint4 *)(b_packed_buf + byte_off);
+        __private uint4 *src = (__private uint4 *)stage;
+        for (uint v = 0; v < nvec; v++) dst[v] = src[v];
+        b_chunk_index[slot] = byte_off;
+    }
+#else
+    /* V0 (production baseline) — legacy path. KNOB G gated. */
+#ifdef KNOBG_VEC_WRITE
+    /* KNOB G ON: round need_bytes up to a 16-byte multiple. The atomic
+     * shape is unchanged (single atomic_add); only the value is rounded.
+     * Slot-start alignment proof: base ptr 16-aligned + each running sum
+     * adds a multiple of 16 -> every byte_off is 16-aligned. */
+    uint need_aligned = (need_bytes + 15u) & ~15u;
+    uint byte_off = atomic_add(
+        &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+        need_aligned);
+
+    /* Capacity guard: use the post-rounding byte count for the bound
+     * check (otherwise the tail uint4 stores could spill past packed). */
+    if (byte_off + need_aligned > params.packed_size) {
+        atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
+        return;
+    }
+#else
     uint byte_off = atomic_add(
         &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
         need_bytes);
@@ -945,31 +1140,43 @@ void cand_rules_phase0(
         atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
         return;
     }
+#endif
 
     uint slot = atomic_add(
         &b_kernelA_state[KERNELA_STATE_SLOT_COUNTER / 4u], 1u);
 
     /* Slot-index capacity: bounded by num_words * num_rules (host alloc
      * size). If for some reason slot >= total (overflow paradox: lanes
-     * past 'total' early-returned at line 1086), flag and skip. */
+     * past 'total' early-returned at the top), flag and skip. */
     if (slot >= total) {
         atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
         return;
     }
 
     /* --- Write [len][bytes] into packed buf ----------------------- */
+#ifdef KNOBG_VEC_WRITE
+    /* KNOB G ON: stage [len][bytes] into a private 16-aligned buffer,
+     * then issue need_aligned/16 uint4 stores. emit_len in [0,255] ->
+     * need_aligned in [16,256] -> nvec in [1,16]. Pad bytes in
+     * stage[1+emit_len .. need_aligned) are undefined; consumer reads
+     * only plen bytes after the [len] header (see §3 spec). */
+    {
+        __private uchar __attribute__((aligned(16))) stage[256];
+        stage[0] = (uchar)emit_len;
+        for (uint i = 0; i < emit_len; i++) stage[1u + i] = buf[i];
+        uint nvec = need_aligned / 16u;
+        __global uint4 *dst = (__global uint4 *)(b_packed_buf + byte_off);
+        __private uint4 *src = (__private uint4 *)stage;
+        for (uint v = 0; v < nvec; v++) dst[v] = src[v];
+    }
+#else
     b_packed_buf[byte_off] = (uchar)emit_len;
     for (uint i = 0; i < emit_len; i++) {
         b_packed_buf[byte_off + 1u + i] = buf[i];
     }
-
-    /* --- Write per-slot byte offset ------------------------------- *
-     * Per contract S7.1 (post-Phase-2 amendment), there is NO parallel
-     * rule_idx sidecar. The post-rule plaintext IS the candidate stored
-     * at b_packed_buf[byte_off]; rule attribution can be re-derived from
-     * slot_idx if a future need arises. */
+#endif
     b_chunk_index[slot] = byte_off;
-
+#endif  /* PROFILE_VARIANT 1/2/6/V0 selection */
     /* Per-spec invariant 1: caller (Phase 4 host) relies on in-order
      * single-queue FIFO to ensure these writes are visible to kernel B
      * before kernel B dispatches. No explicit fence; the queue boundary

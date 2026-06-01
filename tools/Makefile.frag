@@ -35,26 +35,66 @@
 # project-wide $(HX_OBJS) lacks -DHX_STANDALONE and so omits the
 # md5/sha/etc. entries the standalone build gates IN. Mirrors the
 # existing `hx:` target structure.
-tools/hx8_to_c: tools/hx8_to_c.c hx_vm.h hx.c hx_ast.c hx_compile.c hx_vm.c \
-                hx_func.c hx.tab.c hx.lex.c myprogress.c
+tools/hx8_to_c: tools/hx8_to_c.c tools/hx_program_cmp.h hx_vm.h hx.c hx_ast.c \
+                hx_compile.c hx_vm.c hx_func.c hx.tab.c hx.lex.c myprogress.c
 	cc -DHX_STANDALONE -DHX_NO_MAIN -O3 -I. -I/opt/local/include \
 	    -o tools/hx8_to_c \
 	    tools/hx8_to_c.c hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c \
 	    hx.tab.c hx.lex.c myprogress.c \
 	    -L/opt/local/lib -lssl -lcrypto /opt/local/lib/libiconv.a
 
+# codegen/maphashcat_data.h -- AUTO-GENERATED build artifact (Tier 2
+# Feature 2). Extracts mdxfind.c's Maphashcat[] (hashcat-mode, mdxfind-eN)
+# table into a tiny pure-data header so tools/hx_dedup_check can answer
+# --hashcat-mode=N (and the eN->mode reverse annotation) WITHOUT linking
+# mdxfind.c (which would drag the whole binary). Regenerated whenever
+# mdxfind.c or the extractor changes. NOT checked into RCS.
+codegen/maphashcat_data.h: mdxfind.c tools/gen_maphashcat.awk
+	awk -f tools/gen_maphashcat.awk mdxfind.c > codegen/maphashcat_data.h.tmp \
+	    && mv codegen/maphashcat_data.h.tmp codegen/maphashcat_data.h
+
 # tools/hx_dedup_check -- standalone CLI that catches "this proposed hx
 # expression already exists in the catalog under a different name." Per
-# architect spec project_hx_dedup_check_spec_2026-05-26.md (Tier 1).
+# architect spec project_hx_dedup_check_spec_2026-05-26.md
+# (Tier 1 + Tier 2 + Tier 3).
 #
 # Same link surface as tools/hx8_to_c (HX_STANDALONE + prescan stubs),
 # plus codegen/hx_specs_data.o for the catalog the tool compares against.
 # codegen/hx_specs_data.c is built earlier in the pipeline by tools/hx8_to_c
 # itself; we don't list it as a prerequisite here because regenerating it
 # every time the dedup tool is rebuilt would needlessly run hx8_to_c again.
-tools/hx_dedup_check: tools/hx_dedup_check.c hx_vm.h hx.c hx_ast.c \
-                hx_compile.c hx_vm.c hx_func.c hx.tab.c hx.lex.c \
-                myprogress.c codegen/hx_specs_data.c codegen/hx_spec_entry.h
+#
+# Tier 2 deps: tools/hx_program_cmp.h (shared comparator + Layer 2 canon)
+# and codegen/maphashcat_data.h (the --hashcat-mode=N table).
+#
+# Tier 3 (Layer 3 test-vector equivalence) link-surface decision:
+#   The architect spec (R1, §2.2) assumed Layer 3 would link hashpipe.o
+#   and call hx_register_hashpipe_types() for "real" hash resolution. That
+#   is NOT done here, for two reasons:
+#     1. hx_register_hashpipe_types() is `static` in hashpipe.c, and
+#        hashpipe.c carries its own unconditional main() -- linking it
+#        into this leaf tool is impossible without editing hashpipe.c,
+#        which the spec (§4) forbids in ALL tiers.
+#     2. It is UNNECESSARY. The HX_STANDALONE build ALREADY links real
+#        OpenSSL/iconv implementations of md5, md4, sha1, sha256, sha512,
+#        hmac_sha1/256, the pbkdf2 family, siphash, murmur3, plus every
+#        string transform (utf16le, zext16, hex, base64, xor, ...). Those
+#        cover the Layer-3 G9 gate, the NTLM/NTLMH-class non-ASCII
+#        distinction, and the broad md5/sha-family residual.
+#   Consequence: the link line below is UNCHANGED from Tier 1/2 -- no
+#   hashpipe.o, no new static libs (-lsph, -lmhash, etc.). Layer 3 runs
+#   the real hx VM (hx_vm_run) but ONLY for expressions whose every callee
+#   is a real (non-stub) function; long-tail crypt functions (bcrypt,
+#   gost*, hmac_sha384, ...) that exist only as prescan stubs report
+#   "Layer 3 UNAVAILABLE" rather than risk a false-equal verdict on empty
+#   stub output. Lifting to full hashpipe coverage would require either
+#   de-static-ing + main-gating hashpipe.c (out of scope) or a dedicated
+#   hashpipe_hx_register.o TU; deferred until a real algorithm outside the
+#   standalone set needs Layer-3 verification.
+tools/hx_dedup_check: tools/hx_dedup_check.c tools/hx_program_cmp.h hx_vm.h \
+                hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c hx.tab.c \
+                hx.lex.c myprogress.c codegen/hx_specs_data.c \
+                codegen/hx_spec_entry.h codegen/maphashcat_data.h
 	cc -DHX_STANDALONE -DHX_NO_MAIN -O3 -I. -I/opt/local/include \
 	    -o tools/hx_dedup_check \
 	    tools/hx_dedup_check.c hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c \

@@ -35,6 +35,29 @@
  * file). NULL for outliers / compile-fails. Enables codegen emitters
  * to resolve per-call-site function names via hx_callname_for_entry.
  *
+ * hx_dedup_check Tier 2 (2026-05-28), Features 1 + 5: after the main
+ * emission loop, run a build-time INTRA-CATALOG DUPLICATE WARNING pass.
+ * For every pair of compiled entries with byte-identical (Layer 1 +
+ * role-canon + Layer 2 commutative) bytecode, emit ONE informational
+ * WARNING to stderr (never to stdout -- the C source channel). These
+ * warnings DO NOT fail the build: the catalog's ~55 known duplicate
+ * groups are INTENTIONAL historical aliases per
+ * feedback_catalog_aliases_are_historical_dont_alter.md. The pass is
+ * purely so the dedup truth surfaces on EVERY regenerate, not only when
+ * an operator runs `tools/hx_dedup_check --scan`.
+ *
+ * Feature 5: a `# DEDUP_OK` annotation suppresses the warning for an
+ * entry the operator has reviewed and intentionally kept. Two equivalent
+ * forms are accepted (no hx.8 troff-table contamination either way):
+ *   - SIDECAR FILE  tools/dedup_ok.txt : lines of `eN [eM ...] : reason`
+ *     (and `#`-prefixed file comments). Read at tool startup.
+ *   - TROFF COMMENT in hx.8 : a `.\" DEDUP_OK eN [eM ...]: reason` line
+ *     (invisible in the rendered manual; skipped by parse_row). Picked
+ *     up during the line walk.
+ * An entry whose eN is annotated DEDUP_OK is excluded from BOTH sides of
+ * a warning pair. We do NOT auto-annotate the known dupes -- the operator
+ * decides; this only builds the mechanism.
+ *
  * 1.1
  * hx8_to_c.c,v
  * Revision 1.1  2026/05/21 23:22:54  dlr
@@ -50,6 +73,7 @@
 #include <errno.h>
 
 #include "../hx_vm.h"
+#include "hx_program_cmp.h"   /* shared programs_equal() + Layer 2 canon */
 
 /*
  * WARN(...) -- stream-ordering hygiene macro for all stderr writes.
@@ -169,6 +193,113 @@ static void prescan_register_stubs(const char *expr)
  * the `static` qualifier and link properly.
  */
 
+/* ---------- DEDUP_OK suppression set (Feature 5) ---------- */
+
+/*
+ * Set of eN (job_enum) values for which the build-time intra-catalog
+ * duplicate WARNING (Feature 1) is suppressed. Populated from:
+ *   1. tools/dedup_ok.txt sidecar (if present), and
+ *   2. `.\" DEDUP_OK eN [eM ...]: reason` troff-comment lines in hx.8.
+ * Both forms are optional and additive. An eN here is excluded from BOTH
+ * sides of any warning pair.
+ */
+static int  *g_dedup_ok = NULL;
+static int   g_dedup_ok_n = 0;
+static int   g_dedup_ok_cap = 0;
+
+static void dedup_ok_add(int en)
+{
+    for (int i = 0; i < g_dedup_ok_n; i++)
+        if (g_dedup_ok[i] == en) return;        /* already present */
+    if (g_dedup_ok_n >= g_dedup_ok_cap) {
+        g_dedup_ok_cap = g_dedup_ok_cap ? g_dedup_ok_cap * 2 : 16;
+        g_dedup_ok = (int *)realloc(g_dedup_ok,
+                                    (size_t)g_dedup_ok_cap * sizeof(int));
+        if (!g_dedup_ok) { WARN("FATAL: hx8_to_c: OOM dedup_ok\n"); exit(2); }
+    }
+    g_dedup_ok[g_dedup_ok_n++] = en;
+}
+
+static int dedup_ok_has(int en)
+{
+    for (int i = 0; i < g_dedup_ok_n; i++)
+        if (g_dedup_ok[i] == en) return 1;
+    return 0;
+}
+
+/*
+ * Parse a DEDUP_OK payload: a run of `eNNN` tokens up to an optional
+ * ':' (after which is free-text reason). Adds each eNNN to the set.
+ * `p` points just past the "DEDUP_OK" keyword. Tolerant of leading
+ * spaces, commas, and 'e' prefixes (e288, 288, e288,e539 all work).
+ */
+static void dedup_ok_parse_payload(const char *p)
+{
+    while (*p && *p != ':' && *p != '\n' && *p != '\r') {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        if (*p == 'e' || *p == 'E') p++;
+        if (isdigit((unsigned char)*p)) {
+            int en = 0;
+            while (isdigit((unsigned char)*p)) {
+                en = en * 10 + (*p - '0');
+                p++;
+            }
+            dedup_ok_add(en);
+        } else if (*p == ':' || *p == '\0' || *p == '\n' || *p == '\r') {
+            break;
+        } else {
+            /* unexpected token before ':'; stop to avoid misreading the
+             * reason text as eN values. */
+            break;
+        }
+    }
+}
+
+/*
+ * Load tools/dedup_ok.txt if present. Format: one or more whitespace/
+ * comma-separated eN values, optional `:` then a free-text reason, per
+ * line. `#`-prefixed lines and blank lines are ignored. Missing file is
+ * NOT an error (the mechanism is opt-in). Path is relative to CWD (make
+ * runs from the project root, same as hx8_to_c's other relative paths).
+ */
+static void dedup_ok_load_sidecar(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) return;                            /* opt-in: absent is fine */
+    char buf[512];
+    int added_before = g_dedup_ok_n;
+    while (fgets(buf, sizeof(buf), fp)) {
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0' || *p == '\n' || *p == '\r') continue;
+        dedup_ok_parse_payload(p);
+    }
+    fclose(fp);
+    WARN("hx8_to_c: DEDUP_OK sidecar %s: %d eN suppressed\n",
+         path, g_dedup_ok_n - added_before);
+}
+
+/*
+ * Recognize a `.\" DEDUP_OK ...` troff-comment line during the hx.8
+ * walk. Returns 1 if the line was a DEDUP_OK directive (and consumed),
+ * 0 otherwise. The leading `.\"` is the troff comment marker; we accept
+ * optional whitespace before the DEDUP_OK keyword.
+ */
+static int dedup_ok_try_line(const char *line)
+{
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    /* troff comment marker: .\" (a dot, backslash, double-quote). In the
+     * file this is the three chars '.', '\\', '"'. */
+    if (p[0] != '.' || p[1] != '\\' || p[2] != '"') return 0;
+    p += 3;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "DEDUP_OK", 8) != 0) return 0;
+    p += 8;
+    dedup_ok_parse_payload(p);
+    return 1;
+}
+
 /* ---------- input buffer ---------- */
 
 static char *slurp(const char *path, size_t *out_len)
@@ -218,6 +349,62 @@ static int is_markup_outlier(const char *s)
      * '"00000000" . cut(...)' which DO contain '('. */
     if (strchr(s, '(') == NULL) return 1;
     return 0;
+}
+
+/*
+ * Sub-phase 5c.1 (2026-05-27): extract the Note reference number N from a
+ * trailing "(see Note [N])" annotation. Returns N (>0) if present, else 0.
+ *
+ * hx.8 marks multi-emit and other special-handling algorithms with a
+ * trailing "(see Note [N])" after the otherwise-real hx expression. For
+ * the multi-emit colon class (Note [24]) the leading text is a genuine
+ * 6-op FAMILY_MD5PASS expression (e.g. "md5(md5(pass).pass)"); the
+ * annotation is what trips is_markup_outlier()'s "see Note" check. This
+ * helper lets the generator recover N so it can record note_ref and (for
+ * the activated e123 case) strip the suffix and compile the real program.
+ */
+static int extract_note_ref(const char *s)
+{
+    if (!s) return 0;
+    const char *p = strstr(s, "see Note");
+    if (!p) return 0;
+    /* Advance to the '[' after "see Note". */
+    const char *lb = strchr(p, '[');
+    if (!lb) return 0;
+    int n = 0;
+    const char *d = lb + 1;
+    if (!isdigit((unsigned char)*d)) return 0;
+    while (isdigit((unsigned char)*d)) {
+        n = n * 10 + (*d - '0');
+        d++;
+    }
+    return n;
+}
+
+/*
+ * Sub-phase 5c.1 (2026-05-27): return a newly malloc'd copy of s with any
+ * trailing "(see Note [N])" annotation (and the whitespace before it)
+ * removed. Caller frees. If no annotation is present, returns a plain
+ * copy. The leading expression text (before the annotation) is preserved
+ * verbatim so strip_troff_escapes + hx_compile_expr see the real
+ * expression.
+ */
+static char *strip_note_markup(const char *s)
+{
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, s, n + 1);
+    /* Find "(see Note" -- the annotation always opens with '(' then the
+     * literal "see Note". Cut at the '(' and trim trailing whitespace. */
+    char *paren = strstr(out, "(see Note");
+    if (paren) {
+        char *cut = paren;
+        while (cut > out && (cut[-1] == ' ' || cut[-1] == '\t'))
+            cut--;
+        *cut = '\0';
+    }
+    return out;
 }
 
 /*
@@ -481,8 +668,18 @@ int main(int argc, char **argv)
         int  is_outlier;
         int  compile_failed;
         char *expr_cleaned;   /* malloc'd; kept for emitting in entry comment */
+        int  emit_class;      /* 5c.1: enum hx_emit_class (0 SINGLE) */
+        int  note_ref;        /* 5c.1: hx.8 Note [N] ref; 0 = none */
+        hx_program *prog;     /* Tier 2 F1: retained for intra-catalog
+                               * duplicate-warning pass; NULL for
+                               * outlier/compile-fail. Freed after the pass. */
     } *meta = NULL;
     int meta_cap = 0, meta_n = 0;
+
+    /* Feature 5: load the optional DEDUP_OK sidecar before the walk so a
+     * `.\" DEDUP_OK` troff line in hx.8 and the sidecar both feed the same
+     * suppression set. */
+    dedup_ok_load_sidecar("tools/dedup_ok.txt");
 
     int lineno = 0;
     while (line && *line) {
@@ -492,12 +689,60 @@ int main(int argc, char **argv)
         line[linelen] = '\0';
         lineno++;
 
+        /* Feature 5: a `.\" DEDUP_OK eN [...]: reason` troff-comment line
+         * adds eN(s) to the suppression set. Recognized before row parse;
+         * such lines are not rows (parse_row would reject them anyway). */
+        if (dedup_ok_try_line(line)) {
+            line[linelen] = saved;
+            if (!nl) break;
+            line = nl + 1;
+            continue;
+        }
+
         int type;
         char *name = NULL, *expr = NULL;
         if (parse_row(line, &type, &name, &expr)) {
             total++;
-            int is_out = is_markup_outlier(expr);
-            char *clean = strip_troff_escapes(expr);
+            /* Sub-phase 5c.1 (2026-05-27): multi-emit annotation.
+             *
+             * Record the hx.8 "(see Note [N])" reference (if any) for
+             * EVERY row so the entry carries note_ref. For the ACTIVATED
+             * multi-emit member e123 MD5MD5PASS (Note [24]) ONLY, strip
+             * the annotation so the leading "md5(md5(pass).pass)" compiles
+             * to a real 6-op FAMILY_MD5PASS program and flag emit_class =
+             * HX_EMIT_MULTI (=1). All other Note-[N] entries (e687 sha1(),
+             * e663 T{...}, and the other 22 Note-[24] members) STAY
+             * outliers/override exactly as before -- only their note_ref
+             * is recorded; emit_class defaults SINGLE. Gating on type==123
+             * keeps the change minimal (R4) and is the single member we
+             * prove the multi-emit pattern on this sub-phase. */
+            int emit_class = 0;            /* HX_EMIT_SINGLE */
+            int note_ref   = extract_note_ref(expr);
+            int activate_multi = (type == 123 && note_ref == 24);
+            int is_out;
+            char *clean;
+            if (activate_multi) {
+                /* e123's leading text is a real 6-op FAMILY_MD5PASS
+                 * expression; the "(see Note [24])" is wrapped in troff
+                 * italics (\fI ... \fP) in hx.8. Strip troff FIRST, then
+                 * the Note annotation, leaving the bare expression to
+                 * compile. Re-check is_markup_outlier on the fully-cleaned
+                 * text (it should now be a non-outlier real expression).
+                 * Other Note-[N] members do NOT take this path -- they
+                 * keep their existing outlier/override routing. */
+                char *troff_clean = strip_troff_escapes(expr);
+                clean = strip_note_markup(troff_clean);
+                free(troff_clean);
+                /* Trim any trailing whitespace left after the cut. */
+                size_t cl = strlen(clean);
+                while (cl > 0 && (clean[cl-1] == ' ' || clean[cl-1] == '\t'))
+                    clean[--cl] = '\0';
+                is_out = is_markup_outlier(clean);
+                emit_class = 1;            /* HX_EMIT_MULTI */
+            } else {
+                is_out = is_markup_outlier(expr);
+                clean  = strip_troff_escapes(expr);
+            }
             /* Strip any troff escapes from the NAME column too -- the
              * \s-2 ... \s+2 size markers used on long names slip through
              * parse_row as literal backslash chars, which the C compiler
@@ -541,6 +786,9 @@ int main(int argc, char **argv)
             meta[meta_n].is_outlier     = is_out;
             meta[meta_n].compile_failed = cf;
             meta[meta_n].expr_cleaned   = clean;
+            meta[meta_n].emit_class     = emit_class;  /* 5c.1 */
+            meta[meta_n].note_ref       = note_ref;    /* 5c.1 */
+            meta[meta_n].prog           = prog;        /* Tier 2 F1: retain */
             meta_n++;
 
             if (prog) {
@@ -599,7 +847,9 @@ int main(int argc, char **argv)
                 emit_entry_program(out, emitted_eidx, prog);
                 fprintf(out, "\n");
 
-                hx_program_free(prog);
+                /* Tier 2 F1: do NOT free prog here -- retained in
+                 * meta[].prog for the intra-catalog duplicate-warning
+                 * pass, then freed in the cleanup loop. */
             } else {
                 fprintf(out, "/* eidx=%d e%d %s : %s (hx.8 line %d) */\n",
                         emitted_eidx, type, name,
@@ -632,13 +882,21 @@ int main(int argc, char **argv)
         /* Sub-phase 5a.1 (2026-05-22): emit .program AND .call_names.
          * Both NULL for outliers/compile-fails; both populated otherwise.
          * .call_names points at the per-program _hx_callnames_NNN[]
-         * static sidecar emitted earlier in this file. */
+         * static sidecar emitted earlier in this file.
+         *
+         * Sub-phase 5c.1 (2026-05-27): also emit .emit_class + .note_ref.
+         * emit_class is HX_EMIT_MULTI (=1) only for the activated e123
+         * multi-emit member; SINGLE (=0) for everyone else. note_ref
+         * carries the hx.8 "(see Note [N])" reference number (0 = none).*/
         if (m->is_outlier || m->compile_failed)
-            fprintf(out, ".program = NULL, .call_names = NULL },\n");
+            fprintf(out, ".program = NULL, .call_names = NULL, "
+                         ".emit_class = %d, .note_ref = %d },\n",
+                    m->emit_class, m->note_ref);
         else
             fprintf(out, ".program = &_hx_program_%d, "
-                         ".call_names = _hx_callnames_%d },\n",
-                    m->eidx, m->eidx);
+                         ".call_names = _hx_callnames_%d, "
+                         ".emit_class = %d, .note_ref = %d },\n",
+                    m->eidx, m->eidx, m->emit_class, m->note_ref);
     }
     fprintf(out, "};\n"
                  "const int hx_specs_count = %d;\n\n", meta_n);
@@ -652,13 +910,85 @@ int main(int argc, char **argv)
 "    return NULL;\n"
 "}\n");
 
+    /* ---------- Tier 2 Feature 1: build-time intra-catalog warning ----------
+     *
+     * O(N^2) pairwise comparison over the COMPILED entries (those with a
+     * retained prog). Each bytecode-identical pair (under the SHARED
+     * programs_equal() -- Layer 1 + role-canon + Layer 2 commutative)
+     * emits ONE informational WARNING to stderr. Entries whose eN is in
+     * the DEDUP_OK suppression set (Feature 5) are excluded from BOTH
+     * sides of every pair.
+     *
+     * CRITICAL: these are WARNINGS, NOT errors. The build MUST still
+     * succeed -- the ~55 known duplicate groups are INTENTIONAL historical
+     * aliases (feedback_catalog_aliases_are_historical_dont_alter.md). We
+     * never alter, never fail. The pass only surfaces the dedup truth on
+     * every regenerate. Return value stays 0 regardless of warning count.
+     *
+     * The live programs carry resolved .u.call.entry pointers, so the
+     * comparator resolves call names directly (NULL call_names sidecar is
+     * fine -- programs_equal falls back to entry->name). Comparison reads
+     * only; absorbed[] collapses an N-way group into one warning block.
+     */
+    {
+        unsigned char *absorbed = (unsigned char *)calloc((size_t)meta_n, 1);
+        int n_pairs = 0, n_groups = 0, n_suppressed = 0;
+        if (!absorbed) {
+            WARN("hx8_to_c: WARN: OOM in dedup pass; skipping\n");
+        } else {
+            for (int i = 0; i < meta_n; i++) {
+                if (absorbed[i]) continue;
+                if (!meta[i].prog) continue;
+                if (dedup_ok_has(meta[i].type)) continue;
+
+                int group_started = 0;
+                for (int j = i + 1; j < meta_n; j++) {
+                    if (absorbed[j]) continue;
+                    if (!meta[j].prog) continue;
+                    if (dedup_ok_has(meta[j].type)) continue;
+                    if (!programs_equal(meta[i].prog, NULL,
+                                        meta[j].prog, NULL))
+                        continue;
+                    if (!group_started) {
+                        n_groups++;
+                        group_started = 1;
+                        WARN("hx8_to_c: WARNING: intra-catalog duplicate: "
+                             "e%d %s (hx.8 line %d) has bytecode-identical "
+                             "signature to:\n",
+                             meta[i].type, meta[i].name, meta[i].hx8_line);
+                    }
+                    WARN("hx8_to_c: WARNING:   == e%d %s (hx.8 line %d)\n",
+                         meta[j].type, meta[j].name, meta[j].hx8_line);
+                    absorbed[j] = 1;
+                    n_pairs++;
+                }
+                if (group_started) absorbed[i] = 1;
+            }
+            /* Count suppressed entries for the summary. */
+            for (int i = 0; i < meta_n; i++)
+                if (meta[i].prog && dedup_ok_has(meta[i].type)) n_suppressed++;
+            free(absorbed);
+        }
+        if (n_groups > 0)
+            WARN("hx8_to_c: NOTE: %d intra-catalog duplicate group(s), "
+                 "%d alias pairing(s). These are INTENTIONAL historical "
+                 "aliases unless newly introduced -- the build is NOT "
+                 "affected. Annotate reviewed entries via tools/dedup_ok.txt "
+                 "or a `.\\\" DEDUP_OK eN: reason` line in hx.8 to silence. "
+                 "(%d entr%s currently DEDUP_OK-suppressed.)\n",
+                 n_groups, n_pairs, n_suppressed,
+                 n_suppressed == 1 ? "y" : "ies");
+    }
+
     /* Cleanup. */
     for (int i = 0; i < meta_n; i++) {
         free(meta[i].name);
         free(meta[i].expr_cleaned);
+        if (meta[i].prog) hx_program_free(meta[i].prog);
     }
     free(meta);
     free(input);
+    free(g_dedup_ok);
 
     WARN("hx8_to_c: total=%d non_outlier=%d outlier=%d compile_failed=%d\n",
          total, non_outlier, outlier_n, compile_failed);

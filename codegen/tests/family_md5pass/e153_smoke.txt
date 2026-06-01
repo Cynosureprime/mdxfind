@@ -1,0 +1,12 @@
+# MAKE_MD5PASS family validation fixture (e153 HAV256_4MD5PASS smoke)
+# Sub-phase 5b.3b (2026-05-27) Tier 3 byte-exact harness fixture.
+# 8 passwords, no SALT lines (family is unsalted).
+# Algorithm: hav256_4( hex32(md5(pass)) || pass )    (HAVAL-256/4, 4-pass, 256-bit).
+PASS:apple
+PASS:banana
+PASS:cherry_42
+PASS:durian-XL
+PASS:elderberry
+PASS:fig_2026
+PASS:grapefruit-juice
+PASS:honeydewMelon

@@ -127,17 +127,77 @@
  *   rule_cursor_start   (no rule axis)
  */
 
-/* Mask wire encoding sentinel: classid byte == 0xff means MASK_LITERAL.
- * Host upload path translates mdxfind's signed -1 to this unsigned sentinel.
- * Picked from the [0..255] uchar space's high gap (max real classid = 15
- * = MASK_CUSTOM_0+7); 0xff leaves room to grow up to 254 future classes.
- * Decision D9.2.a in the A2 spec; A4 reuses the same encoding verbatim. */
-#define MASK_LITERAL_SENTINEL  0xffu
+/* 2026-05-30 long-mask amendment: A4 absorbs the new descriptor wire
+ * format via helper rename + 1-byte-END prebuf binding. The kernel-arg
+ * signature is unchanged; the host now uploads a 320 B descriptor
+ * stream into mask_pattern_append and a 1-byte END descriptor into
+ * mask_pattern_prepend. params.n_prepend = 1 (just the END byte),
+ * params.n_append = app descriptor byte length.
+ *
+ * BF invariant `pre_len == 0` translates post-amendment to "prebuf walker
+ * sees END at offset 0 and returns 0 expanded bytes" -- the kernel just
+ * skips the prebuf composition naturally without an explicit guard. */
 
-/* Hard cap on mask positions per side. Mirrors mdxfind.c MAX_MASK_POS=16.
- * Per-thread private buffer size; kept identical so the wire format stays
- * 1:1 with the CPU pattern layout. */
+/* ==== A4_PROFILE_VARIANT scaffolding (2026-05-30, BF-engine decomposition) ===
+ * Per architect spec project_kernel_a_a4_profile_variant_spec_2026-05-30.md
+ * D2.a (V0..V5). When kernel is JIT-built with -DA4_PROFILE_VARIANT=N
+ * (N in 1..5), per-lane body is progressively stubbed. V0 (macro undefined)
+ * = byte-identical to production cand_bruteforce_phase0.
+ *
+ * Macro NAME differs from A1's PROFILE_VARIANT so A1 + A4 programs can
+ * coexist in the same JIT context without cross-contamination if both
+ * env vars are set (per spec §4 D1.a).
+ *
+ * Variant semantics (V0-V_N = component cost-share):
+ *   V0 baseline -- full cand_bruteforce_phase0 (uint4 stores by default
+ *      per 2026-05-30 A4 C5 default-on refactor; see V0 site below).
+ *   V1 no atomic claim (per-lane gid*256 strided offset; per-byte write
+ *      still happens). Measures atomic_add cost (CAVEAT: likely
+ *      CONFOUNDED on NVIDIA/AGX/RDNA per spec §9 R1 + A1 #346/#354
+ *      priors -- strided offset breaks SLC write coalescing).
+ *   V2 no per-byte write (atomic claim still runs; per-byte loop +
+ *      chunk_index store omitted). Measures C5 per-byte write cost
+ *      share. Slot counter intentionally NOT incremented so host
+ *      actual_slots stays 0.
+ *   V3 stub charset walk (mask_expand_run_into_gpu returns minimal
+ *      fixed length, fills outbuf with 'A' without consulting descriptor
+ *      stream or charset table). EXPECTED A4 DOMINANT measurement;
+ *      V0-V3 = charset-walk (C3) cost share.
+ *   V4 decode-only (gid decompose + absolute_mask_idx ladder, then
+ *      return BEFORE mask_expand_run_into_gpu). V4 - V5 = C2 decode +
+ *      index-arithmetic cost share.
+ *   V5 empty kernel (return immediately BEFORE param decode). Measures
+ *      C1 dispatch overhead + WG scheduling baseline.
+ *
+ * Variants V1/V3/V4/V5: b_kernelA_state slot_counter and byte_counter
+ * untouched (or restored to 0 implicitly). V2 atomic_add still fires
+ * but slot_counter stays 0. Host sees actual_slots == 0 and the
+ * harness-mode return path short-circuits. Crack-parity for V1..V5 is
+ * INTENTIONALLY NOT preserved (timing-only stubs).
+ *
+ * 2026-05-30 A4 C5 DEFAULT-ON REFACTOR: the V6 cell that previously held
+ * the env-gated KNOBG variant has been REMOVED. The V0 baseline now
+ * unconditionally uses uint4 (16-byte) device stores -- the Knob-G-analog
+ * shape that V6 was measuring is permanently the production path. Setting
+ * A4_PROFILE_VARIANT=6 falls through to V0 (the active range is 0..5).
+ *
+ * Host gate (per spec §4 R5): activated ONLY when KERNEL_A_VARIANT=4
+ * is also active, via gpu_opencl_kernel_a4_profile_variant() accessor. */
+
+/* Wire-format tags (must match mdxfind.c host packer). */
+#define GPU_MASK_DESC_TAG_LIT   0x00u
+#define GPU_MASK_DESC_TAG_VAR   0x01u
+#define GPU_MASK_DESC_TAG_END   0xFFu
+
+/* Per-side caps (must match mdxfind.c host defines). */
+#define GPU_MASK_VAR_CAP        16
+#define GPU_MASK_LIT_BYTES_CAP  224
+#define GPU_MASK_DESC_BYTES_CAP 320
+#define GPU_MASK_SIDE_EXPANDED_CAP (GPU_MASK_LIT_BYTES_CAP + GPU_MASK_VAR_CAP)
+
+/* Deprecated alias retained for grep compatibility. */
 #define MAX_MASK_POS_GPU       16
+#define MASK_LITERAL_SENTINEL  0xffu
 
 /* Bounds: final candidate length cap. The [len] uchar byte caps at 255
  * regardless. For BF the final candidate is purely the append mask
@@ -185,25 +245,94 @@
  *
  * Static inline (kernel A1 convention; no noinline needed since this
  * helper has no hash compression). */
-static inline void mask_expand_into_gpu(
-    ulong index,
-    __global const uchar *pattern,
-    uint patlen,
+/* 2026-05-30 amendment: walker rewritten for run-descriptor wire
+ * format (Design Y). 2-pass: scan descriptor copying literals + recording
+ * VAR positions; then expand VARs HIGH-TO-LOW to preserve CPU's
+ * right-to-left consumption semantics. */
+static int mask_expand_run_into_gpu(
+    ulong idx,
+    __global const uchar *desc,
+    uint desc_bytes,
     __global const uchar *mask_charsets,
     __global const uint  *mask_class_counts,
     uchar *outbuf)
 {
-    for (int i = (int)patlen - 1; i >= 0; i--) {
-        uchar cid = pattern[i * 2];
-        if (cid == MASK_LITERAL_SENTINEL) {
-            outbuf[i] = pattern[i * 2 + 1];
-        } else {
-            uint cc = mask_class_counts[(uint)cid];
-            outbuf[i] = mask_charsets[(uint)cid * MASK_CHARSET_STRIDE
-                                      + (uint)(index % (ulong)cc)];
-            index /= (ulong)cc;
+#if defined(A4_PROFILE_VARIANT) && A4_PROFILE_VARIANT == 3
+    /* V3 stub: skip the EXPENSIVE part of the charset walk (the modulo
+     * + global-byte-load + idx/=cc ladder per VAR), but PRESERVE the
+     * output length contract so downstream host caps don't overflow.
+     *
+     * Compute the true expanded length cheaply (one pass scanning the
+     * descriptor stream summing LIT lens + counting VARs -- same shape
+     * as the V0 pass 1 walk, but WITHOUT the costly VAR pass 2). Then
+     * fill outbuf with fixed 'A' to that length. V0_us - V3_us
+     * approximates the VAR pass-2 cost share (C3b + C3c per spec §2);
+     * the LIT scan (C3a) is shared between V0 and V3, so V3 measures
+     * only the per-VAR charset-fetch + divide-ladder elimination.
+     *
+     * Per spec §2: V3 is the "primary A4 expected dominant" measurement.
+     * The aggregate (V0-V3) IS still expected to dominate on A4 because
+     * the per-VAR expansion (the actual stubbed work) is the dominant
+     * compute for the brute-force engine. */
+    (void)idx;
+    (void)mask_charsets;
+    (void)mask_class_counts;
+    int stub_len = 0;
+    {
+        uint p = 0;
+        while (p < desc_bytes) {
+            uchar tag = desc[p++];
+            if (tag == GPU_MASK_DESC_TAG_END) break;
+            if (tag == GPU_MASK_DESC_TAG_LIT) {
+                if (p + 2u > desc_bytes) break;
+                uint lit_len = (uint)desc[p] | ((uint)desc[p + 1u] << 8);
+                p += 2u;
+                if (p + lit_len > desc_bytes) break;
+                stub_len += (int)lit_len; p += lit_len;
+            } else if (tag == GPU_MASK_DESC_TAG_VAR) {
+                if (p + 1u > desc_bytes) break;
+                p++;
+                stub_len += 1;
+            } else break;
         }
     }
+    if (stub_len < 0) stub_len = 0;
+    if (stub_len > GPU_MASK_SIDE_EXPANDED_CAP) stub_len = GPU_MASK_SIDE_EXPANDED_CAP;
+    for (int i = 0; i < stub_len; i++) outbuf[i] = 'A';
+    return stub_len;
+#else
+    uchar var_classids[GPU_MASK_VAR_CAP];
+    uint  var_outpos[GPU_MASK_VAR_CAP];
+    int   n_vars  = 0;
+    int   out_len = 0;
+    uint  p       = 0;
+    while (p < desc_bytes) {
+        uchar tag = desc[p++];
+        if (tag == GPU_MASK_DESC_TAG_END) break;
+        if (tag == GPU_MASK_DESC_TAG_LIT) {
+            if (p + 2u > desc_bytes) break;
+            uint lit_len = (uint)desc[p] | ((uint)desc[p + 1u] << 8);
+            p += 2u;
+            if (p + lit_len > desc_bytes) break;
+            for (uint i = 0; i < lit_len; i++) outbuf[out_len + (int)i] = desc[p + i];
+            out_len += (int)lit_len; p += lit_len;
+        } else if (tag == GPU_MASK_DESC_TAG_VAR) {
+            if (p + 1u > desc_bytes) break;
+            uchar cid = desc[p++];
+            if (n_vars >= GPU_MASK_VAR_CAP) break;
+            var_classids[n_vars] = cid; var_outpos[n_vars] = (uint)out_len;
+            outbuf[out_len] = 0; out_len++; n_vars++;
+        } else break;
+    }
+    for (int i = n_vars - 1; i >= 0; i--) {
+        uint cid = (uint)var_classids[i];
+        uint cc  = mask_class_counts[cid]; if (cc == 0u) cc = 1u;
+        outbuf[var_outpos[i]] = mask_charsets[cid * MASK_CHARSET_STRIDE
+                                              + (uint)(idx % (ulong)cc)];
+        idx /= (ulong)cc;
+    }
+    return out_len;
+#endif  /* A4_PROFILE_VARIANT == 3 */
 }
 
 /* ==== Total-cardinality helper =========================================
@@ -279,12 +408,18 @@ void cand_bruteforce_phase0(
     __global volatile uint *b_kernelA_state
     )
 {
+#if defined(A4_PROFILE_VARIANT) && A4_PROFILE_VARIANT == 5
+    /* V5: empty kernel; return BEFORE any payload decode. Measures C1
+     * (dispatch overhead + WG scheduling + kernel launch latency). */
+    return;
+#endif
     __global const OCLParams *params_buf = (__global const OCLParams *)payload;
     OCLParams params = *params_buf;
     uint n_words      = params.num_words;
     uint bf_num_masks = params.num_masks;
-    uint app_len      = params.n_append;
-    uint pre_len      = params.n_prepend;             /* BF invariant: expect 0 */
+    uint app_dbytes   = params.n_append;              /* descriptor stream byte length */
+    /* n_prepend is now descriptor byte length (==1 for A4's END-only prebuf);
+     * A4 never composes prebuf, so we ignore it post-amendment. */
     ulong bf_start    = params.mask_start;
     uint bf_offset    = params.mask_offset_per_word;
 
@@ -292,40 +427,36 @@ void cand_bruteforce_phase0(
     uint gid = get_global_id(0);
     if (gid >= total) return;
 
-    /* Lane-major outer + mask-inner decomposition. Maximizes contiguous
-     * writes to b_packed_buf (lane N writes at slot=N, byte_off ~ N *
-     * (1+app_len)) and keeps atomic contention to one byte_counter add
-     * plus one slot_counter add per lane. */
     uint synthetic_word_idx   = gid / bf_num_masks;
     uint mask_offset_in_chunk = gid % bf_num_masks;
 
-    /* D11.3.a: ulong absolute_mask_idx. bf_start is already ulong (off 8);
-     * synthetic_word_idx * bf_offset_per_word + mask_offset_in_chunk could
-     * overflow uint32 for 10-digit+ BF keyspaces, so we widen all
-     * arithmetic to ulong. Matches A2's mask_expand_into_gpu signature
-     * and mdxfind.c:7656 CPU oracle. */
     ulong absolute_mask_idx = bf_start
                             + (ulong)synthetic_word_idx * (ulong)bf_offset
                             + (ulong)mask_offset_in_chunk;
 
-    /* Per-thread private mask scratch. MAX_MASK_POS_GPU bytes. */
-    uchar appbuf[MAX_MASK_POS_GPU];
+#if defined(A4_PROFILE_VARIANT) && A4_PROFILE_VARIANT == 4
+    /* V4: decode-only -- everything up through absolute_mask_idx is done
+     * (C2 component); NO mask_expand, NO atomic, NO write. Sentinel
+     * side-effect on unreachable bit pattern keeps absolute_mask_idx
+     * live (compiler must not dead-strip the ulong ladder). V4 - V5 =
+     * decode + index-arithmetic (C2) cost share; V3 - V4 = charset walk
+     * (C3) isolated. */
+    if (absolute_mask_idx == 0xffffffffffffffffUL) {
+        atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u);
+    }
+    return;
+#endif
 
-    mask_expand_into_gpu(absolute_mask_idx, mask_pattern_append, app_len,
-                         mask_charsets, mask_class_counts, appbuf);
+    /* Per-thread expanded-mask scratch (240 B for new wire format). */
+    uchar appbuf[GPU_MASK_SIDE_EXPANDED_CAP];
 
-    /* BF invariant defensive guard (spec R2): the BF fast-path gate at
-     * mdxfind.c:49032 requires MaskPrependLen == 0. If the host
-     * pathologically ships pre_len > 0, the kernel returns rather than
-     * silently producing wrong output. Dispatcher should also assert
-     * MaskPrependLen == 0 host-side and FATAL on violation. */
-    if (pre_len != 0u) return;
+    int applen = mask_expand_run_into_gpu(absolute_mask_idx,
+                                          mask_pattern_append, app_dbytes,
+                                          mask_charsets, mask_class_counts,
+                                          appbuf);
 
-    /* Final candidate length: [appbuf] only -- no prebuf, no input word.
-     * Clamp via early-return rather than corrupting the [len] slot. With
-     * MAX_MASK_POS_GPU=16, app_len <= 16 << 255 in practice; the cap is
-     * structural for future-scaling. */
-    uint final_len = app_len;
+    /* Final candidate length: [appbuf] only -- no prebuf, no input word. */
+    uint final_len = (uint)applen;
     if (final_len == 0u || final_len > MASK_FINAL_LEN_LIMIT) return;
 
     /* --- Reserve a candidate slot ---------------------------------
@@ -333,11 +464,71 @@ void cand_bruteforce_phase0(
      * then capacity guard, then slot reservation. Overflow flag latched
      * on either overflow. */
     uint need_bytes = 1u + final_len;   /* [len][bytes] */
+
+#if defined(A4_PROFILE_VARIANT) && A4_PROFILE_VARIANT == 1
+    /* V1 (no atomic claim): substitute per-lane deterministic offsets
+     * for atomic_add slot + byte reservation. Per-byte write STILL
+     * HAPPENS so V0 - V1 attributes the atomic cost (CAVEAT: confounded
+     * per spec §9 R1 -- strided gid*256 offset breaks SLC write
+     * coalescing on NVIDIA/AGX/RDNA). slot_counter + byte_counter stay
+     * at zero (no atomic = no increment) so host sees actual_slots == 0
+     * and harness short-circuits.
+     *
+     * Capacity guards: per spec §3 V1 description -- the fake byte_off
+     * = gid * 256 stays within pre-allocated packed buffer for any gid
+     * covered by the host's chunk cap; defensively re-check. */
+    uint byte_off = gid * 256u;
+    uint slot     = gid;
+    if (byte_off + need_bytes > params.packed_size) return;
+    if (slot >= total) return;
+    b_packed_buf[byte_off] = (uchar)final_len;
+    {
+        uint p = byte_off + 1u;
+        for (int i = 0; i < applen; i++) b_packed_buf[p++] = appbuf[i];
+    }
+    b_chunk_index[slot] = byte_off;
+#elif defined(A4_PROFILE_VARIANT) && A4_PROFILE_VARIANT == 2
+    /* V2 (no candidate write): atomic claim still runs (so V0 - V2
+     * attributes the per-byte write loop C5). Per-byte memcpy + index
+     * store are removed. slot_counter intentionally NOT incremented
+     * (host actual_slots stays 0 -> harness short-circuits). Use a
+     * private read-write of byte_counter to keep the atomic_add live
+     * so the compiler does not fold it. */
     uint byte_off = atomic_add(
         &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
         need_bytes);
+    /* Keep byte_off live without producing a visible effect (or-with-0
+     * is a no-op functionally; prevents DCE of the atomic_add). */
+    if (byte_off == 0xffffffffu) {
+        atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u);
+    }
+    /* Slot-counter NOT incremented. Per-byte write loop + chunk_index
+     * store omitted (the measured target). */
+#else
+    /* V0 (production baseline). 2026-05-30 A4 C5 default-on refactor:
+     * the uint4 (16-byte) device-store write path is now the ONLY write
+     * path -- the env-gated KNOBG_A4_VEC_WRITE preprocessor branch and
+     * the legacy per-byte loop have both been removed. Per the paired
+     * Phase 0 verdicts (project_a4_c5_phase0_opencl_ptx_verdict_-
+     * 2026-05-30 + project_a4_c5_phase0_metal_air_verdict_2026-05-30):
+     * explicit V_uint4 stores lower to 16-byte device stores on both
+     * Apple AGX (metal-llc) and NVIDIA Pascal/Maxwell (NVVM); the legacy
+     * V_char per-byte loop remained scalar (st.global.u8 / store i8).
+     * NVIDIA delivered -15% Pascal / -21% Maxwell wall on the production
+     * fixture; Apple AGX delivered null (load-side bound; see followup).
+     *
+     * Round need_bytes up to a 16-byte multiple. The atomic shape is a
+     * single atomic_add; only the value is rounded. Slot-start alignment
+     * proof: base ptr 16-aligned + each running sum adds a multiple of
+     * 16 -> every byte_off is 16-aligned. */
+    uint need_aligned = (need_bytes + 15u) & ~15u;
+    uint byte_off = atomic_add(
+        &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+        need_aligned);
 
-    if (byte_off + need_bytes > params.packed_size) {
+    /* Capacity guard: use the post-rounding byte count for the bound
+     * check (otherwise the tail uint4 stores could spill past packed). */
+    if (byte_off + need_aligned > params.packed_size) {
         atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
         return;
     }
@@ -352,12 +543,56 @@ void cand_bruteforce_phase0(
         return;
     }
 
-    /* --- Write [len][bytes] into packed buf -----------------------
-     * Layout: [final_len][appbuf...]. No prebuf, no input word -- BF's
-     * candidate IS the mask expansion. */
-    b_packed_buf[byte_off] = (uchar)final_len;
-    uint p = byte_off + 1u;
-    for (uint i = 0; i < app_len; i++) b_packed_buf[p++] = appbuf[i];
+    /* --- Write [len][bytes] into packed buf via uint4 stores ----------
+     * Direct-from-appbuf uint4 stores (D5.a shape -- no stage[] copy).
+     * Build the [len|bytes] payload via shifted reads from the thread-
+     * private appbuf into 16-byte uint4 packets. need_aligned/16 stores;
+     * tail reads past applen are safe (appbuf is 240 B private), pad
+     * bytes in the dst tail are undefined but never inspected by the
+     * consumer (plen byte caps the read). emit_len cap for A4 is
+     * MaskAppendLen <= MAX_MASK_POS_GPU = 16; need_aligned in [16,32];
+     * nvec in [1,2]. */
+    {
+        __global uint4 *dst = (__global uint4 *)(b_packed_buf + byte_off);
+        uint hdr0 = (uint)final_len
+                  | ((uint)appbuf[0]  <<  8)
+                  | ((uint)appbuf[1]  << 16)
+                  | ((uint)appbuf[2]  << 24);
+        uint hdr1 = (uint)appbuf[3]
+                  | ((uint)appbuf[4]  <<  8)
+                  | ((uint)appbuf[5]  << 16)
+                  | ((uint)appbuf[6]  << 24);
+        uint hdr2 = (uint)appbuf[7]
+                  | ((uint)appbuf[8]  <<  8)
+                  | ((uint)appbuf[9]  << 16)
+                  | ((uint)appbuf[10] << 24);
+        uint hdr3 = (uint)appbuf[11]
+                  | ((uint)appbuf[12] <<  8)
+                  | ((uint)appbuf[13] << 16)
+                  | ((uint)appbuf[14] << 24);
+        dst[0] = (uint4)(hdr0, hdr1, hdr2, hdr3);
+        uint nvec = need_aligned / 16u;
+        for (uint v = 1u; v < nvec; v++) {
+            uint base = v * 16u - 1u;
+            uint w0 = (uint)appbuf[base + 0u]
+                    | ((uint)appbuf[base + 1u] <<  8)
+                    | ((uint)appbuf[base + 2u] << 16)
+                    | ((uint)appbuf[base + 3u] << 24);
+            uint w1 = (uint)appbuf[base + 4u]
+                    | ((uint)appbuf[base + 5u] <<  8)
+                    | ((uint)appbuf[base + 6u] << 16)
+                    | ((uint)appbuf[base + 7u] << 24);
+            uint w2 = (uint)appbuf[base + 8u]
+                    | ((uint)appbuf[base + 9u] <<  8)
+                    | ((uint)appbuf[base + 10u] << 16)
+                    | ((uint)appbuf[base + 11u] << 24);
+            uint w3 = (uint)appbuf[base + 12u]
+                    | ((uint)appbuf[base + 13u] <<  8)
+                    | ((uint)appbuf[base + 14u] << 16)
+                    | ((uint)appbuf[base + 15u] << 24);
+            dst[v] = (uint4)(w0, w1, w2, w3);
+        }
+    }
 
     /* --- Write per-slot byte offset -------------------------------
      * Per contract S7.1, no parallel mask_idx sidecar. The composed
@@ -366,6 +601,7 @@ void cand_bruteforce_phase0(
      * arises (synthetic_word_idx and mask_offset_in_chunk are
      * recoverable from slot via the absolute_mask_idx formula). */
     b_chunk_index[slot] = byte_off;
+#endif  /* A4_PROFILE_VARIANT 1 / 2 / V0 selection */
 
     /* Per-spec invariant 1: caller (Phase 4 host) relies on in-order
      * single-queue FIFO to ensure these writes are visible to kernel B

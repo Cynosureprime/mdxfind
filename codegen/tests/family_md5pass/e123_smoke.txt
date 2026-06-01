@@ -1,0 +1,24 @@
+# MAKE_MD5PASS family validation fixture (e123 MD5MD5PASS smoke).
+# Sub-phase 5c.2 (2026-05-27) byte-exact harness fixture -- the FIRST
+# multi-emit family member.
+#
+# e123 is MULTI-EMIT: each password produces TWO outer-hash digests,
+# each probed as an independent loaded-hash candidate (CPU oracle
+# mdxfind.c:25181-25204 calls checkhash() once per variant):
+#   variant 0 (canonical): md5( hex32(md5(pass)) . pass )
+#   variant 1 (colon):     md5( hex32(md5(pass)) . ':' . pass )
+#
+# The validation harness plants BOTH variant digests for EVERY pass
+# (n_variants=2) and requires the GPU to emit BOTH cracks per pass --
+# so EVERY line below is implicitly a dual-hash canary. The dedicated
+# G1b canary fixture is e123_multiemit_canary.txt.
+#
+# 8 passwords, no SALT lines (family is unsalted).
+PASS:apple
+PASS:banana
+PASS:cherry_42
+PASS:durian-XL
+PASS:elderberry
+PASS:fig_2026
+PASS:grapefruit-juice
+PASS:honeydewMelon

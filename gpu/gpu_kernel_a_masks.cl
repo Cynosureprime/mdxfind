@@ -6,7 +6,9 @@
 /* gpu_kernel_a_masks.cl -- Kernel A2 (masks-only) candidate producer.
  *
  * Production kernel A variant A2 per Phase 1a sub-phase 1a.2 spec
- *   project_kernel_a_a2_masks_spec_2026-05-20.md.
+ *   project_kernel_a_a2_masks_spec_2026-05-20.md
+ * with 2026-05-30 long-mask amendment (D1.b Design Y wire format)
+ *   project_kernel_a_a2_a3_long_mask_amendment_2026-05-30.md.
  *
  * Produces packed candidates from input words x mask combinations via
  * the buffer-quadruple API (b_packed_buf, b_chunk_index, b_kernelA_state,
@@ -21,112 +23,74 @@
  *   word_idx    = gid % n_words
  *   mask_idx    = gid / n_words
  *
- * Mechanical lineage: this kernel does NOT port from gpu_template.cl's
- * mask-as-salt-axis path (which slices a single mask combination across
- * a workgroup); rather, it ports the CPU mask_expand_into helper from
- * mdxfind.c lines 7646-7660 directly into per-thread private state. Each
- * lane independently materializes one (word, prepend_mask, append_mask)
- * triple into the packed buffer with a per-slot byte offset.
+ * Wire format (2026-05-30 D1.b Design Y -- interleaved run-descriptor):
+ *
+ *   GPU_MASK_DESC_TAG_LIT (0x00) lit_len:u16 (little-endian) bytes[lit_len]
+ *   GPU_MASK_DESC_TAG_VAR (0x01) classid:u8     (one placeholder)
+ *   GPU_MASK_DESC_TAG_END (0xFF) terminator
+ *
+ * Per-side caps:
+ *   GPU_MASK_VAR_CAP       = 16   placeholder positions
+ *   GPU_MASK_LIT_BYTES_CAP = 224  literal bytes
+ *   GPU_MASK_DESC_BYTES_CAP= 320  descriptor stream byte cap
+ *
+ * The walker (mask_expand_run_into_gpu) is a unified 2-pass design that
+ * handles ALL CPU-parsable mask shapes (literal-only, var-only,
+ * interleaved). Per amendment D4.a there is NO short-mask fast path;
+ * the same walker covers pre-amendment workloads (?d?d, ?l, etc.) and
+ * post-amendment long-lit workloads byte-identically.
+ *
+ * Pass 1: scan descriptor, copy literal runs verbatim, mark each VAR
+ *         position with a (classid, outpos) entry in a per-thread table.
+ * Pass 2: walk the VAR table HIGH-TO-LOW and consume idx %= cc / idx /= cc
+ *         in order to preserve CPU's mask_expand_into semantics
+ *         (mdxfind.c:7840-7848).
+ *
+ * Mechanical lineage: this kernel ports the CPU mask_expand_into helper
+ * from mdxfind.c lines 7836-7849 directly into per-thread private state.
+ * The descriptor walker handles the new wire format; the CPU oracle
+ * still operates on the MaskPos[] layout.
  *
  * Authoritative buffer contract:
  *   project_two_kernel_candidate_buffer_contract.md
- * Phase 1a A2-variant spec:
- *   project_kernel_a_a2_masks_spec_2026-05-20.md
  *
  * Contract per buffer (identical to A1):
  *   b_packed_buf        - [len][bytes][len][bytes]... post-mask candidates.
- *                         len byte stored as uchar; bytes follow uncompressed.
- *                         Written at slot's reserved byte offset.
- *   b_chunk_index       - uint32 per slot. b_chunk_index[slot] = byte offset
- *                         into b_packed_buf where this candidate's len byte
- *                         lives. Pure physical byte offsets only.
+ *   b_chunk_index       - uint32 per slot. b_chunk_index[slot] = byte
+ *                         offset where this candidate's len byte lives.
  *   b_kernelA_state     - small counter buffer (same layout as A1):
- *                           offset 0 : uint slot_counter   (atomic_inc)
- *                           offset 4 : uint byte_counter   (atomic_add for
- *                                                            variable-size
- *                                                            byte reservation)
- *                           offset 8 : uint overflow_flag  (set if either
- *                                                            counter exceeds
- *                                                            its capacity)
- *
- * Mask pattern wire encoding (D9.2.a -- 0xff sentinel):
- *   Each MaskPos is encoded as 2 bytes:
- *     byte 0: classid (0..7 builtin, 8..15 custom, 0xff = MASK_LITERAL)
- *     byte 1: literal character (only meaningful when classid == 0xff)
- *   mask_pattern_prepend, mask_pattern_append each carry MAX_MASK_POS_GPU
- *   entries (32 bytes total per side); only the first n_prepend / n_append
- *   are read.
- *
- *   The host upload path encodes mdxfind's MaskPos.classid (signed int, -1
- *   for MASK_LITERAL) as 0xff at upload time. The kernel never sees the
- *   CPU's signed -1 sentinel; comparison is unsigned uchar == 0xff.
- *
- * Charset table layout:
- *   mask_charsets:     MASK_MAX_CLASSES (=16) x 256 bytes flat. Class N's
- *                      characters live at mask_charsets[N*256 + i], i in
- *                      [0, mask_class_counts[N]).
- *   mask_class_counts: uint32 per class. Caps at 256 (e.g. ?b = 256, ?a = 95).
- *
- * Walker behavior:
- *   1. Decode payload -> params, word_offset, words (same layout as A1).
- *   2. Decompose gid -> (word_idx, mask_idx) mask-major.
- *   3. Compute prepend_total / append_total from the patterns (cheap loop;
- *      patlen <= 16).
- *   4. Split mask_idx -> (prepend_idx, append_idx) via mod/div by
- *      append_total; the convention matches mdxfind.c procjob lines
- *      12111-12162.
- *   5. mask_expand_into_gpu(prepend_idx, prepend_pattern, ...) -> prebuf[]
- *      mask_expand_into_gpu(append_idx,  append_pattern,  ...) -> appbuf[]
- *   6. Compose final candidate as [prebuf][word][appbuf]; clamp len to 255.
- *   7. Reserve slot + byte offset (identical atomic discipline to A1);
- *      write [len][bytes] into b_packed_buf, byte offset into b_chunk_index.
- *
- * Geometry: mask-major dispatch (NEW vs A1's rule-major):
- *   global_size = n_words * n_masks
- *   word_idx    = gid % n_words
- *   mask_idx    = gid / n_words
- *
- * Reused primitives from gpu_common.cl: OCLParams struct only.
- *   - No md5_block / md5_buf / md5_to_hex_lc reference (kernel A pure).
- *   - No probe_compact_idx reference.
- *   - No EMIT_HIT_N reference.
+ *                           offset 0 : uint slot_counter
+ *                           offset 4 : uint byte_counter
+ *                           offset 8 : uint overflow_flag
  *
  * OCLParams fields consumed by A2:
  *   num_words           = batch word count
  *   num_masks           = MaskTotal = MaskPrependTotal * MaskAppendTotal
- *   n_prepend           = MaskPrependLen   (active prepend positions)
- *   n_append            = MaskAppendLen    (active append positions)
+ *   n_prepend           = descriptor stream BYTE LENGTH for prepend side
+ *                         (post-amendment semantic; was position-count
+ *                         pre-amendment)
+ *   n_append            = descriptor stream BYTE LENGTH for append side
  *   base_word_idx       = source word index (for kernel B attribution)
  *   packed_size         = bytes available in b_packed_buf
- *
- * OCLParams fields NOT consumed by A2 (set by host but ignored):
- *   num_rules           (rules-axis; A2 has no rule fan-out)
- *   input_cursor_start  (B3 cursor; A2 v1 has no cursor restart -- chunking
- *                        comes 1a.2.x)
- *   rule_cursor_start   (B3 cursor)
  */
 
-/* Mask wire encoding sentinel: classid byte == 0xff means MASK_LITERAL.
- * Host upload path translates mdxfind's signed -1 to this unsigned sentinel.
- * Picked from the [0..255] uchar space's high gap (max real classid = 15
- * = MASK_CUSTOM_0+7); 0xff leaves room to grow up to 254 future classes.
- * Decision D9.2.a in the spec. */
-#define MASK_LITERAL_SENTINEL  0xffu
+/* Wire-format tags (must match mdxfind.c host packer). */
+#define GPU_MASK_DESC_TAG_LIT   0x00u
+#define GPU_MASK_DESC_TAG_VAR   0x01u
+#define GPU_MASK_DESC_TAG_END   0xFFu
 
-/* Hard cap on mask positions per side. Mirrors mdxfind.c MAX_MASK_POS=16.
- * Per-thread private buffer size; kept identical so the wire format stays
- * 1:1 with the CPU pattern layout. */
-#define MAX_MASK_POS_GPU       16
+/* Per-side caps (must match mdxfind.c host defines). */
+#define GPU_MASK_VAR_CAP        16
+#define GPU_MASK_LIT_BYTES_CAP  224
+#define GPU_MASK_DESC_BYTES_CAP 320
 
-/* Bounds: final candidate length cap. Matches A1's RULE_BUF_LIMIT for
- * the [len] uchar byte; 255 is the hard cap regardless because the
- * length byte is uchar. With MAX_MASK_POS_GPU=16 on both sides plus an
- * input word up to RULE_BUF_LIMIT, well above 255 is structurally
- * possible -- we clamp via early-return below. */
+/* Per-thread expanded-mask scratch capacity. lit_bytes + var positions. */
+#define GPU_MASK_SIDE_EXPANDED_CAP (GPU_MASK_LIT_BYTES_CAP + GPU_MASK_VAR_CAP)
+
+/* Final candidate length cap (uchar len byte). */
 #define MASK_FINAL_LEN_LIMIT   255u
 
-/* Kernel-A state buffer offsets. Single source of truth for host wiring
- * to mirror via fixed-offset writes/reads. Identical to A1. */
+/* Kernel-A state buffer offsets. */
 #define KERNELA_STATE_SLOT_COUNTER   0u
 #define KERNELA_STATE_BYTE_COUNTER   4u
 #define KERNELA_STATE_OVERFLOW_FLAG  8u
@@ -135,73 +99,109 @@
 /* Charset table flat-array stride. MASK_MAX_CLASSES * 256 bytes total. */
 #define MASK_CHARSET_STRIDE          256u
 
-/* ==== Mask expander helper ============================================
+/* ==== Mask expander helper (post-amendment 2026-05-30) ===============
  *
- * Literal port of mask_expand_into from mdxfind.c lines 7646-7660:
+ * Walks a run-descriptor stream and produces the expanded mask bytes
+ * into the thread-private outbuf. Returns total expanded length.
  *
- *   for (i = patlen - 1; i >= 0; i--) {
- *       if (pattern[i].classid == MASK_LITERAL)
- *           buf[i] = pattern[i].literal;
- *       else {
- *           buf[i] = mc->chars[index % mc->count];
- *           index /= mc->count;
- *       }
- *   }
+ * Per the D4.a single-unified-walker decision, both pre-amendment short
+ * masks and post-amendment long-lit masks take this path.
  *
- * GPU adaptations:
- *  - pattern is a flat 2-byte-per-entry uchar buffer; classid at offset
- *    i*2, literal at offset i*2+1. MASK_LITERAL_SENTINEL (0xff) replaces
- *    the CPU's signed -1.
- *  - mask_charsets is the flat 16*256 byte table; mask_class_counts is
- *    the uint32-per-class count vector.
- *  - outbuf is thread-private (the apply path passes a stack array).
- *  - index is ulong to handle MaskTotal up to 2^31 (per spec R5 cap);
- *    the division ladder operates on running ulong values.
+ * Per amendment §5 the walker uses a 2-pass design to preserve the CPU
+ * mask_expand_into semantics (right-to-left variable consumption order
+ * via decreasing-i loop at mdxfind.c:7840). Pass 1 lays out the
+ * descriptor; Pass 2 walks variables high-to-low to consume idx.
  *
- * Static inline (kernel A1 convention; no noinline needed since this
- * helper has no hash compression). */
-static inline void mask_expand_into_gpu(
-    ulong index,
-    __global const uchar *pattern,
-    uint patlen,
+ * All lanes in a workgroup read the SAME descriptor (mask is workgroup-
+ * invariant). Branch dispatch is warp-coherent; divergence is zero. */
+static int mask_expand_run_into_gpu(
+    ulong idx,
+    __global const uchar *desc,
+    uint desc_bytes,                          /* upper bound for safety */
     __global const uchar *mask_charsets,
     __global const uint  *mask_class_counts,
     uchar *outbuf)
 {
-    for (int i = (int)patlen - 1; i >= 0; i--) {
-        uchar cid = pattern[i * 2];
-        if (cid == MASK_LITERAL_SENTINEL) {
-            outbuf[i] = pattern[i * 2 + 1];
+    /* Pass 1: scan descriptor, copy literals, record var positions. */
+    uchar var_classids[GPU_MASK_VAR_CAP];
+    uint  var_outpos[GPU_MASK_VAR_CAP];
+    int   n_vars  = 0;
+    int   out_len = 0;
+    uint  p       = 0;
+
+    while (p < desc_bytes) {
+        uchar tag = desc[p++];
+        if (tag == GPU_MASK_DESC_TAG_END) break;
+        if (tag == GPU_MASK_DESC_TAG_LIT) {
+            if (p + 2u > desc_bytes) break;
+            uint lit_len = (uint)desc[p] | ((uint)desc[p + 1u] << 8);
+            p += 2u;
+            if (p + lit_len > desc_bytes) break;
+            /* Bounded copy. lit_len <= GPU_MASK_LIT_BYTES_CAP per
+             * gpu_pack_mask_descriptor()'s caller invariant. */
+            for (uint i = 0; i < lit_len; i++) {
+                outbuf[out_len + (int)i] = desc[p + i];
+            }
+            out_len += (int)lit_len;
+            p += lit_len;
+        } else if (tag == GPU_MASK_DESC_TAG_VAR) {
+            if (p + 1u > desc_bytes) break;
+            uchar cid = desc[p++];
+            if (n_vars >= GPU_MASK_VAR_CAP) break;  /* defensive */
+            var_classids[n_vars] = cid;
+            var_outpos[n_vars]   = (uint)out_len;
+            outbuf[out_len] = 0;
+            out_len += 1;
+            n_vars  += 1;
         } else {
-            uint cc = mask_class_counts[(uint)cid];
-            outbuf[i] = mask_charsets[(uint)cid * MASK_CHARSET_STRIDE
-                                      + (uint)(index % (ulong)cc)];
-            index /= (ulong)cc;
+            /* Unknown tag: bail. Host invariant guarantees this never
+             * happens; we silently truncate to whatever was decoded. */
+            break;
         }
     }
+
+    /* Pass 2: expand variables HIGH-TO-LOW to preserve CPU's
+     * mdxfind.c:7836-7849 left-to-right pattern indexing under reverse
+     * iteration (the CPU's i = patlen-1; i--; loop). */
+    for (int i = n_vars - 1; i >= 0; i--) {
+        uint  cid = (uint)var_classids[i];
+        uint  cc  = mask_class_counts[cid];
+        if (cc == 0u) cc = 1u;
+        outbuf[var_outpos[i]] = mask_charsets[cid * MASK_CHARSET_STRIDE
+                                              + (uint)(idx % (ulong)cc)];
+        idx /= (ulong)cc;
+    }
+
+    return out_len;
 }
 
-/* ==== Total-cardinality helper =========================================
+/* ==== Per-side cardinality helper ====================================
  *
- * Compute the product of class sizes for a (pattern, patlen) pair.
- * Returns 1 when patlen == 0 (matches CPU mdxfind convention; MaskTotal
- * is 1 when the corresponding side is unused). Returns 1 also for any
- * literal-only pattern (literal positions contribute factor 1).
- *
- * Kept inline since per-thread invocation cost is trivial (patlen <= 16
- * yields <= 16 global-memory reads per side per lane; values are cached
- * by the GPU L1 across the workgroup since all lanes read identical
- * pattern + counts arrays). */
-static inline ulong mask_pattern_total(
-    __global const uchar *pattern,
-    uint patlen,
+ * Compute the product of class sizes (placeholder positions) in a
+ * descriptor stream. Returns 1 when stream has zero VAR runs (matches
+ * CPU convention; MaskTotal is 1 when the corresponding side is unused
+ * or literal-only). */
+static ulong mask_pattern_total_run(
+    __global const uchar *desc,
+    uint desc_bytes,
     __global const uint  *mask_class_counts)
 {
     ulong total = 1ul;
-    for (uint i = 0; i < patlen; i++) {
-        uchar cid = pattern[i * 2];
-        if (cid != MASK_LITERAL_SENTINEL) {
-            total *= (ulong)mask_class_counts[(uint)cid];
+    uint  p     = 0;
+    while (p < desc_bytes) {
+        uchar tag = desc[p++];
+        if (tag == GPU_MASK_DESC_TAG_END) break;
+        if (tag == GPU_MASK_DESC_TAG_LIT) {
+            if (p + 2u > desc_bytes) break;
+            uint lit_len = (uint)desc[p] | ((uint)desc[p + 1u] << 8);
+            p += 2u + lit_len;
+        } else if (tag == GPU_MASK_DESC_TAG_VAR) {
+            if (p + 1u > desc_bytes) break;
+            uchar cid = desc[p++];
+            uint cc = mask_class_counts[(uint)cid];
+            if (cc > 0u) total *= (ulong)cc;
+        } else {
+            break;
         }
     }
     return total;
@@ -209,28 +209,23 @@ static inline ulong mask_pattern_total(
 
 /* ---- Kernel A2 (masks-only) production kernel --------------------
  *
- * Payload layout identical to A1 / md5_rules_phase0 (Memo B B1 coalesced):
+ * Payload layout identical to A1 / md5_rules_phase0:
  *
  *   offset   0 : OCLParams params
- *   offset 128 : uint hit_count            (unused by kernel A; reserved
- *                                            for payload symmetry)
+ *   offset 128 : uint hit_count
  *   offset 132 : uint word_offset[num_words]
  *   offset 132 + 4*num_words : uchar packed_words[]
- *
- * params.base_word_idx is read by kernel B (host attribution); A2 does
- * not consume it directly. The host sets it before dispatch.
- *
- * params.packed_size is read as the b_packed_buf capacity. Overflow
- * detection: any candidate whose reservation would push byte_counter
- * past packed_size sets overflow_flag and returns without writing.
  *
  * Output buffer caps:
  *   b_packed_buf       capacity = params.packed_size bytes
  *   b_chunk_index      capacity = params.num_words * params.num_masks slots
- *                                  (worst case: every (word, mask) emits
- *                                   one slot -- no rejection path in A2).
+ *
+ * 8-arg signature is BYTE-IDENTICAL to pre-amendment. Only the semantic
+ * of mask_pattern_prepend / mask_pattern_append changes: they are now
+ * run-descriptor streams sized GPU_MASK_DESC_BYTES_CAP (320 B) each.
+ * params.n_prepend / params.n_append carry the descriptor stream BYTE
+ * LENGTH (used as an upper-bound safety guard inside the walker loop).
  */
-
 __kernel
 void cand_masks_phase0(
     __global uchar         *payload,
@@ -245,11 +240,11 @@ void cand_masks_phase0(
 {
     __global const OCLParams *params_buf = (__global const OCLParams *)payload;
     OCLParams params = *params_buf;
-    uint n_words = params.num_words;
-    uint n_masks = params.num_masks;
-    uint pre_len = params.n_prepend;
-    uint app_len = params.n_append;
-    uint total   = n_words * n_masks;
+    uint n_words      = params.num_words;
+    uint n_masks      = params.num_masks;
+    uint prep_dbytes  = params.n_prepend;   /* descriptor stream byte length */
+    uint app_dbytes   = params.n_append;    /* descriptor stream byte length */
+    uint total        = n_words * n_masks;
 
     uint gid = get_global_id(0);
     if (gid >= total) return;
@@ -257,46 +252,46 @@ void cand_masks_phase0(
     uint word_idx = gid % n_words;
     uint mask_idx = gid / n_words;
 
-    /* Compute per-side cardinalities. Cheap; both pattern arrays + the
-     * counts vector are uniform across the workgroup (cache-friendly).
-     * Values are well under 2^32 in practical use (per-side cap = 16
-     * positions * max 256 chars; full ?b?b?b?b?b = 1.1T which the spec
-     * R5 ASSERT keeps host-side). */
-    ulong append_total  = mask_pattern_total(mask_pattern_append,  app_len,
-                                             mask_class_counts);
+    /* Compute append-side cardinality from the descriptor stream.
+     * Uniform across the workgroup (all lanes read the same descriptor),
+     * so warp-coherent. */
+    ulong append_total = mask_pattern_total_run(mask_pattern_append,
+                                                app_dbytes,
+                                                mask_class_counts);
 
-    /* mdxfind procjob convention (mdxfind.c:12111-12162):
+    /* mdxfind procjob convention (mdxfind.c:12348-12349):
      *   append_idx  = idx % MaskAppendTotal
      *   prepend_idx = idx / MaskAppendTotal
      *
-     * Note: prepend_total is intentionally NOT computed. gid was already
-     * bounded by total = n_words * n_masks, and n_masks = MaskTotal =
-     * MaskPrependTotal * MaskAppendTotal, so any well-formed mask_idx
-     * decomposition is in-range. The host's R5-ASSERT (MaskTotal < 2^31)
-     * keeps the keyspace within ulong/uint dispatch limits. */
-    ulong append_idx  = (ulong)mask_idx % append_total;
+     * append_total is guaranteed >= 1 by mask_pattern_total_run's empty
+     * stream semantics; the guard below mirrors pre-amendment defensive
+     * code. */
+    ulong append_idx;
     ulong prepend_idx;
     if (append_total > 0ul) {
+        append_idx  = (ulong)mask_idx % append_total;
         prepend_idx = (ulong)mask_idx / append_total;
     } else {
-        /* Defensive: empty append side reduces to prepend-only iteration.
-         * Host normally guarantees append_total >= 1 (mask_pattern_total
-         * returns 1 for patlen=0), but guard against pathological zero. */
+        append_idx  = 0ul;
         prepend_idx = (ulong)mask_idx;
     }
 
-    /* Per-thread private mask scratch. MAX_MASK_POS_GPU bytes each side. */
-    uchar prebuf[MAX_MASK_POS_GPU];
-    uchar appbuf[MAX_MASK_POS_GPU];
+    /* Per-thread expanded-mask scratch. 240 B each side; 480 B per WI;
+     * 30 KB per WG at WG=64. Fits Pascal 65 KB and Apple M1 32 KB
+     * threadgroup limits. */
+    uchar prebuf[GPU_MASK_SIDE_EXPANDED_CAP];
+    uchar appbuf[GPU_MASK_SIDE_EXPANDED_CAP];
 
-    mask_expand_into_gpu(prepend_idx, mask_pattern_prepend, pre_len,
-                         mask_charsets, mask_class_counts, prebuf);
-    mask_expand_into_gpu(append_idx,  mask_pattern_append,  app_len,
-                         mask_charsets, mask_class_counts, appbuf);
+    int prelen = mask_expand_run_into_gpu(prepend_idx,
+                                          mask_pattern_prepend, prep_dbytes,
+                                          mask_charsets, mask_class_counts,
+                                          prebuf);
+    int applen = mask_expand_run_into_gpu(append_idx,
+                                          mask_pattern_append,  app_dbytes,
+                                          mask_charsets, mask_class_counts,
+                                          appbuf);
 
-    /* Deterministic sub-buffer pointers from params.num_words (identical
-     * to A1). The compiler hoists since they depend only on params
-     * (uniform across the dispatch). */
+    /* Decode input word from payload (same layout as A1). */
     __global const uint   *word_offset = (__global const uint *)(payload + 132);
     uint pkt_off = 132u + (n_words * 4u);
     __global const uchar  *words = payload + pkt_off;
@@ -304,18 +299,12 @@ void cand_masks_phase0(
     uint wpos = word_offset[word_idx];
     uint wlen = (uint)words[wpos++];
 
-    /* Final candidate length: [prebuf][word][appbuf]. Clamp via early
-     * return if it would overflow the uchar [len] slot. Per-spec v1
-     * the host should size word inputs so this never triggers; defensive
-     * guard keeps us safe under future scaling. */
-    uint final_len = pre_len + wlen + app_len;
+    /* Final candidate length: [prebuf][word][appbuf]. */
+    uint final_len = (uint)prelen + wlen + (uint)applen;
     if (final_len > MASK_FINAL_LEN_LIMIT) return;
 
-    /* --- Reserve a candidate slot ---------------------------------
-     * Identical atomic discipline to A1: byte reservation first, then
-     * capacity guard, then slot reservation. Overflow flag latched on
-     * either overflow. */
-    uint need_bytes = 1u + final_len;   /* [len][bytes] */
+    /* Reserve slot + byte offset (A1's atomic discipline). */
+    uint need_bytes = 1u + final_len;
     uint byte_off = atomic_add(
         &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
         need_bytes);
@@ -328,29 +317,17 @@ void cand_masks_phase0(
     uint slot = atomic_add(
         &b_kernelA_state[KERNELA_STATE_SLOT_COUNTER / 4u], 1u);
 
-    /* Slot-index capacity: bounded by num_words * num_masks. */
     if (slot >= total) {
         atomic_or(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u);
         return;
     }
 
-    /* --- Write [len][bytes] into packed buf -----------------------
-     * Layout: [final_len][prebuf...][word...][appbuf...] */
+    /* Write [len][bytes] into packed buf. */
     b_packed_buf[byte_off] = (uchar)final_len;
     uint p = byte_off + 1u;
-    for (uint i = 0; i < pre_len; i++) b_packed_buf[p++] = prebuf[i];
-    for (uint i = 0; i < wlen;    i++) b_packed_buf[p++] = words[wpos + i];
-    for (uint i = 0; i < app_len; i++) b_packed_buf[p++] = appbuf[i];
+    for (int i = 0; i < prelen; i++) b_packed_buf[p++] = prebuf[i];
+    for (uint i = 0; i < wlen;   i++) b_packed_buf[p++] = words[wpos + i];
+    for (int i = 0; i < applen; i++) b_packed_buf[p++] = appbuf[i];
 
-    /* --- Write per-slot byte offset -------------------------------
-     * Per contract S7.1, no parallel mask_idx sidecar. The composed
-     * plaintext IS the candidate at b_packed_buf[byte_off]; mask
-     * attribution can be re-derived from slot_idx if a future need
-     * arises. */
     b_chunk_index[slot] = byte_off;
-
-    /* Per-spec invariant 1: caller (Phase 4 host) relies on in-order
-     * single-queue FIFO to ensure these writes are visible to kernel B
-     * before kernel B dispatches. No explicit fence; the queue boundary
-     * provides the cross-kernel global-memory visibility. */
 }
