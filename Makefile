@@ -1,5 +1,13 @@
 # Platform detection based on hashpipe Makefile framework
 
+# v1.524 hot-fix: `include codegen/Makefile.frag` lower in this file is
+# parsed BEFORE the `all:` rule, so its first target
+# (codegen/hx_walker.o) would otherwise become the default goal and
+# plain `make` would build only that one .o file and exit. Pinning the
+# default goal up front keeps `make`/`make distclean && make` building
+# everything as expected.
+.DEFAULT_GOAL := all
+
 CC = cc
 AR = ar
 RANLIB = ranlib
