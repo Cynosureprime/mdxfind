@@ -598,6 +598,77 @@ void gpu_metal_jit_release_keep(void *library, void *pso);
  * Sunsets in Phase 5 along with the hand-written kernel files. */
 int gpu_metal_hx_codegen_enabled(void);
 
+/* gpu_metal_experiment_rules_codegen_md5_enabled REMOVED 2026-05-31
+ * per project_codegen_auto_dispatch_spec_2026-05-31.md (D1.c). The
+ * user-visible MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 env flag is
+ * RETIRED; the dispatcher now consults gpu/codegen_auto_dispatch.c
+ * per (op, iter, rules, mask, bf, backend_kind). Developer FORCE
+ * override: MDXFIND_GPU_BACKEND={auto|legacy|codegen}. */
+
+/* Knob G (Metal twin, 2026-05-29): env-flag gate that activates the
+ * coalesced uint4 (16-byte) candidate write path in Metal kernel A1
+ * (cand_rules_phase0). Returns 1 when MDXFIND_METAL_EXPERIMENT_KNOBG_-
+ * VEC_WRITE=1 is set; 0 otherwise. Decision cached.
+ *
+ * Unlike the OpenCL twin (which composes with the parent codegen
+ * experiment flag), the Metal flag stands alone: Metal kernel A1 is
+ * the production path for e347 + the 7 Phase-5a MAKE_MD5PASS family
+ * algos (e122/e159/e161/e163/e165/e167/e169). Unset = byte-identical
+ * to production-baseline Metal kernel (Phase 4a.2b, 2026-05-22).
+ *
+ * Consumed by metal_load_library_kernel_a_rules to thread
+ * -DKNOBG_VEC_WRITE=1 into MTLCompileOptions.preprocessorMacros at
+ * JIT library compile time. Spec: project_metal_knob_g_spec_2026-05-
+ * 29.md. */
+int gpu_metal_experiment_knobg_vec_write_enabled(void);
+
+/* Phase 0 timing harness (Knob G spec D3, 2026-05-29; D2.b refactored
+ * 2026-05-29 to auto-enable on MDXFIND_METAL_PROFILE_VARIANT): env-flag
+ * gate that enables per-dispatch kernel-A wall time recording via the
+ * MTLCommandBuffer's GPUStartTime/GPUEndTime, plus a shutdown-time
+ * aggregate dump. Returns 1 when EITHER MDXFIND_METAL_KERNEL_A_TIMING=1
+ * OR MDXFIND_METAL_PROFILE_VARIANT in 1..6 is set; 0 otherwise.
+ * Decision cached. Used for end-to-end + kernel-A A/B measurement when
+ * toggling Knob G on/off AND for PROFILE_VARIANT V0..V6 decomposition. */
+int gpu_metal_kernel_a_timing_enabled(void);
+
+/* PROFILE_VARIANT-for-Metal perf-decomposition env-flag gate (2026-05-29):
+ * returns 0..6 if MDXFIND_METAL_PROFILE_VARIANT is set to "0".."6";
+ * returns 0 (production-baseline V0) otherwise. Variants 1..5 are
+ * throwaway timing stubs (no valid candidates); V6 produces valid
+ * candidates with Metal Knob G FORCED ON (bit-equivalent to V0 +
+ * KNOBG_VEC_WRITE=1). Consumed by metal_load_library_kernel_a_rules to
+ * thread -DPROFILE_VARIANT=N into MTLCompileOptions.preprocessorMacros
+ * at JIT library compile time; cache forks automatically per variant
+ * (Apple MTLLibrary self-cache is keyed on source + macros).
+ * Spec: project_metal_profile_variant_spec_2026-05-29.md. */
+int gpu_metal_profile_variant(void);
+
+/* gpu_metal_kernel_a4_profile_variant -- PROFILE_VARIANT-for-A4 env-flag
+ * gate (Metal twin, 2026-05-30). Returns 1..5 when MDXFIND_METAL_KERNEL_-
+ * A4_PROFILE_VARIANT is set to a valid value AND the active kernel-A
+ * variant is 4 (host gate R5); returns 0 otherwise (legacy byte-identical
+ * baseline V0 = production unchanged).
+ *
+ * Variant meanings (also documented in gpu/metal_kernel_a_bruteforce.metal
+ * file-top A4_PROFILE_VARIANT block):
+ *   V0 (unset / 0)  baseline -- full cand_bruteforce_phase0 (uint4 stores
+ *                    by default post-2026-05-30 A4 C5 default-on refactor;
+ *                    the env-gated KNOBG path + V6 cell were removed
+ *                    because the A/B measurement was decisive)
+ *   V1               no atomic claim (per-lane gid*256 strided; CONFOUNDED
+ *                    on AGX per spec §9 R1)
+ *   V2               no candidate write (atomic still runs)
+ *   V3               stub charset walk -- EXPECTED A4 DOMINANT
+ *   V4               decode-only (return after absolute_mask_idx ladder)
+ *   V5               empty kernel (return immediately)
+ *
+ * Per spec §4 D1.a: separate per-engine env var (cross-engine pollution
+ * avoidance). Apple MTLLibrary self-cache is keyed on source + macros
+ * so JIT cache disambiguation per variant is automatic.
+ * Spec: project_kernel_a_a4_profile_variant_spec_2026-05-30.md. */
+int gpu_metal_kernel_a4_profile_variant(void);
+
 /* Phase 4 sub-phase 4a.2 (2026-05-21): lazy-init helper that returns the
  * cached MTLComputePipelineState for the hx-codegen-emitted Metal kernel
  * `kernelb_hx_e347_phase0` on the requested device. On first call per
@@ -685,6 +756,28 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,
     int op, int *nhits_out);
+
+/* Metal twin of gpu_opencl_kernelb_proto_plaintext (gpu/gpu_opencl.c:14483).
+ * Recover the post-rule candidate plaintext for a hit emitted by the Metal
+ * codegen kernel B (e347 + the seven Phase-5a MAKE_MD5PASS family algos).
+ * The kernel B writes entry[0] = slot_idx (a packed-buffer slot index in the
+ * kernel-A scratch buffer mtl_buf_proto_packed), NOT a host-side widx. This
+ * accessor resolves slot_idx through the kernel-A index buffer
+ * (mtl_buf_proto_chunk_index) into the kernel-A packed buffer
+ * (mtl_buf_proto_packed) using the same [len][bytes] layout the OpenCL
+ * twin's h_proto_packed_readback uses.
+ *
+ * Must be called AFTER the kernel-A + kernel-B command buffers have
+ * completed (the dispatcher already waits on both via waitUntilCompleted;
+ * the Apple Shared MTLBuffer contents are coherent by then).
+ *
+ * Returns a pointer into the Shared MTLBuffer's contents (caller does NOT
+ * free; valid until the next kernel-A dispatch clobbers the buffer); sets
+ * *plen_out to the plaintext byte count. Returns NULL on out-of-range
+ * slot_idx, missing buffers, or device not ready. dev_idx must be 0 on
+ * Metal (single-device). */
+const char *gpu_metal_kernelb_proto_plaintext(int dev_idx,
+    uint32_t hit_widx, int *plen_out);
 
 #ifdef __cplusplus
 }

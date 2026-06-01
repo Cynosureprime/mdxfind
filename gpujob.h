@@ -204,6 +204,31 @@ void gpujob_overflow_preload_all(void);
  * pool-shared and may be used as legacy for CPU-rule expansions. */
 #define GPU_RULES_MAX_WORDS_PER_BATCH 16384
 #define GPUBATCH_RULES_PACKED_SIZE   (GPU_RULES_MAX_WORDS_PER_BATCH * 256)
+
+/* RULE-AXIS CHUNKING (Option A, 2026-05-29) — codegen two-kernel proto path
+ * candidate-buffer cap. The codegen pipeline (gpu_opencl_kernelb_dispatch_proto)
+ * materializes post-rule candidates in a global buffer sized
+ * num_words * n_rules * 256. At 16384 words x 99K rules (dive.rule, an ORDINARY
+ * ruleset) that is ~415 GB -> OOM FATAL. The dispatcher caps the per-dispatch
+ * candidate buffer to GPU_RULES_CAND_CAP_FRACTION of device VRAM (clamped to
+ * [GPU_RULES_CAND_CAP_MIN_MB, GPU_RULES_CAND_CAP_MAX_MB]) and loops disjoint
+ * rule sub-ranges (rule chunks) of K = cap_bytes/(num_words*256) rules each.
+ * Env override MDXFIND_GPU_CAND_CAP_MB sets cap_bytes directly (0/unset =
+ * fraction). The legacy streaming rules-engine (gpu_opencl_dispatch_md5_rules)
+ * hashes inline and never materializes candidates, so it has no such cap and
+ * is unaffected by these. */
+#define GPU_RULES_CAND_CAP_FRACTION  0.25
+#define GPU_RULES_CAND_CAP_MIN_MB    64
+#define GPU_RULES_CAND_CAP_MAX_MB    1024
+
+/* RULE-AXIS CHUNKING (Metal twin, 2026-05-31) — gpu_metal_kernelb_dispatch_-
+ * proto_chunked candidate-buffer cap. Apple unified memory: shared with macOS
+ * + every other process; cap fraction conservative-lower than OpenCL's
+ * (0.15 vs 0.25). Env override MDXFIND_METAL_GPU_CAND_CAP_MB sets cap_bytes
+ * directly. Hard ceiling MAX_MB mirrors OpenCL. GPU_RULES_CAND_CAP_MIN_MB
+ * (64) above is reused unchanged for the floor. */
+#define GPU_RULES_METAL_CAND_CAP_FRACTION  0.15
+#define GPU_RULES_METAL_CAND_CAP_MAX_MB    1024
 /* Maximum input-word length accepted by the GPU rules-engine pack path
  * in mdxfind.c. MUST match RULE_BUF_LIMIT in gpu/gpu_md5_rules.cl
  * (currently 40959 = RULE_BUF_MAX(40960) - 1). The walker's private buf

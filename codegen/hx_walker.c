@@ -76,8 +76,11 @@
  * NULL entry the walker FATALs uniformly. e347 and per-opcode generic
  * dispatch remain entry-independent.
  *
- * $Revision: 1.7 $
+ * $Revision: 1.8 $
  * $Log: hx_walker.c,v $
+ * Revision 1.8  2026/05/28 14:32:17  dlr
+ * Phase 1b Batch 1: add UNSALTED_SINGLE dispatch arm to hx_emit_kernel routes the 3-op hash of pass shape to hx_emit_unsalted_single_opencl or _metal both backends ship in Batch 1; requires entry for the per-program callnames sidecar FATAL on NULL; placed after the FAMILY_MD5PASS arm
+ *
  * Revision 1.7  2026/05/23 03:21:40  dlr
  * sub-phase 5a.3 walker FAMILY_MD5PASS Metal arm replaces 5a.2 fallthrough placeholder with real hx_emit_family_md5pass_metal dispatch both backends now share the same entry-required gate on NULL entry walker FATALs uniformly e347 and per-opcode generic dispatch remain entry-independent
  *
@@ -552,6 +555,38 @@ int hx_emit_kernel(const hx_program *prog,
                 "-- no emitter for this backend; falling through to "
                 "per-opcode generic dispatch (placeholder, NOT byte-exact "
                 "correct)\n",
+                (int)backend);
+    } else if (pat == HX_PATTERN_UNSALTED_SINGLE) {
+        /* Phase 1b Batch 1 (2026-05-28): unsalted single-hash emitter
+         * (hash(pass), category (a)). Requires entry (resolves the
+         * single CALL primitive via the per-program callnames sidecar).
+         * Both backends ship in Batch 1. */
+        if (!entry) {
+            fprintf(stderr,
+                    "FATAL: hx_walker.c hx_emit_kernel: "
+                    "UNSALTED_SINGLE requires entry (per-program "
+                    "callnames sidecar) but caller passed NULL.\n");
+            return -1;
+        }
+        if (backend == HX_BACKEND_OPENCL) {
+            fprintf(stderr,
+                    "hx codegen: UNSALTED_SINGLE pattern matched (opencl) "
+                    "(ncode=%d nvars=%d) -- dispatching to unsalted emitter\n",
+                    prog->ncode, prog->nvars);
+            return hx_emit_unsalted_single_opencl(out, out_cap, prog,
+                                                  zone, entry);
+        }
+        if (backend == HX_BACKEND_METAL) {
+            fprintf(stderr,
+                    "hx codegen: UNSALTED_SINGLE pattern matched (metal) "
+                    "(ncode=%d nvars=%d) -- dispatching to unsalted emitter\n",
+                    prog->ncode, prog->nvars);
+            return hx_emit_unsalted_single_metal(out, out_cap, prog,
+                                                 zone, entry);
+        }
+        fprintf(stderr,
+                "hx codegen: UNSALTED_SINGLE pattern matched (backend=%d) "
+                "-- no emitter for this backend; falling through.\n",
                 (int)backend);
     } else if (pat != HX_PATTERN_UNKNOWN) {
         /* Detected a pattern but backend not yet implemented; annotate

@@ -57,8 +57,38 @@
  * to small zero buffers; production dispatcher binds the device's
  * existing salt buffers since they're already provisioned.
  *
- * $Revision: 1.11 $
+ * $Revision: 1.21 $
  * $Log: hx_emit_opencl.c,v $
+ * Revision 1.21  2026/05/31 14:08:21  dlr
+ * Codegen kernel B iteration v1 (-i N>1) paired OpenCL + Metal per spec D-defaults all .a. (1) Runtime iter via existing OCLParams.max_iter (offset 60, zero ABI change). (2) Per-primitive iter-feed helpers for MD5+MD4+SHA1+SHA256 in codegen/hx_emit_opencl.c:4191-4480 + Metal twin codegen/hx_emit_metal.c:3829-4140. (3) Iteration loop wraps kernel B body with per-iter mask 1u << (iter & 31u). (4) Hex-encoded digest feedback mirrors legacy md5_rules_phase0 at gpu/gpu_md5_rules.cl:1158-1193 byte-exact. (5) OpenCL host drops iter==1 clause at gpu/gpujob_opencl.c:1172-1195; unhardcodes params.max_iter=1 at gpu/gpu_opencl.c:14071 + :13212. (6) Metal NEW capability: JOB_MD5 admission added to Metal codegen at gpu_metal.m:4814 (was salted-only); new accessor at :4077-4108; route gate at gpu/gpujob_metal.m:1248-1313. Validated 20-cell crack-parity Pascal+Maxwell+M1 byte-identical at iter in {1,2,5,10,100}; R1 hex-feedback verified via C-oracle harness BEFORE crack-parity. Production safety env UNSET unchanged. Gate C 99K rules x -i 10 x rockyou-1m x Pascal: legacy 305.42s vs codegen 425.56s = 1.39x slower (vs 1.46x at -i 1 — gap closes at -i 10). Gate D NEW: Metal -m e1 -i N>1 works correctly via codegen for first time (legacy template_iterate gap remained; codegen sidesteps). v1.1 follow-on: widen route gate for MD4/SHA1RAW/SHA256RAW admission. Spec project_codegen_iteration_v1_spec_2026-05-31.md.
+ *
+ * Revision 1.20  2026/05/28 14:32:03  dlr
+ * Phase 1b Batch 1: add hx_emit_unsalted_single_opencl + hx_emit_unsalted_single_metal one-shot hash of pass emitters for HX_PATTERN_UNSALTED_SINGLE; reuse md5 md4 sha1 sha256 block from gpu_common.cl and metal_common.metal; strictly simpler than family no inner md5 no hex32 no concat; per-primitive usp buf-global helpers reproduce the family MD SHA padding applied to raw pass; SHA1 SHA256 BE to LE state byte-swap for the compact_fp probe; kernel signature mirrors kernelb_hx_codegen_phase0 salt args ignored; reqd work group size 64; C-mirror validated 80 of 80 byte-exact before GPU JIT; FATAL on callname not in wired set md5 md4 sha1 sha256
+ *
+ * Revision 1.19  2026/05/28 06:12:15  dlr
+ * sub-phase 5c.2.1 OpenCL multi-emit family kernel body plus MD5-as-outer helper for e123 MD5MD5PASS the FIRST multi-emit member; new emit_outer_md5_concat_then_hash mirrors the MD4 helper LE schedule 4-uint state 16-byte digest plus a sep parameter; sep 0 canonical hex32 then pass sep 1 colon hex32 then colon-byte then pass shifts pass to logical position 33 total_len 33 plus plen; new emit_family_md5pass_kernel_multiemit emits compute md5 of pass once then N equals 2 unrolled probe-and-emit blocks one per variant each calling outer helper with its sep then probe_compact_idx then the EXISTING EMIT_HIT_4_DEDUP_OR_OVERFLOW macro unchanged dedup keys on per-variant matched_idx; emit_class threaded through hx_emit_family_md5pass_opencl plus emit_family_md5pass_kernel single-emit path untouched; replaced HX_PRIM_MD5 FATAL with emit_class gate MD5-outer admitted only when HX_EMIT_MULTI; wired MD5 into per-primitive emit dispatch plus FATAL filter; dumped kernel on fpga Pascal shows both sep 0 and sep 1 blocks JIT-compiles clean
+ *
+ * Revision 1.18  2026/05/28 04:49:21  dlr
+ * 5b.4b.3: add bespoke emit_outer_gost_concat_then_hash OpenCL helper for GOST R 34.11-94 e125; walks hex32-bar-pass in 32-byte LE blocks accumulating sum8 mod-2^256 checksum + bit-length glen, dual finalization compress glen then sum, LE state output h0..h3 equals hash 0..3 no byteswap; wired 4 sites helper-name switch call-line tree FATAL filter widened to 29 dispatch switch; unified-loop control flow validated byte-exact vs gosthash donor 20 of 20 lengths
+ *
+ * Revision 1.17  2026/05/28 04:32:05  dlr
+ * sub-phase 5b4a3 add parameterised emit_outer_snefru_concat_then_hash helper to hx_emit_opencl.c per D18.1.a D18.3.a ONE C-side helper emits a GPU function specialised on is256 plus digest_bytes covers both Snefru widths e175 SNE128 16-byte is256 0 e177 SNE256 32-byte is256 1 block-size asymmetry R-Tier4-snefru-blocksize SNE128 48-byte data blocks SNE256 32-byte data blocks DBLK equals 64 minus digest_bytes padding plus length-field byte offsets baked per-width length be2me_32 len shifted 29 at block DBLK minus 8 be2me_32 len shifted left 3 at block DBLK minus 4 len in BYTES Snefru IV all-zero 8 rounds fixed BE schedule plus BE state output bswap32 into LE-uint probe frame per feedback_be_state_primitives_need_byteswap_in_codegen CPU recompute fills SNE256 remaining 16 bytes on hit SNE128 exactly 16 bytes wired 4 OpenCL sites helper-name switch outer_snefru128 outer_snefru256 distinct names call-line tree 2 SNE branches FATAL gating filter widened to add sne128 sne256 wired subset emit dispatch switch routes SNE128 is256 0 SNE256 is256 1 to emit_outer_snefru_concat_then_hash C-mirror test_snefru_port 56 of 56 cells PASS vs librhash both widths byte-exact
+ *
+ * Revision 1.16  2026/05/28 03:52:49  dlr
+ * sub-phase 5b3c3 wire 5 HAV*_5 enums into emit_outer_haval_concat_then_hash OpenCL dispatch added HX_PRIM_HAV128_5 HAV160_5 HAV192_5 HAV224_5 HAV256_5 to 4 sites helper-name switch fall-through group call-line tree terminal else comment updated to any 3-pass 4-pass or 5-pass FATAL gating filter widened to 26 wired primitives new dispatch switch group routes HAV*_5 to emit_outer_haval with passes 5 the parameterised helper bakes haval5_block call plus block 118 0x29 5-pass encoding automatically R13 verified in dumped e131 e155 kernels
+ *
+ * Revision 1.15  2026/05/28 03:19:46  dlr
+ * sub-phase 5b3b3 wire 5 HAV*_4 enums into emit_outer_haval_concat_then_hash OpenCL dispatch added HX_PRIM_HAV128_4 HAV160_4 HAV192_4 HAV224_4 HAV256_4 to 3 sites helper-name switch fall-through group call-line tree terminal else comment updated to any 3-pass or 4-pass FATAL gating filter widened to 21 wired primitives new dispatch switch group routes HAV*_4 to emit_outer_haval with passes 4 the parameterised helper bakes haval4_block call plus block 118 0x21 4-pass encoding automatically R13 verified in dumped e129 e153 kernels
+ *
+ * Revision 1.14  2026/05/28 02:24:53  dlr
+ * sub-phase 5b3a3 add parameterised emit_outer_haval_concat_then_hash helper to hx_emit_opencl c per D17.1.a ONE C-side helper emits a GPU function specialised on passes plus digest_bytes covers all 15 HAVAL variants 5b3a ships 5 3-pass via passes 3 fixed digest_bytes 16 20 24 28 32 emitted GPU function outer_haval_concat_then_hash 128-byte block 32 LE-packed uint32 words PAD-TOGGLE 0x01 NOT 0x80 cited donor mhash haval c 760 block 118 119 parameter encoding computed at C-emit time baked as literal constants R1 mitigation 64-bit bitlen LE block 120 127 post-compression digest fold JIT-specialised per width exactly ONE branch emitted no runtime conditional donor havalFinal 816-911 128-bit heavy byte-redistribution 160-bit ROTR fold 192-bit 5-bit-slice 224-bit byte-slot-shift 256-bit no fold direct output R3 mitigation HAVAL state LE-native h0 to h3 state 0 to 3 direct no byte-swap wired 4 OpenCL sites helper-name switch 5 HAV arms call-line tree HAVAL branch FATAL filter widened to 16 primitives emit dispatch switch 5 HAV arms route to emit_outer_haval with passes 3 digest_bytes from outer_digest_bytes C-mirror validated 60 of 60 cells PASS pre-port
+ *
+ * Revision 1.13  2026/05/27 23:07:04  dlr
+ * sub-phase 5b2b3 add emit_outer_tiger_concat_then_hash bespoke per-primitive emit helper for Tiger outer hash structurally divergent from sha2_64 and wrl in 5 ways LE schedule M packed lo-byte-first 8-byte LE length suffix at M7 padding byte 0x01 legacy Tiger NOT Tiger2 0x80 state IV Tiger initial chaining value 0x0123456789abcdef 0xfedcba9876543210 0xf096a5b4c3b2e187 3-ulong state single-block fast path APPLICABLE for plen le 23 threshold 32 plus plen plus 1 plus 8 le 64 unlike Whirlpool which ALWAYS multi-blocks calls tiger_block from gpu_common.cl rev 1.29 LE state output direct extract no byte-swap epilogue h0..h3 from state 0..1 directly added HX_PRIM_TIGER case to helper-name switch outer_tiger_concat_then_hash TIGER branch to call-line tree helper_has_h4 0 TIGER to FATAL gating filter widened to md2 md4 rmd128 sha1 sha224 sha256 sha384 sha512 rmd160 wrl tiger 11 of 11 wired subset via 5a.4 plus 5b.1a plus 5b.1b plus 5b.2a plus 5b.2b TIGER case to emit dispatch switch routes outer_id TIGER to new emit_outer_tiger_concat_then_hash CPU translation test 7 NESSIE vectors plus 1M-a stress PASS byte-exact vs rhash_tiger and sph_tiger R12 pre-flight 16 of 16 cells PASS 2026-05-27 OpenCL twin only Metal twin in 5b2b3-metal
+ *
+ * Revision 1.12  2026/05/27 22:23:47  dlr
+ * sub-phase 5b2a3 add emit_outer_wrl_concat_then_hash bespoke per-primitive emit helper for Whirlpool outer hash structurally divergent from sha2_64 in 4 ways block size 64 not 128 length suffix 32 bytes BE at M4 to M7 high 24 bytes always zero state IV all zero per Whirlpool spec ALWAYS multi-block single-block fast path elided 32 plus plen plus 1 plus 32 le 64 never holds calls wrl_block from gpu_common.cl rev 1.28 BE state byte-swap epilogue identical to emit_outer_sha2_64 first_has_pad logic mirrors sha512 helper added HX_PRIM_WRL case to helper-name switch outer_wrl_concat_then_hash WRL branch to call-line tree helper_has_h4 0 WRL to FATAL gating filter widened to md2 md4 rmd128 sha1 sha224 sha256 sha384 sha512 rmd160 wrl 10 of 10 wired subset via 5a.4 plus 5b.1a plus 5b.1b plus 5b.2a WRL case to emit dispatch switch routes outer_id WRL to new emit_outer_wrl_concat_then_hash CPU translation test 8 NESSIE vectors PASS byte-exact vs librhash and OpenSSL R12 pre-flight confirmed 2026-05-27 OpenCL twin only Metal twin in 5b2a3-metal
+ *
  * Revision 1.11  2026/05/27 18:40:48  dlr
  * sub-phase 5b1b7 revert RIPEMD-128 length-field bug-compat workaround in emit_outer_rmd128_concat_then_hash now that the in-tree rmd128.c MDfinish length-encoding bug is fixed at rmd128.c rev 1.1. Removes bug_lswlen first_has_pad branch from both single-block tail branch and 2-block else branch. Both branches now use bitlen equals total_len times 8 unconditionally per Bosselaers 1996 reference and sph_ripemd128. After the fix mdxfind CPU oracle and GPU emit both produce standard-conformant RIPEMD-128 digests byte-exact across the full plen range. User confirmed 2026-05-27 no production solved-hash records affected by the standard-conformance flip because plen greater than 60 inputs were never exercised in archives for RIPEMD128-using catalog entries e132 e157 e162 e211 e231.
  *
@@ -1509,6 +1539,178 @@ static int emit_outer_md4_concat_then_hash(char **out,
     return rc;
 }
 
+/* Sub-phase 5c.2 (2026-05-27): MD5-as-OUTER multi-emit helper for e123
+ * MD5MD5PASS -- the FIRST multi-emit family member.
+ *
+ * MD5 was always the INNER hash in the shipped family; e123 needs MD5 as
+ * the OUTER too. This helper is structurally identical to the MD4 helper
+ * (LE schedule, 4-uint state, 16-byte digest, single-block fast path +
+ * multi-block first_has_pad tail) with two differences:
+ *   1. it calls md5_block (not md4_block); and
+ *   2. it takes a `sep` parameter encoding the multi-emit variant:
+ *        sep == 0 -> canonical: outer message = hex32(md5(pass)) || pass
+ *                    (total_len = 32 + plen)
+ *        sep == 1 -> colon:     outer message = hex32 || ':' || pass
+ *                    (total_len = 33 + plen; one ':' byte injected at
+ *                     logical position 32, shifting pass to start at 33)
+ *
+ * Both variants share the SAME md5(pass) inner state (mma..mmd); only the
+ * outer concatenation + final MD5 differ. The family kernel body calls
+ * this helper TWICE (sep=0 then sep=1) for emit_class==HX_EMIT_MULTI,
+ * matching the CPU oracle (mdxfind.c:25181-25204) which builds linebuf
+ * (canonical) + linebuf2 (colon) and checkhash()es each independently.
+ *
+ * MD5 schedule is LITTLE-ENDIAN; md5_block returns LE uints; CPU oracle
+ * mymd5() stores LE bytes; harness reinterprets as LE uints -> direct
+ * byte-exact match. NO state byte-swap. */
+static int emit_outer_md5_concat_then_hash(char **out,
+                                           size_t *cap, size_t *len)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_md5_concat_then_hash -- MD5 over the\n"
+        "// multi-emit outer message. sep selects the variant:\n"
+        "//   sep==0 : hex32(md5(pass)) || pass            (canonical)\n"
+        "//   sep==1 : hex32(md5(pass)) || ':' || pass     (colon)\n"
+        "// Output: 4 uints (h0..h3). MD5 schedule is LITTLE-ENDIAN;\n"
+        "// md5_block returns LE uints natively; NO state byte-swap.\n"
+        "// The hex32 prefix occupies logical bytes [0..31]; when sep==1\n"
+        "// a single ':' byte sits at logical position 32 and pass starts\n"
+        "// at position 33. base = 32 + sep is the logical start of pass.\n"
+        "static void outer_md5_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen, int sep,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int base = 32 + sep;               // logical start of pass\n"
+        "    int total_len = base + plen;\n"
+        "\n"
+        "    // MD5 initial state.\n"
+        "    uint a = 0x67452301u, b = 0xEFCDAB89u, c = 0x98BADCFEu, d = 0x10325476u;\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    // MD5 schedule words are LITTLE-ENDIAN (b0|b1<<8|b2<<16|b3<<24).\n"
+        "    uint M[16];\n"
+        "    int byte_pos = 0;\n"
+        "    int pass_consumed = 0;\n"
+        "    int first_has_pad = 0;\n"
+        "\n"
+        "    // First block, logical bytes [0..63]:\n"
+        "    //   [0..31]  hex32\n"
+        "    //   [32]     ':' if sep==1\n"
+        "    //   [base..] as much of pass as fits.\n"
+        "    // p_in_first = how many pass bytes land in the first block.\n"
+        "    int p_in_first = plen;\n"
+        "    if (p_in_first > 64 - base) p_in_first = 64 - base;\n"
+        "    if (p_in_first < 0) p_in_first = 0;\n"
+        "    {\n"
+        "        for (int w = 0; w < 8; w++) {\n"
+        "            int bo = w * 4;\n"
+        "            M[w] = (uint)inner_hex[bo]\n"
+        "                 | ((uint)inner_hex[bo + 1] << 8)\n"
+        "                 | ((uint)inner_hex[bo + 2] << 16)\n"
+        "                 | ((uint)inner_hex[bo + 3] << 24);\n"
+        "        }\n"
+        "        for (int w = 8; w < 16; w++) M[w] = 0u;\n"
+        "        // Inject the ':' separator at logical position 32 (sep==1).\n"
+        "        if (sep) {\n"
+        "            int abs_pos = 32;\n"
+        "            int wi = abs_pos >> 2;\n"
+        "            int sh = (abs_pos & 3) * 8;  // LE\n"
+        "            M[wi] |= (uint)':' << sh;\n"
+        "        }\n"
+        "        for (int i = 0; i < p_in_first; i++) {\n"
+        "            int abs_pos = base + i;\n"
+        "            uint v = (uint)pass[i];\n"
+        "            int wi = abs_pos >> 2;\n"
+        "            int sh = (abs_pos & 3) * 8;  // LE\n"
+        "            M[wi] |= v << sh;\n"
+        "        }\n"
+        "        pass_consumed = p_in_first;\n"
+        "        byte_pos = base + p_in_first;\n"
+        "    }\n"
+        "\n"
+        "    // Single-block fast path: pad (1 byte) + 8-byte length fit in\n"
+        "    // the first block iff total_len + 1 + 8 <= 64 (total_len <= 55).\n"
+        "    if (total_len + 1 + 8 <= 64) {\n"
+        "        int pad_pos = byte_pos;\n"
+        "        int wi = pad_pos >> 2;\n"
+        "        int sh = (pad_pos & 3) * 8;\n"
+        "        M[wi] |= 0x80u << sh;\n"
+        "        ulong bitlen = (ulong)total_len * 8u;\n"
+        "        // MD5 length is LITTLE-ENDIAN 64-bit at M[14]/M[15].\n"
+        "        M[14] = (uint)(bitlen & 0xffffffffu);\n"
+        "        M[15] = (uint)(bitlen >> 32);\n"
+        "        md5_block(&a, &b, &c, &d, M);\n"
+        "        *h0 = a; *h1 = b; *h2 = c; *h3 = d;\n"
+        "        return;\n"
+        "    }\n"
+        "\n"
+        "    // Multi-block path. If ALL pass bytes fit in the first block\n"
+        "    // (p_in_first == plen) but pad+len do not, place the 0x80 in\n"
+        "    // the first block now (first_has_pad) and the tail carries\n"
+        "    // only the length. Mirrors the MD4 / e347 first_has_pad fix.\n"
+        "    if (p_in_first == plen && byte_pos < 64) {\n"
+        "        int pad_pos = byte_pos;\n"
+        "        int wi = pad_pos >> 2;\n"
+        "        int sh = (pad_pos & 3) * 8;\n"
+        "        M[wi] |= 0x80u << sh;\n"
+        "        first_has_pad = 1;\n"
+        "    }\n"
+        "    md5_block(&a, &b, &c, &d, M);\n"
+        "\n"
+        "    int pleft = plen - pass_consumed;\n"
+        "    while (pleft >= 64) {\n"
+        "        for (int w = 0; w < 16; w++) {\n"
+        "            int bo = pass_consumed + w * 4;\n"
+        "            M[w] = (uint)pass[bo]\n"
+        "                 | ((uint)pass[bo + 1] << 8)\n"
+        "                 | ((uint)pass[bo + 2] << 16)\n"
+        "                 | ((uint)pass[bo + 3] << 24);\n"
+        "        }\n"
+        "        md5_block(&a, &b, &c, &d, M);\n"
+        "        pass_consumed += 64;\n"
+        "        pleft -= 64;\n"
+        "    }\n"
+        "\n"
+        "    for (int w = 0; w < 16; w++) M[w] = 0u;\n"
+        "    for (int i = 0; i < pleft; i++) {\n"
+        "        uint v = (uint)pass[pass_consumed + i];\n"
+        "        int wi = i >> 2;\n"
+        "        int sh = (i & 3) * 8;\n"
+        "        M[wi] |= v << sh;\n"
+        "    }\n"
+        "    if (!first_has_pad) {\n"
+        "        int pad_pos = pleft;\n"
+        "        int wi = pad_pos >> 2;\n"
+        "        int sh = (pad_pos & 3) * 8;\n"
+        "        M[wi] |= 0x80u << sh;\n"
+        "    }\n"
+        "    if (pleft + 1 + 8 <= 64 || (first_has_pad && pleft + 8 <= 64)) {\n"
+        "        ulong bitlen = (ulong)total_len * 8u;\n"
+        "        M[14] = (uint)(bitlen & 0xffffffffu);\n"
+        "        M[15] = (uint)(bitlen >> 32);\n"
+        "        md5_block(&a, &b, &c, &d, M);\n"
+        "    } else {\n"
+        "        md5_block(&a, &b, &c, &d, M);\n"
+        "        for (int w = 0; w < 16; w++) M[w] = 0u;\n"
+        "        ulong bitlen = (ulong)total_len * 8u;\n"
+        "        M[14] = (uint)(bitlen & 0xffffffffu);\n"
+        "        M[15] = (uint)(bitlen >> 32);\n"
+        "        md5_block(&a, &b, &c, &d, M);\n"
+        "    }\n"
+        "    // MD5 state is LE; direct copy.\n"
+        "    *h0 = a; *h1 = b; *h2 = c; *h3 = d;\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
 /* Per-primitive outer body emit: RIPEMD-160 (LE-schedule, 5-uint state). */
 /* Per-primitive outer body emit: RMD128 (LE-schedule, 4-uint state).
  * Sub-phase 5b.1b (2026-05-27) Tier 1. Clone of the RMD-160 helper
@@ -2203,6 +2405,863 @@ static int emit_outer_sha512_concat_then_hash(char **out,
         "outer_sha512_concat_then_hash", iv, "SHA-512");
 }
 
+/* Whirlpool emit helper. Phase 5b Tier 2 sub-phase 5b.2a.3 (2026-05-27).
+ *
+ * Bespoke per D16.3.a. Differs from emit_outer_sha512 in 4 key ways:
+ *   1. Block size 64 (not 128); 8 ulong words per block.
+ *   2. Length suffix is 32 bytes BE at M[4..7]; in practice the
+ *      family use case never exceeds 2^64 bits so M[4..6] = 0 and
+ *      M[7] = bitlen.
+ *   3. State IV is all zero (Whirlpool spec); not the SHA-2 IVs.
+ *   4. ALWAYS multi-block: single-block fast path threshold
+ *      32 + plen + 1 + 32 <= 64 -> plen <= -1 never holds. The fast
+ *      path branch is elided entirely. See Tier 2 spec §3 D16.3.
+ *
+ * State output is BE bytes of state[0..7]; first 16 bytes for the
+ * compact_fp probe come from state[0..1] via byte-swap-as-ulong then
+ * LE-uint split (identical epilogue to the sha2_64 helper). */
+static int emit_outer_wrl_concat_then_hash(char **out,
+                                           size_t *cap, size_t *len)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_wrl_concat_then_hash -- Whirlpool over\n"
+        "// (hex32(md5(pass)) || pass). Total input length = 32 + plen.\n"
+        "// Output: 8 ulongs internally (Whirlpool full state). First 4\n"
+        "// LE-uints written to h0..h3 for compact_fp probe (= first 16\n"
+        "// bytes of digest = first 2 ulongs of BE state, byte-swap as\n"
+        "// ulong then split). Block size 64; length suffix 32 bytes BE\n"
+        "// at M[4..7] (M[4..6] always zero for family use case).\n"
+        "// ALWAYS multi-block (single-block fast path elided per Tier 2\n"
+        "// spec finding: 32+plen+1+32 <= 64 never holds).\n"
+        "static void outer_wrl_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "\n"
+        "    // Whirlpool IV: all-zero.\n"
+        "    ulong state[8];\n"
+        "    for (int i = 0; i < 8; i++) state[i] = 0ul;\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    // 64-byte Whirlpool block, 8 ulong message words. M[w]\n"
+        "    // packs 8 bytes BE (b0<<56 | ... | b7).\n"
+        "    ulong M[8];\n"
+        "    int byte_pos = 0;\n"
+        "    int pass_consumed = 0;\n"
+        "    int first_has_pad = 0;\n"
+        "\n"
+        "    // p_in_first = how many pass bytes fit in the first block\n"
+        "    // alongside the 32-byte hex32 prefix. Block-cap = 64 - 32 = 32.\n"
+        "    int p_in_first = plen;\n"
+        "    if (p_in_first > 32) p_in_first = 32;\n"
+        "    {\n"
+        "        // M[0..3]: hex32 (32 B) packed BE per ulong.\n"
+        "        for (int w = 0; w < 4; w++) {\n"
+        "            int bo = w * 8;\n"
+        "            M[w] = ((ulong)inner_hex[bo]     << 56)\n"
+        "                 | ((ulong)inner_hex[bo + 1] << 48)\n"
+        "                 | ((ulong)inner_hex[bo + 2] << 40)\n"
+        "                 | ((ulong)inner_hex[bo + 3] << 32)\n"
+        "                 | ((ulong)inner_hex[bo + 4] << 24)\n"
+        "                 | ((ulong)inner_hex[bo + 5] << 16)\n"
+        "                 | ((ulong)inner_hex[bo + 6] <<  8)\n"
+        "                 |  (ulong)inner_hex[bo + 7];\n"
+        "        }\n"
+        "        for (int w = 4; w < 8; w++) M[w] = 0ul;\n"
+        "        for (int i = 0; i < p_in_first; i++) {\n"
+        "            int abs_pos = 32 + i;\n"
+        "            ulong v = (ulong)pass[i];\n"
+        "            int wi = abs_pos >> 3;\n"
+        "            int sh = (7 - (abs_pos & 7)) * 8;  // BE\n"
+        "            M[wi] |= v << sh;\n"
+        "        }\n"
+        "        pass_consumed = p_in_first;\n"
+        "        byte_pos = 32 + p_in_first;\n"
+        "    }\n"
+        "\n"
+        "    // ALWAYS multi-block (per Tier 2 spec elision finding).\n"
+        "    // If pass fully fit in first block AND there's room for 0x80,\n"
+        "    // mark first_has_pad so the tail loop doesn't re-emit it.\n"
+        "    if (p_in_first == plen && byte_pos < 64) {\n"
+        "        int pad_pos = byte_pos;\n"
+        "        int wi = pad_pos >> 3;\n"
+        "        int sh = (7 - (pad_pos & 7)) * 8;\n"
+        "        M[wi] |= ((ulong)0x80u) << sh;\n"
+        "        first_has_pad = 1;\n"
+        "    }\n"
+        "    wrl_block(state, M);\n"
+        "\n"
+        "    int pleft = plen - pass_consumed;\n"
+        "    while (pleft >= 64) {\n"
+        "        for (int w = 0; w < 8; w++) {\n"
+        "            int bo = pass_consumed + w * 8;\n"
+        "            M[w] = ((ulong)pass[bo]     << 56)\n"
+        "                 | ((ulong)pass[bo + 1] << 48)\n"
+        "                 | ((ulong)pass[bo + 2] << 40)\n"
+        "                 | ((ulong)pass[bo + 3] << 32)\n"
+        "                 | ((ulong)pass[bo + 4] << 24)\n"
+        "                 | ((ulong)pass[bo + 5] << 16)\n"
+        "                 | ((ulong)pass[bo + 6] <<  8)\n"
+        "                 |  (ulong)pass[bo + 7];\n"
+        "        }\n"
+        "        wrl_block(state, M);\n"
+        "        pass_consumed += 64;\n"
+        "        pleft -= 64;\n"
+        "    }\n"
+        "\n"
+        "    // Tail block(s): pack remaining pass bytes, set 0x80 pad if\n"
+        "    // not already in first block, append 32-byte BE length suffix\n"
+        "    // at M[4..7]. If pad+length don't fit in one block, emit two.\n"
+        "    for (int w = 0; w < 8; w++) M[w] = 0ul;\n"
+        "    for (int i = 0; i < pleft; i++) {\n"
+        "        ulong v = (ulong)pass[pass_consumed + i];\n"
+        "        int wi = i >> 3;\n"
+        "        int sh = (7 - (i & 7)) * 8;\n"
+        "        M[wi] |= v << sh;\n"
+        "    }\n"
+        "    if (!first_has_pad) {\n"
+        "        int pad_pos = pleft;\n"
+        "        int wi = pad_pos >> 3;\n"
+        "        int sh = (7 - (pad_pos & 7)) * 8;\n"
+        "        M[wi] |= ((ulong)0x80u) << sh;\n"
+        "    }\n"
+        "    // Length-pad fit: need pleft + 1 (pad) + 32 (length) <= 64,\n"
+        "    // i.e. pleft <= 31. If first_has_pad we already paid the +1\n"
+        "    // upstream so the threshold is pleft + 32 <= 64 -> pleft <= 32.\n"
+        "    if ((!first_has_pad && pleft + 1 + 32 <= 64) ||\n"
+        "        ( first_has_pad && pleft     + 32 <= 64)) {\n"
+        "        ulong bitlen = (ulong)total_len * 8ul;\n"
+        "        M[4] = 0ul;\n"
+        "        M[5] = 0ul;\n"
+        "        M[6] = 0ul;\n"
+        "        M[7] = bitlen;\n"
+        "        wrl_block(state, M);\n"
+        "    } else {\n"
+        "        wrl_block(state, M);\n"
+        "        for (int w = 0; w < 8; w++) M[w] = 0ul;\n"
+        "        ulong bitlen = (ulong)total_len * 8ul;\n"
+        "        M[4] = 0ul;\n"
+        "        M[5] = 0ul;\n"
+        "        M[6] = 0ul;\n"
+        "        M[7] = bitlen;\n"
+        "        wrl_block(state, M);\n"
+        "    }\n"
+        "\n"
+        "    // BE state -> LE uint pairs. Byte-swap state[0..1] as ulong,\n"
+        "    // then split into pair of LE uints (identical epilogue to\n"
+        "    // emit_outer_sha2_64_concat_then_hash).\n"
+        "    {\n"
+        "        ulong s0 = state[0], s1 = state[1];\n"
+        "        ulong sw0 = ((s0 & 0x00000000000000ffUL) << 56) |\n"
+        "                    ((s0 & 0x000000000000ff00UL) << 40) |\n"
+        "                    ((s0 & 0x0000000000ff0000UL) << 24) |\n"
+        "                    ((s0 & 0x00000000ff000000UL) <<  8) |\n"
+        "                    ((s0 & 0x000000ff00000000UL) >>  8) |\n"
+        "                    ((s0 & 0x0000ff0000000000UL) >> 24) |\n"
+        "                    ((s0 & 0x00ff000000000000UL) >> 40) |\n"
+        "                    ((s0 & 0xff00000000000000UL) >> 56);\n"
+        "        ulong sw1 = ((s1 & 0x00000000000000ffUL) << 56) |\n"
+        "                    ((s1 & 0x000000000000ff00UL) << 40) |\n"
+        "                    ((s1 & 0x0000000000ff0000UL) << 24) |\n"
+        "                    ((s1 & 0x00000000ff000000UL) <<  8) |\n"
+        "                    ((s1 & 0x000000ff00000000UL) >>  8) |\n"
+        "                    ((s1 & 0x0000ff0000000000UL) >> 24) |\n"
+        "                    ((s1 & 0x00ff000000000000UL) >> 40) |\n"
+        "                    ((s1 & 0xff00000000000000UL) >> 56);\n"
+        "        *h0 = (uint)(sw0 & 0xffffffffUL);\n"
+        "        *h1 = (uint)(sw0 >> 32);\n"
+        "        *h2 = (uint)(sw1 & 0xffffffffUL);\n"
+        "        *h3 = (uint)(sw1 >> 32);\n"
+        "    }\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
+/* Tiger emit helper. Phase 5b Tier 2 sub-phase 5b.2b.3 (2026-05-27).
+ *
+ * Bespoke per D16.3.a. Differs from emit_outer_sha512 / emit_outer_wrl in
+ * 5 key ways:
+ *   1. LE schedule (M packed LE, lowest-byte-first). Tiger spec is LE,
+ *      matching MD-family convention; OPPOSITE to Whirlpool/SHA-2 BE.
+ *   2. Length suffix is 8 bytes LE at M[7]. M[7] = bitlen as LE ulong.
+ *   3. Padding byte is 0x01 (legacy Tiger, NOT Tiger2's 0x80). This is
+ *      a critical distinction -- the e171 catalog entry uses Tiger (not
+ *      Tiger2); mdxfind's CPU oracle calls sph_tiger_close (the Tiger
+ *      variant), and sph_tiger_close uses 0x01 padding (sph_tiger.c).
+ *   4. State IV is the Tiger initial chaining value
+ *      (0x0123456789abcdefUL, 0xfedcba9876543210UL, 0xf096a5b4c3b2e187UL);
+ *      3-ulong state (not 8 like Whirlpool).
+ *   5. Single-block fast path APPLICABLE for plen <= 23 (threshold
+ *      32 + plen + 1 + 8 <= 64 -> plen <= 23). Unlike Whirlpool which
+ *      ALWAYS multi-blocks. Common case (short passwords) takes the
+ *      fast path.
+ *
+ * State output is LE bytes of state[0..2]; first 16 bytes for the
+ * compact_fp probe come from state[0..1] DIRECTLY (no byte-swap) as
+ * (state[0] lo32, state[0] hi32, state[1] lo32, state[1] hi32). State[2]
+ * holds bytes 16..23 which the GPU dispatch discards; the CPU recompute
+ * path (5a.5 _proto_hexlen = 48 wiring) fills the remaining 8 bytes on
+ * hit for byte-exact full-width verification. */
+static int emit_outer_tiger_concat_then_hash(char **out,
+                                             size_t *cap, size_t *len)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_tiger_concat_then_hash -- Tiger over\n"
+        "// (hex32(md5(pass)) || pass). Total input length = 32 + plen.\n"
+        "// Output: 3 ulongs internally (Tiger full state). First 4\n"
+        "// LE-uints written to h0..h3 for compact_fp probe (= first 16\n"
+        "// bytes of digest = first 2 ulongs of LE state DIRECTLY). LE\n"
+        "// schedule; 0x01 pad byte (legacy Tiger, not Tiger2 0x80);\n"
+        "// 8-byte LE length suffix at M[7]. Single-block fast path for\n"
+        "// plen <= 23 (threshold 32+plen+1+8 <= 64).\n"
+        "static void outer_tiger_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "\n"
+        "    // Tiger IV (Anderson + Biham 1996; matches sph_tiger_init\n"
+        "    // and rhash_tiger_init).\n"
+        "    ulong state[3];\n"
+        "    state[0] = 0x0123456789abcdefUL;\n"
+        "    state[1] = 0xfedcba9876543210UL;\n"
+        "    state[2] = 0xf096a5b4c3b2e187UL;\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    // 64-byte Tiger block, 8 ulong message words. M[w]\n"
+        "    // packs 8 bytes LE (b0 | b1<<8 | ... | b7<<56).\n"
+        "    ulong M[8];\n"
+        "    int byte_pos = 0;\n"
+        "    int pass_consumed = 0;\n"
+        "    int first_has_pad = 0;\n"
+        "\n"
+        "    int p_in_first = plen;\n"
+        "    if (p_in_first > 32) p_in_first = 32;\n"
+        "    {\n"
+        "        // M[0..3]: hex32 (32 B) packed LE per ulong.\n"
+        "        for (int w = 0; w < 4; w++) {\n"
+        "            int bo = w * 8;\n"
+        "            M[w] =  (ulong)inner_hex[bo]\n"
+        "                 | ((ulong)inner_hex[bo + 1] <<  8)\n"
+        "                 | ((ulong)inner_hex[bo + 2] << 16)\n"
+        "                 | ((ulong)inner_hex[bo + 3] << 24)\n"
+        "                 | ((ulong)inner_hex[bo + 4] << 32)\n"
+        "                 | ((ulong)inner_hex[bo + 5] << 40)\n"
+        "                 | ((ulong)inner_hex[bo + 6] << 48)\n"
+        "                 | ((ulong)inner_hex[bo + 7] << 56);\n"
+        "        }\n"
+        "        for (int w = 4; w < 8; w++) M[w] = 0ul;\n"
+        "        for (int i = 0; i < p_in_first; i++) {\n"
+        "            int abs_pos = 32 + i;\n"
+        "            ulong v = (ulong)pass[i];\n"
+        "            int wi = abs_pos >> 3;\n"
+        "            int sh = (abs_pos & 7) * 8;  // LE\n"
+        "            M[wi] |= v << sh;\n"
+        "        }\n"
+        "        pass_consumed = p_in_first;\n"
+        "        byte_pos = 32 + p_in_first;\n"
+        "    }\n"
+        "\n"
+        "    // Single-block fast path: plen <= 23 lets pad + 8-byte LE\n"
+        "    // length suffix fit in the same block as the (32 + plen)\n"
+        "    // bytes of data. Threshold: byte_pos + 1 + 8 <= 64.\n"
+        "    if (p_in_first == plen && byte_pos + 1 + 8 <= 64) {\n"
+        "        int pad_pos = byte_pos;\n"
+        "        int wi = pad_pos >> 3;\n"
+        "        int sh = (pad_pos & 7) * 8;\n"
+        "        // 0x01 padding byte (legacy Tiger, NOT Tiger2 0x80).\n"
+        "        M[wi] |= ((ulong)0x01u) << sh;\n"
+        "        // LE bitlen at M[7].\n"
+        "        ulong bitlen = (ulong)total_len * 8ul;\n"
+        "        M[7] = bitlen;\n"
+        "        tiger_block(state, M);\n"
+        "    } else {\n"
+        "        // Multi-block path: emit first block with pad bit if room,\n"
+        "        // then consume remaining pass bytes in 64-byte chunks,\n"
+        "        // then a tail block with pad (if not already) + 8-byte LE\n"
+        "        // length suffix at M[7].\n"
+        "        if (p_in_first == plen && byte_pos < 64) {\n"
+        "            int pad_pos = byte_pos;\n"
+        "            int wi = pad_pos >> 3;\n"
+        "            int sh = (pad_pos & 7) * 8;\n"
+        "            M[wi] |= ((ulong)0x01u) << sh;\n"
+        "            first_has_pad = 1;\n"
+        "        }\n"
+        "        tiger_block(state, M);\n"
+        "\n"
+        "        int pleft = plen - pass_consumed;\n"
+        "        while (pleft >= 64) {\n"
+        "            for (int w = 0; w < 8; w++) {\n"
+        "                int bo = pass_consumed + w * 8;\n"
+        "                M[w] =  (ulong)pass[bo]\n"
+        "                     | ((ulong)pass[bo + 1] <<  8)\n"
+        "                     | ((ulong)pass[bo + 2] << 16)\n"
+        "                     | ((ulong)pass[bo + 3] << 24)\n"
+        "                     | ((ulong)pass[bo + 4] << 32)\n"
+        "                     | ((ulong)pass[bo + 5] << 40)\n"
+        "                     | ((ulong)pass[bo + 6] << 48)\n"
+        "                     | ((ulong)pass[bo + 7] << 56);\n"
+        "            }\n"
+        "            tiger_block(state, M);\n"
+        "            pass_consumed += 64;\n"
+        "            pleft -= 64;\n"
+        "        }\n"
+        "\n"
+        "        // Tail block(s): pack remaining pass bytes, set 0x01 pad if\n"
+        "        // not already in first block, append 8-byte LE length\n"
+        "        // suffix at M[7]. If pad+length don't fit in one block,\n"
+        "        // emit two.\n"
+        "        for (int w = 0; w < 8; w++) M[w] = 0ul;\n"
+        "        for (int i = 0; i < pleft; i++) {\n"
+        "            ulong v = (ulong)pass[pass_consumed + i];\n"
+        "            int wi = i >> 3;\n"
+        "            int sh = (i & 7) * 8;\n"
+        "            M[wi] |= v << sh;\n"
+        "        }\n"
+        "        if (!first_has_pad) {\n"
+        "            int pad_pos = pleft;\n"
+        "            int wi = pad_pos >> 3;\n"
+        "            int sh = (pad_pos & 7) * 8;\n"
+        "            M[wi] |= ((ulong)0x01u) << sh;\n"
+        "        }\n"
+        "        if ((!first_has_pad && pleft + 1 + 8 <= 64) ||\n"
+        "            ( first_has_pad && pleft     + 8 <= 64)) {\n"
+        "            ulong bitlen = (ulong)total_len * 8ul;\n"
+        "            M[7] = bitlen;\n"
+        "            tiger_block(state, M);\n"
+        "        } else {\n"
+        "            tiger_block(state, M);\n"
+        "            for (int w = 0; w < 8; w++) M[w] = 0ul;\n"
+        "            ulong bitlen = (ulong)total_len * 8ul;\n"
+        "            M[7] = bitlen;\n"
+        "            tiger_block(state, M);\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    // LE state output direct extract -- no byte swap epilogue\n"
+        "    // (unlike sha512/wrl). h0..h3 = first 16 bytes = state[0..1].\n"
+        "    *h0 = (uint)(state[0] & 0xffffffffUL);\n"
+        "    *h1 = (uint)(state[0] >> 32);\n"
+        "    *h2 = (uint)(state[1] & 0xffffffffUL);\n"
+        "    *h3 = (uint)(state[1] >> 32);\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
+/* HAVAL emit helper. Phase 5b Tier 3 sub-phase 5b.3a.3 (2026-05-27).
+ *
+ * PARAMETERISED per D17.1.a: ONE C-side helper emits a GPU function
+ * specialised on (passes, digest_bytes). The 15 HAVAL variants (5 widths
+ * x 3 pass counts) all route through this single helper; each emit call
+ * produces a distinct GPU function body. Sub-phase 5b.3a ships the 5
+ * 3-pass variants (passes==3); 5b.3b + 5b.3c extend the haval<P>_block
+ * dispatch to passes==4 and passes==5.
+ *
+ * The emitted GPU function is named `outer_haval_concat_then_hash`
+ * (single fixed name -- only ONE HAV primitive is emitted per kernel
+ * since each codegen JIT specialises to one JOB enum). It computes:
+ *
+ *     HAVAL-<W*8>/<P> ( hex32(md5(pass)) || pass )
+ *
+ * over the 128-byte HAVAL block (twice the 64-byte MD-family block).
+ *
+ * CRITICAL HAVAL specifics (per Tier 3 spec §3 + donor mhash haval.c):
+ *
+ *   - 128-byte block, 32 LE-packed uint32 message words M[0..31].
+ *   - PAD-TOGGLE byte is 0x01 NOT 0x80 (donor havalFinal:760
+ *     "corrected from 0x80"). EVERY other primitive in gpu_common.cl
+ *     uses 0x80; HAVAL is the exception. Wrong toggle = silently wrong
+ *     digest for ALL inputs.
+ *   - block[118..119] PARAMETER ENCODING (donor havalFinal:786-790):
+ *       block[118] = ((hashLength & 0x03) << 6) | ((passes & 0x07) << 3)
+ *                    | (HAVAL_VERSION=1 & 0x07)
+ *       block[119] = hashLength >> 2
+ *     where hashLength = digest_bytes * 8 (in bits). Each (W, P) tuple
+ *     produces a DIFFERENT 2-byte encoding -- the most likely Tier 3
+ *     bug class (R1). Computed at C-emit time and baked into the
+ *     emitted source as literal constants.
+ *   - 64-bit message bitlen LE at block[120..127].
+ *   - POST-COMPRESSION DIGEST FOLD per width (donor havalFinal:816-911):
+ *       128-bit: heavy byte-redistribution fold of state[4..7] into [0..3]
+ *       160-bit: ROTR-using fold
+ *       192-bit: 5-bit-slice fold
+ *       224-bit: byte-slot-shift fold
+ *       256-bit: NO fold (direct state output)
+ *     JIT-specialised per digest_bytes -- each emitted kernel has exactly
+ *     ONE fold branch (no runtime conditional).
+ *   - Output: first 16 bytes (h0..h3) of the FOLDED state go to the hit
+ *     record; for widths > 16 bytes the CPU recompute fills the rest.
+ *
+ * This helper's C-mirror was validated 60/60 cells PASS vs sph_haval
+ * (5 widths x 12 inputs incl multi-block boundary cases) in 5b.3a.1.
+ */
+static int emit_outer_haval_concat_then_hash(char **out, size_t *cap,
+                                             size_t *len,
+                                             int passes, int digest_bytes)
+{
+    int rc;
+    int hashbits = digest_bytes * 8;
+
+    /* R1 mitigation: compute the block[118..119] parameter bytes at
+     * C-emit time. Each (W, P) variant produces a distinct pair. */
+    int byte118 = ((hashbits & 0x03) << 6) | ((passes & 0x07) << 3) | (1 & 0x07);
+    int byte119 = (hashbits >> 2) & 0xff;
+
+    /* Banner + signature + prologue. Block packing identical for all
+     * widths/passes; only the compression-function call + fold differ. */
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_haval_concat_then_hash -- HAVAL-%d/%d over\n"
+        "// (hex32(md5(pass)) || pass). Total input length = 32 + plen.\n"
+        "// 128-byte HAVAL block; 32 LE-packed uint32 message words.\n"
+        "// PAD-TOGGLE is 0x01 NOT 0x80 (see donor mhash haval.c:760).\n"
+        "// block[118..119] parameter encoding for THIS variant:\n"
+        "//   byte118 = 0x%02x  (hashLength=%d passes=%d version=1)\n"
+        "//   byte119 = 0x%02x  (hashLength>>2)\n"
+        "// Output: first 16 bytes (h0..h3) of folded state for probe;\n"
+        "// CPU recompute fills the remaining %d bytes on hit.\n"
+        "static void outer_haval_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "\n"
+        "    // HAVAL IV (8 uints; Pi-fractional constants).\n"
+        "    uint state[8];\n"
+        "    for (int i = 0; i < 8; i++) state[i] = HAVAL_IV[i];\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    // 128-byte HAVAL block as 32 LE-packed uint32 words.\n"
+        "    // M[w] = b0 | b1<<8 | b2<<16 | b3<<24 (LITTLE-endian).\n"
+        "    uint M[32];\n"
+        "    uchar block[128];\n"
+        "    int consumed = 0;\n"
+        "\n"
+        "    // Process all full 128-byte blocks of (hex32 || pass).\n"
+        "    // The combined message is inner_hex[0..31] then pass[0..plen).\n"
+        "    // total_len = 32 + plen. Walk it in 128-byte chunks; the\n"
+        "    // first 32 bytes come from inner_hex, the rest from pass.\n"
+        "    while (total_len - consumed >= 128) {\n"
+        "        for (int i = 0; i < 128; i++) {\n"
+        "            int abs_pos = consumed + i;\n"
+        "            block[i] = (abs_pos < 32) ? inner_hex[abs_pos]\n"
+        "                                      : pass[abs_pos - 32];\n"
+        "        }\n"
+        "        for (int w = 0; w < 32; w++) {\n"
+        "            int bo = w * 4;\n"
+        "            M[w] = (uint)block[bo] | ((uint)block[bo+1] << 8)\n"
+        "                 | ((uint)block[bo+2] << 16) | ((uint)block[bo+3] << 24);\n"
+        "        }\n"
+        "        haval%d_block(state, M);\n"
+        "        consumed += 128;\n"
+        "    }\n"
+        "\n"
+        "    // Tail block: remaining (total_len - consumed) bytes, then\n"
+        "    // the 0x01 pad toggle, zero-fill, parameter bytes, bitlen.\n"
+        "    int occupied = total_len - consumed;\n"
+        "    for (int i = 0; i < 128; i++) block[i] = 0;\n"
+        "    for (int i = 0; i < occupied; i++) {\n"
+        "        int abs_pos = consumed + i;\n"
+        "        block[i] = (abs_pos < 32) ? inner_hex[abs_pos]\n"
+        "                                  : pass[abs_pos - 32];\n"
+        "    }\n"
+        "    // HAVAL pad toggle is 0x01 NOT 0x80 (donor havalFinal:760).\n"
+        "    block[occupied] = 0x01;\n"
+        "    if (occupied + 1 > 118) {\n"
+        "        // No room for parameter+length bytes; compress this\n"
+        "        // block then start a fresh zeroed one (donor :763-780).\n"
+        "        for (int w = 0; w < 32; w++) {\n"
+        "            int bo = w * 4;\n"
+        "            M[w] = (uint)block[bo] | ((uint)block[bo+1] << 8)\n"
+        "                 | ((uint)block[bo+2] << 16) | ((uint)block[bo+3] << 24);\n"
+        "        }\n"
+        "        haval%d_block(state, M);\n"
+        "        for (int i = 0; i < 128; i++) block[i] = 0;\n"
+        "    }\n"
+        "    // Parameter bytes at block[118..119] for HAVAL-%d/%d.\n"
+        "    block[118] = (uchar)0x%02x;\n"
+        "    block[119] = (uchar)0x%02x;\n"
+        "    // 64-bit message bitlen LE at block[120..127].\n"
+        "    ulong bitlen = (ulong)total_len * 8ul;\n"
+        "    block[120] = (uchar)(bitlen);\n"
+        "    block[121] = (uchar)(bitlen >> 8);\n"
+        "    block[122] = (uchar)(bitlen >> 16);\n"
+        "    block[123] = (uchar)(bitlen >> 24);\n"
+        "    block[124] = (uchar)(bitlen >> 32);\n"
+        "    block[125] = (uchar)(bitlen >> 40);\n"
+        "    block[126] = (uchar)(bitlen >> 48);\n"
+        "    block[127] = (uchar)(bitlen >> 56);\n"
+        "    for (int w = 0; w < 32; w++) {\n"
+        "        int bo = w * 4;\n"
+        "        M[w] = (uint)block[bo] | ((uint)block[bo+1] << 8)\n"
+        "             | ((uint)block[bo+2] << 16) | ((uint)block[bo+3] << 24);\n"
+        "    }\n"
+        "    haval%d_block(state, M);\n"
+        "\n",
+        hashbits, passes,
+        byte118, hashbits, passes, byte119,
+        digest_bytes,
+        passes,         /* full-block compress */
+        passes,         /* spill-block compress */
+        hashbits, passes,
+        byte118, byte119,
+        passes);        /* final compress */
+    if (rc < 0) return rc;
+
+    /* Post-compression digest fold -- JIT-specialised per digest width.
+     * Exactly ONE branch emitted (no runtime conditional). Donor
+     * havalFinal:816-911 transcribed. R3 mitigation: copy-paste-no-retype
+     * with explicit donor line citation; validated 60/60 in C-mirror. */
+    if (digest_bytes == 16) {
+        /* 128-bit fold (donor :819-841). */
+        rc = hx_appendf(out, cap, len,
+        "    // 128-bit digest fold (donor havalFinal:819-841): heavy\n"
+        "    // byte-redistribution of state[4..7] into state[0..3].\n"
+        "    state[3] += (state[7] & 0xFF000000u) | (state[6] & 0x00FF0000u)\n"
+        "              | (state[5] & 0x0000FF00u) | (state[4] & 0x000000FFu);\n"
+        "    state[2] += (((state[7] & 0x00FF0000u) | (state[6] & 0x0000FF00u)\n"
+        "               | (state[5] & 0x000000FFu)) << 8)\n"
+        "               | ((state[4] & 0xFF000000u) >> 24);\n"
+        "    state[1] += (((state[7] & 0x0000FF00u) | (state[6] & 0x000000FFu)) << 16)\n"
+        "               | (((state[5] & 0xFF000000u) | (state[4] & 0x00FF0000u)) >> 16);\n"
+        "    state[0] += (((state[6] & 0xFF000000u) | (state[5] & 0x00FF0000u)\n"
+        "               | (state[4] & 0x0000FF00u)) >> 8)\n"
+        "               | ((state[7] & 0x000000FFu) << 24);\n");
+    } else if (digest_bytes == 20) {
+        /* 160-bit fold (donor :848-859). Uses HAVAL_ROTR32. */
+        rc = hx_appendf(out, cap, len,
+        "    // 160-bit digest fold (donor havalFinal:848-859).\n"
+        "    state[4] += ((state[7] & 0xFE000000u) | (state[6] & 0x01F80000u)\n"
+        "               | (state[5] & 0x0007F000u)) >> 12;\n"
+        "    state[3] += ((state[7] & 0x01F80000u) | (state[6] & 0x0007F000u)\n"
+        "               | (state[5] & 0x00000FC0u)) >> 6;\n"
+        "    state[2] += ((state[7] & 0x0007F000u) | (state[6] & 0x00000FC0u)\n"
+        "               | (state[5] & 0x0000003Fu));\n"
+        "    state[1] += HAVAL_ROTR32((state[7] & 0x00000FC0u)\n"
+        "               | (state[6] & 0x0000003Fu) | (state[5] & 0xFE000000u), 25);\n"
+        "    state[0] += HAVAL_ROTR32((state[7] & 0x0000003Fu)\n"
+        "               | (state[6] & 0xFE000000u) | (state[5] & 0x01F80000u), 19);\n");
+    } else if (digest_bytes == 24) {
+        /* 192-bit fold (donor :868-880). */
+        rc = hx_appendf(out, cap, len,
+        "    // 192-bit digest fold (donor havalFinal:868-880).\n"
+        "    state[5] += ((state[7] & 0xFC000000u) | (state[6] & 0x03E00000u)) >> 21;\n"
+        "    state[4] += ((state[7] & 0x03E00000u) | (state[6] & 0x001F0000u)) >> 16;\n"
+        "    state[3] += ((state[7] & 0x001F0000u) | (state[6] & 0x0000FC00u)) >> 10;\n"
+        "    state[2] += ((state[7] & 0x0000FC00u) | (state[6] & 0x000003E0u)) >> 5;\n"
+        "    state[1] += ((state[7] & 0x000003E0u) | (state[6] & 0x0000001Fu));\n"
+        "    state[0] += HAVAL_ROTR32((state[7] & 0x0000001Fu)\n"
+        "               | (state[6] & 0xFC000000u), 26);\n");
+    } else if (digest_bytes == 28) {
+        /* 224-bit fold (donor :889-895). */
+        rc = hx_appendf(out, cap, len,
+        "    // 224-bit digest fold (donor havalFinal:889-895).\n"
+        "    state[6] += (state[7]      ) & 0x0000000Fu;\n"
+        "    state[5] += (state[7] >>  4) & 0x0000001Fu;\n"
+        "    state[4] += (state[7] >>  9) & 0x0000000Fu;\n"
+        "    state[3] += (state[7] >> 13) & 0x0000001Fu;\n"
+        "    state[2] += (state[7] >> 18) & 0x0000000Fu;\n"
+        "    state[1] += (state[7] >> 22) & 0x0000001Fu;\n"
+        "    state[0] += (state[7] >> 27) & 0x0000001Fu;\n");
+    } else {
+        /* 256-bit: NO fold (donor :903-908 direct output). */
+        rc = hx_appendf(out, cap, len,
+        "    // 256-bit: NO fold (donor havalFinal:903-908 direct output).\n");
+    }
+    if (rc < 0) return rc;
+
+    /* Emit the first 16 bytes (h0..h3) of folded state as LE uints.
+     * state[0..7] are LE-native (matches donor + test vectors); h0..h3 =
+     * state[0..3] DIRECTLY (no byte-swap). The probe uses first 16 bytes;
+     * the CPU recompute supplies the full digest for widths > 16. */
+    rc = hx_appendf(out, cap, len,
+        "\n"
+        "    // LE state output direct extract -- HAVAL state is LE-native.\n"
+        "    // h0..h3 = state[0..3] (first 16 bytes of folded digest).\n"
+        "    *h0 = state[0];\n"
+        "    *h1 = state[1];\n"
+        "    *h2 = state[2];\n"
+        "    *h3 = state[3];\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
+/* Snefru emit helper. Phase 5b Tier 4 sub-phase 5b.4a.3 (2026-05-27).
+ *
+ * PARAMETERISED per D18.1.a/D18.3.a: ONE C-side helper emits a GPU
+ * function specialised on (is256, digest_bytes). Both Snefru widths
+ * (e175 SNE128 16-byte, e177 SNE256 32-byte) route through this helper;
+ * is256 + the per-width data-block size (48 vs 32) + the length-field
+ * byte offsets are baked as compile-time literals into the emitted body.
+ *
+ * Block-size asymmetry (R-Tier4-snefru-blocksize): SNE128 processes
+ * 48-byte data blocks; SNE256 processes 32-byte data blocks. The
+ * padding + length-field placement differs per width:
+ *   - data_block_size dblk = 64 - digest_bytes (48 for SNE128, 32 SNE256).
+ *   - rhash_snefru_final zero-pads the last partial block, compresses it,
+ *     then builds a length block: be2me_32(length >> 29) at byte offset
+ *     dblk-8 and be2me_32(length << 3) at dblk-4. `length` is the message
+ *     length in BYTES (donor ctx->length). This is verified byte-exact
+ *     in the C-mirror (/tmp/test_snefru_port.c 56/56 cells, both widths,
+ *     28 lengths incl. block boundaries 31/32/33/47/48/49/63/64/65/...).
+ *
+ * Snefru IV is all-zero (donor rhash_snefru128/256_init memset). Schedule
+ * is BIG-ENDIAN; state output is BE (donor be32_copy). The CPU oracle
+ * stores those BE bytes; the harness reinterprets them as LE uints, so
+ * the kernel byte-swaps each state word into the LE-uint frame here
+ * (h0..h3 = bswap32(state[0..3]) = first 16 bytes of the digest) per
+ * feedback_be_state_primitives_need_byteswap_in_codegen.md. SNE256's
+ * remaining 16 bytes are filled by the CPU recompute on hit (digest > 16
+ * via _proto_hexlen=64); SNE128 is exactly 16 bytes, no recompute. */
+static int emit_outer_snefru_concat_then_hash(char **out,
+                                             size_t *cap, size_t *len,
+                                             int is256, int digest_bytes)
+{
+    int rc;
+    int dblk = 64 - digest_bytes;   /* 48 (SNE128) or 32 (SNE256) */
+    int off1 = dblk - 8;            /* be2me_32(len>>29) byte offset */
+    int off2 = dblk - 4;            /* be2me_32(len<<3)  byte offset */
+    int state_words = is256 ? 8 : 4;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_snefru%d_concat_then_hash -- Snefru-%d over\n"
+        "// (hex32(md5(pass)) || pass). Total input length = 32 + plen.\n"
+        "// data_block_size = 64 - %d = %d bytes (is256=%d). Snefru IV is\n"
+        "// all-zero; 8 rounds fixed. BE schedule + BE state output; h0..h3\n"
+        "// are bswap32(state[0..3]) = first 16 bytes of the digest. Length\n"
+        "// field: be2me_32(len>>29) at block[%d], be2me_32(len<<3) at\n"
+        "// block[%d] (len in BYTES). CPU recompute fills the remaining\n"
+        "// %d bytes on hit for SNE256.\n"
+        "static void outer_snefru%d_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "    const int DBLK = %d;   // data_block_size for this width\n"
+        "\n"
+        "    // Snefru 512-bit state[8]; IV all-zero.\n"
+        "    uint state[8];\n"
+        "    for (int i = 0; i < 8; i++) state[i] = 0u;\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    uchar block[48];   // max data-block size (SNE128)\n"
+        "    int consumed = 0;\n"
+        "\n"
+        "    // Process all full DBLK-byte data blocks of (hex32 || pass).\n"
+        "    // The combined message is inner_hex[0..31] then pass[0..plen).\n"
+        "    while (total_len - consumed >= DBLK) {\n"
+        "        for (int i = 0; i < DBLK; i++) {\n"
+        "            int abs_pos = consumed + i;\n"
+        "            block[i] = (abs_pos < 32) ? inner_hex[abs_pos]\n"
+        "                                      : pass[abs_pos - 32];\n"
+        "        }\n"
+        "        snefru_block(state, block, %d);\n"
+        "        consumed += DBLK;\n"
+        "    }\n"
+        "\n"
+        "    // Final padding (donor rhash_snefru_final). If a partial block\n"
+        "    // remains, zero-pad it to DBLK and compress.\n"
+        "    int rem = total_len - consumed;\n"
+        "    if (rem) {\n"
+        "        for (int i = 0; i < DBLK; i++) block[i] = 0;\n"
+        "        for (int i = 0; i < rem; i++) {\n"
+        "            int abs_pos = consumed + i;\n"
+        "            block[i] = (abs_pos < 32) ? inner_hex[abs_pos]\n"
+        "                                      : pass[abs_pos - 32];\n"
+        "        }\n"
+        "        snefru_block(state, block, %d);\n"
+        "    }\n"
+        "\n"
+        "    // Length block: be2me_32(len>>29) at block[%d],\n"
+        "    // be2me_32(len<<3) at block[%d]. len is the message length in\n"
+        "    // BYTES (total_len). Stored big-endian.\n"
+        "    for (int i = 0; i < DBLK; i++) block[i] = 0;\n"
+        "    ulong msglen = (ulong)total_len;\n"
+        "    uint hi = (uint)(msglen >> 29);\n"
+        "    uint lo = (uint)(msglen << 3);\n"
+        "    block[%d + 0] = (uchar)(hi >> 24); block[%d + 1] = (uchar)(hi >> 16);\n"
+        "    block[%d + 2] = (uchar)(hi >>  8); block[%d + 3] = (uchar)(hi);\n"
+        "    block[%d + 0] = (uchar)(lo >> 24); block[%d + 1] = (uchar)(lo >> 16);\n"
+        "    block[%d + 2] = (uchar)(lo >>  8); block[%d + 3] = (uchar)(lo);\n"
+        "    snefru_block(state, block, %d);\n"
+        "\n"
+        "    // BE state output -> LE-uint probe frame (bswap32 each word).\n"
+        "    *h0 = (state[0] >> 24) | ((state[0] >> 8) & 0xff00u)\n"
+        "        | ((state[0] << 8) & 0xff0000u) | (state[0] << 24);\n"
+        "    *h1 = (state[1] >> 24) | ((state[1] >> 8) & 0xff00u)\n"
+        "        | ((state[1] << 8) & 0xff0000u) | (state[1] << 24);\n"
+        "    *h2 = (state[2] >> 24) | ((state[2] >> 8) & 0xff00u)\n"
+        "        | ((state[2] << 8) & 0xff0000u) | (state[2] << 24);\n"
+        "    *h3 = (state[3] >> 24) | ((state[3] >> 8) & 0xff00u)\n"
+        "        | ((state[3] << 8) & 0xff0000u) | (state[3] << 24);\n"
+        "}\n"
+        "\n",
+        digest_bytes * 8, digest_bytes * 8,
+        digest_bytes, dblk, is256,
+        off1, off2, (digest_bytes > 16) ? (digest_bytes - 16) : 0,
+        digest_bytes * 8,
+        dblk,
+        is256,
+        is256,
+        off1, off2,
+        off1, off1, off1, off1,
+        off2, off2, off2, off2,
+        is256);
+    (void)state_words;
+    return rc;
+}
+
+/* GOST R 34.11-94 emit helper. Phase 5b Tier 4 sub-phase 5b.4b.3 (2026-05-27).
+ *
+ * Bespoke per-primitive helper (D18.3.a) -- GOST has no structural overlap
+ * with any other family primitive. It is the ONLY block-cipher-based
+ * primitive (GOST 28147-89 with a 32-round Feistel key schedule) and the
+ * only one carrying a running mod-2^256 checksum sum[8] across blocks plus a
+ * dual finalization. Donor: in-tree gosthash/gosthash.c gosthash_compress /
+ * gosthash_bytes / gosthash_final (the LIVE CPU oracle for e125 via
+ * gosthash.o; gosthash() at mdxfind.c:29076). TEST S-box set (NOT CryptoPro)
+ * -- the gost_block primitive in gpu_common.cl bakes the 4 derived
+ * GOST_SBOX_1..4 tables (R-Tier4-gost-sbox HIGH; verified via
+ * test_gost_vectors.c: 4 published TEST-set vectors + 22-len cross-check vs
+ * rhash RHASH_GOST, zero CryptoPro collisions).
+ *
+ * Message layout: (hex32(md5(pass)) || pass), total = 32 + plen. GOST
+ * processes the message in 32-byte blocks (256-bit). For each block the
+ * 32 bytes are converted to 8 LE uint32 words (gosthash_bytes:285-297),
+ * accumulated into the running checksum sum[8] (mod 2^256 add with carry
+ * propagation `c = (c<a)||(c<b)`), the bit-length counter len[0..1] is
+ * advanced, and gost_block(hash, m) compresses. A trailing partial block is
+ * zero-padded to 32 bytes and compressed over its partial bit-length. Then
+ * the DUAL finalization (gosthash_final:358-359): gost_block(hash, len)
+ * compresses the 256-bit bit-length block, then gost_block(hash, sum)
+ * compresses the accumulated checksum. State output is LE byte-order
+ * (gosthash_final:364-372); the harness reinterprets those LE bytes as LE
+ * uints, so h0..h3 = state[0..3] DIRECTLY (no byte-swap). digest = 32 bytes;
+ * the GPU probe carries h0..h3 (first 16 bytes); the CPU recompute fills the
+ * remaining 16 bytes on hit (digest > 16 via _proto_hexlen=64).
+ *
+ * Validated byte-exact in the C-mirror (/tmp/test_gost_port.c 27/27 cells,
+ * lengths straddling the 32-byte block boundary incl 31/32/33/63/64/65) vs
+ * gosthash() BEFORE this GPU code shipped (the gost_block + sum[8] carry +
+ * dual finalization are the highest-transcription-risk primitive in Phase
+ * 5b; R-Tier4-gost-blockcipher / -checksum-carry HIGH/MED). */
+static int emit_outer_gost_concat_then_hash(char **out,
+                                            size_t *cap, size_t *len)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper outer_gost_concat_then_hash -- GOST R 34.11-94 (TEST\n"
+        "// S-box set) over (hex32(md5(pass)) || pass). Total input length =\n"
+        "// 32 + plen. 256-bit state[8]; 256-bit blocks (32 bytes, 8 LE words).\n"
+        "// Running mod-2^256 checksum sum[8] carried across blocks; dual\n"
+        "// finalization compresses the bit-length block then the checksum\n"
+        "// block (gosthash_final). State output is LE; h0..h3 = state[0..3]\n"
+        "// directly (no byte-swap). CPU recompute fills the remaining 16\n"
+        "// bytes on hit (digest = 32 bytes).\n"
+        "static void outer_gost_concat_then_hash(\n"
+        "    uint mma, uint mmb, uint mmc, uint mmd,\n"
+        "    __global const uchar *pass, int plen,\n"
+        "    uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    if (plen < 0) plen = 0;\n"
+        "    if (plen > HX_FAMILY_MAX_PASS) plen = HX_FAMILY_MAX_PASS;\n"
+        "    int total_len = 32 + plen;\n"
+        "\n"
+        "    // GOST 256-bit state hash[8]; checksum sum[8]; bit-length\n"
+        "    // counter len[8] (only len[0..1] used for family-size inputs).\n"
+        "    // All zero-initialised (gosthash_reset).\n"
+        "    uint hash[8]; uint sum[8]; uint glen[8];\n"
+        "    for (int i = 0; i < 8; i++) { hash[i] = 0u; sum[i] = 0u; glen[i] = 0u; }\n"
+        "\n"
+        "    uchar inner_hex[32];\n"
+        "    state_to_hex32_bytes(mma, mmb, mmc, mmd, inner_hex);\n"
+        "\n"
+        "    uchar block[32];   // one GOST data block\n"
+        "    int consumed = 0;\n"
+        "\n"
+        "    // Process all full 32-byte blocks of (hex32 || pass), then the\n"
+        "    // trailing partial block (if any). Each block: convert 32 bytes\n"
+        "    // to 8 LE uint32 words, accumulate sum[8] (mod 2^256), advance\n"
+        "    // the bit-length counter, then gost_block.\n"
+        "    while (consumed < total_len) {\n"
+        "        int rem = total_len - consumed;\n"
+        "        int blk = (rem >= 32) ? 32 : rem;   // bytes from the message\n"
+        "        for (int i = 0; i < 32; i++) {\n"
+        "            if (i < blk) {\n"
+        "                int abs_pos = consumed + i;\n"
+        "                block[i] = (abs_pos < 32) ? inner_hex[abs_pos]\n"
+        "                                          : pass[abs_pos - 32];\n"
+        "            } else {\n"
+        "                block[i] = 0;   // zero-pad the partial final block\n"
+        "            }\n"
+        "        }\n"
+        "        // bytes -> 8 LE words + checksum accumulate (gosthash_bytes).\n"
+        "        uint m[8];\n"
+        "        uint c = 0u;\n"
+        "        for (int i = 0; i < 8; i++) {\n"
+        "            int j = i * 4;\n"
+        "            uint a = ((uint)block[j]) | (((uint)block[j+1]) << 8)\n"
+        "                   | (((uint)block[j+2]) << 16) | (((uint)block[j+3]) << 24);\n"
+        "            m[i] = a;\n"
+        "            uint b = sum[i];\n"
+        "            uint cc = a + c + sum[i];\n"
+        "            sum[i] = cc;\n"
+        "            c = ((cc < a) || (cc < b)) ? 1u : 0u;\n"
+        "        }\n"
+        "        gost_block(hash, m);\n"
+        "        // 64-bit bit-length counter spread over glen[0],glen[1].\n"
+        "        uint bits = (uint)(blk << 3);\n"
+        "        uint prev = glen[0];\n"
+        "        glen[0] = prev + bits;\n"
+        "        if (glen[0] < bits) glen[1] += 1u;\n"
+        "        consumed += blk;\n"
+        "        (void)prev;\n"
+        "    }\n"
+        "\n"
+        "    // DUAL finalization (gosthash_final): compress the bit-length\n"
+        "    // block, then the accumulated checksum block.\n"
+        "    gost_block(hash, glen);\n"
+        "    gost_block(hash, sum);\n"
+        "\n"
+        "    // State output is LE byte-order; LE-uint reinterpretation of the\n"
+        "    // first 16 output bytes == hash[0..3] directly (no byte-swap).\n"
+        "    *h0 = hash[0];\n"
+        "    *h1 = hash[1];\n"
+        "    *h2 = hash[2];\n"
+        "    *h3 = hash[3];\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
 /* Emit the family kernel body. Per-thread (no SALT_BATCH loop).
  * Each thread processes one word: gid -> word_idx; if word_idx >=
  * params.num_words return.
@@ -2215,13 +3274,28 @@ static int emit_outer_sha512_concat_then_hash(char **out,
  * per-primitive helper. 7 of 8 5a-supported primitives wired here;
  * e123 MD5MD5PASS (HX_PRIM_MD5) stays outlier (multi-emit deferred).
  */
+/* Forward decl: multi-emit kernel body (e123 MD5MD5PASS). Defined below
+ * emit_family_md5pass_kernel. */
+static int emit_family_md5pass_kernel_multiemit(
+    char **out, size_t *cap, size_t *len, int job_enum);
+
 static int emit_family_md5pass_kernel(char **out, size_t *cap, size_t *len,
                                       enum hx_primitive_id outer_id,
                                       const char *outer_name,
                                       int outer_digest_bytes,
-                                      int job_enum)
+                                      int job_enum,
+                                      int emit_class)
 {
     int rc;
+
+    /* Sub-phase 5c.2 (2026-05-27): multi-emit members (e123 MD5MD5PASS)
+     * take a dedicated kernel body that runs the probe + EMIT_HIT_4 block
+     * ONCE PER VARIANT (N=2: sep=0 canonical, sep=1 colon). Single-emit
+     * members fall through to the existing body UNCHANGED (G2 regression
+     * safety: the per-variant logic is fully isolated). */
+    if (emit_class == HX_EMIT_MULTI) {
+        return emit_family_md5pass_kernel_multiemit(out, cap, len, job_enum);
+    }
 
     /* Sub-phase 5a.4 (2026-05-23): per-primitive dispatch table for the
      * outer-CALL hash. 7 primitives wired (md4, sha1, sha224, sha256,
@@ -2272,6 +3346,68 @@ static int emit_family_md5pass_kernel(char **out, size_t *cap, size_t *len,
             break;
         case HX_PRIM_SHA512:
             helper_name = "outer_sha512_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        case HX_PRIM_WRL:
+            helper_name = "outer_wrl_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        case HX_PRIM_TIGER:
+            helper_name = "outer_tiger_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        /* Phase 5b Tier 4 sub-phase 5b.4a (2026-05-27): the 2 Snefru
+         * widths route through distinct emitted function names
+         * (outer_snefru128_/outer_snefru256_concat_then_hash) since the
+         * data-block size + length placement differ per width; the C-side
+         * helper bakes is256 + DBLK + offsets into each body. 4-uint
+         * probe; CPU recompute fills SNE256's remaining 16 bytes. */
+        case HX_PRIM_SNE128:
+            helper_name = "outer_snefru128_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        case HX_PRIM_SNE256:
+            helper_name = "outer_snefru256_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        /* Phase 5b Tier 4 sub-phase 5b.4b (2026-05-27): GOST R 34.11-94
+         * (e125, the final GPU-eligible MAKE_MD5PASS member) routes to its
+         * own bespoke helper. 4-uint probe (first 16 bytes); CPU recompute
+         * fills the remaining 16 bytes on hit. */
+        case HX_PRIM_GOST:
+            helper_name = "outer_gost_concat_then_hash";
+            helper_has_h4 = 0;
+            break;
+        /* Phase 5b Tier 3 sub-phase 5b.3a (2026-05-27): all 5 3-pass
+         * HAVAL variants route through the single parameterised helper
+         * named outer_haval_concat_then_hash (the C-side helper bakes
+         * the per-variant passes + digest_bytes into one emitted GPU
+         * function). 4-uint probe (first 16 bytes); CPU recompute fills
+         * the rest for widths > 16. */
+        case HX_PRIM_HAV128_3:
+        case HX_PRIM_HAV160_3:
+        case HX_PRIM_HAV192_3:
+        case HX_PRIM_HAV224_3:
+        case HX_PRIM_HAV256_3:
+        /* Phase 5b Tier 3 sub-phase 5b.3b (2026-05-27): 4-pass HAVAL
+         * variants share the same emitted GPU function name (the helper
+         * differs only in the haval<P>_block call + block[118] passes
+         * field, both baked at C-emit time via the passes parameter). */
+        case HX_PRIM_HAV128_4:
+        case HX_PRIM_HAV160_4:
+        case HX_PRIM_HAV192_4:
+        case HX_PRIM_HAV224_4:
+        case HX_PRIM_HAV256_4:
+        /* Phase 5b Tier 3 sub-phase 5b.3c (2026-05-27): 5-pass HAVAL
+         * variants share the same emitted GPU function name (the helper
+         * differs only in the haval<P>_block call + block[118] passes
+         * field, both baked at C-emit time via the passes parameter). */
+        case HX_PRIM_HAV128_5:
+        case HX_PRIM_HAV160_5:
+        case HX_PRIM_HAV192_5:
+        case HX_PRIM_HAV224_5:
+        case HX_PRIM_HAV256_5:
+            helper_name = "outer_haval_concat_then_hash";
             helper_has_h4 = 0;
             break;
         default:
@@ -2427,16 +3563,182 @@ static int emit_family_md5pass_kernel(char **out, size_t *cap, size_t *len,
                 "    outer_sha384_concat_then_hash(ia, ib, ic, id,\n"
                 "                                  pass_bytes, (int)plen,\n"
                 "                                  &h0, &h1, &h2, &h3);\n"
-              : /* SHA512 */
+              : (outer_id == HX_PRIM_SHA512) ?
                 "    uint h0, h1, h2, h3;\n"
                 "    outer_sha512_concat_then_hash(ia, ib, ic, id,\n"
                 "                                  pass_bytes, (int)plen,\n"
-                "                                  &h0, &h1, &h2, &h3);\n"),
+                "                                  &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_WRL) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_wrl_concat_then_hash(ia, ib, ic, id,\n"
+                "                               pass_bytes, (int)plen,\n"
+                "                               &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_TIGER) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_tiger_concat_then_hash(ia, ib, ic, id,\n"
+                "                                 pass_bytes, (int)plen,\n"
+                "                                 &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_SNE128) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_snefru128_concat_then_hash(ia, ib, ic, id,\n"
+                "                                     pass_bytes, (int)plen,\n"
+                "                                     &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_SNE256) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_snefru256_concat_then_hash(ia, ib, ic, id,\n"
+                "                                     pass_bytes, (int)plen,\n"
+                "                                     &h0, &h1, &h2, &h3);\n"
+              : (outer_id == HX_PRIM_GOST) ?
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_gost_concat_then_hash(ia, ib, ic, id,\n"
+                "                                pass_bytes, (int)plen,\n"
+                "                                &h0, &h1, &h2, &h3);\n"
+              : /* HAVAL (any 3-pass, 4-pass, or 5-pass variant;
+                 * parameterised helper -- emitted GPU function name is
+                 * identical, the passes/width differences are baked into
+                 * the body). */
+                "    uint h0, h1, h2, h3;\n"
+                "    outer_haval_concat_then_hash(ia, ib, ic, id,\n"
+                "                                 pass_bytes, (int)plen,\n"
+                "                                 &h0, &h1, &h2, &h3);\n"),
         helper_has_h4
             ? "    (void)h4;  // 5th word reserved for round-trip readback.\n"
             : "");
 
     (void)helper_name;  /* selected by outer_id in the literal above */
+    return rc;
+}
+
+/* Sub-phase 5c.2 (2026-05-27): multi-emit family kernel body (e123
+ * MD5MD5PASS) -- the FIRST multi-emit algorithm.
+ *
+ * ONE password produces TWO outer-hash digests, each probed against the
+ * loaded hash table as an INDEPENDENT found-hash candidate (byte-exact
+ * match for the CPU oracle at mdxfind.c:25181-25204, which calls
+ * checkhash() once per variant):
+ *   variant 0 (sep=0, canonical): md5( hex32(md5(pass)) . pass )
+ *   variant 1 (sep=1, colon):     md5( hex32(md5(pass)) . ':' . pass )
+ *
+ * Structure: compute md5(pass) ONCE (natural hoist; both variants reuse
+ * the inner state ia..id), then a compile-time-N=2 UNROLLED set of
+ * probe + EMIT_HIT_4_DEDUP_OR_OVERFLOW blocks, one per variant, each
+ * with its OWN digest -> its OWN matched_idx. The dedup macro is the
+ * EXISTING EMIT_HIT_4_DEDUP_OR_OVERFLOW (gpu_common.cl) UNCHANGED -- it
+ * keys on hashes_shown[matched_idx] (the matched loaded-hash slot), which
+ * is ALREADY the correct multi-emit key: two variants hitting two
+ * DIFFERENT loaded hashes land in two different dedup cells and BOTH
+ * emit. No new field, no buffer resize, no key widening.
+ *
+ * Recompute-per-variant (NOT hoisted beyond the shared inner): each
+ * variant builds its own outer message + final MD5 in
+ * outer_md5_concat_then_hash(sep). The hit record stays 16 bytes with NO
+ * variant tag -- the emitted fingerprint self-identifies the matched
+ * loaded hash on hit-replay (matching CPU semantics: mdxfind prints the
+ * matched hash FORM, not the variant). */
+static int emit_family_md5pass_kernel_multiemit(
+    char **out, size_t *cap, size_t *len, int job_enum)
+{
+    int rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: family kernel for e%d MD5MD5PASS (MULTI-EMIT, N=2 variants);\n"
+        "// digest=16 bytes; probe uses h0..h3 per compact_fp/compact_idx.\n"
+        "// variant 0 = md5(hex32(md5(pass)) . pass); variant 1 = md5(hex32 .\n"
+        "// ':' . pass). Each variant probes + emits independently against\n"
+        "// its own matched loaded-hash slot (dedup keyed on matched_idx,\n"
+        "// unchanged). kernel signature mirrors the single-emit family body.\n"
+        "__attribute__((reqd_work_group_size(64,1,1)))\n"
+        "__kernel void kernelb_hx_codegen_phase0(\n"
+        "    __global const uchar         *payload,\n"
+        "    __global const uchar         *b_packed_buf,\n"
+        "    __global const uint          *b_chunk_index,\n"
+        "    __global const uchar         *salts,\n"
+        "    __global const uint          *salt_offsets,\n"
+        "    __global const ushort        *salt_lens,\n"
+        "    __global const uint          *compact_fp,\n"
+        "    __global const uint          *compact_idx,\n"
+        "    __global const uchar         *hash_data_buf,\n"
+        "    __global const ulong         *hash_data_off,\n"
+        "    __global uint                *hits,\n"
+        "    __global volatile uint       *hit_count,\n"
+        "    __global const ulong         *overflow_keys,\n"
+        "    __global const uchar         *overflow_hashes,\n"
+        "    __global const uint          *overflow_offsets,\n"
+        "    __global volatile uint       *hashes_shown\n"
+        "    )\n"
+        "{\n"
+        "    // hx: state EMIT_KERNEL_PREAMBLE (family MD5PASS, multi-emit)\n"
+        "    __global const OCLParams *params_buf =\n"
+        "        (__global const OCLParams *)payload;\n"
+        "    OCLParams params = *params_buf;\n"
+        "\n"
+        "    uint gid = get_global_id(0);\n"
+        "    uint word_idx = gid;\n"
+        "    if (word_idx >= params.num_words) return;\n"
+        "\n"
+        "    (void)salts; (void)salt_offsets; (void)salt_lens;\n"
+        "\n"
+        "    // hx: state EMIT_PRE_INVARIANT (compute MD5(pass) ONCE)\n"
+        "    uint wpos = b_chunk_index[word_idx];\n"
+        "    if (wpos >= params.packed_size) return;  // defensive\n"
+        "    uint plen = (uint)b_packed_buf[wpos];\n"
+        "    __global const uchar *pass_bytes = b_packed_buf + wpos + 1u;\n"
+        "\n"
+        "    // OP_CALL md5 #1 (inner): MD5(pass) -> (ia,ib,ic,id). Shared\n"
+        "    // across BOTH variants (natural hoist).\n"
+        "    uint ia, ib, ic, id;\n"
+        "    md5_buf_global(pass_bytes, (int)plen, &ia, &ib, &ic, &id);\n"
+        "\n"
+        "    // B3 overflow ledger pointers (shared by both variant emits).\n"
+        "    __global volatile uint *ovr_set =\n"
+        "        (__global volatile uint *)(payload + 100);\n"
+        "    __global volatile uint *ovr_gid =\n"
+        "        (__global volatile uint *)(payload + 104);\n"
+        "\n"
+        "    uint widx = params.base_word_idx + word_idx;\n"
+        "\n",
+        job_enum);
+    if (rc < 0) return rc;
+
+    /* Emit N=2 unrolled probe + EMIT_HIT_4 blocks (sep=0, sep=1). The
+     * EMIT_HIT_4_DEDUP_OR_OVERFLOW macro is reused VERBATIM from the
+     * single-emit body; the only change is each block computes its own
+     * variant digest (via outer_md5_concat_then_hash(sep)) and resolves
+     * its own matched_idx. */
+    for (int sep = 0; sep <= 1; sep++) {
+        rc = hx_appendf(out, cap, len,
+            "    // hx: state EMIT_PROBE_AND_HIT variant %d (sep=%d)\n"
+            "    {\n"
+            "        uint h0, h1, h2, h3;\n"
+            "        outer_md5_concat_then_hash(ia, ib, ic, id,\n"
+            "                                   pass_bytes, (int)plen, %d,\n"
+            "                                   &h0, &h1, &h2, &h3);\n"
+            "        uint matched_idx = 0u;\n"
+            "        if (probe_compact_idx(h0, h1, h2, h3,\n"
+            "                              compact_fp, compact_idx,\n"
+            "                              params.compact_mask, params.max_probe,\n"
+            "                              params.hash_data_count,\n"
+            "                              hash_data_buf, hash_data_off,\n"
+            "                              overflow_keys, overflow_hashes,\n"
+            "                              overflow_offsets, params.overflow_count,\n"
+            "                              &matched_idx))\n"
+            "        {\n"
+            "            uint mask = 1u;  // iter==1; dedup slot 0\n"
+            "            // Unsalted family: sidx is always 0 in the emitted hit.\n"
+            "            EMIT_HIT_4_DEDUP_OR_OVERFLOW(hits, hit_count, params.max_hits,\n"
+            "                       widx, 0u, 1u, h0, h1, h2, h3,\n"
+            "                       hashes_shown, matched_idx, mask,\n"
+            "                       ovr_set, ovr_gid, gid);\n"
+            "        }\n"
+            "    }\n"
+            "\n",
+            sep, sep, sep);
+        if (rc < 0) return rc;
+    }
+
+    rc = hx_appendf(out, cap, len,
+        "    // hx: state EMIT_KERNEL_FOOTER (multi-emit)\n"
+        "}\n");
     return rc;
 }
 
@@ -2501,33 +3803,56 @@ int hx_emit_family_md5pass_opencl(
             entry->name ? entry->name : "(noname)", outer_name);
         return -1;
     }
-    /* Sub-phase 5a.4 (2026-05-23): 7 of 8 5a-supported primitives wired.
-     * e123 MD5MD5PASS (HX_PRIM_MD5) is outlier (multi-emit variant
-     * deferred). 22 5b-deferred primitives are filtered upstream by
-     * supported_5a check. */
-    if (outer_id == HX_PRIM_MD5) {
+    /* Sub-phase 5c.2 (2026-05-27): MD5-as-OUTER is now supported for the
+     * e123 MD5MD5PASS multi-emit member. It is admitted ONLY when the
+     * spec entry is flagged emit_class == HX_EMIT_MULTI (the generator
+     * sets this for e123 via the Note-[24] markup-strip). An MD5 outer
+     * with emit_class SINGLE would be an unexpected non-multi-emit MD5
+     * member; FATAL because the single-emit MD5 path is not the intended
+     * shape (e123 is the only MD5-outer family member, and it is
+     * multi-emit by construction). */
+    if (outer_id == HX_PRIM_MD5 && entry->emit_class != HX_EMIT_MULTI) {
         fprintf(stderr,
             "FATAL: %s:%d hx_emit_family_md5pass_opencl: e%d %s outer "
-            "primitive 'md5' (e123 MD5MD5PASS) is an outlier in 5a -- "
-            "the family is multi-emit (canonical + colon variant) and "
-            "ships in a separate multi-emit sub-phase. CPU continues "
-            "to handle e123 in the interim.\n",
+            "primitive 'md5' with emit_class=%d (expected HX_EMIT_MULTI=%d). "
+            "MD5-as-outer is only wired for the e123 multi-emit member; an "
+            "MD5-outer single-emit shape is unexpected. Generator/markup "
+            "drift?\n",
             __FILE__, __LINE__, entry->job_enum,
-            entry->name ? entry->name : "(noname)");
+            entry->name ? entry->name : "(noname)",
+            entry->emit_class, (int)HX_EMIT_MULTI);
         return -1;
     }
-    if (outer_id != HX_PRIM_SHA1 && outer_id != HX_PRIM_MD4 &&
+    if (outer_id != HX_PRIM_MD5 &&
+        outer_id != HX_PRIM_SHA1 && outer_id != HX_PRIM_MD4 &&
         outer_id != HX_PRIM_MD2 && outer_id != HX_PRIM_RMD128 &&
         outer_id != HX_PRIM_RMD160 && outer_id != HX_PRIM_SHA224 &&
         outer_id != HX_PRIM_SHA256 && outer_id != HX_PRIM_SHA384 &&
-        outer_id != HX_PRIM_SHA512)
+        outer_id != HX_PRIM_SHA512 && outer_id != HX_PRIM_WRL &&
+        outer_id != HX_PRIM_TIGER &&
+        outer_id != HX_PRIM_SNE128 && outer_id != HX_PRIM_SNE256 &&
+        outer_id != HX_PRIM_GOST &&
+        outer_id != HX_PRIM_HAV128_3 && outer_id != HX_PRIM_HAV160_3 &&
+        outer_id != HX_PRIM_HAV192_3 && outer_id != HX_PRIM_HAV224_3 &&
+        outer_id != HX_PRIM_HAV256_3 &&
+        outer_id != HX_PRIM_HAV128_4 && outer_id != HX_PRIM_HAV160_4 &&
+        outer_id != HX_PRIM_HAV192_4 && outer_id != HX_PRIM_HAV224_4 &&
+        outer_id != HX_PRIM_HAV256_4 &&
+        outer_id != HX_PRIM_HAV128_5 && outer_id != HX_PRIM_HAV160_5 &&
+        outer_id != HX_PRIM_HAV192_5 && outer_id != HX_PRIM_HAV224_5 &&
+        outer_id != HX_PRIM_HAV256_5)
     {
         fprintf(stderr,
             "FATAL: %s:%d hx_emit_family_md5pass_opencl: e%d %s outer "
             "primitive '%s' is in supported_5a set but not in the "
-            "5a.4 + 5b.1a + 5b.1b wired subset (md2 md4 rmd128 sha1 "
-            "sha224 sha256 sha384 sha512 rmd160). Either add to "
-            "dispatch above or this is a logic bug.\n",
+            "5a.4 + 5b.1a + 5b.1b + 5b.2a + 5b.2b + 5b.3a + 5b.3b + 5b.3c "
+            "+ 5b.4a + 5b.4b + 5c.2 wired subset (md5(multi-emit) md2 md4 "
+            "rmd128 sha1 sha224 sha256 "
+            "sha384 sha512 rmd160 wrl tiger sne128 sne256 gost hav128_3 "
+            "hav160_3 hav192_3 hav224_3 hav256_3 hav128_4 hav160_4 hav192_4 "
+            "hav224_4 hav256_4 hav128_5 hav160_5 hav192_5 hav224_5 "
+            "hav256_5). "
+            "Either add to dispatch above or this is a logic bug.\n",
             __FILE__, __LINE__, entry->job_enum,
             entry->name ? entry->name : "(noname)", outer_name);
         return -1;
@@ -2567,6 +3892,13 @@ int hx_emit_family_md5pass_opencl(
     /* Emit ONE per-primitive helper body matching outer_id. The
      * kernel body (next emit) calls the matching helper by name. */
     switch (outer_id) {
+        /* Sub-phase 5c.2 (2026-05-27): MD5-as-outer multi-emit helper
+         * (e123 MD5MD5PASS). The helper emits ONE function with a `sep`
+         * parameter; the kernel body calls it twice (sep=0 canonical,
+         * sep=1 colon). Only reached for emit_class==HX_EMIT_MULTI
+         * (gated above). */
+        case HX_PRIM_MD5:
+            rc = emit_outer_md5_concat_then_hash(out, out_cap, &cur_len); break;
         case HX_PRIM_SHA1:
             rc = emit_outer_sha1_concat_then_hash(out, out_cap, &cur_len); break;
         case HX_PRIM_MD2:
@@ -2585,10 +3917,74 @@ int hx_emit_family_md5pass_opencl(
             rc = emit_outer_sha384_concat_then_hash(out, out_cap, &cur_len); break;
         case HX_PRIM_SHA512:
             rc = emit_outer_sha512_concat_then_hash(out, out_cap, &cur_len); break;
+        case HX_PRIM_WRL:
+            rc = emit_outer_wrl_concat_then_hash(out, out_cap, &cur_len); break;
+        case HX_PRIM_TIGER:
+            rc = emit_outer_tiger_concat_then_hash(out, out_cap, &cur_len); break;
+        /* Phase 5b Tier 4 sub-phase 5b.4a (2026-05-27): the 2 Snefru
+         * widths route to ONE parameterised helper specialised on
+         * (is256, digest_bytes). SNE128 is256=0 16-byte / SNE256 is256=1
+         * 32-byte. The helper bakes the per-width data-block size (48 vs
+         * 32) + length-field byte offsets into distinct emitted
+         * functions. gost (e125) ships in 5b.4b. */
+        case HX_PRIM_SNE128:
+            rc = emit_outer_snefru_concat_then_hash(out, out_cap, &cur_len,
+                                                    0, outer_digest_bytes);
+            break;
+        case HX_PRIM_SNE256:
+            rc = emit_outer_snefru_concat_then_hash(out, out_cap, &cur_len,
+                                                    1, outer_digest_bytes);
+            break;
+        /* Phase 5b Tier 4 sub-phase 5b.4b (2026-05-27): GOST R 34.11-94
+         * (e125) -- bespoke helper. Block-cipher core + mod-2^256 checksum
+         * carry + dual finalization (the highest-transcription-risk
+         * primitive in Phase 5b). After this ship, the MAKE_MD5PASS family
+         * reaches 29/30 GPU-eligible (only e123 multi-emit remains). */
+        case HX_PRIM_GOST:
+            rc = emit_outer_gost_concat_then_hash(out, out_cap, &cur_len);
+            break;
+        /* Phase 5b Tier 3 sub-phase 5b.3a (2026-05-27): 5 3-pass HAVAL
+         * variants route to ONE parameterised helper. passes=3 fixed
+         * (5b.3a); digest_bytes from outer_digest_bytes (16/20/24/28/32
+         * for hav128/160/192/224/256). The helper bakes the per-variant
+         * block[118..119] encoding + per-width fold into one GPU
+         * function. 4-pass + 5-pass add passes=4/5 in 5b.3b + 5b.3c. */
+        case HX_PRIM_HAV128_3:
+        case HX_PRIM_HAV160_3:
+        case HX_PRIM_HAV192_3:
+        case HX_PRIM_HAV224_3:
+        case HX_PRIM_HAV256_3:
+            rc = emit_outer_haval_concat_then_hash(out, out_cap, &cur_len,
+                                                   3, outer_digest_bytes);
+            break;
+        /* Phase 5b Tier 3 sub-phase 5b.3b (2026-05-27): 5 4-pass HAVAL
+         * variants route to the SAME parameterised helper with passes=4
+         * (emits haval4_block call + block[118] passes=4 encoding). */
+        case HX_PRIM_HAV128_4:
+        case HX_PRIM_HAV160_4:
+        case HX_PRIM_HAV192_4:
+        case HX_PRIM_HAV224_4:
+        case HX_PRIM_HAV256_4:
+            rc = emit_outer_haval_concat_then_hash(out, out_cap, &cur_len,
+                                                   4, outer_digest_bytes);
+            break;
+        /* Phase 5b Tier 3 sub-phase 5b.3c (2026-05-27): 5 5-pass HAVAL
+         * variants route to the SAME parameterised helper with passes=5
+         * (emits haval5_block call + block[118] passes=5 encoding => the
+         * byte118 nibble is (W&3)<<6 | (5<<3) | 1 = 0x29 for 128-bit). */
+        case HX_PRIM_HAV128_5:
+        case HX_PRIM_HAV160_5:
+        case HX_PRIM_HAV192_5:
+        case HX_PRIM_HAV224_5:
+        case HX_PRIM_HAV256_5:
+            rc = emit_outer_haval_concat_then_hash(out, out_cap, &cur_len,
+                                                   5, outer_digest_bytes);
+            break;
         default:
             fprintf(stderr,
                 "FATAL: %s:%d hx_emit_family_md5pass_opencl: unreachable "
-                "(outer_id=%d not in 5a.4 wired set)\n",
+                "(outer_id=%d not in 5a.4 + 5b.1 + 5b.2a + 5b.2b + 5b.3a "
+                "+ 5b.3b + 5b.3c wired set)\n",
                 __FILE__, __LINE__, (int)outer_id);
             return -1;
     }
@@ -2596,10 +3992,643 @@ int hx_emit_family_md5pass_opencl(
 
     rc = emit_family_md5pass_kernel(out, out_cap, &cur_len,
                                     outer_id, outer_name,
-                                    outer_digest_bytes, entry->job_enum);
+                                    outer_digest_bytes, entry->job_enum,
+                                    entry->emit_class);
     if (rc < 0) return rc;
 
     /* Defensive NUL terminator. */
+    if (cur_len + 1 > *out_cap) {
+        char *np = (char *)realloc(*out, cur_len + 1);
+        if (!np) return -1;
+        *out = np;
+        *out_cap = cur_len + 1;
+    }
+    (*out)[cur_len] = '\0';
+    return 0;
+}
+
+/* ====================================================================
+ * Phase 1b Batch 1 (2026-05-28): unsalted single-hash emitter.
+ *
+ * Emits a one-shot `hash(pass)` kernel for the category-(a) MD/SHA
+ * family (HX_PATTERN_UNSALTED_SINGLE). Validated byte-exact in plain C
+ * (/tmp/test_unsalted_single_port.c, 80/80 across md5/md4/sha1/sha256 x
+ * block-boundary-straddling lengths 0..240) BEFORE GPU JIT, per
+ * feedback_c_mirror_before_gpu_port.md.
+ *
+ * STRICTLY SIMPLER than the family emitter: the hash input IS the pass
+ * (length plen), with NO inner md5, NO hex32 prefix, NO concat. The
+ * per-primitive usp_*_buf_global helpers below reproduce the SAME MD/SHA
+ * padding the family emitter uses, applied to the raw pass. Calls
+ * md5_block/md4_block/sha1_block/sha256_block (gpu_common.cl).
+ *
+ * probe uses the first 4 LE uints of the digest (compact_fp contract,
+ * identical to the family path). For BE-state primitives (sha1/sha256)
+ * each of the first 4 state words is byte-swapped to LE before probing,
+ * per feedback_be_state_primitives_need_byteswap_in_codegen.md.
+ * ==================================================================== */
+
+static int emit_unsalted_single_helpers(char **out, size_t *cap, size_t *len)
+{
+    int rc;
+    rc = hx_appendf(out, cap, len,
+        "// ====================================================================\n"
+        "// hx codegen Phase 1b Batch 1 (2026-05-28): unsalted single-hash\n"
+        "// Emitted by hx_emit_unsalted_single_opencl()\n"
+        "// Pattern matched: HX_PATTERN_UNSALTED_SINGLE\n"
+        "// Algorithm: hash(pass)  (no inner md5, no hex32, no concat)\n"
+        "// Helpers from gpu_common.cl (prepended at JIT time):\n"
+        "//   md5_block, md4_block, sha1_block, sha256_block, OCLParams,\n"
+        "//   EMIT_HIT_4_DEDUP_OR_OVERFLOW, probe_compact_idx\n"
+        "// ====================================================================\n"
+        "\n"
+        "#ifndef HX_USP_MAX_PASS\n"
+        "#define HX_USP_MAX_PASS 256\n"
+        "#endif\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper usp_md_buf_global -- MD5/MD4 of variable-length __global\n"
+        "// candidate. is_md4 selects md4_block vs md5_block. LE schedule, LE\n"
+        "// 64-bit bit-length split M[14] (low) / M[15] (high).\n"
+        "static void usp_md_buf_global(__global const uchar *data, int len,\n"
+        "                              int is_md4,\n"
+        "                              uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    uint M[16];\n"
+        "    int pos = 0;\n"
+        "    *h0 = 0x67452301u; *h1 = 0xEFCDAB89u;\n"
+        "    *h2 = 0x98BADCFEu; *h3 = 0x10325476u;\n"
+        "    while (len - pos >= 64) {\n"
+        "        for (int j = 0; j < 16; j++) {\n"
+        "            int b = pos + j * 4;\n"
+        "            M[j] = (uint)data[b] | ((uint)data[b+1] << 8)\n"
+        "                 | ((uint)data[b+2] << 16) | ((uint)data[b+3] << 24);\n"
+        "        }\n"
+        "        if (is_md4) md4_block(h0, h1, h2, h3, M);\n"
+        "        else        md5_block(h0, h1, h2, h3, M);\n"
+        "        pos += 64;\n"
+        "    }\n"
+        "    int rem = len - pos;\n"
+        "    for (int j = 0; j < 16; j++) M[j] = 0;\n"
+        "    for (int i = 0; i < rem; i++) {\n"
+        "        uint v = (uint)data[pos + i];\n"
+        "        M[i >> 2] |= v << ((i & 3) * 8);\n"
+        "    }\n"
+        "    M[rem >> 2] |= (uint)0x80 << ((rem & 3) * 8);\n"
+        "    ulong bits = (ulong)len * 8ul;\n"
+        "    if (rem < 56) {\n"
+        "        M[14] = (uint)(bits & 0xfffffffful);\n"
+        "        M[15] = (uint)(bits >> 32);\n"
+        "        if (is_md4) md4_block(h0, h1, h2, h3, M);\n"
+        "        else        md5_block(h0, h1, h2, h3, M);\n"
+        "    } else {\n"
+        "        if (is_md4) md4_block(h0, h1, h2, h3, M);\n"
+        "        else        md5_block(h0, h1, h2, h3, M);\n"
+        "        for (int j = 0; j < 16; j++) M[j] = 0;\n"
+        "        M[14] = (uint)(bits & 0xfffffffful);\n"
+        "        M[15] = (uint)(bits >> 32);\n"
+        "        if (is_md4) md4_block(h0, h1, h2, h3, M);\n"
+        "        else        md5_block(h0, h1, h2, h3, M);\n"
+        "    }\n"
+        "}\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper usp_sha1_buf_global -- SHA1 of variable-length __global\n"
+        "// candidate. BE schedule, BE 64-bit bit-length at byte offset 56.\n"
+        "// First 4 state words byte-swapped to LE for probe (compact_fp).\n"
+        "static void usp_sha1_buf_global(__global const uchar *data, int len,\n"
+        "                                uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    uint M[16];\n"
+        "    int pos = 0;\n"
+        "    uint st[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,\n"
+        "                   0x10325476u, 0xC3D2E1F0u };\n"
+        "    while (len - pos >= 64) {\n"
+        "        for (int j = 0; j < 16; j++) {\n"
+        "            int b = pos + j * 4;\n"
+        "            M[j] = ((uint)data[b] << 24) | ((uint)data[b+1] << 16)\n"
+        "                 | ((uint)data[b+2] << 8) | (uint)data[b+3];\n"
+        "        }\n"
+        "        sha1_block(st, M); pos += 64;\n"
+        "    }\n"
+        "    int rem = len - pos;\n"
+        "    uchar blk[64];\n"
+        "    for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+        "    for (int i = 0; i < rem; i++) blk[i] = data[pos + i];\n"
+        "    blk[rem] = 0x80;\n"
+        "    ulong bits = (ulong)len * 8ul;\n"
+        "    if (rem >= 56) {\n"
+        "        for (int j = 0; j < 16; j++)\n"
+        "            M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+        "                 | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+        "        sha1_block(st, M);\n"
+        "        for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+        "    }\n"
+        "    for (int i = 0; i < 8; i++) blk[56 + i] = (uchar)((bits >> (56 - i*8)) & 0xffu);\n"
+        "    for (int j = 0; j < 16; j++)\n"
+        "        M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+        "             | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+        "    sha1_block(st, M);\n"
+        "    uint sw[4];\n"
+        "    for (int s = 0; s < 4; s++) {\n"
+        "        uint v = st[s];\n"
+        "        sw[s] = ((v & 0x000000ffu) << 24) | ((v & 0x0000ff00u) << 8)\n"
+        "              | ((v & 0x00ff0000u) >> 8) | ((v & 0xff000000u) >> 24);\n"
+        "    }\n"
+        "    *h0 = sw[0]; *h1 = sw[1]; *h2 = sw[2]; *h3 = sw[3];\n"
+        "}\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx: helper usp_sha256_buf_global -- SHA256 of variable-length\n"
+        "// __global candidate. BE schedule, BE 64-bit length. First 4 state\n"
+        "// words byte-swapped to LE for probe.\n"
+        "static void usp_sha256_buf_global(__global const uchar *data, int len,\n"
+        "                                  uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    uint M[16];\n"
+        "    int pos = 0;\n"
+        "    uint st[8] = { 0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,\n"
+        "                   0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u };\n"
+        "    while (len - pos >= 64) {\n"
+        "        for (int j = 0; j < 16; j++) {\n"
+        "            int b = pos + j * 4;\n"
+        "            M[j] = ((uint)data[b] << 24) | ((uint)data[b+1] << 16)\n"
+        "                 | ((uint)data[b+2] << 8) | (uint)data[b+3];\n"
+        "        }\n"
+        "        sha256_block(st, M); pos += 64;\n"
+        "    }\n"
+        "    int rem = len - pos;\n"
+        "    uchar blk[64];\n"
+        "    for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+        "    for (int i = 0; i < rem; i++) blk[i] = data[pos + i];\n"
+        "    blk[rem] = 0x80;\n"
+        "    ulong bits = (ulong)len * 8ul;\n"
+        "    if (rem >= 56) {\n"
+        "        for (int j = 0; j < 16; j++)\n"
+        "            M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+        "                 | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+        "        sha256_block(st, M);\n"
+        "        for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+        "    }\n"
+        "    for (int i = 0; i < 8; i++) blk[56 + i] = (uchar)((bits >> (56 - i*8)) & 0xffu);\n"
+        "    for (int j = 0; j < 16; j++)\n"
+        "        M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+        "             | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+        "    sha256_block(st, M);\n"
+        "    uint sw[4];\n"
+        "    for (int s = 0; s < 4; s++) {\n"
+        "        uint v = st[s];\n"
+        "        sw[s] = ((v & 0x000000ffu) << 24) | ((v & 0x0000ff00u) << 8)\n"
+        "              | ((v & 0x00ff0000u) >> 8) | ((v & 0xff000000u) >> 24);\n"
+        "    }\n"
+        "    *h0 = sw[0]; *h1 = sw[1]; *h2 = sw[2]; *h3 = sw[3];\n"
+        "}\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    /* ============================================================
+     * Iter v1 (2026-05-31, project_codegen_iteration_v1_spec_-
+     * 2026-05-31.md): per-primitive iter-feed helpers. Mirror the
+     * legacy md5_rules_phase0 iter loop (gpu/gpu_md5_rules.cl:1158-
+     * 1193) byte-for-byte: digest is hex-encoded (lower-case), then
+     * re-hashed from a FRESH IV. R1 mitigation per spec.
+     *
+     *   MD5/MD4:  32 hex chars + 0x80 + length=256  -> single block
+     *   SHA1:     40 hex chars + 0x80 + length=320  -> single block
+     *   SHA256:   64 hex chars + 0x80 + length=512  -> two blocks
+     *
+     * In/out: pointer-to-state (h0..h3 for MD5/MD4 single uints;
+     * st[5]/st[8] for SHA1/SHA256 which keep full state internally
+     * and swap-back the first 4 state words to LE for compact probe).
+     * The kernel emit calls these BEFORE each subsequent probe at
+     * iter >= 2. R7 per-iter probe mask: `1u << (iter & 31u)`.
+     * ============================================================ */
+    rc = hx_appendf(out, cap, len,
+        "// hx iter v1: MD5 hex32-feed (LE schedule, fresh IV). Used by the\n"
+        "// codegen kernel B body between iter levels when max_iter > 1.\n"
+        "static void usp_md5_iter_hex32_feed(uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    uint M[16];\n"
+        "    md5_to_hex_lc(*h0, *h1, *h2, *h3, M);\n"
+        "    M[8] = 0x80u;\n"
+        "    for (int j = 9; j < 14; j++) M[j] = 0u;\n"
+        "    M[14] = 32u * 8u;\n"
+        "    M[15] = 0u;\n"
+        "    *h0 = 0x67452301u; *h1 = 0xEFCDAB89u;\n"
+        "    *h2 = 0x98BADCFEu; *h3 = 0x10325476u;\n"
+        "    md5_block(h0, h1, h2, h3, M);\n"
+        "}\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx iter v1: MD4 hex32-feed (LE schedule, fresh IV). Same shape\n"
+        "// as MD5 since MD4 IV/schedule are identical to MD5 at this layer.\n"
+        "static void usp_md4_iter_hex32_feed(uint *h0, uint *h1, uint *h2, uint *h3)\n"
+        "{\n"
+        "    uint M[16];\n"
+        "    md5_to_hex_lc(*h0, *h1, *h2, *h3, M);\n"
+        "    M[8] = 0x80u;\n"
+        "    for (int j = 9; j < 14; j++) M[j] = 0u;\n"
+        "    M[14] = 32u * 8u;\n"
+        "    M[15] = 0u;\n"
+        "    *h0 = 0x67452301u; *h1 = 0xEFCDAB89u;\n"
+        "    *h2 = 0x98BADCFEu; *h3 = 0x10325476u;\n"
+        "    md4_block(h0, h1, h2, h3, M);\n"
+        "}\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    /* SHA1: between iters, we need to re-hash the 40-char ASCII hex
+     * representation of the previous digest. Caller passes in the LE-
+     * swapped probe key (h0..h3 are the first 4 LE state words). We
+     * must reconstruct the BE state values, hex-encode, then rebuild
+     * SHA1's 5-word state from cold IV (the 5th state word is not in
+     * the probe key — we need to thread it through). Simpler path:
+     * recompute from h0..h4 array carried alongside. See kernel emit
+     * for the storage shape. */
+    rc = hx_appendf(out, cap, len,
+        "// hx iter v1: SHA1 hex40-feed (BE schedule, fresh IV). The full\n"
+        "// 5-word state (st[5]) is the input; the kernel emit keeps it\n"
+        "// alongside the LE-swapped 4-word probe key. After feed, st[5]\n"
+        "// holds the new digest; first 4 state words are byte-swapped to\n"
+        "// LE for the next probe.\n"
+        "static void usp_sha1_iter_hex40_feed(uint *st)\n"
+        "{\n"
+        "    /* Build 40 ASCII hex bytes from st[0..4] (BE digest -> hex). */\n"
+        "    uchar hex[40];\n"
+        "    for (int s = 0; s < 5; s++) {\n"
+        "        uint v = st[s];\n"
+        "        uchar b0 = (uchar)((v >> 24) & 0xffu);\n"
+        "        uchar b1 = (uchar)((v >> 16) & 0xffu);\n"
+        "        uchar b2 = (uchar)((v >>  8) & 0xffu);\n"
+        "        uchar b3 = (uchar)( v        & 0xffu);\n"
+        "        uchar bs[4]; bs[0]=b0; bs[1]=b1; bs[2]=b2; bs[3]=b3;\n"
+        "        for (int k = 0; k < 4; k++) {\n"
+        "            uchar b = bs[k];\n"
+        "            uchar hi = (b >> 4) & 0xfu;\n"
+        "            uchar lo = b & 0xfu;\n"
+        "            hex[s*8 + k*2 + 0] = (uchar)(hi + ((hi < 10u) ? '0' : ('a' - 10)));\n"
+        "            hex[s*8 + k*2 + 1] = (uchar)(lo + ((lo < 10u) ? '0' : ('a' - 10)));\n"
+        "        }\n"
+        "    }\n"
+        "    /* Single block (40 + 1 + 8 = 49 <= 64). BE schedule. */\n"
+        "    uint M[16];\n"
+        "    for (int j = 0; j < 10; j++) {\n"
+        "        M[j] = ((uint)hex[j*4] << 24) | ((uint)hex[j*4+1] << 16)\n"
+        "             | ((uint)hex[j*4+2] << 8) | (uint)hex[j*4+3];\n"
+        "    }\n"
+        "    M[10] = 0x80000000u;   /* sentinel byte at offset 40 (BE word 10, top byte) */\n"
+        "    for (int j = 11; j < 14; j++) M[j] = 0u;\n"
+        "    M[14] = 0u;\n"
+        "    M[15] = 320u;          /* 40 bytes * 8 bits */\n"
+        "    st[0] = 0x67452301u; st[1] = 0xEFCDAB89u; st[2] = 0x98BADCFEu;\n"
+        "    st[3] = 0x10325476u; st[4] = 0xC3D2E1F0u;\n"
+        "    sha1_block(st, M);\n"
+        "}\n"
+        "\n");
+    if (rc < 0) return rc;
+
+    rc = hx_appendf(out, cap, len,
+        "// hx iter v1: SHA256 hex64-feed (BE schedule, fresh IV). 64 hex\n"
+        "// bytes + 1 sentinel + 8 length = 73 > 64; TWO blocks required.\n"
+        "// st[8] is the full state; kernel emit threads it through.\n"
+        "static void usp_sha256_iter_hex64_feed(uint *st)\n"
+        "{\n"
+        "    /* Build 64 ASCII hex bytes from st[0..7] (BE digest -> hex). */\n"
+        "    uchar hex[64];\n"
+        "    for (int s = 0; s < 8; s++) {\n"
+        "        uint v = st[s];\n"
+        "        uchar bs[4];\n"
+        "        bs[0] = (uchar)((v >> 24) & 0xffu);\n"
+        "        bs[1] = (uchar)((v >> 16) & 0xffu);\n"
+        "        bs[2] = (uchar)((v >>  8) & 0xffu);\n"
+        "        bs[3] = (uchar)( v        & 0xffu);\n"
+        "        for (int k = 0; k < 4; k++) {\n"
+        "            uchar b = bs[k];\n"
+        "            uchar hi = (b >> 4) & 0xfu;\n"
+        "            uchar lo = b & 0xfu;\n"
+        "            hex[s*8 + k*2 + 0] = (uchar)(hi + ((hi < 10u) ? '0' : ('a' - 10)));\n"
+        "            hex[s*8 + k*2 + 1] = (uchar)(lo + ((lo < 10u) ? '0' : ('a' - 10)));\n"
+        "        }\n"
+        "    }\n"
+        "    /* Block 1: all 64 hex bytes, no sentinel. BE schedule. */\n"
+        "    uint M[16];\n"
+        "    for (int j = 0; j < 16; j++) {\n"
+        "        M[j] = ((uint)hex[j*4] << 24) | ((uint)hex[j*4+1] << 16)\n"
+        "             | ((uint)hex[j*4+2] << 8) | (uint)hex[j*4+3];\n"
+        "    }\n"
+        "    st[0] = 0x6a09e667u; st[1] = 0xbb67ae85u; st[2] = 0x3c6ef372u; st[3] = 0xa54ff53au;\n"
+        "    st[4] = 0x510e527fu; st[5] = 0x9b05688cu; st[6] = 0x1f83d9abu; st[7] = 0x5be0cd19u;\n"
+        "    sha256_block(st, M);\n"
+        "    /* Block 2: 0x80 sentinel at byte 0, zero pad, BE 64-bit length at end. */\n"
+        "    M[0] = 0x80000000u;\n"
+        "    for (int j = 1; j < 14; j++) M[j] = 0u;\n"
+        "    M[14] = 0u;\n"
+        "    M[15] = 512u;     /* 64 bytes * 8 bits */\n"
+        "    sha256_block(st, M);\n"
+        "}\n"
+        "\n");
+    return rc;
+}
+
+static int emit_unsalted_single_kernel(char **out, size_t *cap, size_t *len,
+                                       enum hx_primitive_id pid,
+                                       const char *prim_name, int job_enum)
+{
+    /* Iter v1 (2026-05-31): unlike Batch 1's one-shot probe, the kernel
+     * body now wraps the hash + probe with a runtime for-loop reading
+     * `params.max_iter` (offset 60). For SHA1/SHA256 the iter feed needs
+     * the full 5/8-word BE state (NOT just the 4-word LE probe key); we
+     * thread the state through and byte-swap-to-LE per iter for probe. */
+    const char *seed_line;    /* iter==1: produce initial digest */
+    const char *probe_load;   /* per-iter: load probe key (LE 4 uints) */
+    const char *feed_line;    /* iter<max: hex-feed to next iter */
+    switch (pid) {
+        case HX_PRIM_MD5:
+            seed_line =
+                "    uint h0, h1, h2, h3;\n"
+                "    usp_md_buf_global(pass_bytes, (int)plen, 0, &h0, &h1, &h2, &h3);\n";
+            probe_load = "    /* h0..h3 are already LE probe key */\n";
+            feed_line =
+                "            usp_md5_iter_hex32_feed(&h0, &h1, &h2, &h3);\n";
+            break;
+        case HX_PRIM_MD4:
+            seed_line =
+                "    uint h0, h1, h2, h3;\n"
+                "    usp_md_buf_global(pass_bytes, (int)plen, 1, &h0, &h1, &h2, &h3);\n";
+            probe_load = "    /* h0..h3 are already LE probe key */\n";
+            feed_line =
+                "            usp_md4_iter_hex32_feed(&h0, &h1, &h2, &h3);\n";
+            break;
+        case HX_PRIM_SHA1:
+            /* The existing helper byte-swaps st[]->h*; we need to thread
+             * the full BE state through iter, so re-implement seed inline
+             * to keep st[5] (then derive h0..h3 = bswap32(st[0..3])). */
+            seed_line =
+                "    uint st[5];\n"
+                "    uint h0, h1, h2, h3;\n"
+                "    /* seed: compute SHA1(pass) -> st[5], then derive LE probe */\n"
+                "    {\n"
+                "        uint M[16];\n"
+                "        int pos = 0;\n"
+                "        st[0] = 0x67452301u; st[1] = 0xEFCDAB89u; st[2] = 0x98BADCFEu;\n"
+                "        st[3] = 0x10325476u; st[4] = 0xC3D2E1F0u;\n"
+                "        while ((int)plen - pos >= 64) {\n"
+                "            for (int j = 0; j < 16; j++) {\n"
+                "                int b = pos + j * 4;\n"
+                "                M[j] = ((uint)pass_bytes[b] << 24) | ((uint)pass_bytes[b+1] << 16)\n"
+                "                     | ((uint)pass_bytes[b+2] << 8) | (uint)pass_bytes[b+3];\n"
+                "            }\n"
+                "            sha1_block(st, M); pos += 64;\n"
+                "        }\n"
+                "        int rem = (int)plen - pos;\n"
+                "        uchar blk[64]; for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+                "        for (int i = 0; i < rem; i++) blk[i] = pass_bytes[pos + i];\n"
+                "        blk[rem] = 0x80;\n"
+                "        ulong bits = (ulong)plen * 8ul;\n"
+                "        if (rem >= 56) {\n"
+                "            for (int j = 0; j < 16; j++)\n"
+                "                M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+                "                     | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+                "            sha1_block(st, M);\n"
+                "            for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+                "        }\n"
+                "        for (int i = 0; i < 8; i++) blk[56 + i] = (uchar)((bits >> (56 - i*8)) & 0xffu);\n"
+                "        for (int j = 0; j < 16; j++)\n"
+                "            M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+                "                 | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+                "        sha1_block(st, M);\n"
+                "    }\n";
+            probe_load =
+                "        /* SHA1: BE state -> LE probe key (mirror usp_sha1_buf_global) */\n"
+                "        h0 = ((st[0] & 0x000000ffu) << 24) | ((st[0] & 0x0000ff00u) << 8)\n"
+                "           | ((st[0] & 0x00ff0000u) >> 8) | ((st[0] & 0xff000000u) >> 24);\n"
+                "        h1 = ((st[1] & 0x000000ffu) << 24) | ((st[1] & 0x0000ff00u) << 8)\n"
+                "           | ((st[1] & 0x00ff0000u) >> 8) | ((st[1] & 0xff000000u) >> 24);\n"
+                "        h2 = ((st[2] & 0x000000ffu) << 24) | ((st[2] & 0x0000ff00u) << 8)\n"
+                "           | ((st[2] & 0x00ff0000u) >> 8) | ((st[2] & 0xff000000u) >> 24);\n"
+                "        h3 = ((st[3] & 0x000000ffu) << 24) | ((st[3] & 0x0000ff00u) << 8)\n"
+                "           | ((st[3] & 0x00ff0000u) >> 8) | ((st[3] & 0xff000000u) >> 24);\n";
+            feed_line =
+                "            usp_sha1_iter_hex40_feed(st);\n";
+            break;
+        case HX_PRIM_SHA256:
+            seed_line =
+                "    uint st[8];\n"
+                "    uint h0, h1, h2, h3;\n"
+                "    /* seed: compute SHA256(pass) -> st[8], then derive LE probe */\n"
+                "    {\n"
+                "        uint M[16];\n"
+                "        int pos = 0;\n"
+                "        st[0] = 0x6a09e667u; st[1] = 0xbb67ae85u; st[2] = 0x3c6ef372u; st[3] = 0xa54ff53au;\n"
+                "        st[4] = 0x510e527fu; st[5] = 0x9b05688cu; st[6] = 0x1f83d9abu; st[7] = 0x5be0cd19u;\n"
+                "        while ((int)plen - pos >= 64) {\n"
+                "            for (int j = 0; j < 16; j++) {\n"
+                "                int b = pos + j * 4;\n"
+                "                M[j] = ((uint)pass_bytes[b] << 24) | ((uint)pass_bytes[b+1] << 16)\n"
+                "                     | ((uint)pass_bytes[b+2] << 8) | (uint)pass_bytes[b+3];\n"
+                "            }\n"
+                "            sha256_block(st, M); pos += 64;\n"
+                "        }\n"
+                "        int rem = (int)plen - pos;\n"
+                "        uchar blk[64]; for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+                "        for (int i = 0; i < rem; i++) blk[i] = pass_bytes[pos + i];\n"
+                "        blk[rem] = 0x80;\n"
+                "        ulong bits = (ulong)plen * 8ul;\n"
+                "        if (rem >= 56) {\n"
+                "            for (int j = 0; j < 16; j++)\n"
+                "                M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+                "                     | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+                "            sha256_block(st, M);\n"
+                "            for (int i = 0; i < 64; i++) blk[i] = 0;\n"
+                "        }\n"
+                "        for (int i = 0; i < 8; i++) blk[56 + i] = (uchar)((bits >> (56 - i*8)) & 0xffu);\n"
+                "        for (int j = 0; j < 16; j++)\n"
+                "            M[j] = ((uint)blk[j*4] << 24) | ((uint)blk[j*4+1] << 16)\n"
+                "                 | ((uint)blk[j*4+2] << 8) | (uint)blk[j*4+3];\n"
+                "        sha256_block(st, M);\n"
+                "    }\n";
+            probe_load =
+                "        /* SHA256: BE state -> LE probe key (mirror usp_sha256_buf_global) */\n"
+                "        h0 = ((st[0] & 0x000000ffu) << 24) | ((st[0] & 0x0000ff00u) << 8)\n"
+                "           | ((st[0] & 0x00ff0000u) >> 8) | ((st[0] & 0xff000000u) >> 24);\n"
+                "        h1 = ((st[1] & 0x000000ffu) << 24) | ((st[1] & 0x0000ff00u) << 8)\n"
+                "           | ((st[1] & 0x00ff0000u) >> 8) | ((st[1] & 0xff000000u) >> 24);\n"
+                "        h2 = ((st[2] & 0x000000ffu) << 24) | ((st[2] & 0x0000ff00u) << 8)\n"
+                "           | ((st[2] & 0x00ff0000u) >> 8) | ((st[2] & 0xff000000u) >> 24);\n"
+                "        h3 = ((st[3] & 0x000000ffu) << 24) | ((st[3] & 0x0000ff00u) << 8)\n"
+                "           | ((st[3] & 0x00ff0000u) >> 8) | ((st[3] & 0xff000000u) >> 24);\n";
+            feed_line =
+                "            usp_sha256_iter_hex64_feed(st);\n";
+            break;
+        default:
+            fprintf(stderr,
+                "FATAL: %s:%d hx unsalted-single emit kernel: primitive "
+                "'%s' (id=%d) not wired in Phase 1b Batch 1 (job=e%d). "
+                "Batch-1 wired set is md5/md4/sha1/sha256.\n",
+                __FILE__, __LINE__, prim_name ? prim_name : "(null)",
+                (int)pid, job_enum);
+            exit(1);
+    }
+
+    return hx_appendf(out, cap, len,
+        "// hx: unsalted-single kernel for e%d prim=%s; probe uses 4 LE uints.\n"
+        "// kernel signature mirrors kernelb_hx_codegen_phase0 (family) so\n"
+        "// the dispatcher binds the same 16 args. The 4 salt args are\n"
+        "// IGNORED (this shape is unsalted). reqd_work_group_size(64) pins\n"
+        "// WG size to the dispatcher lsize=64 (same R8 fix as e347/family).\n"
+        "//\n"
+        "// Iter v1 (2026-05-31): runtime for-loop reading params.max_iter\n"
+        "// (OCLParams offset 60). At iter==1 the body is byte-equivalent\n"
+        "// to the Batch-1 single-probe kernel (no feed runs). At iter>1\n"
+        "// each iter probes then hex-feeds the digest to the next iter,\n"
+        "// mirroring legacy md5_rules_phase0 (gpu_md5_rules.cl:1158-1193)\n"
+        "// byte-for-byte. R7 per-iter mask = (1u << (iter & 31u)).\n"
+        "__attribute__((reqd_work_group_size(64,1,1)))\n"
+        "__kernel void kernelb_hx_codegen_phase0(\n"
+        "    __global const uchar         *payload,\n"
+        "    __global const uchar         *b_packed_buf,\n"
+        "    __global const uint          *b_chunk_index,\n"
+        "    __global const uchar         *salts,\n"
+        "    __global const uint          *salt_offsets,\n"
+        "    __global const ushort        *salt_lens,\n"
+        "    __global const uint          *compact_fp,\n"
+        "    __global const uint          *compact_idx,\n"
+        "    __global const uchar         *hash_data_buf,\n"
+        "    __global const ulong         *hash_data_off,\n"
+        "    __global uint                *hits,\n"
+        "    __global volatile uint       *hit_count,\n"
+        "    __global const ulong         *overflow_keys,\n"
+        "    __global const uchar         *overflow_hashes,\n"
+        "    __global const uint          *overflow_offsets,\n"
+        "    __global volatile uint       *hashes_shown\n"
+        "    )\n"
+        "{\n"
+        "    __global const OCLParams *params_buf =\n"
+        "        (__global const OCLParams *)payload;\n"
+        "    OCLParams params = *params_buf;\n"
+        "\n"
+        "    uint gid = get_global_id(0);\n"
+        "    uint word_idx = gid;\n"
+        "    if (word_idx >= params.num_words) return;\n"
+        "\n"
+        "    (void)salts; (void)salt_offsets; (void)salt_lens;\n"
+        "\n"
+        "    uint wpos = b_chunk_index[word_idx];\n"
+        "    if (wpos >= params.packed_size) return;  // defensive\n"
+        "    uint plen = (uint)b_packed_buf[wpos];\n"
+        "    __global const uchar *pass_bytes = b_packed_buf + wpos + 1u;\n"
+        "\n"
+        "    // OP_CALL %s (seed: single hash of the unsalted pass; iter==1)\n"
+        "%s"
+        "\n"
+        "    __global volatile uint *ovr_set =\n"
+        "        (__global volatile uint *)(payload + 100);\n"
+        "    __global volatile uint *ovr_gid =\n"
+        "        (__global volatile uint *)(payload + 104);\n"
+        "\n"
+        "    uint widx = params.base_word_idx + word_idx;\n"
+        "    uint mi = params.max_iter; if (mi < 1u) mi = 1u;\n"
+        "    for (uint iter = 1u; iter <= mi; iter++) {\n"
+        "%s"
+        "        uint matched_idx = 0u;\n"
+        "        if (probe_compact_idx(h0, h1, h2, h3,\n"
+        "                              compact_fp, compact_idx,\n"
+        "                              params.compact_mask, params.max_probe,\n"
+        "                              params.hash_data_count,\n"
+        "                              hash_data_buf, hash_data_off,\n"
+        "                              overflow_keys, overflow_hashes,\n"
+        "                              overflow_offsets, params.overflow_count,\n"
+        "                              &matched_idx))\n"
+        "        {\n"
+        "            uint mask = 1u << (iter & 31u);\n"
+        "            EMIT_HIT_4_DEDUP_OR_OVERFLOW(hits, hit_count, params.max_hits,\n"
+        "                       widx, 0u, iter, h0, h1, h2, h3,\n"
+        "                       hashes_shown, matched_idx, mask,\n"
+        "                       ovr_set, ovr_gid, gid);\n"
+        "        }\n"
+        "        if (iter < mi) {\n"
+        "%s"
+        "        }\n"
+        "    }\n"
+        "}\n",
+        job_enum, prim_name, prim_name, seed_line,
+        probe_load, feed_line);
+}
+
+int hx_emit_unsalted_single_opencl(
+    char **out, size_t *out_cap,
+    const hx_program *prog,
+    const struct hx_specialization *spec,
+    const struct hx_spec_entry *entry)
+{
+    if (!out || !out_cap || !prog || !spec || !entry) {
+        fprintf(stderr,
+            "FATAL: %s:%d hx_emit_unsalted_single_opencl: NULL argument "
+            "(out=%p cap=%p prog=%p spec=%p entry=%p)\n",
+            __FILE__, __LINE__, (void*)out, (void*)out_cap,
+            (void*)prog, (void*)spec, (void*)entry);
+        return -1;
+    }
+
+    const char *prim_name = hx_callname_for_entry(entry, 1);
+    if (!prim_name) {
+        fprintf(stderr,
+            "FATAL: %s:%d hx_emit_unsalted_single_opencl: e%d %s code[1] "
+            "callname is NULL (sidecar missing).\n",
+            __FILE__, __LINE__, entry->job_enum,
+            entry->name ? entry->name : "(noname)");
+        return -1;
+    }
+    enum hx_primitive_id pid = hx_primitive_id_for_name(prim_name);
+    if (pid == HX_PRIM_UNKNOWN) {
+        fprintf(stderr,
+            "FATAL: %s:%d hx_emit_unsalted_single_opencl: e%d %s callname "
+            "'%s' not recognized in hx_emit_primitives.c table.\n",
+            __FILE__, __LINE__, entry->job_enum,
+            entry->name ? entry->name : "(noname)", prim_name);
+        return -1;
+    }
+    if (pid != HX_PRIM_MD5 && pid != HX_PRIM_MD4 &&
+        pid != HX_PRIM_SHA1 && pid != HX_PRIM_SHA256) {
+        fprintf(stderr,
+            "FATAL: %s:%d hx_emit_unsalted_single_opencl: e%d %s primitive "
+            "'%s' is not in the Phase 1b Batch-1 wired set "
+            "(md5/md4/sha1/sha256). Batch 2/3 widen this gate.\n",
+            __FILE__, __LINE__, entry->job_enum,
+            entry->name ? entry->name : "(noname)", prim_name);
+        return -1;
+    }
+
+    size_t cur_len = 0;
+    if (*out == NULL) *out_cap = 0;
+    int rc;
+
+    rc = hx_appendf(out, out_cap, &cur_len,
+        "// hx codegen: PATTERN UNSALTED_SINGLE matched (e%d %s prim=%s)\n"
+        "// hx: program ncode=%d nvars=%d max_stack=%d has_emit=%d\n"
+        "// hx: code[1] role=%d (0=hex/default, 1=raw-bin; identical digest)\n"
+        "// hx: this kernel JIT-compiled with gpu_common_str prepended\n"
+        "\n",
+        entry->job_enum, entry->name ? entry->name : "(noname)", prim_name,
+        prog->ncode, prog->nvars, prog->max_stack, prog->has_emit,
+        (int)prog->code[1].u.call.role);
+    if (rc < 0) return rc;
+
+    rc = emit_unsalted_single_helpers(out, out_cap, &cur_len);
+    if (rc < 0) return rc;
+
+    rc = emit_unsalted_single_kernel(out, out_cap, &cur_len,
+                                     pid, prim_name, entry->job_enum);
+    if (rc < 0) return rc;
+
     if (cur_len + 1 > *out_cap) {
         char *np = (char *)realloc(*out, cur_len + 1);
         if (!np) return -1;

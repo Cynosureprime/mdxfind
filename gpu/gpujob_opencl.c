@@ -38,6 +38,12 @@
  * JOB_MD5MD5SALT route-gate widening to the seven 5a-eligible
  * MAKE_MD5PASS family JOB enums. */
 #include "gpu_codegen_eligible.h"
+#include "../codegen/hx_emit_primitives.h"  /* sub-phase 5b.3a.0.3 D17.4.b: hx_primitive_for_job + hx_primitive_digest_bytes */
+/* Auto-dispatcher: capability+perf matrix that picks codegen vs legacy
+ * backend per (op, iter, rules, mask, bf). Replaces the user-visible
+ * MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 env-flag opt-in shipped 2026-05-29.
+ * Per spec project_codegen_auto_dispatch_spec_2026-05-31.md. */
+#include "codegen_auto_dispatch.h"
 
 /* Sub-phase 5a.5 (2026-05-22): CPU full-digest recompute helper used by
  * the proto hit-replay path for unsalted family JOBs whose digest
@@ -56,6 +62,16 @@ extern int checkhashbb(union HashU *, int, char *, struct job *);
 extern void mymd5(char *, int, unsigned char *);
 extern void mysha1(char *, int, unsigned char *);
 extern void mysha256(char *, int, unsigned char *);
+/* Iter v1.1 (2026-05-31): MD4 extern for unsalted single-hash full-digest
+ * recompute (only needed when SHA1RAW/SHA256RAW hits surface; MD4 itself
+ * fits in the 16-byte hit record and never triggers recompute). Declared
+ * here for symmetry with mysha1/mysha256. Implementation in OpenSSL
+ * (extern at mdxfind.c:2278). */
+extern void MD4(char *, int, unsigned char *);
+/* Iter v1.2 (2026-05-31): prmd5 extern for SHA1/SHA256 hex-feedback iter
+ * chain recompute. Lower-case hex of digest; mirrors CPU JOB_SHA1 /
+ * JOB_SHA256 iter loop (mdxfind.c:28666 / :29088). Defined mdxfind.c:4600. */
+extern char *prmd5(unsigned char *md5, char *out, int len);
 struct saltentry;
 extern int build_hashsalt_snapshot(struct saltentry *, char *, Pvoid_t, char *, int);
 extern Pvoid_t *Typehashsalt;
@@ -1156,9 +1172,81 @@ void gpujob(void *arg) {
                     }
                 }
 
+                /* Auto-dispatcher route gate (2026-05-31, replaces
+                 * env-flag opt-in shipped 2026-05-29). The user-visible
+                 * MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1 opt-in is
+                 * RETIRED; the dispatcher consults a hardcoded
+                 * capability+perf matrix (gpu/codegen_auto_dispatch.c)
+                 * and picks LEGACY vs CODEGEN per (op, iter, rules,
+                 * mask, bf, backend_kind). Per spec project_codegen_-
+                 * auto_dispatch_spec_2026-05-31.md.
+                 *
+                 * Behavior preserved for env-unset users:
+                 *   OpenCL JOB_MD5 + rules: still LEGACY (faster, 1.39-
+                 *     2.28x per #375/#377). User sees no change.
+                 *   OpenCL JOB_MD4 / SHA1RAW iter==1 / SHA256RAW iter==1:
+                 *     LEGACY (preserves today's env-unset default).
+                 *   SHA1RAW/SHA256RAW iter>1: LEGACY (codegen uses hex
+                 *     feedback; CPU oracle uses binary feedback -- would
+                 *     silently diverge).
+                 *   JOB_SHA1 / JOB_SHA256 (e8/e10) hex-feedback siblings
+                 *     of SHA1RAW/SHA256RAW: LEGACY on OpenCL any-iter
+                 *     (template_iterate works correctly; matches the
+                 *     JOB_MD5 LEGACY default for parity). On Metal these
+                 *     auto-pick CODEGEN at iter>1 (legacy template_-
+                 *     iterate is intentionally NOT called per metal_-
+                 *     template.metal:684 -- same flagship gap as MD5/MD4).
+                 *
+                 * FORCE-override for diagnostics:
+                 *   MDXFIND_GPU_BACKEND=codegen forces all eligible
+                 *     cells through codegen. MDXFIND_GPU_BACKEND=legacy
+                 *     forces the opposite. Default "auto" (unset)
+                 *     consults the matrix.
+                 *
+                 * Out-of-scope guards (mask, BF, rules==0) collapse to
+                 * LEGACY inside the dispatcher itself; we still need to
+                 * NOT set _exp_md5_route when ineligible -- the route
+                 * gate's downstream blocks assume `_exp_md5_route=1`
+                 * implies non-zero rules, etc. */
+                int _exp_md5_route = 0;
+                if (!g->bf_chunk
+                    && MaskTotal == 0
+                    && gpu_rule_count > 0
+                    && (g->op == JOB_MD5
+                        || g->op == JOB_MD4
+                        || g->op == JOB_SHA1
+                        || g->op == JOB_SHA256
+                        || g->op == JOB_SHA1RAW
+                        || g->op == JOB_SHA256RAW)) {
+                    gpu_backend_pick_t _pick = codegen_auto_dispatch_pick(
+                        g->op, Maxiter, gpu_rule_count,
+                        (unsigned long long)MaskTotal,
+                        (unsigned int)g->bf_chunk,
+                        GPU_BACKEND_KIND_OPENCL);
+                    if (_pick == GPU_BACKEND_CODEGEN) {
+                        _exp_md5_route = 1;
+                    } else if (_pick == GPU_BACKEND_FATAL) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d OpenCL: codegen auto-dispatcher "
+                            "FATAL for op=%d iter=%d rules=%d -- neither "
+                            "legacy nor codegen can serve this cell. "
+                            "Workaround: try MDXFIND_GPU_BACKEND=legacy or "
+                            "split rule file into smaller chunks.\n",
+                            __FILE__, __LINE__, g->op, Maxiter, gpu_rule_count);
+                        exit(1);
+                    }
+                    /* else GPU_BACKEND_LEGACY -- fall through to the
+                     * legacy md5_rules_phase0 engine below (no flag set). */
+                } else {
+                    /* Out-of-scope (mask, BF, rules==0, or op not in
+                     * the unsalted-single eligible set): no auto-dispatch
+                     * consultation. Falls through to legacy engines as
+                     * before. */
+                }
                 if (!_proto_fired
                     && (g->op == JOB_MD5MD5SALT
-                        || gpu_codegen_kernelb_family_md5pass_eligible(g->op))
+                        || gpu_codegen_kernelb_family_md5pass_eligible(g->op)
+                        || _exp_md5_route)
                     && !g->bf_chunk) {
                     /* Phase 4 sub-phase 4a.1 (2026-05-21): codegen kernel
                      * B is now the production default for JOB_MD5MD5SALT.
@@ -1178,10 +1266,16 @@ void gpujob(void *arg) {
                      * succeed). Mirrors the harness pattern at
                      * mdxfind.c:38402 (5a.2/5a.3 validate dispatcher). */
                     int _is_family = gpu_codegen_kernelb_family_md5pass_eligible(g->op);
-                    if (_is_family) {
-                        /* Unsalted family: upload a 1-byte zero placeholder
-                         * salt once per op-change, mirroring the validate
-                         * harness placeholder pattern. The family kernel
+                    /* Experiment (2026-05-29): JOB_MD5 (e1) is unsalted and
+                     * uses the same 1-byte zero placeholder-salt path as the
+                     * family — the codegen unsalted KB ignores the salt args
+                     * (void)salts; (void)salt_offsets; (void)salt_lens; but
+                     * the bound cl_mems must be non-NULL for clSetKernelArg. */
+                    int _unsalted_placeholder = _is_family || _exp_md5_route;
+                    if (_unsalted_placeholder) {
+                        /* Unsalted family / experiment: upload a 1-byte zero
+                         * placeholder salt once per op-change, mirroring the
+                         * validate harness placeholder pattern. The kernel
                          * does (void)salts; (void)salt_offsets; (void)salt_lens;
                          * so the contents are ignored, but the buffers must
                          * exist (clSetKernelArg refuses NULL). */
@@ -1447,6 +1541,51 @@ void gpujob(void *arg) {
                             _proto_stored = GPU_PACKED_MAX_HITS;
                         int _is_family =
                             gpu_codegen_kernelb_family_md5pass_eligible(g->op);
+                        /* Experiment (2026-05-29): JOB_MD5 (e1) is unsalted.
+                         * The codegen unsalted KB emits hits as (slot_idx,
+                         * salt_idx=0, iter=1, h0..h3) — a full 16-byte / 32-hex
+                         * MD5 digest in the hit record. Decode must route to
+                         * checkhash() (no salt), NOT checkhashsalt(). This
+                         * flag selects the unsalted decode arm below. It is
+                         * only ever set when _exp_md5_route fired (env flag +
+                         * op in eligible-set + in-scope), so flag-unset
+                         * behavior is unchanged.
+                         *
+                         * Iter v1.1 (2026-05-31): widen the predicate to the
+                         * 3 additional unsalted single-hash primitives
+                         * (MD4=e3, SHA1RAW=e34, SHA256RAW=e36). Naming kept
+                         * `_exp_md5_unsalted` for diff hygiene; semantic role
+                         * is now "unsalted-single codegen hit-decode arm".
+                         *
+                         * Iter v1.2 (2026-05-31, #379 v1.1 widen option a):
+                         * admit JOB_SHA1 (e8) + JOB_SHA256 (e10) -- the hex-
+                         * feedback siblings of SHA1RAW/SHA256RAW. Codegen
+                         * kernel B output shape is byte-identical to the
+                         * RAW variants (first 16 bytes of digest at
+                         * entry[3..6]); hex-feedback semantics for iter>1
+                         * match what codegen emits via the iter-v1 helpers
+                         * (codegen/hx_emit_opencl.c:4195+) -- CPU oracle
+                         * mdxfind.c:28666 (SHA1) / :29088 (SHA256) uses
+                         * the same lower-case hex-feedback via prmd5. */
+                        /* Auto-dispatcher (2026-05-31): the hit-decode
+                         * arm fires when the proto path produced hits AND
+                         * the op is in the unsalted-single eligible set.
+                         * Pre-auto-dispatch this also checked the env
+                         * flag MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5; with
+                         * the env retirement, the upstream route gate
+                         * (above) is the sole admission point. If the
+                         * route gate did not set _exp_md5_route, the
+                         * proto path didn't run for one of these ops, so
+                         * _proto_stored will be zero and this loop is a
+                         * no-op anyway. Safe to drop the env check.
+                         *
+                         * Naming kept `_exp_md5_unsalted` for diff
+                         * hygiene; semantic role is "unsalted-single
+                         * codegen hit-decode arm". */
+                        int _exp_md5_unsalted =
+                            (g->op == JOB_MD5 || g->op == JOB_MD4
+                             || g->op == JOB_SHA1 || g->op == JOB_SHA256
+                             || g->op == JOB_SHA1RAW || g->op == JOB_SHA256RAW);
                         /* For family the hexlen depends on outer primitive.
                          * Mirrors gpu_hash_words for the family — but the
                          * compact-table probe uses 4 uints (16 bytes / 32
@@ -1474,18 +1613,31 @@ void gpujob(void *arg) {
                          */
                         int _proto_hexlen;
                         if (_is_family) {
-                            switch (g->op) {
-                                case JOB_MD4MD5PASS:    _proto_hexlen = 32;  break;
-                                case JOB_RMD160MD5PASS: _proto_hexlen = 40;  break;
-                                case JOB_SHA1MD5PASS:   _proto_hexlen = 40;  break;
-                                case JOB_SHA224MD5PASS: _proto_hexlen = 56;  break;
-                                case JOB_SHA256MD5PASS: _proto_hexlen = 64;  break;
-                                case JOB_SHA384MD5PASS: _proto_hexlen = 96;  break;
-                                case JOB_SHA512MD5PASS: _proto_hexlen = 128; break;
-                                default:                _proto_hexlen = 32;  break;
-                            }
+                            /* Sub-phase 5b.3a.0.3 (2026-05-27) D17.4.b
+                             * refactor: switch over JOB enum replaced
+                             * with table-driven lookup. Each Tier
+                             * widening (Tier 3 4/5-pass HAVAL; Tier 4
+                             * gost/sne128/sne256) auto-propagates via
+                             * prim_table.digest_bytes -- no edit here. */
+                            const enum hx_primitive_id _pid =
+                                hx_primitive_for_job(g->op);
+                            int _db = hx_primitive_digest_bytes(_pid);
+                            if (_db <= 0) _db = 16;
+                            _proto_hexlen = _db * 2;
+                        } else if (_exp_md5_unsalted) {
+                            /* Iter v1.1 (2026-05-31): unsalted single-hash
+                             * primitive — digest width varies per primitive
+                             * (MD5/MD4=16B/32hex, SHA1=20B/40hex,
+                             * SHA256=32B/64hex). Lookup via the unsalted_-
+                             * job_table single source of truth. */
+                            const enum hx_primitive_id _pid =
+                                hx_primitive_for_unsalted_job(g->op);
+                            int _db = hx_primitive_digest_bytes(_pid);
+                            if (_db <= 0) _db = 16;
+                            _proto_hexlen = _db * 2;
                         } else {
-                            _proto_hexlen = 32;  /* e347 MD5: 4 words */
+                            /* e347 MD5MD5SALT: 4 words / 16 bytes / 32 hex. */
+                            _proto_hexlen = 32;
                         }
                         for (int _ph = 0; _ph < _proto_stored; _ph++) {
                             uint32_t *_pe = hits + _ph * GPU_HIT_STRIDE;
@@ -1532,6 +1684,105 @@ void gpujob(void *arg) {
                                 }
                                 checkhash(&curin, _proto_hexlen,
                                           (int)_pe[2],  /* iter_num */
+                                          &synthetic_job);
+                            } else if (_exp_md5_unsalted) {
+                                /* Experiment (2026-05-29): unsalted JOB_MD5.
+                                 * The codegen unsalted KB emits the full
+                                 * 16-byte MD5 digest in the hit record
+                                 * (h0..h3), so no full-digest recompute is
+                                 * needed. Route to checkhash() (no salt) —
+                                 * the same verifier the legacy md5_rules_-
+                                 * phase0 path uses for unsalted MD5 hits.
+                                 * checkhash walks the compact table +
+                                 * overflow + full-digest verification, so the
+                                 * crack output is byte-identical to the
+                                 * legacy engine for a given (plaintext, rule)
+                                 * match.
+                                 *
+                                 * Iter v1.1 (2026-05-31): for digest widths
+                                 * > 16 bytes (SHA1RAW=20B/40hex,
+                                 * SHA256RAW=32B/64hex) the hit record's
+                                 * 4-uint payload covers only the first
+                                 * 16 bytes — checkhash's hybrid_check
+                                 * memcmp's against HashDataBuf for the FULL
+                                 * digest length, so we MUST recompute the
+                                 * tail bytes. Mirror the family branch
+                                 * recompute pattern at lines 1571-1595
+                                 * above. The 16-byte compact_fp probe inside
+                                 * checkhash already filtered down to plausible
+                                 * matches; false positives are sieved by the
+                                 * full-width memcmp. For digest <= 16 bytes
+                                 * (MD5/MD4) the existing branch is byte-
+                                 * identical pre-widening. */
+                                if (_proto_hexlen > 32) {
+                                    unsigned char _fulldigest[64];
+                                    char *_p = (char *)_ptext;
+                                    /* iter_num the kernel saw the hit at
+                                     * (stored as _pe[2]). For SHA1/SHA256
+                                     * hex-feedback ops the recompute must
+                                     * walk the same iter chain the kernel
+                                     * walked; mirror CPU JOB_SHA1 / JOB_SHA256
+                                     * (mdxfind.c:28666 / :29088 -- lower-case
+                                     * hex of prior digest fed back as next
+                                     * iter's input). RAW variants and MD4
+                                     * stay iter=1 recompute (they're gated to
+                                     * iter==1 codegen via auto-dispatch, or
+                                     * they have 16-byte digests that fit in
+                                     * the hit record without recompute). */
+                                    int _iter_n = (int)_pe[2];
+                                    if (_iter_n < 1) _iter_n = 1;
+                                    if (g->op == JOB_SHA1RAW) {
+                                        mysha1(_p, _plen, _fulldigest);
+                                        memcpy(curin.h, _fulldigest, 20);
+                                    } else if (g->op == JOB_SHA1) {
+                                        /* Iter v1.2 (2026-05-31): SHA1 hex-
+                                         * feedback iter chain. Mirror CPU at
+                                         * mdxfind.c:28666-28679. */
+                                        char _hexbuf[64];
+                                        unsigned char *_in =
+                                            (unsigned char *)_p;
+                                        int _inlen = _plen;
+                                        for (int _it = 1; _it <= _iter_n;
+                                             _it++) {
+                                            mysha1(_in, _inlen, _fulldigest);
+                                            if (_it < _iter_n) {
+                                                prmd5(_fulldigest, _hexbuf, 40);
+                                                _in =
+                                                    (unsigned char *)_hexbuf;
+                                                _inlen = 40;
+                                            }
+                                        }
+                                        memcpy(curin.h, _fulldigest, 20);
+                                    } else if (g->op == JOB_SHA256RAW) {
+                                        mysha256(_p, _plen, _fulldigest);
+                                        memcpy(curin.h, _fulldigest, 32);
+                                    } else if (g->op == JOB_SHA256) {
+                                        /* Iter v1.2 (2026-05-31): SHA256 hex-
+                                         * feedback iter chain. Mirror CPU at
+                                         * mdxfind.c:29088-29097. */
+                                        char _hexbuf[128];
+                                        unsigned char *_in =
+                                            (unsigned char *)_p;
+                                        int _inlen = _plen;
+                                        for (int _it = 1; _it <= _iter_n;
+                                             _it++) {
+                                            mysha256(_in, _inlen,
+                                                     _fulldigest);
+                                            if (_it < _iter_n) {
+                                                prmd5(_fulldigest, _hexbuf, 64);
+                                                _in =
+                                                    (unsigned char *)_hexbuf;
+                                                _inlen = 64;
+                                            }
+                                        }
+                                        memcpy(curin.h, _fulldigest, 32);
+                                    } else if (g->op == JOB_MD4) {
+                                        MD4(_p, _plen, _fulldigest);
+                                        memcpy(curin.h, _fulldigest, 16);
+                                    }
+                                }
+                                checkhash(&curin, _proto_hexlen,
+                                          (int)_pe[2],  /* iter_num (==1) */
                                           &synthetic_job);
                             } else {
                                 /* Resolve salt bytes via pack_map and saltsnap.

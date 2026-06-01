@@ -1,3 +1,583 @@
+# mdxfind v1.524 — codegen kernel-B iteration (`-i N>1`), Metal kernel-A chunking, codegen auto-dispatcher (env-flag retirement), MD4/SHA1/SHA1RAW/SHA256/SHA256RAW codegen admission, per-stage Metal DISPATCH_TRACE, Gate-8 cosmetic widening
+
+Source: mdxfind.c rev 1.523 → 1.524, gpu/gpu_opencl.c rev 1.205 → 1.208, gpu/gpu_opencl.h rev 1.42 → 1.43, gpu/gpujob_opencl.c rev 1.157 → 1.160, gpu/codegen_auto_dispatch.h rev 1.1 → 1.2 (NEW), gpu/codegen_auto_dispatch.c rev 1.1 → 1.2 (NEW), gpu/metal_kernel_a_rules.metal rev 1.5 → 1.6 (+ `_str.h` -ko 1.5 → 1.6), gpu_metal.m rev 1.125 → 1.131, gpu_metal.h rev 1.64 → 1.65, gpu/gpujob_metal.m rev 1.41 → 1.44, gpujob.h rev 1.47 → 1.48, codegen/hx_emit_opencl.c rev 1.20 → 1.21, codegen/hx_emit_metal.c rev 1.19 → 1.20, codegen/hx_emit_primitives.c rev 1.13 → 1.14.
+
+Window: 2026-05-31 through 2026-06-01. Released 2026-06-01 (freeze-lift day).
+
+This release extends the two-engine GPU codegen architecture introduced in v1.523 along three orthogonal axes: kernel-B gains a runtime iteration count (`-i N>1` works inside the two-kernel pipeline, hex-feedback semantic), Metal kernel-A gains the rule-axis chunking already shipped on OpenCL (closes the 99K-rule × 1M-word OOM ceiling on Apple), and the user-visible env-flag opt-in is retired in favor of an in-engine capability+perf matrix that auto-selects backend per (op, iter, rules, mask, bf, backend_kind). Codegen now admits MD4 + SHA1 + SHA1RAW + SHA256 + SHA256RAW alongside the original MD5. A latent Apple Metal correctness gap (legacy `template_phase0` returns zero cracks at `-m e1 -i N>1`) is closed by the auto-dispatcher routing those cells through codegen automatically.
+
+## User-facing change summary
+
+**New env vars (auto-dispatcher control):**
+- `MDXFIND_GPU_BACKEND={auto|legacy|codegen}` — auto-dispatch (default) or FORCE one backend; developer/test only.
+- `MDXFIND_GPU_BACKEND_QUIET=1` — suppress the one-shot per-(op, backend) advisory line.
+- `MDXFIND_METAL_GPU_CAND_CAP_MB=N` — Metal kernel-A candidate buffer cap in MB; default 0.15 × `[device recommendedMaxWorkingSetSize]` clamped `[64..1024]`. Stress with `=64` for chunk-correctness verification.
+- `MDXFIND_DISPATCH_TRACE=1` (Metal) — per-chunk `[disp-metal] kernel_a_us / host_gap_us / kernel_b_us / span_us` emission; field-name parity with the OpenCL `[disp]` twin.
+
+**Deprecated env var (still honored as warning, ignored as decision):**
+- `MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5` — superseded by the auto-dispatcher. If set, prints a one-shot stderr WARNING and is ignored; matrix decision fires instead. One-version retention; will be removed in v1.526+.
+
+**New flag-effective behavior:**
+- Apple Metal `-m e1 -i N>1` with rules now produces correct cracks WITHOUT any env flag (previously legacy `template_phase0` returned zero cracks; user had to know about the env-flag opt-in to get codegen routing).
+- Metal `-m e1` with 99K+ rules × 1M+ words no longer hits the `mtl_buf_proto_packed` 415 GB single-buffer OOM; chunking now mirrors the OpenCL #343 implementation.
+- `-i N>1` works through codegen for MD5, MD4, SHA1, SHA256 (hex-feedback). SHA1RAW and SHA256RAW (binary-feedback) admit at iter=1 only and fall through to legacy `template_iterate` at iter>1 with a per-op advisory.
+
+## Codegen kernel-B iteration support (`-i N>1`)
+
+Codegen kernel B now supports runtime iteration via the existing `OCLParams.max_iter` field (zero ABI change — the offset-60 slot was reserved for this in the v1.502 layout). Per-iteration probe mask is `1u << (iter & 31u)`; feed semantic is hex-encoded digest (matches the CPU JOB_MD5 / JOB_MD4 / JOB_SHA1 / JOB_SHA256 loop bodies at `mdxfind.c:28666-28679` and `:29088-29097`). The kernel B body now emits a `for (iter=1u; iter <= mi; iter++) { probe; if (iter<mi) feed; }` wrapper around the per-primitive `usp_{md5,md4,sha1,sha256}_iter_hex32_feed` helpers (`codegen/hx_emit_opencl.c:4191-4480`, Metal twin at `codegen/hx_emit_metal.c:3829-4140`).
+
+Validated byte-exact cross-arch at iter ∈ {1, 2, 5, 10, 100} on Pascal (fpga GTX 1080) + Maxwell (hpi7 GTX 960) + Apple M1 (dev1) + Apple M2 Max (dev3). Sorted-md5 byte-identical to legacy `template_iterate` on hosts where legacy is functional. Apple M1 legacy `template_phase0` returns 0 cracks at iter>1 per a pre-existing template-iterate gap (`gpu/metal_template.metal:684` "Phase 1: template_iterate() is intentionally NOT called"); codegen is the only correct path on M1 for this cell. Apple M2 Max legacy WORKS at iter>1 (returns correct cracks); the gap is M1-specific. Auto-dispatcher routes both to codegen regardless (M1 = correctness; M2 Max = perf, 1.24× faster than legacy).
+
+Cross-arch perf at 99,074 rules × `-i 10` × rockyou-1m × profile_md5_10k_hits.txt (50 cracks each, sorted-md5 `eac0169d…`):
+
+| Host (arch) | Legacy `-m e1 -i 10` | Codegen `-m e1 -i 10` | Codegen / Legacy |
+|---|---:|---:|---:|
+| Ada mmt (RTX 4070 Ti SUPER) | 88.7 s | 108.3 s | 1.22× slower |
+| Pascal fpga (GTX 1080) | 305.42 s | 425.56 s | 1.39× slower |
+| Apple M1 dev1 | BROKEN (3 garbage cracks, 7–12 s) | 1950.3 s | n/a — legacy unusable |
+| Apple M2 Max dev3 | 298.9 s | 240.2 s | **0.80× FASTER** |
+
+The gap closes meaningfully at higher iter on NVIDIA (Ada 2.28× → 1.22×, Pascal 1.46× → 1.39×); on M2 Max codegen INVERTS the OpenCL pattern and beats legacy at both `-i 1` (2.73× faster) and `-i 10` (1.24× faster). M1 codegen wall measurements at `-i 1` show large thermal-state dependence (~318 s cold-from-idle vs ~620 s on a heated chassis); future M1 perf measurement should use ≥5-minute cool-down or report cold + warm separately.
+
+## Metal kernel-A rule-axis chunking
+
+Metal `gpu_metal_kernelb_dispatch_proto_chunked` now mirrors the OpenCL #343 chunked path. The single-buffer `mtl_buf_proto_packed = newBuffer(num_words × n_rules × 256)` allocation that FATAL'd at 415 GB on dev1 M1 (99,074 rules × 1,000,000 words) is replaced by a per-chunk loop with cap-bounded allocations. Apple-specific divergences from OpenCL:
+
+- Cap fraction 0.15 × `[device recommendedMaxWorkingSetSize]` (vs OpenCL 0.25 × `CL_DEVICE_GLOBAL_MEM_SIZE`) — accounts for Apple unified memory shared with the OS and other processes.
+- Env override `MDXFIND_METAL_GPU_CAND_CAP_MB` clamped `[64..1024]` MB.
+- SHAPE-2 file-static host arena keyed by global ordinal `G` for hit accumulation; the `gpu_metal_kernelb_proto_plaintext()` accessor (installed by v1.523 hit-merge fix) branches on `mtl_proto_resolved_active` — UMA zero-copy read is no longer safe under chunking since each chunk reuses the device candidate buffer.
+- `num_rule_chunks ≤ 1` (small-rule workloads) takes the verbatim single-dispatch path; production `-m e347` and the seven Phase-5a family algos are byte-identical to v1.523.
+
+Latent bug deleted in the same commit: `gpu/metal_kernel_a_rules.metal:989-993` had a B3-cursor early-return that would have dropped the entire grid for `chunk_base > 0` (`rule_idx_local < rule_cursor_start` true for all lanes at non-zero chunk base). Inert pre-chunking; would have silently produced 0 cracks if chunking shipped without removal. Caught in spec D5.a.
+
+Validated on dev1 M1: 99,074 rules × 1,000,000 words succeeds at K=204, 486 chunks, 50 cracks `eac0169d…`. dev3 M2 Max same workload at K=256, 388 chunks (larger `recommendedMaxWorkingSetSize`), byte-identical cracks. Cap-stress `=64` MB produces 6,193 chunks (12.7× more), wall 847 s, no FATAL, no overflow. Cross-backend crack-parity confirmed against fpga Pascal OpenCL chunked.
+
+## Codegen auto-dispatcher (env-flag retirement)
+
+The `MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1` opt-in shipped 2026-05-29 is retired in favor of a hardcoded capability+perf matrix consulted at the existing route-gate sites (`gpu/gpujob_opencl.c:1160-1199`, `gpu/gpujob_metal.m:1248-1313`, `gpu_metal.m:4861`). New file `gpu/codegen_auto_dispatch.{h,c}` (~465 LOC) carries `codegen_auto_dispatch_pick(op, iter, rules, mask, bf, backend_kind) → {LEGACY, CODEGEN, FATAL}`. Lazy-cached after first call; one-shot stderr advisory per `(op, backend_pick)` tuple via dedup set.
+
+Two correctness-critical cells flip behavior vs the prior env-unset default:
+1. **Apple Metal × MD5/MD4 × iter>1 × rules** → CODEGEN automatically (flagship user-facing correctness fix; legacy `template_phase0` returned 0 cracks).
+2. **OpenCL × MD5/MD4 × any-iter × rules** → LEGACY (today's env-unset default preserved; legacy is 1.22–2.28× faster than codegen on NVIDIA per the perf table above).
+
+Deprecation shim: if a user still sets `MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5`, a one-shot stderr WARNING fires and the value is IGNORED — matrix decision fires anyway. One-version retention.
+
+Developer FORCE override: `MDXFIND_GPU_BACKEND={auto|legacy|codegen}`. Useful for A/B perf testing and reproducing the broken-legacy cell intentionally.
+
+Validated on 5 hosts (Pascal fpga, Maxwell hpi7, Ada mmt, Apple M1 dev1, Apple M2 Max dev3) across 60+ cells against CPU oracle; sorted-md5 byte-identical on every correctness cell.
+
+## Codegen admission widened — MD4 + SHA1 + SHA1RAW + SHA256 + SHA256RAW
+
+The original v1.503 codegen admitted only JOB_MD5. v1.524 widens to the full unsalted single-hash set:
+
+| Job | iter range | Backend pick (default Apple Metal) | Backend pick (default OpenCL) |
+|---|---|---|---|
+| JOB_MD5 (e1) | any | CODEGEN if iter>1 else LEGACY | LEGACY |
+| JOB_MD4 (e3) | any | CODEGEN if iter>1 else LEGACY | LEGACY |
+| JOB_SHA1 (e8) | any | CODEGEN if iter>1 else LEGACY | LEGACY |
+| JOB_SHA256 (e10) | any | CODEGEN if iter>1 else LEGACY | LEGACY |
+| JOB_SHA1RAW (binary-feedback) | iter=1 | LEGACY | LEGACY |
+| JOB_SHA256RAW (binary-feedback) | iter=1 | LEGACY | LEGACY |
+
+The hex-feedback ops (JOB_SHA1, JOB_SHA256) ride the same iter-v1 codegen path as MD5/MD4; their CPU paths at `mdxfind.c:28666-28679` and `:29088-29097` use lower-case hex feedback (`prmd5(curin.h, mdbuf, len)`) between iters, identical to MD5's chain. The binary-feedback RAW siblings (JOB_SHA1RAW, JOB_SHA256RAW; `mdxfind.c:27994`, `:29077`) admit at iter=1 only; codegen's hex-feedback would produce wrong cracks at iter>1, so the route gate falls through to legacy `template_iterate` with a per-op advisory.
+
+A latent iter-aware recompute bug was caught + fixed during validation: the SHA1/SHA256 hit-replay's full-digest recompute branch was iter=1-only; broke immediately at iter=2 for the new ops. Fix walks N iters of `mysha1 / mysha256` + `prmd5` hex-feedback chain mirroring the CPU loop, applied to both backends.
+
+## Per-stage Metal DISPATCH_TRACE instrumentation
+
+The `MDXFIND_DISPATCH_TRACE=1` env var (OpenCL since v1.504) now emits per-chunk lines on Metal too, with matching field names so cross-backend log scrapers don't need to branch:
+
+```
+[disp-metal] dev=0 op=1 path=kernelB_proto_chunked chunk=0 num_words=16384 n_rules=99075
+             rules_in_chunk=204 hits=11 kernel_a_us=13380 host_gap_us=49 kernel_b_us=8315 span_us=87539
+```
+
+Uses `[cb GPUStartTime]` / `[cb GPUEndTime]` for per-kernel GPU-side timing (after `waitUntilCompleted`); `mach_absolute_time` for host-side gap. Coexists with the pre-existing `MDXFIND_METAL_KERNEL_A_TIMING=1` Knob G timing (different env, different scope). Default-off byte-identical to pre-edit. Distinct `[disp-metal]` prefix (vs OpenCL `[disp]`) signals the per-chunk vs per-batch granularity difference.
+
+Closes the instrumentation gap surfaced during the M1 thermal-throttling investigation: prior to this Metal users had no per-stage breakdown to distinguish kernel-A vs host-gap vs kernel-B contribution, making thermal/contention/host-bottleneck diagnosis impossible without instrumenting the build.
+
+## Gate-8 cosmetic widening
+
+The pre-existing experimental-codegen one-shot advisory emitted by `gpu_experiment_rules_codegen_md5_enabled()` (OpenCL) and `gpu_metal_experiment_rules_codegen_md5_enabled()` (Metal) — now retired by the auto-dispatcher — had hardcoded "JOB_MD5 (-m e1)" wording; the v1.1 widen ship had extended the admit set to MD4 + SHA1RAW + SHA256RAW without updating the advisory string. v1.524 retires both accessors entirely as part of the auto-dispatcher; the new advisory machinery in `gpu/codegen_auto_dispatch.c` enumerates the actual op picked correctly.
+
+---
+
+# mdxfind v1.523 — A2/A3 long-mask GPU dispatch (paired OpenCL+Metal), Knob G uint4 coalesced candidate writes, rule-axis chunking for 100K+ rule sets, A4 brute-force engine, critical Metal e347 hit-merge fix
+
+Source: mdxfind.c rev 1.522 → 1.523, gpu/gpu_opencl.c rev 1.195 → 1.202, gpu/gpu_opencl.h rev 1.42, gpu/gpujob_opencl.c rev 1.156, gpu/gpu_kernel_a_rules.cl rev 1.6 → 1.7 (+ paired `_str.h` -ko), gpu/gpu_kernel_a_masks.cl rev 1.4 (NEW + `_str.h`), gpu/gpu_kernel_a_rules_masks.cl rev 1.2 (NEW + `_str.h`), gpu/gpu_kernel_a_bruteforce.cl rev 1.2 (NEW + `_str.h`), gpu/metal_kernel_a_rules.metal rev 1.5 (+ `_str.h`), gpu/metal_kernel_a_masks.metal rev 1.4 (NEW + `_str.h`), gpu/metal_kernel_a_rules_masks.metal rev 1.2 (NEW + `_str.h`), gpu/metal_kernel_a_bruteforce.metal rev 1.2 (NEW + `_str.h`), gpu_metal.m rev 1.119 → 1.122, gpu_metal.h rev 1.59 → 1.61, gpu/gpujob_metal.m rev 1.39 → 1.40, gpujob.h rev 1.47.
+
+Window: 2026-05-28 through 2026-05-31. Released 2026-06-XX (week of 2026-06-01 freeze lift).
+
+This release bundles the two-engine GPU codegen architecture's first non-rules engines (A2 masks-only, A3 rules+masks composition, A4 brute-force), the first measured-perf kernel-A optimization (Knob G uint4 coalesced writes — Ada -21.6 % / Pascal -11.3 % wall), rule-axis chunking that unlocks 100K-plus rule sets on the codegen GPU path, and a critical correctness fix for Metal users running `-m e347` and the Phase-5a MAKE_MD5PASS family algorithms.
+
+## Critical correctness fix — Metal e347 + Phase-5a family hit-merge
+
+**Metal users running `-m e347` (MD5MD5SALT) or any of the seven Phase-5a MAKE_MD5PASS family algorithms (e122, e159, e161, e163, e165, e167, e169) at `n_rules >= 16` were silently dropping cracks.** The kernel-B codegen wrote `entry[0]` as a slot index into the kernel-A SCRATCH packed buffer, but the host hit-replay loop in `gpu/gpujob_metal.m` treated it as a `widx` index into the host input-word buffer. At low `n_rules` (1–8) this produced partial drops with structurally-untrustworthy plaintext labels; at `n_rules >= 16` it dropped every crack. The defect was Metal-only; the OpenCL twin has had a dedicated proto-replay block since the Phase-4 codegen ship.
+
+Fix: a dedicated `if (_proto_fired)` replay block in `gpu/gpujob_metal.m`, mirroring the OpenCL twin (`gpu/gpujob_opencl.c:1488-1647`), backed by a new `gpu_metal_kernelb_proto_plaintext()` accessor in `gpu_metal.m` (mirror of `gpu_opencl_kernelb_proto_plaintext()` at `gpu_opencl.c:14483`). The block routes e347 hits through `checkhashsalt()` with `pack_map` salt resolve and the seven family ops through `checkhash()` with `oracle_compute_md5pass_family` full-digest recompute. Pure addition (~150 LOC); the standard rules-engine replay loop is unchanged and OpenCL is unaffected.
+
+Validation gates: 14-cell repro grid on dev1 M1 (all stdout cracks now equal kernel-B hit count, was 0 at `n_rules >= 16`); 28-cell Phase-5a family-matrix (7 ops × 4 rule counts) byte-exact vs CPU oracle; dev3 M2 Max cross-check identical to dev1; OpenCL Pascal smoke confirms zero bleed-over; degenerate `n_rules=1` preserves the original 10/10 path.
+
+**Metal users on prior releases should upgrade as soon as the binary ships.** The bug was latent from the Phase-4 codegen introduction (v1.502) through v1.509.
+
+## Long-mask GPU dispatch — A2 (masks-only) + A3 (rules + masks composition)
+
+Two new kernel-A engines are paired across OpenCL and Apple Metal: A2 generates candidates from `-n` / `-N` mask expansion; A3 composes A1's rule walker with A2's mask expander for the rules-plus-masks product. Both wire into the existing codegen kernel-B (engine B is unchanged — the swap is purely on the candidate-generation side, per the two-engine architecture).
+
+The user-visible change: **long literal prefixes in masks are now GPU-eligible.** Pre-amendment the GPU rules-engine path fell back to CPU whenever a mask had more than 16 total positions (literal bytes plus variable placeholders combined), which excluded the common pattern of a long prefix sentence followed by a short variable tail. Example invocation:
+
+```
+mdxfind -f hashes.txt -m e1 -N "TestPrefix2026-05-30: ?a?a?a?a" wordlist.txt
+```
+
+The 22-character literal prefix plus 4 `?a` placeholders (34-byte mask) now stays on the GPU. The two caps are decoupled: `GPU_MASK_VAR_CAP=16` placeholder positions per side (mask-iteration domain, unchanged) and `GPU_MASK_LIT_BYTES_CAP=224` literal bytes per side (the new headroom). The total candidate length is still bounded by the 255-byte `RULE_BUF_LIMIT`.
+
+Wire format: an interleaved run-descriptor stream (LIT length-prefixed bytes / VAR class-id / END) replaces the prior pure-position stream. `n_prepend` / `n_append` shift from position count to descriptor-stream byte length. A single unified walker handles both short and long masks on the same path (no dual-path drift); backward-compatible short-mask workloads were re-verified GPU-routed on all four perf hosts.
+
+Cross-architecture validation: the same sorted-crack md5 `211342b917d22593465c4c6e3cca6a08` was produced byte-identically on five architectures running the same 8.145-billion-candidate workload — NVIDIA Ada (mmt, RTX 4070 Ti SUPER, OpenCL), NVIDIA Pascal (fpga, GTX 1080, OpenCL), AMD RDNA2 (ioblade, gfx1036, OpenCL `-G 3`), Apple M1 (dev1, Metal), and Apple M2 Max (dev3, Metal). A3 rules-plus-masks production tests (prepend-only and mixed prepend+append) were byte-identical across the two tested backends (Pascal OpenCL and M1 Metal).
+
+Production e347 byte-identical when no `-n` / `-N` flag is set.
+
+## A4 brute-force engine (developer-preview)
+
+A fourth kernel-A variant ships as the brute-force candidate generator (`gpu/gpu_kernel_a_bruteforce.cl` + `gpu/metal_kernel_a_bruteforce.metal`), completing the kernel-A variant set {rules, masks, rules+masks, brute-force}. The A4 engine plugs into the same candidate-generation slot as A1/A2/A3.
+
+A4 is gated behind two env flags and is **not yet on the production dispatch path**:
+
+```
+MDXFIND_KERNEL_A_PROTO=1 MDXFIND_KERNEL_A_VARIANT=4 ./mdxfind ...
+```
+
+Production runs with the env flags unset are byte-identical to v1.509. The harness has been validated on a 5-host fleet (3 NVIDIA OpenCL + 1 AMD blocked by compact-table gate in env-mode + 1 Apple Metal) across four fixtures (bf_smoke, bf_single, bf_dual, bf_custom) — all 12 fixture × host cells pass state-counter parity and candidate-multiset byte-identity vs the Python oracle. Promotion to default dispatch is a future sub-phase.
+
+## Performance — Knob G uint4 coalesced candidate writes (paired OpenCL+Metal)
+
+Kernel A1's per-byte candidate-write loop was replaced with 16-byte `uint4` stores from a private 16-aligned staging buffer. Per-slot byte claim is rounded up via `need_aligned = (need_bytes + 15) & ~15`. The kernel-B consumer, accessor, and decode paths are bit-exact.
+
+OpenCL measured deltas at the 100K-rule workload (`dive.rule` 99,075 rules × `rockyou-1m.txt` × MD5):
+
+| Host | Architecture | Kernel A | Wall |
+|------|--------------|---------:|-----:|
+| mmt | Ada RTX 4070 Ti SUPER | -32.4 % | -21.6 % |
+| fpga | Pascal GTX 1080 | -24.7 % | -11.3 % |
+
+Opt-in:
+
+```
+MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 ./mdxfind ...
+```
+
+(composes with `MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1` for the unsalted-MD5 codegen route fork).
+
+The Metal twin (`MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1`, in `gpu/metal_kernel_a_rules.metal`) ships at parity but is **null on Apple AGX**: -0.06 % on M1, +0.41 % on M2 Max. Decomposition evidence (PROFILE_VARIANT V0–V6, see below) shows the apply_rule switch is the dominant component on AGX (77 % of kernel A on M1, 68 % on M2 Max) — the candidate-write loop simply isn't where Apple's time goes. The Metal Knob G is preserved as a future Apple-compiler-evolution monitoring substrate and to keep the OpenCL/Metal parity discipline intact; users should keep it unset.
+
+Production `-m e347` byte-identical with the flag unset (it gates only the `-m e1` MD5 codegen experiment route).
+
+## Rule-axis chunking — 100K+ rule sets on the codegen GPU path
+
+The codegen kernel-B dispatcher (`kernelb_dispatch_proto`) now chunks across the rule axis when the candidate buffer would exceed a per-device cap. Cap helper: `clamp(0.25 × device_global_mem, 64 MB, 1 GB)`; override with `MDXFIND_GPU_CAND_CAP_MB=<N>`. Cross-chunk hit handling resolves the matched plaintext before clobber.
+
+Single-dispatch path (`num_rule_chunks <= 1`) takes the verbatim pre-chunking body — production e347 is bit-identical to v1.509 when the workload fits in one dispatch. Multi-chunk path has a bounded halve-K retry on overflow.
+
+This lifts the prior implicit ceiling that capped the codegen-GPU rules-engine at ~16K active rules. `dive.rule` (99,075 rules) now dispatches end-to-end on the codegen path with `MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1`; the legacy `-m e347` hand-tuned rules-engine path is unaffected.
+
+## Experimental — codegen-MD5 rules route fork (`-m e1`)
+
+`-m e1` rules can be routed through the two-engine codegen pipeline (A1 → codegen kernel-B unsalted MD5) behind:
+
+```
+MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1 ./mdxfind -m e1 -r rules wordlist.txt
+```
+
+Flag-unset is byte-identical to the production `-m e1` path. This is the carrier for ongoing kernel-A perf knob measurement (PROFILE_VARIANT, Knob G); the production `-m e1` path remains the hand-tuned rules engine. Head-to-head perf evaluation is in progress.
+
+Validated bit-identical crack sets vs the legacy path on Ada / Pascal / RDNA4 at `-i1`.
+
+## Observability
+
+Three diagnostic facilities for kernel-A perf investigation; none are intended for production use, all default off, all are env-flag gated.
+
+- `MDXFIND_DISPATCH_TRACE=1` extended to report `host_gap_us` plus per-kernel A and B timing through the chunked-codegen multi-chunk path. Prior to this release the multi-chunk path read 0 for these counters.
+- `MDXFIND_PROFILE_VARIANT=N` (N in 0..6) selects one of seven kernel-A component-attribution variants. V0 is the production baseline byte-identical; V1–V6 are diagnostic stubs that isolate atomic-claim, candidate-write, and apply_rule cost shares. Used to bound predicted gains for future kernel-A work.
+- `MDXFIND_METAL_KERNEL_A_TIMING=1` enables per-dispatch kernel-A wall timing on Metal (cb_a.GPUStartTime / GPUEndTime).
+- `MDXFIND_METAL_PROFILE_VARIANT=N` is the Metal twin of the OpenCL PROFILE_VARIANT.
+
+## Experimental, reverted
+
+Two perf knobs prototyped during this window were reverted from the working tree after measurement showed no gain. They are not in the shipped binary; they are mentioned here so readers comparing source archives between v1.509 and v1.523 understand the diff.
+
+- **Knob F** — workgroup-local atomic claim coalescing. Predicted +5 to +15 % kernel A on Pascal; measured -1.21 % Ada and +1.28 % Pascal regression. Architectural lesson: predictions need component-share microbench evidence, not just a decomposition upper bound.
+- **Knob H** — apply_rule monolithic switch refactored to a per-opcode static-inline LUT (paired OpenCL+Metal). Predicted -5 / -15 / -38 / -34 % kernel A on Ada / Pascal / M1 / M2 Max; measured -0.96 % to +1.12 % median across all five hosts (null). Working theory: the OpenCL and Metal compilers already lower the V0 monolithic switch to a jump-table-equivalent shape; the LUT refactor reaches the same compiled shape. Architectural lesson: REFACTOR predictions need an AIR / PTX diff vs the baseline, not just confirmation that the proposed shape inlines.
+
+## Architectural framing
+
+Two project disciplines established during this window govern future kernel-A and kernel-B work:
+
+- **Two-engine codegen architecture.** Kernel A is the candidate-generation engine (variants: A1 rules, A2 masks, A3 rules+masks, A4 brute-force); kernel B is the hash engine (per-algorithm codegen). The engines are independently swappable. Future perf knobs scope to one engine at a time.
+- **OpenCL / Metal parity.** Kernel-A variants and host-side dispatch infrastructure ship as paired OpenCL+Metal efforts from inception. Backend-asymmetric perf knobs (e.g., Knob G's null result on AGX) ship at parity for code-shape consistency and future compiler-evolution monitoring.
+
+## v1.510 through v1.522
+
+Intermediate source-ready revisions (1.510–1.521) are the User-Defined Hash Types v1 ship described in the v1.509 entry above; that work was completed in the same freeze window and ships in the same release artifact. Rev 1.522 is the Knob G + observability bundle; rev 1.523 is the A2/A3 long-mask amendment ship.
+
+## Known issues / scope
+
+- A4 brute-force is developer-preview only; production dispatch promotion is a future sub-phase.
+- The codegen-MD5 rules route fork (`MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1`) is experimental; the production `-m e1` rules path is the hand-tuned engine.
+- GPU dispatch for user-defined types (the v1.509 USER_<name> feature) is still planned future work; user types continue to run on the CPU through the hx interpreter in this release.
+- Mali (firefly) correctness spot-check on the long-mask path was not run this session; the small-mask backward-compat path is presumed unaffected. Long-mask spot-check on Mali is a backlog item.
+
+This is a SOURCE-READY ship: all source is checked in to RCS on the iMac authoritative tree and cross-arch-validated across five architectures. Version bump, GitHub release, and `mdxfind-release` run are deferred per the release freeze in effect until the week of 2026-06-01.
+
+---
+
+# mdxfind v1.509 — User-defined hash types: custom hx-expression algorithms via userdef.txt, selected with -m u<id>, output USER_<name>
+
+Source: userdef.c rev 1.4, userdef.h rev 1.4 (NEW shared loader module), mdxfind.c rev 1.521, hashpipe.c rev 1.94, Makefile rev 1.46.
+
+Window: 2026-05-28.
+
+A skilled user can now define a custom hash algorithm as an hx expression in a configuration file and use it in mdxfind and hashpipe exactly like a built-in catalog type — no C code, no recompile. The hx language already interprets arbitrary expressions (this is what `hashpipe -X` runs); this release makes that a first-class extension point. Author and test an expression with `hashpipe -X 'expr'`, add a stanza, and run it.
+
+## Definition file — stanza format
+
+User types are read from `userdef.txt`, located in the directory that contains the `MDXFIND_CACHE` path (the same directory as the SQLite line-count cache). The file is INI-style: a `[Name]` header (the type's display name), an `id` key (a free-form identifier — number, UUID, or content-hash, the user's choice), and an `hx` key (the expression). The `hx` value is read verbatim to end-of-line because hx expressions contain `. ( ) " ' $ : ^` that the hx parser owns; the stanza reader never tokenizes it. `#` comments and blank lines are allowed. Unknown keys are warned-and-ignored, so a file written for a future version still loads under the current one.
+
+```
+[Cust1]
+id = 47
+hx = sha1(md5(pass) . "register")
+```
+
+## Selector and output
+
+A user type is selected by its identifier: `mdxfind -m u47 -f hashes.txt wordlist.txt`. The `u<id>` selector is an exact string-keyed lookup (not the `-h` regex path), so an identifier may safely contain regex metacharacters. Matches are reported with the stanza name carrying a `USER_` prefix and the standard iteration suffix, e.g. `USER_Cust1x01 e0d195a682ae3f8a9edbd111d4ae28a3095beb87:password123`. User types ride the same `-i` iteration machinery as built-in types (`-i 2` produces `x02`).
+
+## hashpipe pipe-mode identification
+
+hashpipe loads the same `userdef.txt` and identifies user types in pipe mode: `echo <digest>:<password> | hashpipe` reports `USER_<name>x01` on a match. Identification is additive — hashpipe still reports any matching built-in type alongside the user type. A non-matching line produces no `USER_` output.
+
+## Load-time advisories
+
+When `userdef.txt` loads, each type prints a status line summarizing what was registered (name, selector, internal op, digest length). Three further advisories surface through the same load-time and invoke-time output, with no new command-line flags:
+
+- **Dedup advisory** — when a user expression is byte-for-byte equivalent to a built-in catalog type, mdxfind prints a non-fatal note suggesting the equivalent `-m e<N>`, which has a hand-tuned GPU path. The advisory never blocks; the user's type still runs.
+- **Content-hash suggestion** — mdxfind computes and displays a stable content-hash of the compiled expression as a suggested shared identifier. It is a suggestion only, never enforced; a content-hash id is self-describing, which mitigates the dependency that a `USER_*` solved-hash file is only interpretable with its `userdef.txt` present.
+- **Skip and reject messages** — a malformed stanza or unparseable expression is skipped with a loud per-entry warning naming the file and line, so a typo in one entry does not abort a run that selects another. If the *selected* type failed to load, the run is fatal with the specific diagnostic.
+
+## v1 scope
+
+User types run on the CPU through the hx interpreter. At invoke, an honest status line reports GPU eligibility: a GPU-supported expression shape reports that the shape is eligible but that GPU dispatch for user-defined types is not yet enabled and runs on CPU; an unsupported shape reports that the GPU is not available for the shape and runs on CPU. GPU dispatch for user-defined types is planned future work.
+
+User types are unsalted and password-only in this release. An expression referencing salt, second salt, pepper, or a user/userid value is rejected at load with a clear message. Salted and structured user types — carried by a per-type hash-line load grammar — are a planned future direction.
+
+The dedup advisory and the GPU-eligibility status are mdxfind-only (hashpipe has no GPU path and no catalog comparator); hashpipe still loads, identifies, and skips salted entries at load. No new command-line flags were added — all of the above surfaces through normal load-time and invoke output.
+
+This is a SOURCE-READY ship: all source is checked in to RCS on the authoritative tree. Version bump, GitHub release, and `mdxfind-release` are deferred per the release freeze in effect until the week of 2026-06-01.
+
+---
+
+# mdxfind v1.508 — Phase 5c: e123 MD5MD5PASS multi-emit GPU codegen — the FIRST multi-emit algorithm — family 30/30 on BOTH backends (OpenCL + Metal)
+
+Source: mdxfind.c rev 1.519, codegen/hx_emit_opencl.c rev 1.19, **codegen/hx_emit_metal.c rev 1.18 (Metal twin, 5c.3)**, codegen/hx_emit_primitives.c rev 1.11, codegen/hx_spec_entry.h rev 1.3, tools/hx8_to_c.c rev 1.4, gpu/gpu_codegen_eligible.c rev 1.7 (comment-only), codegen/tests/run_validation_family_md5pass.sh rev 1.12, codegen/tests/family_md5pass/e123_smoke.txt rev 1.1 (NEW), codegen/tests/family_md5pass/e123_multiemit_canary.txt rev 1.1 (NEW G1b canary). Regenerated artifact (not RCS-tracked): codegen/hx_specs_data.c (e123 row flips is_outlier=1→0, program NULL→&_hx_program_122, emit_class=HX_EMIT_MULTI, note_ref=24). UNCHANGED: gpu/gpu_common.cl + gpu/metal_common.metal (md5_block already present on both — multi-emit lives in the emit helper, not a new primitive), gpu/gpu_common_str.h + gpu/metal_common_str.h (no str regen needed), gpu/gpujob_metal.m + gpu/gpujob_opencl.c (4-arg oracle signature preserved; e123 16-byte digest never takes the hit-replay recompute branch; metal_gpu_hash_words / gpu_hash_words resolve e123 to 4 words via the default arm on both backends).
+
+Window: 2026-05-27.
+
+**e123 MD5MD5PASS is the FIRST multi-emit algorithm** in the hx codegen pipeline: ONE password produces TWO outer-hash digests, each probed against the loaded hash table as an independent found-hash candidate (matching the CPU oracle at mdxfind.c:25181-25204, which calls `checkhash()` once per variant):
+- variant 0 (canonical): `md5( hex32(md5(pass)) . pass )`
+- variant 1 (colon):     `md5( hex32(md5(pass)) . ':' . pass )`
+
+## Sub-phase 5c.1 — emit_class plumbing + markup-strip + regenerate
+
+`enum hx_emit_class { HX_EMIT_SINGLE=0, HX_EMIT_MULTI=1 }` + `int emit_class` + `int note_ref` added to `struct hx_spec_entry` (codegen/hx_spec_entry.h rev 1.3). C zero-init defaults every existing entry to HX_EMIT_SINGLE / note_ref=0 — the 29 prior family members + all non-family entries take the single-emit body unchanged.
+
+The generator `tools/hx8_to_c.c` rev 1.4 gains `extract_note_ref()` + `strip_note_markup()`. For e123 ONLY (gated on `type==123 && note_ref==24`, per the minimal-change R4 rule), it strips the troff-italicised `(see Note [24])` annotation so the leading `md5(md5(pass).pass)` compiles to a real 6-op FAMILY_MD5PASS program and flags `emit_class=HX_EMIT_MULTI`, `note_ref=24`. `note_ref` is recorded for every Note-annotated row (e.g. e687 carries note_ref=24 but stays an outlier / SINGLE). Regenerated `codegen/hx_specs_data.c`: a normalized structural diff confirms ONLY the e123 row changed (is_outlier 1→0, program NULL→&_hx_program_122) — exactly +1 program static; every other row's structural fields byte-identical. Pre-flight grep for stderr-merge corruption = 0 (per feedback_hx8_to_c_no_stderr_merge.md).
+
+## Sub-phase 5c.2 — OpenCL multi-emit body + MD5-as-outer helper + oracle
+
+**New MD5-as-outer emit helper** `emit_outer_md5_concat_then_hash` (codegen/hx_emit_opencl.c rev 1.19): MD5 was always the INNER hash in the shipped family; e123 needs MD5 as the OUTER too. The helper mirrors the MD4 helper (LE schedule, 4-uint state, 16-byte digest, single-block fast path + multi-block first_has_pad tail) plus a `sep` parameter: sep=0 emits `hex32 || pass`; sep=1 injects a `':'` at logical position 32 and shifts pass to position 33 (total_len = 33 + plen).
+
+**Multi-emit kernel body** `emit_family_md5pass_kernel_multiemit`: computes `md5(pass)` ONCE (shared inner state across both variants — natural hoist), then a compile-time-N=2 UNROLLED set of probe+emit blocks. Each block calls the outer helper with its `sep`, probes `compact_fp` to resolve its own `matched_idx`, and calls the **EXISTING `EMIT_HIT_4_DEDUP_OR_OVERFLOW` macro UNCHANGED**. The dedup key is already `(matched_idx, iter_bit)` keyed on the matched loaded-hash slot — ALREADY the correct multi-emit key: two variants hitting two different loaded hashes land in two different dedup cells and BOTH emit. NO new field, NO buffer resize, NO key widening (recompute-per-variant per the agreed design; the single-emit body is untouched). The hit record stays 16 bytes with NO variant tag — the emitted fingerprint self-identifies the matched hash on hit-replay, matching CPU semantics (mdxfind prints the matched hash FORM, not the variant).
+
+**Eligibility gate** is the SINGLE `job_to_prim_table` row `{ 123, HX_PRIM_MD5 }` (codegen/hx_emit_primitives.c rev 1.11), NOT a global `supported_5a` flag. HX_PRIM_MD5 was already `supported_5a=1` (it is the inner hash used by every family member), so adding this row admits ONLY job 123 (no other family member maps to an MD5 outer) and does NOT wrongly admit other MD5-inner algos. The multi-emit per-variant body is selected downstream by the spec entry's `emit_class == HX_EMIT_MULTI`, not by the prim id. The admit predicate, harness gates, chokepoint, init-gate, and OpenCL `_proto_hexlen` all auto-propagate via D17.4.b. e123 closes the MAKE_MD5PASS family at **30/30** GPU-eligible on OpenCL.
+
+**Oracle + dlen** (mdxfind.c rev 1.519): `oracle_compute_md5pass_family` replaces the e123 FATAL arm with the canonical variant-0 return (16 bytes) — the gpujob hit-replay recompute branch is not reached for a 16-byte digest, so the 4-arg signature stays unchanged for all callers; `dlen` switch adds JOB_MD5MD5PASS=16. The validation harness `hx_family_md5pass_validate_run_shared` is made multi-emit-aware: `n_variants=2` for e123 (1 otherwise), plants BOTH variant digests per pass as separate loaded-hash rows, sizes the compact table + hits buffer for `n_rows = n_pass × n_variants`, and the diff matches each hit's digest against the pass's variant rows (per-row seen bitmap), requiring `vn_hits == n_rows`.
+
+## OpenCL validation (Pascal GTX 1080, fpga.local) — all GREEN
+
+- **G1b dual-hash canary (THE multi-emit gate): PASS.** 4 passwords → GPU emitted **8 cracks** (BOTH variants per password), byte-exact vs the CPU oracle. The plaintext `password` appears twice with distinct digests (canonical `d3f6f4e6…` + colon `0c7f57e9…`, each verified against openssl and the CPU `mdxfind -m e123`).
+- **e123 5-fixture matrix: PASS** — e123_smoke + family_smoke (n_rows=16), medium (n_rows=2048), edge_minlen / edge_maxlen (n_rows=256), and large at half-fixture (524,288 pw → **1,048,576 rows / 1,048,576 hits** byte-exact). The full 2,097,152-row family_large exceeds the NVIDIA single-NDRange watchdog (a harness fixture-scale ceiling at the 2× multi-emit hit volume — NOT a correctness defect; the e122 single-emit control PASSES at 1,048,576 rows on the same binary).
+- **G2 single-emit regression: PASS (15/15 cells)** — all prior family members show `n_variants=1`, one hit per pass, byte-exact; the emit_class plumbing defaults them to SINGLE with ZERO behavior change.
+- **G3 e347 regression: PASS** — smoke (32 pairs) + medium (1024 pairs) byte-exact; no collateral from the shared family emitter / harness changes.
+
+The dumped e123 kernel on fpga shows both `sep=0` and `sep=1` probe+emit blocks and JIT-compiles cleanly on Pascal.
+
+## Sub-phase 5c.3 — Metal twin (codegen/hx_emit_metal.c rev 1.18)
+
+Hand-ported, structural mirror of the OpenCL twin (no translator):
+
+**`emit_outer_md5_concat_then_hash_metal`** — MD5-as-OUTER helper with the `sep` parameter (sep=0 canonical `hex32 || pass`; sep=1 colon `hex32 || ':' || pass`, total_len=33+plen). Metal idioms: `device const uchar *pass` + `thread uint *` outputs; `md5_block(a,b,c,d,M)` from metal_common.metal takes `thread uint &` references and accumulates into a..d, so a..d are pre-seeded with the MD5 IV (same accumulate convention as the OpenCL `&a..&d` pointer form). LE schedule, single-block fast path + multi-block `first_has_pad` tail, NO state byte-swap. R11 verified: MD5 uses XOR/add/rotate only — no scalar `bitselect()` in play.
+
+**`emit_family_md5pass_kernel_metal_multiemit`** — computes `md5(pass)` ONCE, then the compile-time-N=2 unrolled loop: per variant the outer-helper call (`sep`) → `probe_compact_idx` → the **EXISTING Metal `EMIT_HIT_4_DEDUP_OR_OVERFLOW` macro UNCHANGED**, dedup keyed on per-variant `matched_idx`. 16-byte hit record, no variant tag (fingerprint self-identifies). Selected by `entry->emit_class == HX_EMIT_MULTI` at the top of `emit_family_md5pass_kernel_metal`; the single-emit body is fully isolated (G2 no-op). The Metal HX_PRIM_MD5 FATAL is replaced with the emit_class gate (MD5-outer admitted only when MULTI), and MD5 is wired into the per-primitive emit dispatch + FATAL filter. `gpu/gpujob_metal.m` caller untouched (4-arg oracle signature preserved; verified zero changes needed). `metal_gpu_hash_words(JOB_MD5MD5PASS)` resolves to 4 words via the default arm — exact parity with the OpenCL `gpu_hash_words` default arm.
+
+## Metal cross-arch validation (5c.4 — Apple M2 Max, dev3.local, Metal) — all GREEN
+
+Built on dev1 (Apple Silicon Metal) per the iMac↔dev1 scp-staging truncation memo; test binary staged to dev3 via chunked-scp local-hop; production binaries on fpga + dev3 UNTOUCHED; /tmp-direct VALIDATE invocation.
+
+- **G1b dual-hash canary (THE mandatory multi-emit gate): PASS on Metal.** 4 passwords → Metal emitted **8 cracks** (BOTH variants per password): `n_pass=4 n_variants=2 n_rows=8 vn_hits=8 matched=8 missing=0 extras=0 digest_mismatches=0`, byte-exact vs the CPU oracle. (Also confirmed PASS on dev1 Apple Silicon as a fail-fast pre-stage.)
+- **e123 5-fixture matrix: PASS on Metal** — e123_smoke + family_smoke (n_rows=16), medium (n_rows=2048), edge_minlen / edge_maxlen (n_rows=256), and large at HALF-fixture (524,288 pw → **1,048,576 rows / 1,048,576 hits** byte-exact). Half-large per the 5c.2 NVIDIA-TDR finding (safe default on Apple Silicon too).
+- **G2 single-emit regression: PASS (29/29 cells) on Metal** — every prior family member (e120, e122, e125, e127–e155 HAVAL ×15, e157, e159, e161, e163, e165, e167, e169, e171, e173, e175, e177) shows `n_variants=1`, byte-exact; the emit_class plumbing is a confirmed no-op on Metal.
+- **G3 e347 regression: PASS on Metal** — smoke (32 pairs) + medium (1024 pairs) byte-exact; the shared family-emitter change causes zero collateral to the e347 path.
+
+**OpenCL non-regression:** the only file changed in 5c.3/5c.4 is codegen/hx_emit_metal.c (a Metal-only TU, gated out of the OpenCL build). `rcsdiff` confirms the OpenCL-compiled codegen sources (hx_emit_opencl.c, hx_emit_primitives.c, hx_spec_entry.h) and mdxfind.c (1.519) are byte-identical to their checked-in 5c.2 state — the OpenCL multi-emit path proven in 5c.2 is unperturbed.
+
+**e123 COMPLETE — first multi-emit milestone.** The MAKE_MD5PASS family is now **30/30 GPU-eligible on BOTH backends** (OpenCL Pascal + Apple Silicon Metal). e123 is the FIRST multi-emit algorithm in the hx codegen pipeline; `enum hx_emit_class` + `note_ref` are the extension seam for the remaining ~23 Note-[24] multi-emit entries (deferred — each its own future sub-phase).
+
+This is a SOURCE-READY ship: all source is checked in to RCS on the iMac authoritative tree and cross-arch-validated on both backends. Version bump, GitHub release, and `mdxfind-release` are deferred per the release freeze in effect until the week of 2026-06-01.
+
+---
+
+# mdxfind v1.507 — Phase 5b Tier 4 COMPLETE (sub-phases 5b.4a + 5b.4b): Snefru-128/256 + GOST R 34.11-94 MAKE_MD5PASS family GPU acceleration; family 29/30 (source-ready)
+
+Source: mdxfind.c rev 1.518, gpu/gpu_common.cl rev 1.34, gpu/gpu_common_str.h rev 1.26, gpu/metal_common.metal rev 1.33, gpu/metal_common_str.h rev 1.12, gpu/gpujob_metal.m rev 1.39, codegen/hx_emit_primitives.c rev 1.10, codegen/hx_emit_opencl.c rev 1.18, codegen/hx_emit_metal.c rev 1.17, codegen/tests/run_validation_family_md5pass.sh rev 1.11, codegen/tests/test_snefru_vectors.c rev 1.1 (NEW 5b.4a R15 regression canary), codegen/tests/test_gost_vectors.c rev 1.1 (NEW 5b.4b R15 regression canary), codegen/tests/family_md5pass/{e175,e177}_smoke.txt rev 1.1 (NEW 5b.4a), codegen/tests/family_md5pass/e125_smoke.txt rev 1.1 (NEW 5b.4b). UNCHANGED: gpu/gpu_opencl.c rev 1.196, gpu_metal.m rev 1.119, gpu/gpu_codegen_eligible.c rev 1.6, gpu/gpujob_opencl.c rev 1.155, codegen/hx_emit_primitives.h rev 1.2 — the D17.4.b table-driven admit + OpenCL `_proto_hexlen` + harness OR-chains + chokepoint + init-gate + listing path all auto-propagate; slot-map cap already 64.
+
+Window: 2026-05-27.
+
+Phase 5b Tier 4 is the FOURTH and final tier of the MAKE_MD5PASS primitive-lift roadmap. Per the architect's D18.6.b recommendation Tier 4 shipped in two sub-phases: **5b.4a shipped the Snefru pair** (`e175` SNE128MD5PASS, `e177` SNE256MD5PASS) — the clean pair sharing one parameterized block; **5b.4b ships `e125` GOSTMD5PASS** (the structurally-divergent block-cipher primitive — the highest-transcription-risk primitive in all of Phase 5b — isolated for dedicated attention). With Tier 4 COMPLETE the MAKE_MD5PASS family reaches **29/30 GPU-eligible** (96.7%), leaving only the `e123` MD5MD5PASS multi-emit outlier (deferred to its own future sub-phase).
+
+This is a SOURCE-READY ship: all source is checked in to RCS on the iMac authoritative tree and validated on both backends. The version bump, GitHub release, and `mdxfind-release` run are deferred per the release freeze in effect until the week of 2026-06-01.
+
+## Sub-phase 5b.4a — Snefru-128 (e175) + Snefru-256 (e177) GPU acceleration
+
+`snefru_block` (Snefru core transformation, the standard hardened 8-pass variant) is now resident in the shared GPU helper sources (`gpu/gpu_common.cl` rev 1.33 and `gpu/metal_common.metal` rev 1.32) as a 512-bit (8-uint) state primitive, plus the 16 KB `SNEFRU_SBOX` / `MTL_SNEFRU_SBOX` lookup table (4096 uint32). The donor is the in-tree `RHash-master/librhash/snefru.c` `rhash_snefru_process_block` — which is also the LIVE CPU oracle for e175/e177 (librhash.a is in mdxfind's link list).
+
+Per the architect's D18.1.a recommendation, Snefru is implemented as **ONE parameterized block** `snefru_block(state, block, is256)` handling both widths, NOT two separate functions. The donor's single `rhash_snefru_process_block` has the SAME 8-round S-box transform for both widths; only three sites differ on width, and they collapse to compile-time `if (is256)` branches that the JIT folds (is256 is baked as a literal per emit, so the kernel stays fully unrolled per variant):
+
+- **W[] fill** — Snefru-256 loads `state[4..7]` into `W[4..7]` then reads 8 message words (a 32-byte data block); Snefru-128 loads only `state[0..3]` then reads 12 message words (a 48-byte data block).
+- **Final state XOR-back** — Snefru-256 additionally writes `state[4..7]`.
+- **Data-block size** — handled in the emit helper.
+
+The round count is FIXED at 8 (`SNEFRU_NUMBER_OF_ROUNDS`); there is NO configurable security/pass parameter. The S-box and core transform are width-independent. Snefru's schedule and state output are BIG-ENDIAN (donor `be2me_32` on message load, `be32_copy` on state output); the message words are assembled via a `SNEFRU_BE32` byte-order helper, and the emit helper byte-swaps the BE state words into the LE-uint frame the `compact_fp` probe expects (per `feedback_be_state_primitives_need_byteswap_in_codegen.md`).
+
+### Block-size asymmetry — the key Tier-4 Snefru risk (R-Tier4-snefru-blocksize)
+
+Unlike HAVAL's uniform 128-byte block, **Snefru-128 processes 48-byte data blocks and Snefru-256 processes 32-byte data blocks** (`data_block_size = 64 - digest_length`). The emit helper's padding and length-field placement therefore differ per width. A single parameterized emit helper `emit_outer_snefru_concat_then_hash(is256, digest_bytes)` (and its Metal twin) bakes the per-width data-block size (DBLK = 48 vs 32) and the length-field byte offsets into two distinct emitted GPU functions (`outer_snefru128_…` / `outer_snefru256_…`). The finalization mirrors `rhash_snefru_final`: zero-pad the last partial block and compress it, then build a length block placing `be2me_32(length >> 29)` at byte offset `DBLK-8` and `be2me_32(length << 3)` at `DBLK-4` (the message length is in BYTES). In the emitted kernels this resolves to `block[40]`/`block[44]` for SNE128 and `block[24]`/`block[28]` for SNE256 — verified directly in the dumped kernel sources.
+
+### Pre-flight + pre-port verification
+
+- **R15 pre-flight** (`codegen/tests/test_snefru_vectors.c` rev 1.1): the librhash Snefru donor was cross-checked against the canonical empty-string Snefru-128 + Snefru-256 vectors (`8617f366…` prefix) AND 228 split-update vs single-update self-consistency cells straddling both data-block boundaries (lengths 31/32/33/47/48/49/63/64/65/95/96/97/127/128/129/200 at 7 chunk sizes per width). **230/230 cells PASS** — confirms the donor's multi-block + partial-fill paths byte-exact for the GPU port oracle.
+- **Pre-port C-mirror** (`/tmp/test_snefru_port.c`, one-time harness, not committed): a standalone C reimplementation of the exact GPU `snefru_block` plus the emit-helper full-block-walk + partial-block-pad + length-block placement was cross-checked against the librhash donor for both widths across 28 lengths including all block boundaries: **56/56 cells PASS** byte-exact BEFORE any hardware round-trip. This isolated both the block transform AND the per-width padding/length math (R-Tier4-snefru-blocksize) before the kernel ever ran on a GPU.
+
+### Constant-memory budget (R11)
+
+The 16 KB `SNEFRU_SBOX` brings the cumulative `__constant` footprint to ~42-43 KB of the 64 KB Pascal / Apple Silicon `CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE` budget (post-Tier-3 ~26-27 KB + 16 KB), with ~21 KB headroom. The GOST 4 KB derived tables in 5b.4b will bring it to ~46-47 KB, still comfortably within budget.
+
+### Admit-path edits (NOT pure flag-flip — the Tier-4 divergence from HAVAL)
+
+Unlike the HAVAL tiers, the GOST/Snefru `job_to_prim_table[]` rows were NOT pre-staged in 5b.3a. Per the architect's D18.4.a, 5b.4a adds all 3 Tier-4 rows in `codegen/hx_emit_primitives.c` (the one-time non-flag-flip admit edit): `{ 125, HX_PRIM_GOST }` (pre-staged numeric-sorted, HARMLESS until 5b.4b flips its `supported_5a`), `{ 175, HX_PRIM_SNE128 }`, `{ 177, HX_PRIM_SNE256 }`. After these rows land plus the `supported_5a` flips for SNE128/SNE256, the admit predicate, OpenCL `_proto_hexlen`, harness OR-chains, chokepoint, init-gate, and listing path all auto-propagate via D17.4.b with ZERO edits at those sites. The one OTHER non-auto-propagating site is the Metal `metal_gpu_hash_words()` hand-switch (NOT table-driven, unlike the OpenCL `_proto_hexlen`): 5b.4a adds SNE256 to the `return 8` group (32 bytes) and an explicit SNE128 case to the default-equivalent `return 4` arm (16 bytes), per `feedback_metal_hash_words_width_helper.md`.
+
+### Validation matrix (5b.4a Snefru pair)
+
+| Cell group | OpenCL (Pascal GTX 1080, fpga.local) | Metal (Apple M2 Max, dev3.local) |
+|------------|--------------------------------------|----------------------------------|
+| 2 algos × smoke (8 pw)               | 2/2 PASS | 2/2 PASS |
+| 2 algos × large (1,048,576 pw)       | 2/2 PASS | 2/2 PASS |
+| 2 algos × edge_maxlen (plen→131)     | 2/2 PASS | 2/2 PASS |
+
+**12/12 Snefru cells PASS** (2 algos × 3 fixtures × 2 backends); over 4 million password-digest verifications byte-exact vs the CPU oracle across both backends, zero missing, zero extras, zero digest mismatches. R-Tier4-snefru-blocksize verified in the dumped kernel sources (DBLK=48/length@block[40,44] for SNE128; DBLK=32/length@block[24,28] for SNE256). D17.4.b auto-propagation confirmed: `mdxfind -h` shows e175 + e177 `[GPU]`-tagged with zero listing-path edits; e125 GOSTMD5PASS correctly remains UNtagged (its row is pre-staged but `supported_5a=0` until 5b.4b).
+
+### Aggregate regression (re-run for 5b.4a)
+
+Prior-tier MAKE_MD5PASS family members (HAVAL 3-pass e127, 4-pass e129, 5-pass e131, Tiger e171, Whirlpool e173, SHA1 e161) × smoke × 2 backends: **12/12 cells PASS** — zero regression. Phase 4 e347 production-dispatcher regression (smoke n_pairs=32 + medium n_pairs=1024 × OpenCL + Metal): **4/4 cells PASS**; 5b.4a does not perturb the e347 codegen path.
+
+## Sub-phase 5b.4b — GOST R 34.11-94 (e125) GPU acceleration — Tier 4 COMPLETE, family 29/30
+
+`gost_block` (the GOST R 34.11-94 "chi" compression function, the legacy Russian standard hash) is now resident in the shared GPU helper sources (`gpu/gpu_common.cl` rev 1.34 and `gpu/metal_common.metal` rev 1.33) as a 256-bit (8-uint) state primitive, plus the 4 KB derived S-box tables (`GOST_SBOX_1..4` / `MTL_GOST_SBOX_1..4`, 4 × 256 uint32). The donor is the in-tree `gosthash/gosthash.c` `gosthash_compress` — which is also the LIVE CPU oracle for e125 (`gosthash()` is called directly from the JOB_GOSTMD5PASS case body; `gosthash.o` is in mdxfind's link list). `e125` GOSTMD5PASS is the FINAL GPU-eligible MAKE_MD5PASS family member.
+
+### TEST S-box set, NOT CryptoPro (R-Tier4-gost-sbox, HIGH)
+
+GOST 28147-89 uses an application-specified 8×16 4-bit S-box. e125 uses the **TEST set** (Saarinen 1998 / RFC 4357; the `sbox[8][16]` at gosthash.c:32-42), NOT the CryptoPro set. The CryptoPro set (`RHASH_GOST_CRYPTOPRO`, the separate non-family e14 GOST-CRYPTO job) produces DIFFERENT digests; a wrong-S-box kernel would silently corrupt every digest. The 4 derived speed-up tables are precomputed host-side from `gosthash_init()`'s logic and baked as `__constant` literals (byte-exact vs the donor's `gost_sbox_1..4`, verified in the C-mirror with 0 mismatches). The MANDATORY R15 pre-flight (`codegen/tests/test_gost_vectors.c` rev 1.1) cross-checks `gosthash()` against the 4 published GOST R 34.11-94 TEST-set vectors (empty/"a"/"abc"/"message digest") AND against rhash `RHASH_GOST` (the librhash default, also the test set) across 22 multi-block lengths — **26/26 cells PASS, ZERO CryptoPro collisions**, distinguishing the TEST set from CryptoPro across the full sweep.
+
+### The most structurally-divergent primitive in Phase 5b (R-Tier4-gost-blockcipher, HIGH)
+
+GOST is the ONLY MAKE_MD5PASS primitive based on a block cipher. `gost_block` mirrors `gosthash_compress`: an 8-iteration "chi" key-schedule loop (the U/V state rotation + the P-transformation building 8×32-bit subkeys) wrapping the GOST 28147-89 32-round Feistel encipher (via the 4 derived S-box tables), followed by the three LFSR product-matrix mixing stages (the 12-round / 16-round / 61-round comments at gosthash.c:191-260 — the single highest typo risk, transcribed verbatim). Beyond the block, GOST carries a **running mod-2^256 checksum `sum[8]`** accumulated across every data block (with the donor's `c = (c<a)||(c<b)` carry propagation) AND a **dual finalization**: after the data blocks, compress the 256-bit bit-length block, then compress the accumulated `sum[8]` checksum block (`gosthash_final:358-359`). The state output is little-endian byte order, so the probe `h0..h3 = state[0..3]` directly (no byte-swap). These cross-block-state mechanics are unique among the family primitives; the bespoke emit helper `emit_outer_gost_concat_then_hash` (and its Metal twin) carries the `sum[8]` accumulation and emits both finalization compressions.
+
+### C-mirror before hardware (the highest-transcription-risk primitive)
+
+Per the C-mirror discipline, the EXACT `gost_block` + `sum[8]` carry + dual finalization were reimplemented in plain C (`/tmp/test_gost_port.c`, uncommitted) and validated **27/27 byte-exact vs `gosthash()`** across lengths straddling the 32-byte block boundary (31/32/33/63/64/65/…) BEFORE any GPU code was written; the precise unified-loop control flow the emitted kernel uses (full + partial blocks in one loop) was separately validated **20/20 byte-exact**. The inserted OpenCL `gost_block` body + macros were then differentially confirmed byte-identical to the validated C-mirror.
+
+### Const budget
+
+The GOST 4 KB derived tables bring the cumulative `__constant` footprint to ~46-47 KB of the 64 KB Pascal / Apple Silicon `CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE` budget (post-Snefru ~42-43 KB + 4 KB), with ~17 KB headroom. JIT-compiled clean on both backends.
+
+### Admit wiring (5b.4b)
+
+The `{ 125, HX_PRIM_GOST }` `job_to_prim_table` row was pre-staged in 5b.4a, so 5b.4b's admit edit is the single `supported_5a` 0→1 flip for `HX_PRIM_GOST` in `codegen/hx_emit_primitives.c`. The admit predicate, OpenCL `_proto_hexlen`, harness OR-chains, chokepoint, init-gate, and listing path all auto-propagate via D17.4.b with ZERO edits. The one non-auto-propagating site is the Metal `metal_gpu_hash_words()` hand-switch: 5b.4b adds JOB_GOSTMD5PASS to the `return 8` group (32 bytes). The bespoke `emit_outer_gost_concat_then_hash` helpers were added to `codegen/hx_emit_opencl.c` (rev 1.18) + `hx_emit_metal.c` (rev 1.17), each wired at 4 sites (helper-name switch, call-line tree, FATAL filter widened to 29, dispatch switch); the oracle (`gosthash()` direct, return 32) + dlen (32) arms were added to `mdxfind.c` (rev 1.518).
+
+### Validation matrix (5b.4b GOST)
+
+| Fixture | n_pass | OpenCL (fpga GTX 1080) | Metal (dev3 M2 Max) |
+|---|---|---|---|
+| e125_smoke | 8 | PASS | PASS |
+| e125_medium | 1,024 | PASS | PASS |
+| e125_large | 1,048,576 | PASS | PASS |
+| e125_edge_minlen (1–4) | 128 | PASS | PASS |
+| e125_edge_maxlen (56–128) | 128 | PASS | PASS |
+
+**10/10 GOST cells PASS** (5 fixtures × 2 backends); over 4.2 million password-digest verifications byte-exact vs the `gosthash()` CPU oracle across both backends, zero missing, zero extras, zero digest mismatches. R-Tier4-gost-sbox verified: the byte-exact match against the TEST-set oracle (a CryptoPro-encoded kernel would have produced 100% digest mismatches) confirms the correct S-box. The edge_maxlen fixture (pass 56–128 → total 88–160 bytes = up to 5 GOST blocks) exercises the `sum[8]` checksum carry across multiple data blocks plus the dual finalization. D17.4.b auto-propagation confirmed: `mdxfind -h` shows e125 `[GPU]`-tagged with zero listing-path edits.
+
+### Aggregate regression (re-run for 5b.4b)
+
+Prior-tier MAKE_MD5PASS family members (Snefru-128 e175, Snefru-256 e177, HAVAL 5-pass e131, Tiger e171, Whirlpool e173, SHA1 e161) × smoke × 2 backends: **12/12 cells PASS** — zero regression. Phase 4 e347 production-dispatcher regression (smoke n_pairs=32 + medium n_pairs=1024 × OpenCL + Metal): **4/4 cells PASS**; 5b.4b does not perturb the e347 codegen path.
+
+### Tier 4 COMPLETE — family milestone 29/30
+
+With e125 GOST shipped, all 29 GPU-eligible MAKE_MD5PASS members are `[GPU]`-tagged: e120, e122, **e125**, e127, e129, e131, e133, e135, e137, e139, e141, e143, e145, e147, e149, e151, e153, e155, e157, e159, e161, e163, e165, e167, e169, e171, e173, e175, e177. The ONLY remaining CPU-only family member is `e123` MD5MD5PASS — the multi-emit outlier (canonical + colon variant), deferred to its own future sub-phase. The MAKE_MD5PASS primitive-lift roadmap (Tiers 1-4) is now complete.
+
+---
+
+# mdxfind v1.506 — Phase 5b Tier 3 COMPLETE (sub-phases 5b.3a + 5b.3b + 5b.3c): full 15-variant HAVAL MAKE_MD5PASS family GPU acceleration (source-ready)
+
+Source: mdxfind.c rev 1.516, gpu/gpu_common.cl rev 1.32, gpu/gpu_common_str.h rev 1.24, gpu/metal_common.metal rev 1.31, gpu/metal_common_str.h rev 1.10, gpu/gpu_opencl.c rev 1.196, gpu_metal.m rev 1.119, gpu/gpu_codegen_eligible.c rev 1.6, gpu/gpujob_opencl.c rev 1.155, gpu/gpujob_metal.m rev 1.37, codegen/hx_emit_primitives.c rev 1.8, codegen/hx_emit_primitives.h rev 1.2, codegen/hx_emit_opencl.c rev 1.16, codegen/hx_emit_metal.c rev 1.15, codegen/tests/run_validation_family_md5pass.sh rev 1.9, codegen/tests/test_haval_paper_vectors.c rev 1.1 (NEW 5b.3a R15 regression canary), codegen/tests/family_md5pass/{e127,e133,e139,e145,e151}_smoke.txt rev 1.1 (NEW 5b.3a), codegen/tests/family_md5pass/{e129,e135,e141,e147,e153}_smoke.txt rev 1.1 (NEW 5b.3b), codegen/tests/family_md5pass/{e131,e137,e143,e149,e155}_smoke.txt rev 1.1 (NEW 5b.3c).
+
+Window: 2026-05-27.
+
+Phase 5b Tier 3 lifts the HAVAL primitive family — a parameterized family of 15 variants (5 digest widths × 3 pass counts) — into the shared GPU helper sources and wires it into the MAKE_MD5PASS family codegen pipeline. Tier 3 ships in three pass-count sub-phases per the architect's D17.6.b recommendation: **5b.3a ships the 5 three-pass variants** (`e127` HAV128, `e133` HAV160/3, `e139` HAV192/3, `e145` HAV224/3, `e151` HAV256); **5b.3b ships the 5 four-pass variants** (`e129` HAV128/4, `e135` HAV160/4, `e141` HAV192/4, `e147` HAV224/4, `e153` HAV256/4); **5b.3c ships the 5 five-pass variants** (`e131` HAV128/5, `e137` HAV160/5, `e143` HAV192/5, `e149` HAV224/5, `e155` HAV256/5). With 5b.3c, Tier 3 is COMPLETE: all 15 HAVAL variants (e127 through e155) are GPU-eligible. The MAKE_MD5PASS family now has 26 GPU-eligible members (86.7% family coverage); 4 remain CPU-only — the `e123` MD5MD5PASS multi-emit outlier and the 3 Tier 4 primitives (snefru × 2, gost).
+
+This is a SOURCE-READY ship: all source is checked in to RCS on the iMac authoritative tree and validated on both backends. The version bump, GitHub release, and `mdxfind-release` run are deferred to a single Tier 3 release event after this 5b.3c source check-in.
+
+## Sub-phase 5b.3a — 3-pass HAVAL (e127 / e133 / e139 / e145 / e151) GPU acceleration
+
+`haval3_block` (HAVAL 3-pass compression, Zheng-Pieprzyk-Seberry 1993) is now resident in the shared GPU helper sources (`gpu/gpu_common.cl` and `gpu/metal_common.metal`) as an 8-uint state primitive over a 128-byte block. HAVAL's `__constant` footprint is minimal: the 32-byte 8-uint initial value (`HAVAL_IV` / `MTL_HAVAL_IV`); the 96 round constants are inlined as compile-time hex literals at each round step (matching the donor's structure and letting the JIT compiler fold them into immediate operands). The donor implementation is the public-domain `mhash-0.9.9.9/lib/haval.c` `havalTransform3` (Paulo S.L.M. Barreto, 1998). Pre-flight R15 cross-verification against `sph_haval` (mdxfind's CPU oracle) confirmed standard-conformance across all 15 published empty-input HAVAL paper vectors (5 widths × 3 passes) plus 105 split-update vs single-update self-consistency cells over multi-block boundary inputs (`codegen/tests/test_haval_paper_vectors.c` rev 1.1, **120/120 cells PASS**).
+
+A single parameterized emit helper `emit_outer_haval_concat_then_hash` (and its Metal twin) handles all 15 HAVAL variants: it bakes the per-variant `(passes, digest_bytes)` tuple into one specialized GPU function at C-emit time. This is the architect's D17.1.a recommendation — a single source of truth for the entire HAVAL family rather than 15 bespoke helpers. HAVAL's structural divergence from the prior MD-family primitives is intrinsic and was carefully transcribed:
+
+- **128-byte block** (twice the conventional 64-byte block), 32 LE-packed uint32 message words.
+- **Pad-toggle byte is `0x01`, NOT `0x80`** (donor `havalFinal:760`, explicitly cited in the emit code). Every other primitive in `gpu_common.cl` uses the conventional `0x80` MD/SHA padding bit; HAVAL is the exception, and a careless copy would silently corrupt every digest.
+- **Variant-parameter encoding at `block[118..119]`** (donor `havalFinal:786-790`): each `(width, passes)` tuple produces a distinct 2-byte encoding `(version=1) | (passes<<3) | (digest_bits<<6)` and `digest_bits>>2`. Computed at C-emit time and baked as literal constants. For the five 3-pass variants `block[118]=0x19` uniformly; `block[119]` is `0x20/0x28/0x30/0x38/0x40` for the 128/160/192/224/256-bit widths respectively (verified across all 5 emitted kernels).
+- **Post-compression digest fold**, JIT-specialized per width so each emitted kernel carries exactly one fold branch (no runtime conditional): the heavy 128-bit byte-redistribution fold, the 160-bit ROTR fold, the 192-bit 5-bit-slice fold, the 224-bit byte-slot-shift fold (donor `havalFinal:816-902`), and the trivial 256-bit direct output (no fold).
+
+HAVAL state is little-endian-native (matching the donor and the published test vectors), so the digest extract is a direct `state[0..3]` read with no byte-swap epilogue. The 4-uint probe carries the first 16 bytes to the hit record; the CPU recompute path (already wired since the SHA-512/Whirlpool tiers) supplies the full digest for the 20/24/28/32-byte widths on hit.
+
+### Pre-port C-mirror validation
+
+A standalone C reimplementation of the exact GPU `haval3_block` + emit-helper padding/fold logic was cross-checked against `sph_haval` before any hardware round-trip: **60/60 cells PASS** (5 widths × 12 inputs including the multi-block boundary cases at 84/85/86/118/119/120-byte plaintexts). This isolated the compression-body transcription, the `0x01` pad toggle, the `block[118..119]` parameter encoding, and all five per-width folds as byte-exact before the kernel ever ran on a GPU.
+
+### Load-bearing prerequisites shipped in 5b.3a
+
+5b.3a also lands four prerequisites that benefit Tier 3 + Tier 4 + beyond:
+
+1. **D17.4.b table-driven admit refactor** — a new `hx_primitive_for_job()` lookup helper in `codegen/hx_emit_primitives.c` (hand-built JOB-enum → outer-primitive map) collapses four previously-hand-coded widening sites onto one truth source: the `gpu_codegen_kernelb_family_md5pass_eligible()` admit predicate, the OpenCL + Metal harness OR-chains in `mdxfind.c`, and the `_proto_hexlen` digest-width switch in `gpu/gpujob_opencl.c`. After this refactor each site is a one-liner querying `hx_primitive_for_job()` + `hx_primitive_is_supported_5a()`; future Tier ships (5b.3b, 5b.3c, Tier 4) flip a single `supported_5a` flag in `prim_table[]` and all four sites auto-propagate with zero further edits.
+2. **Slot-map cap bump 16 → 64** — the per-JOB codegen program/PSO slot map (`hx_codegen_slots[]` in `gpu/gpu_opencl.c`, `mtl_codegen_slots[]` in `gpu_metal.m`) is bumped from 16 to 64. The post-Tier-3 active codegen entry count (11 prior + 15 HAVAL + e347 = 27) comfortably fits, with headroom through Tier 4.
+3. **prim_table alias rows** — bare callnames `hav128` and `hav256` (used by the e127/e151 catalog entries, without the `_3` suffix) are aliased to the canonical `HX_PRIM_HAV128_3` / `HX_PRIM_HAV256_3` ids, resolving a catalog-callname-vs-prim-table mismatch that would otherwise FATAL the emit for those two algorithms.
+4. **JIT-only dump-harness `_with_common` fix** — a latent bug in the non-VALIDATE dump harness path (which routed only e347 through the gpu_common-prepending JIT helper) is fixed to route all MAKE_MD5PASS family members through `_with_common` too. The bug was masked through Tiers 1-2 because family validation always used `MDXFIND_HX_CODEGEN_VALIDATE=1` (which uses the correct `_with_common_keep` dispatch path).
+
+### Validation matrix (5b.3a 3-pass HAVAL ship)
+
+| Cell group | OpenCL (Pascal GTX 1080, fpga.local) | Metal (Apple M2 Max, dev3.local) |
+|------------|--------------------------------------|----------------------------------|
+| 5 algos × smoke (8 pw)               | 5/5 PASS | 5/5 PASS |
+| 5 algos × large (1,048,576 pw)       | 5/5 PASS | 5/5 PASS |
+| 5 algos × edge_maxlen (plen→131)     | 5/5 PASS | 5/5 PASS |
+
+**30/30 HAVAL cells PASS** (5 algos × 3 fixtures × 2 backends); ~10.5 million password-digest verifications byte-exact vs the CPU oracle across both backends. The e127 (128-bit fold, the most complex) full 5-fixture validation (smoke + medium + large + edge_minlen + edge_maxlen × 2 backends = 10 cells) all PASS, sanity-checking the parameterized helper across the full fixture range.
+
+## Aggregate Phase 5a + Tier 1 + Tier 2 regression (re-run for 5b.3a)
+
+11 prior GPU-eligible MAKE_MD5PASS family members (`e120`, `e122`, `e157`, `e159`, `e161`, `e163`, `e165`, `e167`, `e169`, `e171`, `e173`) × smoke fixture × 2 backends: **22/22 cells PASS** — the D17.4.b table-driven admit refactor introduced zero regression. Phase 4 e347 production-dispatcher regression: **4/4 cells PASS** (smoke + large × OpenCL + Metal); 5b.3a does not perturb the e347 codegen path.
+
+## Sub-phase 5b.3b — 4-pass HAVAL (e129 / e135 / e141 / e147 / e153) GPU acceleration
+
+`haval4_block` (HAVAL 4-pass compression) is now resident in the shared GPU helper sources (`gpu/gpu_common.cl` rev 1.31, `gpu/metal_common.metal` rev 1.30) as an 8-uint state primitive over a 128-byte block, positioned adjacent to `haval3_block`. The donor is the same public-domain `mhash-0.9.9.9/lib/haval.c` `havalTransform4` (Paulo S.L.M. Barreto, 1998). A critical structural point: HAVAL's per-step F-function argument orderings and message-word permutation schedule in passes 1–3 of the 4-pass core DIFFER from the 3-pass core — the schedule is pass-count specific — so `haval4_block` is a verbatim transcription of `havalTransform4`, not a reuse of the `haval3_block` passes plus an extra pass. Pass 4 adds the F4 round function with 32 more round constants (`0x7A325381 … 0x137A3BE4`) and the feedforward in its final 8 steps. The `MTL_HAVAL_F4` macro (added in 5b.3a) is now exercised; HAVAL's F1–F5 are pure XOR/AND/OR/NOT compositions, so no scalar `bitselect` is involved (R11 not in play).
+
+The 5 four-pass variants reuse the existing parameterized emit helper `emit_outer_haval_concat_then_hash` unchanged — 5b.3b simply wires the 5 `HX_PRIM_HAV*_4` ids into the dispatch / FATAL-filter / helper-name switches with `passes=4`. The helper already bakes the pass count into both the compression-function call (`haval4_block`) and the `block[118]` variant-parameter byte. For the five 4-pass variants `block[118]=0x21` uniformly (vs the 3-pass `0x19`, because the `(passes<<3)` field changes from `0x18` to `0x20`); `block[119]` is `0x20/0x28/0x30/0x38/0x40` for the 128/160/192/224/256-bit widths respectively (verified in the emitted kernel source for e129 and e153). The per-width digest folds are pass-count-independent (HAVAL's final fold is parameterized only by digest width) and were validated unchanged.
+
+Pre-port R15 cross-verification: a standalone C-mirror of `haval4_block` plus the family padding/fold was validated against `sph_haval` for all 5 widths × 12 inputs (including the multi-block boundary cases at 84/85/86/118/119/120 bytes), **60/60 cells PASS** before any GPU code shipped.
+
+### D17.4.b auto-propagation (5b.3b is flag-flip-only)
+
+5b.3b is the first sub-phase to fully exercise the D17.4.b table-driven admit refactor shipped in 5b.3a. The `job_to_prim_table` already carried the 5 `HAV*_4` JOB-enum rows, so flipping the 5 `prim_table.supported_5a` flags from 0 to 1 auto-propagated to ALL downstream gates with zero edits: the admit predicate, the OpenCL + Metal harness OR-chains, the OpenCL `_proto_hexlen` digest-width switch, and the `mdxfind -h` `[GPU]` listing. The 5 new entries (`e129`, `e135`, `e141`, `e147`, `e153`) appear `[GPU]`-tagged in `mdxfind -h` with no edit to the listing path. The only hand edits were: lift `haval4_block` + its Metal twin, flip the 5 flags, wire the emit-dispatch arms, add the 5 oracle + dlen arms, add the 4 `metal_gpu_hash_words` arms (HAV128/4 reuses the 4-word default), and the fixtures.
+
+### Validation matrix (5b.3b 4-pass HAVAL ship)
+
+**30/30 HAVAL 4-pass cells PASS** (5 algos × 3 fixtures [smoke + large + edge_maxlen] × 2 backends); ~31.5 million password-digest verifications byte-exact vs the CPU oracle (Pascal GTX 1080 OpenCL + Apple M2 Max Metal), zero digest mismatches, zero extras, zero missing. Prior-tier regression (3-pass HAVAL + MD2 + SHA1 + Tiger + Whirlpool × smoke × 2 backends): **18/18 cells PASS**. Phase 4 e347 production-dispatcher regression: **4/4 cells PASS** (smoke + large × OpenCL + Metal); 5b.3b does not perturb the e347 path.
+
+## Sub-phase 5b.3c — 5-pass HAVAL (e131 / e137 / e143 / e149 / e155) GPU acceleration — Tier 3 COMPLETE
+
+`haval5_block` (HAVAL 5-pass compression) is now resident in the shared GPU helper sources (`gpu/gpu_common.cl` rev 1.32, `gpu/metal_common.metal` rev 1.31) as an 8-uint state primitive over a 128-byte block, positioned adjacent to `haval4_block`. The donor is the same public-domain `mhash-0.9.9.9/lib/haval.c` `havalTransform5` (Paulo S.L.M. Barreto, 1998) — the longest of the three compression cores at ~200 lines. A critical structural point: HAVAL's per-step F-function argument orderings and message-word permutation schedule in passes 1–4 of the 5-pass core DIFFER from BOTH the 3-pass AND 4-pass cores — the schedule is pass-count specific across all passes — so `haval5_block` is a verbatim transcription of `havalTransform5`, not a reuse of the earlier passes plus extra rounds. Pass 5 adds the F5 round function with 32 more round constants (`0xBA3BF050 … 0x409F60C4`) and the feedforward in its final 8 steps. The `MTL_HAVAL_F5` macro (added in 5b.3a) is now exercised; HAVAL's F1–F5 are pure XOR/AND/OR/NOT compositions, so no scalar `bitselect` is involved (R11 not in play).
+
+The 5 five-pass variants reuse the existing parameterized emit helper `emit_outer_haval_concat_then_hash` unchanged — 5b.3c simply wires the 5 `HX_PRIM_HAV*_5` ids into the dispatch / FATAL-filter / helper-name switches with `passes=5`. The helper already bakes the pass count into both the compression-function call (`haval5_block`) and the `block[118]` variant-parameter byte. For the five 5-pass variants `block[118]=0x29` uniformly (vs the 4-pass `0x21` and 3-pass `0x19`, because the `(passes<<3)` field is now `0x28`); `block[119]` is `0x20/0x28/0x30/0x38/0x40` for the 128/160/192/224/256-bit widths respectively (verified in the emitted kernel source for e131 and e155). The per-width digest folds are pass-count-independent (HAVAL's final fold is parameterized only by digest width) and were validated unchanged.
+
+A pre-port C-mirror of `haval5_block` + the padding/fold logic (the longest transcription target in Tier 3) was validated byte-exact against `sph_haval` for all 5 widths × 12 inputs (including the multi-block boundary cases at 84/85/86/118/119/120 bytes): **60/60 cells PASS** before any GPU hardware ran, catching any 5-pass-schedule transcription error in the plain-C mirror first.
+
+### D17.4.b auto-propagation (5b.3c is flag-flip-only)
+
+5b.3c is flag-flip-only on the admit path, like 5b.3b. The `job_to_prim_table` already carried the 5 `HAV*_5` JOB-enum rows, so flipping the 5 `prim_table.supported_5a` flags from 0 to 1 auto-propagated to ALL downstream gates with zero edits: the admit predicate, the OpenCL + Metal harness OR-chains, the OpenCL `_proto_hexlen` digest-width switch, and the `mdxfind -h` `[GPU]` listing. The 5 new entries (`e131`, `e137`, `e143`, `e149`, `e155`) appear `[GPU]`-tagged in `mdxfind -h` with no edit to the listing path. The only hand edits were: lift `haval5_block` + its Metal twin, flip the 5 flags, wire the emit-dispatch arms, add the 5 oracle + dlen arms, add the 4 `metal_gpu_hash_words` arms (HAV128/5 reuses the 4-word default), and the fixtures. Files left UNCHANGED in 5b.3c: `gpu/gpu_opencl.c`, `gpu_metal.m`, `gpu/gpu_codegen_eligible.c`, `gpu/gpujob_opencl.c`, `codegen/hx_emit_primitives.h` (slot cap already 64; admit/_proto_hexlen/harness all auto-propagate via D17.4.b).
+
+### Validation matrix (5b.3c 5-pass HAVAL ship)
+
+**30/30 HAVAL 5-pass cells PASS** (5 algos × 3 fixtures [smoke + large + edge_maxlen] × 2 backends); ~10.5 million password-digest verifications byte-exact vs the CPU oracle (Pascal GTX 1080 OpenCL + Apple M2 Max Metal), zero digest mismatches, zero extras, zero missing. Prior-tier regression (3-pass + 4-pass HAVAL + MD2 + SHA1 + Tiger + Whirlpool × smoke × 2 backends): **22/22 cells PASS**. Phase 4 e347 production-dispatcher regression: **4/4 cells PASS** (smoke + large × OpenCL + Metal); 5b.3c does not perturb the e347 path.
+
+### Tier 3 COMPLETE milestone
+
+With 5b.3c shipped, all 15 HAVAL MAKE_MD5PASS variants (e127 through e155) are `[GPU]`-tagged and validated on both backends. The MAKE_MD5PASS family is now 26/30 GPU-eligible (86.7%): MD2, MD4, 15 × HAVAL, RMD128, RMD160, SHA1, SHA224, SHA256, SHA384, SHA512, Tiger, Whirlpool. The 4 remaining CPU-only members are the `e123` MD5MD5PASS multi-emit outlier (deferred to a separate multi-emit sub-phase) and the 3 Tier 4 primitives (snefru × 2, gost). The single Tier 3 release event (version bump + GitHub release + `mdxfind-release`) ships on top of this source-ready check-in.
+
+---
+
+# mdxfind v1.505 — Phase 5b Tier 2: Whirlpool / Tiger MAKE_MD5PASS family GPU acceleration
+
+Source: mdxfind.c rev 1.510, gpu/gpu_common.cl rev 1.29, gpu/gpu_common_str.h rev 1.21, gpu/metal_common.metal rev 1.28, gpu/metal_common_str.h rev 1.7, gpu/gpu_codegen_eligible.c rev 1.5, gpu/gpujob_opencl.c rev 1.154, gpu/gpujob_metal.m rev 1.34, codegen/hx_emit_primitives.c rev 1.5, codegen/hx_emit_opencl.c rev 1.13, codegen/hx_emit_metal.c rev 1.12, codegen/tests/run_validation_family_md5pass.sh rev 1.6, codegen/tests/family_md5pass/e173_smoke.txt rev 1.1 (NEW 5b.2a), codegen/tests/family_md5pass/e171_smoke.txt rev 1.1 (NEW 5b.2b), codegen/tests/test_wrl_nessie.c rev 1.1 (NEW 5b.2a regression), codegen/tests/test_tiger_nessie.c rev 1.1 (NEW 5b.2b regression).
+
+Window: 2026-05-27.
+
+Phase 5b Tier 2 lifts two MAKE_MD5PASS outer primitives — Whirlpool (`wrl`) and Tiger — into the shared GPU helper sources and wires them into the family codegen pipeline. After Tier 2 the family has 11 GPU-eligible members; 18 remain CPU-only pending Tier 3 (haval × 15) and Tier 4 (snefru + gost) primitive lifts.
+
+## Sub-phase 5b.2a — WRLMD5PASS (e173) GPU acceleration
+
+`wrl_block` (Whirlpool, ISO/IEC 10118-3) is now resident in the shared GPU helper sources (`gpu/gpu_common.cl` and `gpu/metal_common.metal`) as an 8-ulong state primitive with 16 KB of `__constant` S-box tables and 80 bytes of round constants (total Tier 2a constant memory budget: 16.4 KB; comfortable headroom within the 64 KB CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE on both Pascal and Apple Silicon). The donor implementation is `RHash-master/librhash/whirlpool.c` (Aleksey Kravchenko, 2009-2012) and its companion S-box `RHash-master/librhash/whirlpool_sbox.c`; pre-flight R12 cross-verification against the OpenSSL `WHIRLPOOL()` implementation (mdxfind's CPU oracle) confirmed both donors agree byte-for-byte on all 8 published NESSIE test vectors (`codegen/tests/test_wrl_nessie.c` rev 1.1, 16/16 cells PASS).
+
+A bespoke per-primitive emit helper `emit_outer_wrl_concat_then_hash` (and its Metal twin) is added to the codegen pipeline. Whirlpool's structural divergence from SHA-512 is intrinsic: 64-byte block (not 128), 32-byte BE length suffix at M[4..7] (not 16-byte at M[14..15]), all-zero IV (not the SHA-512 IV), and ALWAYS-multi-block (single-block fast path elided — the threshold `32 + plen + 1 + 32 <= 64` never holds for the family use case). The state output is byte-swap-as-ulong then split into LE-uint pair, identical epilogue to the existing SHA-2 64-bit family helper.
+
+### Validation matrix (Whirlpool ship)
+
+| Fixture / Backend       | OpenCL (Pascal GTX 1080) | Metal (Apple Silicon M2 Max) |
+|-------------------------|--------------------------|------------------------------|
+| family_smoke (8)        | e173 PASS                | e173 PASS                    |
+| family_medium (1,024)   | e173 PASS                | e173 PASS                    |
+| family_large (1,048,576)| e173 PASS                | e173 PASS                    |
+| family_edge_minlen (128)| e173 PASS                | e173 PASS                    |
+| family_edge_maxlen (128)| e173 PASS                | e173 PASS                    |
+
+**10/10 cells PASS**; 2,099,712 password-digest verifications byte-exact vs the CPU oracle across both backends.
+
+## Sub-phase 5b.2b — TIGERMD5PASS (e171) GPU acceleration
+
+`tiger_block` (Tiger/192, Anderson + Biham 1996) is now resident in the shared GPU helper sources as a 3-ulong state primitive with 8 KB of `__constant` S-box tables (4 × 256 ulong). Combined with Whirlpool's 16 KB the total Tier 2 constant memory footprint is ~24 KB; comfortable headroom remains on both Pascal and Apple Silicon. The donor implementation is `RHash-master/librhash/tiger.c` (Aleksey Kravchenko, 2007-2012) and its companion S-box `RHash-master/librhash/tiger_sbox.c`; pre-flight R12 cross-verification against `sph_tiger` from libsph (mdxfind's CPU oracle) confirmed both donors agree byte-for-byte on all 7 published NESSIE test vectors plus the 1-million-`a` stress vector (`codegen/tests/test_tiger_nessie.c` rev 1.1, 16/16 cells PASS).
+
+A bespoke per-primitive emit helper `emit_outer_tiger_concat_then_hash` (and its Metal twin) is added to the codegen pipeline. Tiger's structural divergence from both SHA-512 and Whirlpool is intrinsic: LE schedule (M packed lo-byte-first, matching MD-family convention; the opposite of Whirlpool/SHA-2 BE), 8-byte LE length suffix at M[7] only, padding byte `0x01` (legacy Tiger, NOT Tiger2's `0x80`), Tiger initial chaining value (`0x0123456789abcdef`, `0xfedcba9876543210`, `0xf096a5b4c3b2e187`), and a single-block fast path that IS applicable for short passwords (threshold `32 + plen + 1 + 8 <= 64` holds for `plen <= 23`). The state output is the direct LE-uint split from `state[0..1]` — no byte-swap epilogue is needed because Tiger's spec output is LE state direct. The 3-pass round structure (pass1 mul 5 → KeySchedule → pass2 mul 7 with rotated arg order (c, a, b) → KeySchedule → pass3 mul 9 with (b, c, a)) is transcribed verbatim from the donor source, with explicit line-number citations at each pass boundary.
+
+### Validation matrix (Tiger ship)
+
+| Fixture / Backend       | OpenCL (Pascal GTX 1080) | Metal (Apple Silicon M2 Max) |
+|-------------------------|--------------------------|------------------------------|
+| family_smoke (8)        | e171 PASS                | e171 PASS                    |
+| family_medium (1,024)   | e171 PASS                | e171 PASS                    |
+| family_large (1,048,576)| e171 PASS                | e171 PASS                    |
+| family_edge_minlen (128)| e171 PASS                | e171 PASS                    |
+| family_edge_maxlen (128)| e171 PASS                | e171 PASS                    |
+
+**10/10 cells PASS**; 2,099,728 password-digest verifications byte-exact vs the CPU oracle across both backends. Pascal large fixture (1,048,576) walltime = 1s (~1M verifications/s; Tiger is roughly 4-5× faster than Whirlpool on Pascal due to fewer rounds and smaller S-box footprint). Apple Silicon M2 Max large fixture walltime = sub-second.
+
+## Aggregate Phase 5a + Tier 1 + Tier 2 regression
+
+11 GPU-eligible MAKE_MD5PASS family members (`e120`, `e122`, `e157`, `e159`, `e161`, `e163`, `e165`, `e167`, `e169`, `e171`, `e173`) × 5 fixtures (smoke, medium, large, edge_minlen, edge_maxlen) × 2 backends (OpenCL on Pascal GTX 1080, Metal on Apple Silicon M2 Max): **110/110 cells PASS**, ~23 million password-digest verifications byte-exact. Phase 4 e347 production-dispatcher regression: **4/4 cells PASS** (smoke + large × OpenCL + Metal); Tier 2 does not perturb the e347 codegen path.
+
+## `mdxfind -h` GPU tag display now predicate-based
+
+The `[GPU]` suffix on the `mdxfind -h` hash-type listing is now driven by a single composite predicate (`gpu_op_advertise_for_h_listing`) that ORs the actual runtime GPU admit predicates instead of a hand-maintained if-chain of JOB literals. The composite predicate currently calls (1) a linear scan of the `gpu_ops[]` legacy template-path table, (2) an explicit `JOB_MD5MD5SALT` (e347) check covering the Phase 4 codegen production path, and (3) `gpu_codegen_kernelb_family_md5pass_eligible()` covering the Phase 5a/5b MAKE_MD5PASS family. Prior to this release the if-chain had drifted out of sync with the runtime path: the 12 codegen-eligible algorithms shipped in v1.502 and v1.504/v1.505 (`e120`, `e122`, `e157`, `e159`, `e161`, `e163`, `e165`, `e167`, `e169`, `e171`, `e173`, `e347`) were silently un-tagged in the `-h` listing despite being live on the runtime GPU dispatch path. Post-change the listing emits 90 `[GPU]` tags on the OpenCL build (was 78); all 78 pre-existing tags preserved byte-identically. Future Tier 3 and Tier 4 family ships (haval × 15, gost, gost_crypto, sne128, sne256 outer primitives) will auto-update the listing once the family eligibility predicate widens — no further edits to the listing site are needed.
+
+---
+
 # mdxfind v1.504 — Phase 5b Tier 1: MD2 / RMD128 MAKE_MD5PASS family GPU acceleration + RIPEMD-128 / RIPEMD-160 standard-conformance bug fix
 
 Source: mdxfind.c rev 1.507, rmd128.c rev 1.1 (NEW; bug fix), rmd160.c rev 1.1 (NEW; bug fix), gpu/gpu_common.cl rev 1.27, gpu/gpu_common_str.h rev 1.19, gpu/metal_common.metal rev 1.26, gpu/metal_common_str.h rev 1.5, gpu/gpu_codegen_eligible.c rev 1.3, codegen/hx_emit_primitives.c rev 1.3, codegen/hx_emit_opencl.c rev 1.11, codegen/hx_emit_metal.c rev 1.10, codegen/tests/run_validation_family_md5pass.sh rev 1.4, codegen/tests/family_md5pass/e120_smoke.txt rev 1.1 (NEW 5b.1a), codegen/tests/family_md5pass/e157_smoke.txt rev 1.1 (NEW 5b.1b), codegen/tests/test_rmd128_bosselaers.c rev 1.1 (NEW; regression), codegen/tests/test_rmd160_bosselaers.c rev 1.1 (NEW; regression).

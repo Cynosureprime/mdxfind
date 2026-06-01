@@ -191,6 +191,13 @@ int gpu_opencl_kernel_a_active_variant(void);
  * settings rather than silently switching behavior. */
 int gpu_opencl_hx_codegen_enabled(void);
 
+/* gpu_experiment_rules_codegen_md5_enabled REMOVED 2026-05-31 per
+ * project_codegen_auto_dispatch_spec_2026-05-31.md (D1.c). The
+ * user-visible MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 env flag is
+ * RETIRED; the dispatcher now consults gpu/codegen_auto_dispatch.c
+ * per (op, iter, rules, mask, bf, backend_kind). Developer FORCE
+ * override: MDXFIND_GPU_BACKEND={auto|legacy|codegen}. */
+
 /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only) top-level
  * dispatch entry. Mirrors gpu_opencl_kernelb_dispatch_proto shape but
  * routes to cand_masks_phase0 instead of cand_rules_phase0 + kernel B.

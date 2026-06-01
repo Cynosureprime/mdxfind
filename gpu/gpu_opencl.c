@@ -1013,10 +1013,15 @@ struct gpu_device {
      *
      * Sub-phase 5a.2 (2026-05-22): legacy single-program fields retained
      * for ABI continuity but the active path is the per-JOB slot map
-     * `hx_codegen_slots[16]` below. The legacy fields now alias slot[0]
+     * `hx_codegen_slots[64]` below. The legacy fields now alias slot[0]
      * by convention when the lazy-init helper populates them for
      * JOB_MD5MD5SALT. New JOBs (e161 etc.) use the slot map exclusively.
-     * 5b bumps the slot cap to 64 when more family members ship.
+     *
+     * Sub-phase 5b.3a.0.2 (2026-05-27): slot cap bumped 16 -> 64 to
+     * accommodate the Tier 3 HAVAL ship (15 new family members).
+     * Post-Tier-3 active codegen entry count = 11 prior + 15 HAV + e347
+     * = 27, comfortably below the new 64 cap; headroom carries through
+     * Tier 4 (Snefru x2 + GOST) to 30 entries.
      */
     cl_program prog_kernel_b_codegen;     /* legacy: kernelb_hx_e347_phase0 program (5a.5: retire) */
     cl_kernel  kern_kernel_b_codegen;     /* legacy: extracted kernelb_hx_e347_phase0 (5a.5: retire) */
@@ -1024,7 +1029,7 @@ struct gpu_device {
         int        job_enum;   /* 0 = empty slot */
         cl_program prog;
         cl_kernel  kern;
-    } hx_codegen_slots[16];
+    } hx_codegen_slots[64];
     /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 mask wire-format buffers.
      * Sized fixed (see Phase 4-5 spec §5 + project_kernel_a_a2_masks_spec_-
      * 2026-05-20.md), allocated lazily on the first A2 dispatch with non-
@@ -1070,6 +1075,29 @@ struct gpu_device {
     size_t     h_proto_packed_readback_cap; /* allocated bytes */
     void      *h_proto_index_readback;      /* host copy of b_proto_chunk_index post-kernel-A */
     size_t     h_proto_index_readback_cap;  /* allocated bytes */
+
+    /* RULE-AXIS CHUNKING (Option A, 2026-05-29). cand_cap_bytes: the
+     * per-dispatch candidate-buffer cap for the codegen proto path, computed
+     * once per device from CL_DEVICE_GLOBAL_MEM_SIZE (or MDXFIND_GPU_CAND_CAP_MB)
+     * and cached. 0 = not yet computed (lazy init on first proto dispatch). */
+    size_t     cand_cap_bytes;              /* per-dispatch candidate-buffer cap (0 = uncomputed) */
+
+    /* SHAPE-2 resolved-plaintext arena for multi-chunk proto dispatch. When a
+     * rules+codegen dispatch spans >1 rule chunk, each chunk's candidate buffer
+     * is reused (clobbered by the next chunk's kernel A), so the host MUST
+     * resolve every hit's plaintext into this chunk-independent arena BEFORE the
+     * next chunk runs. Keyed by a GLOBAL hit ordinal (not the per-chunk slot):
+     * h_proto_resolved_off[G] -> byte offset of hit G's [len][bytes] record in
+     * h_proto_resolved_buf. The accessor (gpu_opencl_kernelb_proto_plaintext)
+     * reads from here when proto_resolved_active is set; single-chunk (e347)
+     * dispatch leaves it 0 and uses the legacy h_proto_index/packed path. Grown
+     * lazily; only written for actual hits (rare) so real memory is tiny. */
+    uint8_t   *h_proto_resolved_buf;        /* arena: packed [len][bytes] per global hit ordinal */
+    size_t     h_proto_resolved_buf_cap;    /* allocated bytes */
+    size_t     h_proto_resolved_buf_used;   /* bytes written so far this dispatch */
+    uint32_t  *h_proto_resolved_off;        /* [G] -> byte offset into h_proto_resolved_buf */
+    size_t     h_proto_resolved_off_cap;    /* allocated entries */
+    int        proto_resolved_active;       /* 1 = accessor uses the arena (multi-chunk mode) */
 };
 
 static struct gpu_device gpu_devs[MAX_GPU_DEVICES];
@@ -2740,6 +2768,28 @@ static int init_device(int di, cl_device_id dev_id) {
             qprops |= CL_QUEUE_PROFILING_ENABLE;
             if (di == 0) GPU_DEBUG_FPRINTF(stderr,
                 "OpenCL: dispatch-trace profiling enabled (MDXFIND_DISPATCH_TRACE=%s) — per-stage [disp] fields emitted on proto path\n", e);
+        }
+    }
+    /* PROFILE_VARIANT-for-A4 (2026-05-30, architect spec project_kernel_-
+     * a_a4_profile_variant_spec_2026-05-30.md D5.a): the A4 standalone
+     * dispatcher records kernel_a4_us via cl_event profiling, which
+     * requires the queue to be CL_QUEUE_PROFILING_ENABLE. Auto-enable
+     * whenever the A4 PROFILE_VARIANT env var is set (any value) so
+     * the operator only needs ONE env flag for the common decomp run.
+     * Direct check on getenv (not via the accessor) to avoid host-gate
+     * recursion at queue-creation time -- queue lives across all dispatch
+     * variants, doesn't matter if VARIANT != 4 at this point. */
+    {
+        const char *e = getenv("MDXFIND_KERNEL_A4_PROFILE_VARIANT");
+        if (e && *e) {
+            /* Auto-enable profiling whenever env is SET (including
+             * "0") so the operator can collect the V0 baseline using
+             * the same dispatcher path that V1..V5 use. Per spec D5.a
+             * matching gate semantics with the dispatcher-side
+             * timing accumulator. */
+            qprops |= CL_QUEUE_PROFILING_ENABLE;
+            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
+                "OpenCL: A4 PROFILE_VARIANT timing enabled (MDXFIND_KERNEL_A4_PROFILE_VARIANT=%s) -- per-dispatch [ocl-kA4] line emitted from A4 dispatcher\n", e);
         }
     }
     d->queue = clCreateCommandQueue(d->ctx, dev_id, qprops, &err);
@@ -10596,6 +10646,51 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
  * wanted in the future, add fresh fields and probe
  * kern_kernel_b_codegen inside gpu_opencl_kernelb_codegen_kernel. */
 
+/* Forward declarations for the env-flag accessors defined later in this
+ * TU (the build path below consumes the PROFILE_VARIANT + Knob G flags
+ * at JIT time; the accessors are grouped with the other experiment
+ * gates near the dispatch site for code-locality).
+ *
+ * 2026-05-31 (auto-dispatch): the prior gpu_experiment_rules_codegen_-
+ * md5_enabled() accessor was RETIRED -- the dispatcher now consults
+ * gpu/codegen_auto_dispatch.c per (op, iter, rules, mask, bf). The
+ * developer-only PROFILE_VARIANT + Knob G env flags below still exist
+ * (perf-decomp tooling, not user-facing); they now compose with
+ * MDXFIND_GPU_BACKEND=codegen instead of the old env flag. */
+
+/* PROFILE_VARIANT env accessor (2026-05-29 perf decomposition). Returns
+ * 0..6 if MDXFIND_PROFILE_VARIANT is set to 0/1/2/3/4/5/6; returns 0 (no
+ * variant, byte-identical baseline) if unset or value out of range.
+ * Composes with MDXFIND_GPU_BACKEND=codegen (developer FORCE override);
+ * if force not codegen, PROFILE_VARIANT is a no-op. Decision cached on
+ * first call. V6 (added 2026-05-29 with Knob G) = V0 baseline + Knob G
+ * vectorized uint4 candidate write loop forced ON (regardless of
+ * KNOBG_VEC_WRITE); closes the V0-vs-V6 prediction-verification loop
+ * for Knob G. */
+int gpu_experiment_rules_codegen_profile_variant(void);
+
+/* KNOB G env accessor (2026-05-29 perf experiment). Returns 1 ONLY when
+ * BOTH MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 and developer
+ * FORCE override MDXFIND_GPU_BACKEND=codegen are set; returns 0
+ * otherwise. Decision cached on first call. Threaded into kernel A1
+ * JIT build options as -DKNOBG_VEC_WRITE=1 and into the cache key as
+ * ",KNOBG_VEC_WRITE=1". */
+int gpu_experiment_rules_codegen_vec_write_enabled(void);
+
+/* Internal helper: returns 1 iff MDXFIND_GPU_BACKEND=codegen (developer
+ * FORCE override). Used by PROFILE_VARIANT + Knob G composition checks
+ * below to gate the developer-only stubs to codegen-route runs only.
+ * Replaces the historical gpu_experiment_rules_codegen_md5_enabled()
+ * parent gate. Per project_codegen_auto_dispatch_spec_2026-05-31.md
+ * §15 open-question recommendation: "leave PROFILE_VARIANT's parent-
+ * check as-is and document that PROFILE_VARIANT now implicitly
+ * requires MDXFIND_GPU_BACKEND=codegen to compose." */
+static int _gpu_backend_force_codegen(void)
+{
+    const char *e = getenv("MDXFIND_GPU_BACKEND");
+    return (e && !strcmp(e, "codegen")) ? 1 : 0;
+}
+
 /* Deliverable 2: Lazy-build the kernel A1 (cand_rules_phase0) program.
  *
  * Phase 4 sub-phase 4a.3 (2026-05-22): the kernel B build half was
@@ -10621,12 +10716,43 @@ static int gpu_opencl_kernelb_build_prog(struct gpu_device *d, int dev_idx)
             gpu_common_str,
             gpu_kernel_a_rules_str   /* Phase 1a A1: renamed source */
         };
-        /* Cache key disambiguates from all existing entries via KERNEL_A_VARIANT=1
-         * (Phase 1a; supersedes KERNELB_PROTO=A from the prototype). */
+        int knobg = gpu_experiment_rules_codegen_vec_write_enabled();
+        int pvariant = gpu_experiment_rules_codegen_profile_variant();
+        char opts_buf[320];
+        char key_buf[320];
+        /* Build-options precedence:
+         *   1. PROFILE_VARIANT=N (diagnostic; takes precedence)
+         *   2. KNOB G (uint4 coalesced candidate writes)
+         *   3. baseline (legacy byte-identical to gpu_kernel_a_rules.cl rev 1.6)
+         */
+        if (pvariant > 0) {
+            /* PROFILE_VARIANT path: V1..V5 are timing-only stubs that leave
+             * b_kernelA_state at zero so host-side actual_slots=0 makes
+             * kernel B a no-op. V6 (the Knob G micro-benchmark variant)
+             * DOES produce valid candidates and tests Knob G's vectorized
+             * write loop -- see kernel source. */
+            snprintf(opts_buf, sizeof(opts_buf),
+                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1 -DPROFILE_VARIANT=%d",
+                pvariant);
+            snprintf(key_buf, sizeof(key_buf),
+                "KERNEL_A_VARIANT=1,PROFILE_VARIANT=%d", pvariant);
+        } else if (knobg) {
+            snprintf(opts_buf, sizeof(opts_buf),
+                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1 "
+                "-DKNOBG_VEC_WRITE=1");
+            snprintf(key_buf, sizeof(key_buf),
+                "KERNEL_A_VARIANT=1,KNOBG_VEC_WRITE=1");
+        } else {
+            snprintf(opts_buf, sizeof(opts_buf),
+                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1");
+            snprintf(key_buf, sizeof(key_buf),
+                "KERNEL_A_VARIANT=1");
+        }
+        const char *opts = opts_buf;
+        const char *key  = key_buf;
         d->prog_kernel_a = gpu_kernel_cache_build_program_ex(
             d->ctx, d->dev, 2, sources_a,
-            "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1",
-            "KERNEL_A_VARIANT=1", &err);
+            opts, key, &err);
         if (!d->prog_kernel_a || err != CL_SUCCESS) {
             char log[8192] = {0};
             if (d->prog_kernel_a)
@@ -10859,6 +10985,261 @@ int gpu_opencl_hx_codegen_enabled(void)
     return 1;
 }
 
+/* gpu_experiment_rules_codegen_md5_enabled REMOVED 2026-05-31 by
+ * project_codegen_auto_dispatch_spec_2026-05-31.md (D1.c: retire user-
+ * visible env flag entirely; add MDXFIND_GPU_BACKEND={auto|legacy|
+ * codegen} as developer/test FORCE override; preserve a 1-version
+ * deprecation WARNING shim for MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5).
+ *
+ * The auto-dispatcher (gpu/codegen_auto_dispatch.c) replaces this
+ * accessor at the route gate (gpu/gpujob_opencl.c) AND at the proto
+ * dispatcher admission predicate (further down this file). The
+ * deprecation shim is in codegen_auto_dispatch_deprecation_check(),
+ * invoked automatically on first codegen_auto_dispatch_pick() call.
+ *
+ * PROFILE_VARIANT + Knob G composition (below) now uses the
+ * static _gpu_backend_force_codegen() helper above. */
+
+/* gpu_experiment_rules_codegen_profile_variant — perf decomposition
+ * env-flag gate (2026-05-29). Returns the variant number 1..5 when
+ * MDXFIND_PROFILE_VARIANT is set to a valid value AND the developer
+ * FORCE override MDXFIND_GPU_BACKEND=codegen is set; returns 0
+ * otherwise (legacy byte-identical baseline V0).
+ *
+ * Variant meanings (also documented in gpu_kernel_a_rules.cl):
+ *   V0 (unset / 0)  baseline — full cand_rules_phase0
+ *   V1               no atomic claim (per-lane gid*256 offsets, write happens)
+ *   V2               no candidate write (atomic happens, byte loop omitted)
+ *   V3               stub apply_rule (returns wlen; walker walks but switch gone)
+ *   V4               walker-only (read word into buf, then return; no apply_rule)
+ *   V5               empty kernel (return immediately; dispatch overhead only)
+ *   V6 (2026-05-29)  V0 + Knob G vectorized uint4 write loop FORCED ON
+ *                    (D4 in knob_g_spec). Unlike V1..V5, V6 PRODUCES VALID
+ *                    CANDIDATES (kernel B runs normally; crack output is
+ *                    bit-equivalent to V0+KNOBG_VEC_WRITE=1). The V0-vs-V6
+ *                    kernel_a_us delta is the empirical per-byte-write-
+ *                    component reduction attributable to Knob G.
+ *
+ * For variants V1..V5 the kernel A leaves b_kernelA_state at zero
+ * (no slot_counter/byte_counter writes), so the host site
+ * gpu_opencl_kernelb_dispatch_proto_chunked's
+ *   `if (actual_slots == 0) continue;`
+ * already-existing gate makes kernel B a no-op for the chunk. kernel_a_us
+ * is captured by the per-chunk CL profiling event BEFORE the kernel-B
+ * skip, so the V0-vs-VN delta in kernel_a_us attributes the per-component
+ * cost share. V6 is the exception: it DOES set the counters and produces
+ * valid candidates; the V0-vs-V6 delta measures only the per-byte-write-
+ * loop component (the rest of kernel A is identical).
+ *
+ * Crack-parity is INTENTIONALLY NOT preserved by V1..V5 (timing stubs);
+ * V6 DOES preserve crack-parity (it is the Knob G implementation under
+ * a different selector). Production e347 path
+ * (op = JOB_MD5MD5SALT, not gated by the MD5 flag) is unaffected by
+ * the variant flag because PROFILE_VARIANT is only threaded into the
+ * kernel A1 build (not into the kernel B codegen or the e347 fused
+ * carrier). The JIT cache key disambiguates so different variant runs
+ * don't share a cached kernel binary.
+ *
+ * Decision cached on first call. One-shot stderr advisory when active. */
+int gpu_experiment_rules_codegen_profile_variant(void)
+{
+    static int _cached = -2;
+    if (_cached != -2) return _cached;
+    const char *e = getenv("MDXFIND_PROFILE_VARIANT");
+    int n = 0;
+    /* Range extended 2026-05-29 from 0..5 to 0..6: V6 added for Knob G
+     * micro-benchmark (V0 baseline + Knob G vectorized write loop ON;
+     * produces VALID candidates -- kernel B runs normally). */
+    if (e && e[0] >= '0' && e[0] <= '6' && e[1] == '\0') {
+        n = e[0] - '0';
+    }
+    /* Composition: only active when developer FORCE override has put
+     * the codegen path on the route gate. Auto-dispatch (2026-05-31)
+     * retired the parent env flag; PROFILE_VARIANT now composes with
+     * MDXFIND_GPU_BACKEND=codegen explicitly (per spec §15 open-
+     * question recommendation: simpler parent semantic, preserves the
+     * developer mental model: "variant stubs are meaningful only when
+     * codegen is the active path"). */
+    if (n > 0 && !_gpu_backend_force_codegen()) {
+        fprintf(stderr,
+            "OpenCL: NOTICE -- MDXFIND_PROFILE_VARIANT=%d is set but "
+            "MDXFIND_GPU_BACKEND is not 'codegen' -- variant is a "
+            "no-op outside a force-codegen route. Set BOTH "
+            "MDXFIND_GPU_BACKEND=codegen and MDXFIND_PROFILE_VARIANT=%d "
+            "to enable profile-variant stubs.\n", n, n);
+        _cached = 0;
+        return _cached;
+    }
+    _cached = n;
+    if (_cached > 0 && _cached < 6) {
+        fprintf(stderr,
+            "OpenCL: EXPERIMENT MDXFIND_PROFILE_VARIANT=%d — kernel A1 "
+            "(cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=%d. "
+            "STUB BUILD: kernel A produces NO valid candidates; host "
+            "actual_slots=0 makes kernel B a no-op. Crack count will be "
+            "ZERO. Use for kernel_a_us timing attribution only. "
+            "MDXFIND_DISPATCH_TRACE=1 emits per-chunk kernel_a_us; the "
+            "V0-vs-VN delta is the variant's attributed share.\n",
+            _cached, _cached);
+    } else if (_cached == 6) {
+        fprintf(stderr,
+            "OpenCL: EXPERIMENT MDXFIND_PROFILE_VARIANT=6 — kernel A1 "
+            "(cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=6 "
+            "(Knob G micro-benchmark variant). REAL CANDIDATES produced "
+            "with uint4 vectorized write loop FORCED ON (regardless of "
+            "MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE). Crack output "
+            "is bit-equivalent to V0+KNOBG_VEC_WRITE=1. The V0-vs-V6 "
+            "kernel_a_us delta isolates the per-byte-write component.\n");
+    }
+    return _cached;
+}
+
+/* gpu_opencl_kernel_a4_profile_variant — A4 (brute-force engine) PROFILE_-
+ * VARIANT env-flag gate (2026-05-30, architect spec project_kernel_a_-
+ * a4_profile_variant_spec_2026-05-30.md).
+ *
+ * Returns the variant number 1..5 when MDXFIND_KERNEL_A4_PROFILE_VARIANT
+ * is set to a valid value AND the active kernel-A variant is 4 (host
+ * gate R5; per-engine env vars are NOT cross-engine pollutable). Returns
+ * 0 otherwise (legacy byte-identical baseline V0 = production unchanged).
+ *
+ * Variant meanings (also documented at gpu_kernel_a_bruteforce.cl
+ * file-top A4_PROFILE_VARIANT block):
+ *   V0 (unset / 0)  baseline -- full cand_bruteforce_phase0 (uint4
+ *                    stores by default post-2026-05-30 A4 C5 default-on
+ *                    refactor; the env-gated KNOBG path + V6 cell were
+ *                    removed because the A/B measurement was decisive)
+ *   V1               no atomic claim (per-lane gid*256 strided offsets;
+ *                    write happens) -- CONFOUNDED on NVIDIA/AGX/RDNA
+ *                    per spec §9 R1 (atomic-coalescing-coupling)
+ *   V2               no candidate write (atomic still runs; byte-loop
+ *                    omitted)
+ *   V3               stub charset walk (mask_expand_run_into_gpu returns
+ *                    fixed-length 'A'-fill) -- EXPECTED A4 DOMINANT;
+ *                    V0-V3 = charset-walk (C3) cost share
+ *   V4               decode-only (return after absolute_mask_idx ladder)
+ *   V5               empty kernel (return immediately)
+ *
+ * Per spec §4 D1.a: separate env var from A1's MDXFIND_PROFILE_VARIANT
+ * (cross-engine pollution avoidance; allows running A1 + A4 in same
+ * process with different variants if desired). Macro name in the
+ * kernel is A4_PROFILE_VARIANT (distinct from A1's PROFILE_VARIANT)
+ * for JIT-context coexistence.
+ *
+ * Per spec §4 D1.a / §9 R5: HOST GATE returns 0 if KERNEL_A_VARIANT !=
+ * 4 (the env var is set but A4 isn't dispatching, so JIT-baking the
+ * variant into an unused program is silent waste). Diagnose via one-
+ * shot advisory.
+ *
+ * For variants V1..V5 the kernel A4 leaves b_kernelA_state.slot_counter
+ * at zero (V1/V3/V4/V5 never reach the atomic; V2 keeps the atomic but
+ * the slot_counter is intentionally not bumped). Host actual_slots == 0
+ * causes the harness-mode return path to short-circuit. Crack-parity
+ * is INTENTIONALLY NOT preserved by V1..V5 -- timing-only stubs.
+ *
+ * Decision cached on first call. One-shot stderr advisory when active. */
+int gpu_opencl_kernel_a4_profile_variant(void);
+int gpu_opencl_kernel_a4_profile_variant(void)
+{
+    static int _cached = -2;
+    if (_cached != -2) return _cached;
+    const char *e = getenv("MDXFIND_KERNEL_A4_PROFILE_VARIANT");
+    int n = 0;
+    if (e && e[0] >= '0' && e[0] <= '5' && e[1] == '\0') {
+        n = e[0] - '0';
+    } else if (e && e[0] != '\0') {
+        fprintf(stderr,
+            "OpenCL: NOTICE -- MDXFIND_KERNEL_A4_PROFILE_VARIANT=%s "
+            "invalid (expected 0..5; V6 was removed by the 2026-05-30 "
+            "A4 C5 default-on refactor -- uint4 stores are now the V0 "
+            "production path); falling back to 0 / production.\n",
+            e);
+        _cached = 0;
+        return _cached;
+    }
+    /* R5 host gate: PROFILE_VARIANT-for-A4 only active when
+     * KERNEL_A_VARIANT=4 is the active engine. */
+    if (n > 0 && gpu_opencl_kernel_a_active_variant() != 4) {
+        fprintf(stderr,
+            "OpenCL: NOTICE -- MDXFIND_KERNEL_A4_PROFILE_VARIANT=%d "
+            "requires MDXFIND_KERNEL_A_VARIANT=4; falling through to "
+            "baseline.\n", n);
+        _cached = 0;
+        return _cached;
+    }
+    _cached = n;
+    if (_cached >= 1 && _cached <= 5) {
+        fprintf(stderr,
+            "OpenCL: EXPERIMENT MDXFIND_KERNEL_A4_PROFILE_VARIANT=%d -- "
+            "kernel A4 (cand_bruteforce_phase0) JIT-built with "
+            "-DA4_PROFILE_VARIANT=%d. STUB BUILD: A4 produces NO valid "
+            "candidates (harness short-circuits on actual_slots=0). Use "
+            "for kernel_a4_us timing attribution only. Per-dispatch "
+            "[ocl-kA4] line emitted when active; shutdown-time AGGREGATE "
+            "dumped to stderr.\n",
+            _cached, _cached);
+    }
+    return _cached;
+}
+
+/* gpu_experiment_rules_codegen_vec_write_enabled — Knob G env-flag gate
+ * (2026-05-29, kernel-A coalesced uint4 candidate write experiment).
+ *
+ * Returns 1 ONLY when ALL of:
+ *   MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1   AND
+ *   MDXFIND_GPU_BACKEND=codegen   (developer FORCE override; auto-
+ *     dispatch retirement of the parent flag, 2026-05-31)
+ * are set. UNSET (or set to anything other than "1" / "codegen") =
+ * legacy per-byte write loop in cand_rules_phase0 — byte-identical
+ * to the chunked-codegen baseline shipped in #343 / gpu_opencl.c
+ * 1.200.
+ *
+ * Composition is intentional: Knob G is meaningful only when codegen
+ * is active. Outside a force-codegen route (production e347 path
+ * uses codegen but is not gated by either flag) the VEC_WRITE flag is
+ * a no-op. We do NOT want a user who sets VEC_WRITE=1 by itself
+ * (forgetting the FORCE override) to think they enabled anything.
+ *
+ * Decision cached on first call. One-shot stderr advisory when active.
+ *
+ * Consumed by gpu_opencl_kernelb_build_prog (this TU) to (a) thread
+ * -DKNOBG_VEC_WRITE=1 into the kernel A1 clBuildProgram options, and
+ * (b) disambiguate the JIT cache key. */
+int gpu_experiment_rules_codegen_vec_write_enabled(void)
+{
+    static int _cached = -1;
+    if (_cached != -1) return _cached;
+    const char *e = getenv("MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE");
+    int local_set = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    /* Composition: only active when developer FORCE override has put
+     * the codegen path on the route gate. Auto-dispatch (2026-05-31)
+     * retired the parent env flag; Knob G now composes with
+     * MDXFIND_GPU_BACKEND=codegen explicitly. */
+    _cached = (local_set && _gpu_backend_force_codegen()) ? 1 : 0;
+    if (_cached) {
+        fprintf(stderr,
+            "OpenCL: EXPERIMENT MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 "
+            "(Knob G) -- kernel A1 (cand_rules_phase0) JIT-built with "
+            "-DKNOBG_VEC_WRITE=1; per-byte candidate write loop replaced "
+            "with uint4 (16-byte) stores from a private 16-aligned staging "
+            "buffer; per-slot byte claim rounded up to a 16-byte multiple. "
+            "Crack set unchanged (consumer reads only plen bytes; pad never "
+            "accessed). Avg per-slot padding cost ~3.8 B (rockyou-1m); "
+            "bounded by per-chunk cap.\n");
+    } else if (local_set) {
+        /* User set VEC_WRITE=1 but forgot MDXFIND_GPU_BACKEND=codegen.
+         * Make this loud so they know nothing happened. */
+        fprintf(stderr,
+            "OpenCL: NOTICE -- MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 "
+            "is set but MDXFIND_GPU_BACKEND is not 'codegen' -- Knob G "
+            "is a no-op outside a force-codegen route. Set BOTH "
+            "MDXFIND_GPU_BACKEND=codegen and "
+            "MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 to enable "
+            "Knob G.\n");
+    }
+    return _cached;
+}
+
 /* gpu_opencl_kernel_a_trace_dump — Phase 1a A1 buffer-quadruple trace.
  *
  * Writes the post-kernel-A buffer quadruple to disk for harness
@@ -11009,17 +11390,20 @@ static int gpu_opencl_kernel_a2_build_prog(struct gpu_device *d, int dev_idx)
 }
 
 /* gpu_opencl_kernel_a_upload_mask_buffers -- one-shot lazy mask wire
- * upload. Called from the A2 dispatcher on first invocation per device
- * with non-zero MaskPrependLen+MaskAppendLen. Allocates four cl_mem
- * buffers (total < 5 KB), composes host staging arrays from the CPU
- * mask globals, encodes MASK_LITERAL (-1) as 0xff per D9.2.a, and
- * uploads with CL_TRUE.
+ * upload. Called from the A2/A3/A4 dispatchers on first invocation per
+ * device when gpu_kern_a_mask_eligible is set.
+ *
+ * 2026-05-30 long-mask amendment (D1.b Design Y): mask_pattern_prepend
+ * and mask_pattern_append are now run-descriptor streams sized
+ * GPU_MASK_DESC_BYTES_CAP (320 B) each. The host descriptor packing
+ * happens in mdxfind.c (gpu_pack_mask_descriptor); the packed buffers
+ * are exposed via globals (gpu_kern_a_prep_desc / gpu_kern_a_app_desc
+ * / gpu_kern_a_prep_dlen / gpu_kern_a_app_dlen). This helper simply
+ * uploads them verbatim.
  *
  * Idempotent: returns 0 immediately on subsequent calls after a
  * successful first upload. NO re-upload when masks change at runtime;
- * the v1 spec scope is one mask configuration per process invocation
- * (no -n/-N reconfiguration mid-run). Re-uploading would require
- * tracking pattern hash; deferred to chunking / sub-phase 1a.2.x.
+ * the v1 spec scope is one mask configuration per process invocation.
  *
  * Per feedback_external_failures_are_fatal.md: FATAL on any cl error;
  * NEVER returns -1 with partial state. */
@@ -11028,18 +11412,9 @@ static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev
     if (d->b_kern_a_mask_allocated) return 0;
 
     cl_int err = CL_SUCCESS;
-    /* 2026-05-26: GPU per-side cap is 16 (MAX_MASK_POS_GPU_SIDE in
-     * mdxfind.c) -- the kernel A2 private scratch is uchar[16] and the
-     * template kernel internally clamps n_prepend/n_append to 16. The
-     * cl_mem buffer + host staging arrays stay sized at 32 bytes
-     * (16 positions * 2 bytes) regardless of MAX_MASK_POS_CPU (256 on
-     * CPU side). The mdxfind.c upload guards refuse the upload entirely
-     * when MaskPrependLen or MaskAppendLen exceeds 16, so this site
-     * never sees a longer mask in practice; iterating with the
-     * MIN(MaskPrependLen, KERN_A_PATTERN_LEN_CAP) bound below stays
-     * defensive. */
-    const size_t KERN_A_PATTERN_LEN_CAP = 16u;
-    const size_t pattern_bytes  = KERN_A_PATTERN_LEN_CAP * 2u;            /* 32 */
+    /* 2026-05-30 amendment: persistent per-side descriptor buffer is
+     * 320 B (GPU_MASK_DESC_BYTES_CAP). Charsets + counts unchanged. */
+    const size_t pattern_bytes  = 320u;                                   /* GPU_MASK_DESC_BYTES_CAP */
     const size_t charsets_bytes = (size_t)MASK_MAX_CLASSES_CPU * 256u;    /* 4096 */
     const size_t counts_bytes   = (size_t)MASK_MAX_CLASSES_CPU * sizeof(uint32_t); /* 64 */
 
@@ -11078,33 +11453,38 @@ static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev
         exit(1);
     }
 
-    /* Compose host staging arrays. 32-byte wire format (16 positions *
-     * 2 bytes) is fixed by the kernel A2 signature; iteration is bounded
-     * by KERN_A_PATTERN_LEN_CAP. */
-    unsigned char prepend_wire[16 * 2];
-    unsigned char append_wire[16 * 2];
+    /* 2026-05-30 amendment: descriptor streams come from the global
+     * staging buffers populated by gpu_pack_mask_descriptor() in
+     * mdxfind.c. The host already validated eligibility (per-side var
+     * count <= 16 AND lit_bytes <= 224). We zero-fill the 320 B buffer
+     * tails so any stale bytes past dlen are safe to read (the kernel
+     * walker terminates on END_TAG (0xFF) or desc_bytes exhaustion). */
+    extern unsigned char gpu_kern_a_prep_desc[];
+    extern unsigned char gpu_kern_a_app_desc [];
+    extern int           gpu_kern_a_prep_dlen;
+    extern int           gpu_kern_a_app_dlen;
+
+    unsigned char prepend_wire[320];
+    unsigned char append_wire[320];
     unsigned char charsets_flat[MASK_MAX_CLASSES_CPU * 256];
     uint32_t      counts_flat[MASK_MAX_CLASSES_CPU];
-    memset(prepend_wire,  0, sizeof(prepend_wire));
-    memset(append_wire,   0, sizeof(append_wire));
+    memset(prepend_wire,  0xFF, sizeof(prepend_wire));  /* END-tag fill */
+    memset(append_wire,   0xFF, sizeof(append_wire));
     memset(charsets_flat, 0, sizeof(charsets_flat));
     memset(counts_flat,   0, sizeof(counts_flat));
 
-    /* D9.2.a: encode classid -1 as byte 0xff. */
-    for (int i = 0; i < MaskPrependLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
-        int cid = MaskPrependPattern[i].classid;
-        prepend_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
-                                  ? 0xffu
-                                  : (unsigned char)(cid & 0xff);
-        prepend_wire[i * 2 + 1] = MaskPrependPattern[i].literal;
+    if (gpu_kern_a_prep_dlen > 0 && gpu_kern_a_prep_dlen <= 320) {
+        memcpy(prepend_wire, gpu_kern_a_prep_desc, (size_t)gpu_kern_a_prep_dlen);
+    } else {
+        /* Empty side: a single END tag covers it. */
+        prepend_wire[0] = 0xFF;
     }
-    for (int i = 0; i < MaskAppendLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
-        int cid = MaskAppendPattern[i].classid;
-        append_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
-                                 ? 0xffu
-                                 : (unsigned char)(cid & 0xff);
-        append_wire[i * 2 + 1] = MaskAppendPattern[i].literal;
+    if (gpu_kern_a_app_dlen > 0 && gpu_kern_a_app_dlen <= 320) {
+        memcpy(append_wire,  gpu_kern_a_app_desc,  (size_t)gpu_kern_a_app_dlen);
+    } else {
+        append_wire[0] = 0xFF;
     }
+
     /* Flatten all 16 classes (custom classes 8..15 may be unused; their
      * count==0 leaves the slot zero, kernel skips them). */
     for (int c = 0; c < MASK_MAX_CLASSES_CPU; c++) {
@@ -11157,8 +11537,8 @@ static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev
 
     fprintf(stderr,
         "OpenCL GPU[%d]: kernel A2 mask wire-format uploaded "
-        "(prepend_len=%d append_len=%d total=%llu)\n",
-        dev_idx, MaskPrependLen, MaskAppendLen,
+        "(prep_dlen=%d app_dlen=%d total=%llu)\n",
+        dev_idx, gpu_kern_a_prep_dlen, gpu_kern_a_app_dlen,
         (unsigned long long)MaskTotal);
     return 0;
 }
@@ -11213,6 +11593,25 @@ uint32_t *gpu_opencl_kernel_a_masks_dispatch(int dev_idx,
                 (unsigned long long)MaskTotal);
         }
         return NULL;
+    }
+
+    /* 2026-05-30 amendment: A2/A3/A4 eligibility flag is computed once
+     * in mdxfind.c (gpu_avail init path) and stashed in
+     * gpu_kern_a_mask_eligible. If the mask exceeded the per-side caps
+     * (vars > 16 or lit_bytes > 224), the descriptor stream was NOT
+     * packed and we must fall back to CPU here. */
+    {
+        extern int gpu_kern_a_mask_eligible;
+        if (!gpu_kern_a_mask_eligible) {
+            static int _ineligible_warned = 0;
+            if (!_ineligible_warned) {
+                _ineligible_warned = 1;
+                fprintf(stderr,
+                    "OpenCL GPU[%d]: kernel A2 mask exceeds per-side cap; "
+                    "falling back to CPU iterator.\n", dev_idx);
+            }
+            return NULL;
+        }
     }
 
     /* R5 host-side assert: MaskTotal must fit in uint32_t for kernel A2 v1.
@@ -11314,14 +11713,20 @@ uint32_t *gpu_opencl_kernel_a_masks_dispatch(int dev_idx,
 
     /* Fill payload in host staging. */
     {
+        extern int gpu_kern_a_prep_dlen;
+        extern int gpu_kern_a_app_dlen;
         uint8_t *staging = (uint8_t *)d->h_dispatch_payload;
         OCLParams params;
         memset(&params, 0, sizeof(params));
         params.compact_mask   = _compact_mask;
         params.num_words      = num_words;
         params.num_masks      = n_masks;            /* MaskTotal */
-        params.n_prepend      = (uint32_t)MaskPrependLen;
-        params.n_append       = (uint32_t)MaskAppendLen;
+        /* 2026-05-30 amendment: n_prepend / n_append carry the
+         * run-descriptor stream BYTE LENGTH post-amendment, NOT the
+         * MaskPrependLen / MaskAppendLen position count. The kernel
+         * uses these as upper-bound safety guards inside the walker. */
+        params.n_prepend      = (uint32_t)gpu_kern_a_prep_dlen;
+        params.n_append       = (uint32_t)gpu_kern_a_app_dlen;
         params.num_rules      = 0;                  /* A2 has no rules axis */
         params.max_probe      = 256;
         params.hash_data_count = _hash_data_count;
@@ -11723,8 +12128,14 @@ uint32_t *gpu_opencl_kernel_a_rules_masks_dispatch(int dev_idx,
                                                      * (NOT +1; kernel adds +1 for
                                                      * implicit no-rule pass) */
         params.num_masks      = n_masks;            /* MaskTotal */
-        params.n_prepend      = (uint32_t)MaskPrependLen;
-        params.n_append       = (uint32_t)MaskAppendLen;
+        /* 2026-05-30 amendment: descriptor stream byte length. See
+         * gpu_kernel_a_masks.cl walker docs. */
+        {
+            extern int gpu_kern_a_prep_dlen;
+            extern int gpu_kern_a_app_dlen;
+            params.n_prepend  = (uint32_t)gpu_kern_a_prep_dlen;
+            params.n_append   = (uint32_t)gpu_kern_a_app_dlen;
+        }
         params.max_probe      = 256;
         params.hash_data_count = _hash_data_count;
         params.max_hits       = GPU_PACKED_MAX_HITS;
@@ -11882,6 +12293,58 @@ uint32_t *gpu_opencl_kernel_a_rules_masks_dispatch(int dev_idx,
     return NULL;
 }
 
+/* ---- A4 PROFILE_VARIANT timing harness (2026-05-30) ------------------
+ * Per architect spec project_kernel_a_a4_profile_variant_spec_2026-05-30.md
+ * D5.a + spec §6 rows 17-19 + R7: A4 standalone dispatcher does NOT
+ * route through the A1 two-kernel proto's kernel_a_us harness (that
+ * harness lives inside gpu_opencl_kernelb_dispatch_proto and only fires
+ * on the A1 path). PROFILE_VARIANT-for-A4 therefore requires NEW
+ * timing-capture sites at the A4 NDRange + a dedicated accumulator
+ * with [ocl-kA4] prefix (distinct from A1's [disp] / kernel_a_us
+ * channels per feedback_check_existing_traces_first.md).
+ *
+ * Auto-enabled whenever MDXFIND_KERNEL_A4_PROFILE_VARIANT is set (queue
+ * creation already opted into CL_QUEUE_PROFILING_ENABLE -- see the
+ * gate above the queue-creation site). The accumulator emits per-
+ * dispatch [ocl-kA4] line + atexit aggregate. Independent of the A1
+ * statics (_kb_last_kernel_a_us etc.) to avoid cross-engine pollution.
+ *
+ * Thread-safety: A4 dispatcher runs from the GPU host thread (single
+ * dispatch per chunk via the BF servo); accumulator updates are
+ * serialized by virtue of single-call-per-process-per-chunk. No locks
+ * required. */
+static double  _ka4_total_us = 0.0;
+static double  _ka4_min_us   = 1e18;
+static double  _ka4_max_us   = 0.0;
+static unsigned long _ka4_count = 0;
+static int     _ka4_atexit_armed = 0;
+
+static void gpu_opencl_kernel_a4_timing_dump(void)
+{
+    if (_ka4_count == 0) return;
+    double mean = _ka4_total_us / (double)_ka4_count;
+    fprintf(stderr,
+        "[ocl-kA4] AGGREGATE dispatches=%lu total_us=%.1f mean_us=%.1f "
+        "min_us=%.1f max_us=%.1f\n",
+        _ka4_count, _ka4_total_us, mean, _ka4_min_us, _ka4_max_us);
+}
+
+static void gpu_opencl_kernel_a4_timing_record(int dev_idx, int op, double dt_us)
+{
+    if (!_ka4_atexit_armed) {
+        _ka4_atexit_armed = 1;
+        atexit(gpu_opencl_kernel_a4_timing_dump);
+    }
+    _ka4_total_us += dt_us;
+    if (dt_us < _ka4_min_us) _ka4_min_us = dt_us;
+    if (dt_us > _ka4_max_us) _ka4_max_us = dt_us;
+    _ka4_count++;
+    int variant = gpu_opencl_kernel_a4_profile_variant();
+    fprintf(stderr,
+        "[ocl-kA4] dev=%d dispatch=%lu kernel_a4_us=%.1f op=%d variant=%d\n",
+        dev_idx, _ka4_count, dt_us, op, variant);
+}
+
 /* Phase 1a sub-phase 1a.4 (2026-05-21): A4 brute-force build_prog + dispatch.
  *
  * gpu_opencl_kernel_a4_build_prog -- build the A4 program + extract the
@@ -11898,10 +12361,38 @@ static int gpu_opencl_kernel_a4_build_prog(struct gpu_device *d, int dev_idx)
             gpu_common_str,
             gpu_kernel_a_bruteforce_str   /* Phase 1a sub-phase 1a.4 source */
         };
+        /* PROFILE_VARIANT-for-A4 (2026-05-30 architect spec
+         * project_kernel_a_a4_profile_variant_spec_2026-05-30.md D5.a):
+         * thread -DA4_PROFILE_VARIANT=N + cache key when active. Macro
+         * name disambiguates from A1's PROFILE_VARIANT so A1 + A4
+         * programs can coexist in the same JIT context if both env
+         * vars are set. The accessor returns 0 unless VARIANT=4 active
+         * (R5 host gate).
+         *
+         * 2026-05-30 A4 C5 DEFAULT-ON REFACTOR: the env-gated
+         * -DKNOBG_A4_VEC_WRITE=1 threading was REMOVED here. The uint4
+         * (16-byte) device-store write path is now the unconditional
+         * V0 production path in the kernel; no JIT macro is needed to
+         * select it. The accessor function gpu_experiment_kernel_a4_-
+         * vec_write_enabled() was also removed. */
+        int a4pv  = gpu_opencl_kernel_a4_profile_variant();
+        char opts_buf_a4[320];
+        char key_buf_a4[320];
+        if (a4pv > 0) {
+            snprintf(opts_buf_a4, sizeof(opts_buf_a4),
+                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=4 -DA4_PROFILE_VARIANT=%d",
+                a4pv);
+            snprintf(key_buf_a4, sizeof(key_buf_a4),
+                "KERNEL_A_VARIANT=4,A4_PROFILE_VARIANT=%d", a4pv);
+        } else {
+            snprintf(opts_buf_a4, sizeof(opts_buf_a4),
+                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=4");
+            snprintf(key_buf_a4, sizeof(key_buf_a4),
+                "KERNEL_A_VARIANT=4");
+        }
         d->prog_kernel_a4 = gpu_kernel_cache_build_program_ex(
             d->ctx, d->dev, 2, sources_a4,
-            "-cl-std=CL1.2 -DKERNEL_A_VARIANT=4",
-            "KERNEL_A_VARIANT=4", &err);
+            opts_buf_a4, key_buf_a4, &err);
         if (!d->prog_kernel_a4 || err != CL_SUCCESS) {
             char log[8192] = {0};
             if (d->prog_kernel_a4)
@@ -11963,6 +12454,13 @@ static int gpu_opencl_kernel_a4_build_prog(struct gpu_device *d, int dev_idx)
 uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
     struct jobg *g, int *nhits_out)
 {
+    /* PROFILE_VARIANT-for-A4 timing capture state (2026-05-30). Hoisted
+     * to function scope so it survives across the NDRange site and the
+     * post-readback profiling read at the bottom. evt_a4_for_timing is
+     * non-NULL only when a4pv_timing_active && variant > 0. */
+    cl_event evt_a4_for_timing = NULL;
+    int      a4pv_timing_active = 0;
+
     if (nhits_out) *nhits_out = 0;
 
     /* Variant gate. */
@@ -12045,14 +12543,24 @@ uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
 
     /* Worst-case slot count = num_words * bf_num_masks. Per spec §6
      * "max_packed = slots * (1 + MaskAppendLen) <= 256 MB". Host caps and
-     * FATAL-exits per R5 + feedback_external_failures_are_fatal.md. */
-    size_t max_slots  = (size_t)num_words * (size_t)bf_num_masks;
-    size_t max_packed = max_slots * (size_t)(1u + (uint32_t)MaskAppendLen);
+     * FATAL-exits per R5 + feedback_external_failures_are_fatal.md.
+     *
+     * Per-slot reservation is rounded UP to a 16-byte multiple
+     * unconditionally post-2026-05-30 A4 C5 default-on refactor: the
+     * kernel A4 write path now ALWAYS uses uint4 (16-byte) device
+     * stores via atomic_add(need_aligned), so the host must size the
+     * buffer to match. Without the round-up the kernel's atomic_add
+     * would overrun the host cap, latching overflow_flag and tripping
+     * a downstream NULL-deref in the trace dump path. */
+    size_t max_slots = (size_t)num_words * (size_t)bf_num_masks;
+    size_t per_slot_bytes = (size_t)(1u + (uint32_t)MaskAppendLen);
+    per_slot_bytes = (per_slot_bytes + 15u) & ~(size_t)15u;
+    size_t max_packed = max_slots * per_slot_bytes;
     if (max_packed > MAX_KERNEL_A_PACKED) {
         fprintf(stderr,
             "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 max_packed=%zu B exceeds "
-            "cap=%zu B (num_words=%u bf_num_masks=%u app_len=%d); host-side "
-            "adaptive_bf_chunk_size produced an oversize chunk\n",
+            "cap=%zu B (num_words=%u bf_num_masks=%u app_len=%d); "
+            "host-side adaptive_bf_chunk_size produced an oversize chunk\n",
             __FILE__, __LINE__, dev_idx, max_packed, MAX_KERNEL_A_PACKED,
             num_words, bf_num_masks, MaskAppendLen);
         exit(1);
@@ -12116,8 +12624,14 @@ uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
         params.mask_start          = g->bf_mask_start;
         params.num_words           = num_words;                  /* synthetic lane count */
         params.num_masks           = bf_num_masks;
-        params.n_prepend           = 0u;                         /* BF invariant */
-        params.n_append            = (uint32_t)MaskAppendLen;
+        /* 2026-05-30 amendment: A4's prebuf is now a 1-byte END descriptor.
+         * Walker sees END at offset 0 and returns 0-length prebuf. The
+         * append side uses the standard descriptor stream byte length. */
+        params.n_prepend           = 1u;                         /* 1-byte END descriptor */
+        {
+            extern int gpu_kern_a_app_dlen;
+            params.n_append        = (uint32_t)gpu_kern_a_app_dlen;
+        }
         params.max_probe           = 256u;
         params.hash_data_count     = _hash_data_count;
         params.max_hits            = GPU_PACKED_MAX_HITS;
@@ -12175,9 +12689,26 @@ uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
         size_t lsize_a = 64;
         gsize_a = ((gsize_a + lsize_a - 1) / lsize_a) * lsize_a;
 
+        /* PROFILE_VARIANT-for-A4 (2026-05-30) timing capture: when the
+         * A4 PROFILE_VARIANT env is set (even to "0", so the operator
+         * can collect the V0 baseline alongside V1..V5), queue is
+         * opted into CL_QUEUE_PROFILING_ENABLE up-front; capture a
+         * cl_event so we can read CL_PROFILING_COMMAND_START/END
+         * after the existing blocking readback below. Independent
+         * from the A1 two-kernel proto kernel_a_us harness (which
+         * never fires for A4). When env var is UNSET we pass NULL
+         * like the production path -- byte-identical baseline. The
+         * event lives across the readback; released after profiling
+         * read. */
+        evt_a4_for_timing = NULL;
+        {
+            const char *_a4pv_env = getenv("MDXFIND_KERNEL_A4_PROFILE_VARIANT");
+            a4pv_timing_active = (_a4pv_env && _a4pv_env[0] != '\0') ? 1 : 0;
+        }
         err = clEnqueueNDRangeKernel(d->queue, ka, 1,
                                      NULL, &gsize_a, &lsize_a,
-                                     0, NULL, NULL);
+                                     0, NULL,
+                                     a4pv_timing_active ? &evt_a4_for_timing : NULL);
         if (err != CL_SUCCESS) {
             fprintf(stderr,
                 "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 enqueue failed (err=%d)\n",
@@ -12196,6 +12727,37 @@ uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
             "FATAL: %s:%d OpenCL GPU[%d]: A4 state readback failed (err=%d)\n",
             __FILE__, __LINE__, dev_idx, err);
         exit(1);
+    }
+    /* PROFILE_VARIANT-for-A4 timing readout: blocking readback above
+     * guarantees the NDRange event is complete by this point. Query
+     * profiling info, accumulate, release the event. */
+    if (a4pv_timing_active && evt_a4_for_timing != NULL) {
+        cl_ulong t_start = 0, t_end = 0;
+        cl_int p_err1 = clGetEventProfilingInfo(evt_a4_for_timing,
+            CL_PROFILING_COMMAND_START, sizeof(t_start), &t_start, NULL);
+        cl_int p_err2 = clGetEventProfilingInfo(evt_a4_for_timing,
+            CL_PROFILING_COMMAND_END,   sizeof(t_end),   &t_end,   NULL);
+        if (p_err1 == CL_SUCCESS && p_err2 == CL_SUCCESS && t_end >= t_start) {
+            double dt_us = (double)(t_end - t_start) / 1000.0;  /* ns -> us */
+            gpu_opencl_kernel_a4_timing_record(dev_idx, g->op, dt_us);
+        } else {
+            /* Queue lacks CL_QUEUE_PROFILING_ENABLE on this device.
+             * Per feedback_external_failures_are_fatal.md this is an
+             * instrumentation gap, not a correctness failure -- the
+             * dispatch + readback already succeeded. Warn once. */
+            static int _warned = 0;
+            if (!_warned) {
+                _warned = 1;
+                fprintf(stderr,
+                    "OpenCL GPU[%d]: A4 PROFILE_VARIANT timing requested "
+                    "but clGetEventProfilingInfo failed (err1=%d err2=%d) "
+                    "-- queue may lack CL_QUEUE_PROFILING_ENABLE; "
+                    "[ocl-kA4] lines will be suppressed\n",
+                    dev_idx, p_err1, p_err2);
+            }
+        }
+        clReleaseEvent(evt_a4_for_timing);
+        evt_a4_for_timing = NULL;
     }
     uint32_t actual_slots      = state[0];
     uint32_t actual_byte_count = state[1];
@@ -12311,6 +12873,16 @@ uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
 static const char *codegen_sentinel_for_job(int job_enum)
 {
     if (job_enum == JOB_MD5MD5SALT) return "HX_CODEGEN_E347_V1";
+    /* Iter v1 (2026-05-31, project_codegen_iteration_v1_spec_-
+     * 2026-05-31.md, D5.a): bump the unsalted-single sentinel from
+     * (formerly implicit V1) to V2. Invalidates any pre-iter-v1
+     * cached Batch-1 program lacking the runtime iter loop so a
+     * mid-session upgrade rebuilds. Per spec §11 row 4. */
+    if (job_enum == JOB_MD5 || job_enum == JOB_MD4
+        || job_enum == JOB_SHA1RAW || job_enum == JOB_SHA256RAW
+        || job_enum == JOB_MD5RAW) {
+        return "HX_CODEGEN_UNSALTED_SINGLE_V2";
+    }
     /* All MAKE_MD5PASS family members share a single sentinel because
      * the emitter is shared; per-primitive bodies are inline in the
      * same output. Bump to V2 when any per-primitive body changes. */
@@ -12511,6 +13083,778 @@ gpu_opencl_kernelb_codegen_kernel(struct gpu_device *d, int dev_idx)
                                                  JOB_MD5MD5SALT);
 }
 
+/* RULE-AXIS CHUNKING (Option A, 2026-05-29). Compute (once per device) the
+ * per-dispatch candidate-buffer cap for the codegen proto path. Cached on
+ * d->cand_cap_bytes (0 = uncomputed). Policy (spec §1b):
+ *   cap = clamp(GPU_RULES_CAND_CAP_FRACTION * CL_DEVICE_GLOBAL_MEM_SIZE,
+ *               GPU_RULES_CAND_CAP_MIN_MB, GPU_RULES_CAND_CAP_MAX_MB)
+ * Env override MDXFIND_GPU_CAND_CAP_MB (read once; >0 sets cap directly,
+ * still clamped to MIN so a too-small value can't starve a single chunk).
+ * Returns the cap in bytes. */
+static size_t gpu_opencl_proto_cand_cap_bytes(struct gpu_device *d, int dev_idx)
+{
+    if (d->cand_cap_bytes != 0) return d->cand_cap_bytes;
+
+    const size_t cap_min = (size_t)GPU_RULES_CAND_CAP_MIN_MB * 1024u * 1024u;
+    const size_t cap_max = (size_t)GPU_RULES_CAND_CAP_MAX_MB * 1024u * 1024u;
+
+    size_t cap = 0;
+    const char *e = getenv("MDXFIND_GPU_CAND_CAP_MB");
+    if (e && *e) {
+        long mb = atol(e);
+        if (mb > 0) cap = (size_t)mb * 1024u * 1024u;
+    }
+    if (cap == 0) {
+        cl_ulong gmem = 0;
+        clGetDeviceInfo(d->dev, CL_DEVICE_GLOBAL_MEM_SIZE,
+                        sizeof(gmem), &gmem, NULL);
+        if (gmem == 0) gmem = cap_min;   /* defensive: query failed */
+        cap = (size_t)((double)gmem * GPU_RULES_CAND_CAP_FRACTION);
+    }
+    if (cap < cap_min) cap = cap_min;
+    if (cap > cap_max) cap = cap_max;
+
+    d->cand_cap_bytes = cap;
+    {
+        static int _warned[MAX_GPU_DEVICES] = {0};
+        if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES && !_warned[dev_idx]) {
+            _warned[dev_idx] = 1;
+            fprintf(stderr,
+                "OpenCL GPU[%d]: rules+codegen candidate-buffer cap = %zu MB "
+                "(rule-axis chunking)\n",
+                dev_idx, cap / (1024u * 1024u));
+        }
+    }
+    return cap;
+}
+
+/* RULE-AXIS CHUNKING (Option A, 2026-05-29) — multi-chunk proto dispatch.
+ *
+ * Invoked from gpu_opencl_kernelb_dispatch_proto ONLY when num_rule_chunks > 1
+ * (the full num_words x n_rules candidate buffer would exceed the per-device
+ * cap). The single-chunk case stays on the verbatim legacy body in the caller
+ * (e347 / small-rule PRODUCTION safety). This helper:
+ *
+ *   - Uploads the WORD payload ONCE (word_offset + packed_words); inside the
+ *     loop only the 128-byte OCLParams header is re-uploaded per chunk. This
+ *     is the Option-A perf payoff (words reused across all rule chunks).
+ *   - Zeroes b_hashes_shown ONCE before the loop so cross-chunk dedup matches
+ *     the single-dispatch path byte-for-byte (a word cracking the same hash
+ *     under rules in different chunks is emitted exactly once).
+ *   - For each disjoint rule sub-range [rule_start, rule_start+rule_count):
+ *       set params.num_rules=rule_count, params.rule_cursor_start=rule_start;
+ *       zero kernel-A state; enqueue A; read state; on overflow halve K and
+ *       re-issue (bounded; FATAL only at K==1); enqueue B (same args /
+ *       grid as the single-dispatch path); read hit_count + hits; targeted
+ *       hits-only readback for THIS chunk; then IMMEDIATELY resolve each hit's
+ *       plaintext into d->h_proto_resolved_* keyed by a global hit ordinal G,
+ *       BEFORE the next chunk's kernel A clobbers b_proto_packed_buf.
+ *   - After the loop: copy the accumulated rewritten hit records into d->h_hits
+ *     (each entry[0] = its global ordinal G) and set proto_resolved_active so
+ *     gpu_opencl_kernelb_proto_plaintext reads the arena. The caller's decode
+ *     loop (gpujob_opencl.c) is UNCHANGED (SHAPE 2).
+ *
+ * Returns d->h_hits with *nhits_out = total accumulated hits (capped at
+ * GPU_PACKED_MAX_HITS). All external failures are FATAL with file:line+op. */
+static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
+    struct gpu_device *d, int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, uint32_t n_rules, size_t K, size_t num_rule_chunks,
+    int exp_md5, int *nhits_out)
+{
+    cl_int err;
+    char hostname[256] = "unknown";
+    gethostname(hostname, sizeof(hostname) - 1);
+
+    *nhits_out = 0;
+    d->proto_resolved_active = 1;          /* accessor uses the arena */
+    d->h_proto_resolved_buf_used = 0;      /* reset arena for this dispatch */
+
+    /* One-shot per-device marker: confirms the MULTI-CHUNK path was entered
+     * (vs the verbatim single-dispatch e347 path). Greppable for validation. */
+    {
+        static int _chunked_first[MAX_GPU_DEVICES] = {0};
+        if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES && !_chunked_first[dev_idx]) {
+            _chunked_first[dev_idx] = 1;
+            fprintf(stderr,
+                "OpenCL GPU[%d]: rules+codegen MULTI-CHUNK path entered "
+                "(n_rules=%u K=%zu num_rule_chunks=%zu num_words=%u op=%d)\n",
+                dev_idx, n_rules, K, num_rule_chunks, num_words, op);
+        }
+    }
+
+    /* --- A. One-time word-payload upload (Option A payoff) ------------- *
+     * Largest chunk's candidate buffer = num_words * K * 256 (<= cap). The
+     * last chunk may be smaller but sizing to K's worst case once avoids
+     * realloc churn. */
+    size_t cap_slots  = (size_t)num_words * K;
+    size_t cap_packed = cap_slots * 256u;
+    if (cap_packed < MIN_BUFFER_BYTES) cap_packed = MIN_BUFFER_BYTES;
+    if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, cap_packed, cap_slots) < 0)
+        return NULL;
+
+    size_t payload_woff_bytes = (size_t)num_words * sizeof(uint32_t);
+    size_t payload_size = 128u + 4u + payload_woff_bytes + (size_t)packed_size;
+    if (!d->b_dispatch_payload || payload_size > d->dispatch_payload_cap) {
+        if (d->b_dispatch_payload) clReleaseMemObject(d->b_dispatch_payload);
+        void *new_host = calloc(1, payload_size);
+        if (!new_host) {
+            fprintf(stderr,
+                "FATAL: %s:%d OpenCL GPU[%d] on %s: chunked dispatch_payload "
+                "calloc(%zu) failed\n",
+                __FILE__, __LINE__, dev_idx, hostname, payload_size);
+            exit(1);
+        }
+        if (d->h_dispatch_payload) free(d->h_dispatch_payload);
+        d->h_dispatch_payload = new_host;
+        d->h_dispatch_payload_cap = payload_size;
+        d->b_dispatch_payload = clCreateBuffer(d->ctx,
+            CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+            payload_size, d->h_dispatch_payload, &err);
+        if (!d->b_dispatch_payload || err != CL_SUCCESS) {
+            fprintf(stderr,
+                "FATAL: %s:%d OpenCL GPU[%d] on %s: chunked b_dispatch_payload "
+                "alloc(%zu) failed (err=%d)\n",
+                __FILE__, __LINE__, dev_idx, hostname, payload_size, err);
+            exit(1);
+        }
+        d->dispatch_payload_cap = payload_size;
+    }
+
+    /* Base OCLParams (word-feed shape stays fixed across chunks; only
+     * num_rules / rule_cursor_start / packed_size change per chunk). */
+    {
+        uint8_t *staging = (uint8_t *)d->h_dispatch_payload;
+        OCLParams params;
+        memset(&params, 0, sizeof(params));
+        params.compact_mask     = _compact_mask;
+        params.num_words        = num_words;
+        params.num_rules        = (uint32_t)K;   /* per-chunk; set per chunk below */
+        params.max_probe        = 256;
+        params.hash_data_count  = _hash_data_count;
+        params.max_hits         = GPU_PACKED_MAX_HITS;
+        params.overflow_count   = _overflow_count;
+        /* Iter v1 (2026-05-31): see gpu_opencl_kernelb_dispatch_proto
+         * (non-chunked path above) for rationale. */
+        params.max_iter         = (d->max_iter < 1) ? 1u : (uint32_t)d->max_iter;
+        params.salt_start       = 0;
+        params.num_salts        = (uint32_t)d->salts_count;
+        params.base_word_idx    = 0;
+        params.rule_cursor_start = 0;            /* set per chunk below */
+        params.packed_size      = (uint32_t)cap_packed;
+        memcpy(staging, &params, sizeof(params));
+        uint32_t zero32 = 0;
+        memcpy(staging + 128, &zero32, 4);
+        memcpy(staging + 132, word_offset, payload_woff_bytes);
+        memcpy(staging + 132 + payload_woff_bytes, packed_words, packed_size);
+    }
+    err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
+                               0, payload_size, d->h_dispatch_payload,
+                               0, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d] on %s: chunked payload write failed (err=%d)\n",
+            __FILE__, __LINE__, dev_idx, hostname, err);
+        exit(1);
+    }
+
+    /* --- B. One-time b_hashes_shown alloc + zero (cross-chunk dedup) ---- *
+     * Zeroed ONCE for the whole word-batch so a hash cracked in chunk c is
+     * not re-emitted in chunk c' (matches single-dispatch dedup). */
+    {
+        size_t _hs_need = (size_t)_hash_data_count + (size_t)_overflow_count;
+        if (_hs_need == 0) _hs_need = 1;
+        size_t _hs_bytes = _hs_need * sizeof(uint32_t);
+        if (_hs_bytes < MIN_BUFFER_BYTES) _hs_bytes = MIN_BUFFER_BYTES;
+        if (!d->b_hashes_shown || _hs_need > d->hashes_shown_count) {
+            if (d->b_hashes_shown) clReleaseMemObject(d->b_hashes_shown);
+            cl_int _hs_err;
+            d->b_hashes_shown = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE,
+                                               _hs_bytes, NULL, &_hs_err);
+            if (_hs_err != CL_SUCCESS || !d->b_hashes_shown) {
+                fprintf(stderr,
+                    "FATAL: %s:%d GPU[%d] on %s: chunked b_hashes_shown alloc "
+                    "failed (err=%d, %zu slots)\n",
+                    __FILE__, __LINE__, dev_idx, hostname, _hs_err, _hs_need);
+                exit(1);
+            }
+            d->hashes_shown_count = _hs_need;
+        }
+        uint32_t _hs_zero = 0;
+        size_t _hs_active = _hs_need * sizeof(uint32_t);
+        cl_int _fe = clEnqueueFillBuffer(d->queue, d->b_hashes_shown,
+                                         &_hs_zero, sizeof(_hs_zero),
+                                         0, _hs_active, 0, NULL, NULL);
+        if (_fe != CL_SUCCESS) {
+            void *_z = calloc(1, _hs_active);
+            if (_z) {
+                clEnqueueWriteBuffer(d->queue, d->b_hashes_shown, CL_TRUE,
+                                    0, _hs_active, _z, 0, NULL, NULL);
+                free(_z);
+            }
+        }
+    }
+    if (!d->b_hits || !d->h_hits) {
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d] on %s: b_hits/h_hits not allocated "
+            "before chunked proto dispatch\n",
+            __FILE__, __LINE__, dev_idx, hostname);
+        exit(1);
+    }
+
+    /* --- C. Accumulation arena sizing (lazy, grown to caps) ------------ *
+     * Worst case GPU_PACKED_MAX_HITS hits, each up to 256 packed bytes. */
+    {
+        size_t off_cap_need = (size_t)GPU_PACKED_MAX_HITS;
+        if (!d->h_proto_resolved_off || off_cap_need > d->h_proto_resolved_off_cap) {
+            free(d->h_proto_resolved_off);
+            d->h_proto_resolved_off = (uint32_t *)calloc(off_cap_need, sizeof(uint32_t));
+            if (!d->h_proto_resolved_off) {
+                fprintf(stderr,
+                    "FATAL: %s:%d GPU[%d] on %s: h_proto_resolved_off calloc(%zu) failed\n",
+                    __FILE__, __LINE__, dev_idx, hostname, off_cap_need);
+                exit(1);
+            }
+            d->h_proto_resolved_off_cap = off_cap_need;
+        }
+        /* Arena grows on demand below; seed a modest initial block. */
+        if (!d->h_proto_resolved_buf) {
+            size_t seed = 1u * 1024u * 1024u;   /* 1 MB; enough for ~4K hits */
+            d->h_proto_resolved_buf = (uint8_t *)malloc(seed);
+            if (!d->h_proto_resolved_buf) {
+                fprintf(stderr,
+                    "FATAL: %s:%d GPU[%d] on %s: h_proto_resolved_buf malloc(%zu) failed\n",
+                    __FILE__, __LINE__, dev_idx, hostname, seed);
+                exit(1);
+            }
+            d->h_proto_resolved_buf_cap = seed;
+        }
+    }
+
+    /* The accumulated rewritten hit records (entry[0] = global ordinal G).
+     * We write directly into d->h_hits as we go, capped at GPU_PACKED_MAX_HITS. */
+    uint32_t G = 0;                 /* global hit ordinal */
+    int warned_90 = 0;
+    cl_kernel ka = d->kern_kernel_a_rules;
+    cl_kernel kb = gpu_opencl_kernelb_codegen_kernel_for(d, dev_idx, op);
+    const uint32_t wg_size = 64u;
+
+    /* Phase 1 stage-timing accumulators (2026-05-29 PERF AGENT, UNCOMMITTED):
+     * the single-dispatch path captures per-stage micros into the __thread
+     * statics _kb_last_kernel_a_us / _kb_last_host_gap_us / _kb_last_kernel_b_us
+     * so the gpujob_opencl.c trace emitter (path=kernelB_saltaxis line) can
+     * print them. The chunked path was leaving them at 0 (mdx-team-state #343
+     * handoff item). Capture per-chunk events, accumulate kernel A+B device
+     * time, and compute host_gap = (last_b_end - first_a_start)
+     * - sum(kernel_a) - sum(kernel_b). Both kernels run in the same in-order
+     * queue so the first-A-start and last-B-end bracket all chunked GPU work.
+     * Profiling is enabled only when MDXFIND_DISPATCH_TRACE / MDXFIND_KERNEL_-
+     * TRACE is set (queue created with CL_QUEUE_PROFILING_ENABLE — see
+     * gpu_opencl.c queue-properties block); when off, events still capture
+     * but clGetEventProfilingInfo returns CL_PROFILING_INFO_NOT_AVAILABLE
+     * and we silently skip the accumulation. */
+    uint64_t _ka_us_sum = 0, _kb_us_sum = 0;
+    cl_ulong _first_a_start = 0, _last_b_end = 0;
+    int _stage_valid_any = 0;
+    /* Slot-waste statistics (knob A/B leverage analysis): aggregate
+     * actual_slots and actual_byte_count across all chunks to compute the
+     * average emit_len (= (sum_bytes - sum_slots) / sum_slots; minus one
+     * length byte per slot). Also track per-chunk max emit-bytes as a rough
+     * cap proxy. */
+    uint64_t _slot_sum_slots = 0, _slot_sum_bytes = 0;
+    uint32_t _slot_max_bytes_per_chunk = 0, _slot_max_slots_per_chunk = 0;
+
+    /* --- D. Rule-chunk loop -------------------------------------------- */
+    for (size_t c = 0; c < num_rule_chunks; c++) {
+        size_t rule_start = c * K;
+        size_t rule_count = (n_rules - rule_start < K) ? (n_rules - rule_start) : K;
+
+        /* Bounded halve-K retry on overflow (impossible by construction, but
+         * retained as belt-and-braces per spec §1e). */
+        size_t this_K = rule_count;
+        size_t sub_start = rule_start;
+        while (sub_start < rule_start + rule_count) {
+            size_t this_count = (rule_start + rule_count - sub_start < this_K)
+                              ? (rule_start + rule_count - sub_start) : this_K;
+            size_t sub_slots  = (size_t)num_words * this_count;
+            size_t sub_packed = sub_slots * 256u;
+            if (sub_packed < MIN_BUFFER_BYTES) sub_packed = MIN_BUFFER_BYTES;
+            if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, sub_packed, sub_slots) < 0)
+                return NULL;
+
+            /* Zero kernel-A state for this sub-chunk. */
+            memset(d->h_proto_kernelA_state, 0, 3u * sizeof(uint32_t));
+            err = clEnqueueWriteBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
+                                       0, 3u * sizeof(uint32_t),
+                                       d->h_proto_kernelA_state, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr,
+                    "FATAL: %s:%d GPU[%d] on %s: chunked kernelA_state zero-write "
+                    "(chunk=%zu) failed (err=%d)\n",
+                    __FILE__, __LINE__, dev_idx, hostname, c, err);
+                exit(1);
+            }
+
+            /* Set this sub-chunk's rule sub-range in the OCLParams header. */
+            {
+                OCLParams *p = (OCLParams *)d->h_dispatch_payload;
+                p->num_words        = num_words;
+                p->num_rules        = (uint32_t)this_count;     /* rule_count */
+                p->rule_cursor_start= (uint32_t)sub_start;      /* rule_start  */
+                p->packed_size      = (uint32_t)sub_packed;     /* kernel-A capacity */
+                p->base_word_idx    = 0;
+                err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
+                                           0, sizeof(OCLParams), d->h_dispatch_payload,
+                                           0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked A-params re-upload "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+            }
+
+            /* Enqueue kernel A for this sub-chunk.
+             * _ev_a + _chunk_ev_b are captured at outer-scope so the
+             * post-readback profiling read (below) can disaggregate per-stage
+             * timing for the Phase 1 stage-timing wire-up (UNCOMMITTED). */
+            cl_event _ev_a = NULL;
+            cl_event _chunk_ev_b = NULL;
+            {
+                int a = 0;
+#define KARGC(k, n, s, v) do { cl_int _e = clSetKernelArg(k, n, s, v); \
+    if (_e != CL_SUCCESS) { \
+        fprintf(stderr, "FATAL: %s:%d GPU[%d] on %s: chunked kernel A arg %d (chunk=%zu) failed (err=%d)\n", \
+                __FILE__, __LINE__, dev_idx, hostname, n, c, _e); exit(1); } } while(0)
+                KARGC(ka, a++, sizeof(cl_mem), &d->b_dispatch_payload);
+                KARGC(ka, a++, sizeof(cl_mem), &d->b_rule_program);
+                KARGC(ka, a++, sizeof(cl_mem), &d->b_rule_offset);
+                KARGC(ka, a++, sizeof(cl_mem), &d->b_proto_packed_buf);
+                KARGC(ka, a++, sizeof(cl_mem), &d->b_proto_chunk_index);
+                KARGC(ka, a++, sizeof(cl_mem), &d->b_proto_kernelA_state);
+#undef KARGC
+                size_t gsize_a = (size_t)num_words * this_count;
+                size_t lsize_a = 64;
+                gsize_a = ((gsize_a + lsize_a - 1) / lsize_a) * lsize_a;
+                err = clEnqueueNDRangeKernel(d->queue, ka, 1, NULL,
+                                             &gsize_a, &lsize_a, 0, NULL, &_ev_a);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked kernel A enqueue "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+            }
+
+            /* Read kernel-A state. */
+            uint32_t state[3] = {0, 0, 0};
+            err = clEnqueueReadBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
+                                      0, 3u * sizeof(uint32_t), state, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr,
+                    "FATAL: %s:%d GPU[%d] on %s: chunked kernelA_state readback "
+                    "(chunk=%zu) failed (err=%d)\n",
+                    __FILE__, __LINE__, dev_idx, hostname, c, err);
+                exit(1);
+            }
+            uint32_t actual_slots      = state[0];
+            uint32_t actual_byte_count = state[1];
+            uint32_t overflow_flag     = state[2];
+
+            if (overflow_flag) {
+                /* Overflow should be impossible (sub_packed <= cap by K
+                 * formula). If it ever fires, halve this_K and re-issue the
+                 * remaining span. FATAL only at this_K==1 (a single (word,rule)
+                 * producing > sub_packed bytes — impossible since one record
+                 * <= 256 bytes). NEVER silently drop the chunk. */
+                if (this_K <= 1) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked kernel A overflow at "
+                        "K==1 (chunk=%zu sub_start=%zu slots=%u bytes=%u cap=%zu) — "
+                        "a single (word,rule) exceeds the candidate cap; pathological\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, sub_start,
+                        actual_slots, actual_byte_count, sub_packed);
+                    exit(1);
+                }
+                this_K = this_K / 2;
+                if (this_K < 1) this_K = 1;
+                fprintf(stderr,
+                    "[kernelb_proto_chunked] GPU[%d]: kernel A overflow (chunk=%zu "
+                    "sub_start=%zu) — halving K to %zu and re-issuing\n",
+                    dev_idx, c, sub_start, this_K);
+                /* Release the kernel-A event before re-issuing the span (we
+                 * don't accumulate its timing into the retry — the retry
+                 * issues a fresh _ev_a). */
+                if (_ev_a && p_clReleaseEvent) p_clReleaseEvent(_ev_a);
+                continue;   /* re-issue this span with smaller this_K */
+            }
+
+            if (actual_slots == 0) {
+                /* Phase 1: still account for kernel-A device time on empty
+                 * spans (it ran and consumed GPU time). */
+                if (_ev_a && p_clGetEventProfilingInfo) {
+                    cl_ulong a_start = 0, a_end = 0;
+                    cl_int pe1 = p_clGetEventProfilingInfo(_ev_a,
+                        CL_PROFILING_COMMAND_START, sizeof(a_start), &a_start, NULL);
+                    cl_int pe2 = p_clGetEventProfilingInfo(_ev_a,
+                        CL_PROFILING_COMMAND_END,   sizeof(a_end),   &a_end,   NULL);
+                    if (pe1 == CL_SUCCESS && pe2 == CL_SUCCESS) {
+                        _ka_us_sum += (uint64_t)(a_end - a_start) / 1000ULL;
+                        if (_first_a_start == 0 || a_start < _first_a_start)
+                            _first_a_start = a_start;
+                        if (a_end > _last_b_end) _last_b_end = a_end;
+                        _stage_valid_any = 1;
+                    }
+                }
+                if (_ev_a && p_clReleaseEvent) p_clReleaseEvent(_ev_a);
+                sub_start += this_count;   /* no candidates this span; advance */
+                continue;
+            }
+
+            /* Set kernel-B params: num_words = slot count, packed_size = actual. */
+            {
+                OCLParams *p = (OCLParams *)d->h_dispatch_payload;
+                p->num_words   = actual_slots;
+                p->packed_size = actual_byte_count;
+                p->salt_start  = 0;
+                err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
+                                           0, sizeof(OCLParams), d->h_dispatch_payload,
+                                           0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked B-params re-upload "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+                uint32_t zero32 = 0;
+                err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
+                                           128, sizeof(uint32_t), &zero32,
+                                           0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked B hit_count zero-write "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+            }
+            /* Zero b_hit_count (per-chunk; we drain hits each chunk). */
+            {
+                uint32_t zero32 = 0;
+                err = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE,
+                                           0, sizeof(uint32_t), &zero32,
+                                           0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked b_hit_count zero-write "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+            }
+
+            /* Bind + enqueue kernel B (identical 16-arg signature + grid to the
+             * single-dispatch path). b_hashes_shown is NOT re-zeroed here. */
+            if (!gpu_opencl_hx_codegen_enabled()) {
+                fprintf(stderr,
+                    "FATAL: %s:%d OpenCL GPU[%d] on %s: MDXFIND_HX_CODEGEN=0 "
+                    "unsupported on the chunked codegen path\n",
+                    __FILE__, __LINE__, dev_idx, hostname);
+                exit(1);
+            }
+            {
+                int a = 0;
+#define KBC(n, s, v) do { cl_int _e = clSetKernelArg(kb, n, s, v); \
+    if (_e != CL_SUCCESS) { \
+        fprintf(stderr, "FATAL: %s:%d GPU[%d] on %s: chunked kernel B arg %d (chunk=%zu) failed (err=%d)\n", \
+                __FILE__, __LINE__, dev_idx, hostname, n, c, _e); exit(1); } } while(0)
+                KBC(a++, sizeof(cl_mem), &d->b_dispatch_payload);
+                KBC(a++, sizeof(cl_mem), &d->b_proto_packed_buf);
+                KBC(a++, sizeof(cl_mem), &d->b_proto_chunk_index);
+                KBC(a++, sizeof(cl_mem), &d->b_salt_data);
+                KBC(a++, sizeof(cl_mem), &d->b_salt_off);
+                KBC(a++, sizeof(cl_mem), &d->b_salt_len);
+                KBC(a++, sizeof(cl_mem), &d->b_compact_fp);
+                KBC(a++, sizeof(cl_mem), &d->b_compact_idx);
+                KBC(a++, sizeof(cl_mem), &d->b_hash_data);
+                KBC(a++, sizeof(cl_mem), &d->b_hash_data_off);
+                KBC(a++, sizeof(cl_mem), &d->b_hits);
+                KBC(a++, sizeof(cl_mem), &d->b_hit_count);
+                KBC(a++, sizeof(cl_mem), &d->b_overflow_keys);
+                KBC(a++, sizeof(cl_mem), &d->b_overflow_hashes);
+                KBC(a++, sizeof(cl_mem), &d->b_overflow_offsets);
+                KBC(a++, sizeof(cl_mem), &d->b_hashes_shown);
+#undef KBC
+                uint32_t nsalts_packed = (uint32_t)d->salts_count;
+                uint32_t num_salt_chunks = (nsalts_packed + wg_size - 1u) / wg_size;
+                if (num_salt_chunks == 0u) num_salt_chunks = 1u;
+                size_t gsize_b, lsize_b = (size_t)wg_size;
+                if (exp_md5) {
+                    gsize_b = ((size_t)actual_slots + wg_size - 1u) / wg_size;
+                    gsize_b *= wg_size;
+                } else {
+                    gsize_b = (size_t)actual_slots * (size_t)num_salt_chunks
+                            * (size_t)wg_size;
+                }
+                cl_event _ev_b = NULL;
+                err = clEnqueueNDRangeKernel(d->queue, kb, 1, NULL,
+                                             &gsize_b, &lsize_b, 0, NULL, &_ev_b);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked kernel B enqueue "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+                /* Stash kernel-B event for post-readback profiling read. */
+                _chunk_ev_b = _ev_b;
+            }
+
+            /* Read hit_count for this chunk. */
+            uint32_t hcount = 0;
+            err = clEnqueueReadBuffer(d->queue, d->b_hit_count, CL_TRUE,
+                                      0, sizeof(uint32_t), &hcount, 0, NULL, NULL);
+            if (err != CL_SUCCESS) {
+                fprintf(stderr,
+                    "FATAL: %s:%d GPU[%d] on %s: chunked b_hit_count readback "
+                    "(chunk=%zu) failed (err=%d)\n",
+                    __FILE__, __LINE__, dev_idx, hostname, c, err);
+                exit(1);
+            }
+            if (hcount > (uint32_t)GPU_PACKED_MAX_HITS)
+                hcount = (uint32_t)GPU_PACKED_MAX_HITS;
+
+            /* Phase 1 (UNCOMMITTED) per-chunk stage timing. The b_hit_count
+             * CL_TRUE readback above has drained the queue (in-order, no
+             * event-chain), so both kernel events are complete and
+             * clGetEventProfilingInfo will return real device-nanosecond
+             * timestamps when the queue was created with
+             * CL_QUEUE_PROFILING_ENABLE (gated by MDXFIND_DISPATCH_TRACE /
+             * MDXFIND_KERNEL_TRACE). When profiling is OFF the calls return
+             * CL_PROFILING_INFO_NOT_AVAILABLE and we leave the accumulators
+             * at 0 — the trace emitter silently shows 0 for the path stages,
+             * same as today. */
+            if (_ev_a && _chunk_ev_b && p_clGetEventProfilingInfo) {
+                cl_ulong a_start = 0, a_end = 0, b_start = 0, b_end = 0;
+                cl_int pe1 = p_clGetEventProfilingInfo(_ev_a,
+                    CL_PROFILING_COMMAND_START, sizeof(a_start), &a_start, NULL);
+                cl_int pe2 = p_clGetEventProfilingInfo(_ev_a,
+                    CL_PROFILING_COMMAND_END,   sizeof(a_end),   &a_end,   NULL);
+                cl_int pe3 = p_clGetEventProfilingInfo(_chunk_ev_b,
+                    CL_PROFILING_COMMAND_START, sizeof(b_start), &b_start, NULL);
+                cl_int pe4 = p_clGetEventProfilingInfo(_chunk_ev_b,
+                    CL_PROFILING_COMMAND_END,   sizeof(b_end),   &b_end,   NULL);
+                if (pe1 == CL_SUCCESS && pe2 == CL_SUCCESS
+                    && pe3 == CL_SUCCESS && pe4 == CL_SUCCESS) {
+                    _ka_us_sum += (uint64_t)(a_end - a_start) / 1000ULL;
+                    _kb_us_sum += (uint64_t)(b_end - b_start) / 1000ULL;
+                    if (_first_a_start == 0 || a_start < _first_a_start)
+                        _first_a_start = a_start;
+                    if (b_end > _last_b_end)
+                        _last_b_end = b_end;
+                    _stage_valid_any = 1;
+                }
+            }
+            if (_ev_a && p_clReleaseEvent) p_clReleaseEvent(_ev_a);
+            if (_chunk_ev_b && p_clReleaseEvent) p_clReleaseEvent(_chunk_ev_b);
+            _ev_a = NULL;
+            _chunk_ev_b = NULL;
+
+            /* Slot-waste counters: aggregate post-rule emit byte traffic so the
+             * report can compute average emit_len (= (sum_bytes-sum_slots) /
+             * sum_slots, the 1-byte length header subtracted). */
+            _slot_sum_slots += (uint64_t)actual_slots;
+            _slot_sum_bytes += (uint64_t)actual_byte_count;
+            if (actual_byte_count > _slot_max_bytes_per_chunk)
+                _slot_max_bytes_per_chunk = actual_byte_count;
+            if (actual_slots > _slot_max_slots_per_chunk)
+                _slot_max_slots_per_chunk = actual_slots;
+
+            if (hcount > 0) {
+                /* Read this chunk's hit records into a scratch (reuse d->h_hits
+                 * tail region is unsafe; read into d->h_hits[G..] only after
+                 * resolve). Read into a small local buffer per chunk. */
+                size_t hbytes = (size_t)hcount * GPU_HIT_STRIDE * sizeof(uint32_t);
+                uint32_t *chunk_hits = (uint32_t *)malloc(hbytes);
+                if (!chunk_hits) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked chunk_hits malloc(%zu) "
+                        "failed (chunk=%zu)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, hbytes, c);
+                    exit(1);
+                }
+                err = clEnqueueReadBuffer(d->queue, d->b_hits, CL_TRUE,
+                                          0, hbytes, chunk_hits, 0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d GPU[%d] on %s: chunked b_hits readback "
+                        "(chunk=%zu) failed (err=%d)\n",
+                        __FILE__, __LINE__, dev_idx, hostname, c, err);
+                    exit(1);
+                }
+
+                /* Resolve EACH hit's plaintext into the arena NOW (before the
+                 * next chunk's kernel A clobbers b_proto_packed_buf). */
+                for (uint32_t hi = 0; hi < hcount; hi++) {
+                    uint32_t *he = chunk_hits + (size_t)hi * GPU_HIT_STRIDE;
+                    uint32_t slot = he[0];
+
+                    if (G >= (uint32_t)GPU_PACKED_MAX_HITS) break;
+                    if (!warned_90 &&
+                        G >= (uint32_t)((double)GPU_PACKED_MAX_HITS * 0.9)) {
+                        warned_90 = 1;
+                        fprintf(stderr,
+                            "WARN: %s:%d GPU[%d] on %s: chunked proto accumulated "
+                            "hits at 90%% of GPU_PACKED_MAX_HITS (%u/%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname,
+                            G, GPU_PACKED_MAX_HITS);
+                    }
+
+                    /* Read this slot's byte offset (wpos) from b_proto_chunk_index. */
+                    if ((size_t)slot >= sub_slots) continue;  /* corrupt slot */
+                    uint32_t wpos = 0;
+                    err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index,
+                                              CL_TRUE,
+                                              (size_t)slot * sizeof(uint32_t),
+                                              sizeof(uint32_t), &wpos, 0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d] on %s: chunked targeted chunk_index "
+                            "readback (chunk=%zu slot=%u) failed (err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname, c, slot, err);
+                        exit(1);
+                    }
+                    if (wpos >= actual_byte_count) continue;
+
+                    /* Read the [len][bytes] record (<=256 B). */
+                    size_t avail = (size_t)actual_byte_count - (size_t)wpos;
+                    size_t want  = avail < 256u ? avail : 256u;
+                    uint8_t recbuf[256];
+                    err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
+                                              CL_TRUE, (size_t)wpos, want,
+                                              recbuf, 0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d] on %s: chunked targeted packed_buf "
+                            "readback (chunk=%zu slot=%u wpos=%u want=%zu) failed (err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname, c, slot,
+                            wpos, want, err);
+                        exit(1);
+                    }
+                    uint32_t plen = recbuf[0];
+                    if ((size_t)1u + plen > want) continue;  /* truncated; skip */
+
+                    /* Grow arena if needed. */
+                    size_t rec_bytes = (size_t)1u + plen;
+                    if (d->h_proto_resolved_buf_used + rec_bytes
+                            > d->h_proto_resolved_buf_cap) {
+                        size_t newcap = d->h_proto_resolved_buf_cap * 2u;
+                        while (newcap < d->h_proto_resolved_buf_used + rec_bytes)
+                            newcap *= 2u;
+                        uint8_t *nb = (uint8_t *)realloc(d->h_proto_resolved_buf, newcap);
+                        if (!nb) {
+                            fprintf(stderr,
+                                "FATAL: %s:%d GPU[%d] on %s: chunked resolved arena "
+                                "realloc(%zu) failed\n",
+                                __FILE__, __LINE__, dev_idx, hostname, newcap);
+                            exit(1);
+                        }
+                        d->h_proto_resolved_buf = nb;
+                        d->h_proto_resolved_buf_cap = newcap;
+                    }
+
+                    /* Store record at arena offset; record offset keyed by G. */
+                    size_t arena_off = d->h_proto_resolved_buf_used;
+                    memcpy(d->h_proto_resolved_buf + arena_off, recbuf, rec_bytes);
+                    d->h_proto_resolved_buf_used += rec_bytes;
+                    d->h_proto_resolved_off[G] = (uint32_t)arena_off;
+
+                    /* Rewrite hit record into d->h_hits at ordinal G: entry[0]=G,
+                     * entries [1..18] copied verbatim from the chunk hit. */
+                    uint32_t *out = d->h_hits + (size_t)G * GPU_HIT_STRIDE;
+                    out[0] = G;
+                    for (int w = 1; w < GPU_HIT_STRIDE; w++) out[w] = he[w];
+                    G++;
+                }
+                free(chunk_hits);
+            }
+
+            sub_start += this_count;   /* advance past this (sub)span */
+        } /* while sub_start */
+    } /* for chunks */
+
+    *nhits_out = (int)G;
+
+    /* Phase 1 stage-timing publish (2026-05-29, UNCOMMITTED).
+     * Push the aggregate kernel A+B device time + derived host_gap into the
+     * per-thread last-stage statics so gpujob_opencl.c's trace emitter
+     * (path=kernelB_saltaxis line) prints non-zero values for the chunked
+     * path. host_gap is computed as the wall span of the chunked dispatch
+     * on the device clock (first kernel-A start -> last kernel-B end)
+     * MINUS the sum of all kernel A+B device times — i.e., the total time
+     * the GPU was idle while the host did per-chunk bookkeeping
+     * (state readback, hit readback, targeted plaintext fetches, kernel B
+     * argbinds, b_hit_count zero-write, etc.).
+     *
+     * The wall_us field that gpujob_opencl.c already measures is the
+     * caller-observed dispatch wall, which includes the one-time word-payload
+     * write before the loop and the helper return — the on-device span is
+     * the more direct measure of "kernel A+B+gap". */
+    if (_stage_valid_any) {
+        _kb_last_kernel_a_us = _ka_us_sum;
+        _kb_last_kernel_b_us = _kb_us_sum;
+        uint64_t span_us = (uint64_t)(_last_b_end - _first_a_start) / 1000ULL;
+        uint64_t kernels_us = _ka_us_sum + _kb_us_sum;
+        _kb_last_host_gap_us = (span_us > kernels_us)
+                             ? (span_us - kernels_us) : 0;
+        _kb_last_queue_wait_a_us = 0;     /* not measured on chunked path */
+        _kb_last_stage_valid = 1;
+    }
+
+    /* Per-dispatch one-shot diagnostic for the perf-investigation report.
+     * Emits ONCE per device per process for the chunked path: total chunks
+     * issued, aggregate slot+byte traffic, derived average emit_len, and the
+     * per-chunk peak. Greppable for the Phase 1 bandwidth analysis. Cheap
+     * (single fprintf per dispatch, gated to first-fire). Drop after the
+     * investigation closes. */
+    if (_stage_valid_any) {
+        static int _bw_first[MAX_GPU_DEVICES] = {0};
+        if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES && !_bw_first[dev_idx]) {
+            _bw_first[dev_idx] = 1;
+            double avg_emit_len = 0.0;
+            if (_slot_sum_slots > 0) {
+                /* sum_bytes = sum_slots * (1 + avg_emit_len). */
+                avg_emit_len = ((double)_slot_sum_bytes / (double)_slot_sum_slots) - 1.0;
+            }
+            uint64_t span_us = (uint64_t)(_last_b_end - _first_a_start) / 1000ULL;
+            uint64_t kernels_us = _ka_us_sum + _kb_us_sum;
+            uint64_t gap_us = (span_us > kernels_us) ? (span_us - kernels_us) : 0;
+            fprintf(stderr,
+                "[perf-chunked] GPU[%d]: chunks=%zu K=%zu num_words=%u n_rules=%u "
+                "ka_us=%llu kb_us=%llu gap_us=%llu span_us=%llu G=%u "
+                "slot_sum=%llu byte_sum=%llu avg_emit_len=%.1f "
+                "max_slots_per_chunk=%u max_bytes_per_chunk=%u\n",
+                dev_idx, num_rule_chunks, K, num_words, n_rules,
+                (unsigned long long)_ka_us_sum,
+                (unsigned long long)_kb_us_sum,
+                (unsigned long long)gap_us,
+                (unsigned long long)span_us,
+                G,
+                (unsigned long long)_slot_sum_slots,
+                (unsigned long long)_slot_sum_bytes,
+                avg_emit_len,
+                _slot_max_slots_per_chunk,
+                _slot_max_bytes_per_chunk);
+        }
+    }
+
+    return d->h_hits;
+}
+
 /* Deliverable 4: Sibling dispatch entry point.
  *
  * gpu_opencl_kernelb_dispatch_proto — two-kernel pipeline prototype dispatch
@@ -12556,8 +13900,26 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * family body since the family is unsalted -- the upstream gpujob_-
      * opencl.c route gate uploads a zero-byte placeholder salt entry
      * for family ops so the bound salt buffers are non-NULL. */
+    /* Auto-dispatcher (2026-05-31): admission predicate for the proto
+     * dispatcher. Originally env-gated on MDXFIND_EXPERIMENT_RULES_-
+     * CODEGEN_MD5=1; with the env retirement (per project_codegen_-
+     * auto_dispatch_spec_2026-05-31.md), the upstream route gate at
+     * gpu/gpujob_opencl.c is the SOLE admission control point. If the
+     * route gate's auto-dispatcher pick was LEGACY, the proto path
+     * isn't invoked for these ops -- so checking the op set alone here
+     * is correct.
+     *
+     * The 4 unsalted single-hash primitives (MD5/MD4/SHA1RAW/SHA256RAW)
+     * are admitted unconditionally at this gate; whether the upstream
+     * actually routes them here is the auto-dispatcher's decision.
+     * JOB_MD5RAW (e33) intentionally excluded (binary-output variant).
+     * The local flag name `_exp_md5` is retained for diff hygiene; its
+     * semantic role is "unsalted-single codegen route active". */
+    int _exp_md5 = (op == JOB_MD5 || op == JOB_MD4
+                    || op == JOB_SHA1RAW || op == JOB_SHA256RAW);
     if (op != JOB_MD5MD5SALT
-        && !gpu_codegen_kernelb_family_md5pass_eligible(op)) {
+        && !gpu_codegen_kernelb_family_md5pass_eligible(op)
+        && !_exp_md5) {
         return NULL;
     }
 
@@ -12616,6 +13978,37 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
 
     cl_int err;
     uint32_t n_rules  = (uint32_t)d->gpu_n_rules;
+
+    /* RULE-AXIS CHUNKING (Option A, 2026-05-29). Decide whether the full
+     * (word x rule) candidate buffer fits the per-device cap in ONE dispatch.
+     *   max_packed_full = num_words * n_rules * 256
+     *   K (rules/chunk)  = max(1, cap_bytes / (num_words * 256))
+     *   num_rule_chunks  = ceil(n_rules / K)
+     * If num_rule_chunks <= 1 the dispatch degenerates to the EXISTING single-
+     * dispatch body below — bit-identical to the pre-chunking path (e347 /
+     * small-rule-count PRODUCTION safety, spec §1e/I4). Only num_rule_chunks
+     * > 1 enters the dedicated multi-chunk helper (rule-axis loop +
+     * resolved-plaintext arena), which fully owns the dispatch and returns. */
+    {
+        size_t cap_bytes = gpu_opencl_proto_cand_cap_bytes(d, dev_idx);
+        size_t per_word_rule_bytes = (size_t)num_words * 256u;
+        size_t K = (per_word_rule_bytes > 0)
+                 ? (cap_bytes / per_word_rule_bytes) : (size_t)n_rules;
+        if (K == 0) K = 1;
+        size_t num_rule_chunks = ((size_t)n_rules + K - 1) / K;
+
+        if (num_rule_chunks > 1) {
+            /* Multi-chunk path: dedicated helper owns the whole dispatch. */
+            return gpu_opencl_kernelb_dispatch_proto_chunked(
+                d, dev_idx, packed_words, packed_size, word_offset,
+                num_words, op, n_rules, K, num_rule_chunks, _exp_md5,
+                nhits_out);
+        }
+        /* Single-chunk degenerate path: make sure the accessor uses the
+         * LEGACY h_proto_* staging (a prior multi-chunk dispatch on this
+         * device may have left proto_resolved_active=1). */
+        d->proto_resolved_active = 0;
+    }
 
     /* Phase 5 stage-timing (2026-05-20): per-kernel cl_events captured below
      * so clGetEventProfilingInfo can disaggregate kernel A vs kernel B vs
@@ -12710,7 +14103,14 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         params.hash_data_count  = _hash_data_count;
         params.max_hits         = GPU_PACKED_MAX_HITS;
         params.overflow_count   = _overflow_count;
-        params.max_iter         = 1;               /* prototype: single iter */
+        /* Iter v1 (2026-05-31, project_codegen_iteration_v1_spec_-
+         * 2026-05-31.md): thread the user's -i value from the device-
+         * resident d->max_iter (set by gpu_opencl_set_max_iter from
+         * Maxiter at gpujob init). The codegen kernel B unsalted-single
+         * body now wraps probe with a runtime for-loop over [1..mi].
+         * Pre-iter-v1 hardcoded 1; legacy md5_rules_phase0 always read
+         * this field, so the codegen path now matches that contract. */
+        params.max_iter         = (d->max_iter < 1) ? 1u : (uint32_t)d->max_iter;
         params.salt_start       = 0;               /* kernel B reads this; host sets per salt-page below */
         params.num_salts        = (uint32_t)d->salts_count;
         /* base_word_idx: set to 0 here; will be overwritten per-chunk if chunking
@@ -12811,68 +14211,92 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
     uint32_t overflow_flag     = state[2];  /* KERNELA_STATE_OVERFLOW_FLAG */
 
 
-    /* --- 5b. Read back b_proto_packed_buf and b_proto_chunk_index for
-     * host-side hit replay (Phase 4, 2026-05-19). Per contract §7.1, the
-     * matched plaintext is at h_proto_packed_readback[h_proto_index_readback[slot]]
-     * after kernel A. We read back only actual_byte_count bytes of packed_buf
-     * and actual_slots * 4 bytes of chunk_index to minimize PCIe traffic.
-     * Skip readback if overflow or zero-slot (no hits possible). */
-    if (!overflow_flag && actual_slots > 0) {
-        /* Ensure host staging is large enough. */
-        if (actual_byte_count > d->h_proto_packed_readback_cap) {
-            free(d->h_proto_packed_readback);
-            d->h_proto_packed_readback = calloc(1, actual_byte_count + MIN_BUFFER_BYTES);
-            if (!d->h_proto_packed_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: h_proto_packed_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
+    /* --- 5b. Host-side hit-replay staging (Phase 4, 2026-05-19; targeted-
+     * readback rewrite 2026-05-29). Per contract §7.1 the matched plaintext is
+     * at h_proto_packed_readback[h_proto_index_readback[slot]]. Kernel B reads
+     * the candidate buffer DIRECTLY from its GPU cl_mem (b_proto_packed_buf +
+     * b_proto_chunk_index args) — so the host copy is NOT needed by the kernels;
+     * it exists solely so the host can map a hit slot -> plaintext for the
+     * replay below (gpu_opencl_kernelb_proto_plaintext, called from
+     * gpujob_opencl.c). Hits are RARE, so copying the ENTIRE candidate buffer
+     * (GB-scale on rule-heavy workloads) every dispatch dominated GPU time
+     * (host_gap was 71-93%). We now:
+     *   (a) allocate the host staging buffers to the worst-case caps here
+     *       (cheap calloc; NO PCIe traffic) so the accessor's bounds checks
+     *       pass and the post-kernel-B targeted writes land in-bounds; AND
+     *   (b) populate them with a TARGETED, hits-only readback AFTER kernel B
+     *       (below, just past the hit-count read) — a handful of small reads
+     *       (KB, not GB) instead of the full buffer.
+     * The full whole-buffer readback is retained ONLY for the
+     * MDXFIND_KERNEL_A_TRACE validation-dump channel (it needs every slot),
+     * gated behind that env flag so the normal path never pays for it.
+     * Skip if overflow or zero-slot (no hits possible). */
+    const char *_ka_trace = getenv("MDXFIND_KERNEL_A_TRACE");
+    int _want_full_readback = (_ka_trace && *_ka_trace);
+    {
+        if (!overflow_flag && actual_slots > 0) {
+            /* Ensure host staging is large enough (allocation only — no copy). */
+            if (actual_byte_count > d->h_proto_packed_readback_cap) {
+                free(d->h_proto_packed_readback);
+                d->h_proto_packed_readback = calloc(1, actual_byte_count + MIN_BUFFER_BYTES);
+                if (!d->h_proto_packed_readback) {
+                    fprintf(stderr, "FATAL: %s:%d GPU[%d]: h_proto_packed_readback calloc failed\n",
+                            __FILE__, __LINE__, dev_idx);
+                    exit(1);
+                }
+                d->h_proto_packed_readback_cap = actual_byte_count + MIN_BUFFER_BYTES;
             }
-            d->h_proto_packed_readback_cap = actual_byte_count + MIN_BUFFER_BYTES;
-        }
-        size_t index_bytes = (size_t)actual_slots * sizeof(uint32_t);
-        if (index_bytes > d->h_proto_index_readback_cap) {
-            free(d->h_proto_index_readback);
-            d->h_proto_index_readback = calloc(1, index_bytes + MIN_BUFFER_BYTES);
-            if (!d->h_proto_index_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: h_proto_index_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
+            size_t index_bytes = (size_t)actual_slots * sizeof(uint32_t);
+            if (index_bytes > d->h_proto_index_readback_cap) {
+                free(d->h_proto_index_readback);
+                d->h_proto_index_readback = calloc(1, index_bytes + MIN_BUFFER_BYTES);
+                if (!d->h_proto_index_readback) {
+                    fprintf(stderr, "FATAL: %s:%d GPU[%d]: h_proto_index_readback calloc failed\n",
+                            __FILE__, __LINE__, dev_idx);
+                    exit(1);
+                }
+                d->h_proto_index_readback_cap = index_bytes + MIN_BUFFER_BYTES;
             }
-            d->h_proto_index_readback_cap = index_bytes + MIN_BUFFER_BYTES;
+
+            if (_want_full_readback) {
+                /* TRACE ONLY: copy the entire candidate buffer + chunk index so
+                 * the validation dump below has every slot. This is the old hot-
+                 * path cost, now confined to the diagnostic flag. */
+                err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf, CL_TRUE,
+                                          0, (size_t)actual_byte_count,
+                                          d->h_proto_packed_readback,
+                                          0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr, "FATAL: %s:%d GPU[%d]: b_proto_packed_buf trace readback failed (err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, err);
+                    exit(1);
+                }
+                err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index, CL_TRUE,
+                                          0, index_bytes,
+                                          d->h_proto_index_readback,
+                                          0, NULL, NULL);
+                if (err != CL_SUCCESS) {
+                    fprintf(stderr, "FATAL: %s:%d GPU[%d]: b_proto_chunk_index trace readback failed (err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, err);
+                    exit(1);
+                }
+            }
         }
-        /* Read packed_buf from device (CL_TRUE: synchronous; kernel A already done
-         * per FIFO ordering, but explicit sync is belt-and-suspenders). */
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf, CL_TRUE,
-                                  0, (size_t)actual_byte_count,
-                                  d->h_proto_packed_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: b_proto_packed_buf readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        /* Read chunk_index from device. */
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index, CL_TRUE,
-                                  0, index_bytes,
-                                  d->h_proto_index_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: b_proto_chunk_index readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
+
+        /* Phase 1a A1 buffer-quadruple trace channel (Phase 1a spec §10 q7):
+         * harness reads the dumped files to byte-exact validate the A1 output
+         * shape. Zero overhead when MDXFIND_KERNEL_A_TRACE is unset. The host
+         * buffers are fully populated only in _want_full_readback mode, so the
+         * dump is gated on the same flag (otherwise it would dump uninitialized
+         * staging). */
+        if (_want_full_readback) {
+            gpu_opencl_kernel_a_trace_dump(dev_idx, state,
+                d->h_proto_index_readback,
+                (size_t)actual_slots * sizeof(uint32_t),
+                d->h_proto_packed_readback,
+                (size_t)actual_byte_count);
         }
     }
-
-    /* Phase 1a A1 buffer-quadruple trace channel (Phase 1a spec §10 q7):
-     * harness reads the dumped files to byte-exact validate the A1 output
-     * shape. Zero overhead when MDXFIND_KERNEL_A_TRACE is unset. Called
-     * AFTER the readback so the host buffers reflect kernel A's final
-     * state regardless of whether kernel B subsequently runs. */
-    gpu_opencl_kernel_a_trace_dump(dev_idx, state,
-        d->h_proto_index_readback,
-        (size_t)actual_slots * sizeof(uint32_t),
-        d->h_proto_packed_readback,
-        (size_t)actual_byte_count);
 
     if (overflow_flag) {
         /* Kernel A overflowed the candidate buffer. For the prototype,
@@ -12934,22 +14358,24 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         }
     }
 
-    /* Zero hit buffer. */
+    /* Hit buffer: NO pre-zero needed (2026-05-29). Previously the host did a
+     * memset of the entire 1M-entry x HIT_STRIDE host buffer (~80 MB) plus a
+     * synchronous CL_TRUE clEnqueueWriteBuffer of the same ~80 MB to the device
+     * EVERY dispatch — gratuitous whole-buffer host traffic that dominated
+     * host_gap on rule-light workloads (measured ~14-15 ms of a ~17 ms gap on
+     * Pascal GTX 1080). It is redundant: every EMIT_HIT_* macro in gpu_common.cl
+     * fully writes all HIT_STRIDE words of each slot it claims (meaningful
+     * fields + an explicit zero-fill of the tail), and the host reads back only
+     * the first hit_count slots (see step 9 below), all of which were claimed
+     * and fully written by the kernel. Stale data beyond hit_count is never
+     * read. Only the atomic slot counter (b_hit_count + payload offset 128)
+     * needs zeroing; both are zeroed elsewhere (the payload hit_count at ~128
+     * above, b_hit_count just below). */
     if (!d->b_hits || !d->h_hits) {
         /* h_hits / b_hits should already be allocated by gpu_opencl_init. */
         fprintf(stderr,
             "FATAL: %s:%d OpenCL GPU[%d]: b_hits/h_hits not allocated before proto dispatch\n",
             __FILE__, __LINE__, dev_idx);
-        exit(1);
-    }
-    memset(d->h_hits, 0, (size_t)GPU_PACKED_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t));
-    err = clEnqueueWriteBuffer(d->queue, d->b_hits, CL_TRUE,
-                               0, (size_t)GPU_PACKED_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t),
-                               d->h_hits, 0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: proto b_hits zero-write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
         exit(1);
     }
 
@@ -13142,9 +14568,27 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         uint32_t num_salt_chunks =
             (nsalts_packed + wg_size - 1u) / wg_size;
         if (num_salt_chunks == 0u) num_salt_chunks = 1u;  /* guard nsalts==0 */
-        size_t gsize_b =
-            (size_t)actual_slots * (size_t)num_salt_chunks * (size_t)wg_size;
+        size_t gsize_b;
         size_t lsize_b = (size_t)wg_size;
+
+        /* S1 grid geometry (experiment 2026-05-29): the unsalted MD5
+         * codegen kernel B (kernelb_hx_codegen_phase0) is 1 lane per
+         * candidate — its body is `word_idx = gid; if (word_idx >=
+         * params.num_words) return;` with NO salt fan-out (the 4 salt
+         * args are ignored). Running it with the salt-fanned e347 grid
+         * (actual_slots * num_salt_chunks * wg_size) would launch 64x
+         * the lanes for N_salts==1 (63/64 early-return) — correct but it
+         * would badly skew the benchmark. So for the unsalted experiment
+         * op we launch exactly actual_slots lanes, padded up to a wg_size
+         * multiple to honor the reqd_work_group_size(64,1,1) attribute.
+         * The salted e347 / family path keeps the salt-fanned formula. */
+        if (_exp_md5) {
+            gsize_b = ((size_t)actual_slots + wg_size - 1u) / wg_size;
+            gsize_b *= wg_size;
+        } else {
+            gsize_b =
+                (size_t)actual_slots * (size_t)num_salt_chunks * (size_t)wg_size;
+        }
 
         /* Phase 5 stage-timing (2026-05-20): capture kernel B event. See
          * declaration site comment. */
@@ -13188,6 +14632,71 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
                     "FATAL: %s:%d OpenCL GPU[%d]: proto b_hits readback failed (err=%d)\n",
                     __FILE__, __LINE__, dev_idx, err);
                 exit(1);
+            }
+
+            /* --- 9b. Targeted, hits-only plaintext readback (2026-05-29). ---
+             * The whole-candidate-buffer readback was removed from the hot path
+             * (§5b above). The host now copies ONLY the candidates that actually
+             * hit, into the same h_proto_* staging the replay accessor reads.
+             * gpu_opencl_kernelb_proto_plaintext(slot) does:
+             *     wpos = h_proto_index_readback[slot];
+             *     plen = h_proto_packed_readback[wpos];
+             *     plaintext = &h_proto_packed_readback[wpos + 1];
+             * so for each hit we (1) read the single uint32 chunk_index[slot]
+             * from the GPU to learn wpos, store it at h_proto_index_readback[slot];
+             * (2) read the length byte + plaintext (kernel A clamps emit_len to
+             * 255, so the record is at most 1+255 = 256 bytes; we read
+             * min(256, remaining)) from b_proto_packed_buf at
+             * wpos, store at h_proto_packed_readback[wpos]. Skip when the host
+             * staging already holds the full buffer (trace mode) — no point
+             * re-reading. A duplicate hit slot is harmless (idempotent rewrite). */
+            if (!_want_full_readback && d->h_proto_index_readback &&
+                d->h_proto_packed_readback) {
+                for (uint32_t _hi = 0; _hi < hcount; _hi++) {
+                    uint32_t _slot = d->h_hits[(size_t)_hi * GPU_HIT_STRIDE + 0];
+                    size_t _idx_off = (size_t)_slot * sizeof(uint32_t);
+                    /* Slot must be within the index staging we allocated
+                     * (actual_slots entries). Out-of-range = corrupt hit; the
+                     * accessor will also reject it, but skip the read here. */
+                    if (_idx_off + sizeof(uint32_t) > d->h_proto_index_readback_cap)
+                        continue;
+                    /* (1) Read this slot's byte offset into the packed buffer. */
+                    uint32_t _wpos = 0;
+                    err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index,
+                                              CL_TRUE, _idx_off,
+                                              sizeof(uint32_t), &_wpos,
+                                              0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d]: targeted chunk_index readback "
+                            "(slot=%u) failed (err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, _slot, err);
+                        exit(1);
+                    }
+                    if (_wpos >= (uint32_t)actual_byte_count) continue;
+                    /* (2) Read the length byte + plaintext at wpos (clamped). */
+                    size_t _avail = (size_t)actual_byte_count - (size_t)_wpos;
+                    size_t _want  = _avail < 256u ? _avail : 256u;
+                    if ((size_t)_wpos + _want > d->h_proto_packed_readback_cap)
+                        _want = (d->h_proto_packed_readback_cap > (size_t)_wpos)
+                              ? (d->h_proto_packed_readback_cap - (size_t)_wpos)
+                              : 0;
+                    if (_want == 0) continue;
+                    err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
+                                              CL_TRUE, (size_t)_wpos, _want,
+                                              (uint8_t *)d->h_proto_packed_readback
+                                                  + _wpos,
+                                              0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d]: targeted packed_buf readback "
+                            "(slot=%u wpos=%u want=%zu) failed (err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, _slot, _wpos, _want, err);
+                        exit(1);
+                    }
+                    /* Store wpos so the accessor maps slot -> wpos -> plaintext. */
+                    ((uint32_t *)d->h_proto_index_readback)[_slot] = _wpos;
+                }
             }
         }
         *nhits_out = (int)hcount;
@@ -13310,6 +14819,26 @@ const char *gpu_opencl_kernelb_proto_plaintext(
     if (plen_out) *plen_out = 0;
     if (dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
     struct gpu_device *d = &gpu_devs[dev_idx];
+
+    /* RULE-AXIS CHUNKING (Option A, 2026-05-29): multi-chunk mode resolves
+     * plaintext from the per-device arena keyed by the GLOBAL hit ordinal G
+     * (= hit_widx). The dispatcher copied each hit's [len][bytes] record into
+     * h_proto_resolved_buf BEFORE the next chunk clobbered b_proto_packed_buf,
+     * and recorded its arena byte offset at h_proto_resolved_off[G]. Single-
+     * chunk (e347 / small-rule-count) dispatch leaves proto_resolved_active=0
+     * and takes the verbatim legacy h_proto_index/packed path below. */
+    if (d->proto_resolved_active) {
+        if (!d->h_proto_resolved_off || !d->h_proto_resolved_buf) return NULL;
+        uint32_t G = hit_widx;
+        if ((size_t)G >= d->h_proto_resolved_off_cap) return NULL;
+        size_t arena_off = d->h_proto_resolved_off[G];
+        if (arena_off + 1 > d->h_proto_resolved_buf_used) return NULL;
+        uint8_t plen = d->h_proto_resolved_buf[arena_off];
+        if (arena_off + 1 + plen > d->h_proto_resolved_buf_used) return NULL;
+        if (plen_out) *plen_out = (int)plen;
+        return (const char *)(d->h_proto_resolved_buf + arena_off + 1);
+    }
+
     if (!d->h_proto_index_readback || !d->h_proto_packed_readback) return NULL;
 
     /* slot_idx == hit_widx (base_word_idx=0 in single-chunk prototype). */

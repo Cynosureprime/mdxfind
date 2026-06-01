@@ -110,24 +110,30 @@ endif
 
 # Metal GPU objects (macOS only)
 ifdef METAL_GPU
-  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o gpu/gpu_codegen_eligible.o
+  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o gpu/gpu_codegen_eligible.o gpu/codegen_auto_dispatch.o
 endif
 
 # OpenCL GPU objects (Linux, FreeBSD, aarch64)
 ifdef OPENCL_GPU
-  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o gpu/gpu_codegen_eligible.o
+  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o gpu/gpu_codegen_eligible.o gpu/codegen_auto_dispatch.o
   CFLAGS += -Igpu
 endif
 
-# hx in-process codegen pipeline (used by both OpenCL and Metal builds)
-# Pulled from codegen/Makefile.frag. Defines CODEGEN_OBJS and CODEGEN_HDRS.
+# hx in-process codegen pipeline (used by both OpenCL and Metal builds,
+# AND by userdef.c's hx_detect_pattern call in userdef_gpu_status; always
+# linked so CPU-only builds remain link-clean). Pulled from
+# codegen/Makefile.frag. Defines CODEGEN_OBJS and CODEGEN_HDRS.
 # codegen/hx_specs_data.c is shipped as a pre-generated build artifact in
 # this repository (regenerated on the iMac via tools/hx8_to_c from hx.8);
 # external builds compile it directly without needing hx.8 or the tool.
-ifneq ($(or $(METAL_GPU),$(OPENCL_GPU)),)
-  include codegen/Makefile.frag
-  MDXFIND_OBJS += $(CODEGEN_OBJS)
-endif
+include codegen/Makefile.frag
+MDXFIND_OBJS += $(CODEGEN_OBJS)
+
+# hx language standalone objects (used by mdxfind for user-defined hash
+# types via userdef.c). hx.tab.c + hx.lex.c are shipped as pre-generated
+# bison/flex artifacts so external builds do not need bison or flex.
+HX_SA_OBJS = userdef.o hx_func_sa.o hx_lib.o hx_ast.o hx_compile.o hx_vm.o hx.tab.o hx.lex.o
+MDXFIND_OBJS += $(HX_SA_OBJS)
 
 # argon2 fill-block selection: SSE on x86_64, portable ref elsewhere
 ifeq ($(UNAME_M),x86_64)
@@ -303,6 +309,46 @@ endif
 # nor -DMETAL_GPU.
 gpu/gpu_codegen_eligible.o: gpu/gpu_codegen_eligible.c gpu/gpu_codegen_eligible.h job_types.h
 	$(CC) $(CFLAGS) -c gpu/gpu_codegen_eligible.c -o gpu/gpu_codegen_eligible.o
+
+# codegen_auto_dispatch: in-engine capability+perf matrix for GPU rules
+# backend selection (legacy vs codegen). Pure C; replaces the
+# MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 env-flag opt-in. See spec
+# project_codegen_auto_dispatch_spec_2026-05-31. Compiled with neither
+# -DOPENCL_GPU nor -DMETAL_GPU (used by both backend route gates).
+gpu/codegen_auto_dispatch.o: gpu/codegen_auto_dispatch.c gpu/codegen_auto_dispatch.h job_types.h
+	$(CC) $(CFLAGS) -c gpu/codegen_auto_dispatch.c -o gpu/codegen_auto_dispatch.o
+
+# hx language standalone objects for mdxfind's user-defined hash types
+# (userdef.c). hx_func_sa.o uses -DHX_STANDALONE; userdef.o uses
+# -DUSERDEF_HAVE_CODEGEN. hx.tab.c and hx.lex.c are shipped as pre-generated
+# bison/flex artifacts so external builds do not need bison or flex.
+# userdef.o is always compiled with -DUSERDEF_HAVE_CODEGEN because
+# codegen objects are always linked into mdxfind (see CODEGEN_OBJS above).
+# This matches the iMac authoritative Makefile and avoids the
+# userdef_gpu_status link gap.
+userdef.o: userdef.c userdef.h hx_vm.h
+	$(CC) $(CFLAGS) -DUSERDEF_HAVE_CODEGEN -c userdef.c
+
+hx_func_sa.o: hx_func.c hx_vm.h
+	$(CC) $(CFLAGS) -DHX_STANDALONE -c hx_func.c -o hx_func_sa.o
+
+hx_lib.o: hx.c hx_ast.h hx_vm.h hx.tab.h
+	$(CC) $(CFLAGS) -c hx.c -o hx_lib.o
+
+hx_ast.o: hx_ast.c hx_ast.h
+	$(CC) $(CFLAGS) -c hx_ast.c
+
+hx_compile.o: hx_compile.c hx_ast.h hx_vm.h
+	$(CC) $(CFLAGS) -c hx_compile.c
+
+hx_vm.o: hx_vm.c hx_vm.h
+	$(CC) $(CFLAGS) -c hx_vm.c
+
+hx.tab.o: hx.tab.c hx_ast.h
+	$(CC) $(CFLAGS) -c hx.tab.c
+
+hx.lex.o: hx.lex.c hx.tab.h
+	$(CC) $(CFLAGS) -c hx.lex.c
 
 # _str.h files are pre-generated on the dev machine and committed directly.
 # The .cl/.metal kernel sources are NOT published to this repository.

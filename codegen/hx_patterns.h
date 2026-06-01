@@ -30,8 +30,11 @@
  * for per-call-site name lookup. Detector ships in 5a.1; per-primitive
  * emitter is sub-phase 5a.2.
  *
- * $Revision: 1.2 $
+ * $Revision: 1.3 $
  * $Log: hx_patterns.h,v $
+ * Revision 1.3  2026/05/28 14:31:55  dlr
+ * Phase 1b Batch 1: add HX_PATTERN_UNSALTED_SINGLE detector for the 3-op PUSH_VAR pass CALL hash HALT shape covering e1 MD5 e3 MD4 e33 MD5RAW e34 SHA1RAW e36 SHA256RAW; structural-only, emit helper validates callname; RAW variants differ only in call role ROLE_BIN vs ROLE_DEFAULT a host-side output-format concern not a kernel-compute difference; dispatch table row added cannot collide with e347 ncode 7 or family ncode 6; detector recognition test all pass e347 and e161 correctly not matched
+ *
  * Revision 1.2  2026/05/22 23:52:27  dlr
  * sub-phase 5a.1 add HX_PATTERN_FAMILY_MD5PASS enum + hx_callname_for_entry accessor declaration with forward decl of struct hx_spec_entry
  *
@@ -84,7 +87,22 @@ typedef enum {
      * HALT). Detector verifies structure only; per-algorithm dispatch
      * resolves the outer-CALL name via hx_callname_for_entry at
      * emitter time. Real emitter lands sub-phase 5a.2. */
-    HX_PATTERN_FAMILY_MD5PASS = 2
+    HX_PATTERN_FAMILY_MD5PASS = 2,
+    /* Phase 1b Batch 1 (2026-05-28): unsalted single-hash pattern for
+     * the category-(a) MD/SHA family. Canonical 3-op shape:
+     *   [0] OP_PUSH_VAR slot=0 (pass)
+     *   [1] OP_CALL    <prim>  nargs=1   (role 0 hex OR role 1 raw-bin)
+     *   [2] OP_HALT
+     * Matches e1 MD5 (`md5(pass)`), e3 MD4 (`md4(pass)`), e33 MD5RAW
+     * (`md5_bin(pass)` -> CALL md5 role=1), e34 SHA1RAW, e36 SHA256RAW.
+     * The detector is structural-only (does NOT verify the callname or
+     * role); the emit helper resolves the primitive via
+     * hx_callname_for_entry(entry, 1) and validates it is in the
+     * supported set. The RAW variants share IDENTICAL bytecode + digest
+     * with their hex siblings; only role differs (ROLE_BIN=1 vs
+     * ROLE_DEFAULT=0). The raw-vs-hex distinction is a HOST-SIDE
+     * hit-record-format concern, NOT a kernel-compute difference. */
+    HX_PATTERN_UNSALTED_SINGLE = 3
     /* Future:
      * HX_PATTERN_E31_MD5MD5SALT,
      * HX_PATTERN_E386_SHA512PASSSALT,

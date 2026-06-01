@@ -130,6 +130,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <mach/mach_time.h>   /* mach_absolute_time for gpu_metal_now_us
+                               * (MDXFIND_DISPATCH_TRACE host-wall clock).
+                               * 2026-05-31 — Metal twin of OpenCL
+                               * MDXFIND_DISPATCH_TRACE port. */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -341,6 +345,23 @@ static size_t                      h_proto_packed_readback_cap          = 0;
 static void                       *h_proto_index_readback               = NULL;
 static size_t                      h_proto_index_readback_cap           = 0;
 
+/* RULE-AXIS CHUNKING (Metal twin, 2026-05-31; mirror of OpenCL #343
+ * gpu/gpu_opencl.c gpu_device.h_proto_resolved_* fields). Per-process file-
+ * statics (Metal is single-device today; promote to a struct on multi-device
+ * Metal). When the multi-chunk dispatcher is active the resolve-before-clobber
+ * arena holds each chunk's emitted [len][bytes] candidate plaintext keyed by
+ * the GLOBAL hit ordinal G. gpu_metal_kernelb_proto_plaintext branches on
+ * mtl_proto_resolved_active: if set, reads from the arena via mtl_h_proto_-
+ * resolved_off[G]; else (single-chunk degenerate) takes the legacy direct-
+ * from-device-buffer path. SHAPE 2 per spec §1d. */
+static uint8_t                    *mtl_h_proto_resolved_buf             = NULL;
+static size_t                      mtl_h_proto_resolved_buf_cap         = 0;
+static size_t                      mtl_h_proto_resolved_buf_used        = 0;
+static uint32_t                   *mtl_h_proto_resolved_off             = NULL;
+static size_t                      mtl_h_proto_resolved_off_cap         = 0;
+static int                         mtl_proto_resolved_active            = 0;
+static size_t                      mtl_proto_cand_cap_bytes             = 0;  /* lazy-computed */
+
 /* Phase 1a sub-phase 1a.2 (2026-05-21): kernel A2 (masks-only) standalone
  * library + PSO statics. Mirrors the A1 pattern above (rules-variant).
  * Entry-point name `cand_masks_phase0` (matches OpenCL twin gpu/
@@ -393,11 +414,16 @@ static void                       *mtl_lib_kernelb_codegen              = NULL;
 static void                       *mtl_pso_kernelb_codegen              = NULL;
 
 /* Sub-phase 5a.3 (2026-05-22): per-JOB slot map for the codegen kernel B
- * PSO cache, mirroring the OpenCL twin's gpu_device.hx_codegen_slots[16]
- * (gpu/gpu_opencl.c rev 1.192). Slot 0 is reserved for back-compat with
+ * PSO cache, mirroring the OpenCL twin's gpu_device.hx_codegen_slots[64]
+ * (gpu/gpu_opencl.c rev 1.193+). Slot 0 is reserved for back-compat with
  * the 4a.2 statics above (single-PSO API gpu_metal_kernelb_codegen_pso
- * still works); family members occupy slots 1+. Bumped to 64 in 5b when
- * the remaining 22 deferred family members ship.
+ * still works); family members occupy slots 1+.
+ *
+ * Sub-phase 5b.3a.0.2 (2026-05-27): MTL_CODEGEN_SLOT_COUNT bumped 16 -> 64
+ * to accommodate the Tier 3 HAVAL ship (15 new family members). Post-
+ * Tier-3 active codegen entry count = 11 prior + 15 HAV + e347 = 27,
+ * comfortably below the new 64 cap; headroom carries through Tier 4
+ * (Snefru x2 + GOST) to 30 entries.
  *
  * Storage is CFBridgingRetain'd void* (parallel to the 4a.2 single-PSO
  * statics) so the slots can live in a C-friendly struct without ARC
@@ -411,7 +437,7 @@ typedef struct mtl_codegen_slot_s {
 } mtl_codegen_slot;
 
 #ifndef MTL_CODEGEN_SLOT_COUNT
-#define MTL_CODEGEN_SLOT_COUNT 16
+#define MTL_CODEGEN_SLOT_COUNT 64
 #endif
 static mtl_codegen_slot mtl_codegen_slots[MTL_CODEGEN_SLOT_COUNT];
 
@@ -1023,7 +1049,40 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
         return nil;
     }
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    /* No preprocessorMacros -- variant=1 is baked into the source. */
+    /* KERNEL_A_VARIANT=1 is baked into the source itself. Knob G
+     * (2026-05-29, spec project_metal_knob_g_spec_2026-05-29.md):
+     * when MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1 is set, thread
+     * -DKNOBG_VEC_WRITE=1 into preprocessorMacros so the kernel's
+     * KNOBG branch (uint4-style coalesced candidate writes) compiles.
+     * PROFILE_VARIANT (2026-05-29, spec project_metal_profile_variant_-
+     * spec_2026-05-29.md): when MDXFIND_METAL_PROFILE_VARIANT=N (N in
+     * 1..6) is set, thread -DPROFILE_VARIANT=N into preprocessorMacros
+     * so the kernel's variant-N gate compiles. Apple's MTLLibrary self-
+     * cache is keyed on source + macros, so cache disambiguation across
+     * both flags is automatic (per Knob G spec R6 + profile_variant
+     * spec R10). Build the macros dict programmatically: empty / KNOBG-
+     * only / PROFILE_VARIANT-only / both, per spec §8 row 9.
+     *
+     * Composition precedence (per spec §5c): PROFILE_VARIANT=1..5
+     * short-circuit before/instead of the KNOBG path -- still safe to
+     * thread KNOBG into the macros (dead code in the variant arm), but
+     * we OMIT it to keep the JIT cache key clean. PROFILE_VARIANT=6
+     * bakes the KNOBG-equivalent path internally -- ditto, OMIT the
+     * env-flag KNOBG macro. PROFILE_VARIANT=0 (default) -> KNOBG
+     * respects its own env flag. */
+    int _knobg = gpu_metal_experiment_knobg_vec_write_enabled();
+    int _pv    = gpu_metal_profile_variant();
+    NSMutableDictionary *_macros = [[NSMutableDictionary alloc] init];
+    if (_pv > 0) {
+        [_macros setObject:@(_pv) forKey:@"PROFILE_VARIANT"];
+        /* When PROFILE_VARIANT is active (1..6), KNOBG_VEC_WRITE env
+         * flag is intentionally IGNORED per spec §5c precedence rule. */
+    } else if (_knobg) {
+        [_macros setObject:@1 forKey:@"KNOBG_VEC_WRITE"];
+    }
+    if ([_macros count] > 0) {
+        opts.preprocessorMacros = _macros;
+    }
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
@@ -1033,8 +1092,18 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
                 err ? [[err localizedDescription] UTF8String] : "(no error)");
         return nil;
     }
-    GPU_DEBUG_FPRINTF(stderr,
-        "Metal: kernel A1 (rules-only) library JIT-compiled\n");
+    if (_pv > 0) {
+        fprintf(stderr,
+            "Metal: kernel A1 (rules-only) library JIT-compiled "
+            "(PROFILE_VARIANT=%d)\n", _pv);
+    } else if (_knobg) {
+        fprintf(stderr,
+            "Metal: kernel A1 (rules-only) library JIT-compiled "
+            "(KNOBG_VEC_WRITE=1)\n");
+    } else {
+        GPU_DEBUG_FPRINTF(stderr,
+            "Metal: kernel A1 (rules-only) library JIT-compiled\n");
+    }
     return lib;
 }
 
@@ -1264,6 +1333,28 @@ static id<MTLLibrary> metal_load_library_kernel_a_bruteforce(id<MTLDevice> devic
         return nil;
     }
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    /* PROFILE_VARIANT-for-A4 (2026-05-30 architect spec
+     * project_kernel_a_a4_profile_variant_spec_2026-05-30.md D5.a + §5
+     * JIT cache disambiguation): thread A4_PROFILE_VARIANT=N into
+     * MTLCompileOptions.preprocessorMacros when active. Apple's MTLLibrary
+     * self-cache is keyed on (source + macros), so per-variant cache
+     * disambiguation is automatic. Macro name distinct from A1's
+     * PROFILE_VARIANT so the two engines' programs can coexist.
+     *
+     * 2026-05-30 A4 C5 DEFAULT-ON REFACTOR: the env-gated
+     * KNOBG_A4_VEC_WRITE=1 macro threading was REMOVED here. The uint4
+     * (16-byte) device-store write path is now the unconditional V0
+     * production path in the kernel; no JIT macro is needed to select
+     * it. The accessor function gpu_metal_experiment_kernel_a4_vec_-
+     * write_enabled() was also removed. */
+    int _a4pv = gpu_metal_kernel_a4_profile_variant();
+    NSMutableDictionary *_macros = [[NSMutableDictionary alloc] init];
+    if (_a4pv > 0) {
+        [_macros setObject:@(_a4pv) forKey:@"A4_PROFILE_VARIANT"];
+    }
+    if ([_macros count] > 0) {
+        opts.preprocessorMacros = _macros;
+    }
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
@@ -1273,8 +1364,14 @@ static id<MTLLibrary> metal_load_library_kernel_a_bruteforce(id<MTLDevice> devic
                 err ? [[err localizedDescription] UTF8String] : "(no error)");
         return nil;
     }
-    GPU_DEBUG_FPRINTF(stderr,
-        "Metal: kernel A4 (bruteforce) library JIT-compiled\n");
+    if (_a4pv > 0) {
+        fprintf(stderr,
+            "Metal: kernel A4 (bruteforce) library JIT-compiled "
+            "(A4_PROFILE_VARIANT=%d)\n", _a4pv);
+    } else {
+        GPU_DEBUG_FPRINTF(stderr,
+            "Metal: kernel A4 (bruteforce) library JIT-compiled\n");
+    }
     return lib;
 }
 
@@ -1929,6 +2026,23 @@ void gpu_metal_shutdown(void)
         h_proto_index_readback     = NULL;
         h_proto_index_readback_cap = 0;
     }
+    /* RULE-AXIS CHUNKING (Metal twin, 2026-05-31): release the resolve-
+     * before-clobber arena + per-G offset table (lazy-alloc by
+     * gpu_metal_kernelb_dispatch_proto_chunked). Reset active flag so a
+     * fresh init() leaves the accessor on the legacy direct-buffer path. */
+    if (mtl_h_proto_resolved_buf != NULL) {
+        free(mtl_h_proto_resolved_buf);
+        mtl_h_proto_resolved_buf      = NULL;
+        mtl_h_proto_resolved_buf_cap  = 0;
+        mtl_h_proto_resolved_buf_used = 0;
+    }
+    if (mtl_h_proto_resolved_off != NULL) {
+        free(mtl_h_proto_resolved_off);
+        mtl_h_proto_resolved_off      = NULL;
+        mtl_h_proto_resolved_off_cap  = 0;
+    }
+    mtl_proto_resolved_active = 0;
+    mtl_proto_cand_cap_bytes  = 0;
     /* Phase 2c salt-variant statics. */
     mtl_pso_template_md5_salt_rules_presalt = nil;
     mtl_lib_template_md5_salt_rules_presalt = nil;
@@ -3998,6 +4112,380 @@ int gpu_metal_hx_codegen_enabled(void)
     return 1;
 }
 
+/* gpu_metal_experiment_rules_codegen_md5_enabled REMOVED 2026-05-31
+ * per project_codegen_auto_dispatch_spec_2026-05-31.md (D1.c). The
+ * user-visible MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 env flag is
+ * RETIRED; the dispatcher now consults gpu/codegen_auto_dispatch.c
+ * per (op, iter, rules, mask, bf, backend_kind). Developer FORCE
+ * override: MDXFIND_GPU_BACKEND={auto|legacy|codegen}. */
+
+/* gpu_metal_experiment_knobg_vec_write_enabled -- Knob G env-flag gate
+ * (Metal twin, 2026-05-29). Returns 1 ONLY when the env var
+ *   MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1
+ * is set to the literal "1". Unset (or set to anything other than "1")
+ * = legacy per-byte write loop in Metal kernel A1 cand_rules_phase0
+ * -- byte-identical to the production-baseline Metal kernel shipped
+ * in Phase 4a.2b (2026-05-22).
+ *
+ * Unlike the OpenCL twin (which composes with the parent codegen
+ * experiment flag MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1), the Metal
+ * flag stands alone: on Metal, kernel A1 cand_rules_phase0 is the
+ * production path for e347 (and 7 Phase-5a MAKE_MD5PASS family algos
+ * e122/e159/e161/e163/e165/e167/e169) via gpu_metal_kernelb_dispatch_-
+ * proto. The Metal Knob G flag therefore activates on Metal builds
+ * independently of any OpenCL-side experiment chain. (Per spec D2.a.)
+ *
+ * Decision cached on first call. One-shot stderr advisory when active.
+ *
+ * Consumed by metal_load_library_kernel_a_rules (this TU) to thread
+ * `-DKNOBG_VEC_WRITE=1` into the Metal MTLCompileOptions.preprocessor-
+ * Macros at JIT library compile time. Apple's MTLLibrary self-cache
+ * is keyed on source + macros, so cache disambiguation is automatic
+ * (no manual cache-key extension needed). Per spec D1.a / R6. */
+int gpu_metal_experiment_knobg_vec_write_enabled(void)
+{
+    static int _cached = -1;
+    if (_cached != -1) return _cached;
+    const char *e = getenv("MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE");
+    _cached = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    if (_cached) {
+        fprintf(stderr,
+            "Metal: EXPERIMENT MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1 "
+            "(Knob G) -- kernel A1 (cand_rules_phase0) JIT-built with "
+            "-DKNOBG_VEC_WRITE=1; per-byte candidate write loop replaced "
+            "with direct uint stores from buf[] (no stage[] copy, per "
+            "spec D5.a -- avoids M1 register-budget spill); per-slot byte "
+            "claim rounded up to a 16-byte multiple. Crack set unchanged "
+            "(consumer reads only plen bytes; pad never accessed). "
+            "Production path e347 + Phase-5a family algos affected.\n");
+    }
+    return _cached;
+}
+
+/* gpu_metal_profile_variant -- PROFILE_VARIANT perf-decomposition
+ * env-flag gate (Metal twin, 2026-05-29). Returns the variant number
+ * 1..6 when MDXFIND_METAL_PROFILE_VARIANT is set to a valid value
+ * ("1".."6"); returns 0 otherwise (legacy byte-identical baseline V0,
+ * production unchanged).
+ *
+ * Variant meanings (also documented in gpu/metal_kernel_a_rules.metal
+ * file-top PROFILE_VARIANT block):
+ *   V0 (unset / 0)  baseline -- full cand_rules_phase0 unchanged
+ *   V1               no atomic claim (per-lane gid*256 offsets, write happens)
+ *   V2               no candidate write (atomic happens, byte loop omitted)
+ *   V3               stub apply_rule_thread (returns wlen; walker walks)
+ *   V4               walker-only (read word into buf, then return)
+ *   V5               empty kernel (return after cursor check)
+ *   V6               V0 + Metal Knob G FORCED ON (D5.a direct-from-buf)
+ *
+ * Unlike the OpenCL twin (which composes with the parent codegen
+ * experiment flag MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1), the Metal
+ * PROFILE_VARIANT stands alone -- on Metal, cand_rules_phase0 is the
+ * production path for e347 + 7 Phase-5a MAKE_MD5PASS family algos
+ * via gpu_metal_kernelb_dispatch_proto (Phase 4a.2b, 2026-05-22). No
+ * parent gate to compose with. Same shape as Metal Knob G.
+ *
+ * Composition with Metal Knob G env flag (MDXFIND_METAL_EXPERIMENT_-
+ * KNOBG_VEC_WRITE):
+ *   PROFILE_VARIANT=1..5 -> KNOB G env flag IGNORED (variants short-
+ *                           circuit before / instead of the productive
+ *                           write block).
+ *   PROFILE_VARIANT=6    -> KNOB G FORCED ON internally; KNOB G env
+ *                           flag IGNORED (variant bakes the path in).
+ *   PROFILE_VARIANT=0    -> KNOB G respects its own env flag.
+ *
+ * Crack-parity is INTENTIONALLY NOT preserved for V1..V5 (timing
+ * stubs); V6 DOES preserve crack-parity (it is the Metal Knob G
+ * implementation under a different selector).
+ *
+ * Decision cached on first call. One-shot stderr advisory when active.
+ * Per spec D1.a / D5.a (accept "0".."6"; reject 7+, negatives,
+ * non-numerics; warn-and-zero on invalid).
+ *
+ * Consumed by metal_load_library_kernel_a_rules (this TU) to thread
+ * -DPROFILE_VARIANT=N into MTLCompileOptions.preprocessorMacros at
+ * JIT library compile time. Apple's MTLLibrary self-cache is keyed
+ * on source + macros, so cache disambiguation per variant is automatic
+ * (per spec R10). */
+int gpu_metal_profile_variant(void)
+{
+    static int _cached = -1;
+    if (_cached != -1) return _cached;
+    const char *e = getenv("MDXFIND_METAL_PROFILE_VARIANT");
+    if (e == NULL || e[0] == '\0') {
+        _cached = 0;
+        return _cached;
+    }
+    /* Accept "0".."6"; reject anything else with warn-and-zero. */
+    if (e[0] >= '0' && e[0] <= '6' && e[1] == '\0') {
+        _cached = e[0] - '0';
+    } else {
+        fprintf(stderr,
+            "Metal: NOTICE -- MDXFIND_METAL_PROFILE_VARIANT=%s invalid "
+            "(expected 0..6); falling back to 0 / production.\n", e);
+        _cached = 0;
+        return _cached;
+    }
+    if (_cached >= 1 && _cached <= 5) {
+        fprintf(stderr,
+            "Metal: EXPERIMENT MDXFIND_METAL_PROFILE_VARIANT=%d -- kernel "
+            "A1 (cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=%d. "
+            "STUB BUILD: kernel A produces NO valid candidates for V1/V2/"
+            "V4/V5; host actual_slots=0 makes kernel B a no-op. V3 "
+            "produces only no-rule-pass survivors (the synthetic ':' "
+            "rule). Crack count expected ZERO for V1/V2/V4/V5; for V3 "
+            "expected the no-rule-baseline count. Use for kernel_a_us "
+            "timing attribution only. Timing harness auto-enabled "
+            "(MDXFIND_METAL_KERNEL_A_TIMING semantics). PROFILE_VARIANT "
+            "takes precedence over MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_"
+            "WRITE (which is IGNORED while PROFILE_VARIANT is 1..6).\n",
+            _cached, _cached);
+    } else if (_cached == 6) {
+        fprintf(stderr,
+            "Metal: EXPERIMENT MDXFIND_METAL_PROFILE_VARIANT=6 -- kernel "
+            "A1 (cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=6 "
+            "(Metal Knob G micro-benchmark variant). REAL CANDIDATES "
+            "produced with direct-from-buf uint stores FORCED ON "
+            "(regardless of MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE). "
+            "Crack output is bit-equivalent to V0 + Metal Knob G ON. "
+            "The V0-vs-V6 kernel_a_us delta isolates the per-byte-write "
+            "component reduction attributable to Metal Knob G. Timing "
+            "harness auto-enabled.\n");
+    }
+    return _cached;
+}
+
+/* gpu_metal_kernel_a_timing_enabled -- Phase 0 timing-harness gate
+ * (Metal twin, 2026-05-29). Returns 1 when EITHER env source is set:
+ *   MDXFIND_METAL_KERNEL_A_TIMING=1  (standalone Knob G timing)
+ *   MDXFIND_METAL_PROFILE_VARIANT=1..6  (D2.b -- auto-enable for
+ *                                          PROFILE_VARIANT runs so the
+ *                                          operator only needs ONE env
+ *                                          flag for the common case).
+ *
+ * When active, gpu_metal_kernelb_dispatch_proto records per-dispatch
+ * kernel-A wall time via Metal command-buffer GPUStartTime/GPUEndTime
+ * and emits a one-line per-dispatch advisory + final shutdown
+ * aggregate. Used for end-to-end + kernel-A A/B measurement to
+ * validate Knob G's perf claim AND for the PROFILE_VARIANT V0..V6
+ * decomposition deliverable (no quantitative prediction was made in
+ * the Metal spec; the measured number IS the deliverable per
+ * [[feedback_perf_knob_predictions_need_microbench]]).
+ *
+ * Default off; production untouched. Decision cached on first call.
+ * (Per spec D3 + D2.b promote-to-implicit refactor 2026-05-29.) */
+int gpu_metal_kernel_a_timing_enabled(void)
+{
+    static int _cached = -1;
+    if (_cached != -1) return _cached;
+    const char *e = getenv("MDXFIND_METAL_KERNEL_A_TIMING");
+    int direct = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    int via_pv = (gpu_metal_profile_variant() != 0) ? 1 : 0;
+    _cached = (direct || via_pv) ? 1 : 0;
+    if (_cached) {
+        if (direct) {
+            fprintf(stderr,
+                "Metal: MDXFIND_METAL_KERNEL_A_TIMING=1 -- per-dispatch "
+                "kernel-A wall time will be recorded via MTLCommandBuffer "
+                "GPUStartTime/GPUEndTime; shutdown-time aggregate dumped "
+                "to stderr.\n");
+        } else {
+            fprintf(stderr,
+                "Metal: kernel-A timing auto-enabled by MDXFIND_METAL_"
+                "PROFILE_VARIANT=%d -- per-dispatch kernel-A wall time "
+                "will be recorded via MTLCommandBuffer GPUStartTime/"
+                "GPUEndTime; shutdown-time aggregate dumped to stderr.\n",
+                gpu_metal_profile_variant());
+        }
+    }
+    return _cached;
+}
+
+/* metal_kernel_a_timing -- Phase 0 timing accumulator (Knob G spec D3).
+ * File-local static state; thread-safe by virtue of the proto dispatcher
+ * being single-call-per-process-per-dispatch (the GPU dispatch path
+ * serializes through the host loop). Atexit handler dumps aggregate. */
+static double  _mkt_total_us = 0.0;
+static double  _mkt_min_us   = 1e18;
+static double  _mkt_max_us   = 0.0;
+static unsigned long _mkt_count = 0;
+
+static void metal_kernel_a_timing_dump(void)
+{
+    if (_mkt_count == 0) return;
+    double mean = _mkt_total_us / (double)_mkt_count;
+    fprintf(stderr,
+        "[metal-kA] AGGREGATE dispatches=%lu total_us=%.1f mean_us=%.1f "
+        "min_us=%.1f max_us=%.1f\n",
+        _mkt_count, _mkt_total_us, mean, _mkt_min_us, _mkt_max_us);
+}
+
+static void metal_kernel_a_timing_record(int dev_idx, int op, double dt_us)
+{
+    static int _armed = 0;
+    if (!_armed) {
+        _armed = 1;
+        atexit(metal_kernel_a_timing_dump);
+    }
+    _mkt_total_us += dt_us;
+    if (dt_us < _mkt_min_us) _mkt_min_us = dt_us;
+    if (dt_us > _mkt_max_us) _mkt_max_us = dt_us;
+    _mkt_count++;
+    int _pv = gpu_metal_profile_variant();
+    if (_pv > 0) {
+        fprintf(stderr,
+            "[metal-kA] dev=%d dispatch=%lu kernel_a_us=%.1f op=%d "
+            "variant=%d\n",
+            dev_idx, _mkt_count, dt_us, op, _pv);
+    } else {
+        fprintf(stderr,
+            "[metal-kA] dev=%d dispatch=%lu kernel_a_us=%.1f op=%d\n",
+            dev_idx, _mkt_count, dt_us, op);
+    }
+}
+
+/* MDXFIND_DISPATCH_TRACE — Metal twin of OpenCL per-stage instrumentation
+ * (2026-05-31, port from gpu_opencl.c rev 1.178 + gpujob_opencl.c rev 1.146;
+ * gap surfaced in #389 thermal investigation). When set (any non-empty,
+ * non-"0" value), the chunked + single-dispatch proto paths emit one
+ * stderr line per chunk with per-stage kernel-A / host-gap / kernel-B /
+ * span micros, derived from MTLCommandBuffer GPUStartTime/GPUEndTime
+ * (GPU-side timestamps; coherent after waitUntilCompleted).
+ *
+ * Output line format (Metal-distinct prefix [disp-metal] so log parsers
+ * can branch on per-chunk vs OpenCL's per-batch granularity; same field
+ * names + order as OpenCL [disp] path=kernelB_saltaxis):
+ *
+ *   [disp-metal] dev=N op=N path=kernelB_proto_chunked chunk=N
+ *     num_words=N n_rules=N rules_in_chunk=N hits=N
+ *     kernel_a_us=N host_gap_us=N kernel_b_us=N span_us=N
+ *
+ * The single-dispatch path (num_rule_chunks <= 1) emits ONE line with
+ * chunk=0 and path=kernelB_proto.
+ *
+ * Coexists with MDXFIND_METAL_KERNEL_A_TIMING (Knob G [metal-kA] lines);
+ * both can be set simultaneously. Default off; production untouched.
+ * Decision cached on first call. */
+int gpu_metal_dispatch_trace_enabled(void)
+{
+    static int _cached = -1;
+    if (_cached != -1) return _cached;
+    const char *e = getenv("MDXFIND_DISPATCH_TRACE");
+    _cached = (e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
+    if (_cached) {
+        fprintf(stderr,
+            "Metal: MDXFIND_DISPATCH_TRACE=%s -- per-chunk "
+            "[disp-metal] line emitted with kernel_a_us / host_gap_us / "
+            "kernel_b_us / span_us derived from MTLCommandBuffer GPU-side "
+            "timestamps (twin of OpenCL gpu_opencl.c per-stage profiling).\n",
+            e);
+    }
+    return _cached;
+}
+
+/* gpu_metal_now_us -- monotonic host-wall microsecond clock for span_us
+ * + host_gap_us computation. mach_absolute_time scaled by mach_timebase.
+ * Independent of MTLCommandBuffer's GPU-side timestamps (those are
+ * device-clock; this is CFAbsoluteTime/wall). */
+static uint64_t gpu_metal_now_us(void)
+{
+    static mach_timebase_info_data_t _tb = {0, 0};
+    if (_tb.denom == 0) (void)mach_timebase_info(&_tb);
+    uint64_t t = mach_absolute_time();
+    /* (t * numer) can overflow at ~hundreds of years; safe for all
+     * realistic process lifetimes. */
+    return (t * _tb.numer) / _tb.denom / 1000ULL;
+}
+
+/* ---- PROFILE_VARIANT-for-A4 (Metal twin, 2026-05-30) -----------------
+ * Per architect spec project_kernel_a_a4_profile_variant_spec_2026-05-30.md
+ * D1.a + D5.a + R5: separate per-engine env var
+ * (MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT); ONLY active when
+ * KERNEL_A_VARIANT=4 also active; auto-enables Metal-side per-dispatch
+ * GPUStartTime/GPUEndTime timing on the A4 standalone dispatcher
+ * (which does NOT route through the A1 [metal-kA] harness in
+ * gpu_metal_kernelb_dispatch_proto).
+ *
+ * Mirrors the OpenCL twin gpu_opencl_kernel_a4_profile_variant +
+ * gpu_opencl_kernel_a4_timing_record shape. Independent accumulator
+ * statics from A1's _mkt_* (no cross-engine pollution) per
+ * feedback_check_existing_traces_first.md. */
+int gpu_metal_kernel_a4_profile_variant(void)
+{
+    static int _cached = -1;
+    if (_cached != -1) return _cached;
+    const char *e = getenv("MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT");
+    if (e == NULL || e[0] == '\0') {
+        _cached = 0;
+        return _cached;
+    }
+    if (e[0] >= '0' && e[0] <= '5' && e[1] == '\0') {
+        _cached = e[0] - '0';
+    } else {
+        fprintf(stderr,
+            "Metal: NOTICE -- MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT=%s "
+            "invalid (expected 0..5; V6 was removed by the 2026-05-30 A4 "
+            "C5 default-on refactor -- uint4 stores are now the V0 "
+            "production path); falling back to 0 / production.\n", e);
+        _cached = 0;
+        return _cached;
+    }
+    /* R5 host gate: only active when KERNEL_A_VARIANT=4 dispatching. */
+    if (_cached > 0 && gpu_metal_kernel_a_active_variant() != 4) {
+        fprintf(stderr,
+            "Metal: NOTICE -- MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT=%d "
+            "requires MDXFIND_KERNEL_A_VARIANT=4; falling through to "
+            "baseline.\n", _cached);
+        _cached = 0;
+        return _cached;
+    }
+    if (_cached >= 1 && _cached <= 5) {
+        fprintf(stderr,
+            "Metal: EXPERIMENT MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT=%d "
+            "-- kernel A4 (cand_bruteforce_phase0) JIT-built with "
+            "-DA4_PROFILE_VARIANT=%d. STUB BUILD: A4 produces NO valid "
+            "candidates (harness short-circuits on actual_slots=0). Use "
+            "for kernel_a4_us timing attribution only. Timing harness "
+            "auto-enabled (per-dispatch [metal-kA4] line + atexit "
+            "AGGREGATE).\n",
+            _cached, _cached);
+    }
+    return _cached;
+}
+
+/* A4-specific timing accumulator (independent from A1 _mkt_*). */
+static double  _mkt_a4_total_us = 0.0;
+static double  _mkt_a4_min_us   = 1e18;
+static double  _mkt_a4_max_us   = 0.0;
+static unsigned long _mkt_a4_count = 0;
+
+static void metal_kernel_a4_timing_dump(void)
+{
+    if (_mkt_a4_count == 0) return;
+    double mean = _mkt_a4_total_us / (double)_mkt_a4_count;
+    fprintf(stderr,
+        "[metal-kA4] AGGREGATE dispatches=%lu total_us=%.1f mean_us=%.1f "
+        "min_us=%.1f max_us=%.1f\n",
+        _mkt_a4_count, _mkt_a4_total_us, mean, _mkt_a4_min_us, _mkt_a4_max_us);
+}
+
+static void metal_kernel_a4_timing_record(int dev_idx, int op, double dt_us)
+{
+    static int _armed = 0;
+    if (!_armed) {
+        _armed = 1;
+        atexit(metal_kernel_a4_timing_dump);
+    }
+    _mkt_a4_total_us += dt_us;
+    if (dt_us < _mkt_a4_min_us) _mkt_a4_min_us = dt_us;
+    if (dt_us > _mkt_a4_max_us) _mkt_a4_max_us = dt_us;
+    _mkt_a4_count++;
+    int variant = gpu_metal_kernel_a4_profile_variant();
+    fprintf(stderr,
+        "[metal-kA4] dev=%d dispatch=%lu kernel_a4_us=%.1f op=%d variant=%d\n",
+        dev_idx, _mkt_a4_count, dt_us, op, variant);
+}
+
 /* Phase 4 sub-phase 4a.2 (2026-05-21): hx codegen kernel B lazy-init
  * helper for JOB_MD5MD5SALT Metal production dispatch. Metal twin of
  * gpu_opencl_kernelb_codegen_kernel (gpu/gpu_opencl.c rev 1.190 line
@@ -4107,22 +4595,30 @@ void *gpu_metal_kernelb_codegen_pso_for(int dev_idx, int job_enum)
     }
 
     /* Build specialization. e347 uses the original tp0 spec; family
-     * MAKE_MD5PASS members are unsalted single-emit; both cases set
-     * iter_count=1, has_rules=1, no masks/BF. The salt_minlen/maxlen +
-     * salt_count_regime fields are descriptive only for the emitter (no
-     * functional effect on the family kernel which ignores salts). */
+     * MAKE_MD5PASS members are unsalted single-emit; iter v1 (2026-05-31)
+     * adds JOB_MD5 / JOB_MD4 / JOB_SHA1RAW / JOB_SHA256RAW unsalted-single
+     * admission. Mirror gpu/gpu_opencl.c:12919-12940 -- salted vs unsalted
+     * pick on job_enum (the unsalted set has HX_SALT_SINGLE; the
+     * unsalted-single emitter ignores the regime anyway, but keep the
+     * descriptor consistent across backends). */
     struct hx_specialization spec;
     memset(&spec, 0, sizeof(spec));
     spec.iter_count_if_fixed = 1;
     spec.has_rules           = 1;
     spec.has_masks           = 0;
     spec.has_bf              = 0;
-    spec.salt_minlen         = 1;
-    spec.salt_maxlen         = 64;
-    spec.salt_count_regime   = HX_SALT_BATCH_64;
     spec.iter_shape          = HX_ITER_NONE;
     spec.digest_endianness   = HX_DIGEST_LE;
     spec.emit_width          = 16;
+    if (job_enum == JOB_MD5MD5SALT) {
+        spec.salt_minlen       = 1;
+        spec.salt_maxlen       = 64;
+        spec.salt_count_regime = HX_SALT_BATCH_64;
+    } else {
+        spec.salt_minlen       = 0;
+        spec.salt_maxlen       = 0;
+        spec.salt_count_regime = HX_SALT_SINGLE;
+    }
 
     char *src = NULL;
     size_t src_cap = 0;
@@ -4400,6 +4896,687 @@ void *gpu_metal_kernelb_codegen_pso(int dev_idx)
 static int gpu_metal_kernelA_ensure_proto_bufs(size_t need_packed_bytes,
                                                size_t need_index_slots);
 
+/* RULE-AXIS CHUNKING (Metal twin of OpenCL #343, 2026-05-31). Compute (once
+ * per process) the per-dispatch candidate-buffer cap for the codegen proto
+ * path. Cached on mtl_proto_cand_cap_bytes (0 = uncomputed). Apple unified-
+ * memory policy is more conservative than the OpenCL discrete-VRAM analog:
+ *
+ *   cap = clamp(GPU_RULES_METAL_CAND_CAP_FRACTION
+ *               * [device recommendedMaxWorkingSetSize],
+ *               GPU_RULES_CAND_CAP_MIN_MB,
+ *               GPU_RULES_METAL_CAND_CAP_MAX_MB)
+ *
+ * Env override MDXFIND_METAL_GPU_CAND_CAP_MB (read once; >0 sets cap_bytes
+ * directly, still clamped to MIN so a too-small value can't starve a single
+ * chunk). The _METAL_ infix mirrors the OpenCL env var name pattern and
+ * prevents accidental cross-backend override in a Universal2 macOS build. */
+static size_t gpu_metal_proto_cand_cap_bytes(int dev_idx)
+{
+    if (mtl_proto_cand_cap_bytes != 0) return mtl_proto_cand_cap_bytes;
+
+    const size_t cap_min = (size_t)GPU_RULES_CAND_CAP_MIN_MB * 1024u * 1024u;
+    const size_t cap_max = (size_t)GPU_RULES_METAL_CAND_CAP_MAX_MB * 1024u * 1024u;
+
+    size_t cap = 0;
+    const char *e = getenv("MDXFIND_METAL_GPU_CAND_CAP_MB");
+    if (e && *e) {
+        long mb = atol(e);
+        if (mb > 0) cap = (size_t)mb * 1024u * 1024u;
+    }
+    if (cap == 0) {
+        size_t rmwss = 0;
+        if (mtl_device != nil) {
+            rmwss = (size_t)[mtl_device recommendedMaxWorkingSetSize];
+        }
+        if (rmwss == 0) rmwss = cap_min;   /* defensive: query failed */
+        cap = (size_t)((double)rmwss * GPU_RULES_METAL_CAND_CAP_FRACTION);
+    }
+    if (cap < cap_min) cap = cap_min;
+    if (cap > cap_max) cap = cap_max;
+
+    mtl_proto_cand_cap_bytes = cap;
+    {
+        static int _warned = 0;
+        if (!_warned) {
+            _warned = 1;
+            size_t rmwss = (mtl_device != nil)
+                ? (size_t)[mtl_device recommendedMaxWorkingSetSize] : 0;
+            fprintf(stderr,
+                "Metal GPU[%d]: rules+codegen candidate-buffer cap = %zu MB "
+                "(rule-axis chunking, fraction=%.2f of recommendedMaxWorkingSetSize=%zu MB)\n",
+                dev_idx, cap / (1024u * 1024u),
+                GPU_RULES_METAL_CAND_CAP_FRACTION,
+                rmwss / (1024u * 1024u));
+        }
+    }
+    return cap;
+}
+
+/* RULE-AXIS CHUNKING (Metal twin of OpenCL #343, 2026-05-31) — multi-chunk
+ * proto dispatch.
+ *
+ * Invoked from gpu_metal_kernelb_dispatch_proto ONLY when num_rule_chunks > 1
+ * (the full num_words x n_rules candidate buffer would exceed the per-device
+ * cap). The single-chunk case stays on the verbatim legacy body in the caller
+ * (e347 / small-rule PRODUCTION safety). This helper:
+ *
+ *   - Uploads the WORD payload ONCE (word_offset + packed_words) into a
+ *     persistent file-static shared-storage MTLBuffer; inside the loop only
+ *     the 128-byte OCLParams header is re-uploaded per chunk. This is the
+ *     Option-A perf payoff (words reused across all rule chunks).
+ *   - Zeroes buf_hashes_shown ONCE before the loop so cross-chunk dedup
+ *     matches the single-dispatch path byte-for-byte (a word cracking the
+ *     same hash under rules in different chunks is emitted exactly once).
+ *   - For each disjoint rule sub-range [rule_start, rule_start+rule_count):
+ *       set params.num_rules=rule_count, params.rule_cursor_start=rule_start;
+ *       zero kernel-A state; commit cb_a (kernel A1); waitUntilCompleted;
+ *       read state via [contents]; on overflow halve K and re-issue
+ *       (bounded; FATAL only at K==1); commit cb_b (kernel B); wait; read
+ *       hit_count + hits via [contents]; for each hit IMMEDIATELY resolve
+ *       its plaintext into mtl_h_proto_resolved_* keyed by a global hit
+ *       ordinal G, BEFORE the next chunk's kernel A clobbers mtl_buf_proto_-
+ *       packed.
+ *   - After the loop: h_hits holds the accumulated rewritten hit records
+ *     (each entry[0] = its global ordinal G) and mtl_proto_resolved_active
+ *     is left at 1 so gpu_metal_kernelb_proto_plaintext reads the arena.
+ *     The caller's decode loop (gpu/gpujob_metal.m) is UNCHANGED (SHAPE 2).
+ *
+ * Returns h_hits with *nhits_out = total accumulated hits (capped at
+ * GPU_MAX_HITS). All external failures are FATAL with file:line + hostname.
+ *
+ * Apple-specific notes:
+ *   - All MTLBuffers use MTLResourceStorageModeShared (zero-copy on UMA,
+ *     DMA on discrete iMac AMD). Coherent after waitUntilCompleted.
+ *   - One MTLCommandBuffer per kernel per chunk (D3.a) -- pairs with per-
+ *     chunk waitUntilCompleted. In-order MTLCommandQueue + per-chunk
+ *     waitUntilCompleted + sequential host code guarantees the resolve-
+ *     before-clobber invariant (spec §1d, R2/R3, I3).
+ *   - The persistent payload buffer + per-chunk OCLParams re-upload avoids
+ *     allocating a new ~payload_size MTLBuffer for every chunk. */
+static uint32_t *gpu_metal_kernelb_dispatch_proto_chunked(
+    int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, uint32_t n_rules, size_t K, size_t num_rule_chunks,
+    int exp_md5, int *nhits_out)
+{
+    (void)exp_md5;   /* iter-v1 wiring threads max_iter through OCLParams; no
+                      * separate exp_md5 branch on Metal -- the codegen kernel
+                      * B PSO already encapsulates the per-op body. */
+    char hostname[256] = "unknown";
+    gethostname(hostname, sizeof(hostname) - 1);
+
+    if (nhits_out != NULL) *nhits_out = 0;
+
+    mtl_proto_resolved_active     = 1;   /* accessor uses the arena */
+    mtl_h_proto_resolved_buf_used = 0;   /* reset arena for this dispatch */
+
+    /* One-shot per-process marker: confirms the MULTI-CHUNK path was entered
+     * (vs the verbatim single-dispatch e347 path). Greppable for validation. */
+    {
+        static int _chunked_first = 0;
+        if (!_chunked_first) {
+            _chunked_first = 1;
+            fprintf(stderr,
+                "Metal GPU[%d]: rules+codegen MULTI-CHUNK path entered "
+                "(n_rules=%u K=%zu num_rule_chunks=%zu num_words=%u op=%d)\n",
+                dev_idx, n_rules, K, num_rule_chunks, num_words, op);
+        }
+    }
+
+    /* Acquire kernel-B codegen PSO via the per-JOB slot cache (same
+     * resolution rule as the single-dispatch path). FATAL on any failure. */
+    void *kb_pso_void = gpu_metal_kernelb_codegen_pso_for(dev_idx, op);
+    if (kb_pso_void == NULL) {
+        fprintf(stderr,
+            "FATAL: %s:%d Metal GPU[%d]: chunked kernel B codegen PSO unavailable "
+            "on %s (op=%d)\n",
+            __FILE__, __LINE__, dev_idx, hostname, op);
+        exit(1);
+    }
+    id<MTLComputePipelineState> kb_pso =
+        (__bridge id<MTLComputePipelineState>)kb_pso_void;
+
+    /* --- A. Worst-case per-chunk buffer sizing -------------------------- *
+     * Largest chunk's candidate buffer = num_words * K * 256 (<= cap). The
+     * last chunk may be smaller but sizing to K's worst case once avoids
+     * realloc churn. Persistent buffers grown via the same helper the
+     * single-dispatch path uses. */
+    size_t cap_slots  = (size_t)num_words * K;
+    size_t cap_packed = cap_slots * 256u;
+    if (cap_packed < METAL_MIN_BUFFER_BYTES) cap_packed = METAL_MIN_BUFFER_BYTES;
+    if (gpu_metal_kernelA_ensure_proto_bufs(cap_packed, cap_slots) < 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d Metal GPU[%d]: chunked kernelA_ensure_proto_bufs "
+            "failed on %s (cap_packed=%zu cap_slots=%zu)\n",
+            __FILE__, __LINE__, dev_idx, hostname, cap_packed, cap_slots);
+        exit(1);
+    }
+
+    /* Ensure rule program / rule offset MTLBuffers are uploaded (idempotent). */
+    if (metal_upload_rules_lazy() < 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d Metal GPU[%d]: chunked metal_upload_rules_lazy failed "
+            "on %s (rule_count=%d program_len=%u)\n",
+            __FILE__, __LINE__, dev_idx, hostname,
+            gpu_rule_count, gpu_rule_program_len);
+        exit(1);
+    }
+
+    /* Precondition checks on kernel B device-resident buffers. */
+    if (buf_compact_fp == nil || buf_compact_idx == nil ||
+        buf_hash_data == nil || buf_hash_data_off == nil ||
+        buf_salt_data == nil || buf_salt_off == nil || buf_salt_lens == nil) {
+        fprintf(stderr,
+            "FATAL: %s:%d Metal GPU[%d]: chunked kernel B requires compact-table + "
+            "salt buffers on %s\n",
+            __FILE__, __LINE__, dev_idx, hostname);
+        exit(1);
+    }
+    if (buf_overflow_keys == nil || buf_overflow_hashes == nil ||
+        buf_overflow_offsets == nil) {
+        if (gpu_metal_set_overflow(0, NULL, NULL, NULL, NULL, 0) != 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d Metal GPU[%d]: chunked overflow placeholder "
+                "provisioning failed on %s\n",
+                __FILE__, __LINE__, dev_idx, hostname);
+            exit(1);
+        }
+    }
+
+    int ret_nhits = 0;
+
+    @autoreleasepool {
+        /* --- A1. Persistent payload MTLBuffer (lazy + grow-on-demand). *
+         * Sized ONCE for this dispatch: 128B OCLParams + 4B hit_count slot
+         * + word_offset[num_words] + packed_words[packed_size]. Per-chunk
+         * loop only re-writes the 128B header (num_rules/rule_cursor_start/
+         * packed_size). */
+        size_t wo_size      = (size_t)num_words * sizeof(uint32_t);
+        size_t payload_pkt  = 132u + wo_size;
+        size_t payload_size = payload_pkt + (size_t)packed_size;
+        if (payload_size < METAL_MIN_BUFFER_BYTES) payload_size = METAL_MIN_BUFFER_BYTES;
+
+        id<MTLBuffer> buf_payload =
+            [mtl_device newBufferWithLength:payload_size
+                                    options:MTLResourceStorageModeShared];
+        if (buf_payload == nil) {
+            fprintf(stderr,
+                "FATAL: %s:%d Metal GPU[%d]: chunked payload newBuffer "
+                "(%zu bytes) failed on %s\n",
+                __FILE__, __LINE__, dev_idx, payload_size, hostname);
+            exit(1);
+        }
+        uint8_t *p = (uint8_t *)[buf_payload contents];
+        memset(p, 0, payload_size);
+
+        /* Base OCLParams (shape stays fixed across chunks; only num_rules /
+         * rule_cursor_start / packed_size mutate per chunk). */
+        OCLParams params;
+        memset(&params, 0, sizeof(params));
+        params.compact_mask      = cache_compact_mask;
+        params.num_words         = num_words;
+        params.num_rules         = (uint32_t)K;        /* per-chunk; re-set below */
+        params.max_probe         = 256u;
+        params.hash_data_count   = cache_hash_data_count;
+        params.max_hits          = (uint32_t)GPU_MAX_HITS;
+        params.overflow_count    = (uint32_t)cache_overflow_count;
+        params.max_iter          = (cache_max_iter < 1) ? 1u : (uint32_t)cache_max_iter;
+        params.iter_count        = 1u;
+        params.salt_start        = 0u;
+        params.num_salts         = (uint32_t)cached_salts_count;
+        params.base_word_idx     = 0u;
+        params.rule_cursor_start = 0u;                 /* per-chunk; re-set below */
+        params.packed_size       = (uint32_t)cap_packed;
+        memcpy(p, &params, sizeof(params));
+        /* hit_count slot at offset 128 stays zero (already cleared). */
+        memcpy(p + 132, word_offset, wo_size);
+        memcpy(p + payload_pkt, packed_words, packed_size);
+
+        /* --- A2. One-time buf_hashes_shown alloc + zero (cross-chunk dedup). *
+         * Sized for hash_data_count + overflow_count. Zeroed ONCE for the
+         * whole word-batch so a hash cracked in chunk c is not re-emitted
+         * in chunk c'. Mirrors single-dispatch path. */
+        {
+            size_t hs_need = (size_t)cache_hash_data_count
+                           + (size_t)cache_overflow_count;
+            if (hs_need == 0) hs_need = 1;
+            size_t hs_bytes = hs_need * sizeof(uint32_t);
+            if (hs_bytes < METAL_MIN_BUFFER_BYTES) hs_bytes = METAL_MIN_BUFFER_BYTES;
+            if (buf_hashes_shown == nil
+                || hs_bytes > mtl_buf_kernelb_hashes_shown_cap) {
+                buf_hashes_shown = nil;  /* ARC drop old before realloc */
+                buf_hashes_shown =
+                    [mtl_device newBufferWithLength:hs_bytes
+                                            options:MTLResourceStorageModeShared];
+                if (buf_hashes_shown == nil) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d Metal GPU[%d]: chunked buf_hashes_shown "
+                        "newBuffer(%zu bytes) failed on %s\n",
+                        __FILE__, __LINE__, dev_idx, hs_bytes, hostname);
+                    exit(1);
+                }
+                mtl_buf_kernelb_hashes_shown_cap = hs_bytes;
+            }
+            memset([buf_hashes_shown contents], 0, hs_bytes);
+        }
+
+        /* Ensure persistent ovr_set + ovr_gid atomic_uint buffers exist
+         * (same as single-dispatch path). Reset to sentinel before each
+         * kernel B encode below. */
+        if (mtl_buf_kernelb_ovr_set == nil) {
+            mtl_buf_kernelb_ovr_set =
+                [mtl_device newBufferWithLength:sizeof(uint32_t)
+                                        options:MTLResourceStorageModeShared];
+            if (mtl_buf_kernelb_ovr_set == nil) {
+                fprintf(stderr,
+                    "FATAL: %s:%d Metal GPU[%d]: chunked kernel B ovr_set "
+                    "newBuffer failed on %s\n",
+                    __FILE__, __LINE__, dev_idx, hostname);
+                exit(1);
+            }
+        }
+        if (mtl_buf_kernelb_ovr_gid == nil) {
+            mtl_buf_kernelb_ovr_gid =
+                [mtl_device newBufferWithLength:sizeof(uint32_t)
+                                        options:MTLResourceStorageModeShared];
+            if (mtl_buf_kernelb_ovr_gid == nil) {
+                fprintf(stderr,
+                    "FATAL: %s:%d Metal GPU[%d]: chunked kernel B ovr_gid "
+                    "newBuffer failed on %s\n",
+                    __FILE__, __LINE__, dev_idx, hostname);
+                exit(1);
+            }
+        }
+
+        /* --- A3. Per-chunk hit_count + hits transient buffers. Sized for
+         * GPU_MAX_HITS; reused across all chunks (zeroed at top of each
+         * chunk's kernel B encode). */
+        id<MTLBuffer> buf_hit_count =
+            [mtl_device newBufferWithLength:sizeof(uint32_t)
+                                    options:MTLResourceStorageModeShared];
+        if (buf_hit_count == nil) {
+            fprintf(stderr,
+                "FATAL: %s:%d Metal GPU[%d]: chunked kernel B hit_count "
+                "newBuffer failed on %s\n",
+                __FILE__, __LINE__, dev_idx, hostname);
+            exit(1);
+        }
+        size_t hits_bytes = (size_t)GPU_MAX_HITS * GPU_HIT_STRIDE * sizeof(uint32_t);
+        id<MTLBuffer> buf_hits =
+            [mtl_device newBufferWithLength:hits_bytes
+                                    options:MTLResourceStorageModeShared];
+        if (buf_hits == nil) {
+            fprintf(stderr,
+                "FATAL: %s:%d Metal GPU[%d]: chunked kernel B hits "
+                "newBuffer(%zu bytes) failed on %s\n",
+                __FILE__, __LINE__, dev_idx, hits_bytes, hostname);
+            exit(1);
+        }
+
+        /* --- C. Resolved-arena sizing (lazy, grown to caps). ---------- *
+         * Worst case GPU_MAX_HITS hits, each up to 256 packed bytes.
+         * Seeded at 1 MB and grown via realloc on demand (mirrors OpenCL
+         * twin gpu_opencl.c:13294-13317). */
+        {
+            size_t off_cap_need = (size_t)GPU_MAX_HITS;
+            if (!mtl_h_proto_resolved_off || off_cap_need > mtl_h_proto_resolved_off_cap) {
+                free(mtl_h_proto_resolved_off);
+                mtl_h_proto_resolved_off =
+                    (uint32_t *)calloc(off_cap_need, sizeof(uint32_t));
+                if (!mtl_h_proto_resolved_off) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d Metal GPU[%d]: chunked h_proto_resolved_off "
+                        "calloc(%zu) failed on %s\n",
+                        __FILE__, __LINE__, dev_idx, off_cap_need, hostname);
+                    exit(1);
+                }
+                mtl_h_proto_resolved_off_cap = off_cap_need;
+            }
+            if (!mtl_h_proto_resolved_buf) {
+                size_t seed = 1u * 1024u * 1024u;   /* 1 MB; ~4K hits */
+                mtl_h_proto_resolved_buf = (uint8_t *)malloc(seed);
+                if (!mtl_h_proto_resolved_buf) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d Metal GPU[%d]: chunked h_proto_resolved_buf "
+                        "malloc(%zu) failed on %s\n",
+                        __FILE__, __LINE__, dev_idx, seed, hostname);
+                    exit(1);
+                }
+                mtl_h_proto_resolved_buf_cap = seed;
+            }
+        }
+
+        uint32_t G = 0;                /* global hit ordinal */
+        int warned_90 = 0;
+        const NSUInteger tg_size_a = 64;
+        const NSUInteger tg_size_b = 64;
+
+        /* --- D. Rule-chunk loop ----------------------------------------- */
+        for (size_t c = 0; c < num_rule_chunks; c++) {
+            size_t rule_start = c * K;
+            size_t rule_count = (n_rules - rule_start < K)
+                              ? (n_rules - rule_start) : K;
+
+            /* Bounded halve-K retry on overflow (impossible by construction,
+             * retained as belt-and-braces per spec §5 I5). */
+            size_t this_K     = rule_count;
+            size_t sub_start  = rule_start;
+            while (sub_start < rule_start + rule_count) {
+                size_t this_count = (rule_start + rule_count - sub_start < this_K)
+                                  ? (rule_start + rule_count - sub_start) : this_K;
+                size_t sub_slots  = (size_t)num_words * this_count;
+                size_t sub_packed = sub_slots * 256u;
+                if (sub_packed < METAL_MIN_BUFFER_BYTES) sub_packed = METAL_MIN_BUFFER_BYTES;
+                if (gpu_metal_kernelA_ensure_proto_bufs(sub_packed, sub_slots) < 0) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d Metal GPU[%d]: chunked kernelA_ensure_proto_bufs "
+                        "(chunk=%zu) failed on %s\n",
+                        __FILE__, __LINE__, dev_idx, c, hostname);
+                    exit(1);
+                }
+
+                /* Set this sub-chunk's rule sub-range in the OCLParams header. */
+                {
+                    OCLParams *ph = (OCLParams *)p;
+                    ph->num_words         = num_words;
+                    ph->num_rules         = (uint32_t)this_count;
+                    ph->rule_cursor_start = (uint32_t)sub_start;
+                    ph->packed_size       = (uint32_t)sub_packed;
+                    ph->base_word_idx     = 0u;
+                    /* hit_count slot at offset 128 zeroed by kernel B prep below. */
+                }
+
+                /* Zero kernel-A state for this sub-chunk. */
+                memset([mtl_buf_proto_state contents], 0, 3u * sizeof(uint32_t));
+
+                /* --- D3. Encode + dispatch kernel A1. */
+                NSUInteger global_a = (NSUInteger)num_words * (NSUInteger)this_count;
+                NSUInteger padded_a = ((global_a + tg_size_a - 1) / tg_size_a) * tg_size_a;
+                NSUInteger groups_a = padded_a / tg_size_a;
+                if (groups_a == 0) groups_a = 1;
+                MTLSize tg_a   = MTLSizeMake(tg_size_a, 1, 1);
+                MTLSize grid_a = MTLSizeMake(groups_a, 1, 1);
+
+                id<MTLCommandBuffer> cb_a = [mtl_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc_a = [cb_a computeCommandEncoder];
+                [enc_a setComputePipelineState:mtl_pso_kernel_a_rules];
+                [enc_a setBuffer:buf_payload                offset:0 atIndex:0];
+                [enc_a setBuffer:buf_rule_program           offset:0 atIndex:1];
+                [enc_a setBuffer:buf_rule_offset            offset:0 atIndex:2];
+                [enc_a setBuffer:mtl_buf_proto_packed       offset:0 atIndex:3];
+                [enc_a setBuffer:mtl_buf_proto_chunk_index  offset:0 atIndex:4];
+                [enc_a setBuffer:mtl_buf_proto_state        offset:0 atIndex:5];
+                [enc_a dispatchThreadgroups:grid_a threadsPerThreadgroup:tg_a];
+                [enc_a endEncoding];
+                /* MDXFIND_DISPATCH_TRACE: host-wall span markers
+                 * (2026-05-31 — Metal twin of OpenCL per-stage trace). */
+                uint64_t _disp_t_a_dispatch = 0;
+                uint64_t _disp_t_a_complete = 0;
+                if (gpu_metal_dispatch_trace_enabled()) {
+                    _disp_t_a_dispatch = gpu_metal_now_us();
+                }
+                [cb_a commit];
+                [cb_a waitUntilCompleted];
+                if (gpu_metal_dispatch_trace_enabled()) {
+                    _disp_t_a_complete = gpu_metal_now_us();
+                }
+
+                if (cb_a.status != MTLCommandBufferStatusCompleted) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d Metal GPU[%d]: chunked kernel A1 cmdbuffer "
+                        "status=%ld (chunk=%zu) on %s (error=%s)\n",
+                        __FILE__, __LINE__, dev_idx, (long)cb_a.status, c, hostname,
+                        cb_a.error ? [[cb_a.error localizedDescription] UTF8String]
+                                   : "(none)");
+                    exit(1);
+                }
+
+                /* Knob G timing (mirrors single-dispatch path). Captures
+                 * per-chunk kernel-A wall; aggregate across chunks is the
+                 * sum reported via metal_kernel_a_timing_record. */
+                if (gpu_metal_kernel_a_timing_enabled()) {
+                    double t0 = cb_a.GPUStartTime;
+                    double t1 = cb_a.GPUEndTime;
+                    double dt_us = (t1 - t0) * 1.0e6;
+                    if (dt_us < 0.0) dt_us = 0.0;
+                    metal_kernel_a_timing_record(dev_idx, op, dt_us);
+                }
+
+                /* --- D4. Read kernel-A state via [contents] (zero-copy on
+                 * UMA, coherent after waitUntilCompleted). */
+                uint32_t state[3] = {0, 0, 0};
+                memcpy(state, [mtl_buf_proto_state contents], 3u * sizeof(uint32_t));
+                uint32_t actual_slots      = state[0];
+                uint32_t actual_byte_count = state[1];
+                uint32_t overflow_flag     = state[2];
+
+                if (overflow_flag) {
+                    /* Overflow should be impossible (sub_packed <= cap by K
+                     * formula). Halve-K retry; FATAL only at this_K==1. */
+                    if (this_K <= 1) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d Metal GPU[%d]: chunked kernel A overflow at "
+                            "K==1 (chunk=%zu sub_start=%zu slots=%u bytes=%u cap=%zu) "
+                            "on %s -- a single (word,rule) exceeds the candidate cap; "
+                            "pathological\n",
+                            __FILE__, __LINE__, dev_idx, c, sub_start,
+                            actual_slots, actual_byte_count, sub_packed, hostname);
+                        exit(1);
+                    }
+                    this_K = this_K / 2;
+                    if (this_K < 1) this_K = 1;
+                    fprintf(stderr,
+                        "[kernelb_proto_chunked] Metal GPU[%d]: kernel A overflow "
+                        "(chunk=%zu sub_start=%zu) -- halving K to %zu and re-issuing\n",
+                        dev_idx, c, sub_start, this_K);
+                    continue;   /* re-issue this span with smaller this_K */
+                }
+
+                if (actual_slots == 0) {
+                    sub_start += this_count;   /* no candidates; advance */
+                    continue;
+                }
+
+                /* --- D6. Set kernel-B params: num_words = slot count,
+                 * packed_size = actual bytes. Re-zero hit_count slot. */
+                {
+                    OCLParams *ph = (OCLParams *)p;
+                    ph->num_words   = actual_slots;
+                    ph->packed_size = actual_byte_count;
+                    ph->salt_start  = 0u;
+                }
+                *((uint32_t *)(p + 128)) = 0u;
+
+                /* Reset ovr sentinels + per-chunk hit_count. */
+                *((uint32_t *)[mtl_buf_kernelb_ovr_set contents]) = 0u;
+                *((uint32_t *)[mtl_buf_kernelb_ovr_gid contents]) = 0xFFFFFFFFu;
+                *((uint32_t *)[buf_hit_count contents]) = 0u;
+
+                /* --- D7. Encode + dispatch kernel B (18-arg signature,
+                 * mirroring single-dispatch path at gpu_metal.m:5275-5293). */
+                uint32_t num_salt_chunks =
+                    ((uint32_t)cached_salts_count + 64u - 1u) / 64u;
+                if (num_salt_chunks == 0u) num_salt_chunks = 1u;
+                NSUInteger total_threads =
+                    (NSUInteger)actual_slots * (NSUInteger)num_salt_chunks;
+                NSUInteger groups_b = (total_threads + tg_size_b - 1) / tg_size_b;
+                if (groups_b == 0) groups_b = 1;
+                MTLSize tg_b   = MTLSizeMake(tg_size_b, 1, 1);
+                MTLSize grid_b = MTLSizeMake(groups_b, 1, 1);
+
+                id<MTLCommandBuffer> cb_b = [mtl_queue commandBuffer];
+                id<MTLComputeCommandEncoder> enc_b = [cb_b computeCommandEncoder];
+                [enc_b setComputePipelineState:kb_pso];
+                [enc_b setBuffer:buf_payload               offset:0 atIndex:0];
+                [enc_b setBuffer:mtl_buf_proto_packed      offset:0 atIndex:1];
+                [enc_b setBuffer:mtl_buf_proto_chunk_index offset:0 atIndex:2];
+                [enc_b setBuffer:buf_salt_data             offset:0 atIndex:3];
+                [enc_b setBuffer:buf_salt_off              offset:0 atIndex:4];
+                [enc_b setBuffer:buf_salt_lens             offset:0 atIndex:5];
+                [enc_b setBuffer:buf_compact_fp            offset:0 atIndex:6];
+                [enc_b setBuffer:buf_compact_idx           offset:0 atIndex:7];
+                [enc_b setBuffer:buf_hash_data             offset:0 atIndex:8];
+                [enc_b setBuffer:buf_hash_data_off         offset:0 atIndex:9];
+                [enc_b setBuffer:buf_hits                  offset:0 atIndex:10];
+                [enc_b setBuffer:buf_hit_count             offset:0 atIndex:11];
+                [enc_b setBuffer:buf_overflow_keys         offset:0 atIndex:12];
+                [enc_b setBuffer:buf_overflow_hashes       offset:0 atIndex:13];
+                [enc_b setBuffer:buf_overflow_offsets      offset:0 atIndex:14];
+                [enc_b setBuffer:buf_hashes_shown          offset:0 atIndex:15];
+                [enc_b setBuffer:mtl_buf_kernelb_ovr_set   offset:0 atIndex:16];
+                [enc_b setBuffer:mtl_buf_kernelb_ovr_gid   offset:0 atIndex:17];
+                [enc_b dispatchThreadgroups:grid_b threadsPerThreadgroup:tg_b];
+                [enc_b endEncoding];
+                /* MDXFIND_DISPATCH_TRACE: host-wall span markers
+                 * (2026-05-31 — Metal twin). */
+                uint64_t _disp_t_b_dispatch = 0;
+                uint64_t _disp_t_b_complete = 0;
+                if (gpu_metal_dispatch_trace_enabled()) {
+                    _disp_t_b_dispatch = gpu_metal_now_us();
+                }
+                [cb_b commit];
+                [cb_b waitUntilCompleted];
+                if (gpu_metal_dispatch_trace_enabled()) {
+                    _disp_t_b_complete = gpu_metal_now_us();
+                }
+
+                if (cb_b.status != MTLCommandBufferStatusCompleted) {
+                    fprintf(stderr,
+                        "FATAL: %s:%d Metal GPU[%d]: chunked kernel B cmdbuffer "
+                        "status=%ld (chunk=%zu) on %s (error=%s)\n",
+                        __FILE__, __LINE__, dev_idx, (long)cb_b.status, c, hostname,
+                        cb_b.error ? [[cb_b.error localizedDescription] UTF8String]
+                                   : "(none)");
+                    exit(1);
+                }
+
+                /* --- D8. Read this chunk's hits. */
+                uint32_t hcount = *((uint32_t *)[buf_hit_count contents]);
+                if (hcount > (uint32_t)GPU_MAX_HITS) hcount = (uint32_t)GPU_MAX_HITS;
+
+                /* MDXFIND_DISPATCH_TRACE per-chunk emission
+                 * (2026-05-31 — Metal twin of OpenCL gpu_opencl.c +
+                 * gpujob_opencl.c per-stage trace; #389 thermal investigation
+                 * surfaced the Metal gap). One stderr line per sub-iteration
+                 * that reaches kernel-B completion (overflow + actual_slots==0
+                 * branches above already `continue` and emit no trace).
+                 *
+                 * Field names + order match OpenCL [disp] line for cross-
+                 * backend log parsers; distinct prefix [disp-metal] signals
+                 * per-chunk granularity vs OpenCL [disp] per-batch. */
+                if (gpu_metal_dispatch_trace_enabled()) {
+                    double a_t0 = cb_a.GPUStartTime;
+                    double a_t1 = cb_a.GPUEndTime;
+                    double b_t0 = cb_b.GPUStartTime;
+                    double b_t1 = cb_b.GPUEndTime;
+                    uint64_t _ka_us = (a_t1 > a_t0)
+                        ? (uint64_t)((a_t1 - a_t0) * 1.0e6) : 0;
+                    uint64_t _kb_us = (b_t1 > b_t0)
+                        ? (uint64_t)((b_t1 - b_t0) * 1.0e6) : 0;
+                    uint64_t _gap_us = (_disp_t_b_dispatch > _disp_t_a_complete)
+                        ? (_disp_t_b_dispatch - _disp_t_a_complete) : 0;
+                    uint64_t _span_us = (_disp_t_b_complete > _disp_t_a_dispatch)
+                        ? (_disp_t_b_complete - _disp_t_a_dispatch) : 0;
+                    fprintf(stderr,
+                        "[disp-metal] dev=%d op=%d path=kernelB_proto_chunked "
+                        "chunk=%zu num_words=%u n_rules=%u rules_in_chunk=%zu "
+                        "hits=%u kernel_a_us=%llu host_gap_us=%llu "
+                        "kernel_b_us=%llu span_us=%llu\n",
+                        dev_idx, op, c, num_words, n_rules, this_count, hcount,
+                        (unsigned long long)_ka_us,
+                        (unsigned long long)_gap_us,
+                        (unsigned long long)_kb_us,
+                        (unsigned long long)_span_us);
+                }
+
+                if (hcount > 0) {
+                    const uint32_t *chunk_hits =
+                        (const uint32_t *)[buf_hits contents];
+                    const uint32_t *index_base =
+                        (const uint32_t *)[mtl_buf_proto_chunk_index contents];
+                    const uint8_t  *packed_base =
+                        (const uint8_t  *)[mtl_buf_proto_packed contents];
+
+                    /* --- D9. RESOLVE LOOP (resolve-before-clobber, R3). *
+                     * Each hit's plaintext is copied into the arena NOW
+                     * (before the next chunk's cb_a commit). Apple in-order
+                     * MTLCommandQueue + waitUntilCompleted on cb_b above +
+                     * sequential host code guarantees the arena reads see
+                     * THIS chunk's bytes from mtl_buf_proto_packed (R2/R3,
+                     * I3). */
+                    for (uint32_t hi = 0; hi < hcount; hi++) {
+                        const uint32_t *he = chunk_hits + (size_t)hi * GPU_HIT_STRIDE;
+                        uint32_t slot = he[0];
+
+                        if (G >= (uint32_t)GPU_MAX_HITS) break;
+                        if (!warned_90 &&
+                            G >= (uint32_t)((double)GPU_MAX_HITS * 0.9)) {
+                            warned_90 = 1;
+                            fprintf(stderr,
+                                "WARN: %s:%d Metal GPU[%d]: chunked proto "
+                                "accumulated hits at 90%% of GPU_MAX_HITS "
+                                "(%u/%d) on %s\n",
+                                __FILE__, __LINE__, dev_idx, G, GPU_MAX_HITS,
+                                hostname);
+                        }
+
+                        if ((size_t)slot >= sub_slots) continue;   /* corrupt */
+                        uint32_t wpos = index_base[slot];
+                        if (wpos >= actual_byte_count) continue;
+
+                        size_t avail = (size_t)actual_byte_count - (size_t)wpos;
+                        size_t want  = avail < 256u ? avail : 256u;
+                        uint8_t plen = packed_base[wpos];
+                        if ((size_t)1u + plen > want) continue;   /* truncated */
+
+                        /* Grow arena if needed. */
+                        size_t rec_bytes = (size_t)1u + plen;
+                        if (mtl_h_proto_resolved_buf_used + rec_bytes
+                                > mtl_h_proto_resolved_buf_cap) {
+                            size_t newcap = mtl_h_proto_resolved_buf_cap * 2u;
+                            while (newcap < mtl_h_proto_resolved_buf_used + rec_bytes)
+                                newcap *= 2u;
+                            uint8_t *nb = (uint8_t *)realloc(
+                                mtl_h_proto_resolved_buf, newcap);
+                            if (!nb) {
+                                fprintf(stderr,
+                                    "FATAL: %s:%d Metal GPU[%d]: chunked resolved "
+                                    "arena realloc(%zu) failed on %s\n",
+                                    __FILE__, __LINE__, dev_idx, newcap, hostname);
+                                exit(1);
+                            }
+                            mtl_h_proto_resolved_buf     = nb;
+                            mtl_h_proto_resolved_buf_cap = newcap;
+                        }
+
+                        /* Store record at arena offset; record offset keyed by G. */
+                        size_t arena_off = mtl_h_proto_resolved_buf_used;
+                        memcpy(mtl_h_proto_resolved_buf + arena_off,
+                               packed_base + wpos, rec_bytes);
+                        mtl_h_proto_resolved_buf_used += rec_bytes;
+                        mtl_h_proto_resolved_off[G] = (uint32_t)arena_off;
+
+                        /* Rewrite hit record into h_hits at ordinal G:
+                         * entry[0]=G, entries [1..18] verbatim. */
+                        uint32_t *out = h_hits + (size_t)G * GPU_HIT_STRIDE;
+                        out[0] = G;
+                        for (int w = 1; w < GPU_HIT_STRIDE; w++) out[w] = he[w];
+                        G++;
+                    }
+                }
+
+                sub_start += this_count;   /* advance past this (sub)span */
+            } /* while sub_start */
+        } /* for chunks */
+
+        ret_nhits = (int)G;
+    }  /* autoreleasepool */
+
+    if (nhits_out != NULL) *nhits_out = ret_nhits;
+    return h_hits;
+}
+
 uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,
@@ -4421,8 +5598,29 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
      * placeholder salt for family ops so the kernel's salt buffer
      * bindings are non-NULL (the family body does (void)salts;
      * (void)salt_offsets; (void)salt_lens; so contents are ignored). */
+    /* Auto-dispatcher (2026-05-31, project_codegen_auto_dispatch_-
+     * spec_2026-05-31.md): admission predicate for the Metal proto
+     * dispatcher. Originally env-gated on MDXFIND_EXPERIMENT_RULES_-
+     * CODEGEN_MD5=1; with the env retirement, the upstream route gate
+     * at gpu/gpujob_metal.m is the SOLE admission control point. If
+     * the route gate's auto-dispatcher pick was LEGACY, the proto
+     * path isn't invoked for these ops -- so checking the op set
+     * alone here is correct.
+     *
+     * The 6 unsalted single-hash primitives (MD5/MD4/SHA1/SHA256/
+     * SHA1RAW/SHA256RAW) are admitted unconditionally at this gate;
+     * whether the upstream actually routes them here is the auto-
+     * dispatcher's decision. JOB_MD5RAW (e33) intentionally excluded
+     * (binary-output variant). Iter v1.2 (2026-05-31, #379 v1.1 widen
+     * option a): added JOB_SHA1 (e8) + JOB_SHA256 (e10) -- hex-feedback
+     * siblings of SHA1RAW/SHA256RAW; kernel B output shape byte-
+     * identical. Mirrors OpenCL twin at gpu/gpu_opencl.c. */
+    int _is_exp_md5 = (op == JOB_MD5 || op == JOB_MD4
+                       || op == JOB_SHA1 || op == JOB_SHA256
+                       || op == JOB_SHA1RAW || op == JOB_SHA256RAW);
     if (op != JOB_MD5MD5SALT
-        && !gpu_codegen_kernelb_family_md5pass_eligible(op)) {
+        && !gpu_codegen_kernelb_family_md5pass_eligible(op)
+        && !_is_exp_md5) {
         return NULL;
     }
     if (!metal_ready || dev_idx != 0) return NULL;
@@ -4508,6 +5706,39 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
     }
 
     uint32_t n_rules = (uint32_t)gpu_rule_count;
+
+    /* RULE-AXIS CHUNKING (Metal twin of OpenCL #343, 2026-05-31). Decide
+     * whether the full (word x rule) candidate buffer fits the per-process
+     * cap in ONE dispatch. Mirrors gpu/gpu_opencl.c:13984-14003 byte-for-byte
+     * in shape:
+     *   max_packed_full = num_words * n_rules * 256
+     *   K (rules/chunk)  = max(1, cap_bytes / (num_words * 256))
+     *   num_rule_chunks  = ceil(n_rules / K)
+     * If num_rule_chunks <= 1 the dispatch degenerates to the EXISTING
+     * single-dispatch body below -- bit-identical to the pre-chunking path
+     * (e347 / small-rule-count PRODUCTION safety, spec §1f / I4). Only
+     * num_rule_chunks > 1 enters the dedicated multi-chunk helper
+     * (rule-axis loop + resolved-plaintext arena), which fully owns the
+     * dispatch and returns. */
+    {
+        size_t cap_bytes = gpu_metal_proto_cand_cap_bytes(dev_idx);
+        size_t per_word_rule_bytes = (size_t)num_words * 256u;
+        size_t K = (per_word_rule_bytes > 0)
+                 ? (cap_bytes / per_word_rule_bytes) : (size_t)n_rules;
+        if (K == 0) K = 1;
+        size_t num_rule_chunks = ((size_t)n_rules + K - 1) / K;
+
+        if (num_rule_chunks > 1) {
+            /* Multi-chunk path: dedicated helper owns the whole dispatch. */
+            return gpu_metal_kernelb_dispatch_proto_chunked(
+                dev_idx, packed_words, packed_size, word_offset, num_words,
+                op, n_rules, K, num_rule_chunks, _is_exp_md5, nhits_out);
+        }
+        /* Single-chunk degenerate path: make sure the accessor uses the
+         * LEGACY direct-from-mtl_buf_proto_packed staging (a prior multi-
+         * chunk dispatch may have left mtl_proto_resolved_active=1). */
+        mtl_proto_resolved_active = 0;
+    }
 
     /* --- 1. Ensure persistent kernel-A scratch buffers exist + are
      * sized for the worst-case (num_words * n_rules) slots. */
@@ -4608,11 +5839,25 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
         params.hash_data_count  = cache_hash_data_count;
         params.max_hits         = (uint32_t)GPU_MAX_HITS;
         params.overflow_count   = (uint32_t)cache_overflow_count;
-        params.max_iter         = 1u;
+        /* Iter v1 (2026-05-31): thread the user's -i value from
+         * cache_max_iter (set by gpu_metal_set_max_iter from Maxiter).
+         * Codegen kernel B unsalted-single body now wraps probe with a
+         * runtime for-loop over [1..mi]. e347 + Phase-5a family ops
+         * are iter-baking carriers so they still see mi=1 in practice;
+         * the new JOB_MD5 admission (R5) is the consumer. */
+        params.max_iter         = (cache_max_iter < 1) ? 1u : (uint32_t)cache_max_iter;
         params.iter_count       = 1u;
         params.salt_start       = 0u;
         params.num_salts        = (uint32_t)cached_salts_count;
         params.base_word_idx    = 0u;
+        /* RULE-AXIS CHUNKING (Metal twin, 2026-05-31) R4 mitigation: the
+         * post-edit kernel A1 (metal_kernel_a_rules.metal:992-1000) reads
+         * rule_cursor_start as the chunk base; this single-dispatch path
+         * MUST explicitly set it to 0 so the global rule index equals
+         * rule_start (0) + rule_idx_local (gid/n_words) = pre-edit
+         * rule_idx geometry byte-identically. The OCLParams memset above
+         * implicitly zeroed it, but explicit > implicit per spec §11 row 10. */
+        params.rule_cursor_start= 0u;
         params.packed_size      = (uint32_t)max_packed;  /* capacity for kernel A */
         memcpy(p, &params, sizeof(params));
 
@@ -4643,8 +5888,18 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
         [enc_a setBuffer:mtl_buf_proto_state        offset:0 atIndex:5];
         [enc_a dispatchThreadgroups:grid_a threadsPerThreadgroup:tg_a];
         [enc_a endEncoding];
+        /* MDXFIND_DISPATCH_TRACE: host-wall span markers
+         * (2026-05-31 — Metal twin of OpenCL per-stage trace). */
+        uint64_t _disp_t_a_dispatch = 0;
+        uint64_t _disp_t_a_complete = 0;
+        if (gpu_metal_dispatch_trace_enabled()) {
+            _disp_t_a_dispatch = gpu_metal_now_us();
+        }
         [cb_a commit];
         [cb_a waitUntilCompleted];
+        if (gpu_metal_dispatch_trace_enabled()) {
+            _disp_t_a_complete = gpu_metal_now_us();
+        }
 
         if (cb_a.status != MTLCommandBufferStatusCompleted) {
             fprintf(stderr,
@@ -4655,6 +5910,40 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
                            : "(none)");
             exit(1);
         }
+
+        /* Phase 0 timing harness (Knob G spec D3, 2026-05-29).
+         * MDXFIND_METAL_KERNEL_A_TIMING=1 emits per-dispatch kernel-A
+         * wall time via the MTLCommandBuffer's GPU-side timestamps and
+         * accumulates a shutdown-time aggregate (printed by the
+         * atexit-registered metal_kernel_a_timing_dump). Observer
+         * effect is <0.1% (one CFAbsoluteTime read + arithmetic per
+         * dispatch). Used to validate Knob G's perf claim on Metal
+         * via end-to-end + kernel-A A/B (no quantitative prediction
+         * in spec; the measured number IS the deliverable per
+         * [[feedback_perf_knob_predictions_need_microbench]]). */
+        if (gpu_metal_kernel_a_timing_enabled()) {
+            double t0 = cb_a.GPUStartTime;
+            double t1 = cb_a.GPUEndTime;
+            double dt_us = (t1 - t0) * 1.0e6;
+            if (dt_us < 0.0) dt_us = 0.0;
+            metal_kernel_a_timing_record(dev_idx, op, dt_us);
+        }
+
+        /* MDXFIND_DISPATCH_TRACE: capture kernel-A GPU device time NOW
+         * (cb_a is still in autoreleasepool scope). Final per-dispatch
+         * [disp-metal] line emitted at end of pool below; covers all
+         * three outcome branches (overflow / empty-slots / real kernel-B). */
+        uint64_t _disp_ka_us = 0;
+        uint64_t _disp_kb_us = 0;
+        uint64_t _disp_t_b_dispatch = 0;
+        uint64_t _disp_t_b_complete = 0;
+        if (gpu_metal_dispatch_trace_enabled()) {
+            double a_t0 = cb_a.GPUStartTime;
+            double a_t1 = cb_a.GPUEndTime;
+            _disp_ka_us = (a_t1 > a_t0)
+                ? (uint64_t)((a_t1 - a_t0) * 1.0e6) : 0;
+        }
+        uint32_t _disp_hcount = 0;   /* mutated only in else branch */
 
         /* --- 6. Read kernel-A state (slot/byte/overflow counters).
          * Shared storage: [contents] is host-visible after waitUntilCompleted. */
@@ -4819,8 +6108,19 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
             [enc_b setBuffer:mtl_buf_kernelb_ovr_gid   offset:0 atIndex:17];
             [enc_b dispatchThreadgroups:grid_b threadsPerThreadgroup:tg_b];
             [enc_b endEncoding];
+            /* MDXFIND_DISPATCH_TRACE: host-wall span markers. */
+            if (gpu_metal_dispatch_trace_enabled()) {
+                _disp_t_b_dispatch = gpu_metal_now_us();
+            }
             [cb_b commit];
             [cb_b waitUntilCompleted];
+            if (gpu_metal_dispatch_trace_enabled()) {
+                _disp_t_b_complete = gpu_metal_now_us();
+                double b_t0 = cb_b.GPUStartTime;
+                double b_t1 = cb_b.GPUEndTime;
+                _disp_kb_us = (b_t1 > b_t0)
+                    ? (uint64_t)((b_t1 - b_t0) * 1.0e6) : 0;
+            }
 
             if (cb_b.status != MTLCommandBufferStatusCompleted) {
                 fprintf(stderr,
@@ -4842,11 +6142,116 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
                        (size_t)hcount * GPU_HIT_STRIDE * sizeof(uint32_t));
             }
             ret_nhits = (int)hcount;
+            _disp_hcount = hcount;
+        }
+
+        /* MDXFIND_DISPATCH_TRACE per-dispatch emission (single-dispatch
+         * degenerate path; chunk=0). Covers all three outcome branches:
+         *   overflow / actual_slots==0  -> kernel_b_us=0 host_gap_us=0
+         *                                  span_us covers kernel-A only
+         *   real kernel B               -> all four fields populated
+         * Span here is HOST-WALL between a_dispatch and b_complete (or
+         * a_complete for empty branches); host_gap_us is host-wall between
+         * a_complete and b_dispatch (the actual host bookkeeping window). */
+        if (gpu_metal_dispatch_trace_enabled()) {
+            uint64_t _gap_us = 0;
+            uint64_t _span_us = 0;
+            if (_disp_t_b_dispatch > 0 && _disp_t_b_complete > 0) {
+                _gap_us = (_disp_t_b_dispatch > _disp_t_a_complete)
+                    ? (_disp_t_b_dispatch - _disp_t_a_complete) : 0;
+                _span_us = (_disp_t_b_complete > _disp_t_a_dispatch)
+                    ? (_disp_t_b_complete - _disp_t_a_dispatch) : 0;
+            } else {
+                _span_us = (_disp_t_a_complete > _disp_t_a_dispatch)
+                    ? (_disp_t_a_complete - _disp_t_a_dispatch) : 0;
+            }
+            fprintf(stderr,
+                "[disp-metal] dev=%d op=%d path=kernelB_proto chunk=0 "
+                "num_words=%u n_rules=%u rules_in_chunk=%u hits=%u "
+                "kernel_a_us=%llu host_gap_us=%llu kernel_b_us=%llu "
+                "span_us=%llu\n",
+                dev_idx, op, num_words, n_rules, n_rules, _disp_hcount,
+                (unsigned long long)_disp_ka_us,
+                (unsigned long long)_gap_us,
+                (unsigned long long)_disp_kb_us,
+                (unsigned long long)_span_us);
         }
     }  /* autoreleasepool */
 
     if (nhits_out != NULL) *nhits_out = ret_nhits;
     return h_hits;
+}
+
+/* Metal twin of gpu_opencl_kernelb_proto_plaintext (gpu/gpu_opencl.c:14483).
+ * Recovers the post-rule candidate plaintext from the kernel-A SCRATCH
+ * packed buffer (mtl_buf_proto_packed) using the kernel-A index buffer
+ * (mtl_buf_proto_chunk_index) as the slot -> byte-offset lookup. The
+ * accessor is consumed by the dedicated proto-replay block in
+ * gpu/gpujob_metal.m (which fires when _proto_fired=1) to fix the
+ * structural hit-merge bug where the standard rules-engine replay loop
+ * treated entry[0] (= kernel-A slot index) as widx (host packed_buf
+ * index). See spec project_metal_hit_merge_debug_spec_2026-05-30.md
+ * §4-§6 for the full diagnosis.
+ *
+ * The two MTLBuffers are MTLResourceStorageModeShared (Apple Silicon
+ * UMA) so [buf contents] after the dispatcher's waitUntilCompleted is
+ * the documented coherent-read pattern; same convention as the existing
+ * gpu_metal_kernelb_dispatch_proto state readback (gpu_metal.m:5129).
+ *
+ * Bounds checks mirror the OpenCL twin: slot_idx must fall within the
+ * recorded index buffer cap; the byte offset read from the index buffer
+ * must fall within the recorded packed buffer cap; the [len] prefix
+ * plus body must fit within the packed buffer cap. Returns NULL on any
+ * out-of-range condition (silent skip is correct for the replay caller;
+ * the dispatcher itself already FATAL-exits on overflow per
+ * gpu_metal.m:4960-4969). */
+const char *gpu_metal_kernelb_proto_plaintext(int dev_idx,
+    uint32_t hit_widx, int *plen_out)
+{
+    if (plen_out) *plen_out = 0;
+    if (dev_idx != 0) return NULL;
+    if (!metal_ready) return NULL;
+
+    /* RULE-AXIS CHUNKING (Metal twin of OpenCL #343, 2026-05-31): multi-
+     * chunk mode resolves plaintext from the file-static arena keyed by the
+     * GLOBAL hit ordinal G (= hit_widx). The dispatcher copied each hit's
+     * [len][bytes] record into mtl_h_proto_resolved_buf BEFORE the next
+     * chunk clobbered mtl_buf_proto_packed (resolve-before-clobber, R3),
+     * and recorded its arena byte offset at mtl_h_proto_resolved_off[G].
+     * Single-chunk (e347 / small-rule-count) dispatch leaves
+     * mtl_proto_resolved_active=0 and takes the legacy direct-from-device-
+     * buffer path below. Mirrors gpu/gpu_opencl.c:14818-14828. */
+    if (mtl_proto_resolved_active) {
+        if (!mtl_h_proto_resolved_off || !mtl_h_proto_resolved_buf) return NULL;
+        uint32_t G = hit_widx;
+        if ((size_t)G >= mtl_h_proto_resolved_off_cap) return NULL;
+        size_t arena_off = (size_t)mtl_h_proto_resolved_off[G];
+        if (arena_off + 1 > mtl_h_proto_resolved_buf_used) return NULL;
+        uint8_t plen = mtl_h_proto_resolved_buf[arena_off];
+        if (arena_off + 1 + plen > mtl_h_proto_resolved_buf_used) return NULL;
+        if (plen_out) *plen_out = (int)plen;
+        return (const char *)(mtl_h_proto_resolved_buf + arena_off + 1);
+    }
+
+    if (mtl_buf_proto_packed == nil || mtl_buf_proto_chunk_index == nil)
+        return NULL;
+
+    uint32_t slot_idx = hit_widx;
+    size_t index_byte_off = (size_t)slot_idx * sizeof(uint32_t);
+    if (index_byte_off + sizeof(uint32_t) > mtl_buf_proto_index_cap)
+        return NULL;
+
+    const uint32_t *index_base =
+        (const uint32_t *)[mtl_buf_proto_chunk_index contents];
+    uint32_t wpos = index_base[slot_idx];
+    if ((size_t)wpos + 1 > mtl_buf_proto_packed_cap) return NULL;
+
+    const uint8_t *packed = (const uint8_t *)[mtl_buf_proto_packed contents];
+    uint8_t plen = packed[wpos];
+    if ((size_t)wpos + 1 + plen > mtl_buf_proto_packed_cap) return NULL;
+
+    if (plen_out) *plen_out = (int)plen;
+    return (const char *)(packed + wpos + 1);
 }
 
 /* ====================================================================
@@ -5255,14 +6660,8 @@ static int gpu_metal_kernelA_upload_mask_buffers(void)
         GPU_FATAL("Metal: kernel A2 mask upload called with device=nil");
     }
 
-    /* 2026-05-26: pattern_bytes stays at 32 bytes (16 positions * 2)
-     * regardless of MAX_MASK_POS_CPU (256 on CPU side). The kernel A2
-     * private scratch is uchar[16] and the metal_template internally
-     * clamps n_prepend/n_append to 16. The mdxfind.c upload guards
-     * refuse longer masks upstream; KERN_A_PATTERN_LEN_CAP defends in
-     * depth. */
-    const size_t KERN_A_PATTERN_LEN_CAP = 16u;
-    const size_t pattern_bytes  = KERN_A_PATTERN_LEN_CAP * 2u;            /* 32 */
+    /* 2026-05-30 amendment: 320 B descriptor wire format per side. */
+    const size_t pattern_bytes  = 320u;                                   /* GPU_MASK_DESC_BYTES_CAP */
     const size_t charsets_bytes = (size_t)MASK_MAX_CLASSES_CPU * 256u;    /* 4096 */
     const size_t counts_bytes   = (size_t)MASK_MAX_CLASSES_CPU * sizeof(uint32_t); /* 64 */
 
@@ -5297,24 +6696,29 @@ static int gpu_metal_kernelA_upload_mask_buffers(void)
     unsigned char *charsets_p   = (unsigned char *)[mtl_buf_kern_a_mask_charsets contents];
     uint32_t      *counts_p     = (uint32_t *)     [mtl_buf_kern_a_mask_counts   contents];
 
-    memset(prepend_wire, 0, alloc_pattern);
-    memset(append_wire,  0, alloc_pattern);
-    memset(charsets_p,   0, alloc_charsets);
-    memset(counts_p,     0, alloc_counts);
+    /* 2026-05-30 amendment: descriptor streams come from the global
+     * staging buffers populated by gpu_pack_mask_descriptor() in mdxfind.c.
+     * We zero-fill the 320 B buffer tails with 0xFF (END tag) so any
+     * stale bytes past dlen terminate the walker safely. */
+    extern unsigned char gpu_kern_a_prep_desc[];
+    extern unsigned char gpu_kern_a_app_desc [];
+    extern int           gpu_kern_a_prep_dlen;
+    extern int           gpu_kern_a_app_dlen;
 
-    for (int i = 0; i < MaskPrependLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
-        int cid = MaskPrependPattern[i].classid;
-        prepend_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
-                                  ? 0xffu
-                                  : (unsigned char)(cid & 0xff);
-        prepend_wire[i * 2 + 1] = MaskPrependPattern[i].literal;
+    memset(prepend_wire, 0xFF, alloc_pattern);
+    memset(append_wire,  0xFF, alloc_pattern);
+    memset(charsets_p,   0,    alloc_charsets);
+    memset(counts_p,     0,    alloc_counts);
+
+    if (gpu_kern_a_prep_dlen > 0 && gpu_kern_a_prep_dlen <= 320) {
+        memcpy(prepend_wire, gpu_kern_a_prep_desc, (size_t)gpu_kern_a_prep_dlen);
+    } else {
+        prepend_wire[0] = 0xFF;
     }
-    for (int i = 0; i < MaskAppendLen && i < (int)KERN_A_PATTERN_LEN_CAP; i++) {
-        int cid = MaskAppendPattern[i].classid;
-        append_wire[i * 2]     = (cid == MASK_LITERAL_CPU)
-                                 ? 0xffu
-                                 : (unsigned char)(cid & 0xff);
-        append_wire[i * 2 + 1] = MaskAppendPattern[i].literal;
+    if (gpu_kern_a_app_dlen > 0 && gpu_kern_a_app_dlen <= 320) {
+        memcpy(append_wire, gpu_kern_a_app_desc, (size_t)gpu_kern_a_app_dlen);
+    } else {
+        append_wire[0] = 0xFF;
     }
     for (int c = 0; c < MASK_MAX_CLASSES_CPU; c++) {
         counts_p[c] = (uint32_t)MaskClasses[c].count;
@@ -5328,8 +6732,8 @@ static int gpu_metal_kernelA_upload_mask_buffers(void)
     mtl_buf_kern_a_mask_allocated = 1;
     fprintf(stderr,
         "Metal: kernel A2 mask wire-format uploaded "
-        "(prepend_len=%d append_len=%d total=%llu)\n",
-        MaskPrependLen, MaskAppendLen,
+        "(prep_dlen=%d app_dlen=%d total=%llu)\n",
+        gpu_kern_a_prep_dlen, gpu_kern_a_app_dlen,
         (unsigned long long)MaskTotal);
     return 0;
 }
@@ -5372,6 +6776,21 @@ uint32_t *gpu_metal_kernelA_masks_dispatch(int dev_idx,
                 (unsigned long long)MaskTotal);
         }
         return NULL;
+    }
+
+    /* 2026-05-30 amendment: A2/A3/A4 eligibility check. */
+    {
+        extern int gpu_kern_a_mask_eligible;
+        if (!gpu_kern_a_mask_eligible) {
+            static int _ineligible_warned = 0;
+            if (!_ineligible_warned) {
+                _ineligible_warned = 1;
+                fprintf(stderr,
+                    "Metal GPU[%d]: kernel A2 mask exceeds per-side cap; "
+                    "falling back to CPU iterator.\n", dev_idx);
+            }
+            return NULL;
+        }
     }
 
     if (MaskTotal >= (1ULL << 31)) {
@@ -5431,8 +6850,13 @@ uint32_t *gpu_metal_kernelA_masks_dispatch(int dev_idx,
         OCLParams *params = (OCLParams *)p;
         params->num_words   = num_words;
         params->num_masks   = n_masks;
-        params->n_prepend   = (uint32_t)MaskPrependLen;
-        params->n_append    = (uint32_t)MaskAppendLen;
+        /* 2026-05-30 amendment: descriptor stream byte length. */
+        {
+            extern int gpu_kern_a_prep_dlen;
+            extern int gpu_kern_a_app_dlen;
+            params->n_prepend   = (uint32_t)gpu_kern_a_prep_dlen;
+            params->n_append    = (uint32_t)gpu_kern_a_app_dlen;
+        }
         params->num_rules   = 0;
         params->max_probe   = 256u;
         params->max_iter    = 1u;
@@ -5668,8 +7092,13 @@ uint32_t *gpu_metal_kernelA_rules_masks_dispatch(int dev_idx,
         params->num_words   = num_words;
         params->num_rules   = n_rules;            /* D10.1.a source count */
         params->num_masks   = n_masks;            /* MaskTotal */
-        params->n_prepend   = (uint32_t)MaskPrependLen;
-        params->n_append    = (uint32_t)MaskAppendLen;
+        /* 2026-05-30 amendment: descriptor stream byte length. */
+        {
+            extern int gpu_kern_a_prep_dlen;
+            extern int gpu_kern_a_app_dlen;
+            params->n_prepend   = (uint32_t)gpu_kern_a_prep_dlen;
+            params->n_append    = (uint32_t)gpu_kern_a_app_dlen;
+        }
         params->max_probe   = 256u;
         params->max_iter    = 1u;
         params->packed_size = (uint32_t)max_packed;
@@ -5861,14 +7290,25 @@ uint32_t *gpu_metal_kernelA_bruteforce_dispatch(int dev_idx,
 
     /* Worst-case slot count = num_words * bf_num_masks. Per spec §6
      * max_packed = slots * (1 + MaskAppendLen) <= 256 MB. Host caps and
-     * FATAL-exits per R5. */
+     * FATAL-exits per R5.
+     *
+     * Per-slot reservation is rounded UP to a 16-byte multiple
+     * unconditionally post-2026-05-30 A4 C5 default-on refactor: the
+     * Metal kernel A4 write path now ALWAYS uses uint4 (16-byte)
+     * device stores via atomic_fetch_add_explicit(need_aligned), so
+     * the host must size the buffer to match. Without the round-up
+     * the kernel's atomic would overrun the host cap, latching
+     * overflow_flag and tripping a downstream NULL-deref in the trace
+     * dump path. */
     static const size_t MAX_KERNEL_A_PACKED_METAL = (size_t)256 * 1024u * 1024u;
-    size_t max_slots  = (size_t)num_words * (size_t)bf_num_masks;
-    size_t max_packed = max_slots * (size_t)(1u + (uint32_t)MaskAppendLen);
+    size_t max_slots = (size_t)num_words * (size_t)bf_num_masks;
+    size_t per_slot_bytes = (size_t)(1u + (uint32_t)MaskAppendLen);
+    per_slot_bytes = (per_slot_bytes + 15u) & ~(size_t)15u;
+    size_t max_packed = max_slots * per_slot_bytes;
     if (max_packed > MAX_KERNEL_A_PACKED_METAL) {
         GPU_FATAL("Metal GPU[%d]: kernel A4 max_packed=%zu B exceeds cap=%zu B "
-                  "(num_words=%u bf_num_masks=%u app_len=%d); host-side "
-                  "adaptive_bf_chunk_size produced an oversize chunk",
+                  "(num_words=%u bf_num_masks=%u app_len=%d); host-"
+                  "side adaptive_bf_chunk_size produced an oversize chunk",
                   dev_idx, max_packed, MAX_KERNEL_A_PACKED_METAL,
                   num_words, bf_num_masks, MaskAppendLen);
     }
@@ -5899,8 +7339,13 @@ uint32_t *gpu_metal_kernelA_bruteforce_dispatch(int dev_idx,
         params->mask_start          = g->bf_mask_start;
         params->num_words           = num_words;
         params->num_masks           = bf_num_masks;
-        params->n_prepend           = 0u;                       /* BF invariant */
-        params->n_append            = (uint32_t)MaskAppendLen;
+        /* 2026-05-30 amendment: A4 prebuf bound to 1-byte END descriptor;
+         * append side carries the standard descriptor stream byte length. */
+        params->n_prepend           = 1u;
+        {
+            extern int gpu_kern_a_app_dlen;
+            params->n_append        = (uint32_t)gpu_kern_a_app_dlen;
+        }
         params->max_probe           = 256u;
         params->max_iter            = 1u;
         params->packed_size         = (uint32_t)max_packed;
@@ -5953,6 +7398,25 @@ uint32_t *gpu_metal_kernelA_bruteforce_dispatch(int dev_idx,
                 "Metal kernel A4 dispatch error op=%d num_words=%u "
                 "bf_num_masks=%u",
                 g->op, num_words, bf_num_masks);
+        }
+
+        /* PROFILE_VARIANT-for-A4 (2026-05-30) timing capture: the A4
+         * standalone dispatcher does NOT route through
+         * gpu_metal_kernelb_dispatch_proto, so the A1 [metal-kA]
+         * harness at line ~4943 never fires here. Read cb.GPUStartTime
+         * / cb.GPUEndTime directly and record to the independent A4
+         * accumulator. Gate: env var SET (any value including "0")
+         * so the operator can collect the V0 baseline alongside
+         * V1..V5. Zero overhead when env unset. */
+        {
+            const char *_a4pv_env = getenv("MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT");
+            if (_a4pv_env != NULL && _a4pv_env[0] != '\0') {
+                double t0 = cb.GPUStartTime;
+                double t1 = cb.GPUEndTime;
+                double dt_us = (t1 - t0) * 1.0e6;
+                if (dt_us < 0.0) dt_us = 0.0;
+                metal_kernel_a4_timing_record(dev_idx, g->op, dt_us);
+            }
         }
 
         uint32_t state[3] = {0, 0, 0};

@@ -107,6 +107,129 @@
  * rules walker section of md5_rules_phase0 has no salt-axis fan-out
  * (verified by reading lines 1064-1153 of gpu_md5_rules.cl rev 1.30);
  * salts feed into the trailing MD5+probe block which kernel A omits.
+ *
+ * ====================================================================
+ * KNOB G (Metal twin, 2026-05-29) -- coalesced uint4 (16-byte)
+ * candidate writes.
+ * --------------------------------------------------------------------
+ * Build-gated by -DKNOBG_VEC_WRITE=1 (host env-flag MDXFIND_METAL_-
+ * EXPERIMENT_KNOBG_VEC_WRITE=1). Metal preprocessorMacros at the
+ * library-load site in gpu_metal.m forks the JIT cache automatically
+ * (Apple's MTLLibrary self-cache is keyed on source + macros).
+ *
+ * When the macro is defined, the per-byte write loop that emits
+ * [len][bytes] into b_packed_buf is replaced by uint4 (16-byte)
+ * stores. Each slot's atomic byte-claim is rounded UP to a multiple
+ * of 16 (need_aligned = (need_bytes + 15) & ~15), so every slot
+ * starts on a 16-byte boundary and consumes a 16-byte multiple of
+ * bytes. Pad bytes inside each slot's padded tail are undefined; the
+ * consumer reads only [len] bytes (plen) and never accesses padding
+ * -- bit-perfect equivalence with the legacy path.
+ *
+ * Invariant (proof by induction): the candidate buffer base is
+ * 256-byte aligned by Apple Metal MTLBuffer guarantee; first
+ * byte_off=0 (16-aligned); every subsequent claim adds a multiple
+ * of 16 -> every byte_off is a multiple of 16. Aligned uint4 stores
+ * into the slot region are legal.
+ *
+ * Metal D5 (direct-from-buf design, per spec): unlike the OpenCL
+ * twin which copies into a private 256-byte stage[] buffer before
+ * issuing uint4 stores, the Metal port issues uint stores DIRECTLY
+ * from `buf[]` (already 16-byte aligned at metal_kernel_a_rules.-
+ * metal:872) via per-uint shift-reconstruction. This avoids an
+ * extra private-buffer copy that the Apple compiler is less reliable
+ * about hoisting into registers on M1 (M1's per-thread register
+ * budget is tighter than M2+).
+ *
+ * Layout per slot (byte_off through byte_off+need_aligned-1):
+ *   byte 0   : emit_len
+ *   byte 1   : buf[0]
+ *   byte 2   : buf[1]
+ *   ...
+ *   byte k+1 : buf[k]
+ *   ...
+ *   byte emit_len     : buf[emit_len-1]
+ *   byte (emit_len+1) .. (need_aligned-1) : undefined pad
+ *
+ * Implementation: reconstruct each 4-byte uint of the slot as
+ *   uint0 = emit_len | buf[0]<<8  | buf[1]<<16 | buf[2]<<24
+ *   uint1 = buf[3]   | buf[4]<<8  | buf[5]<<16 | buf[6]<<24
+ *   ...
+ *   uintN = buf[4N-1]| buf[4N]<<8 | buf[4N+1]<<16 | buf[4N+2]<<24
+ * then issue need_aligned/4 uint stores to the slot region as a
+ * single aligned uint pointer at byte_off. Apple's Metal compiler
+ * groups consecutive aligned uint stores into wider SIMD transactions
+ * (uint4 / uint2) at the assembler stage; no separate uint4 cast
+ * needed in source. Reading past buf[emit_len-1] is safe (buf[] is
+ * 16-byte aligned, RULE_BUF_MAX=40960 -- the tail uint reads land
+ * inside the same private allocation and write undefined-but-stable
+ * pad bytes that the consumer never inspects).
+ *
+ * Authoritative spec: project_metal_knob_g_spec_2026-05-29.md.
+ * ====================================================================
+ *
+ * ====================================================================
+ * PROFILE_VARIANT scaffolding (Metal twin, 2026-05-29)
+ * --------------------------------------------------------------------
+ * Build-gated by -DPROFILE_VARIANT=N (N in 1..6); host env-flag
+ *   MDXFIND_METAL_PROFILE_VARIANT=N
+ * threads the macro via MTLCompileOptions.preprocessorMacros at JIT
+ * library load. Apple's MTLLibrary self-cache is keyed on source +
+ * macros, so cache forks automatically per variant (no manual cache-
+ * key threading needed).
+ *
+ * Variant semantics (mirror OpenCL twin gpu_kernel_a_rules.cl rev 1.7):
+ *
+ *   V0 (unset / 0) baseline -- full cand_rules_phase0 unchanged
+ *                              (production byte-identical).
+ *   V1              no atomic claim -- deterministic per-lane offset
+ *                   gid*256; per-byte write still happens; apply_rule
+ *                   still runs. Slot/byte counters stay at 0 -> host
+ *                   sees actual_slots=0 -> kernel B skipped. Measures
+ *                   atomic_fetch_add_explicit cost share on Apple AGX.
+ *   V2              no candidate write -- atomic_add still runs (so
+ *                   byte_counter advances) but per-byte write loop +
+ *                   index store are removed. slot_counter NOT
+ *                   incremented (host actual_slots=0 -> kernel B
+ *                   skipped). Measures per-byte write loop cost share.
+ *   V3              stub apply_rule_thread -- returns wlen unchanged;
+ *                   walker walks but the 650-LOC opcode switch is
+ *                   skipped. Slot/byte counters DO advance for
+ *                   no-rule-pass survivors (per [[feedback_no_rule_-
+ *                   pass]] / R7 in spec); kernel B runs with the
+ *                   no-rule subset only. Measures apply_rule switch
+ *                   cost share.
+ *   V4              walker-only -- word into buf, then return. NO
+ *                   apply_rule_thread, NO atomic, NO write. Sentinel
+ *                   buf[0]==0xff branch keeps the buf write live in
+ *                   the compiler's liveness analysis.
+ *   V5              empty kernel -- return immediately after the
+ *                   gid-bounds + cursor check; before the word-read.
+ *                   Measures dispatch + chunk-loop overhead.
+ *   V6              V0 + Metal Knob G FORCED ON (D5.a direct-from-buf
+ *                   shape, NOT OpenCL stage[]). PRODUCES VALID
+ *                   CANDIDATES (unlike V1..V5); kernel B runs
+ *                   normally; crack output is bit-equivalent to V0 +
+ *                   MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1. The
+ *                   V0-vs-V6 kernel_a_us delta is the empirical
+ *                   per-byte-write-component reduction attributable
+ *                   to Metal Knob G. Closes the prediction-
+ *                   verification loop on Metal.
+ *
+ * Crack-parity is INTENTIONALLY NOT preserved by V1..V5 (timing
+ * stubs); V6 DOES preserve crack-parity (it is the Metal Knob G
+ * implementation under a different selector).
+ *
+ * Composition with KNOBG_VEC_WRITE:
+ *   PROFILE_VARIANT=1..5: kernel A short-circuits before / instead of
+ *                         the productive write block; KNOBG_VEC_WRITE
+ *                         is IGNORED.
+ *   PROFILE_VARIANT=6:    Knob G is FORCED ON internally; KNOBG_VEC_-
+ *                         WRITE env flag is IGNORED.
+ *   PROFILE_VARIANT=0:    Knob G respects its own env flag.
+ *
+ * Authoritative spec: project_metal_profile_variant_spec_2026-05-29.md.
+ * ====================================================================
  */
 
 /* ==== Opcode definitions (must match ruleproc.c RULE_OP_* exactly) ==== */
@@ -203,6 +326,15 @@ static inline uchar case_flip_mask(uchar c)
  */
 static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int len)
 {
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 3
+    /* V3 (PROFILE_VARIANT=3): stub apply_rule -- return input length
+     * unchanged; suppress the huge opcode switch entirely. The walker
+     * still runs (word read into buf), the atomic claim still happens,
+     * the per-byte write still happens; only the apply_rule body is
+     * stubbed. Used to isolate the cost of the rule-walker switch.
+     * Mirrors OpenCL twin gpu_kernel_a_rules.cl:216-224. */
+    return len;
+#else
     int k = 0;
     int orig_len = len;
 
@@ -793,6 +925,7 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
         }
     }
     return len;
+#endif  /* PROFILE_VARIANT == 3 stub guard */
 }
 
 /* ---- Kernel A1 (rules-only) production kernel --------------------
@@ -841,23 +974,39 @@ void cand_rules_phase0(device uchar         *payload,
     device const OCLParams *params_buf = (device const OCLParams *)payload;
     OCLParams params = *params_buf;
     uint n_words = params.num_words;
-    uint n_rules = params.num_rules;
-    uint total   = n_words * n_rules;
+    /* RULE-AXIS CHUNKING (Metal twin of OpenCL #343, 2026-05-31): params.num_rules
+     * carries the per-chunk rule COUNT (rule_count) and params.rule_cursor_start
+     * carries the per-chunk rule BASE (rule_start) into rule_offset[]. The host
+     * loops disjoint rule sub-ranges [rule_start, rule_start+rule_count) so the
+     * candidate buffer for one dispatch is bounded to n_words*rule_count*256
+     * <= cap. When the whole ruleset fits one chunk (e347 / small rule count)
+     * the host sets rule_start=0 and rule_count=n_rules, making this decode
+     * BYTE-IDENTICAL to the pre-chunking geometry (rule_idx = gid / n_words).
+     * The legacy B3 overflow-cursor early-return is REMOVED from this A1 path
+     * (D5.a in spec): with chunking the per-chunk buffer cannot overflow by
+     * construction (host caps K), and overloading rule_cursor_start with two
+     * meanings (chunk base vs overflow-restart cursor) would corrupt the chunk
+     * decode (chunks > 0 would early-return on the entire grid since
+     * rule_idx_local < rule_cursor_start would be true for all lanes).
+     * Overflow is now handled host-side by a bounded halve-K retry. */
+    uint rule_start = params.rule_cursor_start;  /* chunk base into rule_offset[] */
+    uint n_rules    = params.num_rules;           /* this chunk's rule_count */
+    uint total      = n_words * n_rules;
 
     if (gid >= total) return;
 
-    uint word_idx = gid % n_words;
-    uint rule_idx = gid / n_words;
+    uint word_idx        = gid % n_words;
+    uint rule_idx_local  = gid / n_words;           /* 0..(rule_count-1) */
+    uint rule_idx        = rule_start + rule_idx_local;  /* GLOBAL rule index */
 
-    /* B3 cursor check (mirrors md5_rules_phase0). On a re-issue dispatch
-     * the host sets input_cursor_start + rule_cursor_start to the (word,
-     * rule) coordinate of the first overflowing lane from the prior
-     * dispatch; lanes whose (rule, word) lex-precedes that early-return. */
-    if (params.input_cursor_start > 0u || params.rule_cursor_start > 0u) {
-        if (rule_idx < params.rule_cursor_start) return;
-        if (rule_idx == params.rule_cursor_start &&
-            word_idx < params.input_cursor_start) return;
-    }
+    /* ==== PROFILE_VARIANT scaffolding (2026-05-29, perf decomposition) =====
+     * Mirrors OpenCL twin gpu_kernel_a_rules.cl rev 1.7 lines 935-1184.
+     * See file-top PROFILE_VARIANT block for full variant semantics.
+     * V5 short-circuits BEFORE the word-read; placed here so even the
+     * private buffer allocation cost is NOT in the measurement. */
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 5
+    return;
+#endif
 
     /* Deterministic sub-buffer pointers from params.num_words (identical
      * to md5_rules_phase0). The compiler hoists since they depend only on
@@ -875,6 +1024,22 @@ void cand_rules_phase0(device uchar         *payload,
     int wlen = (int)words[wpos++];
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
     for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
+
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 4
+    /* V4 (walker only): word-read into buf is done; skip apply_rule_-
+     * thread, atomic claim, per-byte write, index store. Sentinel
+     * branch on buf[0]==0xff keeps the compiler from dead-stripping
+     * the buf write (unreachable on real data since wlen>0 by
+     * construction; the sentinel reads back the buf into a live
+     * side-effect path). Mirrors OpenCL twin gpu_kernel_a_rules.cl
+     * lines 997-1009. */
+    if (buf[0] == 0xffu) {
+        atomic_fetch_or_explicit(
+            &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u,
+            memory_order_relaxed);
+    }
+    return;
+#endif
 
     uint rpos = rule_offset[rule_idx];
     int is_no_rule = (rule_program[rpos] == 0);
@@ -902,6 +1067,113 @@ void cand_rules_phase0(device uchar         *payload,
 
     /* --- Reserve a candidate slot --------------------------------- */
     uint need_bytes = 1u + emit_len;   /* [len][bytes] */
+
+#if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 1
+    /* V1 (no atomic claim): substitute deterministic per-lane offsets
+     * for the atomic_fetch_add slot/byte reservation. Per-byte write
+     * still happens (so V0 - V1 attributes the atomic_add cost on Apple
+     * AGX). slot_counter + byte_counter stay at zero, so host sees
+     * actual_slots=0 and skips kernel B. Mirrors OpenCL twin lines
+     * 1044-1060. (See spec R3: AGX coalescing-coupling answer is UNKNOWN;
+     * the measurement IS the deliverable.) */
+    {
+        uint byte_off = gid * 256u;
+        uint slot     = gid;
+        if (byte_off + need_bytes > params.packed_size) return;
+        if (slot >= total) return;
+        b_packed_buf[byte_off] = (uchar)emit_len;
+        for (uint i = 0; i < emit_len; i++) {
+            b_packed_buf[byte_off + 1u + i] = buf[i];
+        }
+        b_chunk_index[slot] = byte_off;
+    }
+#elif defined(PROFILE_VARIANT) && PROFILE_VARIANT == 2
+    /* V2 (no candidate write): atomic_fetch_add still runs (so V0 - V2
+     * attributes the per-byte write loop cost). Per-byte memcpy + index
+     * store are removed. slot_counter NOT incremented (host actual_-
+     * slots=0 -> kernel B skipped). Mirrors OpenCL twin lines 1061-1078. */
+    {
+        uint byte_off = atomic_fetch_add_explicit(
+            &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+            need_bytes, memory_order_relaxed);
+        /* Keep byte_off live so the compiler doesn't fold the atomic;
+         * cheap side-effect via overflow flag (or'd with 0 = no-op). */
+        if (byte_off == 0xffffffffu) {
+            atomic_fetch_or_explicit(
+                &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u,
+                memory_order_relaxed);
+        }
+        /* slot_counter NOT incremented; per-byte write loop omitted. */
+    }
+#elif defined(PROFILE_VARIANT) && PROFILE_VARIANT == 6
+    /* V6 (Metal Knob G micro-benchmark; D4.a in profile_variant_spec):
+     * V0 baseline with the Metal Knob G direct-from-buf vectorized write
+     * loop FORCED ON, regardless of KNOBG_VEC_WRITE env flag. PRODUCES
+     * VALID CANDIDATES (kernel B runs normally); crack output is
+     * bit-equivalent to V0 + KNOBG_VEC_WRITE=1. The V0-vs-V6 kernel_a_us
+     * delta isolates the per-byte-write-component reduction attributable
+     * to Metal Knob G. Closes the prediction-verification loop on Metal.
+     *
+     * NOTE: Uses Metal Knob G's D5.a direct-from-buf shape (NOT the
+     * OpenCL V6's stage[] design). The V6 measurement reflects what
+     * Metal Knob G actually SHIPS. */
+    {
+        uint need_aligned = (need_bytes + 15u) & ~15u;
+        uint byte_off = atomic_fetch_add_explicit(
+            &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+            need_aligned, memory_order_relaxed);
+        if (byte_off + need_aligned > params.packed_size) {
+            atomic_fetch_or_explicit(
+                &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u,
+                memory_order_relaxed);
+            return;
+        }
+        uint slot = atomic_fetch_add_explicit(
+            &b_kernelA_state[KERNELA_STATE_SLOT_COUNTER / 4u], 1u,
+            memory_order_relaxed);
+        if (slot >= total) {
+            atomic_fetch_or_explicit(
+                &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u,
+                memory_order_relaxed);
+            return;
+        }
+        device uint *dst = (device uint *)(b_packed_buf + byte_off);
+        uint hdr = (uint)emit_len
+                 | ((uint)buf[0] <<  8)
+                 | ((uint)buf[1] << 16)
+                 | ((uint)buf[2] << 24);
+        dst[0] = hdr;
+        uint nuint = need_aligned / 4u;
+        for (uint v = 1u; v < nuint; v++) {
+            uint base = (v - 1u) * 4u + 3u;
+            uint w = (uint)buf[base]
+                   | ((uint)buf[base + 1u] <<  8)
+                   | ((uint)buf[base + 2u] << 16)
+                   | ((uint)buf[base + 3u] << 24);
+            dst[v] = w;
+        }
+        b_chunk_index[slot] = byte_off;
+    }
+#else
+    /* V0 (production baseline) -- legacy path. KNOB G gated. */
+#ifdef KNOBG_VEC_WRITE
+    /* KNOB G ON: round need_bytes up to a 16-byte multiple. The atomic
+     * shape is unchanged (single atomic_fetch_add_explicit); only the
+     * value claimed is rounded. Slot-start alignment proof: Apple
+     * MTLBuffer base is 256-byte aligned + each running sum adds a
+     * multiple of 16 -> every byte_off is 16-aligned. */
+    uint need_aligned = (need_bytes + 15u) & ~15u;
+    uint byte_off = atomic_fetch_add_explicit(
+        &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
+        need_aligned, memory_order_relaxed);
+
+    /* Capacity guard: use the post-rounding byte count for the bound
+     * check (otherwise the tail uint stores could spill past packed). */
+    if (byte_off + need_aligned > params.packed_size) {
+        atomic_fetch_or_explicit(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u, memory_order_relaxed);
+        return;
+    }
+#else
     uint byte_off = atomic_fetch_add_explicit(
         &b_kernelA_state[KERNELA_STATE_BYTE_COUNTER / 4u],
         need_bytes, memory_order_relaxed);
@@ -913,6 +1185,7 @@ void cand_rules_phase0(device uchar         *payload,
         atomic_fetch_or_explicit(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u, memory_order_relaxed);
         return;
     }
+#endif
 
     uint slot = atomic_fetch_add_explicit(
         &b_kernelA_state[KERNELA_STATE_SLOT_COUNTER / 4u], 1u, memory_order_relaxed);
@@ -926,10 +1199,38 @@ void cand_rules_phase0(device uchar         *payload,
     }
 
     /* --- Write [len][bytes] into packed buf ----------------------- */
+#ifdef KNOBG_VEC_WRITE
+    /* KNOB G ON: direct-from-buf shift reconstruction (spec D5.a).
+     * No private stage[] copy -- avoids M1 register-budget spill risk.
+     * Layout: uint0 = [emit_len][buf[0]][buf[1]][buf[2]] (little-endian
+     * byte order); uintN (N>=1) = [buf[4N-1]][buf[4N]][buf[4N+1]][buf[4N+2]].
+     * Reading past buf[emit_len-1] is safe (buf[] is 40960-byte aligned
+     * private allocation; tail uint reads stay in-bounds; pad bytes in
+     * the destination's [emit_len+1..need_aligned-1) range are undefined
+     * but never inspected by the consumer -- contract preserved). */
+    {
+        device uint *dst = (device uint *)(b_packed_buf + byte_off);
+        uint hdr = (uint)emit_len
+                 | ((uint)buf[0] <<  8)
+                 | ((uint)buf[1] << 16)
+                 | ((uint)buf[2] << 24);
+        dst[0] = hdr;
+        uint nuint = need_aligned / 4u;
+        for (uint v = 1u; v < nuint; v++) {
+            uint base = (v - 1u) * 4u + 3u;
+            uint w = (uint)buf[base]
+                   | ((uint)buf[base + 1u] <<  8)
+                   | ((uint)buf[base + 2u] << 16)
+                   | ((uint)buf[base + 3u] << 24);
+            dst[v] = w;
+        }
+    }
+#else
     b_packed_buf[byte_off] = (uchar)emit_len;
     for (uint i = 0; i < emit_len; i++) {
         b_packed_buf[byte_off + 1u + i] = buf[i];
     }
+#endif
 
     /* --- Write per-slot byte offset ------------------------------- *
      * Per contract S7.1 (post-Phase-2 amendment), there is NO parallel
@@ -937,6 +1238,7 @@ void cand_rules_phase0(device uchar         *payload,
      * at b_packed_buf[byte_off]; rule attribution can be re-derived from
      * slot_idx if a future need arises. */
     b_chunk_index[slot] = byte_off;
+#endif  /* PROFILE_VARIANT 1/2/6/V0 selection */
 
     /* Per-spec invariant 1: caller (Phase 4 host) relies on in-order
      * single-queue FIFO to ensure these writes are visible to kernel B

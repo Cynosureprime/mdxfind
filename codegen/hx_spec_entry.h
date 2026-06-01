@@ -43,6 +43,36 @@ extern "C" {
 #endif
 
 /*
+ * Sub-phase 5c.1 (2026-05-27): multi-emit annotation.
+ *
+ * Most MAKE_MD5PASS family members produce ONE digest per password
+ * (the canonical hash); they are HX_EMIT_SINGLE. A small "Note [N]"
+ * class in hx.8 produces MORE THAN ONE digest per password, each
+ * probed against the loaded hash table as an independent found-hash
+ * candidate (the CPU calls checkhash() once per variant). e123
+ * MD5MD5PASS is the proof-of-concept: it emits BOTH
+ *   variant 0 (canonical): md5( hex32(md5(pass)) . pass )
+ *   variant 1 (colon):      md5( hex32(md5(pass)) . ':' . pass )
+ * The codegen family emitter consults emit_class to decide whether to
+ * emit one probe+EMIT_HIT_4 block (SINGLE) or a compile-time-N
+ * unrolled set of probe+EMIT_HIT_4 blocks (MULTI). The dedup machinery
+ * (EMIT_HIT_4_DEDUP_OR_OVERFLOW keyed on the matched loaded-hash slot)
+ * is ALREADY the correct multi-emit key -- no key widening; each
+ * variant deduplicates against its own matched_idx.
+ *
+ * note_ref records the hx.8 "(see Note [N])" reference that drives the
+ * variant set (24 = canonical+colon for e123). 0 = no Note reference.
+ *
+ * Default (C zero-init) is HX_EMIT_SINGLE (=0) / note_ref=0 for every
+ * existing entry: the 29 prior family members + all non-family entries
+ * take the single-emit body unchanged.
+ */
+enum hx_emit_class {
+    HX_EMIT_SINGLE = 0,   /* one digest per password (default) */
+    HX_EMIT_MULTI  = 1    /* N>1 digests per password (Note-[N] class) */
+};
+
+/*
  * One entry per algorithm row in hx.8. The build-time tool emits a
  * static const array `hx_specs_data[]` of these into the auto-
  * generated codegen/hx_specs_data.c.
@@ -66,6 +96,14 @@ struct hx_spec_entry {
      * in MAKE_MD5PASS family kernels).
      */
     const char *const  *call_names;     /* per-code-index fn name sidecar */
+    /*
+     * Sub-phase 5c.1 (2026-05-27): multi-emit annotation (see enum
+     * hx_emit_class above). The generator tools/hx8_to_c sets these by
+     * parsing the "(see Note [N])" markup. Default-init zero =>
+     * HX_EMIT_SINGLE / note_ref=0 for every existing entry.
+     */
+    int                 emit_class;     /* enum hx_emit_class */
+    int                 note_ref;       /* hx.8 Note [N] ref; 0 = none */
 };
 
 /* Auto-generated table + count -- emitted into codegen/hx_specs_data.c. */

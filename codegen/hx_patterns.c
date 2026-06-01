@@ -31,8 +31,19 @@
  * b(pass).pass)` variant) would be rejected by the emitter's name
  * verification.
  *
- * $Revision: 1.2 $
+ * Phase 1b Batch 1 (2026-05-28): adds HX_PATTERN_UNSALTED_SINGLE
+ * recognizer for the category-(a) MD/SHA family bare-digest 3-op shape
+ * (PUSH_VAR pass / CALL hash / HALT). Covers e1 MD5, e3 MD4, e33 MD5RAW,
+ * e34 SHA1RAW, e36 SHA256RAW. Structural-only; the emit helper validates
+ * the callname. The RAW variants differ from their hex siblings ONLY in
+ * code[1].u.call.role (ROLE_BIN=1 vs ROLE_DEFAULT=0) -- a host-side
+ * output-format concern, not a kernel-compute difference.
+ *
+ * $Revision: 1.3 $
  * $Log: hx_patterns.c,v $
+ * Revision 1.3  2026/05/28 14:31:55  dlr
+ * Phase 1b Batch 1: add HX_PATTERN_UNSALTED_SINGLE detector for the 3-op PUSH_VAR pass CALL hash HALT shape covering e1 MD5 e3 MD4 e33 MD5RAW e34 SHA1RAW e36 SHA256RAW; structural-only, emit helper validates callname; RAW variants differ only in call role ROLE_BIN vs ROLE_DEFAULT a host-side output-format concern not a kernel-compute difference; dispatch table row added cannot collide with e347 ncode 7 or family ncode 6; detector recognition test all pass e347 and e161 correctly not matched
+ *
  * Revision 1.2  2026/05/22 23:52:30  dlr
  * sub-phase 5a.1 replace single-recognizer dispatch with table-driven hx_pattern_table; add matches_family_md5pass detector for 30-member MAKE_MD5PASS family; implement hx_callname_for_entry reading entry sidecar with NULL and bounds guards
  *
@@ -55,6 +66,8 @@ const char *hx_pattern_name(hx_pattern_id id)
         return "E347_MD5MD5MD5SALT";
     case HX_PATTERN_FAMILY_MD5PASS:
         return "FAMILY_MD5PASS";
+    case HX_PATTERN_UNSALTED_SINGLE:
+        return "UNSALTED_SINGLE";
     default:
         return "???";
     }
@@ -134,6 +147,57 @@ static int matches_family_md5pass(const hx_program *prog)
 }
 
 /*
+ * Phase 1b Batch 1 (2026-05-28): detect HX_PATTERN_UNSALTED_SINGLE.
+ *
+ * Structural requirements (canonical unsalted single-hash 3-op shape):
+ *   ncode == 3
+ *   code[0].op == OP_PUSH_VAR && code[0].u.slot == HX_SLOT_PASS (=0)
+ *   code[1].op == OP_CALL     && code[1].u.call.nargs == 1   (the hash)
+ *   code[2].op == OP_HALT
+ *
+ * Detector does NOT verify the callname or the call role. Verified
+ * against e1 MD5 (_hx_program_0), e3 MD4 (_hx_program_2), e33 MD5RAW
+ * (_hx_program_32, CALL md5 role=1), e34 SHA1RAW (_hx_program_33), and
+ * e36 SHA256RAW (_hx_program_35) in codegen/hx_specs_data.c -- every
+ * entry matches this exact shape. The hex and raw-binary variants share
+ * identical bytecode; only code[1].u.call.role differs (ROLE_BIN=1 for
+ * the *_bin RAW forms vs ROLE_DEFAULT=0 for the hex forms). That
+ * distinction is irrelevant to the kernel (it computes the same digest);
+ * it drives only the HOST-SIDE hit-record output format.
+ *
+ * No string or integer literals required. nvars >= 1 (pass).
+ *
+ * The emit helper (hx_emit_unsalted_single_*) MUST resolve code[1]
+ * callname via hx_callname_for_entry(entry, 1), map it through
+ * hx_primitive_id_for_name, and FATAL on any name not in the
+ * supported-and-wired set for the chosen backend. This shape can in
+ * principle match algorithms whose primitive is NOT yet wired (e.g. a
+ * hypothetical bare `tiger(pass)`); the emitter's name-validation is the
+ * gate, exactly as the family emitter validates its outer-CALL.
+ *
+ * IMPORTANT (Phase 1b coverage gap, see handoff): a bytecode shape match
+ * here does NOT mean an op is safe to MIGRATE off the legacy template
+ * path. The legacy rules-engine path GPU-accelerates rules/masks/iter for
+ * these ops; the unsalted-single codegen kernel is a one-shot hash(pass).
+ * Production routing decisions live in the admit predicate + dispatcher,
+ * NOT in this detector. The detector only says "the no-rule no-mask
+ * iter==1 compute shape is hash(pass)."
+ */
+static int matches_unsalted_single(const hx_program *prog)
+{
+    if (!prog || !prog->code || prog->ncode != 3) return 0;
+    if (prog->nvars < 1) return 0;
+
+    const hx_inst *c = prog->code;
+
+    if (c[0].op != OP_PUSH_VAR || c[0].u.slot != HX_SLOT_PASS) return 0;
+    if (c[1].op != OP_CALL     || c[1].u.call.nargs != 1)      return 0;
+    if (c[2].op != OP_HALT)                                     return 0;
+
+    return 1;
+}
+
+/*
  * Sub-phase 5a.1 (2026-05-22): table-driven pattern dispatch.
  *
  * Ordering rule: more-specific patterns FIRST. E347's 7-op shape and
@@ -153,6 +217,10 @@ static const struct {
 } hx_pattern_table[] = {
     { HX_PATTERN_E347_MD5MD5MD5SALT, matches_e347,           "E347_MD5MD5MD5SALT" },
     { HX_PATTERN_FAMILY_MD5PASS,     matches_family_md5pass, "FAMILY_MD5PASS"     },
+    /* Phase 1b Batch 1 (2026-05-28): ncode==3 shape; cannot collide with
+     * e347 (ncode==7) or family (ncode==6). Placed last by convention
+     * (more-specific first). */
+    { HX_PATTERN_UNSALTED_SINGLE,    matches_unsalted_single,"UNSALTED_SINGLE"    },
 };
 
 hx_pattern_id hx_detect_pattern(const hx_program *prog)

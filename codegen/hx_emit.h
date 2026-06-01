@@ -37,8 +37,11 @@
  * per the feedback memo. 5a.3 ships SHA1 only (e161); 5a.4 adds the
  * other 7 5a-supported primitives across both backends symmetrically.
  *
- * $Revision: 1.6 $
+ * $Revision: 1.7 $
  * $Log: hx_emit.h,v $
+ * Revision 1.7  2026/05/28 14:32:03  dlr
+ * Phase 1b Batch 1: add hx_emit_unsalted_single_opencl + hx_emit_unsalted_single_metal one-shot hash of pass emitters for HX_PATTERN_UNSALTED_SINGLE; reuse md5 md4 sha1 sha256 block from gpu_common.cl and metal_common.metal; strictly simpler than family no inner md5 no hex32 no concat; per-primitive usp buf-global helpers reproduce the family MD SHA padding applied to raw pass; SHA1 SHA256 BE to LE state byte-swap for the compact_fp probe; kernel signature mirrors kernelb_hx_codegen_phase0 salt args ignored; reqd work group size 64; C-mirror validated 80 of 80 byte-exact before GPU JIT; FATAL on callname not in wired set md5 md4 sha1 sha256
+ *
  * Revision 1.6  2026/05/23 03:21:08  dlr
  * sub-phase 5a.3 add hx_emit_family_md5pass_metal declaration mirror of OpenCL 5a.2 twin same return contract structurally identical token translations device address space thread qualifier on out-state pointers atomic_uint counters sequential buffer attribute binding SHA1 outer body MUST include BE-to-LE state byte-swap per feedback memo only SHA1 ships in 5a.3 other 5a-supported primitives FATAL with deferred-to-5a4 diagnostic
  *
@@ -197,6 +200,43 @@ int hx_emit_family_md5pass_opencl(
  * ships SHA1 only; other 5a-supported primitives FATAL with the same
  * "deferred to 5a.4" diagnostic the OpenCL twin emits. */
 int hx_emit_family_md5pass_metal(
+    char **out, size_t *out_cap,
+    const hx_program *prog,
+    const struct hx_specialization *spec,
+    const struct hx_spec_entry *entry);
+
+/* ---- pattern-recognized unsalted single-hash emitters (Phase 1b Batch 1) ----
+ *
+ * Emits a one-shot `hash(pass)` kernel for the category-(a) MD/SHA family
+ * (HX_PATTERN_UNSALTED_SINGLE, 3-op shape). Reuses the per-primitive
+ * `*_block` functions already in gpu_common.cl / metal_common.metal (md5,
+ * md4, sha1, sha256). STRICTLY SIMPLER than the family emitter: no inner
+ * md5, no hex32 prefix, no concat -- the input to the hash IS the pass.
+ *
+ * Resolves the primitive via hx_callname_for_entry(entry, 1) (code[1] is
+ * the single CALL). FATALs on any callname not in the Batch-1 wired set
+ * (md5/md4/sha1/sha256). The call ROLE (hex vs raw-bin) is IGNORED here:
+ * the digest is identical; raw-vs-hex is a host-side hit-record concern.
+ *
+ * Kernel signature mirrors kernelb_hx_codegen_phase0 (the family kernel)
+ * so the same dispatcher binding works; the 4 salt args are ignored.
+ *
+ * On entry: *out may be NULL (allocates), *out_cap is current alloc.
+ * On success: *out null-terminated source, return 0. On error: negative.
+ * Per feedback_external_failures_are_fatal.md the emitter exits(1) on
+ * unrecoverable failures (callname missing / primitive not wired). */
+int hx_emit_unsalted_single_opencl(
+    char **out, size_t *out_cap,
+    const hx_program *prog,
+    const struct hx_specialization *spec,
+    const struct hx_spec_entry *entry);
+
+/* Metal twin of hx_emit_unsalted_single_opencl. Same return contract;
+ * token translations (device/thread address spaces, atomic_uint,
+ * [[buffer(N)]] binding). SHA1/SHA256 outer bodies include the BE-to-LE
+ * state byte-swap per feedback_be_state_primitives_need_byteswap_in_-
+ * codegen.md so emitted h0.. match the CPU bytewise oracle. */
+int hx_emit_unsalted_single_metal(
     char **out, size_t *out_cap,
     const hx_program *prog,
     const struct hx_specialization *spec,

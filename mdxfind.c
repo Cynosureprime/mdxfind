@@ -105,6 +105,16 @@
 #include "sqlite3.h"
 
 #include "mdxfind.h"
+#include "userdef.h"
+
+/*
+ * TYPENAME(op): display name for a hash op.  Built-in ops index Types[]
+ * directly; user-defined ops (op >= JOB_USERDEF_BASE) are not in the
+ * static Types[] array, so consult the userdef registry.  Used by the
+ * checkhash output paths so a user op prints "USER_<name>" not garbage.
+ */
+extern char *Types[];
+#define TYPENAME(op) (userdef_is_userop(op) ? userdef_name(op) : Types[op])
 
 /* O_BINARY is needed on Windows to keep open() from doing CRLF translation
  * and stopping at 0x1A (Ctrl-Z EOF) on binary compressed input. xz/bz2/zstd/
@@ -235,10 +245,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.507 2026/05/27 17:50:57 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.524 2026/06/01 12:32:51 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.507 2026/05/27 17:50:57 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.524 2026/06/01 12:32:51 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -256,6 +266,57 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.524  2026/06/01 12:32:51  dlr
+ * v1.524 release: extend DISPATCH_TRACE provenance comment at line 925 to note Metal twin parity (gpu_metal.m rev 1.131 [disp-metal] per-chunk emit with matching kernel_a_us/host_gap_us/kernel_b_us field names per #390). Bumps RCS rev 1.523 to 1.524 marking the v1.524 release scope (iter-v1 + Metal kernel-A chunking + auto-dispatcher env-flag retirement + MD4/SHA1/SHA1RAW/SHA256/SHA256RAW codegen admission + per-stage Metal DISPATCH_TRACE + Gate-8 cosmetic widening). Pure comment edit; binary linkage unchanged.
+ *
+ * Revision 1.523  2026/05/31 00:49:03  dlr
+ * A2/A3 paired ship per long-mask amendment 2026-05-30: (1) NEW kernel A2 (masks-only) + A3 (rules+masks composed) — gpu_kernel_a_masks.cl + metal twin + gpu_kernel_a_rules_masks.cl + metal twin + their _str.h regens (RCS -ko). (2) Wire format: interleaved run-descriptor stream (LIT len bytes / VAR classid / END); n_prepend/n_append semantic shift from position count to descriptor stream byte length; GPU_MASK_VAR_CAP=16 + GPU_MASK_LIT_BYTES_CAP=224 decoupled (per-side 240B, total candidate <= 255 RULE_BUF_LIMIT preserved). (3) Host parse + descriptor pack: mdxfind.c gains wire-format defines + globals + gpu_pack_mask_descriptor helper + single pack site. (4) Host dispatcher updates: gpu_opencl.c upload helper 32B->320B + 3 dispatcher param-set sites + A2 eligibility guard; gpu_metal.m mirror. (5) A4 D3.a touch-up: helper rename mask_expand_into_gpu to mask_expand_run_into_gpu + bind 1-byte END descriptor for BF prebuf. (6) Single unified walker D4.a (no dual-path drift; backward-compat short masks take same path). Production e347 byte-identical when no mask flag set. Validated 5-architecture byte-exact crack-parity (mmt Ada / fpga Pascal / dev1 M1 / dev3 M2 Max / ioblade gfx1036 RDNA2 via -G 3) — same sorted-crack md5 211342b917d22593465c4c6e3cca6a08 across all 5. A3 production crack test PASS fpga + dev1 prepend-only + mixed prep+app. Backward-compat short-mask PASS 4 hosts. A4 BF regression PASS hpi7. Gate fixture (42-lit + 7-var) GPU-eligible + cracks correctly. Spec project_kernel_a_a2_a3_long_mask_amendment_2026-05-30.md.
+ *
+ * Revision 1.522  2026/05/29 02:11:13  dlr
+ * Add -Y: validate userdef.txt and exit. The userdef load runs before getopt so -m u<id> can resolve during arg parsing, which means a getopt case would flip the verbose flag too late; pre-scan argv for -Y, enable the load report, load, and exit. Default run is silent (shared loader gated on userdef_verbose).
+ *
+ * Revision 1.521  2026/05/28 21:08:58  dlr
+ * Milestone 2 sub-phase C+D user-defined hash types integration: -m u id selector now reports the recorded load-skip reason via userdef_skip_reason when a seen-but-failed id is selected (fatal-if-selected with the specific diagnostic), falling back to not-found for never-defined ids; invoke-time Working-on listing prints the honest GPU-eligibility status line for each selected user op via userdef_gpu_status (no new flag, piggybacks existing output). Dedup advisory and content-hash suggestion are emitted by the loader (userdef.c 1.2).
+ *
+ * Revision 1.520  2026/05/28 20:44:23  dlr
+ * Milestone 1 user-defined hash types: loader plus CPU dispatch. New userdef.c userdef.h parse stanza config MDXFIND_CACHE userdef.txt, compile each hx expression via hx_compile_expr, register under synthetic op JOB_USERDEF_BASE 1000 (chosen below JOB_DONE 2000 and within 16-bit Hashchain.flags ceiling, not the 100000 the spec sketched). mdxfind.c: include userdef.h, add TYPENAME accessor wrapping Types for user ops, add -m u id exact-string selector bypassing regex, add userdef VM dispatch arm in procjob per-word switch feeding digest to checkhash with i iteration re-feed, set TYPEOPT_NEEDSF for user ops so plain-hex loader fast-path runs, extend Working-on and Totalfound allocation plus final summary for user ops.
+ *
+ * Revision 1.519  2026/05/28 06:12:33  dlr
+ * sub-phase 5c.2.2 e123 MD5MD5PASS multi-emit oracle plus dlen plus harness; oracle_compute_md5pass_family replaces e123 FATAL arm with variant-0 canonical return md5 of buf hex32-md5-pass-then-pass 16 bytes; gpujob hit-replay recompute branch not reached for 16-byte digest so signature unchanged all callers fine; dlen switch adds JOB_MD5MD5PASS 16; hx_family_md5pass_validate_run_shared made multi-emit-aware n_variants 2 for JOB_MD5MD5PASS else 1; plant N variant rows per pass row r equals pi times n_variants plus v variant 0 via oracle variant 1 colon built inline mymd5 prmd5 colon-byte then pass matching CPU oracle linebuf2; compact table set_compact_table hits buffer max_hits sized n_rows; diff rewritten to match each hit digest against the pass variant rows track per-row seen bitmap expect vn_hits equals n_rows THE G1b dual-hash canary; single-emit n_variants 1 identical to prior behavior G2; admit harness chokepoint init-gate _proto_hexlen all auto-propagate via D17.4.b once job_to_prim_table 123 row landed
+ *
+ * Revision 1.518  2026/05/28 04:51:31  dlr
+ * sub-phase 5b.4b.4 mdxfind oracle plus dlen extended for GOSTMD5PASS e125 oracle_compute_md5pass_family adds JOB_GOSTMD5PASS arm calls in-tree gosthash directly the LIVE CPU oracle matches the JOB_GOSTMD5PASS case body TEST S-box set NOT CryptoPro R-Tier4-gost-sbox HIGH 32-byte digest on hex32 md5 pass concat pass buffer hx_family_md5pass_validate_run_shared dlen switch adds JOB_GOSTMD5PASS dlen 32 gosthash extern already declared at mdxfind.c 2252 gosthash_init at startup no new includes admit predicate harness OR-chains chokepoint init-gate _proto_hexlen all auto-propagate via D17.4.b job_to_prim_table 125 row pre-staged 5b.4a supported_5a flipped 5b.4b R15 pre-flight test_gost_vectors 26 of 26 PASS GPU C-mirror test_gost_port 27 of 27 byte-exact unified-loop control flow 20 of 20 byte-exact family now 29 of 30 GPU-eligible
+ *
+ * Revision 1.517  2026/05/28 04:32:21  dlr
+ * sub-phase 5b4a4 mdxfind oracle plus dlen extended for 2 Snefru family members oracle_compute_md5pass_family adds 2 arms JOB_SNE128MD5PASS e175 fresh local rhash handle rhash_init RHASH_SNEFRU128 update final free 16 bytes JOB_SNE256MD5PASS e177 rhash_init RHASH_SNEFRU256 32 bytes on hex32 md5 pass concat pass buffer uses FRESH LOCAL rhash handle NOT global rhash_con per R-Tier4-oracle-rhash-context global is configured per-op not safe for standalone recompute helper matches the JOB_SNE128 256MD5PASS CPU case bodies which rhash_init RHASH_SNEFRU hx_family_md5pass_validate_run_shared dlen switch adds same 2 arms returning 16 and 32 rhash.h already included at line 62 no new includes admit predicate harness OR-chains _proto_hexlen all auto-propagate via D17.4.b job_to_prim_table 175 177 rows added in 5b4a1 supported_5a flipped in 5b4a4 librhash live oracle R15 pre-flight test_snefru_vectors 230 of 230 PASS GPU C-mirror test_snefru_port 56 of 56 PASS 12-cell GPU matrix 30 of 30 byte-exact across 2 backends Pascal OpenCL plus M2 Max Metal over 4 million verifications
+ *
+ * Revision 1.516  2026/05/28 03:53:04  dlr
+ * sub-phase 5b3c4 mdxfind oracle plus dlen extended for 5 5-pass HAVAL family members oracle_compute_md5pass_family adds 5 arms JOB_HAV128_5MD5PASS e131 sph_haval128_5 16 bytes JOB_HAV160_5MD5PASS e137 sph_haval160_5 20 bytes JOB_HAV192_5MD5PASS e143 sph_haval192_5 24 bytes JOB_HAV224_5MD5PASS e149 sph_haval224_5 28 bytes JOB_HAV256_5MD5PASS e155 sph_haval256_5 32 bytes on hex32 md5 pass concat pass buffer hx_family_md5pass_validate_run_shared dlen switch adds same 5 arms returning 16 20 24 28 32 sph_haval header already included no new includes admit predicate harness OR-chains _proto_hexlen all auto-propagate via D17.4.b job_to_prim_table already had HAV*_5 rows flip prim_table supported_5a only sph_haval R15 cross-verified test_haval5_port C-mirror 60 of 60 cells PASS GPU 30-cell matrix 30 of 30 PASS Pascal OpenCL plus M2 Max Metal completes 15-variant HAVAL family Tier 3
+ *
+ * Revision 1.515  2026/05/28 03:20:02  dlr
+ * sub-phase 5b3b4 mdxfind oracle plus dlen extended for 5 4-pass HAVAL family members oracle_compute_md5pass_family adds 5 arms JOB_HAV128_4MD5PASS e129 sph_haval128_4 16 bytes JOB_HAV160_4MD5PASS e135 sph_haval160_4 20 bytes JOB_HAV192_4MD5PASS e141 sph_haval192_4 24 bytes JOB_HAV224_4MD5PASS e147 sph_haval224_4 28 bytes JOB_HAV256_4MD5PASS e153 sph_haval256_4 32 bytes on hex32 md5 pass concat pass buffer hx_family_md5pass_validate_run_shared dlen switch adds same 5 arms returning 16 20 24 28 32 sph_haval header already included no new includes admit predicate harness OR-chains _proto_hexlen all auto-propagate via D17.4.b job_to_prim_table already had HAV*_4 rows flip prim_table supported_5a only sph_haval R15 cross-verified test_haval4_port C-mirror 60 of 60 cells PASS GPU 30-cell matrix 30 of 30 PASS Pascal OpenCL plus M2 Max Metal
+ *
+ * Revision 1.514  2026/05/28 02:42:33  dlr
+ * sub-phase 5b3a JIT-only dump-harness fix route MAKE_MD5PASS family members through gpu_opencl_jit_compile_source_with_common not just e347 the non-VALIDATE dump path at the 2a.3 harness JIT site previously routed only target_job 347 through _with_common all other jobs through bare gpu_opencl_jit_compile_source which does not prepend gpu_common_str family kernels reference OCLParams md5_block state_to_hex32_bytes the primitive _block functions HAVAL_IV etc from gpu_common so they JIT-failed with undeclared identifier errors in dump mode latent since 5a.2 only surfaced now because Tier 1 2 3 always validated via MDXFIND_HX_CODEGEN_VALIDATE which uses the correct _with_common_keep dispatch path widen the condition to target_job 347 OR gpu_codegen_kernelb_family_md5pass_eligible target_job Metal twin already always uses _with_common no change needed verified all 5 HAVAL variants now JIT ok in dump mode on fpga Pascal GTX 1080
+ *
+ * Revision 1.513  2026/05/28 02:25:10  dlr
+ * sub-phase 5b3a4 mdxfind admit oracle plus dlen extended for 5 3-pass HAVAL family members oracle_compute_md5pass_family adds 5 arms JOB_HAV128MD5PASS e127 sph_haval128_3 16 bytes JOB_HAV160_3MD5PASS e133 sph_haval160_3 20 bytes JOB_HAV192_3MD5PASS e139 sph_haval192_3 24 bytes JOB_HAV224_3MD5PASS e145 sph_haval224_3 28 bytes JOB_HAV256MD5PASS e151 sph_haval256_3 32 bytes on hex32 md5 pass concat pass buffer hx_family_md5pass_validate_run_shared dlen switch adds same 5 arms returning 16 20 24 28 32 sph_haval header already included at mdxfind c line 79 from existing JOB_HAV128HEXSALT and JOB_HAV CPU paths no new includes needed admit predicate plus harness OR-chains auto-propagate via D17.4.b refactor flip prim_table supported_5a flag only sph_haval cross-verified standard-conformant via R15 pre-flight test_haval_paper_vectors c 120 of 120 cells PASS 2026-05-27 GPU port C-mirror 60 of 60 cells PASS
+ *
+ * Revision 1.512  2026/05/28 02:09:53  dlr
+ * sub-phase 5b3a03 D17.4.b refactor 11-entry OpenCL harness OR-chain at line 39527-era and 11-entry Metal harness OR-chain at line 40037-era both replaced with single-source-of-truth predicate call via gpu_codegen_kernelb_family_md5pass_eligible single line each from 11 OR-chain entries to 1 predicate query future Tier 3 sub-phases 5b3b 4-pass HAVAL and 5b3c 5-pass HAVAL plus Tier 4 gost sne128 sne256 ships flip prim_table supported_5a flag only no edit at either harness site cleanup of the 5a.4 era OR-chain pattern that was the last hand-coded family enumeration in mdxfind c
+ *
+ * Revision 1.511  2026/05/28 01:18:55  dlr
+ * Dedup gpu_ops table by lifting to file-scope static const int gpu_ops[] above build_compact_table previously declared at function scope at line 39174 with a parallel mirror table gpu_ops_listing at line 45560 in helper gpu_op_advertise_for_h_listing now both sites iterate the single file-scope table eliminating the drift class where mirror could silently fall out of sync also replace inline 11-JOB literal family override table at line 39254 covering JOB_MD2MD5PASS through JOB_WRLMD5PASS with a J1F J1N walk over Dohash applying the gpu_codegen_kernelb_family_md5pass_eligible predicate directly future Tier 3 4 widens propagate automatically with no edit at this site no semantic change rev 1.510 to rev 1.511 cleanup follow on to the predicate-based GPU tag fix shipped earlier 2026-05-27
+ *
+ * Revision 1.510  2026/05/28 01:06:39  dlr
+ * Replace manual GPU tag if-chain with predicate-based detection - new helper gpu_op_advertise_for_h_listing ORs gpu_ops legacy template path with codegen admit predicates so the -h listing tracks runtime GPU dispatch reality automatically - 12 codegen-eligible algorithms (e120 e122 e157 e159 e161 e163 e165 e167 e169 e171 e173 e347) now correctly tagged GPU - future Tier 3 plus Tier 4 work auto-updates the listing without manual edits - pre-existing 78 GPU-tagged entries preserved zero regressions validated on dev205 build and h-output diff
+ *
+ * Revision 1.509  2026/05/27 23:12:04  dlr
+ * sub-phase 5b2b4 mdxfind admit oracle plus dlen plus harness gates extended for TIGERMD5PASS e171 oracle_compute_md5pass_family adds JOB_TIGERMD5PASS arm calls sph_tiger_init plus sph_tiger plus sph_tiger_close on hex32 md5 pass concat pass buffer returns 24-byte digest hx_family_md5pass_validate_run_shared dlen switch adds JOB_TIGERMD5PASS dlen 24 byte chokepoint admit _family_ops list widens from 10 to 11 entries adds JOB_TIGERMD5PASS in numeric sort between JOB_SHA512MD5PASS and JOB_WRLMD5PASS OpenCL harness gate at hx_family_md5pass_validate_run_shared OpenCL backend dispatch widens from 10 to 11 OR-chain entries adds JOB_TIGERMD5PASS Metal harness gate parallel widens from 10 to 11 OR-chain entries adds JOB_TIGERMD5PASS sph_tiger header already included at mdxfind.c line 96 from existing JOB_TIGER plus JOB_TIGERMD5 plus JOB_TIGERMD5PASS CPU paths no new includes needed cross-verified mdxfind oracle byte-exact vs rhash_tiger via R12 pre-flight 8 NESSIE vectors 16 of 16 PASS 2026-05-27
+ *
+ * Revision 1.508  2026/05/27 22:28:56  dlr
+ * sub-phase 5b2a4 mdxfind admit oracle plus dlen plus harness gates extended for WRLMD5PASS e173 oracle_compute_md5pass_family adds JOB_WRLMD5PASS arm calls WHIRLPOOL openssl on hex32 md5 pass concat pass buffer returns 64-byte digest hx_family_md5pass_validate_run_shared dlen switch adds JOB_WRLMD5PASS dlen 64 bytes chokepoint admit _family_ops list widens from 9 to 10 entries adds JOB_WRLMD5PASS in numeric sort after JOB_SHA512MD5PASS OpenCL harness gate at hx_family_md5pass_validate_run_shared OpenCL backend dispatch widens from 9 to 10 OR-chain entries adds JOB_WRLMD5PASS Metal harness gate parallel widens from 9 to 10 OR-chain entries adds JOB_WRLMD5PASS WHIRLPOOL extern already declared at mdxfind.c line 2204 OpenSSL libcrypto.a implementation no new header includes needed cross-verified mdxfind oracle byte-exact vs librhash via R12 pre-flight 8 NESSIE vectors 16 of 16 PASS 2026-05-27
+ *
  * Revision 1.507  2026/05/27 17:50:57  dlr
  * sub-phase 5b1b4 mdxfind admit oracle plus dlen plus harness gates extended for RMD128MD5PASS e157 oracle_compute_md5pass_family adds JOB_RMD128MD5PASS arm calls RIPEMD128 on hex32 md5 pass concat pass buffer returns 16-byte digest hx_family_md5pass_validate_run_shared dlen switch adds JOB_RMD128MD5PASS dlen 16 byte chokepoint admit family_ops list widens from 8 to 9 entries adds JOB_RMD128MD5PASS between MD4 and RMD160 numeric sort OpenCL harness gate at hx_family_md5pass_validate_run_shared OpenCL backend dispatch widens from 8 to 9 OR-chain entries adds JOB_RMD128MD5PASS Metal harness gate parallel widens from 8 to 9 OR-chain entries adds JOB_RMD128MD5PASS RIPEMD128 extern already declared at mdxfind.c line 2210 implementation in rmd128.c line 230 no new header includes needed
  *
@@ -864,7 +925,7 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
  *
  * Multi-GPU diagnostic infrastructure (one-shot, low overhead, opt-in tracer):
  * - Path-a read-back probes after every per-device upload (rule_program, rule_offset, compact_fp, compact_idx, overflow). Silent on correctness; fprintf+abort on mismatch.
- * - Per-batch dispatch tracer gated on MDXFIND_DISPATCH_TRACE env var; logs dev/op/packed_count/packed_pos/input_xor/iter/masks/hits/wall_us per dispatch.
+ * - Per-batch dispatch tracer gated on MDXFIND_DISPATCH_TRACE env var; logs dev/op/packed_count/packed_pos/input_xor/iter/masks/hits/wall_us per dispatch. Metal twin emits [disp-metal] per-chunk lines with matching kernel_a_us/host_gap_us/kernel_b_us field names (gpu_metal.m rev 1.131, 2026-05-31).
  * - warm_probe_async early-return now logs WARN with probe_thread_count.
  * - Per-device end-of-run summary: name, BDF, batches/words/hits, wall/busy/idle, hash_Gh/s (rules*iter expanded), word_Mh/s, h2d_GBps, LnkSta start/end via lspci.
  * - Per-device share line printed by gpujob_print_share_line() before final summary.
@@ -7531,24 +7592,66 @@ char *NumbersFmt;
  * negligible: each struct MaskPos is 8 bytes; the 3 pattern arrays
  * grow from 128 B to 2 KB total.
  *
- * MAX_MASK_POS_GPU_SIDE is the per-side hard limit enforced by all
- * GPU kernel paths today (template_phase0, kernel_a_masks, kernel_a_-
- * rules_masks, kernel_a_bruteforce, and the Metal twins). The kernels
- * themselves clamp npre/napp to 16 internally (gpu_template.cl:442-
- * 443, metal_template.metal:455-456) and the per-thread private
- * scratch arrays are sized [16] (gpu_kernel_a_*.cl, metal_kernel_a_-
- * *.metal). Raising this requires coordinated source changes in every
- * .cl/.metal file plus cl2str.py regeneration of the _str.h string
- * literals plus widening of the OCLParams n_prepend/n_append fields
- * if they ever exceed uchar. Deferred until a customer needs >16
- * positions per side on the GPU.
+ * GPU per-side caps (2026-05-30 long-mask amendment, supersedes the
+ * single MAX_MASK_POS_GPU_SIDE=16 cap):
  *
- * The GPU upload sites (mdxfind.c ~50324, ~50424, ~50686) skip the
- * upload and emit a one-time warning when an input mask exceeds
- * MAX_MASK_POS_GPU_SIDE, falling back to the CPU mask iterator
- * (which has the larger MAX_MASK_POS cap). */
+ *   GPU_MASK_VAR_CAP       16   maximum variable (placeholder ?d/?l/?a
+ *                                /?[abc]) positions per side. Matches
+ *                                pre-amendment cap; per-thread private
+ *                                scratch arrays for placeholder expansion
+ *                                stay at 16 entries.
+ *
+ *   GPU_MASK_LIT_BYTES_CAP 224  maximum literal bytes per side. Decoupled
+ *                                from variable count. Lifts the 2026-05-30
+ *                                gate fixture
+ *                                  -N "This is triumph, I'm making a note here: ?a?a?a?a?a?d?d"
+ *                                (42 literal + 7 variable = 49 positions)
+ *                                onto the GPU path. Total per-side <=
+ *                                lit_bytes_cap + var_cap = 240; combined
+ *                                with input word <=15 stays under
+ *                                RULE_BUF_LIMIT=255.
+ *
+ *   GPU_MASK_DESC_BYTES_CAP 320 sizing for the wire-format run-descriptor
+ *                                stream (see below). Per-side persistent
+ *                                cl_mem allocation is 320 B.
+ *
+ * Wire format (Design Y, amendment D1.b): the prepend / append mask
+ * buffers are interleaved run-descriptor streams of:
+ *
+ *   GPU_MASK_DESC_TAG_LIT  (0x00) lit_len:u16 (little-endian) bytes[lit_len]
+ *   GPU_MASK_DESC_TAG_VAR  (0x01) classid:u8     (one placeholder position)
+ *   GPU_MASK_DESC_TAG_END  (0xFF) terminator (no payload)
+ *
+ * Worst-case packing per side (16 var + 17 lit + END): 308 B (well under
+ * the 320 B persistent allocation). gpu_pack_mask_descriptor() in this
+ * file is the host-side encoder; mask_expand_run_into_gpu() in
+ * gpu_kernel_a_masks.cl is the GPU walker.
+ *
+ * Backward compat: MAX_MASK_POS_GPU_SIDE retained as a deprecated alias
+ * for GPU_MASK_VAR_CAP (16). Pre-amendment short-mask workloads (e.g.
+ * -n ?d?d, 0 lit + 2 var) take the same unified walker as long-mask
+ * workloads, producing byte-identical multisets.
+ *
+ * Backend coverage: the OpenCL A2/A3/A4 dispatchers consume the
+ * descriptor wire format. The Metal twins follow per amendment §9.
+ * The template/slab kernel path (gpu_template.cl / metal_template.metal)
+ * is on a separate upload wire (gpu_opencl_set_mask /
+ * gpu_metal_set_mask) and is UNAFFECTED by this amendment; that path
+ * retains its own MASK_POS_CAP=16 per-side gate.
+ *
+ * The GPU upload sites (mdxfind.c, the OpenCL+Metal A2/A3/A4 family
+ * blocks below) now check (var_count <= GPU_MASK_VAR_CAP &&
+ * lit_bytes <= GPU_MASK_LIT_BYTES_CAP) per side; on overflow they
+ * fall back to CPU iteration. The template/slab path still emits its
+ * own MAX_MASK_POS_GPU_SIDE warning. */
 #define MAX_MASK_POS 256
-#define MAX_MASK_POS_GPU_SIDE 16
+#define MAX_MASK_POS_GPU_SIDE 16        /* deprecated alias for GPU_MASK_VAR_CAP */
+#define GPU_MASK_VAR_CAP        16      /* placeholder positions per side */
+#define GPU_MASK_LIT_BYTES_CAP  224     /* literal bytes per side */
+#define GPU_MASK_DESC_BYTES_CAP 320     /* run-descriptor stream cap per side */
+#define GPU_MASK_DESC_TAG_LIT   0x00u
+#define GPU_MASK_DESC_TAG_VAR   0x01u
+#define GPU_MASK_DESC_TAG_END   0xFFu
 #define MASK_LITERAL -1
 #define MASK_CLASS_d 0
 #define MASK_CLASS_l 1
@@ -7579,6 +7682,15 @@ unsigned long long MaskAppendTotal = 1;
 struct MaskPos   MaskPrependPattern[MAX_MASK_POS];
 int              MaskPrependLen;
 unsigned long long MaskPrependTotal = 1;
+
+/* 2026-05-30 long-mask amendment: A2/A3/A4 dispatcher wire-format
+ * staging. Packed once in the gpu_avail init path; consumed by
+ * gpu_opencl_kernel_a_upload_mask_descriptors() and Metal twin. */
+unsigned char gpu_kern_a_prep_desc[GPU_MASK_DESC_BYTES_CAP];
+unsigned char gpu_kern_a_app_desc [GPU_MASK_DESC_BYTES_CAP];
+int           gpu_kern_a_prep_dlen     = 0;
+int           gpu_kern_a_app_dlen      = 0;
+int           gpu_kern_a_mask_eligible = 0;
 
 static void mask_init_classes(void) {
     int i;
@@ -7797,6 +7909,81 @@ static inline int mask_expand_into(unsigned long long index,
 /* Legacy wrapper */
 static inline int mask_expand(unsigned long long index, char *buf) {
     return mask_expand_into(index, MaskPattern, MaskLen, buf);
+}
+
+/* 2026-05-30 long-mask amendment (D1.b Design Y interleaved run-descriptor
+ * stream). Pack a CPU MaskPos[] pattern into the GPU run-descriptor wire
+ * format consumed by mask_expand_run_into_gpu() in gpu_kernel_a_masks.cl
+ * (and Metal twin metal_kernel_a_masks.metal).
+ *
+ * Stream layout:
+ *   [LIT_TAG=0x00][len_lo:u8][len_hi:u8][bytes...]    coalesced literal run
+ *   [VAR_TAG=0x01][classid:u8]                         one placeholder
+ *   [END_TAG=0xFF]                                     terminator
+ *
+ * Consecutive MASK_LITERAL positions are coalesced into a single LIT
+ * descriptor (worst-case 17 LIT runs of 1-byte each, alternating with
+ * 16 VAR runs, packs to 17*(3+1) + 16*2 + 1 = 101 B; the largest single
+ * LIT run is 224 B (3-byte hdr) which alone takes 227 B).
+ *
+ * Returns:
+ *   >= 0  total descriptor byte length (includes the END tag)
+ *   < 0   FATAL: descriptor would exceed desc_cap, OR either per-side cap
+ *         (GPU_MASK_VAR_CAP, GPU_MASK_LIT_BYTES_CAP) is exceeded.
+ *
+ * Caller responsibility: pre-check the per-side caps via
+ * gpu_mask_count_vars_lit_bytes() so this helper's negative returns are
+ * a programming-error signal rather than a normal control-flow path. */
+static int gpu_pack_mask_descriptor(const struct MaskPos *pattern, int plen,
+                                    unsigned char *desc_out, int desc_cap)
+{
+    int p = 0;
+    int i = 0;
+    int n_vars = 0, n_lit_bytes = 0;
+    while (i < plen) {
+        if (pattern[i].classid == MASK_LITERAL) {
+            /* Coalesce consecutive literals into one LIT run. */
+            int run_start = i;
+            int run_len = 0;
+            while (i < plen && pattern[i].classid == MASK_LITERAL) {
+                run_len++; i++;
+            }
+            if (run_len > 0xFFFF) return -1;
+            if (p + 3 + run_len > desc_cap) return -1;
+            if (n_lit_bytes + run_len > GPU_MASK_LIT_BYTES_CAP) return -1;
+            desc_out[p++] = (unsigned char)GPU_MASK_DESC_TAG_LIT;
+            desc_out[p++] = (unsigned char)(run_len & 0xFF);
+            desc_out[p++] = (unsigned char)((run_len >> 8) & 0xFF);
+            for (int k = 0; k < run_len; k++)
+                desc_out[p++] = pattern[run_start + k].literal;
+            n_lit_bytes += run_len;
+        } else {
+            if (p + 2 > desc_cap) return -1;
+            if (n_vars + 1 > GPU_MASK_VAR_CAP) return -1;
+            desc_out[p++] = (unsigned char)GPU_MASK_DESC_TAG_VAR;
+            desc_out[p++] = (unsigned char)pattern[i].classid;
+            n_vars++; i++;
+        }
+    }
+    if (p + 1 > desc_cap) return -1;
+    desc_out[p++] = (unsigned char)GPU_MASK_DESC_TAG_END;
+    return p;
+}
+
+/* Count variable positions vs literal bytes for a mask pattern. Used to
+ * gate GPU eligibility before invoking gpu_pack_mask_descriptor(). */
+static void gpu_mask_count_vars_lit_bytes(const struct MaskPos *pattern,
+                                          int plen,
+                                          int *out_vars,
+                                          int *out_lit_bytes)
+{
+    int v = 0, lb = 0;
+    for (int i = 0; i < plen; i++) {
+        if (pattern[i].classid == MASK_LITERAL) lb++;
+        else                                     v++;
+    }
+    *out_vars      = v;
+    *out_lit_bytes = lb;
 }
 
 struct job *FreeHead, **FreeTail;
@@ -8604,13 +8791,13 @@ release(FreeWaiting);
 	      job->outlen = 0;
 	    }
 	    if (dohex) {
-	      job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:$HEX[", rotval, Types[job->op],  rotbuf, key);
+	      job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:$HEX[", rotval, TYPENAME(job->op),  rotbuf, key);
 	      prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	      job->outlen += job->clen*2;
 	      job->outbuf[job->outlen++] = ']';
 	      job->outbuf[job->outlen++] = '\n';
 	    } else
-	      job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:%s\n", rotval,  Types[job->op], rotbuf, key, job->pass);
+	      job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:%s\n", rotval,  TYPENAME(job->op), rotbuf, key, job->pass);
           }
         }
         if (offset == (len - Minhashlen))
@@ -8687,13 +8874,13 @@ release(FreeWaiting);
 	  job->outlen = 0;
 	}
 	if (dohex) {
-	  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", Types[job->op],  newbuf, key);
+	  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", TYPENAME(job->op),  newbuf, key);
 	  prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	  job->outlen += job->clen*2;
 	  job->outbuf[job->outlen++] = ']';
 	  job->outbuf[job->outlen++] = '\n';
 	} else
-	  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", Types[job->op], newbuf, key, job->pass);
+	  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", TYPENAME(job->op), newbuf, key, job->pass);
       }
     }
     if (offset == (len - Minhashlen))
@@ -8764,13 +8951,13 @@ int checkhashwerkzeug(union HashU *curin, int len, char *key, const char *prefix
     job->outlen = 0;
   }
   if (dohex) {
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s$%s$%s:$HEX[", Types[job->op], prefix, key, newbuf);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s$%s$%s:$HEX[", TYPENAME(job->op), prefix, key, newbuf);
     prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
     job->outlen += job->clen*2;
     job->outbuf[job->outlen++] = ']';
     job->outbuf[job->outlen++] = '\n';
   } else
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s$%s$%s:%s\n", Types[job->op], prefix, key, newbuf, job->pass);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s$%s$%s:%s\n", TYPENAME(job->op), prefix, key, newbuf, job->pass);
   return 1;
 }
 
@@ -8823,13 +9010,13 @@ int checkhash_netscaler512(union HashU *curin, int len, char *salt, int saltlen,
     job->outlen = 0;
   }
   if (dohex) {
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], newbuf);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), newbuf);
     prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
     job->outlen += job->clen*2;
     job->outbuf[job->outlen++] = ']';
     job->outbuf[job->outlen++] = '\n';
   } else
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], newbuf, job->pass);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), newbuf, job->pass);
   return 1;
 }
 
@@ -8879,13 +9066,13 @@ int checkhash_netwitness(union HashU *curin, int len, char *salt, int saltlen, s
     job->outlen = 0;
   }
   if (dohex) {
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", Types[job->op], newbuf, b64buf);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", TYPENAME(job->op), newbuf, b64buf);
     prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
     job->outlen += job->clen*2;
     job->outbuf[job->outlen++] = ']';
     job->outbuf[job->outlen++] = '\n';
   } else
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", Types[job->op], newbuf, b64buf, job->pass);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", TYPENAME(job->op), newbuf, b64buf, job->pass);
   return 1;
 }
 
@@ -8934,13 +9121,13 @@ int checkhash_authme(union HashU *curin, int len, char *salt, int saltlen, struc
     job->outlen = 0;
   }
   if (dohex) {
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s $SHA$%.*s$%s:$HEX[", Types[job->op], saltlen, salt, newbuf);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s $SHA$%.*s$%s:$HEX[", TYPENAME(job->op), saltlen, salt, newbuf);
     prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
     job->outlen += job->clen*2;
     job->outbuf[job->outlen++] = ']';
     job->outbuf[job->outlen++] = '\n';
   } else
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s $SHA$%.*s$%s:%s\n", Types[job->op], saltlen, salt, newbuf, job->pass);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s $SHA$%.*s$%s:%s\n", TYPENAME(job->op), saltlen, salt, newbuf, job->pass);
   return 1;
 }
 
@@ -8953,7 +9140,7 @@ struct Hashchain found;
   int hitcount = 0;
 
   if (job->clen > MAXLINE) { 
-    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,Types[job->op]);
+    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,TYPENAME(job->op));
     fprintf(stderr,"Password: %s\n",job->pass);
     exit(1);
   }
@@ -9040,18 +9227,18 @@ release(FreeWaiting);
 	  }
           if (dohex) {
 	    if (x > 0)
-              job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:$HEX[", Types[job->op], x, newbuf);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:$HEX[", TYPENAME(job->op), x, newbuf);
 	    else
-              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], newbuf);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), newbuf);
 	    prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	    job->outlen += job->clen*2;
 	    job->outbuf[job->outlen++] = ']';
 	    job->outbuf[job->outlen++] = '\n';
           } else {
 	    if (x > 0)
-              job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s\n", Types[job->op], x, newbuf, job->pass);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s\n", TYPENAME(job->op), x, newbuf, job->pass);
 	    else
-              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], newbuf, job->pass);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), newbuf, job->pass);
 	  }
 	  /* Emit second line without tag for types with hex prefix */
 	  if (job->op == JOB_BLAKE2B512 || job->op == JOB_BLAKE2S256 || job->op == JOB_BLAKE2B256 ||
@@ -9063,18 +9250,18 @@ release(FreeWaiting);
 	    }
 	    if (dohex) {
 	      if (x > 0)
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:$HEX[", Types[job->op], x, newbuf);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:$HEX[", TYPENAME(job->op), x, newbuf);
 	      else
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], newbuf);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), newbuf);
 	      prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	      job->outlen += job->clen*2;
 	      job->outbuf[job->outlen++] = ']';
 	      job->outbuf[job->outlen++] = '\n';
 	    } else {
 	      if (x > 0)
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s\n", Types[job->op], x, newbuf, job->pass);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s\n", TYPENAME(job->op), x, newbuf, job->pass);
 	      else
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], newbuf, job->pass);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), newbuf, job->pass);
 	    }
 	  }
       }
@@ -9148,18 +9335,18 @@ release(FreeWaiting);
 	  }
           if (dohex) {
 	    if (x > 0)
-              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:$HEX[",rotval, Types[job->op], x, rotbuf);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:$HEX[",rotval, TYPENAME(job->op), x, rotbuf);
 	    else
-              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:$HEX[",rotval, Types[job->op], rotbuf);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:$HEX[",rotval, TYPENAME(job->op), rotbuf);
 	    prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	    job->outlen += job->clen*2;
 	    job->outbuf[job->outlen++] = ']';
 	    job->outbuf[job->outlen++] = '\n';
           } else {
 	    if (x > 0)
-              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:%s\n", rotval, Types[job->op], x, rotbuf, job->pass);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:%s\n", rotval, TYPENAME(job->op), x, rotbuf, job->pass);
 	    else
-              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s\n", rotval, Types[job->op], rotbuf, job->pass);
+              job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s\n", rotval, TYPENAME(job->op), rotbuf, job->pass);
 	  }
         }
       }
@@ -9184,7 +9371,7 @@ struct Hashchain found;
   int hitcount = 0;
 
   if (job->clen > MAXLINE) { 
-    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,Types[job->op]);
+    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,TYPENAME(job->op));
     fprintf(stderr,"Password: %s\n",job->pass);
     exit(1);
   }
@@ -9265,18 +9452,18 @@ release(FreeWaiting);
 	    }
 	    if (dohex) {
 	      if (x > 0)
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:%s:$HEX[", rotval, Types[job->op], x, rotbuf, saltbuf);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:%s:$HEX[", rotval, TYPENAME(job->op), x, rotbuf, saltbuf);
 	      else
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:$HEX[", rotval, Types[job->op], rotbuf, saltbuf);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:$HEX[", rotval, TYPENAME(job->op), rotbuf, saltbuf);
 	      prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	      job->outlen += job->clen*2;
 	      job->outbuf[job->outlen++] = ']';
 	      job->outbuf[job->outlen++] = '\n';
 	    } else {
 	      if (x > 0)
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:%s:%s\n", rotval, Types[job->op], x, rotbuf, saltbuf, job->pass);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%sx%02d %s:%s:%s\n", rotval, TYPENAME(job->op), x, rotbuf, saltbuf, job->pass);
 	      else
-	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:%s\n", rotval, Types[job->op], rotbuf, saltbuf, job->pass);
+	        job->outlen += sprintf(&job->outbuf[job->outlen],"rot%02d_%s %s:%s:%s\n", rotval, TYPENAME(job->op), rotbuf, saltbuf, job->pass);
 	    }
           }
         }
@@ -9360,18 +9547,18 @@ release(FreeWaiting);
 	}
 	if (dohex) {
 	  if (x > 0)
-	    job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:$HEX[", Types[job->op], x, newbuf, saltbuf);
+	    job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:$HEX[", TYPENAME(job->op), x, newbuf, saltbuf);
 	  else
-	    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", Types[job->op], newbuf, saltbuf);
+	    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", TYPENAME(job->op), newbuf, saltbuf);
 	  prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	  job->outlen += job->clen*2;
 	  job->outbuf[job->outlen++] = ']';
 	  job->outbuf[job->outlen++] = '\n';
 	} else {
 	  if (x > 0)
-	    job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:%s\n", Types[job->op], x, newbuf, saltbuf, job->pass);
+	    job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:%s\n", TYPENAME(job->op), x, newbuf, saltbuf, job->pass);
 	  else
-	    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", Types[job->op], newbuf, saltbuf, job->pass);
+	    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", TYPENAME(job->op), newbuf, saltbuf, job->pass);
 	}
       }
     }
@@ -9400,7 +9587,7 @@ int checkhashsalt2(union HashU *curin, int len,
   int hitcount = 0;
 
   if (job->clen > MAXLINE) {
-    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,Types[job->op]);
+    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,TYPENAME(job->op));
     exit(1);
   }
   if (Printall && !hfound) {
@@ -9468,18 +9655,18 @@ release(FreeWaiting);
     }
     if (dohex) {
       if (x > 0)
-        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:%s:$HEX[", Types[job->op], x, newbuf2, saltbuf1, saltbuf2);
+        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:%s:$HEX[", TYPENAME(job->op), x, newbuf2, saltbuf1, saltbuf2);
       else
-        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s:$HEX[", Types[job->op], newbuf2, saltbuf1, saltbuf2);
+        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s:$HEX[", TYPENAME(job->op), newbuf2, saltbuf1, saltbuf2);
       prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
       job->outlen += job->clen*2;
       job->outbuf[job->outlen++] = ']';
       job->outbuf[job->outlen++] = '\n';
     } else {
       if (x > 0)
-        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:%s:%s\n", Types[job->op], x, newbuf2, saltbuf1, saltbuf2, job->pass);
+        job->outlen += sprintf(&job->outbuf[job->outlen],"%sx%02d %s:%s:%s:%s\n", TYPENAME(job->op), x, newbuf2, saltbuf1, saltbuf2, job->pass);
       else
-        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s:%s\n", Types[job->op], newbuf2, saltbuf1, saltbuf2, job->pass);
+        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s:%s\n", TYPENAME(job->op), newbuf2, saltbuf1, saltbuf2, job->pass);
     }
   }
   return (hitcount);
@@ -9493,7 +9680,7 @@ struct Hashchain found;
   int hitcount = 0;
 
   if (job->clen > MAXLINE) {
-    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,Types[job->op]);
+    fprintf(stderr,"Output line too long: %d bytes in type %s\n",job->clen,TYPENAME(job->op));
     fprintf(stderr,"Password: %s\n",job->pass);
     exit(1);
   }
@@ -9559,13 +9746,13 @@ release(FreeWaiting);
 	job->outlen = 0;
       }
       if (dohex) {
-	job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:$HEX[", Types[job->op], salt, newbuf);
+	job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:$HEX[", TYPENAME(job->op), salt, newbuf);
 	prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 	job->outlen += job->clen*2;
 	job->outbuf[job->outlen++] = ']';
 	job->outbuf[job->outlen++] = '\n';
       } else
-	job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:%s\n", Types[job->op], salt, newbuf, job->pass);
+	job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:%s\n", TYPENAME(job->op), salt, newbuf, job->pass);
     }
   }
   return (hitcount);
@@ -9602,13 +9789,13 @@ release(FreeWaiting);
     job->outlen = 0;
   }
   if (dohex) {
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], hash);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), hash);
     prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
     job->outlen += job->clen*2;
     job->outbuf[job->outlen++] = ']';
     job->outbuf[job->outlen++] = '\n';
   } else
-    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], hash, job->pass);
+    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), hash, job->pass);
 }
 
 int build_salt_snapshot(struct saltentry *snap, char *pool,
@@ -10450,6 +10637,12 @@ struct saltentry *saltsnap;
 char *saltpool;
 rhash rhash_con;
 void *argon2_ws;
+/* User-defined hash type (Milestone 1): per-thread hx VM, initialised
+ * lazily on first use of a given user op within this worker thread and
+ * torn down when the op changes.  The hx_program is shared/read-only; the
+ * hx_vm holds the per-thread mutable arena/stack/vars. */
+hx_vm userdef_vm;
+int userdef_vm_op = 0;        /* op the userdef_vm is currently bound to */
 sph_haval_context haval;
 sph_sha256_context sha256ctx;
 sph_sha512_context sha512ctx;
@@ -12577,7 +12770,55 @@ do {
      * kernel already handles every (word, rule) combination — there is
      * no behavioral regression. */
 #endif
-/*     printf("Starting job %d (%s) %llx\n",job->op,Types[job->op],job->outbuf);  */
+/*     printf("Starting job %d (%s) %llx\n",job->op,TYPENAME(job->op),job->outbuf);  */
+    if (userdef_is_userop(job->op)) {
+      /*
+       * User-defined hash type (Milestone 1): run the type's compiled hx
+       * program on the candidate via the per-thread hx VM, then feed the
+       * digest into the existing match/checkhash machinery.  The VM's
+       * default digest role is ROLE_HEX, so it returns a hex string; we
+       * hex-decode it into curin.h (raw bytes) and pass the hex length to
+       * checkhash, exactly like the JOB_SHA1 built-in path.
+       *
+       * -i iteration (xNN): for x>1 the previous hex digest becomes the
+       * next password, matching the standard built-in iteration convention.
+       */
+      struct userdef_type *ut = userdef_get(job->op);
+      if (ut && ut->prog && len <= MAXLINE) {
+        const char *vpass = cur;
+        int vplen = len;
+        char itbuf[513];   /* holds the hex digest fed back across iters */
+
+        /* lazily (re)bind the per-thread VM to this op */
+        if (userdef_vm_op != job->op) {
+          if (userdef_vm_op != 0)
+            hx_vm_free(&userdef_vm);
+          hx_vm_init(&userdef_vm, ut->prog);
+          userdef_vm_op = job->op;
+        }
+
+        for (x = 1; x <= Maxiter; x++) {
+          hx_val r = hx_vm_run(&userdef_vm, vpass, vplen,
+                               "", 0, "", 0, "", 0, "", 0);
+          int hlen = (r.data && r.len > 0) ? r.len : 0;
+          hashcnt++;
+          if (hlen <= 0 || (hlen & 1) || hlen > (int)sizeof(curin.h) * 2)
+            break;
+          /* decode hex digest -> binary into curin.h */
+          get32((char *)r.data, curin.h, hlen);
+          checkhash(&curin, hlen, x, job);
+          if (x < Maxiter) {
+            /* re-feed the hex digest as the next password */
+            if (hlen >= (int)sizeof(itbuf)) break;
+            memcpy(itbuf, r.data, hlen);
+            itbuf[hlen] = '\0';
+            vpass = itbuf;
+            vplen = hlen;
+          }
+        }
+      }
+      break;
+    }
     switch (job->op) {
 
       case JOB_PROGRESSENCODE:
@@ -14112,13 +14353,13 @@ release(FreeWaiting);
 		    job->outlen = 0;
 		  }
 		  if (dohex) {
-		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], mdbuf);
+		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), mdbuf);
 		    prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 		    job->outlen += job->clen*2;
 		    job->outbuf[job->outlen++] = ']';
 		    job->outbuf[job->outlen++] = '\n';
 		  } else {
-		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], mdbuf, job->pass);
+		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), mdbuf, job->pass);
 		  }
 	}
 	if (!nsalts_job) Typedone[job->op] = 1;
@@ -14539,34 +14780,34 @@ release(FreeWaiting);
 		      ive_out = newbuf;
 		    }
 		    if (dohex) {
-		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], ive_out);
+		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), ive_out);
 		      prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 		      job->outlen += job->clen*2;
 		      job->outbuf[job->outlen++] = ']';
 		      job->outbuf[job->outlen++] = '\n';
 		    } else
-		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], ive_out, job->pass);
+		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), ive_out, job->pass);
 		    goto crypt_done;
 		  }
 		  if (job->op == JOB_AIXMD5) {
 		    if (dohex) {
-		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s {smd5}%s:$HEX[", Types[job->op], mdbuf);
+		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s {smd5}%s:$HEX[", TYPENAME(job->op), mdbuf);
 		      prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 		      job->outlen += job->clen*2;
 		      job->outbuf[job->outlen++] = ']';
 		      job->outbuf[job->outlen++] = '\n';
 		    } else
-		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s {smd5}%s:%s\n", Types[job->op], mdbuf, job->pass);
+		      job->outlen += sprintf(&job->outbuf[job->outlen],"%s {smd5}%s:%s\n", TYPENAME(job->op), mdbuf, job->pass);
 		    goto crypt_done;
 		  }
 		  if (dohex) {
-		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], mdbuf);
+		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), mdbuf);
 		    prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 		    job->outlen += job->clen*2;
 		    job->outbuf[job->outlen++] = ']';
 		    job->outbuf[job->outlen++] = '\n';
 		  } else
-		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], mdbuf, job->pass);
+		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), mdbuf, job->pass);
 crypt_done: ;
                   }
                 }
@@ -14953,13 +15194,13 @@ nextbb:
 				    }
 				  }
 				  if (dohex) {
-				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
 				    prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 				    job->outlen += job->clen*2;
 				    job->outbuf[job->outlen++] = ']';
 				    job->outbuf[job->outlen++] = '\n';
 				  } else
-				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
 				}
 				break;
 			      }
@@ -15000,13 +15241,13 @@ nextbb:
 			      }
 			    }
 			    if (dohex) {
-			      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+			      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
 			      prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 			      job->outlen += job->clen*2;
 			      job->outbuf[job->outlen++] = ']';
 			      job->outbuf[job->outlen++] = '\n';
 			    } else
-			      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+			      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
 			  }
 			}
 		    }
@@ -15148,13 +15389,13 @@ BC_Start:
 			  }
 			}
 			if (dohex) {
-			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
 			  prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 			  job->outlen += job->clen*2;
 			  job->outbuf[job->outlen++] = ']';
 			  job->outbuf[job->outlen++] = '\n';
 			} else
-			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
 		      }
                     }
                   }
@@ -19290,13 +19531,13 @@ sha11saltmd5:
                       if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                     }
                     if (y2) {
-                      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+                      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
                       prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                       job->outlen += job->clen*2;
                       job->outbuf[job->outlen++] = ']';
                       job->outbuf[job->outlen++] = '\n';
                     } else
-                      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+                      job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
                   }
                 }
                 break;
@@ -19377,14 +19618,14 @@ sha11saltmd5:
                           }
                           if (dohex) {
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                              Types[job->op], expect);
+                              TYPENAME(job->op), expect);
                             prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                             job->outlen += job->clen*2;
                             job->outbuf[job->outlen++] = ']';
                             job->outbuf[job->outlen++] = '\n';
                           } else
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                              Types[job->op], expect, job->pass);
+                              TYPENAME(job->op), expect, job->pass);
                         }
                       }
                     }
@@ -19445,14 +19686,14 @@ sha11saltmd5:
                           }
                           if (dohex) {
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                              Types[job->op], hm_full);
+                              TYPENAME(job->op), hm_full);
                             prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                             job->outlen += job->clen*2;
                             job->outbuf[job->outlen++] = ']';
                             job->outbuf[job->outlen++] = '\n';
                           } else
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                              Types[job->op], hm_full, job->pass);
+                              TYPENAME(job->op), hm_full, job->pass);
                         }
                       }
                     }
@@ -19508,13 +19749,13 @@ sha11saltmd5:
                         if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                       }
                       if (y2)  {
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", Types[job->op], linebuf2, s1);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", TYPENAME(job->op), linebuf2, s1);
                         prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                         job->outlen += job->clen*2;
                         job->outbuf[job->outlen++] = ']';
                         job->outbuf[job->outlen++] = '\n';
                       } else
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", Types[job->op], linebuf2, s1, job->pass);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", TYPENAME(job->op), linebuf2, s1, job->pass);
                     }
                   }
                     }
@@ -19558,13 +19799,13 @@ sha11saltmd5:
                         if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                       }
                       if (y2)  {
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], pix_enc);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), pix_enc);
                         prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                         job->outlen += job->clen*2;
                         job->outbuf[job->outlen++] = ']';
                         job->outbuf[job->outlen++] = '\n';
                       } else
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], pix_enc, job->pass);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), pix_enc, job->pass);
                     }
                   }
                 }
@@ -19636,13 +19877,13 @@ sha11saltmd5:
                           if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                         }
                         if (y2)  {
-                          job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], asa_enc);
+                          job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), asa_enc);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
-                          job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], asa_enc, job->pass);
+                          job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), asa_enc, job->pass);
                       }
                     }
                     }
@@ -19716,13 +19957,13 @@ sha11saltmd5:
                                 if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                               }
                               if (y2) {
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
                                 prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                                 job->outlen += job->clen*2;
                                 job->outbuf[job->outlen++] = ']';
                                 job->outbuf[job->outlen++] = '\n';
                               } else
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
                             }
                           }
                         }
@@ -19796,13 +20037,13 @@ sha11saltmd5:
                                 if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                               }
                               if (y2) {
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
                                 prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                                 job->outlen += job->clen*2;
                                 job->outbuf[job->outlen++] = ']';
                                 job->outbuf[job->outlen++] = '\n';
                               } else
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
                             }
                           }
                         }
@@ -19939,13 +20180,13 @@ sha11saltmd5:
                         }
                       }
                       if (dohex) {
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], mdbuf);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), mdbuf);
                         prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                         job->outlen += job->clen*2;
                         job->outbuf[job->outlen++] = ']';
                         job->outbuf[job->outlen++] = '\n';
                       } else
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], mdbuf, job->pass);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), mdbuf, job->pass);
                     }
                     break;
                   }
@@ -20029,13 +20270,13 @@ sha11saltmd5:
                                 }
                               }
                               if (dohex) {
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], saltsnap[si].salt);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), saltsnap[si].salt);
                                 prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                                 job->outlen += job->clen*2;
                                 job->outbuf[job->outlen++] = ']';
                                 job->outbuf[job->outlen++] = '\n';
                               } else
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], saltsnap[si].salt, job->pass);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), saltsnap[si].salt, job->pass);
                             }
                           }
                         }
@@ -20110,13 +20351,13 @@ sha11saltmd5:
                               if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                             }
                             if (y2) {
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], mdbuf);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), mdbuf);
                               prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                               job->outlen += job->clen*2;
                               job->outbuf[job->outlen++] = ']';
                               job->outbuf[job->outlen++] = '\n';
                             } else
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], mdbuf, job->pass);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), mdbuf, job->pass);
                           }
                         }
                       }
@@ -20209,14 +20450,14 @@ sha11saltmd5:
                         }
                         if (dohex) {
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                            Types[job->op], mdbuf);
+                            TYPENAME(job->op), mdbuf);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                            Types[job->op], mdbuf, job->pass);
+                            TYPENAME(job->op), mdbuf, job->pass);
                       }
                     }
                   }
@@ -20326,14 +20567,14 @@ sha11saltmd5:
                         }
                         if (dohex) {
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                            Types[job->op], mdbuf);
+                            TYPENAME(job->op), mdbuf);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                            Types[job->op], mdbuf, job->pass);
+                            TYPENAME(job->op), mdbuf, job->pass);
                       }
                     }
                   }
@@ -20452,14 +20693,14 @@ sha11saltmd5:
                         }
                         if (dohex) {
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                            Types[job->op], out_sl);
+                            TYPENAME(job->op), out_sl);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                            Types[job->op], out_sl, job->pass);
+                            TYPENAME(job->op), out_sl, job->pass);
                       }
                     }
                   }
@@ -20589,14 +20830,14 @@ sha11saltmd5:
                         }
                         if (dohex) {
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                            Types[job->op], out_sl);
+                            TYPENAME(job->op), out_sl);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                            Types[job->op], out_sl, job->pass);
+                            TYPENAME(job->op), out_sl, job->pass);
                       }
                     }
                   }
@@ -20679,14 +20920,14 @@ sha11saltmd5:
                         }
                         if (dohex) {
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                            Types[job->op], outkey);
+                            TYPENAME(job->op), outkey);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                            Types[job->op], outkey, job->pass);
+                            TYPENAME(job->op), outkey, job->pass);
                       }
                       continue;  /* skip sniffed mode if offline matched */
                     }
@@ -20736,14 +20977,14 @@ sha11saltmd5:
                                   }
                                   if (dohex) {
                                     job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                                      Types[job->op], outkey);
+                                      TYPENAME(job->op), outkey);
                                     prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                                     job->outlen += job->clen*2;
                                     job->outbuf[job->outlen++] = ']';
                                     job->outbuf[job->outlen++] = '\n';
                                   } else
                                     job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                                      Types[job->op], outkey, job->pass);
+                                      TYPENAME(job->op), outkey, job->pass);
                                 }
                                 break;  /* found a match, stop walking */
                               }
@@ -20823,14 +21064,14 @@ sha11saltmd5:
                         }
                         if (dohex) {
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                            Types[job->op], fg_out);
+                            TYPENAME(job->op), fg_out);
                           prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                           job->outlen += job->clen*2;
                           job->outbuf[job->outlen++] = ']';
                           job->outbuf[job->outlen++] = '\n';
                         } else
                           job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                            Types[job->op], fg_out, job->pass);
+                            TYPENAME(job->op), fg_out, job->pass);
                       }
                     }
                   }
@@ -22025,13 +22266,13 @@ sha11saltmd5:
                               if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                             }
                             if (y2) {
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf2);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
                               prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                               job->outlen += job->clen*2;
                               job->outbuf[job->outlen++] = ']';
                               job->outbuf[job->outlen++] = '\n';
                             } else
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf2, job->pass);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
                           }
                         }
                       }
@@ -22100,13 +22341,13 @@ sha11saltmd5:
                               if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                             }
                             if (y2) {
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf);
                               prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                               job->outlen += job->clen*2;
                               job->outbuf[job->outlen++] = ']';
                               job->outbuf[job->outlen++] = '\n';
                             } else
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf, job->pass);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf, job->pass);
                           }
                         }
                       }
@@ -22663,14 +22904,14 @@ sha11saltmd5:
                           }
                           if (dohex) {
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                              Types[job->op], mw_full);
+                              TYPENAME(job->op), mw_full);
                             prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                             job->outlen += job->clen*2;
                             job->outbuf[job->outlen++] = ']';
                             job->outbuf[job->outlen++] = '\n';
                           } else
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                              Types[job->op], mw_full, job->pass);
+                              TYPENAME(job->op), mw_full, job->pass);
                         }
                       }
                     }
@@ -22764,13 +23005,13 @@ sha11saltmd5:
                         if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                       }
                       if (y2)  {
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], c4_enc);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), c4_enc);
                         prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                         job->outlen += job->clen*2;
                         job->outbuf[job->outlen++] = ']';
                         job->outbuf[job->outlen++] = '\n';
                       } else
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], c4_enc, job->pass);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), c4_enc, job->pass);
                     }
                   }
                 }
@@ -22830,14 +23071,14 @@ sha11saltmd5:
                             }
                             if (dohex) {
                               job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:$HEX[",
-                                Types[job->op], mdbuf);
+                                TYPENAME(job->op), mdbuf);
                               prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                               job->outlen += job->clen*2;
                               job->outbuf[job->outlen++] = ']';
                               job->outbuf[job->outlen++] = '\n';
                             } else
                               job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s:%s\n",
-                                Types[job->op], mdbuf, job->pass);
+                                TYPENAME(job->op), mdbuf, job->pass);
                           }
                         }
                       }
@@ -22978,13 +23219,13 @@ sha11saltmd5:
                             if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                           }
                           if (y2)  {
-                            job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:$HEX[", Types[job->op], prefix, jkey);
+                            job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:$HEX[", TYPENAME(job->op), prefix, jkey);
                             prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                             job->outlen += job->clen*2;
                             job->outbuf[job->outlen++] = ']';
                             job->outbuf[job->outlen++] = '\n';
                           } else
-                            job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:%s\n", Types[job->op], prefix, jkey, job->pass);
+                            job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s%s:%s\n", TYPENAME(job->op), prefix, jkey, job->pass);
                         }
                       }
                     }
@@ -23283,13 +23524,13 @@ sha1md5salt:
                             if (job->clen > 5 && strncmp(job->pass, "$HEX[", 5) == 0)
                               dohex = 1;
                             if (dohex) {
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], phps_orig);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), phps_orig);
                               prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                               job->outlen += job->clen*2;
                               job->outbuf[job->outlen++] = ']';
                               job->outbuf[job->outlen++] = '\n';
                             } else
-                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], phps_orig, job->pass);
+                              job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), phps_orig, job->pass);
                           }
                         }
                       }
@@ -24635,7 +24876,7 @@ nextsalt1:
 			job->outlen = 0;
 		      }
 		      if (y) {
-			job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], linebuf);
+			job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf);
 			prmd5((unsigned char *)cur, &job->outbuf[job->outlen], i*2);
 			job->outlen += i*2;
 			job->outbuf[job->outlen++] = ']';
@@ -24643,7 +24884,7 @@ nextsalt1:
 		      } else {
                         strncpy(linebuf + MAXLINE, cur, i);
                         linebuf[i + MAXLINE] = 0;
-			job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], linebuf, linebuf+MAXLINE);
+			job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf, linebuf+MAXLINE);
 		      }
                     }
                   }
@@ -27826,14 +28067,14 @@ sha1md5md5uc:
                           }
                           if (dohex) {
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s %s:$HEX[",
-                              Types[job->op], yaf_b64, saltsnap[si].salt);
+                              TYPENAME(job->op), yaf_b64, saltsnap[si].salt);
                             prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                             job->outlen += job->clen*2;
                             job->outbuf[job->outlen++] = ']';
                             job->outbuf[job->outlen++] = '\n';
                           } else
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s %s:%s\n",
-                              Types[job->op], yaf_b64, saltsnap[si].salt, job->pass);
+                              TYPENAME(job->op), yaf_b64, saltsnap[si].salt, job->pass);
                         }
                       }
                     }
@@ -32488,13 +32729,13 @@ HAV256_5_start:
 			  if ((signed char)(job->pass[jj]+1) < '!' || job->pass[jj] == ':') { dh = 1; break; }
 			if (job->clen > 5 && strncmp(job->pass, "$HEX[", 5) == 0) dh = 1;
 			if (dh) {
-			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", Types[job->op], outhash + 2);
+			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), outhash + 2);
 			  prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 			  job->outlen += job->clen*2;
 			  job->outbuf[job->outlen++] = ']';
 			  job->outbuf[job->outlen++] = '\n';
 			} else
-			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", Types[job->op], outhash + 2, job->pass);
+			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), outhash + 2, job->pass);
 		      }
 		      PV_DEC(saltsnap[si].PV);
 		      if (!Printall && *saltsnap[si].PV == 0) {
@@ -38346,15 +38587,226 @@ oracle_compute_md5pass_family(int job_enum, const char *pass, int plen,
         mysha512((char *)buf, total, out);
         free(buf);
         return 64;
-    /* e123 MD5MD5PASS is outlier (multi-emit, deferred). */
-    case JOB_MD5MD5PASS:
-        fprintf(stderr,
-            "FATAL: %s:%d oracle_compute_md5pass_family: e123 MD5MD5PASS "
-            "is multi-emit (canonical + colon variant); ships in a "
-            "separate sub-phase. CPU continues to handle e123.\n",
-            __FILE__, __LINE__);
+    case JOB_TIGERMD5PASS:       /* e171 -- 5b.2b Tier 2 */
+        {
+            sph_tiger_context ctiger;
+            sph_tiger_init(&ctiger);
+            sph_tiger(&ctiger, buf, total);
+            sph_tiger_close(&ctiger, out);
+        }
         free(buf);
-        exit(1);
+        return 24;
+    case JOB_WRLMD5PASS:         /* e173 -- 5b.2a Tier 2 */
+        WHIRLPOOL((char *)buf, total, out);
+        free(buf);
+        return 64;
+    /* Phase 5b Tier 3 sub-phase 5b.3a (2026-05-27): 5 3-pass HAVAL
+     * variants. Each calls the matching sph_haval<W>_3 entry point;
+     * sph_haval is the verified-conformant CPU oracle (R15 pre-flight
+     * test_haval_paper_vectors.c 120/120 cells PASS). */
+    case JOB_HAV128MD5PASS:      /* e127 -- 5b.3a Tier 3 (3-pass, 128-bit) */
+        {
+            sph_haval128_3_context c;
+            sph_haval128_3_init(&c);
+            sph_haval128_3(&c, buf, total);
+            sph_haval128_3_close(&c, out);
+        }
+        free(buf);
+        return 16;
+    case JOB_HAV160_3MD5PASS:    /* e133 -- 5b.3a Tier 3 (3-pass, 160-bit) */
+        {
+            sph_haval160_3_context c;
+            sph_haval160_3_init(&c);
+            sph_haval160_3(&c, buf, total);
+            sph_haval160_3_close(&c, out);
+        }
+        free(buf);
+        return 20;
+    case JOB_HAV192_3MD5PASS:    /* e139 -- 5b.3a Tier 3 (3-pass, 192-bit) */
+        {
+            sph_haval192_3_context c;
+            sph_haval192_3_init(&c);
+            sph_haval192_3(&c, buf, total);
+            sph_haval192_3_close(&c, out);
+        }
+        free(buf);
+        return 24;
+    case JOB_HAV224_3MD5PASS:    /* e145 -- 5b.3a Tier 3 (3-pass, 224-bit) */
+        {
+            sph_haval224_3_context c;
+            sph_haval224_3_init(&c);
+            sph_haval224_3(&c, buf, total);
+            sph_haval224_3_close(&c, out);
+        }
+        free(buf);
+        return 28;
+    case JOB_HAV256MD5PASS:      /* e151 -- 5b.3a Tier 3 (3-pass, 256-bit) */
+        {
+            sph_haval256_3_context c;
+            sph_haval256_3_init(&c);
+            sph_haval256_3(&c, buf, total);
+            sph_haval256_3_close(&c, out);
+        }
+        free(buf);
+        return 32;
+    case JOB_HAV128_4MD5PASS:    /* e129 -- 5b.3b Tier 3 (4-pass, 128-bit) */
+        {
+            sph_haval128_4_context c;
+            sph_haval128_4_init(&c);
+            sph_haval128_4(&c, buf, total);
+            sph_haval128_4_close(&c, out);
+        }
+        free(buf);
+        return 16;
+    case JOB_HAV160_4MD5PASS:    /* e135 -- 5b.3b Tier 3 (4-pass, 160-bit) */
+        {
+            sph_haval160_4_context c;
+            sph_haval160_4_init(&c);
+            sph_haval160_4(&c, buf, total);
+            sph_haval160_4_close(&c, out);
+        }
+        free(buf);
+        return 20;
+    case JOB_HAV192_4MD5PASS:    /* e141 -- 5b.3b Tier 3 (4-pass, 192-bit) */
+        {
+            sph_haval192_4_context c;
+            sph_haval192_4_init(&c);
+            sph_haval192_4(&c, buf, total);
+            sph_haval192_4_close(&c, out);
+        }
+        free(buf);
+        return 24;
+    case JOB_HAV224_4MD5PASS:    /* e147 -- 5b.3b Tier 3 (4-pass, 224-bit) */
+        {
+            sph_haval224_4_context c;
+            sph_haval224_4_init(&c);
+            sph_haval224_4(&c, buf, total);
+            sph_haval224_4_close(&c, out);
+        }
+        free(buf);
+        return 28;
+    case JOB_HAV256_4MD5PASS:    /* e153 -- 5b.3b Tier 3 (4-pass, 256-bit) */
+        {
+            sph_haval256_4_context c;
+            sph_haval256_4_init(&c);
+            sph_haval256_4(&c, buf, total);
+            sph_haval256_4_close(&c, out);
+        }
+        free(buf);
+        return 32;
+    case JOB_HAV128_5MD5PASS:    /* e131 -- 5b.3c Tier 3 (5-pass, 128-bit) */
+        {
+            sph_haval128_5_context c;
+            sph_haval128_5_init(&c);
+            sph_haval128_5(&c, buf, total);
+            sph_haval128_5_close(&c, out);
+        }
+        free(buf);
+        return 16;
+    case JOB_HAV160_5MD5PASS:    /* e137 -- 5b.3c Tier 3 (5-pass, 160-bit) */
+        {
+            sph_haval160_5_context c;
+            sph_haval160_5_init(&c);
+            sph_haval160_5(&c, buf, total);
+            sph_haval160_5_close(&c, out);
+        }
+        free(buf);
+        return 20;
+    case JOB_HAV192_5MD5PASS:    /* e143 -- 5b.3c Tier 3 (5-pass, 192-bit) */
+        {
+            sph_haval192_5_context c;
+            sph_haval192_5_init(&c);
+            sph_haval192_5(&c, buf, total);
+            sph_haval192_5_close(&c, out);
+        }
+        free(buf);
+        return 24;
+    case JOB_HAV224_5MD5PASS:    /* e149 -- 5b.3c Tier 3 (5-pass, 224-bit) */
+        {
+            sph_haval224_5_context c;
+            sph_haval224_5_init(&c);
+            sph_haval224_5(&c, buf, total);
+            sph_haval224_5_close(&c, out);
+        }
+        free(buf);
+        return 28;
+    case JOB_HAV256_5MD5PASS:    /* e155 -- 5b.3c Tier 3 (5-pass, 256-bit) */
+        {
+            sph_haval256_5_context c;
+            sph_haval256_5_init(&c);
+            sph_haval256_5(&c, buf, total);
+            sph_haval256_5_close(&c, out);
+        }
+        free(buf);
+        return 32;
+    /* Phase 5b Tier 4 sub-phase 5b.4a (2026-05-27): the 2 Snefru widths.
+     * Use a FRESH LOCAL rhash handle (NOT the global rhash_con, which is
+     * configured per-op and is not safe for a standalone recompute helper
+     * -- R-Tier4-oracle-rhash-context). librhash is the LIVE CPU oracle
+     * for e175/e177 (matches the JOB_SNE128/256MD5PASS case bodies which
+     * use rhash_init(RHASH_SNEFRU*)). */
+    case JOB_SNE128MD5PASS:      /* e175 -- 5b.4a Tier 4 (Snefru-128) */
+        {
+            rhash rc128 = rhash_init(RHASH_SNEFRU128);
+            if (!rc128) {
+                fprintf(stderr,
+                    "FATAL: %s:%d oracle_compute_md5pass_family: "
+                    "rhash_init(RHASH_SNEFRU128) failed (e175)\n",
+                    __FILE__, __LINE__);
+                free(buf);
+                exit(1);
+            }
+            rhash_update(rc128, buf, total);
+            rhash_final(rc128, out);
+            rhash_free(rc128);
+        }
+        free(buf);
+        return 16;
+    case JOB_SNE256MD5PASS:      /* e177 -- 5b.4a Tier 4 (Snefru-256) */
+        {
+            rhash rc256 = rhash_init(RHASH_SNEFRU256);
+            if (!rc256) {
+                fprintf(stderr,
+                    "FATAL: %s:%d oracle_compute_md5pass_family: "
+                    "rhash_init(RHASH_SNEFRU256) failed (e177)\n",
+                    __FILE__, __LINE__);
+                free(buf);
+                exit(1);
+            }
+            rhash_update(rc256, buf, total);
+            rhash_final(rc256, out);
+            rhash_free(rc256);
+        }
+        free(buf);
+        return 32;
+    /* Phase 5b Tier 4 sub-phase 5b.4b (2026-05-27): GOST R 34.11-94 (e125),
+     * the FINAL GPU-eligible MAKE_MD5PASS member. Call the in-tree
+     * gosthash() directly (the LIVE CPU oracle; matches the JOB_GOSTMD5PASS
+     * case body at mdxfind.c:29076). TEST S-box set (gosthash_init computes
+     * the derived tables once at startup; NOT CryptoPro -- R-Tier4-gost-sbox
+     * HIGH). 32-byte digest. */
+    case JOB_GOSTMD5PASS:        /* e125 -- 5b.4b Tier 4 (GOST R 34.11-94) */
+        gosthash((char *)buf, total, out);
+        free(buf);
+        return 32;
+    /* Sub-phase 5c.2 (2026-05-27): e123 MD5MD5PASS multi-emit.
+     *
+     * e123 produces TWO digests per password (variant 0 canonical +
+     * variant 1 colon). This 4-arg oracle returns variant 0 (canonical):
+     *   md5( hex32(md5(pass)) . pass )
+     * which is exactly the `buf` built above (hex32 || pass). The colon
+     * variant is built separately by the validation harness (it injects
+     * a ':' at offset 32). On the gpujob hit-replay path this arm is NOT
+     * reached for e123: the recompute branch only fires for digests > 16
+     * bytes, and e123's MD5 digest is 16 bytes (checkhash re-probes the
+     * loaded table directly from the kernel-emitted fingerprint, which
+     * self-identifies the matched variant -- no recompute needed). So
+     * returning the canonical variant here is sufficient + the signature
+     * stays unchanged for all callers. */
+    case JOB_MD5MD5PASS:         /* e123 -- 5c.2 multi-emit (variant 0) */
+        mymd5((char *)buf, total, out);
+        free(buf);
+        return 16;
     default:
         fprintf(stderr,
             "FATAL: %s:%d oracle_compute_md5pass_family: e%d not in "
@@ -38435,6 +38887,7 @@ static void hx_family_md5pass_validate_run_shared(
      * MD4=16, RMD160=20, SHA1=20, SHA224=28, SHA256=32, SHA384=48, SHA512=64. */
     int dlen = 0;
     switch (job_enum) {
+        case JOB_MD5MD5PASS:    dlen = 16; break;  /* 5c.2 multi-emit (e123) */
         case JOB_MD2MD5PASS:    dlen = 16; break;  /* 5b.1a Tier 1 */
         case JOB_MD4MD5PASS:    dlen = 16; break;
         case JOB_RMD128MD5PASS: dlen = 16; break;  /* 5b.1b Tier 1 */
@@ -38444,28 +38897,66 @@ static void hx_family_md5pass_validate_run_shared(
         case JOB_SHA256MD5PASS: dlen = 32; break;
         case JOB_SHA384MD5PASS: dlen = 48; break;
         case JOB_SHA512MD5PASS: dlen = 64; break;
+        case JOB_TIGERMD5PASS:  dlen = 24; break;  /* 5b.2b Tier 2 */
+        case JOB_WRLMD5PASS:    dlen = 64; break;  /* 5b.2a Tier 2 */
+        case JOB_HAV128MD5PASS: dlen = 16; break;  /* 5b.3a Tier 3 (e127) */
+        case JOB_HAV160_3MD5PASS: dlen = 20; break;/* 5b.3a Tier 3 (e133) */
+        case JOB_HAV192_3MD5PASS: dlen = 24; break;/* 5b.3a Tier 3 (e139) */
+        case JOB_HAV224_3MD5PASS: dlen = 28; break;/* 5b.3a Tier 3 (e145) */
+        case JOB_HAV256MD5PASS: dlen = 32; break;  /* 5b.3a Tier 3 (e151) */
+        case JOB_HAV128_4MD5PASS: dlen = 16; break;/* 5b.3b Tier 3 (e129) */
+        case JOB_HAV160_4MD5PASS: dlen = 20; break;/* 5b.3b Tier 3 (e135) */
+        case JOB_HAV192_4MD5PASS: dlen = 24; break;/* 5b.3b Tier 3 (e141) */
+        case JOB_HAV224_4MD5PASS: dlen = 28; break;/* 5b.3b Tier 3 (e147) */
+        case JOB_HAV256_4MD5PASS: dlen = 32; break;/* 5b.3b Tier 3 (e153) */
+        case JOB_HAV128_5MD5PASS: dlen = 16; break;/* 5b.3c Tier 3 (e131) */
+        case JOB_HAV160_5MD5PASS: dlen = 20; break;/* 5b.3c Tier 3 (e137) */
+        case JOB_HAV192_5MD5PASS: dlen = 24; break;/* 5b.3c Tier 3 (e143) */
+        case JOB_HAV224_5MD5PASS: dlen = 28; break;/* 5b.3c Tier 3 (e149) */
+        case JOB_HAV256_5MD5PASS: dlen = 32; break;/* 5b.3c Tier 3 (e155) */
+        case JOB_SNE128MD5PASS: dlen = 16; break;  /* 5b.4a Tier 4 (e175) */
+        case JOB_SNE256MD5PASS: dlen = 32; break;  /* 5b.4a Tier 4 (e177) */
+        case JOB_GOSTMD5PASS:   dlen = 32; break;  /* 5b.4b Tier 4 (e125) */
         default: break;
     }
     if (dlen == 0) {
         fprintf(stderr,
             "FATAL: %s:%d 5a family validate: digest width unknown for "
-            "e%d on %s (5a.4 wires 7 family members; e123 outlier)\n",
+            "e%d on %s (family + 5c.2 multi-emit e123 wired)\n",
             __FILE__, __LINE__, job_enum, hxhost);
         exit(1);
     }
-    unsigned char *oracle = (unsigned char *)malloc((size_t)n_pass * dlen);
+
+    /* Sub-phase 5c.2 (2026-05-27): multi-emit support.
+     *
+     * A multi-emit member (e123 MD5MD5PASS) produces N>1 digests per
+     * password (variant 0 canonical + variant 1 colon). The harness must
+     * plant ALL N variant digests as separate loaded-hash candidates and
+     * expect the GPU to emit ALL N cracks per password (the G1b
+     * dual-hash canary). We model this with n_variants distinct "rows"
+     * per pass: row r = pi*n_variants + v carries pass pi's variant-v
+     * digest. The compact table is sized for n_rows = n_pass*n_variants.
+     * Single-emit members keep n_variants=1 -> identical to prior
+     * behavior (G2 regression safety). */
+    int n_variants = (job_enum == JOB_MD5MD5PASS) ? 2 : 1;
+    size_t n_rows = n_pass * (size_t)n_variants;
+
+    unsigned char *oracle = (unsigned char *)malloc(n_rows * dlen);
     if (!oracle) {
         fprintf(stderr,
             "FATAL: %s:%d 5a.2 family validate (%s): malloc(oracle %zu B) "
             "failed on %s\n",
             __FILE__, __LINE__, backend_name,
-            (size_t)n_pass * dlen, hxhost);
+            n_rows * dlen, hxhost);
         exit(1);
     }
     for (size_t pi = 0; pi < n_pass; pi++) {
+        int plen = (int)strlen(passes[pi]);
+        /* Variant 0 (canonical) via the shared oracle: returns
+         * md5(hex32(md5(pass)) . pass). */
+        unsigned char *row0 = oracle + (pi * n_variants + 0) * dlen;
         int rdlen = oracle_compute_md5pass_family(
-                        job_enum, passes[pi], (int)strlen(passes[pi]),
-                        oracle + pi * dlen);
+                        job_enum, passes[pi], plen, row0);
         if (rdlen != dlen) {
             fprintf(stderr,
                 "FATAL: %s:%d 5a.2 family validate: oracle returned "
@@ -38473,23 +38964,37 @@ static void hx_family_md5pass_validate_run_shared(
                 __FILE__, __LINE__, rdlen, dlen, pi, passes[pi]);
             exit(1);
         }
+        if (n_variants == 2) {
+            /* Variant 1 (colon): md5(hex32(md5(pass)) . ':' . pass).
+             * Built inline (mirrors mdxfind.c CPU oracle linebuf2 at
+             * the JOB_MD5MD5PASS case). 16-byte MD5 digest. */
+            unsigned char inner[16];
+            char vbuf[32 + 1 + 256];
+            mymd5((void *)passes[pi], plen, inner);
+            prmd5(inner, vbuf, 32);
+            vbuf[32] = ':';
+            if (plen > (int)sizeof(vbuf) - 33) plen = (int)sizeof(vbuf) - 33;
+            memcpy(vbuf + 33, passes[pi], plen);
+            unsigned char *row1 = oracle + (pi * n_variants + 1) * dlen;
+            mymd5(vbuf, 33 + plen, row1);
+        }
     }
     fprintf(stderr,
         "hx codegen 5a.2 (%s) e%d: oracle digests computed (%d bytes each) "
-        "for %zu passes\n",
-        backend_name, job_enum, dlen, n_pass);
+        "for %zu passes x %d variants = %zu rows\n",
+        backend_name, job_enum, dlen, n_pass, n_variants, n_rows);
 
-    /* Build synthetic compact-hash table sized for n_pass. */
+    /* Build synthetic compact-hash table sized for n_rows. */
     uint64_t cap_pow2 = 1;
-    while (cap_pow2 < (uint64_t)n_pass * 2) cap_pow2 <<= 1;
+    while (cap_pow2 < (uint64_t)n_rows * 2) cap_pow2 <<= 1;
     if (cap_pow2 < 64) cap_pow2 = 64;
     uint64_t cmask = cap_pow2 - 1;
     uint32_t *cfp  = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
     uint32_t *cidx = (uint32_t *)calloc(cap_pow2, sizeof(uint32_t));
-    unsigned char *hbuf = (unsigned char *)malloc((size_t)n_pass * dlen);
-    size_t *hoff = (size_t *)malloc(n_pass * sizeof(size_t));
+    unsigned char *hbuf = (unsigned char *)malloc(n_rows * dlen);
+    size_t *hoff = (size_t *)malloc(n_rows * sizeof(size_t));
     unsigned short *hlen =
-        (unsigned short *)malloc(n_pass * sizeof(unsigned short));
+        (unsigned short *)malloc(n_rows * sizeof(unsigned short));
     if (!cfp || !cidx || !hbuf || !hoff || !hlen) {
         fprintf(stderr,
             "FATAL: %s:%d 5a.2 family validate (%s): alloc compact "
@@ -38497,7 +39002,7 @@ static void hx_family_md5pass_validate_run_shared(
             __FILE__, __LINE__, backend_name, hxhost);
         exit(1);
     }
-    for (size_t i = 0; i < n_pass; i++) {
+    for (size_t i = 0; i < n_rows; i++) {
         memcpy(hbuf + i * dlen, oracle + i * dlen, dlen);
         hoff[i] = i * dlen;
         hlen[i] = (unsigned short)dlen;
@@ -38518,9 +39023,9 @@ static void hx_family_md5pass_validate_run_shared(
     }
     fprintf(stderr,
         "hx codegen 5a.2 (%s) e%d: compact table built cap=%llu "
-        "mask=0x%llx\n",
+        "mask=0x%llx n_rows=%zu\n",
         backend_name, job_enum,
-        (unsigned long long)cap_pow2, (unsigned long long)cmask);
+        (unsigned long long)cap_pow2, (unsigned long long)cmask, n_rows);
 
     /* Upload compact table + a single 1-byte salt placeholder (kernel
      * ignores salts but the buffer slot must bind; both backends'
@@ -38529,7 +39034,7 @@ static void hx_family_md5pass_validate_run_shared(
     if (backend_id == 0) {
 #if defined(OPENCL_GPU)
         if (gpu_opencl_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
-                hbuf, (size_t)n_pass * dlen, hoff, n_pass, hlen) != 0) {
+                hbuf, n_rows * dlen, hoff, n_rows, hlen) != 0) {
             fprintf(stderr,
                 "FATAL: %s:%d 5a.2 family validate (OpenCL): "
                 "set_compact_table failed on %s dev[0]\n",
@@ -38552,7 +39057,7 @@ static void hx_family_md5pass_validate_run_shared(
     } else {
 #if defined(__APPLE__) && defined(METAL_GPU)
         if (gpu_metal_set_compact_table(0, cfp, cidx, cap_pow2, cmask,
-                hbuf, (size_t)n_pass * dlen, hoff, n_pass, hlen) != 0) {
+                hbuf, n_rows * dlen, hoff, n_rows, hlen) != 0) {
             fprintf(stderr,
                 "FATAL: %s:%d 5a.3 family validate (Metal): "
                 "set_compact_table failed on %s dev[0]\n",
@@ -38607,8 +39112,9 @@ static void hx_family_md5pass_validate_run_shared(
     }
 
     /* JIT family kernel via _keep wrapper + dispatch via family validate
-     * sibling. Family kernel entry-point is kernelb_hx_codegen_phase0. */
-    int max_hits = (int)n_pass;
+     * sibling. Family kernel entry-point is kernelb_hx_codegen_phase0.
+     * Multi-emit can produce up to n_rows hits (n_variants per pass). */
+    int max_hits = (int)n_rows;
     if (max_hits < 16) max_hits = 16;
     uint32_t *vhits =
         (uint32_t *)calloc((size_t)max_hits * 19, sizeof(uint32_t));
@@ -38656,8 +39162,18 @@ static void hx_family_md5pass_validate_run_shared(
         "(expected %zu)\n",
         backend_name, job_enum, vn_hits, n_pass);
 
-    /* Diff: every pi should appear exactly once. */
-    unsigned char *seen = (unsigned char *)calloc(n_pass, 1);
+    /* Diff: every ROW (pass x variant) should appear EXACTLY once.
+     *
+     * Sub-phase 5c.2 (2026-05-27) multi-emit: a hit carries widx (the
+     * pass index) + its 16-byte digest (slot[3..6]). For multi-emit each
+     * pass emits n_variants hits sharing the same widx but with DISTINCT
+     * digests. We resolve each hit to its (pass, variant) ROW by matching
+     * the hit digest against that pass's planted variant digests, then
+     * mark seen_row[r]. A hit whose digest matches NO variant of its pass
+     * is a digest mismatch; a widx out of range is an extra. The total
+     * expected hit count is n_rows. This is THE G1b dual-hash canary
+     * check: for the canary pass, BOTH variant rows must be seen. */
+    unsigned char *seen_row = (unsigned char *)calloc(n_rows, 1);
     int extras = 0, mismatches = 0;
     size_t first_mismatch_print = 0;
     for (int h = 0; h < vn_hits; h++) {
@@ -38674,48 +39190,63 @@ static void hx_family_md5pass_validate_run_shared(
             }
             continue;
         }
-        uint32_t exp0 = ((uint32_t *)(oracle + widx * dlen))[0];
-        uint32_t exp1 = ((uint32_t *)(oracle + widx * dlen))[1];
-        uint32_t exp2 = ((uint32_t *)(oracle + widx * dlen))[2];
-        uint32_t exp3 = ((uint32_t *)(oracle + widx * dlen))[3];
-        if (slot[3] != exp0 || slot[4] != exp1 ||
-            slot[5] != exp2 || slot[6] != exp3)
-        {
-            mismatches++;
-            if (first_mismatch_print < 10) {
-                fprintf(stderr,
-                    "  HIT-DIFF #%d (pi=%u) exp=%08x%08x%08x%08x "
-                    "got=%08x%08x%08x%08x\n",
-                    h, widx,
-                    exp0, exp1, exp2, exp3,
-                    slot[3], slot[4], slot[5], slot[6]);
-                first_mismatch_print++;
+        /* Match the hit digest against pass widx's n_variants rows. */
+        int matched_variant = -1;
+        for (int v = 0; v < n_variants; v++) {
+            size_t r = (size_t)widx * n_variants + v;
+            uint32_t e0 = ((uint32_t *)(oracle + r * dlen))[0];
+            uint32_t e1 = ((uint32_t *)(oracle + r * dlen))[1];
+            uint32_t e2 = ((uint32_t *)(oracle + r * dlen))[2];
+            uint32_t e3 = ((uint32_t *)(oracle + r * dlen))[3];
+            if (slot[3] == e0 && slot[4] == e1 &&
+                slot[5] == e2 && slot[6] == e3) {
+                matched_variant = v;
+                break;
             }
         }
-        if (!seen[widx]) seen[widx] = 1;
+        if (matched_variant < 0) {
+            mismatches++;
+            if (first_mismatch_print < 10) {
+                uint32_t e0 = ((uint32_t *)(oracle + (size_t)widx * n_variants * dlen))[0];
+                fprintf(stderr,
+                    "  HIT-DIFF #%d (pi=%u) no variant matched; "
+                    "got=%08x%08x%08x%08x (variant0[0]=%08x)\n",
+                    h, widx,
+                    slot[3], slot[4], slot[5], slot[6], e0);
+                first_mismatch_print++;
+            }
+            continue;
+        }
+        size_t r = (size_t)widx * n_variants + matched_variant;
+        if (!seen_row[r]) seen_row[r] = 1;
     }
     size_t matched = 0, missing = 0;
-    for (size_t i = 0; i < n_pass; i++)
-        if (seen[i]) matched++; else missing++;
+    for (size_t i = 0; i < n_rows; i++)
+        if (seen_row[i]) matched++; else missing++;
     int miss_print = 0;
     if (missing > 0) {
-        fprintf(stderr, "  Missing passes (showing first 10):\n");
-        for (size_t i = 0; i < n_pass && miss_print < 10; i++) {
-            if (!seen[i]) {
-                fprintf(stderr, "    pi=%zu pass=\"%s\"\n", i, passes[i]);
+        fprintf(stderr, "  Missing rows (pass x variant, first 10):\n");
+        for (size_t i = 0; i < n_rows && miss_print < 10; i++) {
+            if (!seen_row[i]) {
+                size_t pi = i / n_variants;
+                size_t v  = i % n_variants;
+                fprintf(stderr, "    row=%zu pi=%zu variant=%zu pass=\"%s\"\n",
+                        i, pi, v, passes[pi]);
                 miss_print++;
             }
         }
     }
 
     int pass_ok = (mismatches == 0 && extras == 0 &&
-                   matched == n_pass && vn_hits == (int)n_pass);
+                   matched == n_rows && vn_hits == (int)n_rows);
     fprintf(stderr,
-        "hx codegen 5a.2 (%s) e%d RESULT on %s: %s  n_pass=%zu vn_hits=%d "
-        "matched=%zu missing=%zu extras=%d digest_mismatches=%d\n",
+        "hx codegen 5a.2 (%s) e%d RESULT on %s: %s  n_pass=%zu n_variants=%d "
+        "n_rows=%zu vn_hits=%d matched=%zu missing=%zu extras=%d "
+        "digest_mismatches=%d\n",
         backend_name, job_enum, hxhost,
         pass_ok ? "PASS" : "FAIL",
-        n_pass, vn_hits, matched, missing, extras, mismatches);
+        n_pass, n_variants, n_rows, vn_hits, matched, missing, extras,
+        mismatches);
 
     if (pass_ok) {
         fprintf(stderr,
@@ -38725,15 +39256,11 @@ static void hx_family_md5pass_validate_run_shared(
         for (size_t s = 0; s < sample; s++) {
             uint32_t *slot = vhits + s * 19;
             uint32_t widx = slot[0];
-            uint32_t e0 = ((uint32_t *)(oracle + widx * dlen))[0];
-            uint32_t e1 = ((uint32_t *)(oracle + widx * dlen))[1];
-            uint32_t e2 = ((uint32_t *)(oracle + widx * dlen))[2];
-            uint32_t e3 = ((uint32_t *)(oracle + widx * dlen))[3];
+            /* Print the hit's own digest; for multi-emit the matching
+             * planted variant is whichever row equals slot[3..6]. */
             fprintf(stderr,
-                "  [%zu] pass=\"%s\" oracle[0..15]=%08x%08x%08x%08x "
-                "codegen=%08x%08x%08x%08x\n",
-                s, passes[widx],
-                e0, e1, e2, e3,
+                "  [%zu] pass=\"%s\" codegen=%08x%08x%08x%08x\n",
+                s, (widx < n_pass) ? passes[widx] : "(oob)",
                 slot[3], slot[4], slot[5], slot[6]);
         }
     }
@@ -38749,7 +39276,7 @@ static void hx_family_md5pass_validate_run_shared(
         gpu_metal_jit_release_keep(fam_jit_a, fam_jit_b);
 #endif
     }
-    free(vhits); free(seen);
+    free(vhits); free(seen_row);
     free(packed); free(woff);
     free(cfp); free(cidx); free(hbuf); free(hoff); free(hlen);
     free(oracle);
@@ -38760,6 +39287,81 @@ static void hx_family_md5pass_validate_run_shared(
     exit(pass_ok ? 0 : 1);
 }
 #endif /* OPENCL_GPU || (APPLE && METAL_GPU) */
+
+#ifdef GPU_ENABLED
+/* gpu_ops[] -- file-scope single source of truth for the legacy
+ * template-path GPU op set. Sentinel-terminated with -1.
+ *
+ * Iterated in two places, both of which must agree by construction:
+ *   1. The GPU init preamble inside build_compact_table() (~line 39185) --
+ *      sets need_gpu=1 if any Dohash[] entry matches one of these JOBs
+ *      (so gpu_opencl_init or gpu_metal_init fires).
+ *   2. gpu_op_advertise_for_h_listing (~line 45515) -- drives the [GPU]
+ *      tag on the `mdxfind -h` hash-type listing.
+ *
+ * Prior to rev 1.511 (2026-05-27) this lived at function scope and the
+ * helper carried a parallel mirror; the two could drift silently. New
+ * legacy-template-path GPU ops are added here ONCE and both sites pick
+ * up the change automatically.
+ *
+ * Codegen-path ops (JOB_MD5MD5SALT e347; MAKE_MD5PASS family e120/e122/
+ * e157/e159/e161/e163/e165/e167/e169/e171/e173) are intentionally
+ * ABSENT from this table -- they are admitted via separate predicates
+ * (the JOB_MD5MD5SALT check and gpu_codegen_kernelb_family_md5pass_-
+ * eligible) so the legacy template path is not advertised as covering
+ * them. Both the init preamble and gpu_op_advertise_for_h_listing apply
+ * those extra predicates after the gpu_ops[] scan.
+ */
+static const int gpu_ops[] = {
+    JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT,
+    JOB_MD5SALTPASS, JOB_MD5PASSSALT,
+    JOB_SHA256PASSSALT, JOB_SHA256SALTPASS,
+    /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS joins the GPU-init
+     * op list so `mdxfind -G N -M SHA224SALTPASS` (without other GPU
+     * types) actually initializes GPU devices. Without this entry the
+     * chokepoint admit gate never fires (GPU init is skipped in the
+     * type-loader preamble). */
+    JOB_SHA224SALTPASS,
+    JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS,
+    JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
+    JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD5UC, JOB_MD4, JOB_SHA1,
+    JOB_SHA224, JOB_SHA256, JOB_SHA384, JOB_SHA512,
+    /* JOB_NTLM (e369): permanently CPU-only by design. The rules engine
+     * assumes ASCII input bytes; NTLM emits 2-3 UTF-16LE candidate plains
+     * per word via iconv (utf-8/cp1251/cp1252) which the rules engine
+     * cannot process correctly. NTLMH (e786) is the GPU-capable variant
+     * (single zero-extend, the hashcat-broken-conversion); MD4UTF16
+     * (e496) is the iter sibling. */
+    JOB_WRL, JOB_NTLMH, JOB_MD4UTF16, JOB_MD6256, JOB_SHA256RAW,
+    JOB_KECCAK224, JOB_KECCAK256, JOB_KECCAK384, JOB_KECCAK512,
+    JOB_SHA3_224, JOB_SHA3_256, JOB_SHA3_384, JOB_SHA3_512,
+    JOB_HMAC_MD5, JOB_HMAC_MD5_KPASS,
+    JOB_HMAC_SHA1, JOB_HMAC_SHA1_KPASS,
+    JOB_HMAC_SHA224, JOB_HMAC_SHA224_KPASS,
+    JOB_HMAC_SHA256, JOB_HMAC_SHA256_KPASS,
+    JOB_HMAC_SHA384, JOB_HMAC_SHA384_KPASS,
+    JOB_HMAC_SHA512, JOB_HMAC_SHA512_KPASS,
+    JOB_HMAC_RMD160, JOB_HMAC_RMD160_KPASS,
+    JOB_HMAC_RMD320, JOB_HMAC_RMD320_KPASS,
+    JOB_HMAC_BLAKE2S,
+    JOB_STREEBOG_32, JOB_STREEBOG_64,
+    JOB_HMAC_STREEBOG256_KPASS, JOB_HMAC_STREEBOG256_KSALT,
+    JOB_HMAC_STREEBOG512_KPASS, JOB_HMAC_STREEBOG512_KSALT,
+    JOB_SHA512PASSSALT, JOB_SHA512SALTPASS,
+    /* Phase 2d.5.7-followup (2026-05-13): admit JOB_SHA384SALTPASS to
+     * the need_gpu activation set so Metal init runs when -m e812 is in
+     * Dohash. Mirrors B6.9/B6.10 SHA512 sibling admission. */
+    JOB_SHA384SALTPASS,
+    JOB_SHA512CRYPT, JOB_SHA256CRYPT, JOB_SHA512CRYPTMD5,
+    JOB_MD5RAW, JOB_SHA1RAW, JOB_SHA384RAW, JOB_SHA512RAW,
+    JOB_SQL5, JOB_MYSQL3, JOB_DESCRYPT,
+    JOB_RMD160, JOB_RMD320, JOB_BLAKE2S256,
+    /* B5 sub-batch 3 (2026-05-06): BLAKE2B-256 / BLAKE2B-512 GPU
+     * template. BLAKE2B-160 omitted -- no JOB_BLAKE2B160. */
+    JOB_BLAKE2B256, JOB_BLAKE2B512,
+    JOB_BCRYPT, -1
+};
+#endif
 
 void build_compact_table(void) {
   size_t i;
@@ -39145,59 +39747,19 @@ void build_compact_table(void) {
       fprintf(stderr, "Compact table: added %d SHA256CRYPT hashes for GPU probing\n", s5_added);
   }
 #ifdef GPU_ENABLED
-  /* Only initialize GPU if at least one GPU-capable hash type is selected */
+  /* Only initialize GPU if at least one GPU-capable hash type is selected.
+   *
+   * gpu_ops[] is declared at file scope as `static const int` (just above
+   * gpu_op_advertise_for_h_listing near `void *Stack;`). Both this init
+   * preamble loop AND gpu_op_advertise_for_h_listing iterate the same
+   * sentinel-terminated table, eliminating the prior drift class where a
+   * mirror table in the helper silently fell out of sync.
+   *
+   * Cleanup 2026-05-27 (rev 1.511): lifted from function-scope mutable
+   * to file-scope static const; mirror table in helper deleted; inline
+   * 11-JOB family override table replaced with a J1F/J1N walk over
+   * Dohash calling gpu_codegen_kernelb_family_md5pass_eligible. */
   { int need_gpu = 0;
-    int gpu_ops[] = { JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT,
-                      JOB_MD5SALTPASS, JOB_MD5PASSSALT,
-                      JOB_SHA256PASSSALT, JOB_SHA256SALTPASS,
-                      /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS joins
-                       * the GPU-init op list so `mdxfind -G N -M SHA224SALTPASS`
-                       * (without other GPU types) actually initializes GPU
-                       * devices. Without this entry the chokepoint admit gate
-                       * never fires (GPU init is skipped in the type-loader
-                       * preamble). */
-                      JOB_SHA224SALTPASS,
-                      JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS,
-                      JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
-                      JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD5UC, JOB_MD4, JOB_SHA1,
-                      JOB_SHA224, JOB_SHA256, JOB_SHA384, JOB_SHA512,
-                      /* JOB_NTLM (e369): permanently CPU-only by design. The rules
-                       * engine assumes ASCII input bytes; NTLM emits 2-3 UTF-16LE
-                       * candidate plains per word via iconv (utf-8/cp1251/cp1252)
-                       * which the rules engine cannot process correctly. NTLMH
-                       * (e786) is the GPU-capable variant (single zero-extend, the
-                       * hashcat-broken-conversion); MD4UTF16 (e496) is the iter
-                       * sibling. */
-                      JOB_WRL, JOB_NTLMH, JOB_MD4UTF16, JOB_MD6256, JOB_SHA256RAW,
-                      JOB_KECCAK224, JOB_KECCAK256, JOB_KECCAK384, JOB_KECCAK512,
-                      JOB_SHA3_224, JOB_SHA3_256, JOB_SHA3_384, JOB_SHA3_512,
-                      JOB_HMAC_MD5, JOB_HMAC_MD5_KPASS,
-                      JOB_HMAC_SHA1, JOB_HMAC_SHA1_KPASS,
-                      JOB_HMAC_SHA224, JOB_HMAC_SHA224_KPASS,
-                      JOB_HMAC_SHA256, JOB_HMAC_SHA256_KPASS,
-                      JOB_HMAC_SHA384, JOB_HMAC_SHA384_KPASS,
-                      JOB_HMAC_SHA512, JOB_HMAC_SHA512_KPASS,
-                      JOB_HMAC_RMD160, JOB_HMAC_RMD160_KPASS,
-                      JOB_HMAC_RMD320, JOB_HMAC_RMD320_KPASS,
-                      JOB_HMAC_BLAKE2S,
-                      JOB_STREEBOG_32, JOB_STREEBOG_64,
-                      JOB_HMAC_STREEBOG256_KPASS, JOB_HMAC_STREEBOG256_KSALT,
-                      JOB_HMAC_STREEBOG512_KPASS, JOB_HMAC_STREEBOG512_KSALT,
-                      JOB_SHA512PASSSALT, JOB_SHA512SALTPASS,
-                      /* Phase 2d.5.7-followup (2026-05-13): admit
-                       * JOB_SHA384SALTPASS to the need_gpu activation
-                       * set so Metal init runs when -m e812 is in
-                       * Dohash. Mirrors B6.9/B6.10 SHA512 sibling
-                       * admission. */
-                      JOB_SHA384SALTPASS,
-                      JOB_SHA512CRYPT, JOB_SHA256CRYPT, JOB_SHA512CRYPTMD5,
-                      JOB_MD5RAW, JOB_SHA1RAW, JOB_SHA384RAW, JOB_SHA512RAW,
-                      JOB_SQL5, JOB_MYSQL3, JOB_DESCRYPT,
-                      JOB_RMD160, JOB_RMD320, JOB_BLAKE2S256,
-                      /* B5 sub-batch 3 (2026-05-06): BLAKE2B-256 / BLAKE2B-512
-                       * GPU template. BLAKE2B-160 omitted — no JOB_BLAKE2B160. */
-                      JOB_BLAKE2B256, JOB_BLAKE2B512,
-                      JOB_BCRYPT, -1 };
     for (int gi = 0; gpu_ops[gi] >= 0; gi++) {
       Word_t grc;
       J1T(grc, Dohash, gpu_ops[gi]);
@@ -39228,22 +39790,22 @@ void build_compact_table(void) {
         if (_grc_md5md5salt) need_gpu = 1;
     }
     if (!need_gpu) {
-        static const int _family_ops[] = {
-            JOB_MD2MD5PASS,    /* e120 -- 5b.1a Tier 1 */
-            JOB_MD4MD5PASS,    /* e122 */
-            JOB_RMD128MD5PASS, /* e157 -- 5b.1b Tier 1 */
-            JOB_RMD160MD5PASS, /* e159 */
-            JOB_SHA1MD5PASS,   /* e161 */
-            JOB_SHA224MD5PASS, /* e163 */
-            JOB_SHA256MD5PASS, /* e165 */
-            JOB_SHA384MD5PASS, /* e167 */
-            JOB_SHA512MD5PASS, /* e169 */
-        };
-        for (size_t _fi = 0;
-             _fi < sizeof(_family_ops) / sizeof(_family_ops[0]); _fi++) {
-            Word_t _grc_fam;
-            J1T(_grc_fam, Dohash, (Word_t)_family_ops[_fi]);
-            if (_grc_fam) { need_gpu = 1; break; }
+        /* Cleanup 2026-05-27 (rev 1.511): inline 11-JOB literal family
+         * table replaced with a J1F/J1N walk over Dohash applying the
+         * single-source-of-truth predicate
+         * gpu_codegen_kernelb_family_md5pass_eligible. Future Phase 5b
+         * Tier 3/4 widens (haval/gost/sne128/sne256) auto-propagate
+         * here once the predicate widens in gpu_codegen_eligible.c --
+         * no edit needed at this site. */
+        Word_t _fi_op = 0;
+        Word_t _grc_fam;
+        J1F(_grc_fam, Dohash, _fi_op);
+        while (_grc_fam) {
+            if (gpu_codegen_kernelb_family_md5pass_eligible((int)_fi_op)) {
+                need_gpu = 1;
+                break;
+            }
+            J1N(_grc_fam, Dohash, _fi_op);
         }
     }
     /* hx codegen sub-phase 2a.1 (2026-05-21): force need_gpu=1 when the
@@ -39457,20 +40019,14 @@ void build_compact_table(void) {
             hx_e347_validate_run_shared(0, hxsrc, fixture_env, hxhost);
             /* NOTREACHED */
         }
-        /* Sub-phase 5a.4 (2026-05-23): MAKE_MD5PASS family harness
-         * dispatch widened to 7 family members (e122 e159 e161 e163
-         * e165 e167 e169). e123 MD5MD5PASS remains outlier (multi-emit
-         * deferred). The 5a.5 production dispatcher will widen the
-         * admit predicate similarly. */
-        if ((target_job == JOB_MD2MD5PASS    ||  /* 5b.1a Tier 1 */
-             target_job == JOB_MD4MD5PASS    ||
-             target_job == JOB_RMD128MD5PASS ||  /* 5b.1b Tier 1 */
-             target_job == JOB_RMD160MD5PASS ||
-             target_job == JOB_SHA1MD5PASS   ||
-             target_job == JOB_SHA224MD5PASS ||
-             target_job == JOB_SHA256MD5PASS ||
-             target_job == JOB_SHA384MD5PASS ||
-             target_job == JOB_SHA512MD5PASS) && validate_on) {
+        /* Sub-phase 5b.3a.0.3 (2026-05-27) D17.4.b refactor: 11-entry
+         * OR-chain replaced with single-source-of-truth predicate call
+         * via gpu_codegen_kernelb_family_md5pass_eligible. Future Tier
+         * 3 sub-phases (5b.3b 4-pass HAVAL, 5b.3c 5-pass HAVAL) + Tier
+         * 4 (gost/sne128/sne256) flip prim_table.supported_5a and this
+         * OR-chain auto-propagates. */
+        if (gpu_codegen_kernelb_family_md5pass_eligible(target_job)
+            && validate_on) {
             hx_family_md5pass_validate_run_shared(
                 0, hxsrc, fixture_env, hxhost, target_job);
             /* NOTREACHED */
@@ -39843,7 +40399,19 @@ void build_compact_table(void) {
          * Route those through the with-common JIT helper which prepends
          * gpu_common_str at clCreateProgramWithSource. Other (generic-
          * dispatch placeholder) emissions remain on the original helper. */
-        if (target_job == 347) {
+        /* Sub-phase 5b.3a (2026-05-27): the MAKE_MD5PASS family emitter
+         * (5a.2+) also produces source that references gpu_common.cl
+         * symbols (OCLParams, md5_block, state_to_hex32_bytes, the
+         * primitive *_block functions, HAVAL_IV, etc.), so the JIT-only
+         * dump harness path MUST route family members through the
+         * _with_common helper too -- not just e347. Prior to this fix the
+         * non-VALIDATE dump path JIT-failed on family members with
+         * "undeclared identifier" errors (gpu_common never prepended);
+         * latent since 5a.2 but only surfaced now because Tier 1/2/3
+         * always validated via MDXFIND_HX_CODEGEN_VALIDATE=1 (which uses
+         * the _with_common_keep dispatch path). */
+        if (target_job == 347
+            || gpu_codegen_kernelb_family_md5pass_eligible(target_job)) {
             gpu_opencl_jit_compile_source_with_common(0, hxsrc, "-cl-std=CL1.2");
         } else {
             gpu_opencl_jit_compile_source(0, hxsrc, "-cl-std=CL1.2");
@@ -39968,17 +40536,12 @@ void build_compact_table(void) {
             hx_e347_validate_run_shared(1, hxsrc, m_fixture_env, hxhost);
             /* NOTREACHED */
         }
-        /* Sub-phase 5a.4 (2026-05-23): Metal twin widened to 7 family
-         * members (e122 e159 e161 e163 e165 e167 e169). e123 outlier. */
-        if ((target_job == JOB_MD2MD5PASS    ||  /* 5b.1a Tier 1 */
-             target_job == JOB_MD4MD5PASS    ||
-             target_job == JOB_RMD128MD5PASS ||  /* 5b.1b Tier 1 */
-             target_job == JOB_RMD160MD5PASS ||
-             target_job == JOB_SHA1MD5PASS   ||
-             target_job == JOB_SHA224MD5PASS ||
-             target_job == JOB_SHA256MD5PASS ||
-             target_job == JOB_SHA384MD5PASS ||
-             target_job == JOB_SHA512MD5PASS) && m_validate_on) {
+        /* Sub-phase 5b.3a.0.3 (2026-05-27) D17.4.b refactor: 11-entry
+         * Metal OR-chain replaced with single-source-of-truth predicate
+         * call. Mirror of the OpenCL twin's refactor at line 39527-era.
+         */
+        if (gpu_codegen_kernelb_family_md5pass_eligible(target_job)
+            && m_validate_on) {
             hx_family_md5pass_validate_run_shared(
                 1, hxsrc, m_fixture_env, hxhost, target_job);
             /* NOTREACHED */
@@ -45496,6 +46059,53 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
 }
 void *Stack;
 
+/* gpu_op_advertise_for_h_listing -- predicate-based GPU-eligibility
+ * check driving the [GPU] suffix on the `mdxfind -h` hash-type listing.
+ *
+ * Replaces a manually-maintained if-chain that listed every JOB literal
+ * (added 2026-05-27). The chain wasn't extended when codegen-path
+ * algorithms became GPU-eligible, so newly-eligible e120/e122/e157/e159/
+ * e161/e163/e165/e167/e169/e171/e173/e347 entries silently lost their
+ * [GPU] tag in the listing despite being live on the runtime dispatch
+ * path. This helper composes the three actual admit predicates so the
+ * display tracks runtime reality automatically:
+ *
+ *   1. gpu_ops[] legacy template-path scan -- every JOB enum whose
+ *      presence in Dohash[] triggers need_gpu in the GPU init preamble.
+ *      Same file-scope table referenced by the init preamble (no mirror).
+ *   2. JOB_MD5MD5SALT (e347) -- codegen Phase 4 production path; absent
+ *      from gpu_ops[] by design (need_gpu override at ~line 39200).
+ *   3. gpu_codegen_kernelb_family_md5pass_eligible -- Phase 5a/5b
+ *      MAKE_MD5PASS family entries; absent from gpu_ops[] by design
+ *      (need_gpu override at ~line 39210).
+ *
+ * Cleanup 2026-05-27 (rev 1.511): the helper's parallel `gpu_ops_listing`
+ * mirror is gone; both call-sites now iterate the single file-scope
+ * gpu_ops[] table above. Future Phase 5b Tier 3/4 ships (haval/gost/
+ * sne128/sne256 family members) auto-update this listing once
+ * gpu_codegen_kernelb_family_md5pass_eligible widens -- no edit needed
+ * here.
+ *
+ * Non-GPU builds (GPU_ENABLED undefined) unconditionally return 0,
+ * preserving the prior iMac listing behavior.
+ */
+static int gpu_op_advertise_for_h_listing(int x) {
+#ifdef GPU_ENABLED
+    /* Predicate 1: shared file-scope gpu_ops[] linear scan. */
+    for (int i = 0; gpu_ops[i] >= 0; i++) {
+        if (gpu_ops[i] == x) return 1;
+    }
+    /* Predicate 2: Phase 4 codegen e347 (MD5MD5SALT). Absent from
+     * gpu_ops[]; production dispatch via codegen kernel B. */
+    if (x == JOB_MD5MD5SALT) return 1;
+    /* Predicate 3: Phase 5a/5b MAKE_MD5PASS family codegen entries. */
+    if (gpu_codegen_kernelb_family_md5pass_eligible(x)) return 1;
+#else
+    (void)x;
+#endif
+    return 0;
+}
+
 int main(int argc, char **argv) {
   struct stat sb;
   struct job *job;
@@ -45669,59 +46279,16 @@ union HashU curin;
               }
             }
             { const char *gpu = "";
-#ifdef GPU_ENABLED
-              if (x == JOB_MD5SALT || x == JOB_MD5UCSALT ||
-                  x == JOB_MD5revMD5SALT || x == JOB_MD5sub8_24SALT ||
-                  x == JOB_MD5SALTPASS || x == JOB_MD5PASSSALT ||
-                  x == JOB_SHA256SALTPASS || x == JOB_SHA256PASSSALT ||
-                  /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS is
-                   * GPU-capable via the unified template path — advertise
-                   * the [GPU] tag in `mdxfind -h` output. */
-                  x == JOB_SHA224SALTPASS ||
-                  x == JOB_MD5CRYPT || x == JOB_MD5_MD5SALTMD5PASS ||
-                  x == JOB_SHA1SALTPASS || x == JOB_SHA1PASSSALT ||
-                  x == JOB_SHA1DRU || x == JOB_PHPBB3 ||
-                  x == JOB_DESCRYPT || x == JOB_MD5 || x == JOB_MD5UC ||
-                  /* JOB_NTLM (e369): permanently CPU-only — see need_gpu list comment. */
-                  x == JOB_MD4 || x == JOB_NTLMH ||
-                  x == JOB_SHA1 ||
-                  x == JOB_SHA224 || x == JOB_SHA256 ||
-                  x == JOB_SHA384 || x == JOB_SHA512 ||
-                  x == JOB_WRL || x == JOB_MD6256 ||
-                  x == JOB_SHA256RAW ||
-                  x == JOB_KECCAK224 || x == JOB_KECCAK256 ||
-                  x == JOB_KECCAK384 || x == JOB_KECCAK512 ||
-                  x == JOB_SHA3_224 || x == JOB_SHA3_256 ||
-                  x == JOB_SHA3_384 || x == JOB_SHA3_512 ||
-                  x == JOB_HMAC_MD5 || x == JOB_HMAC_MD5_KPASS ||
-                  x == JOB_HMAC_SHA1 || x == JOB_HMAC_SHA1_KPASS ||
-                  x == JOB_HMAC_SHA224 || x == JOB_HMAC_SHA224_KPASS ||
-                  x == JOB_HMAC_SHA256 || x == JOB_HMAC_SHA256_KPASS ||
-                  x == JOB_HMAC_SHA384 || x == JOB_HMAC_SHA384_KPASS ||
-                  x == JOB_HMAC_SHA512 || x == JOB_HMAC_SHA512_KPASS ||
-                  x == JOB_HMAC_RMD160 || x == JOB_HMAC_RMD160_KPASS ||
-                  x == JOB_HMAC_RMD320 || x == JOB_HMAC_RMD320_KPASS ||
-                  x == JOB_HMAC_BLAKE2S ||
-                  x == JOB_STREEBOG_32 || x == JOB_STREEBOG_64 ||
-                  x == JOB_HMAC_STREEBOG256_KPASS || x == JOB_HMAC_STREEBOG256_KSALT ||
-                  x == JOB_HMAC_STREEBOG512_KPASS || x == JOB_HMAC_STREEBOG512_KSALT ||
-                  x == JOB_SHA512PASSSALT || x == JOB_SHA512SALTPASS ||
-                  /* Phase 2d.5.7-followup (2026-05-13): SHA384SALTPASS
-                   * Metal scaffolding shipped Phase 2d.5.7. */
-                  x == JOB_SHA384SALTPASS ||
-                  x == JOB_SHA512CRYPT || x == JOB_SHA256CRYPT ||
-                  x == JOB_MD5RAW || x == JOB_SHA1RAW ||
-                  x == JOB_SHA384RAW || x == JOB_SHA512RAW ||
-                  x == JOB_SQL5 || x == JOB_MYSQL3 ||
-                  x == JOB_BCRYPT || x == JOB_RMD160 ||
-                  x == JOB_RMD320 ||
-                  x == JOB_BLAKE2S256 ||
-                  /* B5 sub-batch 3: BLAKE2B-256 / BLAKE2B-512 GPU template. */
-                  x == JOB_BLAKE2B256 || x == JOB_BLAKE2B512 ||
-                  x == JOB_SHA512CRYPTMD5 ||
-                  x == JOB_MD4UTF16)
+              /* 2026-05-27: replaced manual if-chain with predicate-based
+               * detection via gpu_op_advertise_for_h_listing (defined
+               * above main). The helper composes gpu_ops[] legacy
+               * template scan, JOB_MD5MD5SALT (e347) codegen, and the
+               * Phase 5a/5b MAKE_MD5PASS family eligibility predicate
+               * so the listing auto-tracks runtime GPU admit reality
+               * across all dispatch paths. Non-GPU builds get the
+               * (void)x no-op path inside the helper. */
+              if (gpu_op_advertise_for_h_listing(x))
                 gpu = " [GPU]";
-#endif
               if (hci)
                 printf("e%-*d  %-7s  %-*s  %s%s\n", ch - 1, x, optbuf, z, Types[x], hcbuf, gpu);
               else
@@ -45761,6 +46328,45 @@ union HashU curin;
   inhashcnt = 0;
   current_utc_time(&starthash);
 
+  /*
+   * User-defined hash types (Milestone 1): load $MDXFIND_CACHE/userdef.txt
+   * before argv parsing so that `-m u<id>` selectors can resolve against
+   * the registered synthetic ops.  Missing file / unset MDXFIND_CACHE is
+   * fine -- user types are optional.
+   */
+  /*
+   * -Y (validate userdef.txt and exit): the load runs before getopt so that
+   * -m u<id> can resolve during arg parsing -- which means a getopt case would
+   * flip the verbose flag too late to print the load report.  Pre-scan argv
+   * for -Y here: if present, turn the load report on, load, and exit.  A pure
+   * "did it read userdef.txt correctly?" mode that emits nothing otherwise.
+   */
+  {
+    int _yi;
+    for (_yi = 1; _yi < argc; _yi++)
+      if (!strcmp(argv[_yi], "-Y")) {
+        userdef_verbose = 1;
+        userdef_load(getenv("MDXFIND_CACHE"));
+        exit(0);
+      }
+  }
+  userdef_load(getenv("MDXFIND_CACHE"));
+  /*
+   * Milestone 1 user types are unsalted: mark each loaded user op with
+   * TYPEOPT_NEEDSF so the hash-file loader uses the plain-hex fast path
+   * (commit_compact into the compact table) exactly like a built-in
+   * unsalted digest type.  Synthetic ops are assigned sequentially from
+   * JOB_USERDEF_BASE, so iterate that contiguous range.
+   */
+  {
+    int _uc = userdef_count(), _ui;
+    for (_ui = 0; _ui < _uc; _ui++) {
+      int _uop = JOB_USERDEF_BASE + _ui;
+      if (_uop < JOB_DONE && userdef_get(_uop))
+        TypeOpts[_uop] = TYPEOPT_NEEDSF;
+    }
+  }
+
   while ((ch = getopt(argc, argv, "?abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:N:R:M:S:U:P:W:X:")) != -1) {
     switch (ch) {
       case 'X':
@@ -45788,6 +46394,40 @@ union HashU curin;
         while (*s) {
           if (*s == ',' || *s == ':' || *s == '.') {
             s++;
+            continue;
+          }
+          if (*s == 'u') {
+            /*
+             * User-defined hash type selector: -m u<id>.  EXACT string-keyed
+             * lookup (NOT the regex -h path) -- a freeform id may contain
+             * regex metacharacters.  The id token runs to the next
+             * separator (',' or end-of-string).
+             */
+            char idbuf[128];
+            int il = 0, uop;
+            s++;
+            while (*s && *s != ',' && il < (int)sizeof(idbuf) - 1) {
+              idbuf[il++] = *s++;
+            }
+            idbuf[il] = '\0';
+            uop = userdef_lookup_by_id(idbuf);
+            if (uop < 0) {
+              /*
+               * Sub-phase C2 (fatal-if-selected): a non-fatal load skip is
+               * fatal when that exact id is the one SELECTED.  Surface the
+               * recorded reason if the id was seen-but-skipped; otherwise
+               * it simply was never defined.
+               */
+              const char *why = userdef_skip_reason(idbuf);
+              if (why)
+                fprintf(stderr, "User-defined hash type u%s failed to "
+                        "load: %s\n", idbuf, why);
+              else
+                fprintf(stderr, "Unknown user-defined hash type u%s "
+                        "(not found in $MDXFIND_CACHE/userdef.txt)\n", idbuf);
+              exit(1);
+            }
+            J1S(RC, Dohash, uop);
             continue;
           }
           if (*s == 'e') {
@@ -46710,6 +47350,36 @@ badrule:
       if (x == JOB_MD5SPECAM) {
         Totalfound[JOB_MD5AM - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
         Totalfound[JOB_MD5AM2 - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
+      }
+    }
+  }
+  /* User-defined hash types (Milestone 1): not in Types[], so handled in a
+   * second pass over the synthetic-op range.  Same Totalfound allocation +
+   * "Working on" listing so checkhash's per-op found counter is valid. */
+  {
+    int _uc = userdef_count(), _ui;
+    for (_ui = 0; _ui < _uc; _ui++) {
+      int _uop = JOB_USERDEF_BASE + _ui;
+      if (_uop >= JOB_DONE) break;
+      Totalfound[_uop - 1] = NULL;
+      J1T(RC, Dohash, _uop);
+      if (RC) {
+        const char *_gs;
+        struct userdef_type *_ut;
+        y++;
+        fprintf(stderr, "%s ", userdef_name(_uop));
+        Totalfound[_uop - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
+        /*
+         * Sub-phase D4: honest GPU-eligibility status for the SELECTED
+         * user type.  Enum-agnostic shape detection on the compiled
+         * hx_program (no new flag -- piggybacks the invoke-time output).
+         * GPU dispatch for user types is phase 2, so a supported shape
+         * still reports "running on CPU".
+         */
+        _gs = userdef_gpu_status(_uop);
+        _ut = userdef_get(_uop);
+        if (_gs && _ut)
+          fprintf(stderr, "\n-m u%s: %s\n", _ut->idstr, _gs);
       }
     }
   }
@@ -50306,6 +50976,67 @@ usage:
     if (gpu_avail) {
       gpujob_init(maxt * 2 + maxt / 2);
       gpu_batch_lines = gpujob_batch_max();
+
+      /* 2026-05-30 long-mask amendment: pack the per-side run-descriptor
+       * streams for the A2/A3/A4 dispatchers ONCE here. Both OpenCL and
+       * Metal A2/A3/A4 dispatchers consult the globals below
+       * (gpu_kern_a_prep_desc[], gpu_kern_a_app_desc[],
+       * gpu_kern_a_prep_dlen, gpu_kern_a_app_dlen,
+       * gpu_kern_a_mask_eligible) to decide whether to upload + dispatch.
+       *
+       * The template/slab kernel path uses a separate upload wire
+       * (gpu_opencl_set_mask / gpu_metal_set_mask) and a separate
+       * eligibility flag (MAX_MASK_POS_GPU_SIDE check) -- those live
+       * in the backend-specific blocks below. */
+      if (MaskPrependLen > 0 || MaskAppendLen > 0) {
+        int prep_vars = 0, prep_lit = 0;
+        int app_vars  = 0, app_lit  = 0;
+        gpu_mask_count_vars_lit_bytes(MaskPrependPattern, MaskPrependLen,
+                                      &prep_vars, &prep_lit);
+        gpu_mask_count_vars_lit_bytes(MaskAppendPattern,  MaskAppendLen,
+                                      &app_vars,  &app_lit);
+        int kern_a_mask_ok = (prep_vars <= GPU_MASK_VAR_CAP) &&
+                             (prep_lit  <= GPU_MASK_LIT_BYTES_CAP) &&
+                             (app_vars  <= GPU_MASK_VAR_CAP) &&
+                             (app_lit   <= GPU_MASK_LIT_BYTES_CAP);
+        if (!kern_a_mask_ok) {
+          fprintf(stderr,
+            "Mask exceeds A2/A3/A4 per-side cap "
+            "(prep vars=%d/%d lit=%d/%d  app vars=%d/%d lit=%d/%d). "
+            "A2/A3/A4 GPU path falls back to CPU; template-path "
+            "eligibility checked separately. Gate fixture for the "
+            "long-mask amendment: -N \"This is triumph, I'm making a "
+            "note here: ?a?a?a?a?a?d?d\" (42 lit + 7 var) fits.\n",
+            prep_vars, GPU_MASK_VAR_CAP, prep_lit, GPU_MASK_LIT_BYTES_CAP,
+            app_vars,  GPU_MASK_VAR_CAP, app_lit,  GPU_MASK_LIT_BYTES_CAP);
+        }
+        gpu_kern_a_mask_eligible = 0;
+        gpu_kern_a_prep_dlen     = 0;
+        gpu_kern_a_app_dlen      = 0;
+        if (kern_a_mask_ok) {
+          int dprep = gpu_pack_mask_descriptor(MaskPrependPattern, MaskPrependLen,
+                                               gpu_kern_a_prep_desc,
+                                               GPU_MASK_DESC_BYTES_CAP);
+          int dapp  = gpu_pack_mask_descriptor(MaskAppendPattern,  MaskAppendLen,
+                                               gpu_kern_a_app_desc,
+                                               GPU_MASK_DESC_BYTES_CAP);
+          if (dprep < 0 || dapp < 0) {
+            fprintf(stderr,
+              "FATAL: %s:%d gpu_pack_mask_descriptor overflow despite cap "
+              "check passed (dprep=%d dapp=%d). Host/kernel buffer-sizing "
+              "skew bug; report to mdxfind maintainer.\n",
+              __FILE__, __LINE__, dprep, dapp);
+            exit(1);
+          }
+          gpu_kern_a_prep_dlen     = dprep;
+          gpu_kern_a_app_dlen      = dapp;
+          gpu_kern_a_mask_eligible = 1;
+          fprintf(stderr,
+            "GPU A2/A3/A4 mask wire-format packed (prep dlen=%d, app dlen=%d, "
+            "prep vars=%d lit=%d, app vars=%d lit=%d)\n",
+            dprep, dapp, prep_vars, prep_lit, app_vars, app_lit);
+        }
+      }
 #ifdef OPENCL_GPU
       /* Compile GPU kernel families for active hash types */
       { unsigned int fam = 0, finalfam = 0;
@@ -50420,22 +51151,22 @@ usage:
       }
       /* Upload mask descriptor to GPU if mask mode is active (OpenCL).
        *
-       * 2026-05-26: per-side cap is MAX_MASK_POS_GPU_SIDE (=16), the
-       * hard limit of every live GPU kernel path. If the parsed mask
-       * exceeds that on either side we skip the upload entirely; the
-       * job then dispatches via CPU only (which honors the larger
-       * MAX_MASK_POS=256 cap). Pre-fix the staging arrays were sized
-       * MAX_MASK_POS*2 and the loop silently overran the GPU kernel's
-       * fixed cap of 16 per side. */
+       * 2026-05-30 long-mask amendment: A2/A3/A4 eligibility + run-
+       * descriptor pack is performed ABOVE this block (in the common
+       * gpu_avail branch) so both OpenCL and Metal blocks see the same
+       * gpu_kern_a_{prep,app}_desc + gpu_kern_a_mask_eligible globals.
+       * This block remains the template/slab-path uploader; that path
+       * has its own MAX_MASK_POS_GPU_SIDE=16 cap and is unaffected by
+       * the amendment. */
       if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpujob_available()) {
         int gpu_mask_ok = 1;
         if (MaskPrependLen > MAX_MASK_POS_GPU_SIDE ||
             MaskAppendLen > MAX_MASK_POS_GPU_SIDE ||
             MaskLen > MAX_MASK_POS_GPU_SIDE) {
           fprintf(stderr,
-            "Mask exceeds GPU per-side cap (MaskPrependLen=%d MaskAppendLen=%d "
-            "MaskLen=%d, GPU per-side cap=%d). Mask-mode job will run on CPU "
-            "only.\n",
+            "Mask exceeds template-path per-side cap (MaskPrependLen=%d "
+            "MaskAppendLen=%d MaskLen=%d, template cap=%d). Template/slab "
+            "GPU path skipped; A2/A3/A4 eligibility computed separately.\n",
             MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
           gpu_mask_ok = 0;
         }
@@ -50545,9 +51276,9 @@ usage:
             MaskAppendLen > MAX_MASK_POS_GPU_SIDE ||
             MaskLen > MAX_MASK_POS_GPU_SIDE) {
           fprintf(stderr,
-            "Mask exceeds Metal GPU per-side cap (MaskPrependLen=%d "
-            "MaskAppendLen=%d MaskLen=%d, GPU per-side cap=%d). Mask-mode "
-            "job will run on CPU only.\n",
+            "Mask exceeds Metal template-path per-side cap (MaskPrependLen=%d "
+            "MaskAppendLen=%d MaskLen=%d, template cap=%d). Template/slab "
+            "GPU path skipped; A2/A3/A4 eligibility computed separately.\n",
             MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
           m_gpu_ok = 0;
         }
@@ -51541,6 +52272,20 @@ bf_done:
       continue;
     for (x = 0; x < Maxiter; x++) {
       if (Totalfound[y - 1][x]) fprintf(stderr, "%s %sx%02d hashes found\n", commify(Totalfound[y - 1][x]), Types[y], x + 1);
+    }
+  }
+  /* User-defined hash types (Milestone 1): per-op found counts. */
+  {
+    int _uc = userdef_count(), _ui;
+    for (_ui = 0; _ui < _uc; _ui++) {
+      int _uop = JOB_USERDEF_BASE + _ui;
+      if (_uop >= JOB_DONE) break;
+      if (!Totalfound[_uop - 1]) continue;
+      for (x = 0; x < Maxiter; x++) {
+        if (Totalfound[_uop - 1][x])
+          fprintf(stderr, "%s %sx%02d hashes found\n",
+                  commify(Totalfound[_uop - 1][x]), userdef_name(_uop), x + 1);
+      }
     }
   }
   if (Totfound == 0)
