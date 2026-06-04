@@ -245,10 +245,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.524 2026/06/01 12:32:51 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.525 2026/06/01 22:43:05 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.524 2026/06/01 12:32:51 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.525 2026/06/01 22:43:05 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -266,6 +266,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.525  2026/06/01 22:43:05  dlr
+ * Split BSDI extended-DES into JOB_BSDICRYPT (e997) — separate type for the 20-char _CCCCSSSS BSDi extended DES format that was previously piggybacking on JOB_DESCRYPT after rev 1.187. Restores -z descrypt to 4096 standard salts only; -z bsdicrypt emits the 4096 extended _J9..XX.. salts. Hashcat mode 12400 repointed from 500 to 997 (12400 has always been BSDi-extended, not standard descrypt). New procjob case mirrors JOB_DESCRYPT structure but filters saltlen==9 + leading underscore; JOB_DESCRYPT case narrowed to saltlen==2 only. Loader narrowed JOB_DESCRYPT to len==13; added JOB_BSDICRYPT block for len==20 + _ prefix. Added BSDIcryptcnt counter alongside DEScryptcnt. All 5 validation gates PASS: build clean, -z e500 emits 4096 standard only with zero _ prefix, -z e997 emits 4096 extended, round-trip cracks back, hashpipe -T shows 992 passed/0 failed with BSDICRYPT, table-parity diff clean at indices 997 + 12400. hashcat reference vector _GW..8841inaTltazRsQ:hashcat verifies via -m e997 and -m 12400. GPU OUT OF SCOPE (variable-round DES Feistel does not fit GPU carrier per mdxfind.c:11767 comment).
+ *
  * Revision 1.524  2026/06/01 12:32:51  dlr
  * v1.524 release: extend DISPATCH_TRACE provenance comment at line 925 to note Metal twin parity (gpu_metal.m rev 1.131 [disp-metal] per-chunk emit with matching kernel_a_us/host_gap_us/kernel_b_us field names per #390). Bumps RCS rev 1.523 to 1.524 marking the v1.524 release scope (iter-v1 + Metal kernel-A chunking + auto-dispatcher env-flag retirement + MD4/SHA1/SHA1RAW/SHA256/SHA256RAW codegen admission + per-stage Metal DISPATCH_TRACE + Gate-8 cosmetic widening). Pure comment edit; binary linkage unchanged.
  *
@@ -4894,7 +4897,7 @@ struct MapHashcat {
     {12150, 908},   /* 12150 | Apache Shiro 1 SHA-512 */
     {12200, 909},   /* 12200 | eCryptfs */
     {12300, 910},   /* 12300 | Oracle T: Type (Oracle 12+) */
-    {12400, 500},  /* Extended DES */
+    {12400, 997},  /* BSDi Extended DES (BSDICRYPT) */
     {12500, 65535}, /* 12500 | RAR3-hp */
     {12600, 911},   /* 12600 | ColdFusion 10+ */
     {12700, 65535}, /* 12700 | Blockchain, My Wallet */
@@ -5533,6 +5536,7 @@ char *Types[] = {
     "GOST12512CRYPT",
     "YESCRYPT",
     "MD5SHA256SHA256",
+    "BSDICRYPT",
 
 NULL
 
@@ -6557,6 +6561,7 @@ NULL
 #define JOB_GOST12512CRYPT  994
 #define JOB_YESCRYPT        995
 #define JOB_MD5SHA256SHA256 996
+#define JOB_BSDICRYPT       997
 
 #define JOB_DONE 2000
 
@@ -7577,6 +7582,7 @@ static unsigned short TypeOpts[JOB_DONE] = {
 [994] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* GOST12512CRYPT */
 [995] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* YESCRYPT */
     [996] = TYPEOPT_NEEDSF,  /* MD5SHA256SHA256 */
+    [997] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BSDICRYPT */
 };
 
 unsigned long Iter_Count[] = {0, 10, 10, 100, 100, 1000, 1000, 1000, 1000, 10000, 10000, 10000, 10000, 100000, 100000, 100000, 100000};
@@ -24688,7 +24694,7 @@ nextsalt1:
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2 && !(saltsnap[si].saltlen == 9 && saltsnap[si].salt[0] == '_')) {
+		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
 		    *saltsnap[si].PV = 0;
 		    saltsnap[si] = saltsnap[--nsalts_job]; si--;
 		  }
@@ -24776,7 +24782,7 @@ nextsalt1:
                 if (!nsalts_job) { Typedone[job->op] = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2 && !(saltsnap[si].saltlen == 9 && saltsnap[si].salt[0] == '_')) {
+		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
 		    *saltsnap[si].PV = 0;
 		    saltsnap[si] = saltsnap[--nsalts_job]; si--;
 		  }
@@ -24833,7 +24839,7 @@ nextsalt1:
                 Word_t *HPV;
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2 && !(saltsnap[si].saltlen == 9 && saltsnap[si].salt[0] == '_')) {
+		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
 		    *saltsnap[si].PV = 0;
 		    saltsnap[si] = saltsnap[--nsalts_job]; si--;
 		  }
@@ -24857,6 +24863,91 @@ nextsalt1:
                       if (!Printall && HPV) {
                         if (*HPV == 0) {
                           *HPV = 1;
+                          PV_DEC(saltsnap[si].PV);
+                          if (!Printall && *saltsnap[si].PV == 0) {
+                            saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                          }
+                        }
+                      }
+                      if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
+                      atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+  		      release(FreeWaiting);
+                      (*job->found)++;
+                      if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
+                        printf("# From %s\n", job->filename);fflush(stdout);
+                        *job->doneprint = 1;
+                      }
+		      if (job->outlen && ((job->outlen + i*2) > (MAXLINE*2))) {
+			fwrite(job->outbuf,job->outlen,1,stdout);fflush(stdout);
+			job->outlen = 0;
+		      }
+		      if (y) {
+			job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf);
+			prmd5((unsigned char *)cur, &job->outbuf[job->outlen], i*2);
+			job->outlen += i*2;
+			job->outbuf[job->outlen++] = ']';
+			job->outbuf[job->outlen++] = '\n';
+		      } else {
+                        strncpy(linebuf + MAXLINE, cur, i);
+                        linebuf[i + MAXLINE] = 0;
+			job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf, linebuf+MAXLINE);
+		      }
+                    }
+                  }
+                }
+                if (!nsalts_job) Typedone[job->op] = 1;
+                }
+                break;
+
+              case JOB_BSDICRYPT:
+                /* BSDi extended DES: _CCCCSSSSHHHHHHHHHHH (9-char salt, variable rounds) */
+                if (Typedone[job->op]) break;
+                if (len > MAXLINE)
+                  break;
+                if (!Typesalt[job->op])
+                  break;
+                if (!desblock) {
+                  desblock = malloc_lock(102400, "desblock");
+                }
+                for (x = 0; x < len; x++)
+                  if (cur[x] == 0)
+                    len = x;
+                job->clen = len;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  Typesalt[job->op], tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                }
+                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                { Word_t *BPVB;
+                  int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  /* Skip salts that are not 9-char extended DES (_CCCCSSSS) */
+		  while (nsalts_job && *saltsnap[si].PV &&
+                         !(saltsnap[si].saltlen == 9 && saltsnap[si].salt[0] == '_')) {
+                    *saltsnap[si].PV = 0;
+                    saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                  }
+                  if (nsalts_job == 0) break;
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  hashcnt++;
+                  s = bsd_crypt_des(cur, s1, linebuf, desblock);
+                  if (s) {
+                    JSLG(BPVB, JudyJ[JOB_BSDICRYPT],(unsigned char *)linebuf);
+                    if (Printall || (BPVB && *BPVB == 0)) {
+                      i = len;
+                      for (y = x = 0; x < i; x++) {
+                        if ((signed char) cur[x] < ' ') {
+                          y = 1;
+                          break;
+                        }
+                      }
+  		      possess(FreeWaiting);
+                      if (!Printall && BPVB) {
+                        if (*BPVB == 0) {
+                          *BPVB = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (!Printall && *saltsnap[si].PV == 0) {
                             saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -43619,8 +43710,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         }
       }
     }
-    /* DES crypt: 13 phpitoa64 chars, or 20 for extended DES (_CCCCSSSSHHHHHHHHHHH) */
-    if (lf[JOB_DESCRYPT] && ((len == 13 && strchr(phpitoa64, line[0])) || (len == 20 && line[0] == '_'))) {
+    /* DES crypt: 13 phpitoa64 chars (standard 25-round DES) */
+    if (lf[JOB_DESCRYPT] && (len == 13 && strchr(phpitoa64, line[0]))) {
       int desok = 1;
       for (y = 1; y < len; y++) {
         if (!strchr(phpitoa64, line[y])) { desok = 0; break; }
@@ -43664,6 +43755,22 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           commit_compact(16);
         }
         Foundcnt[JOB_DESCRYPT]++;
+        continue;
+      }
+    }
+    /* BSDi extended DES: 20 chars (_CCCCSSSSHHHHHHHHHHH), 9-char salt */
+    if (lf[JOB_BSDICRYPT] && (len == 20 && line[0] == '_')) {
+      int desok = 1;
+      for (y = 1; y < len; y++) {
+        if (!strchr(phpitoa64, line[y])) { desok = 0; break; }
+      }
+      if (desok) {
+        JSLI(PV, JudyJ[JOB_BSDICRYPT],(unsigned char *)line);
+        /* Extract 9-char salt (_CCCCSSSS) for Typesalt */
+        strncpy(salttmp, line, 9);
+        salttmp[9] = 0;
+        Saltloaded[JOB_BSDICRYPT] += store_typesalt(JOB_BSDICRYPT, salttmp, 9);
+        Foundcnt[JOB_BSDICRYPT]++;
         continue;
       }
     }
@@ -46141,7 +46248,7 @@ union HashU curin;
   unsigned long long curline, numline;    /* widened — wordlist line positions can exceed 4.29B */
   char *readbuf;
   struct LineInfo *readindex;
-  unsigned int Linecount, Bcryptcnt, DEScryptcnt, ProgressEnccnt;
+  unsigned int Linecount, Bcryptcnt, DEScryptcnt, BSDIcryptcnt, ProgressEnccnt;
   __attribute__((unused)) int gpu_batch_lines = 0;
   struct Hashchain *chain;
   int Recurse = 0;
@@ -48083,6 +48190,7 @@ usage:
   tsfprintf(stderr, "Searching through %s unique hex hashes from %s\n", commify(Insize), infilename);
   Bcryptcnt = 0;
   DEScryptcnt = 0;
+  BSDIcryptcnt = 0;
   ProgressEnccnt = 0;
   {
     line[0] = 0;
@@ -48102,6 +48210,7 @@ usage:
       JSLN(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
     }
     if (DEScryptcnt) {
+      /* Standard descrypt only: all entries are 13-char/2-char-salt */
       int des_types[] = { JOB_DESCRYPT, JOB_MD5DESCRYPT, JOB_MD4DESCRYPT,
                           JOB_SHA1DESCRYPT, JOB_MD4UTF16DESCRYPT, 0 };
       int dt;
@@ -48112,9 +48221,8 @@ usage:
       while (PV) {
         y = mystrlen(line);
         if (y >= 10) {
-          x = (line[0] == '_') ? 9 : 2;
-          strncpy(last, line, x);
-          last[x] = 0;
+          strncpy(last, line, 2);
+          last[2] = 0;
           JSLI(SPV, salt_counts, (unsigned char *)last);
           if (SPV) (*SPV)++;
         }
@@ -48136,6 +48244,7 @@ usage:
       JSLFA(RC, salt_counts);
       fprintf(stderr, "Searching through %s unique DESCRYPT hashes\n", commify(DEScryptcnt));
     } else if (Printall) {
+      /* -z mode: generate 4096 standard 2-char DES salts */
       int des_types[] = { JOB_DESCRYPT, JOB_MD5DESCRYPT, JOB_MD4DESCRYPT,
                           JOB_SHA1DESCRYPT, JOB_MD4UTF16DESCRYPT, 0 };
       int dt;
@@ -48153,27 +48262,44 @@ usage:
           }
           Numsalts += 4096;
           fprintf(stderr, "Generated 4096 standard DES salts for %s\n", Types[des_types[dt]]);
-          /* Also generate extended DES salts (_CCCCSSSS format) */
-          {
-            char edsalt[10];
-            Word_t *EPV;
-            int a, b;
-            /* _J9.. = 725 rounds, vary 4-char salt */
-            edsalt[0] = '_'; edsalt[1] = 'J'; edsalt[2] = '9';
-            edsalt[3] = '.'; edsalt[4] = '.';
-            for (a = 0; a < 64; a++) {
-              for (b = 0; b < 64; b++) {
-                edsalt[5] = phpitoa64[a]; edsalt[6] = phpitoa64[b];
-                edsalt[7] = '.'; edsalt[8] = '.'; edsalt[9] = 0;
-                JSLI(EPV, Typesalt[des_types[dt]], (unsigned char *)edsalt);
-                if (EPV) *EPV = 1000000;
-              }
-            }
-            Numsalts += 4096;
-            fprintf(stderr, "Generated 4096 extended DES salts for %s\n", Types[des_types[dt]]);
-          }
         }
       }
+    }
+
+    /* BSDICRYPT bootstrap: BSDi extended DES (_CCCCSSSS 9-char salt) */
+    line[0] = 0;
+    JSLF(PV, JudyJ[JOB_BSDICRYPT],(unsigned char *)line);
+    while (PV) {
+      BSDIcryptcnt++;
+      JSLN(PV, JudyJ[JOB_BSDICRYPT],(unsigned char *)line);
+    }
+    if (BSDIcryptcnt) {
+      fprintf(stderr, "Searching through %s unique BSDICRYPT hashes\n", commify(BSDIcryptcnt));
+    } else if (Printall) {
+      /* -z mode: generate 4096 extended DES salts (_J9..XXXX format, 725 rounds) */
+      J1T(RC, Dohash, JOB_BSDICRYPT);
+      if (RC && !Typesalt[JOB_BSDICRYPT]) {
+        char edsalt[10];
+        Word_t *EPV;
+        int a, b;
+        edsalt[0] = '_'; edsalt[1] = 'J'; edsalt[2] = '9';
+        edsalt[3] = '.'; edsalt[4] = '.';
+        for (a = 0; a < 64; a++) {
+          for (b = 0; b < 64; b++) {
+            edsalt[5] = phpitoa64[a]; edsalt[6] = phpitoa64[b];
+            edsalt[7] = '.'; edsalt[8] = '.'; edsalt[9] = 0;
+            JSLI(EPV, Typesalt[JOB_BSDICRYPT], (unsigned char *)edsalt);
+            if (EPV) *EPV = 1000000;
+          }
+        }
+        /* Dummy JudyJ entry so Printall lookup doesn't gate output */
+        JSLI(EPV, JudyJ[JOB_BSDICRYPT], (unsigned char *)"_J9.......zz");
+        if (EPV) *EPV = 0;
+        Numsalts += 4096;
+        fprintf(stderr, "Generated 4096 extended DES salts for BSDICRYPT\n");
+      }
+    } else {
+      J1U(RC, Dohash, JOB_BSDICRYPT);
     }
 
     line[0] = 0;

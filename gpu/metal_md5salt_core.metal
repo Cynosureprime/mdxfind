@@ -245,8 +245,10 @@ static inline void template_finalize(thread template_state &st,
         md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
     } else {
         /* First block: salt bytes only (no 0x80 yet -- it lives in
-         * the second block). first_chunk = bytes of salt that fit in
-         * this block after inner_len. */
+         * the second block UNLESS the salt fully fits in block 1 AND
+         * total_len < 64; see eom_in_first comment below for the
+         * salt-length-30 padding-bug fix, 2026-06-03). first_chunk =
+         * bytes of salt that fit in this block after inner_len. */
         uint first_chunk = 64u - inner_len;
         if (first_chunk > slen) first_chunk = slen;
         for (uint i = 0u; i < first_chunk; i++) {
@@ -254,22 +256,35 @@ static inline void template_finalize(thread template_state &st,
             uint v = (uint)salt_buf[i];
             M[pos_byte >> 2] |= v << ((pos_byte & 3) * 8);
         }
+        /* MD5 padding correctness (2026-06-03 fix): when first_chunk
+         * == slen AND total_len ∈ [56..63], the 0x80 EOM marker MUST
+         * go into byte total_len of BLOCK 1 (not byte 0 of block 2).
+         * For total_len == 64 the legacy path's M[0] |= 0x80 in block
+         * 2 is correct. For total_len > 64, rem_salt > 0 also OK. */
+        uint rem_salt = slen - first_chunk;
+        uint eom_in_first = (rem_salt == 0u && total_len < 64u) ? 1u : 0u;
+        if (eom_in_first) {
+            uint eom_pos = inner_len + first_chunk;  /* total_len, in [56..63] */
+            M[eom_pos >> 2] |= (uint)0x80u << ((eom_pos & 3) * 8);
+        }
         st.h[0] = 0x67452301u;
         st.h[1] = 0xEFCDAB89u;
         st.h[2] = 0x98BADCFEu;
         st.h[3] = 0x10325476u;
         md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
 
-        /* Second block: remaining salt bytes + 0x80 + length-bits.
-         * rem_salt < 64; if rem_salt < 56 the length-bits land in
-         * this same block, otherwise one more block. */
+        /* Second block: remaining salt bytes + 0x80 (if not already
+         * in block 1) + length-bits. rem_salt < 64; if rem_salt < 56
+         * the length-bits land in this same block, otherwise one more
+         * block. */
         for (int j = 0; j < 16; j++) M[j] = 0u;
-        uint rem_salt = slen - first_chunk;
         for (uint i = 0u; i < rem_salt; i++) {
             uint v = (uint)salt_buf[first_chunk + i];
             M[i >> 2] |= v << ((i & 3) * 8);
         }
-        M[rem_salt >> 2] |= (uint)0x80u << ((rem_salt & 3) * 8);
+        if (!eom_in_first) {
+            M[rem_salt >> 2] |= (uint)0x80u << ((rem_salt & 3) * 8);
+        }
         if (rem_salt < 56u) {
             M[14] = total_len * 8u;
             M[15] = 0u;
@@ -488,6 +503,16 @@ static inline void template_finalize_post(thread template_state &st,
             uint v = (uint)salt_buf[i];
             M[pos_byte >> 2] |= v << ((pos_byte & 3) * 8);
         }
+        /* MD5 padding correctness (2026-06-03 fix): see template_finalize
+         * eom_in_first comment. When first_chunk == slen AND total_len
+         * ∈ [56..63] the 0x80 EOM marker MUST go into byte total_len of
+         * block 1 (not byte 0 of block 2). */
+        uint rem_salt = slen - first_chunk;
+        uint eom_in_first = (rem_salt == 0u && total_len < 64u) ? 1u : 0u;
+        if (eom_in_first) {
+            uint eom_pos = inner_len + first_chunk;
+            M[eom_pos >> 2] |= (uint)0x80u << ((eom_pos & 3) * 8);
+        }
         st.h[0] = 0x67452301u;
         st.h[1] = 0xEFCDAB89u;
         st.h[2] = 0x98BADCFEu;
@@ -495,12 +520,13 @@ static inline void template_finalize_post(thread template_state &st,
         md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
 
         for (int j = 0; j < 16; j++) M[j] = 0u;
-        uint rem_salt = slen - first_chunk;
         for (uint i = 0u; i < rem_salt; i++) {
             uint v = (uint)salt_buf[first_chunk + i];
             M[i >> 2] |= v << ((i & 3) * 8);
         }
-        M[rem_salt >> 2] |= (uint)0x80u << ((rem_salt & 3) * 8);
+        if (!eom_in_first) {
+            M[rem_salt >> 2] |= (uint)0x80u << ((rem_salt & 3) * 8);
+        }
         if (rem_salt < 56u) {
             M[14] = total_len * 8u;
             md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);

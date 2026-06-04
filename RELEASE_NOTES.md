@@ -1,3 +1,52 @@
+# mdxfind v1.525 — BSDICRYPT split (e997), MD5SALT padding fix sweep (GPU OpenCL + Metal + ARM NEON + PowerPC slen 24..31)
+
+Source: mdxfind.c rev 1.524 → 1.525, mymd5.c rev 1.33 → 1.34, gpu/gpu_md5salt_core.cl rev 1.7 → 1.8 (+ `_str.h` 1.5 → 1.6), gpu/metal_md5salt_core.metal rev 1.3 → 1.4 (+ `_str.h` -ko 1.2 → 1.3 NEW to github).
+
+Window: 2026-06-01 (post-freeze-lift) through 2026-06-04. Released 2026-06-04.
+
+Two independent fixes shipping together: (1) BSDi extended-DES (725-round, 20-char `_CCCCSSSS` format) is moved out of `JOB_DESCRYPT` into its own `JOB_BSDICRYPT` (e997, hashcat mode 12400), restoring `-z descrypt` to the 4096 standard salts only; (2) a multi-platform MD5 padding bug in the MD5SALT path on GPU OpenCL, GPU Metal, CPU ARM NEON, and CPU PowerPC is corrected for the `total_len ∈ [56..63]` boundary case. CPU x86 SSE path was unaffected.
+
+## BSDICRYPT split (e997 — hashcat mode 12400)
+
+Since mdxfind.c rev 1.187 the loader recognized both 13-char standard `crypt(3)` (`saltchar2 + 11 hash`) and the 20-char BSDi extended format (`_CCCCSSSShashhash...`, single `_` prefix + 4 round-count chars + 4 salt chars + 11 hash chars) and routed both to `JOB_DESCRYPT`. The `-z` generator at `mdxfind.c:48156-48174` was emitting 8192 candidate salts (4096 standard + 4096 extended `_J9..XX..`) per password — twice the actual standard-DES keyspace, and conflating two wire-format-distinct algorithms behind one mode number.
+
+This release introduces `JOB_BSDICRYPT = 997` (next available after `JOB_PEERCOIN_WALLET = 996`) with the BSDi extended path lifted into a sibling case mirroring `JOB_DESCRYPT`. Wire-format demultiplexing in the loader narrows `JOB_DESCRYPT` to len==13 only; the len==20 + `_` prefix variant routes to `JOB_BSDICRYPT`. Counters split: `DEScryptcnt` for standard, `BSDIcryptcnt` for extended.
+
+Behavior change (intentional):
+- `echo password | ./mdxfind -m e500 -z stdin` now emits **4096** lines (4096 standard salts × 1 password); previously emitted 8192.
+- `echo password | ./mdxfind -m e997 -z stdin` emits the 4096 `_J9..XX..` extended-DES salts.
+- `hashcat -m 12400` reference (the canonical BSDi-extended example vector `_J9..SDizh.vll5aL`) now matches against `-m e997`, not `-m e500`. `Maphashcat[12400]` repointed from 500 to 997.
+
+Validation: `-z e500` keyspace audited (4096 lines, zero `_` prefix); `-z e997` keyspace audited (4096 lines, all `_` prefix, all 20-char); round-trip crack of the hashcat reference vector `_GW..8841inaTltazRsQ` succeeds via `-m e997` and `-m 12400`; table-parity diff against the hashcat type catalog clean at indices 997 and 12400.
+
+## MD5SALT padding fix sweep — `total_len ∈ [56..63]`
+
+The MD5 message-padding step requires the 0x80 end-of-message marker to land in block 1 when `total_len ∈ [56..63]` (i.e. the salt+pass length leaves <8 bytes of slack in the first 64-byte block, so the 8-byte length suffix forces a second block, but the EOM marker itself still belongs in block 1 at byte `total_len`). Four implementations were silently mis-placing the marker into block 2 at byte 0 (or in some cases skipping it entirely on ARM NEON), producing wrong digests for the corresponding salt-length range.
+
+| Implementation | Status pre-v1.525 | Affected slen (salt-length) range | Fix |
+|---|---|---|---|
+| CPU x86 SSE (`mymd5.c:1575` mymd5salt2 Intel path) | CORRECT (reference) | — | unchanged |
+| CPU ARM NEON (`mymd5.c:1077` mymd5salt2 NEON path) | wrong digests slen 24..31; collisions slen 32..35 | 24..31 | single→two-block compression, eom-in-first-block |
+| CPU PowerPC (`mymd5.c:622` mymd5salt2 PowerPC path) | wrong digests slen 24..31 | 24..31 | single→two-block compression, eom-in-first-block |
+| GPU OpenCL (`gpu/gpu_md5salt_core.cl` slow-path) | wrong digests slen 24..31 | 24..31 | `eom_in_first` guard before block-2 padding |
+| GPU Metal (`gpu/metal_md5salt_core.metal` slow-path, both kernel-A and kernel-B) | wrong digests slen 24..31 | 24..31 | `eom_in_first` guard (twin of OpenCL) |
+
+Reference fixture: user-supplied `work2711.txt` (all 30-char salts derived from the production `50m/50m.MD5SALT` dataset) had been silently producing 626,852 GPU cracks vs 626,863 CPU x86 SSE cracks on a 626,863-hash universe; the GPU shortfall + the ARM NEON CPU also producing wrong digests on Apple-host references were the two ends of the same boundary-padding bug. Post-fix, all five implementations produce byte-identical e31 sweep output across slen 22..40 — sha-of-sorted-output `003f7c00bcdbe9c342355eea4f60a65e`. Sorted-and-deduped crack counts match across CPU x86 SSE, GPU OpenCL (Pascal + Ada + RDNA4), GPU Metal (M1 + M2 Max).
+
+The standard `sm-saltfull` benchmark fixture uses salts ≤ 23 chars, so this boundary was outside the regression sweep. Production workloads that use a 30-char salt format (e.g. wallet-derived KDFs, custom enterprise schemas with hash-truncated nonce headers) would have silently produced wrong-digest cracks before this release.
+
+Reference invariance check (recommended for downstream consumers): on Apple Silicon hosts, do NOT use `-G none` as the MD5SALT correctness reference for pre-v1.525 binaries — the ARM NEON CPU path was the wrong-digest peer of the GPU bug. Use the x86 SSE CPU (or Python `hashlib.md5(salt+pass)`) as the cross-architecture oracle.
+
+## Build / sync
+
+Source-tree size, build matrix, and platform set unchanged from v1.524. The Metal `_str.h` companion file pattern shipped in v1.524 gains one more pair (`metal_md5salt_core_str.h` — `-ko` mode, regenerated by the standard `cl2str.py` toolchain). The `mdxfind-release` `sync_metal` step has been extended to include `metal_*_core_str.h` so future companion-pair additions ship automatically.
+
+## Acknowledgments / cross-references
+
+ARM NEON + PowerPC fix was a collateral catch during the Metal validation: the agent establishing the CPU oracle on Apple ARM dev1/dev3 hosts surfaced the slen 24..31 digest divergence that pointed at the same boundary-padding class as the GPU bug. The ARM NEON slen 32..35 collision symptom (different inputs → same digest) is resolved by the same two-block conversion — the single-block path was structurally dropping block-2 input bytes from the digest.
+
+---
+
 # mdxfind v1.524 — codegen kernel-B iteration (`-i N>1`), Metal kernel-A chunking, codegen auto-dispatcher (env-flag retirement), MD4/SHA1/SHA1RAW/SHA256/SHA256RAW codegen admission, per-stage Metal DISPATCH_TRACE, Gate-8 cosmetic widening
 
 Source: mdxfind.c rev 1.523 → 1.524, gpu/gpu_opencl.c rev 1.205 → 1.208, gpu/gpu_opencl.h rev 1.42 → 1.43, gpu/gpujob_opencl.c rev 1.157 → 1.160, gpu/codegen_auto_dispatch.h rev 1.1 → 1.2 (NEW), gpu/codegen_auto_dispatch.c rev 1.1 → 1.2 (NEW), gpu/metal_kernel_a_rules.metal rev 1.5 → 1.6 (+ `_str.h` -ko 1.5 → 1.6), gpu_metal.m rev 1.125 → 1.131, gpu_metal.h rev 1.64 → 1.65, gpu/gpujob_metal.m rev 1.41 → 1.44, gpujob.h rev 1.47 → 1.48, codegen/hx_emit_opencl.c rev 1.20 → 1.21, codegen/hx_emit_metal.c rev 1.19 → 1.20, codegen/hx_emit_primitives.c rev 1.13 → 1.14.

@@ -585,8 +585,32 @@ static inline void template_finalize(template_state *st,
         uint first_chunk = 64u - inner_len;
         if (first_chunk > slen) first_chunk = slen;
         /* Salt-only pack for the first md5_block; 0x80 lives in the second
-         * block (added via OR-update at rem_salt path below). */
+         * block (added via OR-update at rem_salt path below) UNLESS the
+         * salt fully fits in the first block AND total_len < 64. See
+         * eom_in_first comment below for the salt-length-30 padding-bug
+         * fix (2026-06-03). */
         salt_pack_uint(M, inner_len >> 2, salt_buf, first_chunk, /*use_eom=*/0u);
+        /* MD5 padding correctness (2026-06-03 fix): when the salt fully
+         * fits in the first block (first_chunk == slen) AND the total
+         * message length is in [56..63], the 0x80 end-of-message marker
+         * MUST go into byte `total_len` of BLOCK 1, not into byte 0 of
+         * BLOCK 2. The original logic skipped block-1 EOM unconditionally
+         * and only wrote 0x80 at M[0] of block 2 — that produces a wrong
+         * digest for any total_len in [56..63] (i.e. slen ∈ [24..31] for
+         * inner_len=32 mode-0 e31 MD5SALT, which is precisely the range
+         * the user-reported bug fixture (30-char salts) lands in). For
+         * total_len == 64 the original logic was correct (0x80 belongs
+         * at M[0] of block 2). For total_len > 64 rem_salt > 0 carries
+         * salt bytes into block 2 ahead of the 0x80, also unaffected.
+         * We compute eom_in_first once, write 0x80 into block 1 when
+         * appropriate, and OR-in 0x80 in block 2 only when eom_in_first
+         * is false. */
+        uint rem_salt = slen - first_chunk;
+        uint eom_in_first = (rem_salt == 0u && total_len < 64u) ? 1u : 0u;
+        if (eom_in_first) {
+            uint eom_pos = inner_len + first_chunk;  /* total_len, in [56..63] */
+            M[eom_pos >> 2] |= ((uint)0x80u) << ((eom_pos & 3) * 8);
+        }
         st->h[0] = 0x67452301u;
         st->h[1] = 0xEFCDAB89u;
         st->h[2] = 0x98BADCFEu;
@@ -594,12 +618,13 @@ static inline void template_finalize(template_state *st,
         md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
 
         for (int j = 0; j < 16; j++) M[j] = 0;
-        uint rem_salt = slen - first_chunk;
         for (uint i = 0; i < rem_salt; i++) {
             uchar c = salt_buf[first_chunk + i];
             M[i >> 2] |= ((uint)c) << ((i & 3) * 8);
         }
-        M[rem_salt >> 2] |= ((uint)0x80u) << ((rem_salt & 3) * 8);
+        if (!eom_in_first) {
+            M[rem_salt >> 2] |= ((uint)0x80u) << ((rem_salt & 3) * 8);
+        }
         if (rem_salt < 56u) {
             M[14] = total_len * 8u;
             M[15] = 0u;
@@ -758,8 +783,17 @@ static inline void template_finalize_post(template_state *st,
          * block has no shared prefix, uses plain md5_block. */
         uint first_chunk = 64u - inner_len;
         if (first_chunk > slen) first_chunk = slen;
-        /* Salt-only pack; 0x80 lives in the second md5_block. */
+        /* Salt-only pack; 0x80 lives in the second md5_block UNLESS the
+         * salt fully fits in block 1 AND total_len < 64 (see eom_in_first
+         * note in template_finalize for the salt-length-30 padding-bug
+         * fix, 2026-06-03). */
         salt_pack_uint(M, inner_len >> 2, salt_buf, first_chunk, /*use_eom=*/0u);
+        uint rem_salt = slen - first_chunk;
+        uint eom_in_first = (rem_salt == 0u && total_len < 64u) ? 1u : 0u;
+        if (eom_in_first) {
+            uint eom_pos = inner_len + first_chunk;  /* total_len, in [56..63] */
+            M[eom_pos >> 2] |= ((uint)0x80u) << ((eom_pos & 3) * 8);
+        }
         st->h[0] = 0x67452301u;
         st->h[1] = 0xEFCDAB89u;
         st->h[2] = 0x98BADCFEu;
@@ -768,12 +802,13 @@ static inline void template_finalize_post(template_state *st,
                         pre->a8, pre->b8, pre->c8, pre->d8, M);
 
         for (int j = 0; j < 16; j++) M[j] = 0;
-        uint rem_salt = slen - first_chunk;
         for (uint i = 0; i < rem_salt; i++) {
             uchar c = salt_buf[first_chunk + i];
             M[i >> 2] |= ((uint)c) << ((i & 3) * 8);
         }
-        M[rem_salt >> 2] |= ((uint)0x80u) << ((rem_salt & 3) * 8);
+        if (!eom_in_first) {
+            M[rem_salt >> 2] |= ((uint)0x80u) << ((rem_salt & 3) * 8);
+        }
         if (rem_salt < 56u) {
             M[14] = total_len * 8u;
             M[15] = 0u;

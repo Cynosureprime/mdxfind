@@ -1,5 +1,8 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.34  2026/06/04 16:03:42  dlr
+ * ARM NEON + PowerPC AltiVec MD5 padding fix for two-block mymd5salt2 (CPU analog of GPU eom_in_first 2026-06-03). The ARM NEON sibling at line 1077-1158 and POWERPC AltiVec sibling at line 622-703 of mymd5.c had a single-block compression where Intel SSE at line 1575-1735 has two-block. Callers of mymd5salt2(SSEBUF3, hashes) (mdxfind.c:23724/23761 NEON salt loop and equivalents for MD5SALT family) pack salt-length 24..63 messages into a 2-block SSEBUF3 layout: inner_hash + salt-up-to-byte-32-of-block-0 plus optional spillover into block 1, 0x80 sentinel, and length at block-1 word 14. The Intel pattern: FINAL stores post-block-0 chained state into hash[], X += 16, reload chained state, run another 64 OPs, FINAL2 adds block-1 result. The broken NEON/POWERPC paths only did block 0 then FINAL2 added that to stale hash[] = wrong digest for slen 24..31 (block 1 = length+0x80 only; matches the GPU eom_in_first symptom) and collisions for slen 32..35 (block 1 = 0..3 spillover salt bytes; identical block-0 across the 4 SIMD lanes). Fix mirrors the Intel two-block pattern: NEON uses the sval_load round-trip; POWERPC uses temporary-register chaining to avoid the AIX swap_128 round-trip issue. Validated on dev1 M1 + dev3 M2 Max + ubpower8 PowerPC + iMac x86 SSE + .205 Ubuntu Intel SSE: all 5 hosts produce byte-identical e31 sweep slen 22..40 output (md5=003f7c00bcdbe9c342355eea4f60a65e) and 4/4 slen 32..35 collision-fixture cracks. iMac x86 regression-clean (Intel mymd5salt2 unchanged). User-fixture work2711.txt 100-hash subset cracks 100/100 byte-identical across iMac + dev1 + ubpower8. Affects all callers of mymd5salt2 on ARM and PowerPC: JOB_MD5SALT (e31), JOB_MD5UCSALT (e350), JOB_MD5revMD5SALT (e541), JOB_MD5sub8_24SALT (e542), JOB_MD5_MD5SALTMD5PASS (e367), JOB_MD5SALTPASS, JOB_MD5SALTPASSSALT, JOB_MD5SALTMD5PASS, and the SHA1+MD5SALT variant. The mymd5salt / mymd5salt_pre / mymd5salt_post fast-path callers (slen less than 24) are unchanged and remain correct.
+ *
  * Revision 1.33  2026/05/18 05:22:45  dlr
  * mymd5.c: remove duplicate stdio.h, stdlib.h, string.h includes at line 3034 area (already included at file top); flagged by clangd unused-includes.
  *
@@ -696,10 +699,113 @@ void mymd5salt2(unsigned char *block, SVAL *hash) {
   OP(I, c, d, a, b, 2, 15, 0x2ad7d2bb);
   OP(I, b, c, d, a, 9, 21, 0xeb86d391);
 
-  FINAL2(0, a);
-  FINAL2(1, b);
-  FINAL2(2, c);
-  FINAL2(3, d);
+  /* 2026-06-04 POWER8 AltiVec MD5 padding fix (CPU analog of GPU eom_in_first):
+   * mymd5salt2 is a TWO-block MD5 from IV. Prior to this fix only the first
+   * block was compressed and FINAL2 added the result to whatever stale value
+   * was in hash[], producing wrong digests for any callsite that placed
+   * message bytes into block 1 of SSEBUF3 (i.e. all e31 MD5SALT etc. with
+   * salt-length >= 24 for inner_len=32). Matches the ARM NEON sibling bug
+   * fixed in the same revision and the GPU OpenCL/Metal eom_in_first fix
+   * shipped 2026-06-03. Mirror the Intel SSE pattern: capture the post-
+   * block-0 chained state into temporaries (a_c..d_c), advance X by 16 to
+   * point at block 1, restart with a,b,c,d=chained state, run another 64
+   * OPs, then store hash[] = chained_state + block-1 result via FINAL2-
+   * style ADD on the live a,b,c,d. The temporary-register approach avoids
+   * the AIX swap_128 round-trip that the Intel sval_load pattern requires. */
+  {
+    vector unsigned int a_c = ADD(a, SET1(AA));
+    vector unsigned int b_c = ADD(b, SET1(BB));
+    vector unsigned int c_c = ADD(c, SET1(CC));
+    vector unsigned int d_c = ADD(d, SET1(DD));
+    X += 16;
+    a = a_c;
+    b = b_c;
+    c = c_c;
+    d = d_c;
+
+  OP(F, a, b, c, d, 0, 7, 0xd76aa478);
+  OP(F, d, a, b, c, 1, 12, 0xe8c7b756);
+  OP(F, c, d, a, b, 2, 17, 0x242070db);
+  OP(F, b, c, d, a, 3, 22, 0xc1bdceee);
+  OP(F, a, b, c, d, 4, 7, 0xf57c0faf);
+  OP(F, d, a, b, c, 5, 12, 0x4787c62a);
+  OP(F, c, d, a, b, 6, 17, 0xa8304613);
+  OP(F, b, c, d, a, 7, 22, 0xfd469501);
+  OP(F, a, b, c, d, 8, 7, 0x698098d8);
+  OP(F, d, a, b, c, 9, 12, 0x8b44f7af);
+  OP(F, c, d, a, b, 10, 17, 0xffff5bb1);
+  OP(F, b, c, d, a, 11, 22, 0x895cd7be);
+  OP(F, a, b, c, d, 12, 7, 0x6b901122);
+  OP(F, d, a, b, c, 13, 12, 0xfd987193);
+  OP(F, c, d, a, b, 14, 17, 0xa679438e);
+  OP(F, b, c, d, a, 15, 22, 0x49b40821);
+  /* Round 2. */
+  OP(G, a, b, c, d, 1, 5, 0xf61e2562);
+  OP(G, d, a, b, c, 6, 9, 0xc040b340);
+  OP(G, c, d, a, b, 11, 14, 0x265e5a51);
+  OP(G, b, c, d, a, 0, 20, 0xe9b6c7aa);
+  OP(G, a, b, c, d, 5, 5, 0xd62f105d);
+  OP(G, d, a, b, c, 10, 9, 0x02441453);
+  OP(G, c, d, a, b, 15, 14, 0xd8a1e681);
+  OP(G, b, c, d, a, 4, 20, 0xe7d3fbc8);
+  OP(G, a, b, c, d, 9, 5, 0x21e1cde6);
+  OP(G, d, a, b, c, 14, 9, 0xc33707d6);
+  OP(G, c, d, a, b, 3, 14, 0xf4d50d87);
+  OP(G, b, c, d, a, 8, 20, 0x455a14ed);
+  OP(G, a, b, c, d, 13, 5, 0xa9e3e905);
+  OP(G, d, a, b, c, 2, 9, 0xfcefa3f8);
+  OP(G, c, d, a, b, 7, 14, 0x676f02d9);
+  OP(G, b, c, d, a, 12, 20, 0x8d2a4c8a);
+  /* Round 3. */
+  OP(H, a, b, c, d, 5, 4, 0xfffa3942);
+  OP(H, d, a, b, c, 8, 11, 0x8771f681);
+  OP(H, c, d, a, b, 11, 16, 0x6d9d6122);
+  OP(H, b, c, d, a, 14, 23, 0xfde5380c);
+  OP(H, a, b, c, d, 1, 4, 0xa4beea44);
+  OP(H, d, a, b, c, 4, 11, 0x4bdecfa9);
+  OP(H, c, d, a, b, 7, 16, 0xf6bb4b60);
+  OP(H, b, c, d, a, 10, 23, 0xbebfbc70);
+  OP(H, a, b, c, d, 13, 4, 0x289b7ec6);
+  OP(H, d, a, b, c, 0, 11, 0xeaa127fa);
+  OP(H, c, d, a, b, 3, 16, 0xd4ef3085);
+  OP(H, b, c, d, a, 6, 23, 0x04881d05);
+  OP(H, a, b, c, d, 9, 4, 0xd9d4d039);
+  OP(H, d, a, b, c, 12, 11, 0xe6db99e5);
+  OP(H, c, d, a, b, 15, 16, 0x1fa27cf8);
+  OP(H, b, c, d, a, 2, 23, 0xc4ac5665);
+  /* Round 4. */
+  OP(I, a, b, c, d, 0, 6, 0xf4292244);
+  OP(I, d, a, b, c, 7, 10, 0x432aff97);
+  OP(I, c, d, a, b, 14, 15, 0xab9423a7);
+  OP(I, b, c, d, a, 5, 21, 0xfc93a039);
+  OP(I, a, b, c, d, 12, 6, 0x655b59c3);
+  OP(I, d, a, b, c, 3, 10, 0x8f0ccc92);
+  OP(I, c, d, a, b, 10, 15, 0xffeff47d);
+  OP(I, b, c, d, a, 1, 21, 0x85845dd1);
+  OP(I, a, b, c, d, 8, 6, 0x6fa87e4f);
+  OP(I, d, a, b, c, 15, 10, 0xfe2ce6e0);
+  OP(I, c, d, a, b, 6, 15, 0xa3014314);
+  OP(I, b, c, d, a, 13, 21, 0x4e0811a1);
+  OP(I, a, b, c, d, 4, 6, 0xf7537e82);
+  OP(I, d, a, b, c, 11, 10, 0xbd3af235);
+  OP(I, c, d, a, b, 2, 15, 0x2ad7d2bb);
+  OP(I, b, c, d, a, 9, 21, 0xeb86d391);
+
+  /* hash[idx] = block-1-result + post-block-0 chained state.
+   * On AIX, FINAL applies swap_128 to the stored value (matches the
+   * byte-ordering convention of the single-block FINAL above). */
+#ifdef AIX
+  hash[0].sse = swap_128(ADD(a, a_c));
+  hash[1].sse = swap_128(ADD(b, b_c));
+  hash[2].sse = swap_128(ADD(c, c_c));
+  hash[3].sse = swap_128(ADD(d, d_c));
+#else
+  hash[0].sse = ADD(a, a_c);
+  hash[1].sse = ADD(b, b_c);
+  hash[2].sse = ADD(c, c_c);
+  hash[3].sse = ADD(d, d_c);
+#endif
+  }
 }
 
 extern int checkhashbb(union HashU *curin, int len, char *salt, struct job *job);
@@ -1082,6 +1188,97 @@ void mymd5salt2(unsigned char *block, SVAL *hash) {
   b = SET1(BB);
   c = SET1(CC);
   d = SET1(DD);
+
+  OP(F, a, b, c, d, 0, 7, 0xd76aa478);
+  OP(F, d, a, b, c, 1, 12, 0xe8c7b756);
+  OP(F, c, d, a, b, 2, 17, 0x242070db);
+  OP(F, b, c, d, a, 3, 22, 0xc1bdceee);
+  OP(F, a, b, c, d, 4, 7, 0xf57c0faf);
+  OP(F, d, a, b, c, 5, 12, 0x4787c62a);
+  OP(F, c, d, a, b, 6, 17, 0xa8304613);
+  OP(F, b, c, d, a, 7, 22, 0xfd469501);
+  OP(F, a, b, c, d, 8, 7, 0x698098d8);
+  OP(F, d, a, b, c, 9, 12, 0x8b44f7af);
+  OP(F, c, d, a, b, 10, 17, 0xffff5bb1);
+  OP(F, b, c, d, a, 11, 22, 0x895cd7be);
+  OP(F, a, b, c, d, 12, 7, 0x6b901122);
+  OP(F, d, a, b, c, 13, 12, 0xfd987193);
+  OP(F, c, d, a, b, 14, 17, 0xa679438e);
+  OP(F, b, c, d, a, 15, 22, 0x49b40821);
+  /* Round 2. */
+  OP(G, a, b, c, d, 1, 5, 0xf61e2562);
+  OP(G, d, a, b, c, 6, 9, 0xc040b340);
+  OP(G, c, d, a, b, 11, 14, 0x265e5a51);
+  OP(G, b, c, d, a, 0, 20, 0xe9b6c7aa);
+  OP(G, a, b, c, d, 5, 5, 0xd62f105d);
+  OP(G, d, a, b, c, 10, 9, 0x02441453);
+  OP(G, c, d, a, b, 15, 14, 0xd8a1e681);
+  OP(G, b, c, d, a, 4, 20, 0xe7d3fbc8);
+  OP(G, a, b, c, d, 9, 5, 0x21e1cde6);
+  OP(G, d, a, b, c, 14, 9, 0xc33707d6);
+  OP(G, c, d, a, b, 3, 14, 0xf4d50d87);
+  OP(G, b, c, d, a, 8, 20, 0x455a14ed);
+  OP(G, a, b, c, d, 13, 5, 0xa9e3e905);
+  OP(G, d, a, b, c, 2, 9, 0xfcefa3f8);
+  OP(G, c, d, a, b, 7, 14, 0x676f02d9);
+  OP(G, b, c, d, a, 12, 20, 0x8d2a4c8a);
+  /* Round 3. */
+  OP(H, a, b, c, d, 5, 4, 0xfffa3942);
+  OP(H, d, a, b, c, 8, 11, 0x8771f681);
+  OP(H, c, d, a, b, 11, 16, 0x6d9d6122);
+  OP(H, b, c, d, a, 14, 23, 0xfde5380c);
+  OP(H, a, b, c, d, 1, 4, 0xa4beea44);
+  OP(H, d, a, b, c, 4, 11, 0x4bdecfa9);
+  OP(H, c, d, a, b, 7, 16, 0xf6bb4b60);
+  OP(H, b, c, d, a, 10, 23, 0xbebfbc70);
+  OP(H, a, b, c, d, 13, 4, 0x289b7ec6);
+  OP(H, d, a, b, c, 0, 11, 0xeaa127fa);
+  OP(H, c, d, a, b, 3, 16, 0xd4ef3085);
+  OP(H, b, c, d, a, 6, 23, 0x04881d05);
+  OP(H, a, b, c, d, 9, 4, 0xd9d4d039);
+  OP(H, d, a, b, c, 12, 11, 0xe6db99e5);
+  OP(H, c, d, a, b, 15, 16, 0x1fa27cf8);
+  OP(H, b, c, d, a, 2, 23, 0xc4ac5665);
+  /* Round 4. */
+  OP(I, a, b, c, d, 0, 6, 0xf4292244);
+  OP(I, d, a, b, c, 7, 10, 0x432aff97);
+  OP(I, c, d, a, b, 14, 15, 0xab9423a7);
+  OP(I, b, c, d, a, 5, 21, 0xfc93a039);
+  OP(I, a, b, c, d, 12, 6, 0x655b59c3);
+  OP(I, d, a, b, c, 3, 10, 0x8f0ccc92);
+  OP(I, c, d, a, b, 10, 15, 0xffeff47d);
+  OP(I, b, c, d, a, 1, 21, 0x85845dd1);
+  OP(I, a, b, c, d, 8, 6, 0x6fa87e4f);
+  OP(I, d, a, b, c, 15, 10, 0xfe2ce6e0);
+  OP(I, c, d, a, b, 6, 15, 0xa3014314);
+  OP(I, b, c, d, a, 13, 21, 0x4e0811a1);
+  OP(I, a, b, c, d, 4, 6, 0xf7537e82);
+  OP(I, d, a, b, c, 11, 10, 0xbd3af235);
+  OP(I, c, d, a, b, 2, 15, 0x2ad7d2bb);
+  OP(I, b, c, d, a, 9, 21, 0xeb86d391);
+
+  /* 2026-06-04 ARM NEON MD5 padding fix (CPU analog of GPU eom_in_first):
+   * mymd5salt2 is a TWO-block MD5 from IV. Prior to this fix only the first
+   * block was compressed and FINAL2 added a + IV directly to hash[], which
+   * produced wrong digests for any callsite that placed message bytes into
+   * block 1 of SSEBUF3 (i.e. all e31 MD5SALT etc. with salt-length >= 24
+   * for inner_len=32). For slen 24..31 block 1 held only the length field
+   * and 0x80 sentinel and the wrong digest pattern matched the GPU bug.
+   * For slen 32..35 block 1 held 0..3 spillover salt bytes and the missed
+   * block-1 compression produced identical-block-0 collisions on the
+   * 4-wide NEON lane batch. Mirror the Intel SSE pattern at line 1653:
+   * FINAL stores the post-block-0 chained state into hash[], advance X by
+   * 16 to point at block 1, reload state, run another 64 OPs, FINAL2 adds
+   * block-1 result onto the chained state = correct two-block MD5. */
+  X += 16;
+  FINAL(0, a, AA);
+  FINAL(1, b, BB);
+  FINAL(2, c, CC);
+  FINAL(3, d, DD);
+  a = sval_load(&hash[0]);
+  b = sval_load(&hash[1]);
+  c = sval_load(&hash[2]);
+  d = sval_load(&hash[3]);
 
   OP(F, a, b, c, d, 0, 7, 0xd76aa478);
   OP(F, d, a, b, c, 1, 12, 0xe8c7b756);
