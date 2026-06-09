@@ -1,3 +1,19 @@
+# mdxfind v1.526 — Makefile hot-fix: stop `make clean` from deleting checked-in metal `_str.h` + `mdxfind_metallib.h`
+
+Source: Makefile only (clean target). Binary content identical to v1.525 — mdxfind.c `$Header` stays at rev 1.525.
+
+The v1.525 `clean` target indiscriminately deleted `gpu/mdxfind_metallib.h` and `gpu/metal_*_str.h` files even though they are CHECKED IN as the pre-generated ground-truth artifacts shipped to Linux/Windows builds (which do not run `metal2str.py`). Running `make clean` on a fresh Linux clone produced a dirty working tree with phantom modified-file noise.
+
+This release moves those deletions into a new explicit `make metalclean` target for the macOS workflow that genuinely wants to force the metal artifacts to regenerate. On macOS the existing pattern rules at the top of the Makefile already auto-regenerate via timestamp dependency on `.metal` source files; no manual cleanup is required.
+
+After upgrading to v1.526:
+- `make clean && make all` on a fresh clone leaves `git status` clean.
+- macOS devs who want to force a metal regen: `make metalclean` (or delete the files by hand).
+
+No source code, no library, no platform behavior changes vs v1.525.
+
+---
+
 # mdxfind v1.525 — BSDICRYPT split (e997), MD5SALT padding fix sweep (GPU OpenCL + Metal + ARM NEON + PowerPC slen 24..31)
 
 Source: mdxfind.c rev 1.524 → 1.525, mymd5.c rev 1.33 → 1.34, gpu/gpu_md5salt_core.cl rev 1.7 → 1.8 (+ `_str.h` 1.5 → 1.6), gpu/metal_md5salt_core.metal rev 1.3 → 1.4 (+ `_str.h` -ko 1.2 → 1.3 NEW to github).

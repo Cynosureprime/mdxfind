@@ -395,6 +395,15 @@ clean:
 	rm -f lm/*.o lm/lm.a
 	rm -f gosthash/*.o
 	rm -f gpu/*.o
+	rm -f gpu/mdxfind.metallib
+# gpu/mdxfind_metallib.h and gpu/metal_*_str.h are CHECKED IN as
+# pre-generated artifacts for Linux/Windows builds (which don't run
+# metal2str.py). On macOS, the rules above auto-regenerate them via
+# timestamp dependency on the source .metal files. Deleting them here
+# dirties a fresh git checkout on Linux. Use 'make metalclean' if you
+# genuinely want to force a regen on macOS.
+
+metalclean:
 	rm -f gpu/mdxfind.metallib gpu/mdxfind_metallib.h
 	rm -f gpu/metal_*_core_str.h gpu/metal_common_str.h gpu/metal_template_str.h gpu/metal_md5_rules_str.h
 
