@@ -338,7 +338,7 @@ userdef.o: userdef.c userdef.h hx_vm.h
 	$(CC) $(CFLAGS) -DUSERDEF_HAVE_CODEGEN -c userdef.c
 
 hx_func_sa.o: hx_func.c hx_vm.h
-	$(CC) $(CFLAGS) -DHX_STANDALONE -c hx_func.c -o hx_func_sa.o
+	$(CC) $(CFLAGS) -DHX_STANDALONE -DHX_HAS_KDF -c hx_func.c -o hx_func_sa.o
 
 hx_lib.o: hx.c hx_ast.h hx_vm.h hx.tab.h
 	$(CC) $(CFLAGS) -c hx.c -o hx_lib.o

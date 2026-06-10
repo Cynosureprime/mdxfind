@@ -1,3 +1,60 @@
+# mdxfind v1.527 — User-defined hash types: accept `salt` + `user` slots; bcrypt + phpass available to mdxfind userdef expressions
+
+Source: userdef.h rev 1.5 → 1.6, userdef.c rev 1.6 → 1.7, mdxfind.c rev 1.525 → 1.526, hx_func.c rev 1.4 → 1.5; iMac Makefile rev 1.46 → 1.47 (adds `-DHX_HAS_KDF` to the `hx_func_sa.o` build rule).
+
+Window: 2026-06-10. Released 2026-06-10.
+
+v1.527 unblocks salted user-defined hash types in mdxfind for the common case of one salt + one repurposed-as-second-salt slot. The userdef v1 loader rejected ANY reference to `salt` / `salt2` / `pepper` / `user` to keep the M1 scope unsalted; v1.527 lifts that for `salt` and `user` (loader + dispatch infrastructure already in place via `Typesalt[]` / `Typeuser[]` and `hx_vm_run`'s 5-slot signature). `salt2` + `pepper` stay rejected until the v2 load grammar (`load=` / `fields=` / `sep=` / `*.enc=`) lands, since the existing per-line file loader has no way to parse those out of the hash file.
+
+## What unlocks
+
+`bcrypt(phpbb3(pass))` and similar two-salt compositions can now run as `-m u<id>` in mdxfind:
+
+```ini
+# userdef.txt
+[BcryptPhpbb3]
+id = 800
+hx = bcrypt_hex(phpass_encode(phpass_bin(pass, salt, 9)), user, 10)
+```
+
+Invocation against external salt pools:
+```
+mdxfind -m u800 \
+    -s phpbb3_salts.txt \
+    -u bcrypt_salts.txt \
+    -F hashes.txt \
+    wordlist.gz
+```
+
+End-to-end test vector (verified): `pass=123456`, phpbb3 salt = `RsqOrLNk` (8 char + log2=9), bcrypt salt = `vw31ldi5VPlyG2t5HxqIKe` (22 char + cost=10), expected bcrypt-hex digest `d07c7b7f140772676d0480c3136ab484a20e426505ddfb`.
+
+## userdef.c changes
+
+- `program_uses_salt(prog)` (bool) replaced by `program_slot_mask(prog)` (USERDEF_SLOT_* bitmask).
+- `finalize_stanza()` rejects only when `SALT2 | PEPPER` bits are set; `SALT | USER` are accepted and propagated to the new `slot_mask` field of `struct userdef_type`.
+- Load report adds `, uses salt` / `, uses user` annotations.
+- Legacy `uses_salt` field preserved (now nonzero iff `slot_mask != 0`).
+
+## mdxfind.c changes
+
+- TypeOpts auto-assignment for user ops now consults `slot_mask`: `TYPEOPT_NEEDSALT|SALTJUDY` if `salt` is referenced; `TYPEOPT_NEEDUSER|USERJUDY` if `user` is referenced. The standard generic-file salt+user loaders + the SaltArray→Typesalt and UserArray→Typeuser post-load copies then populate per-type Judys without additional code.
+- The userdef dispatch arm now iterates `Typesalt[op]` (via `build_salt_snapshot`) and `Typeuser[op]` (via `JSLF`/`JSLN`) when the corresponding slot is referenced; nested salt × user product when both are present. Unused slots take a single empty-value visit (unsalted path is byte-identical to v1.526).
+- `-i N>1` iteration feedback for salted types: the per-iter `vpass` re-fed digest is the LAST seen digest across the salt × user product, matching the per-built-in convention.
+
+## hx_func.c + Makefile change
+
+`bcrypt` + `phpass` (plus the rest of the KDF / crypt-family entries that link into mdxfind: scrypt, argon2*, yescrypt, md5crypt, apr1, sha256/512crypt, descrypt) are now registered in mdxfind's `hx_func_sa.o` table under the new compile flag `HX_HAS_KDF`. The build-only `tools/hx8_to_c` standalone tool (HX_STANDALONE, no HX_HAS_KDF) skips them — it doesn't link the crypt libs and never could. The 6 truly hashpipe-only entries (pomelo, rc4_hmac_md5, aes128/256_cts_hmac_sha1, sm3crypt, gost12_512crypt) keep a nested `#ifndef HX_STANDALONE` guard because mdxfind doesn't link `pomelo_hash` / `hp_sm3_*` / KRB5 CTS.
+
+iMac Makefile rule `hx_func_sa.o:` adds `-DHX_HAS_KDF`. Per-host Makefiles on remote build hosts (.205, .206, .209, .206/.209 cross-compile, ubpower8, dev1, hpi7, firefly) must add the same flag — they are NOT auto-synced.
+
+## What's still NOT supported
+
+- `salt2` + `pepper` userdef slot references (need v2 load grammar). Document workaround: repurpose `user` as the "second salt."
+- Per-hash variable iteration counts in hx expressions (phpbb3 log2, bcrypt cost). The hx `^N` operator is compile-time only; runtime iter would need an `HX_SLOT_ITER` language extension. Workaround: one userdef stanza per distinct `(log2, cost)` pair.
+- Per-line `hash:salt:user` binding. The generic loader at `mdxfind.c:46195` stores the SAME `:suffix` into BOTH `Typesalt[Dosalt[x]]` AND `Typeuser[Douser[x]]` — it doesn't split on a second colon. v1.527 supports salts and users only via the pool-file flags `-s SALT_FILE` and `-u USER_FILE` (combinatorial N × M per pass). Per-line binding is a future loader change.
+
+---
+
 # mdxfind v1.526 — Makefile hot-fix: stop `make clean` from deleting checked-in metal `_str.h` + `mdxfind_metallib.h`
 
 Source: Makefile only (clean target). Binary content identical to v1.525 — mdxfind.c `$Header` stays at rev 1.525.

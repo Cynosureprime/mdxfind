@@ -283,10 +283,16 @@ static void fn_pbkdf2_md5(hx_func_entry *self, hx_val *args, int nargs,
 { fn_pbkdf2(self, args, nargs, result, arena, role, EVP_md5()); }
 
 /* ================================================================
- * KDF built-ins (hashpipe-only — require bcrypt, yescrypt, argon2)
+ * KDF + crypt-family built-ins.
+ *
+ * Outer gate `!HX_STANDALONE || HX_HAS_KDF`: hashpipe (no HX_STANDALONE)
+ * and mdxfind (HX_STANDALONE + HX_HAS_KDF) both get this whole section;
+ * tools/hx8_to_c (HX_STANDALONE alone) skips it.  Per-function NESTED
+ * guards `#ifndef HX_STANDALONE` carve out the few entries mdxfind
+ * doesn't link (pomelo_hash, etc.) so they remain hashpipe-only.
  * ================================================================ */
 
-#ifndef HX_STANDALONE
+#if !defined(HX_STANDALONE) || defined(HX_HAS_KDF)
 
 #include "yescrypt/yescrypt.h"
 #include "argon2/argon2.h"
@@ -1323,7 +1329,10 @@ static void fn_phpass(hx_func_entry *self, hx_val *args, int nargs,
 	}
 }
 
-/* ---- pomelo(pass, salt, t_cost, m_cost) ---- */
+/* ---- pomelo(pass, salt, t_cost, m_cost) ----
+ * mdxfind doesn't link pomelo_hash; hashpipe-only.  See v1.527 KDF
+ * gating note at the top of this file. */
+#ifndef HX_STANDALONE
 
 extern int pomelo_hash(void *out, size_t outlen, const void *in, size_t inlen,
 	const void *salt, size_t saltlen,
@@ -1687,7 +1696,9 @@ static void fn_gost12_512crypt(hx_func_entry *self, hx_val *args, int nargs,
 	}
 }
 
-#endif /* !HX_STANDALONE */
+#endif /* !HX_STANDALONE — close fn_pomelo..fn_gost12_512crypt block */
+
+#endif /* !HX_STANDALONE || HX_HAS_KDF */
 
 /* ================================================================
  * siphash(pass, key) — SipHash-2-4 with 16-byte key
@@ -1852,7 +1863,7 @@ static void fn_pbkdf1_sha1(hx_func_entry *self, hx_val *args, int nargs,
 
 /* ---- argon2 (alias for argon2id) ---- */
 
-#ifndef HX_STANDALONE
+#if !defined(HX_STANDALONE) || defined(HX_HAS_KDF)
 static void fn_argon2(hx_func_entry *self, hx_val *args, int nargs,
 	hx_val *result, hx_arena *arena, uint8_t role)
 {
@@ -4007,15 +4018,18 @@ hx_func_entry hx_func_table[HX_MAX_FUNCS] = {
 	{ "pbkdf2_sha256", fn_pbkdf2_sha256,  0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "pbkdf2_sha512", fn_pbkdf2_sha512,  0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "pbkdf2_md5",    fn_pbkdf2_md5,     0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
-#ifndef HX_STANDALONE
-	/* KDF built-ins (hashpipe-only) */
+#if !defined(HX_STANDALONE) || defined(HX_HAS_KDF)
+	/* KDF + crypt-family registry entries.  Available in hashpipe and in
+	 * mdxfind (HX_STANDALONE + HX_HAS_KDF); skipped in the build-only
+	 * tools/hx8_to_c standalone build.  Inner nested guard removes the
+	 * subset whose backing symbols (pomelo_hash, hp_sm3_*, krb5 CTS, etc.)
+	 * are not on mdxfind's link line. */
 	{ "bcrypt",        fn_bcrypt,         0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
 	{ "scrypt",        fn_scrypt,         0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "argon2id",      fn_argon2id,       0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "argon2i",       fn_argon2i,        0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "argon2d",       fn_argon2d,        0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "yescrypt",      fn_yescrypt,       0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
-	/* crypt-family built-ins */
 	{ "md5crypt",      fn_md5crypt,       0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
 	{ "apr1",          fn_apr1,           0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
 	{ "sha256crypt",   fn_sha256crypt,    0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
@@ -4023,6 +4037,8 @@ hx_func_entry hx_func_table[HX_MAX_FUNCS] = {
 	{ "descrypt",      fn_descrypt,       0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
 	{ "phpass",        fn_phpass,         0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
 	{ "argon2",        fn_argon2,         0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
+#ifndef HX_STANDALONE
+	/* hashpipe-only subset: mdxfind doesn't link the backing libs */
 	{ "pomelo",        fn_pomelo,         0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "rc4_hmac_md5",  fn_rc4_hmac_md5,   0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "aes128_cts_hmac_sha1", fn_aes128_cts_hmac_sha1, 0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
@@ -4030,17 +4046,29 @@ hx_func_entry hx_func_table[HX_MAX_FUNCS] = {
 	{ "sm3crypt",      fn_sm3crypt,       0, NULL, 0, ROLES_CRYPT,  ROLE_MCF },
 	{ "gost12_512crypt", fn_gost12_512crypt, 0, NULL, 0, ROLES_CRYPT, ROLE_MCF },
 #endif
+#endif /* !HX_STANDALONE || HX_HAS_KDF */
 	/* Always-available functions (no hashpipe dependency) */
 	{ "siphash",       fn_siphash,        8, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "murmur3",       fn_murmur3,        4, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "pbkdf1_sha1",   fn_pbkdf1_sha1,    0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 };
 
-/* Count initial static entries */
-#ifdef HX_STANDALONE
-int hx_func_count = 7 + 38 + 21 + 3;  /* 7 hash + 38 common (incl des_block, bswap32) + 21 custom + 3 always */
+/* Count initial static entries.  v1.527: KDF + crypt-family split into
+ * an "mdxfind + hashpipe" set of 13 entries (bcrypt, phpass, scrypt,
+ * argon2*, yescrypt, md5crypt, apr1, sha256crypt, sha512crypt, descrypt,
+ * argon2-alias) and a hashpipe-only set of 6 entries (pomelo,
+ * rc4_hmac_md5, aes128/256_cts_hmac_sha1, sm3crypt, gost12_512crypt).
+ *
+ *   tools/hx8_to_c (standalone, no HX_HAS_KDF): 7 + 38 + 21 + 3
+ *   mdxfind        (standalone, HX_HAS_KDF):    7 + 38 + 21 + 13 + 3
+ *   hashpipe       (non-standalone):            38 + 21 + 13 + 6 + 3
+ */
+#if defined(HX_STANDALONE) && defined(HX_HAS_KDF)
+int hx_func_count = 7 + 38 + 21 + 13 + 3;
+#elif defined(HX_STANDALONE)
+int hx_func_count = 7 + 38 + 21 + 3;
 #else
-int hx_func_count = 38 + 21 + 19 + 3;  /* 38 common (incl bswap32) + 21 custom + 6 kdf + 13 crypt/krb + 3 always */
+int hx_func_count = 38 + 21 + 13 + 6 + 3;
 #endif
 
 hx_func_entry *hx_func_lookup(const char *name)

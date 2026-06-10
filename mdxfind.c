@@ -245,10 +245,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.525 2026/06/01 22:43:05 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.526 2026/06/10 15:41:51 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.525 2026/06/01 22:43:05 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.526 2026/06/10 15:41:51 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -266,6 +266,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.526  2026/06/10 15:41:51  dlr
+ * v1.527: userdef salt+user dispatch (mdxfind.c arm at procjob user-op switch). TypeOpts auto-assigned from slot_mask: NEEDSALT|SALTJUDY for salt, NEEDUSER|USERJUDY for user. Per-pass iteration walks Typesalt[op] snapshot x Typeuser[op] Judy; nested when both present. Unsalted path byte-identical to v1.526.
+ *
  * Revision 1.525  2026/06/01 22:43:05  dlr
  * Split BSDI extended-DES into JOB_BSDICRYPT (e997) — separate type for the 20-char _CCCCSSSS BSDi extended DES format that was previously piggybacking on JOB_DESCRYPT after rev 1.187. Restores -z descrypt to 4096 standard salts only; -z bsdicrypt emits the 4096 extended _J9..XX.. salts. Hashcat mode 12400 repointed from 500 to 997 (12400 has always been BSDi-extended, not standard descrypt). New procjob case mirrors JOB_DESCRYPT structure but filters saltlen==9 + leading underscore; JOB_DESCRYPT case narrowed to saltlen==2 only. Loader narrowed JOB_DESCRYPT to len==13; added JOB_BSDICRYPT block for len==20 + _ prefix. Added BSDIcryptcnt counter alongside DEScryptcnt. All 5 validation gates PASS: build clean, -z e500 emits 4096 standard only with zero _ prefix, -z e997 emits 4096 extended, round-trip cracks back, hashpipe -T shows 992 passed/0 failed with BSDICRYPT, table-parity diff clean at indices 997 + 12400. hashcat reference vector _GW..8841inaTltazRsQ:hashcat verifies via -m e997 and -m 12400. GPU OUT OF SCOPE (variable-round DES Feistel does not fit GPU carrier per mdxfind.c:11767 comment).
  *
@@ -12779,21 +12782,28 @@ do {
 /*     printf("Starting job %d (%s) %llx\n",job->op,TYPENAME(job->op),job->outbuf);  */
     if (userdef_is_userop(job->op)) {
       /*
-       * User-defined hash type (Milestone 1): run the type's compiled hx
-       * program on the candidate via the per-thread hx VM, then feed the
-       * digest into the existing match/checkhash machinery.  The VM's
-       * default digest role is ROLE_HEX, so it returns a hex string; we
-       * hex-decode it into curin.h (raw bytes) and pass the hex length to
-       * checkhash, exactly like the JOB_SHA1 built-in path.
+       * User-defined hash type: run the type's compiled hx program on
+       * the candidate via the per-thread hx VM, then feed the digest into
+       * the existing match/checkhash machinery.  The VM's default digest
+       * role is ROLE_HEX so it returns a hex string; we hex-decode into
+       * curin.h (raw bytes) and pass the hex length to checkhash, exactly
+       * like the JOB_SHA1 built-in path.
+       *
+       * v1.527: if the expression references `salt`, iterate Typesalt[op]
+       * snapshots; if it references `user`, iterate Typeuser[op] Judy.
+       * Nested when both are present (N x M per pass).  Unsalted /
+       * unuser types take the original single-call path.
        *
        * -i iteration (xNN): for x>1 the previous hex digest becomes the
-       * next password, matching the standard built-in iteration convention.
+       * next password (built-in iteration convention).
        */
       struct userdef_type *ut = userdef_get(job->op);
       if (ut && ut->prog && len <= MAXLINE) {
         const char *vpass = cur;
         int vplen = len;
         char itbuf[513];   /* holds the hex digest fed back across iters */
+        int uses_salt = (ut->slot_mask & USERDEF_SLOT_SALT) != 0;
+        int uses_user = (ut->slot_mask & USERDEF_SLOT_USER) != 0;
 
         /* lazily (re)bind the per-thread VM to this op */
         if (userdef_vm_op != job->op) {
@@ -12803,23 +12813,81 @@ do {
           userdef_vm_op = job->op;
         }
 
+        /*
+         * Per-pass iteration. The three loops collapse cleanly: when a
+         * slot is unused we visit it exactly once with an empty value;
+         * when used we iterate the Judy. -i feedback re-runs the WHOLE
+         * salt x user product against the new pass each iteration to
+         * match built-in semantics.
+         */
         for (x = 1; x <= Maxiter; x++) {
-          hx_val r = hx_vm_run(&userdef_vm, vpass, vplen,
-                               "", 0, "", 0, "", 0, "", 0);
-          int hlen = (r.data && r.len > 0) ? r.len : 0;
-          hashcnt++;
-          if (hlen <= 0 || (hlen & 1) || hlen > (int)sizeof(curin.h) * 2)
-            break;
-          /* decode hex digest -> binary into curin.h */
-          get32((char *)r.data, curin.h, hlen);
-          checkhash(&curin, hlen, x, job);
-          if (x < Maxiter) {
-            /* re-feed the hex digest as the next password */
-            if (hlen >= (int)sizeof(itbuf)) break;
-            memcpy(itbuf, r.data, hlen);
-            itbuf[hlen] = '\0';
+          int last_hlen = 0;
+          const char *last_hex = NULL;
+          /* salt snapshot for this pass */
+          if (uses_salt && !snap_valid) {
+            nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                              Typesalt[job->op], tsalt, Printall);
+            snap_valid = 1;
+            if (!nsalts_job) { Typedone[job->op] = 1; break; }
+          }
+          { int nsalts = uses_salt ? nsalts_job : 1;
+            int si;
+            for (si = 0; si < nsalts; si++) {
+              const char *ssalt = uses_salt ? saltsnap[si].salt : "";
+              int slen = uses_salt ? saltsnap[si].saltlen : 0;
+              Pvoid_t ujudy = uses_user ? (Pvoid_t)Typeuser[job->op] : NULL;
+              char ubuf[MAXLINE+1];
+              int did_user = 0;
+              ubuf[0] = 0;
+              if (uses_user) {
+                if (!ujudy) continue;
+                JSLF(PV, ujudy, (unsigned char *)ubuf);
+                while (PV) {
+                  if (Printall || *PV > 0) {
+                    int ulen = mystrlen(ubuf);
+                    hx_val r = hx_vm_run(&userdef_vm, vpass, vplen,
+                                         ssalt, slen, "", 0, "", 0, ubuf, ulen);
+                    int hlen = (r.data && r.len > 0) ? r.len : 0;
+                    hashcnt++;
+                    if (hlen > 0 && !(hlen & 1) &&
+                        hlen <= (int)sizeof(curin.h) * 2) {
+                      get32((char *)r.data, curin.h, hlen);
+                      checkhash(&curin, hlen, x, job);
+                      last_hlen = hlen;
+                      last_hex  = (const char *)r.data;
+                    }
+                  }
+                  JSLN(PV, ujudy, (unsigned char *)ubuf);
+                }
+                did_user = 1;
+                (void)did_user;
+              } else {
+                hx_val r = hx_vm_run(&userdef_vm, vpass, vplen,
+                                     ssalt, slen, "", 0, "", 0, "", 0);
+                int hlen = (r.data && r.len > 0) ? r.len : 0;
+                hashcnt++;
+                if (hlen > 0 && !(hlen & 1) &&
+                    hlen <= (int)sizeof(curin.h) * 2) {
+                  get32((char *)r.data, curin.h, hlen);
+                  checkhash(&curin, hlen, x, job);
+                  last_hlen = hlen;
+                  last_hex  = (const char *)r.data;
+                }
+              }
+            }
+          }
+          /* iter feedback: only meaningful for unsalted / single-(salt,user) types.
+           * For multi-salt/user expressions iter>1 reuses the last digest seen,
+           * which mirrors the existing per-built-in behaviour where iter feed is
+           * applied to the password stream only. */
+          if (x < Maxiter && last_hlen > 0 && last_hex &&
+              last_hlen < (int)sizeof(itbuf)) {
+            memcpy(itbuf, last_hex, last_hlen);
+            itbuf[last_hlen] = '\0';
             vpass = itbuf;
-            vplen = hlen;
+            vplen = last_hlen;
+          } else {
+            break;
           }
         }
       }
@@ -46459,18 +46527,31 @@ union HashU curin;
   }
   userdef_load(getenv("MDXFIND_CACHE"));
   /*
-   * Milestone 1 user types are unsalted: mark each loaded user op with
-   * TYPEOPT_NEEDSF so the hash-file loader uses the plain-hex fast path
-   * (commit_compact into the compact table) exactly like a built-in
-   * unsalted digest type.  Synthetic ops are assigned sequentially from
-   * JOB_USERDEF_BASE, so iterate that contiguous range.
+   * Per loaded user type, assemble TypeOpts from the slot-inference mask
+   * computed at load time (userdef.c::program_slot_mask).  Always
+   * NEEDSF (plain-hex fast path through commit_compact); add NEEDSALT |
+   * SALTJUDY if the expression references `salt`, and NEEDUSER |
+   * USERJUDY if it references `user`.  The standard load_hash_file
+   * generic hex[:salt][:user] handler then populates Typesalt[uop] /
+   * Typeuser[uop] per-hash automatically.
+   *
+   * v1.527: salt2 + pepper still rejected at load (userdef.c), so those
+   * bits never appear here.  Synthetic ops are assigned sequentially
+   * from JOB_USERDEF_BASE, so iterate the contiguous range.
    */
   {
     int _uc = userdef_count(), _ui;
     for (_ui = 0; _ui < _uc; _ui++) {
       int _uop = JOB_USERDEF_BASE + _ui;
-      if (_uop < JOB_DONE && userdef_get(_uop))
-        TypeOpts[_uop] = TYPEOPT_NEEDSF;
+      struct userdef_type *_ut = userdef_get(_uop);
+      unsigned short _opts;
+      if (_uop >= JOB_DONE || !_ut) continue;
+      _opts = TYPEOPT_NEEDSF;
+      if (_ut->slot_mask & USERDEF_SLOT_SALT)
+        _opts |= TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY;
+      if (_ut->slot_mask & USERDEF_SLOT_USER)
+        _opts |= TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY;
+      TypeOpts[_uop] = _opts;
     }
   }
 

@@ -1,8 +1,11 @@
 /*
  * userdef.h - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.5 $
+ * $Revision: 1.6 $
  * $Log: userdef.h,v $
+ * Revision 1.6  2026/06/10 15:41:40  dlr
+ * v1.527: USERDEF_SLOT_* bitmask + uses_salt legacy field; struct userdef_type gains slot_mask. Forward-compat with v2 load grammar.
+ *
  * Revision 1.5  2026/05/29 02:11:12  dlr
  * Add extern userdef_verbose (load-message verbosity; default 0 = silent). Leave userdef_gpu_status declaration UNGUARDED (definition stays codegen-gated): mdxfind.c is not compiled with USERDEF_HAVE_CODEGEN, so the guarded prototype was invisible there, making the call default to implicit int and truncate the returned const char pointer to 32 bits on a 64-bit target (latent crash when the static buffer loads above 4 GB).
  *
@@ -54,6 +57,20 @@
  */
 extern int userdef_verbose;
 
+/*
+ * Slot-usage bitmask (v1.527+).  Each bit set means the compiled program
+ * references the corresponding hx VM slot, which in turn drives:
+ *   (a) the load-time accept/reject decision (salt2 + pepper still rejected
+ *       in v1.527; salt + user accepted),
+ *   (b) TypeOpts auto-assignment in mdxfind.c so the standard Typesalt[] /
+ *       Typeuser[] per-line loaders populate the right Judy arrays,
+ *   (c) the dispatch arm's per-pass iteration over salt + user snapshots.
+ */
+#define USERDEF_SLOT_SALT    0x01
+#define USERDEF_SLOT_SALT2   0x02   /* rejected: needs v2 load grammar */
+#define USERDEF_SLOT_PEPPER  0x04   /* rejected: needs v2 load grammar */
+#define USERDEF_SLOT_USER    0x08
+
 struct userdef_type {
 	char        name[128];   /* stanza header => USER_<name>            */
 	char        dispname[160]; /* "USER_<name>" precomputed for output   */
@@ -62,7 +79,8 @@ struct userdef_type {
 	hx_program *prog;        /* compiled program (shared, read-only)    */
 	int         op;          /* synthetic op = JOB_USERDEF_BASE + seq   */
 	int         diglen_hex;  /* hex-string digest length (2 * bytes)    */
-	int         uses_salt;   /* slot-inference: references salt/etc      */
+	int         uses_salt;   /* legacy: nonzero iff slot_mask != 0       */
+	int         slot_mask;   /* USERDEF_SLOT_* bits referenced by prog   */
 };
 
 /*

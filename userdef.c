@@ -1,8 +1,11 @@
 /*
  * userdef.c - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.6 $
+ * $Revision: 1.7 $
  * $Log: userdef.c,v $
+ * Revision 1.7  2026/06/10 15:41:40  dlr
+ * v1.527: program_slot_mask() replaces program_uses_salt(); finalize_stanza accepts SALT + USER, rejects SALT2 + PEPPER only (v2 load grammar still needed). slot_mask propagates through struct + load report.
+ *
  * Revision 1.6  2026/05/29 02:13:28  dlr
  * Comment fix: the load-report opt-in is the -Y validate-and-exit option (in hashpipe and mdxfind), not the briefly-used -U.
  *
@@ -247,24 +250,30 @@ static int keyis(const char *k, const char *want)
 }
 
 /*
- * Slot-inference (minimal, for M1): does the compiled program reference any
- * salt/salt2/pepper/user slot?  M1 is unsalted-only; a salted user type is
- * rejected with a clear message (full v2 support is later).  This also
- * exercises the inference plumbing per the spec.
+ * Slot-inference: which hx VM slots does the compiled program reference?
+ * Returns a USERDEF_SLOT_* bitmask.  v1.527 accepts SALT + USER (both have
+ * existing loader + dispatch infrastructure: Typesalt[] from -s file or the
+ * per-line :salt: split; Typeuser[] from -u file or the per-line :user:
+ * split).  SALT2 + PEPPER are still rejected — they need the v2 load
+ * grammar (load=, fields=, sep=, per-field .enc=) before the per-hash binding can be
+ * parsed out of the input file.
  */
-static int program_uses_salt(hx_program *prog)
+static int program_slot_mask(hx_program *prog)
 {
-	int i;
+	int i, mask = 0;
 	if (!prog || !prog->code) return 0;
 	for (i = 0; i < prog->ncode; i++) {
 		if (prog->code[i].op == OP_PUSH_VAR) {
-			int slot = prog->code[i].u.slot;
-			if (slot == HX_SLOT_SALT  || slot == HX_SLOT_SALT2 ||
-			    slot == HX_SLOT_PEPPER || slot == HX_SLOT_USERID)
-				return 1;
+			switch (prog->code[i].u.slot) {
+			case HX_SLOT_SALT:   mask |= USERDEF_SLOT_SALT;   break;
+			case HX_SLOT_SALT2:  mask |= USERDEF_SLOT_SALT2;  break;
+			case HX_SLOT_PEPPER: mask |= USERDEF_SLOT_PEPPER; break;
+			case HX_SLOT_USERID: mask |= USERDEF_SLOT_USER;   break;
+			default: break;
+			}
 		}
 	}
-	return 0;
+	return mask;
 }
 
 /*
@@ -458,6 +467,7 @@ static void finalize_stanza(const char *name, const char *idstr,
 	struct userdef_type *u;
 	hx_program *prog;
 	int i, diglen;
+	int slot_mask = 0;
 
 	if (!name[0]) return;             /* no header seen yet */
 
@@ -503,17 +513,20 @@ static void finalize_stanza(const char *name, const char *idstr,
 	}
 
 	/*
-	 * Sub-phase C1: slot-inference reject-salted.  v1 supports only
-	 * unsalted/unstructured expressions; any reference to
-	 * salt/salt2/pepper/user is rejected at load with a clear message.
-	 * This exercises the inference plumbing and de-risks v2.
+	 * Slot-inference (v1.527+): accept SALT and USER (per-line loader and
+	 * dispatch already in place); still reject SALT2 and PEPPER until the
+	 * v2 load grammar lands (no way to parse them out of the hash file
+	 * yet).  Repurposing USER as a second salt slot is the documented
+	 * workaround for two-salt formats.
 	 */
-	if (program_uses_salt(prog)) {
-		UD_MSG( "userdef: %s (u%s): salted/structured user types "
-		        "are not yet supported (v2); skipping\n",
+	slot_mask = program_slot_mask(prog);
+	if (slot_mask & (USERDEF_SLOT_SALT2 | USERDEF_SLOT_PEPPER)) {
+		UD_MSG( "userdef: %s (u%s): salt2 / pepper slots "
+		        "are not yet supported (v2 load grammar "
+		        "needed); skipping\n",
 		        name, idstr);
-		record_skip(idstr, "salted/structured user types are not yet "
-		            "supported (v2)");
+		record_skip(idstr, "salt2/pepper slots not yet "
+		            "supported (v2 load grammar needed)");
 		hx_program_free(prog);
 		return;
 	}
@@ -537,11 +550,15 @@ static void finalize_stanza(const char *name, const char *idstr,
 	u->prog       = prog;
 	u->op         = JOB_USERDEF_BASE + Userdef_count;
 	u->diglen_hex = diglen;
-	u->uses_salt  = 0;
+	u->slot_mask  = slot_mask;
+	u->uses_salt  = (slot_mask != 0);   /* legacy field — nonzero iff any salt-class slot referenced */
 	Userdef_count++;
 
-	UD_MSG( "userdef: loaded %s (-m u%s, op %d, %d-char digest): "
-	        "%s\n", u->dispname, u->idstr, u->op, u->diglen_hex, u->hx);
+	UD_MSG( "userdef: loaded %s (-m u%s, op %d, %d-char digest%s%s): "
+	        "%s\n", u->dispname, u->idstr, u->op, u->diglen_hex,
+	        (slot_mask & USERDEF_SLOT_SALT)  ? ", uses salt"  : "",
+	        (slot_mask & USERDEF_SLOT_USER)  ? ", uses user"  : "",
+	        u->hx);
 
 	/*
 	 * Sub-phase D5: content-hash identity suggestion.  Compute a stable
