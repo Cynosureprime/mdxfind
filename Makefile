@@ -340,6 +340,15 @@ userdef.o: userdef.c userdef.h hx_vm.h
 hx_func_sa.o: hx_func.c hx_vm.h
 	$(CC) $(CFLAGS) -DHX_STANDALONE -DHX_HAS_KDF -c hx_func.c -o hx_func_sa.o
 
+# hx.c is a hand-written driver, NOT generated from hx.y/hx.l (bison/flex emit
+# hx.tab.c and hx.lex.c, shipped pre-generated above). This empty rule cancels
+# GNU Make's built-in implicit rules %.c: %.y and %.c: %.l, which would otherwise
+# run bison/flex on the shipped hx.y/hx.l and OVERWRITE hx.c whenever those tools
+# are in PATH and hx.y/hx.l look newer (e.g. a fresh git clone with equal
+# mtimes). That clobber injects yyparse/yylval/yyerror into hx_lib.o and breaks
+# the link with multiple-definition errors.
+hx.c: ;
+
 hx_lib.o: hx.c hx_ast.h hx_vm.h hx.tab.h
 	$(CC) $(CFLAGS) -c hx.c -o hx_lib.o
 
