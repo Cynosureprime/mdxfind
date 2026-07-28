@@ -1,3 +1,17 @@
+# mdxfind v1.528 — Fix `-M e537` (PHPBB3MD5): `$P$`/`$H$` hashes now load when e537 is selected without also selecting e455
+
+Source: mdxfind.c rev 1.526 → 1.528. The release tag is realigned to the mdxfind.c `$Header` revision (prior release tags ran one ahead of the file revision; this release restores tag == rev).
+
+`mdxfind -M e537` (PHPBB3MD5) silently failed to load any `$P$`/`$H$` hash: the run reported zero hash calculations and "None found", even when the hash's password was present in the wordlist. hashpipe identified the same hash correctly, which localised the fault to mdxfind's input path.
+
+The `$P$`/`$H$` loader block gated on `lf[JOB_PHPBB3]` (e455) alone. PHPBB3MD5 (e537) and PHPBB3 (e455) consume the identical hash format — they differ only in whether the candidate is the password or `md5(password)` — and the e537 compute arm falls through to the e455 arm. Selecting e537 without e455 left the loader gate closed, so the hash was never parsed, never salt-loaded, and never entered the table. The post-load pass that copies the salt into `Typesalt[JOB_PHPBB3MD5]` was already present; only the loader gate was missing e537.
+
+Fix: the loader gate now admits either op (`lf[JOB_PHPBB3] || lf[JOB_PHPBB3MD5]`). Verified: `-M e537` alone now cracks a phpBB3-MD5 hash; `-M e455` and `-M e455,e537` are unchanged; a `$1$` (MD5CRYPT) sanity load confirms neighbouring `$…$` parsing is undisturbed. An audit of the other shared-format families found bcrypt (`$2$`) and the `$5$`/`$6$` crypt family already admit all their fall-through variants — phpBB3 was the only gate missing its `*MD5` op.
+
+No other behaviour changes vs v1.527.
+
+---
+
 # mdxfind v1.527 — User-defined hash types: accept `salt` + `user` slots; bcrypt + phpass available to mdxfind userdef expressions
 
 Source: userdef.h rev 1.5 → 1.6, userdef.c rev 1.6 → 1.7, mdxfind.c rev 1.525 → 1.526, hx_func.c rev 1.4 → 1.5; iMac Makefile rev 1.46 → 1.47 (adds `-DHX_HAS_KDF` to the `hx_func_sa.o` build rule).

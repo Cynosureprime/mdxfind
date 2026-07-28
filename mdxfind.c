@@ -245,10 +245,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.526 2026/06/10 15:41:51 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.528 2026/07/27 19:58:36 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.526 2026/06/10 15:41:51 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.528 2026/07/27 19:58:36 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -266,6 +266,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.528  2026/07/27 19:58:36  dlr
+ * e537/phpBB3MD5: document the dual-op loader gate + version-align checkin. Expand the comment above the widened phpBB3 P/H gate to explain why it admits both JOB_PHPBB3 (e455) and JOB_PHPBB3MD5 (e537) and how the post-load salt copy handles the e537 compute fallthrough. This checkin bumps RCS to 1.528 so the file header matches the v1.528 release tag - prior release tags ran one ahead of the header revision; this realigns them. No functional change from 1.527.
+ *
+ * Revision 1.527  2026/07/27 19:44:10  dlr
+ * e537 PHPBB3MD5: fix loader gate. The phpBB3 P/H loader block (line 44235) gated only on lf[JOB_PHPBB3], so -M e537 alone never loaded the hash (0 calcs, None found). Widened gate to (lf[JOB_PHPBB3] || lf[JOB_PHPBB3MD5]); the post-load salt copy into Typesalt[JOB_PHPBB3MD5] at line 50615 already handled the compute fallthrough. Verified: e537 alone now cracks 9lives; e455 and e455,e537 regress clean; MD5CRYPT 1-format sanity clean. Audit: bcrypt (43727) and crypt (44292) shared-format families already used the multi-op gate pattern, phpbb3 was the sole miss.
+ *
  * Revision 1.526  2026/06/10 15:41:51  dlr
  * v1.527: userdef salt+user dispatch (mdxfind.c arm at procjob user-op switch). TypeOpts auto-assigned from slot_mask: NEEDSALT|SALTJUDY for salt, NEEDUSER|USERJUDY for user. Per-pass iteration walks Typesalt[op] snapshot x Typeuser[op] Judy; nested when both present. Unsalted path byte-identical to v1.526.
  *
@@ -44231,8 +44237,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         }
       }
     }
-    /* phpBB3 / phpass: $P$ or $H$ */
-    if (lf[JOB_PHPBB3] && (line[0] == '$' && (line[1] == 'P' || line[1] == 'H') && line[2] == '$') && len >= 34) {
+    /* phpBB3 / phpass: $P$ or $H$.  Admit either JOB_PHPBB3 (e455) or
+       JOB_PHPBB3MD5 (e537): both consume this identical hash format, and the
+       e537 compute arm falls through to the e455 arm, so the salt stored here
+       under JOB_PHPBB3 is copied to Typesalt[JOB_PHPBB3MD5] in the post-load
+       pass.  Gating on JOB_PHPBB3 alone silently dropped e537-only loads. */
+    if ((lf[JOB_PHPBB3] || lf[JOB_PHPBB3MD5]) && (line[0] == '$' && (line[1] == 'P' || line[1] == 'H') && line[2] == '$') && len >= 34) {
       { int pbbx = i64hex[line[3] & 0xff];
         if (pbbx >= 7 && pbbx <= 30) {
           for (x = 4; x < 12; x++) {
