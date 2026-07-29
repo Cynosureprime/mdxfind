@@ -245,10 +245,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.529 2026/07/29 13:23:45 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.530 2026/07/29 16:28:22 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.529 2026/07/29 13:23:45 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.530 2026/07/29 16:28:22 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -266,6 +266,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.530  2026/07/29 16:28:22  dlr
+ * KRB5TGS23 + KRB5PA23 (e914/e874): replace the ASN.1/timestamp verification heuristic with the definitive RC4-HMAC checksum recompute -- HMAC-MD5(K1, decrypted) == stored checksum -- matching hashcat m13100 decrypt_and_check. The heuristic false-positived: a wrong RC4 key can hit the loose byte pattern (notably the 0x82 long-length case, where the ASN.1 SEQUENCE tag is at dec[12] not dec[11]) while the HMAC never matches. Validated: the reported false-positive (251027) is now rejected by both tools; password123 test vectors still crack; hashpipe -T KRB5TGS23/KRB5PA23 Pass. AES etype 17/18 (KRB5PA-17/18, KRB5DB17/18) already do proper HMAC-SHA1 / PBKDF2 verification and are unaffected.
+ *
  * Revision 1.529  2026/07/29 13:23:45  dlr
  * v1.529 version anchor: document the OpenCL rules-dispatch salt-page work-size guard at the rules-engine gate. The functional fix is in gpu/gpu_opencl.c rev 1.209 (cap salts_per_page so the 1-D global work size stays under the device 32-bit work-item limit; a large salted hashlist + >1024 rules previously overflowed 2^32 and failed with CL_INVALID_GLOBAL_WORK_SIZE on AMD). No functional change in mdxfind.c; this bumps the header to 1.529 so the release tag stays aligned to the file revision.
  *
@@ -20314,22 +20317,19 @@ sha11saltmd5:
                             RC4(&rc4key, data_len, encrypted, (unsigned char *)newbuf);
                           }
                           hashcnt++;
-                          /* verify: decrypted bytes 14-15 must be '2','0' (year 20xx)
-                           * and bytes 16-27 must all be ASCII digits (GeneralizedTime) */
-                          if (Printall || (data_len >= 28 &&
-                              newbuf[14] == '2' && newbuf[15] == '0' &&
-                              newbuf[16] >= '0' && newbuf[16] <= '9' &&
-                              newbuf[17] >= '0' && newbuf[17] <= '9' &&
-                              newbuf[18] >= '0' && newbuf[18] <= '9' &&
-                              newbuf[19] >= '0' && newbuf[19] <= '9' &&
-                              newbuf[20] >= '0' && newbuf[20] <= '9' &&
-                              newbuf[21] >= '0' && newbuf[21] <= '9' &&
-                              newbuf[22] >= '0' && newbuf[22] <= '9' &&
-                              newbuf[23] >= '0' && newbuf[23] <= '9' &&
-                              newbuf[24] >= '0' && newbuf[24] <= '9' &&
-                              newbuf[25] >= '0' && newbuf[25] <= '9' &&
-                              newbuf[26] >= '0' && newbuf[26] <= '9' &&
-                              newbuf[27] >= '0' && newbuf[27] <= '9')) {
+                          /* Definitive verification: HMAC-MD5(K1, decrypted) ==
+                           * stored checksum (matches hashcat; the PA-ENC-TS
+                           * timestamp heuristic is not cryptographic). Printall
+                           * (-z) still forces a match to emit the generated hash. */
+                          int pa_match = Printall;
+                          if (!pa_match && data_len >= 16) {
+                            unsigned char pa_mac[16];
+                            MHASH td = mhash_hmac_init(MHASH_MD5, md5buf.h, 16, mhash_get_hash_pblock(MHASH_MD5));
+                            mhash(td, (unsigned char *)newbuf, data_len);
+                            mhash_hmac_deinit(td, pa_mac);
+                            pa_match = (memcmp(pa_mac, checksum, 16) == 0);
+                          }
+                          if (pa_match) {
                             if (!Printall) {
                               PV_DEC(saltsnap[si].PV);
                               { Word_t *PV2;
@@ -22073,21 +22073,21 @@ sha11saltmd5:
                       RC4(&rc4key, edata_len, (unsigned char *)linebuf2, (unsigned char *)newbuf);
                     }
                     hashcnt++;
-                    /* Verify ASN.1 ticket structure:
-                     * dec[8..9] == "63" + ("81" or "82") && dec[11] == 0x30
-                     * OR dec[16..21] == "030500" or dec[16..23] == "050307A0" */
-                    unsigned char *dec = (unsigned char *)newbuf;
-                    int tgs_match = 0;
-                    if (edata_len >= 22 &&
-                        dec[8] == 0x63 && (dec[9] == 0x81 || dec[9] == 0x82) && dec[11] == 0x30)
-                      tgs_match = 1;
-                    if (!tgs_match && edata_len >= 24 &&
-                        dec[16] == 0x03 && dec[17] == 0x05 && dec[18] == 0x00)
-                      tgs_match = 1;
-                    if (!tgs_match && edata_len >= 24 &&
-                        dec[16] == 0x05 && dec[17] == 0x03 && dec[18] == 0x07 && dec[19] == 0xa0)
-                      tgs_match = 1;
-                    if (tgs_match) {
+                    /* Definitive verification: recompute the RC4-HMAC checksum
+                     * over the full decrypted data (HMAC-MD5(K1, decrypted)) and
+                     * require all 16 bytes to equal the stored checksum -- as
+                     * hashcat m13100 (decrypt_and_check) does. The prior
+                     * ASN.1-structure heuristic false-positived: a wrong RC4 key
+                     * can hit the loose byte pattern (notably the 0x82
+                     * long-length case, where the SEQUENCE tag is at dec[12], not
+                     * dec[11]) while the HMAC never matches. */
+                    unsigned char tgs_mac[16];
+                    { MHASH td;
+                      td = mhash_hmac_init(MHASH_MD5, md5buf.h, 16, mhash_get_hash_pblock(MHASH_MD5));
+                      mhash(td, (unsigned char *)newbuf, edata_len);
+                      mhash_hmac_deinit(td, tgs_mac);
+                    }
+                    if (memcmp(tgs_mac, tgs_ck, 16) == 0) {
                       snprintf(linebuf2, MAXLINE*3, "%s", saltsnap[si].salt);
                       PV_DEC(saltsnap[si].PV);
                       if (*saltsnap[si].PV == 0) {

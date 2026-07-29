@@ -1,3 +1,15 @@
+# mdxfind v1.530 — KRB5TGS23 / KRB5PA23: definitive HMAC checksum verification (fixes false positives)
+
+Source: mdxfind.c rev 1.529 → 1.530 (companion hashpipe fix released as hashpipe v1.99).
+
+The Kerberos RC4-HMAC (etype 23) verifiers — **KRB5TGS23** (`-m 13100`, e914) and **KRB5PA23** (e874) — validated a candidate password by checking the RC4-decrypted plaintext's ASN.1 / timestamp byte structure instead of recomputing the cryptographic checksum. A wrong key can hit that loose byte pattern by chance, producing a **false positive** — a reported crack that is not actually the password. (The KRB5TGS23 ASN.1 check additionally mishandled the DER `0x82` long-length encoding, testing the SEQUENCE tag at the wrong offset.)
+
+Fix: both verifiers now recompute `HMAC-MD5(K1, decrypted)` and require all 16 bytes to equal the stored checksum — the definitive test, matching hashcat mode 13100. Verified: a reported false positive is now correctly rejected, valid test vectors still crack, and the full self-test suite passes. The AES etype 17/18 Kerberos types (KRB5PA-17/18, KRB5DB17/18) already performed proper HMAC-SHA1 / key verification and are unchanged.
+
+If you have collected KRB5TGS23 / KRB5PA23 results from earlier builds, re-verify them — some may be spurious.
+
+---
+
 # mdxfind v1.529 — GPU: fix `CL_INVALID_GLOBAL_WORK_SIZE` (-63) on large salted hash lists with many rules
 
 Source: gpu/gpu_opencl.c rev 1.208 → 1.209; mdxfind.c rev 1.528 → 1.529 (documentation / version-anchor only, no functional change in mdxfind.c).
