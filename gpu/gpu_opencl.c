@@ -15965,6 +15965,35 @@ validator_skip:
             }
         }
         salts_per_page = (total_salts < spp_default) ? total_salts : spp_default;
+        /* Work-size guard (2026-07-29): the salt axis rides inside the single
+         * 1-D global work size at the dispatch below
+         * (global = num_words * n_rules * effective_mask_size * salt_axis,
+         *  with salt_axis <= salts_per_page).  AMD GPUs bound a 1-D global
+         * work size to the 32-bit global-ID range, so a large salted hashlist
+         * (salts_per_page up to 8192) times a high rule count overflows it and
+         * clEnqueueNDRangeKernel fails with CL_INVALID_GLOBAL_WORK_SIZE (-63)
+         * -- e.g. 512 words * 20215 rules * 8192 salts = 8.5e10 >> 2^32.  Cap
+         * salts_per_page so the product stays under the device ceiling; the
+         * n_pages computation just below grows to keep every salt covered
+         * (correctness preserved -- fewer salts per page, more pages).  Env
+         * override MDXFIND_GPU_MAX_GLOBAL for devices whose real limit differs. */
+        if (salts_per_page > 0u) {
+            uint64_t max_global = 0xFFF00000ULL; /* ~2^32 - 1M; headroom for the local round-up at dispatch */
+            const char *mg = getenv("MDXFIND_GPU_MAX_GLOBAL");
+            if (mg && *mg) {
+                unsigned long long v = strtoull(mg, NULL, 0);
+                if (v >= 65536ULL) max_global = (uint64_t)v;
+            }
+            uint64_t per_salt = (uint64_t)num_words
+                              * (uint64_t)d->gpu_n_rules
+                              * (uint64_t)effective_mask_size;
+            if (per_salt > 0ull) {
+                uint64_t spp_cap = max_global / per_salt;
+                if (spp_cap < 1ull) spp_cap = 1ull; /* per-salt work alone at the ceiling; enqueue may still error and is caught by the existing GPU_FATAL */
+                if ((uint64_t)salts_per_page > spp_cap)
+                    salts_per_page = (uint32_t)spp_cap;
+            }
+        }
         if (salts_per_page == 0u) {
             /* Defensive: salts_count == 0 should have been caught upstream
              * (gpujob_opencl.c:618 stale-salt protection). Treat as a no-

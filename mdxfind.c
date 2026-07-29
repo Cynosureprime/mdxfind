@@ -245,10 +245,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.528 2026/07/27 19:58:36 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.529 2026/07/29 13:23:45 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.528 2026/07/27 19:58:36 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.529 2026/07/29 13:23:45 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -266,6 +266,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.529  2026/07/29 13:23:45  dlr
+ * v1.529 version anchor: document the OpenCL rules-dispatch salt-page work-size guard at the rules-engine gate. The functional fix is in gpu/gpu_opencl.c rev 1.209 (cap salts_per_page so the 1-D global work size stays under the device 32-bit work-item limit; a large salted hashlist + >1024 rules previously overflowed 2^32 and failed with CL_INVALID_GLOBAL_WORK_SIZE on AMD). No functional change in mdxfind.c; this bumps the header to 1.529 so the release tag stays aligned to the file revision.
+ *
  * Revision 1.528  2026/07/27 19:58:36  dlr
  * e537/phpBB3MD5: document the dual-op loader gate + version-align checkin. Expand the comment above the widened phpBB3 P/H gate to explain why it admits both JOB_PHPBB3 (e455) and JOB_PHPBB3MD5 (e537) and how the post-load salt copy handles the e537 compute fallthrough. This checkin bumps RCS to 1.528 so the file header matches the v1.528 release tag - prior release tags ran one ahead of the header revision; this realigns them. No functional change from 1.527.
  *
@@ -11255,6 +11258,12 @@ while (1) {
         (MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
          MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
          (MaskPrependLen + MaskAppendLen) >= 1);
+    /* v1.529: the OpenCL rules dispatch caps its per-page salt count so the
+       1-D global work size (words x rules x mask x salt-axis) stays under the
+       device's 32-bit work-item limit; without it a large salted hashlist plus
+       a high rule count overflowed and failed the enqueue with
+       CL_INVALID_GLOBAL_WORK_SIZE. See the salts_per_page guard in
+       gpu/gpu_opencl.c. */
     if (gpu_rules_engine_active &&
         (job->op == JOB_MD5 || job->op == JOB_MD5UC || job->op == JOB_MD4 ||
          job->op == JOB_SHA1 || job->op == JOB_SHA224 ||

@@ -1,3 +1,15 @@
+# mdxfind v1.529 — GPU: fix `CL_INVALID_GLOBAL_WORK_SIZE` (-63) on large salted hash lists with many rules
+
+Source: gpu/gpu_opencl.c rev 1.208 → 1.209; mdxfind.c rev 1.528 → 1.529 (documentation / version-anchor only, no functional change in mdxfind.c).
+
+On OpenCL AMD GPUs, `mdxfind` with a salted hash type plus a rule file could fail with `FATAL: GPU error: md5_rules dispatch error -63` (`CL_INVALID_GLOBAL_WORK_SIZE`). It reproduced with a small wordlist, a large salted hash list (≥ 8192 unique salts), and more than ~1024 rules; a ≤ 1k-rule run was unaffected.
+
+Cause: the salted rules dispatch packs the salt axis into a single 1-D OpenCL global work size, `global = num_words × n_rules × mask_size × salt_axis`, where `salt_axis` follows the per-page salt count (default 8192). On AMD GPUs a 1-D global work size is bounded by the 32-bit global-ID range (2³²), and the product crosses it once `num_words × n_rules × salts_per_page > 2³²` — with the common 512-word batch and an 8192-salt page, that is exactly `n_rules > 1024`.
+
+Fix: the per-page salt count is now capped so the resulting global work size stays under the device limit (`salts_per_page ≤ MAX_GLOBAL / (num_words × n_rules × mask_size)`). The cap is applied before the salt-page count is computed, so a smaller page just yields more pages and every salt is still processed — no cracks are lost, and low-rule / unsalted / small-salt workloads are unchanged (the cap is inert unless the product would overflow). The env var `MDXFIND_GPU_MAX_GLOBAL` overrides the ceiling for devices whose limit differs.
+
+---
+
 # mdxfind v1.528 — Fix `-M e537` (PHPBB3MD5): `$P$`/`$H$` hashes now load when e537 is selected without also selecting e455
 
 Source: mdxfind.c rev 1.526 → 1.528. The release tag is realigned to the mdxfind.c `$Header` revision (prior release tags ran one ahead of the file revision; this release restores tag == rev).
