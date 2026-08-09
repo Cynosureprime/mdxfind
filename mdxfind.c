@@ -36,6 +36,7 @@
 #endif
 #include <stdint.h>
 #include <stdatomic.h>
+#include "mdxhost.h"   /* mdx_gethostname() -- gethostname() is Winsock-only on Windows */
 
 #ifdef SPARC
 #define NOTINTEL 1
@@ -133,8 +134,31 @@ const struct Benchrates { int idx; long long rate; } bench_rates[] = {
 ,{INT_MAX,0}
 };
 
-struct Linehints *linehints;   /* defined in mdxfind.h, allocated at runtime */
-int linehints_count;  /* number of entries in linehints[] (highest op + 1) */
+/* Built-in / user-defined op address space (Phase A). Defined here, ahead
+ * of the first per-op accessor, because every accessor routes on it. */
+unsigned Userdef_base = JOB_USERDEF_BASE;   /* derived at startup; see main() */
+/* op <-> user-id mapping. Valid only after Userdef_base is derived. */
+static inline int      op_is_user(unsigned op) { return op >= Userdef_base; }
+static inline unsigned op_user_id(unsigned op) { return op - Userdef_base; }
+static inline unsigned user_id_op(unsigned id) { return Userdef_base + id; }
+
+struct Linehints *linehints;
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types use separate Linehints storage. The built-in
+ * block stays dynamically sized from the selected-op range; the user block
+ * is a fixed USERDEF_MAX table indexed by user id. */
+static struct Linehints Userlinehints[USERDEF_MAX];
+static inline struct Linehints *linehints_ref(unsigned op) {
+    return op_is_user(op) ? &Userlinehints[op_user_id(op)] : &linehints[op];
+}
+#define LINEHINTS(op) (*linehints_ref(op))
+   /* defined in mdxfind.h, allocated at runtime */
+int linehints_count;  /* number of entries in LINEHINTS() (highest op + 1) */
 volatile unsigned long long InflightLines = 0;  /* dispatched but not yet retired */
 
 /* arc4random_buf fallback for glibc < 2.36 and Windows */
@@ -245,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.530 2026/07/29 16:28:22 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.531 2026/08/09 20:14:45 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.530 2026/07/29 16:28:22 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.531 2026/08/09 20:14:45 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -266,6 +290,17 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.531  2026/08/09 20:14:45  dlr
+ * Four new hash types, a heap-corruption fix, a dispatch fan-out fix, and the built-in / user-defined op address separation.
+ *
+ * Types: SCRYPT e884 now also accepts the 7 dollar-sign crypt spelling, normalised at load into the canonical SCRYPT form and emitted in both spellings on a crack. GOST-YESCRYPT e998 mode 46100, validated 25 of 25 against libxcrypt 4.4.27 across real corpus salts. SHA1CRYPT e999 hashcat 15100, liberal on input and conformant on output - the hashcat published example hash is nonconformant in its last 4 characters and is accepted, then reported in the NetBSD spelling. 7ZIP e1000 hashcat 11600, stage 1 AES zero-pad check only so Deflate64 archives crack, which hashcat and john both fail silently. CMIYC e1001, validated against 387 real corpus hashes with known plaintexts.
+ *
+ * Heap corruption, pre-existing: build_compact_table allocated overflow chain entries from the mymalloc arena while compact_resize frees them with free, which aborted as free invalid pointer the first time the compact table doubled. The bcrypt append also wrote one past the end of the hash entry arrays and silently DROPPED hashes once its byte buffer filled. Adds hashdata_reserve and hashdatabuf_reserve so a future append site cannot forget, and removes a hardcoded HashDataCap of 65536 that claimed capacity the arrays might not have.
+ *
+ * Dispatch: the one-word-per-dispatch fan-out gated on a type raw hashes per second rather than its cost per wordlist line, so SCRYPT at 3403 h/s against 1800 salts - about one word per second - was batched 512 words into a single dispatch and ran on one core. Now gates on rate divided by Livesalts. Same failure was hitting SHA1CRYPT.
+ *
+ * Address separation, phases A to C: the user-defined base is derived from the Types array length at startup instead of a hand-maintained constant that the built-in range had already grown into. All 2417 per-op array accesses route through accessors, and built-in and user-defined types now have genuinely separate storage - they are different objects, so aliasing is structurally impossible. Adds a separate DoUser selection bitfield. Fixes 6 sites that indexed Types by op over the full range, which read past the end for any user-defined type that loaded hashes.
+ *
  * Revision 1.530  2026/07/29 16:28:22  dlr
  * KRB5TGS23 + KRB5PA23 (e914/e874): replace the ASN.1/timestamp verification heuristic with the definitive RC4-HMAC checksum recompute -- HMAC-MD5(K1, decrypted) == stored checksum -- matching hashcat m13100 decrypt_and_check. The heuristic false-positived: a wrong RC4 key can hit the loose byte pattern (notably the 0x82 long-length case, where the ASN.1 SEQUENCE tag is at dec[12] not dec[11]) while the HMAC never matches. Validated: the reported false-positive (251027) is now rejected by both tools; password123 test vectors still crack; hashpipe -T KRB5TGS23/KRB5PA23 Pass. AES etype 17/18 (KRB5PA-17/18, KRB5DB17/18) already do proper HMAC-SHA1 / PBKDF2 verification and are unaffected.
  *
@@ -2321,6 +2356,57 @@ static void streebog512_final_wrap(void *ctx, void *dest) {
     unsigned char *d = (unsigned char *)dest;
     for (int i = 0; i < 64; i++) d[i] = tmp[63 - i];
 }
+/* Streebog-256 with STANDARD byte order.
+ *
+ * The bundled Saarinen streebog.c emits the digest byte-reversed relative to
+ * the GOST R 34.11-2012 published vectors (same reason streebog512_final_wrap
+ * above reverses). Verified 2026-08-07 against both official vectors: without
+ * the reversal, M1 comes out as 00557be5...159d instead of 9d151eef...5500.
+ */
+static void sbog256_std(const void *data, size_t len, unsigned char *dest) {
+    unsigned char tmp[32];
+    int i;
+    streebog(tmp, 32, data, len);
+    for (i = 0; i < 32; i++) dest[i] = tmp[31 - i];
+}
+
+/* HMAC-Streebog-256 (block size 64), standard byte order THROUGHOUT --
+ * the key hash, the inner digest, and the final digest are each reversed.
+ *
+ * The uniform-reversal convention is not a guess: all 8 combinations of
+ * (reverse key-hash, reverse inner, reverse final) were computed against
+ * libxcrypt 4.4.27's gost-yescrypt output on 2026-08-07 and exactly one --
+ * this one -- reproduces it. Deviating in any single position yields a
+ * plausible-looking but wrong digest for every candidate.
+ */
+static void hmac_sbog256_std(const unsigned char *key, size_t keylen,
+                             const unsigned char *msg, size_t msglen,
+                             unsigned char *out) {
+    unsigned char kpad[64], ipad[64], opad[64], inner[32];
+    streebog_t stx;
+    size_t i;
+
+    memset(kpad, 0, sizeof(kpad));
+    if (keylen > 64)
+        sbog256_std(key, keylen, kpad);          /* long key -> hashed */
+    else
+        memcpy(kpad, key, keylen);
+
+    for (i = 0; i < 64; i++) { ipad[i] = kpad[i] ^ 0x36; opad[i] = kpad[i] ^ 0x5c; }
+
+    streebog_init(&stx, 32);
+    streebog_update(&stx, ipad, 64);
+    if (msglen) streebog_update(&stx, msg, msglen);
+    streebog_final(inner, &stx);
+    for (i = 0; i < 16; i++) { unsigned char t = inner[i]; inner[i] = inner[31-i]; inner[31-i] = t; }
+
+    streebog_init(&stx, 32);
+    streebog_update(&stx, opad, 64);
+    streebog_update(&stx, inner, 32);
+    streebog_final(out, &stx);
+    for (i = 0; i < 16; i++) { unsigned char t = out[i]; out[i] = out[31-i]; out[31-i] = t; }
+}
+
 /* All-in-one wrapper with standard byte order output */
 static void gost2012_64_std(char *data, int len, unsigned char *dest) {
     unsigned char tmp[64];
@@ -2331,6 +2417,54 @@ static void gost2012_64_std(char *data, int len, unsigned char *dest) {
 extern char *crypt_rn(const char *key, const char *setting, void *data, int size);
 
 #include "argon2/argon2.h"
+
+/* 7-Zip KDF digest context, per thread (2^19 updates per candidate) */
+static __thread EVP_MD_CTX *sevenzip_tls_md;
+
+/* CMIYC (e1001) per-thread block arena: N*64 bytes, 64 MiB at memlog=20.
+ * Grown on demand and kept across candidates -- reallocating 64 MiB per
+ * candidate would dominate a hash that is already memory-bound. */
+static __thread unsigned char *cmiyc_tls_buf;
+static __thread size_t cmiyc_tls_bufsz;
+
+/* ------------------------------------------------------------------
+ * 7-Zip (7zAES) archive records -- JOB_SEVENZIP / e1000 / hashcat 11600.
+ *
+ * Stage 1 (the only thing in the hot path) needs just the last TWO
+ * ciphertext blocks and the pad size, so that is all we keep. The KDF
+ * output depends solely on (salt, log2_iter), so archives are grouped by
+ * that and the 2^19-round key derivation is paid ONCE per group per
+ * candidate no matter how many archives share it. With the CMIYC
+ * challenge_2 set (all saltlen=0, all 2^19) every archive lands in one
+ * group -- five archives for the price of one derivation.
+ * ------------------------------------------------------------------ */
+struct SevenZipRec {
+  char group[96];            /* KDF group key: saltlen:salthex:log2 */
+  unsigned char tail[32];    /* final two ciphertext blocks */
+  int padsize;               /* packedlen - unpackedlen */
+  char *line;                /* full input line: JudyJ key + output */
+};
+static struct SevenZipRec *SevenZipRecs = NULL;
+static int SevenZipCount = 0, SevenZipCap = 0;
+
+static void sevenzip_addrec(const char *group, const unsigned char *tail,
+                            int padsize, const char *line) {
+  if (SevenZipCount >= SevenZipCap) {
+    int nc = SevenZipCap ? SevenZipCap * 2 : 16;
+    struct SevenZipRec *nr = realloc(SevenZipRecs, nc * sizeof(*nr));
+    if (!nr) { fprintf(stderr, "Failed to grow 7zip record table\n"); exit(1); }
+    SevenZipRecs = nr; SevenZipCap = nc;
+  }
+  { struct SevenZipRec *r = &SevenZipRecs[SevenZipCount];
+    snprintf(r->group, sizeof(r->group), "%s", group);
+    memcpy(r->tail, tail, 32);
+    r->padsize = padsize;
+    r->line = strdup(line);
+    if (!r->line) { fprintf(stderr, "Failed to store 7zip hash line\n"); exit(1); }
+  }
+  SevenZipCount++;
+}
+
 
 /* Yescrypt per-thread local memory (reused across calls) */
 static __thread yescrypt_local_t *yescrypt_tls_local;
@@ -2742,6 +2876,18 @@ char *Curfile;
 unsigned long long int Lowline, LowSkip, TotLines, Fileline;
 Pvoid_t HashL;
 Pvoid_t JuniperIVE;  /* secondary mapping: md5crypt hash → original Juniper IVE base64 */
+/* Phase A: DoUser is the SEPARATE selection bitfield for user-defined types,
+ * keyed by user id (0..userdef_count()-1), NOT by synthetic op. It is the
+ * authoritative record of "which user types did the operator select".
+ *
+ * Dohash remains the unified ITERATION set over everything selected, because
+ * the dispatcher must run both kinds and 16 enumeration sites walk it. The
+ * two are kept in sync by userdef_select() below: selection is separated,
+ * iteration deliberately is not. Splitting iteration as well belongs with the
+ * per-op accessor work (Phase B/C), not here. */
+Pvoid_t DoUser;
+
+
 Pvoid_t Dohash, Doload, SaltArray, UserArray, KeyArray, RuleArray, NRuleArray, PepperArray;
 /* JudyJ[] array and individual Judy name aliases defined after JOB_ constants */
 
@@ -2979,8 +3125,25 @@ struct RuleHist {
 char *MD5_user;
 char *combo_pepper;
 Pvoid_t *Typesalt;
+Pvoid_t *UserTypesalt;
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline Pvoid_t *typesalt_ref(unsigned op) {
+    return op_is_user(op) ? &UserTypesalt[op_user_id(op)] : &Typesalt[op];
+}
+#define TYPESALT(op) (*typesalt_ref(op))
+
 Pvoid_t *Typehashsalt; /* parallel Judy: same key as Typesalt, value = ptr to precomputed hash of salt */
-int *Typesaltcnt;      /* max entries per Typesalt[type] */
+int *Typesaltcnt;      /* max entries per TYPESALT(type) */
 long long *Typesaltbytes;    /* total salt string bytes per type */
 struct saltentry {
     char *salt;      /* points into thread-local saltpool (copy of Judy key) */
@@ -2999,6 +3162,23 @@ struct saltentry {
 };
 char **Typesalt2;
 void **Typeuser;
+void **UserTypeuser;
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline void **typeuser_ref(unsigned op) {
+    return op_is_user(op) ? &UserTypeuser[op_user_id(op)] : &Typeuser[op];
+}
+#define TYPEUSER(op) (*typeuser_ref(op))
+
 Pvoid_t UseridJudy;
 char **Typepepper;
 int XOR_key_len;
@@ -3044,6 +3224,23 @@ struct timespec starthash, current;
 
 unsigned int Numsalts, Totsalts, Numrules, Numpeppers;
 volatile unsigned int *Livesalts;
+volatile unsigned int *UserLivesalts;
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline volatile unsigned int *livesalts_ref(unsigned op) {
+    return op_is_user(op) ? &UserLivesalts[op_user_id(op)] : &Livesalts[op];
+}
+#define LIVESALTS(op) (*livesalts_ref(op))
+
 unsigned int Minhashlen, Maxdepth;
 unsigned long long Dupcnt, Insize;
 
@@ -3240,6 +3437,60 @@ void md5crypt_b64encode(const unsigned char *in, char *out) {
       out[j++] = phpitoa64[v & 0x3f];
     }
     out[j] = 0;
+}
+
+/* Encode a 20-byte SHA-1 digest to the NetBSD sha1crypt 28-char form.
+ *
+ * Six groups consume bytes 0..17. Only two bytes remain, so NetBSD pads the
+ * seventh group's third byte with digest[0] -- the FIRST byte, wrapped around,
+ * so byte 0 appears TWICE in the output. From crypt-sha1.c rev 1.11:
+ *   "Only 2 bytes left, so we pad with byte0"
+ *
+ * Confirmed empirically 2026-08-07: all 8262 CMIYC sha1crypt digests decode
+ * with additional_byte == digest[0], across 256 distinct values -- genuinely
+ * the wrap, not a constant.
+ *
+ * WARNING: hashcat's published ST_HASH for -m 15100
+ * ($sha1$20000$75552156$HhYMDdaEHiK3eMIzTldOFPnw.s2Q) uses 0 for that byte and
+ * is NONCONFORMANT; the correct tail is "Wt2Q", not ".s2Q". hashcat only ever
+ * compares the 20 real digest bytes so it never notices. Do NOT "correct" this
+ * encoder to match hashcat -- that would break all 8262 real hashes.
+ */
+static void sha1crypt_b64encode(const unsigned char *d, char *out) {
+    static const int g[7][3] = {
+        {0,1,2}, {3,4,5}, {6,7,8}, {9,10,11}, {12,13,14}, {15,16,17}, {18,19,0}
+    };
+    int i, j = 0;
+    for (i = 0; i < 7; i++) {
+        unsigned int v = (d[g[i][0]] << 16) | (d[g[i][1]] << 8) | d[g[i][2]];
+        out[j++] = phpitoa64[v & 0x3f]; v >>= 6;
+        out[j++] = phpitoa64[v & 0x3f]; v >>= 6;
+        out[j++] = phpitoa64[v & 0x3f]; v >>= 6;
+        out[j++] = phpitoa64[v & 0x3f];
+    }
+    out[j] = 0;
+}
+
+/* Decode a 28-char sha1crypt digest field to 21 raw bytes.
+ * Inverse of sha1crypt_b64encode(). Bytes 0..19 are the real SHA-1 digest;
+ * byte 20 is the additional/wrap byte, which SHOULD equal byte 0 but is not
+ * required to (see the loader's normalisation). Returns 0, or -1 on a
+ * character outside the crypt-base64 alphabet. */
+static int sha1crypt_b64decode(const char *s, unsigned char *out) {
+    int g, k;
+    init_phpatoi64();
+    for (g = 0; g < 7; g++) {
+        unsigned int v = 0;
+        for (k = 0; k < 4; k++) {
+            int d = phpatoi64[(unsigned char)s[g * 4 + k]];
+            if (d < 0) return -1;
+            v |= (unsigned int)d << (6 * k);
+        }
+        out[g * 3 + 0] = (unsigned char)((v >> 16) & 0xff);
+        out[g * 3 + 1] = (unsigned char)((v >> 8) & 0xff);
+        out[g * 3 + 2] = (unsigned char)(v & 0xff);
+    }
+    return 0;
 }
 
 /* Decode phpass base64 (22 chars) to 16 binary bytes.
@@ -3828,6 +4079,134 @@ int b64_encode(char *clrstr, char *b64dst, int inlen) {
   }
   *out = 0;
   return (outlen);
+}
+
+/* ------------------------------------------------------------------
+ * crypt(3) base64 ("./0-9A-Za-z"), LITTLE-endian 6-bit groups.
+ *
+ * This is NOT standard base64: both the alphabet and the bit order
+ * differ. It is the encoding used by the yescrypt family, including
+ * the $7$ scrypt setting (see yescrypt/yescrypt-common.c:184
+ * decode64_uint32_fixed, which these mirror). Added 2026-08-07 for
+ * the $7$ alternate input format of SCRYPT (e884).
+ * ------------------------------------------------------------------ */
+static const char Crypt64_alpha[] =
+  "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+static int crypt64_val(int c) {
+  const char *p = memchr(Crypt64_alpha, c, 64);
+  return p ? (int)(p - Crypt64_alpha) : -1;
+}
+
+/* Decode `nchar` crypt64 chars as one little-endian integer.
+ * Caller keeps nchar * 6 <= 32. Returns 0 on success, -1 on a bad char. */
+static int crypt64_uint32(const char *s, int nchar, unsigned int *out) {
+  unsigned int v = 0;
+  int i;
+  for (i = 0; i < nchar; i++) {
+    int d = crypt64_val((unsigned char)s[i]);
+    if (d < 0) return -1;
+    v |= (unsigned int)d << (6 * i);
+  }
+  *out = v;
+  return 0;
+}
+
+/* Decode a crypt64 run into bytes. Returns byte count, -1 on a bad
+ * char or if the result would exceed outmax. Trailing bits that do
+ * not complete a byte are discarded, matching decode64(). */
+static int crypt64_bytes(const char *s, int nchar,
+                         unsigned char *out, int outmax) {
+  unsigned int acc = 0;
+  int bits = 0, n = 0, i;
+  for (i = 0; i < nchar; i++) {
+    int d = crypt64_val((unsigned char)s[i]);
+    if (d < 0) return -1;
+    acc |= (unsigned int)d << bits;
+    bits += 6;
+    while (bits >= 8) {
+      if (n >= outmax) return -1;
+      out[n++] = (unsigned char)(acc & 0xff);
+      acc >>= 8;
+      bits -= 8;
+    }
+  }
+  return n;
+}
+
+/* Encode the low `srcbits` bits of v as ceil(srcbits/6) crypt64 chars.
+ * Mirrors encode64_uint32_fixed() (yescrypt-common.c:135). Returns the
+ * char count, or -1 if v did not fit in srcbits. Does not NUL-terminate. */
+static int crypt64_enc_uint32(unsigned int v, int srcbits, char *out) {
+  int bits, n = 0;
+  for (bits = 0; bits < srcbits; bits += 6) {
+    out[n++] = Crypt64_alpha[v & 0x3f];
+    v >>= 6;
+  }
+  return v ? -1 : n;
+}
+
+/* Encode bytes as crypt64: 3 bytes -> 4 chars, little-endian groups, with
+ * a short tail emitting ceil(bits/6). Mirrors encode64()
+ * (yescrypt-common.c:157). Returns char count (NUL-terminated), -1 on
+ * overflow. 32 bytes -> 43 chars. */
+static int crypt64_enc_bytes(const unsigned char *in, int inlen, char *out) {
+  int i = 0, n = 0;
+  while (i < inlen) {
+    unsigned int value = 0;
+    int bits = 0, k;
+    do {
+      value |= (unsigned int)in[i++] << bits;
+      bits += 8;
+    } while (bits < 24 && i < inlen);
+    k = crypt64_enc_uint32(value, bits, out + n);
+    if (k < 0) return -1;
+    n += k;
+  }
+  out[n] = 0;
+  return n;
+}
+
+/* base64url (RFC 4648 §5): '-' and '_' for 62/63, no padding.
+ * Used by the $cmiyc$ format for both the 22-char salt and 43-char hash. */
+static const char B64url_alpha[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+static int b64url_val(int c) {
+  const char *p = memchr(B64url_alpha, c, 64);
+  return p ? (int)(p - B64url_alpha) : -1;
+}
+
+/* Decode `nchar` unpadded base64url chars. Returns byte count, -1 on error. */
+static int b64url_dec(const char *s, int nchar, unsigned char *out, int outmax) {
+  unsigned int acc = 0;
+  int bits = 0, n = 0, i;
+  for (i = 0; i < nchar; i++) {
+    int d = b64url_val((unsigned char)s[i]);
+    if (d < 0) return -1;
+    acc = (acc << 6) | (unsigned int)d;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (n >= outmax) return -1;
+      out[n++] = (unsigned char)((acc >> bits) & 0xff);
+    }
+  }
+  return n;
+}
+
+/* Encode to unpadded base64url. Returns char count (NUL-terminated). */
+static int b64url_enc(const unsigned char *in, int inlen, char *out) {
+  unsigned int acc = 0;
+  int bits = 0, n = 0, i;
+  for (i = 0; i < inlen; i++) {
+    acc = (acc << 8) | in[i];
+    bits += 8;
+    while (bits >= 6) { bits -= 6; out[n++] = B64url_alpha[(acc >> bits) & 0x3f]; }
+  }
+  if (bits) out[n++] = B64url_alpha[(acc << (6 - bits)) & 0x3f];
+  out[n] = 0;
+  return n;
 }
 
 char *rot13(char *pass, char *dest, int len) {
@@ -4720,9 +5099,9 @@ struct MapHashcat {
     {130,  803},  /* sha1(utf16le($pass).$salt) */
     {131,  850},  /* 131 | MSSQL (2000) */
     {132,  851},  /* 132 | MSSQL (2005) */
-    {133,  858},  /* 133 | JudyJ[JOB_PEOPLESOFT] */
+    {133,  858},  /* 133 | JUDYJ(JOB_PEOPLESOFT) */
     {140,  804},  /* sha1($salt.utf16le($pass)) */
-    {141,  859},  /* 141 | JudyJ[JOB_EPISERVER] 6.x < .NET 4 */
+    {141,  859},  /* 141 | JUDYJ(JOB_EPISERVER) 6.x < .NET 4 */
     {150,  793},  /* HMAC-SHA1 (key = $pass) */
     {160,  215},
     {170,  727},
@@ -4747,7 +5126,7 @@ struct MapHashcat {
     {1421, 860},  /* 1421 | hMailServer */
     {1430, 806},  /* sha256(utf16le($pass).$salt) */
     {1440, 807},  /* sha256($salt.utf16le($pass)) */
-    {1441, 859},  /* 1441 | JudyJ[JOB_EPISERVER] 6.x >= .NET 4 */
+    {1441, 859},  /* 1441 | JUDYJ(JOB_EPISERVER) 6.x >= .NET 4 */
     {1450, 795},  /* HMAC-SHA256 (key = $pass) */
     {1460, 217},
     {1470, 805},  /* sha256(utf16le($pass)) */
@@ -4836,7 +5215,7 @@ struct MapHashcat {
     {6800, 899},  /* 6800 | LastPass + LastPass sniffed */
     {6900, 13},
     {7000, 900},  /* 7000 | FortiGate (FortiOS) */
-    {7100, 533},  /* 7100 | OSX v10.8+ (JudyJ[JOB_PKCS5S2]-SHA512) */
+    {7100, 533},  /* 7100 | OSX v10.8+ (JUDYJ(JOB_PKCS5S2)-SHA512) */
     {7200, 533},  /* 7200 | GRUB 2 (PBKDF2-SHA512 via $ml$ conversion) */
     {7300, 872},  /* 7300 | IPMI2 RAKP HMAC-SHA1 */
     {7350, 873},  /* 7350 | IPMI2 RAKP HMAC-MD5 */
@@ -4847,12 +5226,12 @@ struct MapHashcat {
     {7701, 923},  /* 7701 | SAP CODVN B (BCODE) 4-byte */
     {7800, 924},  /* 7800 | SAP CODVN F/G (PASSCODE) */
     {7801, 925},  /* 7801 | SAP CODVN F/G (PASSCODE) 5-byte */
-    {7900, 876},  /* 7900 | JudyJ[JOB_DRUPAL7] */
+    {7900, 876},  /* 7900 | JUDYJ(JOB_DRUPAL7) */
     {8000, 877},  /* 8000 | Sybase ASE */
     {8100, 878},  /* 8100 | Citrix NetScaler  */
     {8200, 65535}, /* 8200 | 1Password, cloudkeychain */
     {8300, 879},  /* 8300 | DNSSEC (NSEC3) */
-    {8400, 880},  /* 8400 | JudyJ[JOB_WBB3] */
+    {8400, 880},  /* 8400 | JUDYJ(JOB_WBB3) */
     {8500, 881},  /* RACF */
     {8501, 926},  /* 8501 | AS/400 DES */
     {8600, 882},  /* 8600 | Lotus Notes/Domino 5  */
@@ -4861,7 +5240,7 @@ struct MapHashcat {
     {8900, 884},  /* scrypt */
     {9000, 65535}, /* 9000 | Password Safe v2 */
     {9100, 901},  /* 9100 | Lotus Notes/Domino 8 */
-    {9200, 529},  /* 9200 | Cisco-IOS $8$ (JudyJ[JOB_PKCS5S2]-SHA256) */
+    {9200, 529},  /* 9200 | Cisco-IOS $8$ (JUDYJ(JOB_PKCS5S2)-SHA256) */
     {9300, 917},   /* 9300 | Cisco-IOS $9$ (scrypt) */
     {9400, 65535}, /* 9400 | MS Office 2007  */
     {9500, 65535}, /* 9500 | MS Office 2010 */
@@ -4873,7 +5252,7 @@ struct MapHashcat {
     {9810, 65535}, /* MS office */
     {9820, 65535}, /* MS office */
     {9900, 264},
-    {10000, 530},  /* 10000 | Django (JudyJ[JOB_PKCS5S2]-SHA256) */
+    {10000, 530},  /* 10000 | Django (JUDYJ(JOB_PKCS5S2)-SHA256) */
     {10100, 902},  /* SipHash */
     {10200, 903},  /* CRAM-MD5 */
     {10300, 904},   /* 10300 | SAP CODVN H (PWDSALTEDHASH) iSSHA-1 */
@@ -4889,7 +5268,7 @@ struct MapHashcat {
     {10830, 814},  /* 10830 | sha384(utf16le($pass).$salt) */
     {10840, 815},  /* 10840 | sha384($salt.utf16le($pass)) */
     {10870, 813},  /* 10870 | sha384(utf16le($pass)) */
-    {10900, 530},  /* 10900 | JudyJ[JOB_PKCS5S2]-HMAC-SHA256 */
+    {10900, 530},  /* 10900 | JUDYJ(JOB_PKCS5S2)-HMAC-SHA256 */
     {10901, 905},  /* 10901 | RedHat 389-DS LDAP (PBKDF2-HMAC-SHA256) */
     {11000, 394},  /* 11000 | PrestaShop - md5($salt.$pass) */
     {11100, 906},   /* 11100 | PostgreSQL CRAM (MD5) */
@@ -4897,7 +5276,7 @@ struct MapHashcat {
     {11300, 65535}, /* 11300 | Bitcoin/Litecoin wallet.dat */
     {11400, 65535}, /* 11400 | SIP digest authentication (MD5) */
     {11500, 65535}, /* CRC32 */
-    {11600, 65535}, /* 11600 | 7-Zip  */
+    {11600, 1000},  /* 11600 | 7-Zip (7zAES)  */
     {11700, 427},
     {11750, 837},  /* 11750 | HMAC-Streebog-256 (key = $pass) */
     {11760, 838},  /* 11760 | HMAC-Streebog-256 (key = $salt) */
@@ -4905,10 +5284,10 @@ struct MapHashcat {
     {11800, 428},  /* 11800 | GOST R 34.11-2012 (Streebog) 512-bit */
     {11850, 839},  /* 11850 | HMAC-Streebog-512 (key = $pass) */
     {11860, 840},  /* 11860 | HMAC-Streebog-512 (key = $salt) */
-    {11900, 531},  /* 11900 | JudyJ[JOB_PKCS5S2]-HMAC-MD5 */
-    {12000, 532},  /* 12000 | JudyJ[JOB_PKCS5S2]-HMAC-SHA1 */
-    {12001, 534},  /* 12001 | Atlassian (JudyJ[JOB_PKCS5S2]-HMAC-SHA1)  */
-    {12100, 533},  /* 12100 | JudyJ[JOB_PKCS5S2]-HMAC-SHA512 */
+    {11900, 531},  /* 11900 | JUDYJ(JOB_PKCS5S2)-HMAC-MD5 */
+    {12000, 532},  /* 12000 | JUDYJ(JOB_PKCS5S2)-HMAC-SHA1 */
+    {12001, 534},  /* 12001 | Atlassian (JUDYJ(JOB_PKCS5S2)-HMAC-SHA1)  */
+    {12100, 533},  /* 12100 | JUDYJ(JOB_PKCS5S2)-HMAC-SHA512 */
     {12150, 908},   /* 12150 | Apache Shiro 1 SHA-512 */
     {12200, 909},   /* 12200 | eCryptfs */
     {12300, 910},   /* 12300 | Oracle T: Type (Oracle 12+) */
@@ -4954,12 +5333,12 @@ struct MapHashcat {
     {14800, 65535}, /* 14800 | iTunes backup >= 10.0 */
     {14900, 65535},
     {15000, 65535}, /* 15000 | FileZilla Server >= 0.9.55 */
-    {15100, 65535}, /* 15100 | Juniper/NetBSD sha1crypt */
+    {15100, 999},   /* 15100 | Juniper/NetBSD sha1crypt */
     {15200, 65535}, /* 15200 | Blockchain, My Wallet, V2 */
     {15300, 65535}, /* 15300 | DPAPI masterkey file v1 and v2  */
     {15400, 65535}, /* ChaCha20 */
     {15500, 65535}, /* 15500 | JKS Java Key Store Private Keys (SHA1) */
-    {15600, 65535}, /* 15600 | Ethereum Wallet, JudyJ[JOB_PKCS5S2]-HMAC-SHA256 */
+    {15600, 65535}, /* 15600 | Ethereum Wallet, JUDYJ(JOB_PKCS5S2)-HMAC-SHA256 */
     {15700, 65535}, /* 15700 | Ethereum Wallet, SCRYPT */
     {16100, 930},  /* 16100 | TACACS+ */
     {16200, 931},  /* 16200 | Apple Secure Notes */
@@ -5089,6 +5468,7 @@ struct MapHashcat {
     {35500, 993},  /* 35500 | WordPress bcrypt(hmac-sha384($pass)) */
     {35600, 994},  /* 35600 | gost12512crypt */
     {35800, 992},  /* 35800 | Symfony Legacy SHA256 */
+    {46100, 998},  /* 46100 | gost-yescrypt (team-local mode; not upstream hashcat) */
     {67000, 995},  /* 67000 | yescrypt */
     {65535, 65535}}; /*EOF */
 
@@ -5552,6 +5932,10 @@ char *Types[] = {
     "YESCRYPT",
     "MD5SHA256SHA256",
     "BSDICRYPT",
+    "GOST-YESCRYPT",
+    "SHA1CRYPT",
+    "7ZIP",
+    "CMIYC",
 
 NULL
 
@@ -6577,12 +6961,50 @@ NULL
 #define JOB_YESCRYPT        995
 #define JOB_MD5SHA256SHA256 996
 #define JOB_BSDICRYPT       997
+#define JOB_GOSTYESCRYPT    998
+#define JOB_SHA1CRYPT       999
+#define JOB_SEVENZIP        1000
+#define JOB_CMIYC           1001
 
 #define JOB_DONE 2000
 
 /* Hash-lookup Judy arrays indexed by JOB_ constant. */
 Pvoid_t JudyJ[JOB_DONE];
+Pvoid_t UserJudyJ[USERDEF_MAX];
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline Pvoid_t *judyj_ref(unsigned op) {
+    return op_is_user(op) ? &UserJudyJ[op_user_id(op)] : &JudyJ[op];
+}
+#define JUDYJ(op) (*judyj_ref(op))
+
 char Typedone[JOB_DONE];
+char UserTypedone[USERDEF_MAX];
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline char *typedone_ref(unsigned op) {
+    return op_is_user(op) ? &UserTypedone[op_user_id(op)] : &Typedone[op];
+}
+#define TYPEDONE(op) (*typedone_ref(op))
+
 
 
 #define TYPEOPT_NEEDSJ     1
@@ -7130,10 +7552,10 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [527] = TYPEOPT_NEEDSF,  /* MD5BASE64BASE64BASE64 */
     [528] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5-SALTSHA1SALTPASS */
     [529] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* CISCO8 */
-    [530] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JudyJ[JOB_PKCS5S2]-SHA256 */
-    [531] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JudyJ[JOB_PKCS5S2]-MD5 */
-    [532] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JudyJ[JOB_PKCS5S2]-SHA1 */
-    [533] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JudyJ[JOB_PKCS5S2]-SHA512 */
+    [530] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JUDYJ(JOB_PKCS5S2)-SHA256 */
+    [531] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JUDYJ(JOB_PKCS5S2)-MD5 */
+    [532] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JUDYJ(JOB_PKCS5S2)-SHA1 */
+    [533] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JUDYJ(JOB_PKCS5S2)-SHA512 */
     [534] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* PKCS5S2 */
     [535] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* SHA1-CUSTOMUSERSALT */
     [536] = TYPEOPT_NEEDSF,  /* PROGRESSENCODE */
@@ -7480,7 +7902,7 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [877] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* SYBASE_ASE */
     [878] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* NETSCALER */
     [879] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* NSEC3 */
-    [880] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JudyJ[JOB_WBB3] */
+    [880] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JUDYJ(JOB_WBB3) */
     [881] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* RACF */
     [882] = TYPEOPT_NEEDSJ,  /* DOMINO5 */
     [883] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* DOMINO6 */
@@ -7598,7 +8020,29 @@ static unsigned short TypeOpts[JOB_DONE] = {
 [995] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* YESCRYPT */
     [996] = TYPEOPT_NEEDSF,  /* MD5SHA256SHA256 */
     [997] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BSDICRYPT */
+    [998] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* GOST-YESCRYPT */
+    [999] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* SHA1CRYPT */
+    [1000] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* 7ZIP */
+    [1001] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CMIYC */
 };
+static unsigned short UserTypeOpts[USERDEF_MAX];
+
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline unsigned short *typeopts_ref(unsigned op) {
+    return op_is_user(op) ? &UserTypeOpts[op_user_id(op)] : &TypeOpts[op];
+}
+#define TYPEOPTS(op) (*typeopts_ref(op))
+
 
 unsigned long Iter_Count[] = {0, 10, 10, 100, 100, 1000, 1000, 1000, 1000, 10000, 10000, 10000, 10000, 100000, 100000, 100000, 100000};
 
@@ -8083,6 +8527,23 @@ static int BruteForceMode = 0;
 static unsigned long long BruteForceTotal = 0;  /* total keyspace */
 static volatile unsigned long long BruteForceProgress = 0;  /* candidates dispatched so far */
 atomic_ullong *Totalfound[JOB_DONE], *RuleCnt;
+atomic_ullong *UserTotalfound[USERDEF_MAX];
+
+/* ---- Phase B per-op accessor -------------------------------------------
+ * All access to this per-op array goes through this reference function.
+ * The body is a plain redirect today (storage is still one shared range);
+ * Phase C flips built-in vs user-defined to genuinely separate storage by
+ * changing THIS FUNCTION ONLY, not the call sites. */
+/* Phase C: user-defined types now live in SEPARATE storage, indexed by user
+ * id (0..USERDEF_MAX-1), not by synthetic op. Built-in and user state can no
+ * longer alias each other even if the op ranges were somehow to overlap --
+ * they are different objects. This routing is the ONLY place that knows the
+ * split; all 2,417 call sites go through the macro. */
+static inline atomic_ullong **totalfound_ref(unsigned op) {
+    return op_is_user(op) ? &UserTotalfound[op_user_id(op)] : &Totalfound[op];
+}
+#define TOTALFOUND(op) (*totalfound_ref(op))
+
 
 /* SIGUSR1 pauses, SIGUSR2 resumes (Unix); named events (Windows) */
 volatile int MDXpause = 0;
@@ -8222,7 +8683,11 @@ static void compact_resize(void) {
             prev = NULL;
             while (next) {
                 if (hlen < next->len) break;
-                if (memcmp(hash + 8, next->hash, hlen - 8) <= 0) break;
+                /* Only compare bytes when the lengths match. The chain is ordered
+                 * by length first, so hlen > next->len simply means keep walking --
+                 * comparing here read hlen-8 bytes out of an entry that holds only
+                 * next->len-8 (raw32 vs raw96 in one file overruns by 32 bytes). */
+                if (hlen == next->len && memcmp(hash + 8, next->hash, hlen - 8) <= 0) break;
                 prev = next;
                 next = next->next;
             }
@@ -8292,7 +8757,11 @@ static int compact_insert(void) {
 
         while (next) {
             if (hlen < next->len) break;
-            if (memcmp(hash + 8, next->hash, hlen - 8) <= 0) break;
+            /* Only compare bytes when the lengths match. The chain is ordered
+             * by length first, so hlen > next->len simply means keep walking --
+             * comparing here read hlen-8 bytes out of an entry that holds only
+             * next->len-8 (raw32 vs raw96 in one file overruns by 32 bytes). */
+            if (hlen == next->len && memcmp(hash + 8, next->hash, hlen - 8) <= 0) break;
             prev = next;
             next = next->next;
         }
@@ -8329,7 +8798,7 @@ char any=0;
   J1F(RC, Dohash, ti);
   while (RC) {
     if (ti < JOB_DONE) {
-      if ((TypeOpts[ti] & TYPEOPT_NEEDSALT) && !(TypeOpts[ti] & TYPEOPT_NEEDSJ) && !Typesalt[ti] && !SaltArray) {
+      if ((TYPEOPTS(ti) & TYPEOPT_NEEDSALT) && !(TYPEOPTS(ti) & TYPEOPT_NEEDSJ) && !TYPESALT(ti) && !SaltArray) {
 	Dosalt[Dosaltcnt++] = ti;
         any = 1;
       }
@@ -8373,7 +8842,7 @@ char any=0;
   fprintf(stderr, "Generated %d salts\n", num);
   for (x=0; x <Dosaltcnt; x++) {
     fprintf(stderr,"Added to %s salts\n",Types[Dosalt[x]]);
-    Typesalt[Dosalt[x]] = lsalt;
+    TYPESALT(Dosalt[x]) = lsalt;
   }
   Numsalts += num;
 }
@@ -8587,6 +9056,15 @@ static const struct { int job; const char *salt; } default_salts[] = {
   { JOB_WPBCRYPT, "$2b$05$RndSa1tRndSa1tRndSa1tu" },
   { JOB_GOST12512CRYPT, "$gost12512hash$defaultS$" },
   { JOB_YESCRYPT, "$y$j9T$oJqQoBLMgF5$" },
+  /* verified against libxcrypt 4.4.27 gost-yescrypt 2026-08-07 */
+  { JOB_GOSTYESCRYPT, "$gy$j9T$2WmURad1wKLkIzjayhv/41$" },
+  { JOB_SHA1CRYPT, "$sha1$5000$rndSa1t$" },
+  /* KDF group of the verified spec vector (tv.7z, pw Hiems20%) */
+  { JOB_SEVENZIP, "0::19" },
+  /* -z at rounds=1/memlog=10: the live parameters (4/20) would make -z take
+   * ~7 seconds per password, which makes it useless for generating vectors.
+   * The parameters are visible in the emitted string, so there is no ambiguity. */
+  { JOB_CMIYC, "$cmiyc$2026$1$10$AAAAAAAAAAAAAAAAAAAAAA$" },
   { 0, NULL }
 };
 static const struct { int job; const char *user; } default_users[] = {
@@ -8603,12 +9081,12 @@ static void init_default_salts(void) {
   if (!Printall) return;
   for (i = 0; default_salts[i].salt; i++) {
     int j = default_salts[i].job;
-    if (Typesalt[j]) continue;
+    if (TYPESALT(j)) continue;
     /* Don't insert defaults if -s provided salts (SaltArray will copy later) */
-    if (SaltArray && (TypeOpts[j] & TYPEOPT_NEEDSALT)) continue;
+    if (SaltArray && (TYPEOPTS(j) & TYPEOPT_NEEDSALT)) continue;
     J1T(RC, Dohash, j);
     if (RC) {
-      JSLI(PV, Typesalt[j], (unsigned char *)default_salts[i].salt);
+      JSLI(PV, TYPESALT(j), (unsigned char *)default_salts[i].salt);
       if (PV) {
         *PV = 1000000;
         Typesaltcnt[j]++;
@@ -8618,10 +9096,10 @@ static void init_default_salts(void) {
   }
   for (i = 0; default_users[i].user; i++) {
     int j = default_users[i].job;
-    if (Typeuser[j]) continue;
+    if (TYPEUSER(j)) continue;
     J1T(RC, Dohash, j);
     if (RC) {
-      JSLI(PV, Typeuser[j], (unsigned char *)default_users[i].user);
+      JSLI(PV, TYPEUSER(j), (unsigned char *)default_users[i].user);
       if (PV) *PV = 1000000;
     }
   }
@@ -8798,7 +9276,7 @@ possess(FreeWaiting);
 #endif
             if (RuleCnt)
               atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-            atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+            atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -8881,7 +9359,7 @@ release(FreeWaiting);
 possess(FreeWaiting);
 #endif
 	if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-        atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+        atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -8958,7 +9436,7 @@ int checkhashwerkzeug(union HashU *curin, int len, char *key, const char *prefix
   possess(FreeWaiting);
 #endif
   if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
   release(FreeWaiting);
 #endif
@@ -9017,7 +9495,7 @@ int checkhash_netscaler512(union HashU *curin, int len, char *salt, int saltlen,
   possess(FreeWaiting);
 #endif
   if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
   release(FreeWaiting);
 #endif
@@ -9073,7 +9551,7 @@ int checkhash_netwitness(union HashU *curin, int len, char *salt, int saltlen, s
   possess(FreeWaiting);
 #endif
   if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
   release(FreeWaiting);
 #endif
@@ -9128,7 +9606,7 @@ int checkhash_authme(union HashU *curin, int len, char *salt, int saltlen, struc
   possess(FreeWaiting);
 #endif
   if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
   release(FreeWaiting);
 #endif
@@ -9233,7 +9711,7 @@ possess(FreeWaiting);
 #endif
           if (RuleCnt)
             atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-          atomic_fetch_add(&Totalfound[job->op - 1][x > 0 ? x - 1 : 0],1);
+          atomic_fetch_add(&TOTALFOUND(job->op - 1)[x > 0 ? x - 1 : 0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -9345,7 +9823,7 @@ possess(FreeWaiting);
 #endif
           if (RuleCnt)
             atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-          atomic_fetch_add(&Totalfound[job->op - 1][x > 0 ? x-1 : 0],1);
+          atomic_fetch_add(&TOTALFOUND(job->op - 1)[x > 0 ? x-1 : 0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -9458,7 +9936,7 @@ possess(FreeWaiting);
 #endif
             if (RuleCnt)
               atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-            atomic_fetch_add(&Totalfound[job->op - 1][x > 0 ? x-1 : 0],1);
+            atomic_fetch_add(&TOTALFOUND(job->op - 1)[x > 0 ? x-1 : 0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -9553,7 +10031,7 @@ possess(FreeWaiting);
 #endif
         if (RuleCnt)
           atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-        atomic_fetch_add(&Totalfound[job->op - 1][x > 0 ? x - 1 : 0],1);
+        atomic_fetch_add(&TOTALFOUND(job->op - 1)[x > 0 ? x - 1 : 0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -9661,7 +10139,7 @@ possess(FreeWaiting);
 #endif
     if (RuleCnt)
       atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-    atomic_fetch_add(&Totalfound[job->op - 1][x > 0 ? x - 1 : 0],1);
+    atomic_fetch_add(&TOTALFOUND(job->op - 1)[x > 0 ? x - 1 : 0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -9753,7 +10231,7 @@ struct Hashchain found;
 possess(FreeWaiting);
 #endif
       if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-      atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -9796,7 +10274,7 @@ possess(FreeWaiting);
 #endif
   if (RuleCnt)
     atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -10716,13 +11194,13 @@ saltpool = NULL;
       if (Typesaltcnt[sti] > maxcnt) maxcnt = Typesaltcnt[sti];
       if (Typesaltbytes[sti] > maxbytes) maxbytes = Typesaltbytes[sti];
       /* HMAC key=$salt types use Typeuser — count those too */
-      if (Typeuser && Typeuser[sti]) {
+      if (Typeuser && TYPEUSER(sti)) {
         Word_t cnt = 0;
         long long bytes = 0;
         unsigned char tbuf[MAXLINE];
         tbuf[0] = 0;
-        JSLF(PV, Typeuser[sti], tbuf);
-        while (PV) { cnt++; bytes += mystrlen((char *)tbuf) + 1; JSLN(PV, Typeuser[sti], tbuf); }
+        JSLF(PV, TYPEUSER(sti), tbuf);
+        while (PV) { cnt++; bytes += mystrlen((char *)tbuf) + 1; JSLN(PV, TYPEUSER(sti), tbuf); }
         if (cnt > (Word_t)maxcnt) maxcnt = (int)cnt;
         if (bytes > maxbytes) maxbytes = bytes;
       }
@@ -11118,7 +11596,7 @@ while (1) {
   lineproc = 0;
   snap_valid = 0;
   nsalts_job = 0;
-  if (saltsnap && Typesalt[job->op] && !Typedone[job->op]) {
+  if (saltsnap && TYPESALT(job->op) && !TYPEDONE(job->op)) {
     if (Typehashsalt[job->op] && (job->op == JOB_MD5_MD5SALTMD5PASS ||
         job->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
         job->op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
@@ -11127,10 +11605,10 @@ while (1) {
                       Typehashsalt[job->op], tsalt, Printall);
     } else {
       nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                      Typesalt[job->op], tsalt, Printall);
+                      TYPESALT(job->op), tsalt, Printall);
     }
     snap_valid = 1;
-    if (!nsalts_job) Typedone[job->op] = 1;
+    if (!nsalts_job) TYPEDONE(job->op) = 1;
   }
 
   /* Track lowest active line at job start */
@@ -11157,12 +11635,12 @@ while (1) {
       if (hashcnt) {
         Tothash += hashcnt;
         if (linehints && job->op < linehints_count)
-          __sync_fetch_and_add(&linehints[job->op].hashes_accum, hashcnt);
+          __sync_fetch_and_add(&LINEHINTS(job->op).hashes_accum, hashcnt);
       }
       if (found) Totfound += found;
       if (rulecnt) Totrules += rulecnt;
       if (lineproc && linehints && job->op < linehints_count)
-        __sync_fetch_and_add(&linehints[job->op].retired_line, lineproc);
+        __sync_fetch_and_add(&LINEHINTS(job->op).retired_line, lineproc);
       if (lineproc)
         __sync_fetch_and_sub(&InflightLines, lineproc);
       lineproc = hashcnt = rulecnt = found = 0;
@@ -12844,16 +13322,16 @@ do {
           /* salt snapshot for this pass */
           if (uses_salt && !snap_valid) {
             nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                              Typesalt[job->op], tsalt, Printall);
+                              TYPESALT(job->op), tsalt, Printall);
             snap_valid = 1;
-            if (!nsalts_job) { Typedone[job->op] = 1; break; }
+            if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
           }
           { int nsalts = uses_salt ? nsalts_job : 1;
             int si;
             for (si = 0; si < nsalts; si++) {
               const char *ssalt = uses_salt ? saltsnap[si].salt : "";
               int slen = uses_salt ? saltsnap[si].saltlen : 0;
-              Pvoid_t ujudy = uses_user ? (Pvoid_t)Typeuser[job->op] : NULL;
+              Pvoid_t ujudy = uses_user ? (Pvoid_t)TYPEUSER(job->op) : NULL;
               char ubuf[MAXLINE+1];
               int did_user = 0;
               ubuf[0] = 0;
@@ -12918,7 +13396,7 @@ do {
         hashcnt++;
         memset(cur + len, 0, len % 16);
         myprogress(cur, len, linebuf);
-        JSLG(PV, JudyJ[JOB_PROGRESSENCODE], (unsigned char *)linebuf);
+        JSLG(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)linebuf);
         if (Printall || (PV && *PV == 0)) {
 	  if (!Printall) *PV = 1;
 	  prfound(job,linebuf);
@@ -12926,14 +13404,14 @@ do {
         break;
 
       case JOB_SHA1_CUSTOMUSERSALT:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	  x = saltsnap[si].saltlen;
@@ -12976,21 +13454,21 @@ do {
 	    }
 	  }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_PKCS5S2:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* iterate unique salts from Typesalt Judy */
 	/* Typesalt key = base64-encoded 16-byte raw salt */
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    i = b64_decode(saltsnap[si].salt, linebuf, &cryptlen);
@@ -13001,7 +13479,7 @@ do {
 	    { char expect[128];
 	      memcpy(expect, "{PKCS5S2}", 9);
 	      b64_encode(newbuf, expect + 9, 48);
-	      JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+	      JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 	      if (Printall || (PV && *PV == 0)) {
 		if (!Printall) {
 		  *PV = 1;
@@ -13014,23 +13492,23 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
 
 
       case JOB_PBKDF2_MD5:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* iterate unique salts from Typesalt Judy */
 	/* key = "md5:ITERS:SALT_B64" or "pbkdf2_md5$ITERS$SALT" */
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    /* parse iterations and salt from prefix */
@@ -13054,7 +13532,7 @@ do {
 		{ char expect[256];
 		  int pfxlen = sprintf(expect, "%s%c", saltsnap[si].salt, sep);
 		  b64_encode((char *)curin.h, expect + pfxlen, 32);
-		  JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		  JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  if (Printall || (PV && *PV == 0)) {
 		    if (!Printall) {
 		      *PV = 1;
@@ -13069,21 +13547,21 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_PBKDF2_SHA1:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* iterate unique salts from Typesalt Judy */
 	/* key = "sha1:ITERS:SALT_B64" or "pbkdf2_sha1$ITERS$SALT" */
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    s = saltsnap[si].salt;
@@ -13106,11 +13584,11 @@ do {
 		{ char expect[256];
 		  int pfxlen = sprintf(expect, "%s%c", saltsnap[si].salt, sep);
 		  b64_encode((char *)curin.h, expect + pfxlen, 20);
-		  JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		  JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  if (!PV) {
 		    /* try truncated 16-byte output */
 		    b64_encode((char *)curin.h, expect + pfxlen, 16);
-		    JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
 		  if (Printall || (PV && *PV == 0)) {
 		    if (!Printall) {
@@ -13126,21 +13604,21 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_PBKDF2_SHA512:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* iterate unique salts from Typesalt Judy */
 	/* key = "sha512:ITERS:SALT_B64" or "$ml$ITERS$HEXSALT" */
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    s = saltsnap[si].salt + 1;
@@ -13173,11 +13651,11 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, i);
 		  else
 		    prmd5(curin.h, expect + pfxlen, 128);
-		  JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		  JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  if (!PV && sep == ':') {
 		    /* try truncated 16-byte output */
 		    b64_encode((char *)curin.h, expect + pfxlen, 16);
-		    JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
 		  if (Printall || (PV && *PV == 0)) {
 		    if (!Printall) {
@@ -13193,21 +13671,21 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_PBKDF2_SHA256:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* iterate unique salts from Typesalt Judy */
 	/* key = "sha256:ITERS:SALT_B64" or "pbkdf2_sha256$ITERS$SALT" */
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    s = saltsnap[si].salt;
@@ -13230,11 +13708,11 @@ do {
 		{ char expect[256];
 		  int pfxlen = sprintf(expect, "%s%c", saltsnap[si].salt, sep);
 		  b64_encode((char *)curin.h, expect + pfxlen, 32);
-		  JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		  JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  if (!PV) {
 		    /* try truncated 24-byte output */
 		    b64_encode((char *)curin.h, expect + pfxlen, 24);
-		    JSLG(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)expect);
+		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
 		  if (Printall || (PV && *PV == 0)) {
 		    if (!Printall) {
@@ -13250,20 +13728,20 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_CISCO8:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* JudyJ[JOB_CISCO8]: iterate unique salts from Typesalt Judy */
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    hashcnt++;
@@ -13276,7 +13754,7 @@ do {
 	    php64_encode((char *)curin.h, c8_full + 18, 32);
 	    c8_full[61] = 0;
 	    { Word_t *PV2;
-	      JSLG(PV2, JudyJ[JOB_CISCO8],(unsigned char *)c8_full);
+	      JSLG(PV2, JUDYJ(JOB_CISCO8),(unsigned char *)c8_full);
 	      if (Printall || (PV2 && *PV2 == 0)) {
 	        if (!Printall) {
 	          *PV2 = 1;
@@ -13289,21 +13767,21 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_CISCO9:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	/* Cisco-IOS $9$ (9300): scrypt(pass, salt, 16384, 1, 1, 32) */
 	if (len > MAXLINE) break;
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    hashcnt++;
@@ -13320,7 +13798,7 @@ do {
 	    php64_encode((char *)curin.h, c9_full + 18, 32);
 	    c9_full[61] = 0;
 	    { Word_t *PV2;
-	      JSLG(PV2, JudyJ[JOB_CISCO9],(unsigned char *)c9_full);
+	      JSLG(PV2, JUDYJ(JOB_CISCO9),(unsigned char *)c9_full);
 	      if (Printall || (PV2 && *PV2 == 0)) {
 	        if (!Printall) {
 	          *PV2 = 1;
@@ -13333,7 +13811,7 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
@@ -13341,7 +13819,7 @@ do {
 	/* DCC2 / MS Cache 2 (2100): PBKDF2-HMAC-SHA1(DCC1, lc(user), iter, 16)
 	 * DCC1 = MD4(NTLM + UTF16LE(lc(user)))
 	 * Typesalt = iter:username, JudyJ = hash32hex */
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE) break;
 	/* compute NTLM hash: MD4(UTF16LE(pass)) */
 	{ unsigned char *u16p = (unsigned char *)wline;
@@ -13350,11 +13828,11 @@ do {
 	}
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    /* Parse iter:username from salt */
@@ -13384,7 +13862,7 @@ do {
 	    prmd5((unsigned char *)newbuf, mdbuf, 32);
 	    mdbuf[32] = 0;
 	    { Word_t *PV2;
-	      JSLG(PV2, JudyJ[JOB_DCC2], (unsigned char *)mdbuf);
+	      JSLG(PV2, JUDYJ(JOB_DCC2), (unsigned char *)mdbuf);
 	      if (Printall || (PV2 && *PV2 == 0)) {
 	        snprintf(linebuf2, MAXLINE*3, "$DCC2$%d#%s#%s", dcc_iter, uname, mdbuf);
 	        if (!Printall) {
@@ -13398,22 +13876,22 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_PWSAFE3:
 	/* Password Safe v3 (5200): SHA256(pass+salt), iterate SHA256 N times
 	 * Typesalt = iter:salt64hex, JudyJ = hash64hex */
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE) break;
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	    const char *ts = saltsnap[si].salt;
@@ -13436,7 +13914,7 @@ do {
 	    prmd5(curin.h, mdbuf, 64);
 	    mdbuf[64] = 0;
 	    { Word_t *PV2;
-	      JSLG(PV2, JudyJ[JOB_PWSAFE3], (unsigned char *)mdbuf);
+	      JSLG(PV2, JUDYJ(JOB_PWSAFE3), (unsigned char *)mdbuf);
 	      if (Printall || (PV2 && *PV2 == 0)) {
 	        /* Reconstruct hex: PWS3 + salt + iter_le + hash */
 	        char pw_out[200];
@@ -13464,7 +13942,7 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
@@ -13472,15 +13950,15 @@ do {
       case JOB_IKEPSK_SHA1:
 	/* IKE-PSK MD5/SHA1 (5300/5400): HMAC(HMAC(PSK, nonces), msg)
 	 * Typesalt = full line (9 colon-sep hex fields), JudyJ = full line */
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE) break;
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	  int is_sha1 = (job->op == JOB_IKEPSK_SHA1);
 	for (si = 0; si < nsalts_job; si++) {
@@ -13540,7 +14018,7 @@ do {
 	      out_sl = newbuf;
 	    }
 	    { Word_t *PV2;
-	      JSLG(PV2, JudyJ[job->op], (unsigned char *)sl);
+	      JSLG(PV2, JUDYJ(job->op), (unsigned char *)sl);
 	      if (Printall || (PV2 && *PV2 == 0)) {
 	        if (!Printall) {
 	          *PV2 = 1;
@@ -13553,14 +14031,14 @@ do {
 	      }
 	    }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
 	break;
 
       case JOB_SM3CRYPT:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE) break;
-	if (!Typesalt[job->op]) break;
+	if (!TYPESALT(job->op)) break;
 	hashfunc = mysm3;
 	hashinit = sm3_wrap_init;
 	hashop = sm3_wrap_update;
@@ -13571,9 +14049,9 @@ do {
 	goto crypt_round;
 
       case JOB_SHA256CRYPT:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE) break;
-	if (!Typesalt[job->op]) break;
+	if (!TYPESALT(job->op)) break;
 	hashfunc = mysha256;
 	hashinit = sph_sha256_init;
 	hashop = sph_sha256;
@@ -13587,8 +14065,8 @@ do {
       	mymd5(cur,len,curin.h);
 	cur = prmd5(curin.h,linebuf+MAXLINE,32);  /* stage to non-aliased region; crypt_round overwrites linebuf[] in P-stretch (mirrors PHPBB3MD5 pattern at line 13713) */
 	len = 32;
-	if (Typedone[job->op]) break;
-	if (!Typesalt[job->op]) break;
+	if (TYPEDONE(job->op)) break;
+	if (!TYPESALT(job->op)) break;
 	hashfunc = mysha512;
 	hashinit = sph_sha512_init;
 	hashop = sph_sha512;
@@ -13599,10 +14077,10 @@ do {
 	goto crypt_round;
 
       case JOB_SHA512CRYPT:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE)
 	  break;
-	if (!Typesalt[job->op])
+	if (!TYPESALT(job->op))
 	  break;
 	hashfunc = mysha512;
 	hashinit = sph_sha512_init;
@@ -13614,10 +14092,10 @@ do {
 	goto crypt_round;
 
       case JOB_GOST12512CRYPT:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 	if (len > MAXLINE)
 	  break;
-	if (!Typesalt[job->op])
+	if (!TYPESALT(job->op))
 	  break;
 	hashfunc = gost2012_64_std;
 	hashinit = streebog512_init_wrap;
@@ -13629,11 +14107,11 @@ do {
       crypt_round:
 	if (!snap_valid) {
 	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-	                  Typesalt[job->op], tsalt, Printall);
+	                  TYPESALT(job->op), tsalt, Printall);
 	  snap_valid = 1;
-	  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
-	if (!nsalts_job) { Typedone[job->op] = 1; break; }
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	  unsigned int cas;
@@ -14431,7 +14909,7 @@ possess(FreeWaiting);
 #endif
                   if (RuleCnt)
                     atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -14454,46 +14932,46 @@ release(FreeWaiting);
 		    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), mdbuf, job->pass);
 		  }
 	}
-	if (!nsalts_job) Typedone[job->op] = 1;
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
 	}
                 break;
 
               case JOB_AIXMD5:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 i = 0; /* AIX smd5: empty magic string */
                 goto crypt_all;
 
               case JOB_APR1:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 i = 6; /* magic string length for $apr1$ */
                 goto crypt_all;
 
               case JOB_JUNIPERIVE:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 i = 3; /* magic length for $1$ */
                 goto crypt_all;
 
               case JOB_MD5CRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   /* Typesalt key is "$1$salt$" — extract salt after "$1$" */
@@ -14574,7 +15052,7 @@ release(FreeWaiting);
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -14582,11 +15060,11 @@ release(FreeWaiting);
 crypt_all:
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   s2 = saltsnap[si].salt;
@@ -14832,7 +15310,7 @@ possess(FreeWaiting);
 #endif
                   if (RuleCnt)
                     atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
 release(FreeWaiting);
 #endif
@@ -14903,7 +15381,7 @@ release(FreeWaiting);
 crypt_done: ;
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -14913,10 +15391,10 @@ crypt_done: ;
 		len = 32;
 
               case JOB_PHPBB3:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 cur = linebuf + MAXLINE;
@@ -14941,11 +15419,11 @@ crypt_done: ;
                   pcnt = 0;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       s1 = saltsnap[si].salt;
@@ -15003,7 +15481,7 @@ nextbb:
                     if (!Printall && *saltsnap[si].PV == 0)
                       saltsnap[si] = saltsnap[--nsalts_job];
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                   break;
                 }
@@ -15011,11 +15489,11 @@ nextbb:
 
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 #if ARM > 6
                 /* NEON 4-wide PHPBB3: batch 4 salts with same iteration count */
                 if (len < 40) {
@@ -15077,7 +15555,7 @@ nextbb:
                     if (!Printall && *saltsnap[si].PV == 0)
                       saltsnap[si] = saltsnap[--nsalts_job];
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 } else {
                   /* Password too long for NEON batching — scalar fallback */
                   curin.i[4] = curin.i[5] = 0;
@@ -15101,7 +15579,7 @@ nextbb:
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
 #elif defined(POWERPC)
@@ -15163,7 +15641,7 @@ nextbb:
                     if (!Printall && *saltsnap[si].PV == 0)
                       saltsnap[si] = saltsnap[--nsalts_job];
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 } else {
                   /* Password too long for AltiVec batching — scalar fallback */
                   curin.i[4] = curin.i[5] = 0;
@@ -15187,7 +15665,7 @@ nextbb:
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
 #else
@@ -15213,7 +15691,7 @@ nextbb:
                         saltsnap[si] = saltsnap[--nsalts_job]; si--;
                       }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 #endif
                 break;
@@ -15242,7 +15720,7 @@ nextbb:
                 /* iterate unique salt prefixes from Typesalt[job->op] */
                 linebuf2[MAXLINE] = linebuf2[0] = linebuf[0] = 0;
                 cur[len] = 0;
-                JSLF(PV, Typesalt[job->op], (unsigned char *)linebuf);
+                JSLF(PV, TYPESALT(job->op), (unsigned char *)linebuf);
                 while (PV) {
 		  MHASH td;
 		  char lmac[64],hmac_buf[64];
@@ -15261,14 +15739,14 @@ nextbb:
 			    crypt_rn(lmac, linebuf2+MAXLINE, linebuf2, BCRYPT_HASHSIZE);
 			    /* look up computed hash in JudyJ[JOB_BCRYPT] Judy */
 			    { Word_t *PV2;
-			      JSLG(PV2, JudyJ[JOB_BCRYPT],(unsigned char *)linebuf2);
+			      JSLG(PV2, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
 			      if (Printall || (PV2 && *PV2 == 0)) {
 				if (!Printall) {
 				  *PV2 = 1;
 				  PV_DEC(PV);
 				}
 				(*job->found)++;
-				atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+				atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
 				if (RuleCnt)
 				  atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
 				if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -15305,17 +15783,17 @@ nextbb:
 			b64_encode(hmac_buf,lmac,32);
 			hashcnt++;
 			crypt_rn(lmac, linebuf, linebuf2, BCRYPT_HASHSIZE);
-			JSLG(PV, JudyJ[JOB_BCRYPT],(unsigned char *)linebuf2);
+			JSLG(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
 			if (Printall || (PV && *PV == 0)) {
 			  if (!Printall) {
 			    *PV = 1;
 			    { Word_t *SPV;
-			      JSLG(SPV, Typesalt[job->op], (unsigned char *)linebuf);
+			      JSLG(SPV, TYPESALT(job->op), (unsigned char *)linebuf);
 			      if (SPV) PV_DEC(SPV);
 			    }
 			  }
 			  (*job->found)++;
-			  atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+			  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
 			  if (RuleCnt)
 			    atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
 			  if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -15344,7 +15822,7 @@ nextbb:
 			}
 		    }
                   }
-                  JSLN(PV, Typesalt[job->op], (unsigned char *)linebuf);
+                  JSLN(PV, TYPESALT(job->op), (unsigned char *)linebuf);
                 }
                 break;
 
@@ -15358,15 +15836,15 @@ nextbb:
                  *   mdbuf[0..63]      base64 of HMAC (44 chars + null)
                  *   linebuf2[0..127]  crypt_rn output (BCRYPT_HASHSIZE)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned int hmac_outlen = 32;
                   cur[len] = 0;
@@ -15386,7 +15864,7 @@ nextbb:
                     if (!crypt_rn(mdbuf, setting, linebuf2, BCRYPT_HASHSIZE))
                       continue;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_BCRYPTHMACSHA256], (unsigned char *)linebuf2);
+                    JSLG(PV2, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)linebuf2);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Format output: $bcrypt-sha256$v=2,t=2b,r=NN$SALT22$HASH31 */
                       /* setting[4..5] = rounds, setting[7..28] = salt22 */
@@ -15403,7 +15881,7 @@ nextbb:
                       prfound(job, newbuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -15441,29 +15919,29 @@ BC_Start:
                  * slab-retirement ladder (final major slab kernel). */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
                 }
 #endif
                 /* iterate unique salt prefixes from Typesalt[job->op] */
                 linebuf[0] = 0;
                 cur[len] = 0;
-                JSLF(PV, Typesalt[job->op], (unsigned char *)linebuf);
+                JSLF(PV, TYPESALT(job->op), (unsigned char *)linebuf);
                 while (PV) {
                   if (Printall || *PV > 0) {
                     hashcnt++;
                     crypt_rn(cur, linebuf, linebuf2, BCRYPT_HASHSIZE);
-                    JSLG(PV, JudyJ[JOB_BCRYPT],(unsigned char *)linebuf2);
+                    JSLG(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
                     if (Printall || (PV && *PV == 0)) {
                       if (!Printall) {
                         *PV = 1;
                         { Word_t *SPV;
-                          JSLG(SPV, Typesalt[job->op], (unsigned char *)linebuf);
+                          JSLG(SPV, TYPESALT(job->op), (unsigned char *)linebuf);
                           if (SPV) PV_DEC(SPV);
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -15491,7 +15969,7 @@ BC_Start:
 		      }
                     }
                   }
-                  JSLN(PV, Typesalt[job->op], (unsigned char *)linebuf);
+                  JSLN(PV, TYPESALT(job->op), (unsigned char *)linebuf);
                 }
                 break;
 
@@ -15501,16 +15979,16 @@ BC_Start:
                 break;
 
               case JOB_POMELO:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   hashcnt++;
@@ -15524,7 +16002,7 @@ BC_Start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -15578,18 +16056,18 @@ sha512salt_b:
                 hashfunc2 = mysha512;
 
 sha512salt_s:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 cur = linebuf + MAXLINE;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15610,7 +16088,7 @@ sha512salt_s:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -15633,18 +16111,18 @@ sha512salt_s:
               case JOB_WRLPASSSALT:
               case JOB_SHA512PASSSALT:
               sha512passsalt_start:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf, cur, len);
                 cur = linebuf;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15686,12 +16164,12 @@ sha512salt_s:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_SALT_UTF16_PEPPER:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (Unicode) break;
                 if (len > MAXLINE)
                   break;
@@ -15709,11 +16187,11 @@ sha512salt_s:
                 len = y;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   char *pepper;
@@ -15751,21 +16229,21 @@ sha512salt_s:
                   }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_SALT_SPECIAL:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15794,7 +16272,7 @@ sha512salt_s:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -15820,16 +16298,16 @@ sha512salt_s:
 
 
               case JOB_MD5SHA1PASSSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15854,7 +16332,7 @@ sha512salt_s:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -15881,16 +16359,16 @@ sha512salt_s:
 	
               case JOB_SHA1PASSSALT:
 sha1passsalt:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15913,14 +16391,14 @@ sha1passsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_HMAC_MD5:
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -15944,18 +16422,18 @@ sha1passsalt:
                 break;
 
               case JOB_SHA1MD5SHA1PASSSALT:
-              	if (Typedone[job->op]) break;
+              	if (TYPEDONE(job->op)) break;
 		mysha1(cur,len,curin.h);
 		prmd5(curin.h, linebuf, 40);
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -15978,21 +16456,21 @@ sha1passsalt:
                     }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_8TRACK:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16010,7 +16488,7 @@ sha1passsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -16079,16 +16557,16 @@ sha1saltpass:
               case JOB_SHA1SALTPASS:
               case JOB_SHA1SALTPASSSALT:
               sha1saltpass_start:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16115,21 +16593,21 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1SHA1SALTPASSSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16151,12 +16629,12 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1MD5SHA1_SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mysha1(cur, len, curin.h);
 		prmd5(curin.h, newbuf, 40);
 		mymd5(newbuf, 40, curin.h);
@@ -16164,11 +16642,11 @@ sha1saltpass:
                 memcpy(linebuf, newbuf, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16190,21 +16668,21 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1MD5_SALTMD5PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mymd5(cur, len, curin.h);
 		prmd5(curin.h, linebuf+MAXLINE, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16227,21 +16705,21 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
               case JOB_SHA1SHA1CAPSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mysha1(cur, len, curin.h);
 		prmd5(curin.h, newbuf, 40);
                 memcpy(linebuf, newbuf, 40);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16269,21 +16747,21 @@ sha1saltpass:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1SALTCX:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16318,21 +16796,21 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1SALTSHA1SALTSHA1PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16358,25 +16836,25 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA256SHA256SALT:
                 if (len > MAXLINE)
                   break;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op])
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op))
                   break;
                 mysha256(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 64);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16398,25 +16876,25 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_AUTHME:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 mysha256(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 64);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16432,25 +16910,25 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_NETWITNESS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 mysha256(cur, len, curin.h);
                 prmd5UC(curin.h, linebuf, 64);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16466,20 +16944,20 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_MULTISALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16511,7 +16989,7 @@ sha1saltpass:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -16586,7 +17064,7 @@ sha1saltpass:
 		}
 
                 memmove(linebuf, md5buf.h, 16);
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -16873,18 +17351,18 @@ md4utf16:
 		len = 32;
 	      case JOB_MD4UTF16MD5PASSMD5SHA1SALT:
               case JOB_MD4UTF16MD5PASSMD5SALT:
-              	if (Typedone[job->op]) break;
+              	if (TYPEDONE(job->op)) break;
 		mymd5(cur, len, curin.h);
 		prmd5(curin.h, newbuf, 32);
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -16916,7 +17394,7 @@ md4utf16:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -17134,15 +17612,15 @@ md4utf16:
                 break;
 
               case JOB_SHA1MD5_PASSMD5SALT:
-              	if (Typedone[job->op]) break;
+              	if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17167,13 +17645,13 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
 
               case JOB_MD5_MD5SHA1PASSSHA1MD5SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mysha1(cur, len, md5buf.h);
                 cur = prmd5(md5buf.h, linebuf, 40);
 		mymd5(cur,40,curin.h);
@@ -17181,11 +17659,11 @@ md4utf16:
 	      linebuf[32+40] = 0;
               if (!snap_valid) {
                 nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                Typesalt[job->op], tsalt, Printall);
+                                TYPESALT(job->op), tsalt, Printall);
                 snap_valid = 1;
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
               }
-              if (!nsalts_job) { Typedone[job->op] = 1; break; }
+              if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
               { int si;
               for (si = 0; si < nsalts_job; si++) {
                 saltlen = saltsnap[si].saltlen;
@@ -17213,22 +17691,22 @@ md4utf16:
                   }
                 }
               }
-              if (!nsalts_job) Typedone[job->op] = 1;
+              if (!nsalts_job) TYPEDONE(job->op) = 1;
               }
               break;
 
               case JOB_MD5_SALTSHA1SALTPASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf+MAXLINE+MAXLINE,cur,len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17253,22 +17731,22 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_SALTMD5PASSSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17292,22 +17770,22 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_SALTMD5SALTPASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17331,22 +17809,22 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5SALTPASSSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17370,7 +17848,7 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -17456,18 +17934,18 @@ md4utf16:
                 goto MDstart;
 
               case JOB_MD5SALTMD5PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 mymd5(cur, len, md5buf.h);
                 prmd5(md5buf.h, linebuf + MAXLINE, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17490,24 +17968,24 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
 	      case JOB_SHA1MD5SALTPASS:
               case JOB_MD5SALTPASS:
               md5saltpass_start:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17542,7 +18020,7 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -17551,7 +18029,7 @@ md4utf16:
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf, cur, len);
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -17584,17 +18062,17 @@ md4utf16:
                 break;
 
               case JOB_MD5_MD5psSHA1MD5psp:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17622,12 +18100,12 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_MD5PASS_SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 mymd5(cur, len, curin.h);
@@ -17636,11 +18114,11 @@ md4utf16:
                 len = 32;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17663,12 +18141,12 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1MD5PASS_SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 mymd5(cur, len, curin.h);
@@ -17677,11 +18155,11 @@ md4utf16:
                 len = 32;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17704,12 +18182,12 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_MD5SHA1PASSSHA1MD5SALT:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mysha1(cur, len, md5buf.h);
 		prmd5(md5buf.h, linebuf, 40);
                 mymd5(linebuf, 40, md5buf.h);
@@ -17717,11 +18195,11 @@ md4utf16:
                 prmd5(md5buf.h, linebuf, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17746,23 +18224,23 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
 	
               case JOB_SHA1_MD5PASSSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mymd5(cur, len, md5buf.h);
                 hashcnt++;
                 prmd5(md5buf.h, linebuf, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17785,7 +18263,7 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -17795,16 +18273,16 @@ md4utf16:
 		cur = prmd5(md5buf.h, newbuf, 32);
 		len = 32;
               case JOB_SHA1MD5DSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   fastcopy(linebuf, cur, len);
@@ -17868,20 +18346,20 @@ md4utf16:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 	      case JOB_SHA1MD5SALTMD5PASS:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mymd5(cur,len,md5buf.h);
 		prmd5(md5buf.h,linebuf+32,32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17903,7 +18381,7 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -17912,7 +18390,7 @@ md4utf16:
 		cur = prmd5UC(md5buf.h, newbuf, 32);
 		len = 32;
 	      case JOB_SHA1_MD5PASSMD5MD5SALT:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mymd5(cur,len,md5buf.h);
 		if (job->op == JOB_SHA1_MD5UCMD5UCPASSMD5UCSALT)
 		  prmd5UC(md5buf.h,linebuf,32);
@@ -17920,11 +18398,11 @@ md4utf16:
 		  prmd5(md5buf.h,linebuf,32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -17955,7 +18433,7 @@ md4utf16:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 	
@@ -17988,7 +18466,7 @@ moresha1md5salt:
 		else 
 		  cur = prmd5(md5buf.h, newbuf, 32);
 moremd5md5salt:
-	if (Typedone[job->op]) break;
+	if (TYPEDONE(job->op)) break;
 		len = 32;
                 fastcopy(linebuf, cur, len);
 		if (job->op == JOB_SHA1MD5CAPSALT ||
@@ -18004,11 +18482,11 @@ moremd5md5salt:
 		}
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18056,7 +18534,7 @@ sha1md51cap:
 		  }
 sha1md51cap_done: ;
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -18067,7 +18545,7 @@ sha1md51cap_done: ;
 		len = 32;
               case JOB_SHA1SALTSHA256TRUNC:
               case JOB_SHA1SALTSHA256UCTRUNC:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mysha256(cur,len,curin.h);
 		if (job->op == JOB_SHA1SALTSHA256UCTRUNC) {
 		  prmd5UC(curin.h, linebuf+512, 64);
@@ -18080,11 +18558,11 @@ sha1md51cap_done: ;
                 {
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18119,13 +18597,13 @@ sha1md51cap_done: ;
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 }
 	        break;
 
               case JOB_SHA1SALTSHA512UCTRUNC:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mysha512(cur,len,curin.h);
 		prmd5UC(curin.h, linebuf+512, 128);
 		prmd5UC(curin.h, linebuf+1024, 128);
@@ -18133,11 +18611,11 @@ sha1md51cap_done: ;
                 {
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18172,7 +18650,7 @@ sha1md51cap_done: ;
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 }
 	        break;
@@ -18192,15 +18670,15 @@ sha1md51cap_done: ;
 		mymd5(cur,len,curin.h);
 		len = 32;
 sha1_truncsalt:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 {
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
 		  prmd5(curin.h, linebuf, len);
@@ -18230,24 +18708,24 @@ sha1_truncsalt:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 }
 	        break;
 		
 		
               case JOB_SHA1MD5PASSSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18272,23 +18750,23 @@ sha1_truncsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5PASSSALT:
               md5passsalt_start:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18310,21 +18788,21 @@ sha1_truncsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_SHA512PASSSHA512SALT:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mysha512(cur, len, curin.h);
 		prmd5(curin.h, linebuf, 128);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18346,23 +18824,23 @@ sha1_truncsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_MD5PASSMD5SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 mymd5(cur, len, md5buf.h);
                 prmd5(md5buf.h, linebuf, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18384,22 +18862,22 @@ sha1_truncsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_MD5SALT_PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 memmove(linebuf + 32, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18422,22 +18900,22 @@ sha1_truncsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5_PASS_MD5SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 memmove(linebuf, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18459,12 +18937,12 @@ sha1_truncsalt:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
 	      case JOB_SHA1MD5SALTPASSPEPPER:
-	      if (Typedone[job->op]) break;
+	      if (TYPEDONE(job->op)) break;
 	      pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
 	      if (!pep)
 	        pep = "\x01:\x00\xff";
@@ -18475,11 +18953,11 @@ sha1_truncsalt:
 		pep += peplen;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18508,7 +18986,7 @@ sha1_truncsalt:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 	      }
 	      break;
@@ -18545,7 +19023,7 @@ sha1_truncsalt:
 		prmd5(md5buf.h, linebuf+MAXLINE, 32);
               y = 32;
 SHA1_saltpepper:
-	      if (Typedone[job->op]) break;
+	      if (TYPEDONE(job->op)) break;
 	      pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
 	      if (!pep) 
 	        pep = "\x01:\x00\xff";
@@ -18556,11 +19034,11 @@ SHA1_saltpepper:
 		pep += peplen;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18586,7 +19064,7 @@ SHA1_saltpepper:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 	      }
 	      break;
@@ -18608,16 +19086,16 @@ morepep:
               case JOB_SHA1_MD5_MD5SALTMD5PASS_SALT:
               case JOB_SHA1_MD5_MD5SALTMD5PASS:
               case JOB_MD5_MD5SALTMD5PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_hashsalt_snapshot(saltsnap, saltpool,
                                   Typehashsalt[job->op], tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 mymd5(cur, len, md5buf.h);
                 prmd5(md5buf.h, linebuf + 32, 32);
                 { int si;
@@ -18689,7 +19167,7 @@ morepep:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 		if (job->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS)
 		   goto morepep;
@@ -18706,10 +19184,10 @@ morepep:
                 break;
 
               case JOB_MD5_MD5USERSHA1MD5PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -18742,7 +19220,7 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -18867,14 +19345,14 @@ morepep:
                 break;
 
               case JOB_MD5MD5SALT_SALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -18904,16 +19382,16 @@ morepep:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
 
               case JOB_LEET:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -18961,13 +19439,13 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1USERSQL3:
-                if (Typedone[job->op]) break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                if (TYPEDONE(job->op)) break;
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19007,15 +19485,15 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA512SHA512RAWUSER:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19053,15 +19531,15 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1SHA1USER:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19100,7 +19578,7 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -19115,8 +19593,8 @@ morepep:
               case JOB_MD5CAPMD5USER:
               case JOB_SHA1MD5USER:
               case JOB_MD5MD5USER:
-                if (Typedone[job->op]) break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                if (TYPEDONE(job->op)) break;
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19179,7 +19657,7 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -19194,7 +19672,7 @@ morepep:
 		    linebuf[MAXLINE+1+x] = cur[x];
 		}
 		linebuf[MAXLINE] = ':';
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -19230,7 +19708,7 @@ morepep:
                 if (len > MAXLINE)
                   break;
                 y = len;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -19263,10 +19741,10 @@ morepep:
                 break;
 
               case JOB_MD5USERnulPASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19291,7 +19769,7 @@ morepep:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -19443,8 +19921,8 @@ sha11saltmd5:
                 len = 32;
 
               case JOB_MD5USERIDMD5:
-                if (Typedone[job->op]) break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                if (TYPEDONE(job->op)) break;
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19478,15 +19956,15 @@ sha11saltmd5:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5USERPASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19519,15 +19997,15 @@ sha11saltmd5:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_POSTGRESQL:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   int salts_active = 0;
                   if (!ujudy) ujudy = UseridJudy;
                   if (!ujudy) break;
@@ -19549,14 +20027,14 @@ sha11saltmd5:
                     }
                     JSLN(PV, ujudy, (unsigned char *)tsalt);
                   }
-                  if (!salts_active) Typedone[job->op] = 1;
+                  if (!salts_active) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SKYPE:
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -19596,7 +20074,7 @@ sha11saltmd5:
                 hashcnt++;
                 b64_encode((char *)curin.h, linebuf2, 20);
                 linebuf2[28] = 0;
-                JSLG(PV, JudyJ[JOB_PEOPLESOFT], (unsigned char *)linebuf2);
+                JSLG(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)linebuf2);
                 if (Printall || (PV && *PV == 0)) {
                   if (!Printall)
                     *PV = 1;
@@ -19605,7 +20083,7 @@ sha11saltmd5:
 #endif
                   if (RuleCnt)
                     atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                  atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                   release(FreeWaiting);
 #endif
@@ -19635,7 +20113,7 @@ sha11saltmd5:
                 break;
 
               case JOB_EPISERVER:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 /* convert password to UTF-16LE */
@@ -19653,11 +20131,11 @@ sha11saltmd5:
                 /* Typesalt key format: "V*SALT_B64" where V=0(SHA1) or 1(SHA256) */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     int epiver = saltsnap[si].salt[0] - '0';
@@ -19681,7 +20159,7 @@ sha11saltmd5:
                         while (el > elen && expect[el-1] == '=') el--;
                         expect[el] = 0;
                       }
-                      JSLG(PV, JudyJ[JOB_EPISERVER], (unsigned char *)expect);
+                      JSLG(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)expect);
                       if (Printall || (PV && *PV == 0)) {
                         if (!Printall) {
                           *PV = 1;
@@ -19691,7 +20169,7 @@ sha11saltmd5:
                             }
                         }
                         (*job->found)++;
-                        atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                        atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                         if (RuleCnt)
                           atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                         if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -19722,22 +20200,22 @@ sha11saltmd5:
                       }
                     }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_HMAILSERVER:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* hMailServer: iterate unique salts from Typesalt Judy */
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     int hm_slen = saltsnap[si].saltlen;
@@ -19753,7 +20231,7 @@ sha11saltmd5:
                     hm_full[hm_slen + 64] = 0;
                     /* look up in JudyJ[JOB_HMAILSERVER] */
                     { Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_HMAILSERVER], (unsigned char *)hm_full);
+                      JSLG(PV2, JUDYJ(JOB_HMAILSERVER), (unsigned char *)hm_full);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         if (!Printall) {
                           *PV2 = 1;
@@ -19763,7 +20241,7 @@ sha11saltmd5:
                           }
                         }
                         (*job->found)++;
-                        atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                        atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                         if (RuleCnt)
                           atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                         if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -19790,14 +20268,14 @@ sha11saltmd5:
                       }
                     }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_JUNIPERSSG:
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -19814,7 +20292,7 @@ sha11saltmd5:
                   mymd5(linebuf, i + 22 + len, curin.h);
                   hashcnt++;
                   juniper_encode(curin.h, linebuf2);
-                  JSLG(PV, JudyJ[JOB_JUNIPERSSG], (unsigned char *)linebuf2);
+                  JSLG(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)linebuf2);
                   if (Printall || (PV && *PV == 0)) {
                     if (!Printall)
                       *PV = 1;
@@ -19823,7 +20301,7 @@ sha11saltmd5:
 #endif
                     if (RuleCnt)
                       atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                    atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                    atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                     release(FreeWaiting);
 #endif
@@ -19864,7 +20342,7 @@ sha11saltmd5:
                   mymd5(linebuf, 16, curin.h);
                   cisco_pix_encode(curin.h, pix_enc);
                   hashcnt++;
-                  JSLG(PV, JudyJ[JOB_CISCOPIX], (unsigned char *)pix_enc);
+                  JSLG(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)pix_enc);
                   if (Printall || (PV && *PV == 0)) {
                     if (!Printall)
                       *PV = 1;
@@ -19873,7 +20351,7 @@ sha11saltmd5:
 #endif
                     if (RuleCnt)
                       atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                    atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                    atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                     release(FreeWaiting);
 #endif
@@ -19906,16 +20384,16 @@ sha11saltmd5:
               case JOB_CISCOASA:
                 if (len > MAXLINE)
                   break;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 { char asa_enc[22];
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     saltlen = saltsnap[si].saltlen;
@@ -19937,7 +20415,7 @@ sha11saltmd5:
                     asa_enc[17 + saltlen] = 0;
                     hashcnt++;
                     { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_CISCOASA], (unsigned char *)asa_enc);
+                    JSLG(PV2, JUDYJ(JOB_CISCOASA), (unsigned char *)asa_enc);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -19951,7 +20429,7 @@ sha11saltmd5:
 #endif
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                      atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                       release(FreeWaiting);
 #endif
@@ -19980,23 +20458,23 @@ sha11saltmd5:
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
                 break;
 
               case JOB_IPMI_SHA1:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* HMAC-SHA1(password, hex_decode(salt)) — iterate unique salts */
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = salt_hex */
@@ -20013,7 +20491,7 @@ sha11saltmd5:
                         linebuf[40] = ':';
                         strcpy(linebuf + 41, saltsnap[si].salt);
                         { Word_t *PV2;
-                          JSLG(PV2, JudyJ[JOB_IPMI_SHA1], (unsigned char *)linebuf);
+                          JSLG(PV2, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)linebuf);
                           if (Printall || (PV2 && *PV2 == 0)) {
                             /* save salt before compaction may invalidate si */
                             const char *matched_salt = saltsnap[si].salt;
@@ -20029,7 +20507,7 @@ sha11saltmd5:
 #endif
                             if (RuleCnt)
                               atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                            atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                            atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                             release(FreeWaiting);
 #endif
@@ -20061,22 +20539,22 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_IPMI_MD5:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* HMAC-MD5(password, hex_decode(salt)) — iterate unique salts */
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = salt_hex */
@@ -20093,7 +20571,7 @@ sha11saltmd5:
                         linebuf[32] = ':';
                         strcpy(linebuf + 33, saltsnap[si].salt);
                         { Word_t *PV2;
-                          JSLG(PV2, JudyJ[JOB_IPMI_MD5], (unsigned char *)linebuf);
+                          JSLG(PV2, JUDYJ(JOB_IPMI_MD5), (unsigned char *)linebuf);
                           if (Printall || (PV2 && *PV2 == 0)) {
                             /* save salt before compaction may invalidate si */
                             const char *matched_salt = saltsnap[si].salt;
@@ -20109,7 +20587,7 @@ sha11saltmd5:
 #endif
                             if (RuleCnt)
                               atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                            atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                            atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                             release(FreeWaiting);
 #endif
@@ -20141,21 +20619,21 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_ISCSI_CHAP:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* iSCSI CHAP (4800): MD5(id_byte || password || challenge_bytes) */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = challenge_hex:id_hex */
@@ -20181,7 +20659,7 @@ sha11saltmd5:
                       linebuf[32] = ':';
                       strcpy(linebuf + 33, salt_str);
                       { Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_ISCSI_CHAP], (unsigned char *)linebuf);
+                        JSLG(PV2, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)linebuf);
                         if (Printall || (PV2 && *PV2 == 0)) {
                           const char *matched_salt = saltsnap[si].salt;
                           if (!Printall) {
@@ -20197,12 +20675,12 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_KRB5PA23:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* Kerberos 5 AS-REQ Pre-Auth etype 23: NTLM -> HMAC-MD5 -> RC4 -> verify */
                 if (len > MAXLINE)
                   break;
@@ -20254,7 +20732,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf + 85, 32);
                     /* output */
                     (*job->found)++;
-                    atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                    atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                     if (RuleCnt)
                       atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                     if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -20285,11 +20763,11 @@ sha11saltmd5:
                   /* iterate unique hashes from Typesalt Judy */
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* parse enc_hex: skip $krb5pa$23$ then 3 more $ to get enc */
@@ -20333,7 +20811,7 @@ sha11saltmd5:
                             if (!Printall) {
                               PV_DEC(saltsnap[si].PV);
                               { Word_t *PV2;
-                                JSLG(PV2, JudyJ[JOB_KRB5PA23], (unsigned char *)saltsnap[si].salt);
+                                JSLG(PV2, JUDYJ(JOB_KRB5PA23), (unsigned char *)saltsnap[si].salt);
                                 if (PV2) *PV2 = 1;
                               }
                               if (*saltsnap[si].PV == 0) {
@@ -20341,7 +20819,7 @@ sha11saltmd5:
                               }
                             }
                             (*job->found)++;
-                            atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                            atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                             if (RuleCnt)
                               atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                             if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -20371,7 +20849,7 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
@@ -20384,16 +20862,16 @@ sha11saltmd5:
                 break;
 
               case JOB_NETSCALER:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* Citrix NetScaler (8100): iterate unique salts from Typesalt Judy */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = 8-hex salt string */
@@ -20409,7 +20887,7 @@ sha11saltmd5:
                       prmd5(curin.h, mdbuf + 9, 40);
                       mdbuf[49] = 0;
                       { Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_NETSCALER], (unsigned char *)mdbuf);
+                        JSLG(PV2, JUDYJ(JOB_NETSCALER), (unsigned char *)mdbuf);
                         if (Printall || (PV2 && *PV2 == 0)) {
                           if (!Printall) {
                             *PV2 = 1;
@@ -20422,7 +20900,7 @@ sha11saltmd5:
                           possess(FreeWaiting);
 #endif
                           if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                          atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                          atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                           release(FreeWaiting);
 #endif
@@ -20451,21 +20929,21 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_NETSCALER_SHA512:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -20483,7 +20961,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -20491,15 +20969,15 @@ sha11saltmd5:
                 /* Citrix NetScaler PBKDF2-HMAC-SHA256, 2500 iterations
                  * Format: "5" + 64-hex-salt + 64-hex-hash (129 chars)
                  * Typesalt = 64-char hex salt, JudyJ key = full 129-char hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   /* decode 64-hex salt to 32 binary bytes */
@@ -20514,7 +20992,7 @@ sha11saltmd5:
                   prmd5(curin.h, mdbuf + 65, 64);
                   mdbuf[129] = 0;
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_NETSCALER_PBKDF2], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -20524,7 +21002,7 @@ sha11saltmd5:
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -20551,7 +21029,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -20559,15 +21037,15 @@ sha11saltmd5:
                 /* Oracle H: Type (Oracle 7+) — DES-CBC based
                  * Format: 16-hex-UC-hash:username, JudyJ key = "HASH:salt"
                  * Typesalt = username (1-30 chars) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 30) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   /* salt = username from Typesalt, cur = password */
@@ -20631,7 +21109,7 @@ sha11saltmd5:
                   mdbuf[17 + usrlen] = 0;
 
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_ORACLE7], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_ORACLE7), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -20641,7 +21119,7 @@ sha11saltmd5:
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -20668,21 +21146,21 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_NETNTLMV1:
                 /* NetNTLMv1 (5500): user::domain:lm(0-48hex):ntlm(48hex):challenge(16hex)
                  * Typesalt = full hash line, JudyJ key = full hash line */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* compute NTLM hash once per password: MD4(UTF16LE(pass)) */
                   unsigned char *u16p = (unsigned char *)wline;
@@ -20757,7 +21235,7 @@ sha11saltmd5:
 
                   /* match — look up in JudyJ */
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_NETNTLMV1], (unsigned char *)sl);
+                    JSLG(PV2, JUDYJ(JOB_NETNTLMV1), (unsigned char *)sl);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -20767,7 +21245,7 @@ sha11saltmd5:
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -20794,7 +21272,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -20802,14 +21280,14 @@ sha11saltmd5:
                 /* NetNTLMv2 (5600): user::domain:srvchall(16hex):response(32hex):blob(hex)
                  * NTLMv2 = HMAC-MD5(NTLM, UC(user_UTF16) + domain_UTF16)
                  * resp = HMAC-MD5(NTLMv2, srvchall_bin + blob_bin) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* compute NTLM hash once per password */
                   unsigned char *u16p = (unsigned char *)wline;
@@ -20894,7 +21372,7 @@ sha11saltmd5:
 
                   /* match */
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_NETNTLMV2], (unsigned char *)sl);
+                    JSLG(PV2, JUDYJ(JOB_NETNTLMV2), (unsigned char *)sl);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -20904,7 +21382,7 @@ sha11saltmd5:
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -20931,7 +21409,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -20939,15 +21417,15 @@ sha11saltmd5:
                 /* LastPass (6800): PBKDF2-HMAC-SHA256 + AES-256-ECB
                  * Typesalt = "iterations:email:iv_hex"
                  * JudyJ key = 32-hex-lc hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   static const unsigned char lastpass_magic[16] = {
                     'l','a','s','t','p','a','s','s',
@@ -20981,7 +21459,7 @@ sha11saltmd5:
                     mdbuf[32] = 0;
                   }
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_LASTPASS], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_LASTPASS), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* reconstruct full format: hash:salt for output */
                       char outkey[256];
@@ -20994,7 +21472,7 @@ sha11saltmd5:
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -21032,7 +21510,7 @@ sha11saltmd5:
                       /* iterate all JudyJ entries */
                       mdbuf[0] = 0;
                       { Word_t *PV2;
-                        JSLF(PV2, JudyJ[JOB_LASTPASS], (unsigned char *)mdbuf);
+                        JSLF(PV2, JUDYJ(JOB_LASTPASS), (unsigned char *)mdbuf);
                         while (PV2) {
                           if (Printall || *PV2 == 0) {
                             unsigned char hash_bin[16], decrypted[16], plain[16];
@@ -21051,7 +21529,7 @@ sha11saltmd5:
                                   }
                                 }
                                 (*job->found)++;
-                                atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                                atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                                 if (RuleCnt)
                                   atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                                 if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -21079,28 +21557,28 @@ sha11saltmd5:
                               }
                             }
                           }
-                          JSLN(PV2, JudyJ[JOB_LASTPASS], (unsigned char *)mdbuf);
+                          JSLN(PV2, JUDYJ(JOB_LASTPASS), (unsigned char *)mdbuf);
                         }
                       }
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_FORTIGATE:
                 /* FortiGate (7000): SHA1(salt[12] + pass + magic[24])
                  * Typesalt = 24-hex salt, JudyJ key = 40-hex SHA1 hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE - 48) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   static const unsigned char fortigate_magic[24] = {
                     0xa3,0x88,0xba,0x2e,0x42,0x4c,0xb0,0x4a,
@@ -21121,7 +21599,7 @@ sha11saltmd5:
                   prmd5(curin.h, mdbuf, 40);
                   mdbuf[40] = 0;
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_FORTIGATE], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_FORTIGATE), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* reconstruct AK1 + base64(salt + sha1) for output */
                       char fg_raw[32], fg_out[64];
@@ -21138,7 +21616,7 @@ sha11saltmd5:
                         }
                       }
                       (*job->found)++;
-                      atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                       if (RuleCnt)
                         atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -21165,7 +21643,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -21175,15 +21653,15 @@ sha11saltmd5:
                  * → PBKDF2-HMAC-SHA1(lotus6_22, salt16, iter) → 8 bytes
                  * Typesalt = 32-hex salt16 + ":" + iter_str + ":" + 4-hex chars
                  * JudyJ key = 16-hex digest */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 256) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   /* Step 1: domino5(password) — computed once */
                   domino5_transform((const unsigned char *)cur, len, curin.h);
@@ -21242,7 +21720,7 @@ sha11saltmd5:
                     mdbuf[16] = 0;
 
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_DOMINO8], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_DOMINO8), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct (H...) hash for output */
                       unsigned char d8_enc_raw[36];
@@ -21271,21 +21749,21 @@ sha11saltmd5:
                       prfound(job, d8_out);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SIPHASH:
                 /* SipHash-2-4 (10100): siphash24(password, key) → 8-byte hash
                  * Typesalt = 32-hex key, JudyJ key = 16-hex hash (LE) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21304,7 +21782,7 @@ sha11saltmd5:
                     mdbuf[16] = 0;
                     hashcnt++;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_SIPHASH], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_SIPHASH), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output format: hash:2:4:key */
                       snprintf(linebuf, MAXLINE, "%s:2:4:%s", mdbuf, ts);
@@ -21318,22 +21796,22 @@ sha11saltmd5:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_CRAMMD5:
                 /* CRAM-MD5 (10200): HMAC-MD5(key=pass, msg=b64decode(challenge))
                  * Typesalt = b64challenge$b64response, JudyJ = 32-hex HMAC */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21355,7 +21833,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf, 32);
                     mdbuf[32] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_CRAMMD5], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_CRAMMD5), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct $cram_md5$challenge$response with new HMAC */
                       /* Decode old response to get username prefix */
@@ -21391,22 +21869,22 @@ sha11saltmd5:
                       prfound(job, newbuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SAPCODVNH:
                 /* SAP CODVN H (10300): h=SHA1(pass+salt), iter: h=SHA1(pass+h)
                  * Typesalt = iter:hex_salt, JudyJ = 40-hex SHA1 */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21436,7 +21914,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf, 40);
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_SAPCODVNH], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_SAPCODVNH), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct {x-issha, ITER}BASE64(hash+salt) for output */
                       unsigned char sh_raw[280];
@@ -21455,22 +21933,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_REDHAT389DS:
                 /* RedHat 389-DS (10901): PBKDF2-HMAC-SHA256(pass, salt64, iter, 256)
                  * Typesalt = iter:hex_salt128, JudyJ = 64-hex (first 32 bytes) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21494,7 +21972,7 @@ sha11saltmd5:
                     prmd5(rh_hash, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_REDHAT389DS], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_REDHAT389DS), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct {PBKDF2_SHA256}BASE64(iter4_BE+salt64+hash256) */
                       unsigned char rh_raw[324];
@@ -21517,22 +21995,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_POSTGRESCRAM:
                 /* PostgreSQL CRAM (11100): MD5(hex(MD5(pass+user)) + challenge_bytes)
                  * Typesalt = user:challenge_hex, JudyJ = 32-hex hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21559,7 +22037,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf, 32);
                     mdbuf[32] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_POSTGRESCRAM], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: $postgres$user*challenge*hash */
                       snprintf(linebuf2, MAXLINE*3, "$postgres$%.*s*%s*%s",
@@ -21574,22 +22052,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MYSQLCRAM:
                 /* MySQL CRAM (11200): SHA1(pass) XOR SHA1(nonce + SHA1(SHA1(pass)))
                  * Typesalt = 40-hex nonce, JudyJ = 40-hex response */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   /* SHA1(pass) - compute once */
@@ -21618,7 +22096,7 @@ sha11saltmd5:
                     prmd5(mc_resp, mdbuf, 40);
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_MYSQLCRAM], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE*3, "$mysqlna$%s*%s", ts, mdbuf);
                       if (!Printall) {
@@ -21631,22 +22109,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHIRO1:
                 /* Apache Shiro 1 (12150): SHA512(salt+pass), iter N-1 SHA512(digest)
                  * Typesalt = iter:hex_salt32, JudyJ = 64-hex (first 32 bytes) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21672,7 +22150,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_SHIRO1], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_SHIRO1), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct: $shiro1$SHA-512$iter$b64salt$b64hash */
                       char sh_b64s[32], sh_b64h[100];
@@ -21690,22 +22168,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_ECRYPTFS:
                 /* eCryptfs (12200): SHA512(salt+pass), 65536 more SHA512(digest)
                  * Typesalt = 16-hex salt, JudyJ = 16-hex (first 8 bytes) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21726,7 +22204,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf, 16);
                     mdbuf[16] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_ECRYPTFS], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_ECRYPTFS), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE*3, "$ecryptfs$0$1$%s$%s", ts, mdbuf);
                       if (!Printall) {
@@ -21739,22 +22217,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_ORACLE12:
                 /* Oracle 12+ (12300): PBKDF2-HMAC-SHA512(pass, salt+AUTH_PBKDF2_SPEEDY_KEY, 4096, 64) -> SHA512(key+salt)
                  * Typesalt = 32-hex salt, JudyJ = first 64-hex of hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21779,7 +22257,7 @@ sha11saltmd5:
                     prmd5(curin.h, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_ORACLE12], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_ORACLE12), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: 128 UC hex hash + 32 UC hex salt */
                       char or_out[161];
@@ -21803,22 +22281,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_COLDFUSION10:
                 /* ColdFusion 10+ (12600): SHA256(salt + UC(SHA1(pass)))
                  * Typesalt = 64-hex salt, JudyJ = 64-hex hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   /* SHA1(pass) -> UC hex, computed once */
                   mysha1(cur, len, curin.h);
@@ -21837,7 +22315,7 @@ sha11saltmd5:
                     prmd5(curin.h, cf_hex, 64);
                     cf_hex[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_COLDFUSION10], (unsigned char *)cf_hex);
+                    JSLG(PV2, JUDYJ(JOB_COLDFUSION10), (unsigned char *)cf_hex);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE*3, "%s:%s", cf_hex, ts);
                       if (!Printall) {
@@ -21850,22 +22328,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_AZURESYNC:
                 /* MS-AzureSync (12800): PBKDF2-SHA256(UTF16LE(UC(NTLM(pass))), salt, iter, 32)
                  * Typesalt = iter:hex_salt20, JudyJ = 64-hex hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   /* NTLM = MD4(UTF16LE(pass)) -> UC hex -> UTF16LE */
                   to_utf16le(cur, (char *)wline, len);
@@ -21896,7 +22374,7 @@ sha11saltmd5:
                     prmd5(az_hash, az_hex, 64);
                     az_hex[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_AZURESYNC], (unsigned char *)az_hex);
+                    JSLG(PV2, JUDYJ(JOB_AZURESYNC), (unsigned char *)az_hex);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE*3, "v1;PPH1_MD4,%s,%d,%s", hp, az_iter, az_hex);
                       if (!Printall) {
@@ -21909,22 +22387,22 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_ANDROIDFDE:
                 /* Android FDE Samsung DEK (12900): HMAC-SHA256(PBKDF2-SHA256(pass,salt,4096,32), salt2)
                  * Typesalt = salt2_hex64:salt_hex32, JudyJ = 64-hex HMAC */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -21948,7 +22426,7 @@ sha11saltmd5:
                     prmd5(curin.h, af_hex, 64);
                     af_hex[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_ANDROIDFDE], (unsigned char *)af_hex);
+                    JSLG(PV2, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)af_hex);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: salt2(64) + hmac(64) + salt(32) = 160 hex */
                       char af_out[161];
@@ -21967,14 +22445,14 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_KRB5TGS23:
                 /* Kerberos 5 TGS-REP etype 23 (13100): NTLM -> HMAC-MD5(usage=2) -> RC4 -> verify
                  * Typesalt = full line, JudyJ = full line */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 /* compute NTLM hash once for this password */
                 to_utf16le(cur, (char *)wline, len);
@@ -22029,17 +22507,17 @@ sha11saltmd5:
                   off += 128;
                   linebuf2[off] = 0;
                   (*job->found)++;
-                  atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                   prfound(job, linebuf2);
                   break;
                 }
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     /* parse: skip $krb5tgs$23$*user$realm$spn* then $checksum$edata2 */
@@ -22096,14 +22574,14 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_AXCRYPT:
                 /* AxCrypt (13200): SHA1(pass) XOR salt -> AES Key Unwrap
                  * Typesalt = iter:salt32:wrapped48, JudyJ = full line */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (Printall) {
                   /* Forward AES Key Wrap: generate valid wrapped key from password */
@@ -22171,17 +22649,17 @@ sha11saltmd5:
                   }
                   ax_out[ax_off] = 0;
                   (*job->found)++;
-                  atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                  atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                   prfound(job, ax_out);
                   break;
                 }
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   /* SHA1(pass) */
                   mysha1(cur, len, curin.h);
@@ -22267,14 +22745,14 @@ sha11saltmd5:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_AXCRYPTSHA1:
                 /* AxCrypt in-memory SHA1 (13300): SHA1(pass), first 32 hex
                  * JudyJ = 32-hex */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 {
                   mysha1(cur, len, curin.h);
@@ -22282,7 +22760,7 @@ sha11saltmd5:
                   prmd5(curin.h, mdbuf, 32);
                   mdbuf[32] = 0;
                   Word_t *PV2;
-                  JSLG(PV2, JudyJ[JOB_AXCRYPTSHA1], (unsigned char *)mdbuf);
+                  JSLG(PV2, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)mdbuf);
                   if (Printall || (PV2 && *PV2 == 0)) {
                     snprintf(linebuf2, MAXLINE*3, "$axcrypt_sha1$%s", mdbuf);
                     if (!Printall) *PV2 = 1;
@@ -22292,7 +22770,7 @@ sha11saltmd5:
                 break;
 
               case JOB_WBB3:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* JudyJ[JOB_WBB3] (8400): iterate unique salts from Typesalt Judy */
                 if (len > MAXLINE) break;
                   /* h1 = sha1(pass) -> hex — computed once before salt loop */
@@ -22300,11 +22778,11 @@ sha11saltmd5:
                   prmd5(curin.h, mdbuf, 40);
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = 40-hex salt */
@@ -22324,7 +22802,7 @@ sha11saltmd5:
                       memcpy(linebuf2 + 41, saltsnap[si].salt, 40);
                       linebuf2[81] = 0;
                       { Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_WBB3], (unsigned char *)linebuf2);
+                        JSLG(PV2, JUDYJ(JOB_WBB3), (unsigned char *)linebuf2);
                         if (Printall || (PV2 && *PV2 == 0)) {
                           if (!Printall) {
                             *PV2 = 1;
@@ -22337,7 +22815,7 @@ sha11saltmd5:
                           possess(FreeWaiting);
 #endif
                           if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                          atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                          atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                           release(FreeWaiting);
 #endif
@@ -22366,12 +22844,12 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_SYBASE_ASE:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* Sybase ASE (8000): iterate unique salts from Typesalt Judy */
                 if (len > 255) break;
                   /* pre-build UTF-16BE password padded to 510 bytes */
@@ -22382,11 +22860,11 @@ sha11saltmd5:
                   }
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = 16-hex salt */
@@ -22399,7 +22877,7 @@ sha11saltmd5:
                       prmd5(curin.h, linebuf + 22, 64);
                       linebuf[86] = 0;
                       { Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_SYBASE_ASE], (unsigned char *)linebuf);
+                        JSLG(PV2, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)linebuf);
                         if (Printall || (PV2 && *PV2 == 0)) {
                           if (!Printall) {
                             *PV2 = 1;
@@ -22412,7 +22890,7 @@ sha11saltmd5:
                           possess(FreeWaiting);
 #endif
                           if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                          atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                          atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                           release(FreeWaiting);
 #endif
@@ -22441,12 +22919,12 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_RACF:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* RACF (8500): DES_ecb(EBCDIC_username, key_from_EBCDIC_password) */
                 if (len > MAXLINE) break;
                 {
@@ -22472,11 +22950,11 @@ sha11saltmd5:
                   /* iterate unique usernames from Typesalt Judy */
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* Uppercase username, pad to 8 with spaces, convert to EBCDIC */
@@ -22496,7 +22974,7 @@ sha11saltmd5:
                         prmd5UC(ciphertext, expect + elen, 16);
                         expect[elen + 16] = 0;
                         Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_RACF], (unsigned char *)expect);
+                        JSLG(PV2, JUDYJ(JOB_RACF), (unsigned char *)expect);
                         if (Printall || PV2) {
                           /* Build output as HASH:USER before compaction */
                           snprintf(linebuf2, MAXLINE*3, "%s:%.*s",
@@ -22511,22 +22989,22 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
                 break;
 
               case JOB_NSEC3:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* DNSSEC NSEC3 (8300): iterated SHA1(wire_domain + salt) */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = domain:salt_hex:iterations */
@@ -22561,7 +23039,7 @@ sha11saltmd5:
                               base32hex_encode(curin.h, 20, b32, 33);
                               sprintf(newbuf, "%s:%s", b32, saltsnap[si].salt);
                               Word_t *PV2;
-                              JSLG(PV2, JudyJ[JOB_NSEC3], (unsigned char *)newbuf);
+                              JSLG(PV2, JUDYJ(JOB_NSEC3), (unsigned char *)newbuf);
                               if (Printall || PV2) {
                                 if (!Printall) {
                                   PV_DEC(saltsnap[si].PV);
@@ -22576,23 +23054,23 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_DOMINO6:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* Lotus Notes/Domino 6 (8700): domino5(raw_salt+"("+UCHEX(domino5(pass)[0:14])) */
                 if (len > 256) break;
                 { /* h1 = domino5_transform(password) — computed once per password */
                   domino5_transform((const unsigned char *)cur, len, curin.h);
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = 10-char hex of 5-byte raw salt */
@@ -22623,7 +23101,7 @@ sha11saltmd5:
                       d6_enc[21] = ')';
                       d6_enc[22] = 0;
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_DOMINO6], (unsigned char *)d6_enc);
+                      JSLG(PV2, JUDYJ(JOB_DOMINO6), (unsigned char *)d6_enc);
                       if (Printall || PV2) {
                         if (!Printall) {
                           PV_DEC(saltsnap[si].PV);
@@ -22634,22 +23112,22 @@ sha11saltmd5:
                         prfound(job, d6_enc);
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
                 break;
 
               case JOB_DRUPAL7:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* JudyJ[JOB_DRUPAL7] (7900): iterate unique salts from Typesalt Judy */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = iter_char + 8-char salt (9 chars total) */
@@ -22688,7 +23166,7 @@ sha11saltmd5:
                         memcpy(linebuf2 + 12, mdbuf, 43);
                         linebuf2[55] = 0;
                         { Word_t *PV2;
-                          JSLG(PV2, JudyJ[JOB_DRUPAL7], (unsigned char *)linebuf2);
+                          JSLG(PV2, JUDYJ(JOB_DRUPAL7), (unsigned char *)linebuf2);
                           if (Printall || PV2) {
                             if (!Printall) {
                               PV_DEC(saltsnap[si].PV);
@@ -22701,21 +23179,21 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_MYSQL_SHA256CRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* MySQL $A$ (7401): sha256crypt with rounds=NNN*1000 */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = $mysql$A$NNN*hex_salt */
@@ -22816,7 +23294,7 @@ sha11saltmd5:
                               linebuf[tslen+1+86] = 0;
                             }
                             Word_t *PV2;
-                            JSLG(PV2, JudyJ[JOB_MYSQL_SHA256CRYPT], (unsigned char *)linebuf);
+                            JSLG(PV2, JUDYJ(JOB_MYSQL_SHA256CRYPT), (unsigned char *)linebuf);
                             if (Printall || PV2) {
                               if (!Printall) {
                                 PV_DEC(saltsnap[si].PV);
@@ -22830,21 +23308,21 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_SCRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* scrypt (8900): crypto_scrypt(pass, salt, N, r, p, output, 32) */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* saltsnap[si].salt = SCRYPT:N:r:p:base64_salt */
@@ -22875,33 +23353,79 @@ sha11saltmd5:
                             b64_encode((char *)curin.h, mdbuf, 32);
                             sprintf(newbuf, "%s:%s", saltsnap[si].salt, mdbuf);
                             Word_t *PV2;
-                            JSLG(PV2, JudyJ[JOB_SCRYPT], (unsigned char *)newbuf);
+                            JSLG(PV2, JUDYJ(JOB_SCRYPT), (unsigned char *)newbuf);
                             if (Printall || PV2) {
                               PV_DEC(saltsnap[si].PV);
                               if (!Printall && *saltsnap[si].PV == 0) {
                                 saltsnap[si] = saltsnap[--nsalts_job]; si--;
                               }
                               prfound(job, newbuf);
+                              /* Also emit the $7$ crypt spelling when this
+                               * salt/params tuple is representable in it:
+                               *   $7$<log2N><r:5><p:5><salt>$<hash:43>
+                               * Requires N an exact power of two, r and p
+                               * under 2^30 (5 crypt64 chars = 30 bits), and
+                               * a salt of literal printable bytes with no
+                               * '$' -- $7$ stores the salt raw, so a binary
+                               * salt has no $7$ spelling at all. Mirrors the
+                               * argon2/Magento dual-emit above.
+                               * linebuf is unused in this case; it is the
+                               * per-thread scratch here (no stack buffers). */
+                              { unsigned long long nn = sc_N;
+                                int lg = 0, k, ok7 = (sc_salt_len > 0);
+                                while (nn > 1) { nn >>= 1; lg++; }
+                                if ((1ULL << lg) != sc_N || lg < 1 || lg > 63)
+                                  ok7 = 0;
+                                if (sc_r >= (1 << 30) || sc_p >= (1 << 30))
+                                  ok7 = 0;
+                                for (k = 0; k < sc_salt_len && ok7; k++) {
+                                  unsigned char sc = (unsigned char)tsalt[k];
+                                  if (sc < 0x21 || sc > 0x7e || sc == '$')
+                                    ok7 = 0;
+                                }
+                                if (ok7 && (sc_salt_len + 64) < MAXLINE) {
+                                  char *o = linebuf;
+                                  int nc;
+                                  *o++ = '$'; *o++ = '7'; *o++ = '$';
+                                  *o++ = Crypt64_alpha[lg];
+                                  nc = crypt64_enc_uint32((unsigned int)sc_r, 30, o);
+                                  if (nc < 0) ok7 = 0; else o += nc;
+                                  if (ok7) {
+                                    nc = crypt64_enc_uint32((unsigned int)sc_p, 30, o);
+                                    if (nc < 0) ok7 = 0; else o += nc;
+                                  }
+                                  if (ok7) {
+                                    memcpy(o, tsalt, sc_salt_len);
+                                    o += sc_salt_len;
+                                    *o++ = '$';
+                                    nc = crypt64_enc_bytes(curin.h, 32, o);
+                                    if (nc == 43) {
+                                      o[43] = 0;
+                                      prfound(job, linebuf);
+                                    }
+                                  }
+                                }
+                              }
                             }
                           }
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_YESCRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* yescrypt (67000): $y$params$salt$hash */
                 if (len > MAXLINE) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   /* Initialize thread-local yescrypt memory if needed */
                   if (!yescrypt_tls_local) {
                     yescrypt_tls_local = calloc(1, sizeof(yescrypt_local_t));
@@ -22920,7 +23444,7 @@ sha11saltmd5:
                       hashcnt++;
                       if (result) {
                         Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_YESCRYPT], (unsigned char *)result);
+                        JSLG(PV2, JUDYJ(JOB_YESCRYPT), (unsigned char *)result);
                         if (Printall || PV2) {
                           if (!Printall) {
                             PV_DEC(saltsnap[si].PV);
@@ -22932,12 +23456,508 @@ sha11saltmd5:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
+                  }
+                break;
+
+              case JOB_GOSTYESCRYPT:
+                if (TYPEDONE(job->op)) break;
+                /* gost-yescrypt (46100), libxcrypt lib/crypt-gost-yescrypt.c:
+                 *   HMAC_Streebog256( HMAC_Streebog256(Streebog256(K), M),
+                 *                     yescrypt(K, S) )
+                 * where M is the $gy$ setting WITHOUT its trailing '$'.
+                 *
+                 * The stored Typesalt is exactly "$gy$params$salt$", so:
+                 *   - the yescrypt setting is that with "$gy$" -> "$y$"
+                 *   - M is that with the final '$' chopped, i.e. length-1.
+                 * That length is the C's (hptr - retval) = 5+len(params)+len(salt);
+                 * including the trailing '$' silently breaks every candidate.
+                 *
+                 * Buffer layout (all pre-allocated per-thread, 2x headroom):
+                 *   mdbuf            yescrypt_r output ($y$...$hash)
+                 *   newbuf[0..]      rewritten $y$ setting
+                 *   linebuf[0..]     assembled $gy$ output line
+                 *   linebuf2[0..63]    HK      (32 used)
+                 *   linebuf2[64..127]  INTERM  (32)
+                 *   linebuf2[128..191] OUT     (32)
+                 *   linebuf2[192..255] Y       (32)
+                 *   linebuf2[256..383] tail    (43 + NUL)
+                 */
+                if (len > MAXLINE) break;
+                  if (!snap_valid) {
+                    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                    TYPESALT(job->op), tsalt, Printall);
+                    snap_valid = 1;
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  if (!yescrypt_tls_local) {
+                    yescrypt_tls_local = calloc(1, sizeof(yescrypt_local_t));
+                    if (yescrypt_tls_local)
+                      yescrypt_init_local(yescrypt_tls_local);
+                  }
+                  if (!yescrypt_tls_local) break;
+                  { int si;
+                    unsigned char *gy_hk     = (unsigned char *)linebuf2;
+                    unsigned char *gy_interm = (unsigned char *)linebuf2 + 64;
+                    unsigned char *gy_out    = (unsigned char *)linebuf2 + 128;
+                    unsigned char *gy_y      = (unsigned char *)linebuf2 + 192;
+                    char          *gy_tail   = (char *)linebuf2 + 256;
+
+                    /* HK = Streebog256(password). Depends ONLY on the password,
+                     * so it is hoisted out of the salt loop: with the contest
+                     * corpus (4834 distinct salts, one param set) this runs once
+                     * per candidate instead of once per candidate per salt. */
+                    sbog256_std(cur, len, gy_hk);
+
+                    for (si = 0; si < nsalts_job; si++) {
+                      const char *setting = saltsnap[si].salt;
+                      int setlen = saltsnap[si].saltlen;
+                      uint8_t *result;
+                      /* setting is "$gy$..."; rewrite the prefix to "$y$..." */
+                      if (setlen < 5 || setlen + 8 > MAXLINE) continue;
+                      newbuf[0] = '$'; newbuf[1] = 'y'; newbuf[2] = '$';
+                      memcpy(newbuf + 3, setting + 4, setlen - 4);
+                      newbuf[setlen - 1] = 0;
+                      result = yescrypt_r(NULL, yescrypt_tls_local,
+                                          (const uint8_t *)cur, len,
+                                          (const uint8_t *)newbuf, NULL,
+                                          (uint8_t *)mdbuf, MAXLINE);
+                      hashcnt++;
+                      if (!result) continue;
+                      { char *hp = strrchr((char *)result, '$');
+                        if (!hp) continue;
+                        if (crypt64_bytes(hp + 1, (int)strlen(hp + 1), gy_y, 32) != 32)
+                          continue;
+                      }
+                      /* M = the $gy$ setting minus its trailing '$' */
+                      hmac_sbog256_std(gy_hk, 32,
+                                       (const unsigned char *)setting,
+                                       (size_t)(setlen - 1), gy_interm);
+                      hmac_sbog256_std(gy_interm, 32, gy_y, 32, gy_out);
+                      if (crypt64_enc_bytes(gy_out, 32, gy_tail) != 43) continue;
+                      snprintf(linebuf, MAXLINE, "%.*s%s", setlen, setting, gy_tail);
+                      { Word_t *PV2;
+                        JSLG(PV2, JUDYJ(JOB_GOSTYESCRYPT), (unsigned char *)linebuf);
+                        if (Printall || PV2) {
+                          if (!Printall) {
+                            PV_DEC(saltsnap[si].PV);
+                            if (*saltsnap[si].PV == 0) {
+                              saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                            }
+                          }
+                          prfound(job, linebuf);
+                        }
+                      }
+                    }
+                    if (!nsalts_job) TYPEDONE(job->op) = 1;
+                  }
+                break;
+
+              case JOB_CMIYC:
+                if (TYPEDONE(job->op)) break;
+                /* CMIYC contest hash (e1001), per challenge/cmiyc_ref.py.
+                 *
+                 *   seed   = HMAC-SHA512(key=salt16, pw || le32(rounds) || le32(memlog))
+                 *   buf[0] = SHA512(seed || "cmiyc-fill" || le64(0))
+                 *   buf[i] = SHA512(buf[i-1] || "cmiyc-fill" || le64(i))
+                 *   per round r = 1..rounds:
+                 *     forward i = 0..N-1 : j = le64(buf[i][0..7])  & (N-1)
+                 *                          buf[i] = SHA512(X||buf[j]||le64(r)||le64(i)||'A')
+                 *     reverse i = N-1..0 : j = le64(buf[i][8..15]) & (N-1)   <-- offset 8
+                 *                          buf[i] = SHA512(X||buf[j]||le64(r)||le64(i)||'B')
+                 *   digest = SHA512(XOR of all N blocks)[0..31]
+                 *
+                 * X is copied out before buf[i] is overwritten, so the j==i
+                 * case still reads the OLD block, matching the reference.
+                 *
+                 * *** UNVALIDATED ALGORITHM ***
+                 * cmiyc_ref.py carries its own "NOT YET VALIDATED AGAINST
+                 * GROUND TRUTH" banner: no (password, hash) pair is known and
+                 * no AIX host is reachable to run the binary as an oracle. A
+                 * single wrong offset yields a silently wrong digest, so a
+                 * clean "not found" here proves nothing until one real pair
+                 * confirms the construction end to end.
+                 *
+                 * Cost at the live parameters (rounds=4, memlog=20):
+                 * ~1.3 GB of SHA-512 and a 64 MiB working set PER CANDIDATE
+                 * PER SALT. The 636 corpus hashes all carry distinct salts,
+                 * so one password against the full set is ~828 GB of SHA-512.
+                 * Budget accordingly -- this is targeted-guess territory, not
+                 * wordlist territory. */
+                if (len > MAXLINE) break;
+                  if (!snap_valid) {
+                    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                    TYPESALT(job->op), tsalt, Printall);
+                    snap_valid = 1;
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  { int si;
+                    for (si = 0; si < nsalts_job; si++) {
+                      const char *cs = saltsnap[si].salt;   /* $cmiyc$v$r$m$salt$ */
+                      long c_ver, c_rounds, c_memlog;
+                      unsigned char c_salt[24], c_seed[64], c_acc[64], c_dig[64];
+                      unsigned char c_msg[160];
+                      unsigned long long c_N, c_mask, ii;
+                      long rr;
+                      const char *p1;
+                      /* parse "$cmiyc$ver$rounds$memlog$b64salt$" */
+                      { const char *q1 = cs + 7, *q2, *q3, *q4;
+                        c_ver = strtol(q1, NULL, 10);
+                        q2 = strchr(q1, '$'); if (!q2) continue; q2++;
+                        c_rounds = strtol(q2, NULL, 10);
+                        q3 = strchr(q2, '$'); if (!q3) continue; q3++;
+                        c_memlog = strtol(q3, NULL, 10);
+                        q4 = strchr(q3, '$'); if (!q4) continue; q4++;
+                        p1 = q4;
+                        { const char *e = strchr(p1, '$');
+                          int sl = e ? (int)(e - p1) : (int)strlen(p1);
+                          if (b64url_dec(p1, sl, c_salt, sizeof(c_salt)) != 16) continue;
+                        }
+                      }
+                      (void)c_ver;
+                      if (c_rounds < 1 || c_rounds > 32) continue;
+                      if (c_memlog < 10 || c_memlog > 24) continue;
+                      c_N = 1ULL << c_memlog;
+                      c_mask = c_N - 1;
+                      /* per-thread 64-byte-block arena, grown on demand */
+                      if (cmiyc_tls_bufsz < c_N * 64) {
+                        unsigned char *nb = realloc(cmiyc_tls_buf, (size_t)(c_N * 64));
+                        if (!nb) { TYPEDONE(job->op) = 1; break; }
+                        cmiyc_tls_buf = nb; cmiyc_tls_bufsz = (size_t)(c_N * 64);
+                      }
+                      /* ---- seed ---- */
+                      { unsigned char sm[MAXLINE + 16];
+                        unsigned int hl = 64;
+                        int ml = len;
+                        if (ml > MAXLINE) continue;
+                        memcpy(sm, cur, ml);
+                        sm[ml+0]=(unsigned char)c_rounds;      sm[ml+1]=(unsigned char)(c_rounds>>8);
+                        sm[ml+2]=(unsigned char)(c_rounds>>16);sm[ml+3]=(unsigned char)(c_rounds>>24);
+                        sm[ml+4]=(unsigned char)c_memlog;      sm[ml+5]=(unsigned char)(c_memlog>>8);
+                        sm[ml+6]=(unsigned char)(c_memlog>>16);sm[ml+7]=(unsigned char)(c_memlog>>24);
+                        HMAC(EVP_sha512(), c_salt, 16, sm, ml + 8, c_seed, &hl);
+                      }
+                      /* ---- fill: chained SHA-512 ---- */
+                      { unsigned char fm[64 + 10 + 8];
+                        memcpy(fm, c_seed, 64);
+                        memcpy(fm + 64, "cmiyc-fill", 10);
+                        for (ii = 0; ii < c_N; ii++) {
+                          int b; unsigned long long v = ii;
+                          for (b = 0; b < 8; b++) fm[74 + b] = (unsigned char)(v >> (8 * b));
+                          mysha512((char *)fm, 82, cmiyc_tls_buf + ii * 64);
+                          memcpy(fm, cmiyc_tls_buf + ii * 64, 64);   /* chain */
+                        }
+                      }
+                      /* ---- rounds ---- */
+                      for (rr = 1; rr <= c_rounds; rr++) {
+                        int b;
+                        for (b = 0; b < 8; b++) c_msg[128 + b] = (unsigned char)(((unsigned long long)rr) >> (8 * b));
+                        for (ii = 0; ii < c_N; ii++) {
+                          unsigned long long j = 0, v = ii;
+                          unsigned char *bi = cmiyc_tls_buf + ii * 64;
+                          memcpy(c_msg, bi, 64);
+                          for (b = 7; b >= 0; b--) j = (j << 8) | c_msg[b];   /* le64 @0 */
+                          j &= c_mask;
+                          memcpy(c_msg + 64, cmiyc_tls_buf + j * 64, 64);
+                          for (b = 0; b < 8; b++) c_msg[136 + b] = (unsigned char)(v >> (8 * b));
+                          c_msg[144] = 0x41;                                  /* 'A' */
+                          mysha512((char *)c_msg, 145, bi);
+                        }
+                        for (ii = c_N; ii-- > 0; ) {
+                          unsigned long long j = 0, v = ii;
+                          unsigned char *bi = cmiyc_tls_buf + ii * 64;
+                          memcpy(c_msg, bi, 64);
+                          for (b = 15; b >= 8; b--) j = (j << 8) | c_msg[b];  /* le64 @8 */
+                          j &= c_mask;
+                          memcpy(c_msg + 64, cmiyc_tls_buf + j * 64, 64);
+                          for (b = 0; b < 8; b++) c_msg[136 + b] = (unsigned char)(v >> (8 * b));
+                          c_msg[144] = 0x42;                                  /* 'B' */
+                          mysha512((char *)c_msg, 145, bi);
+                        }
+                      }
+                      /* ---- finalise: SHA-512 over the XOR-fold, truncated to 32 ---- */
+                      memset(c_acc, 0, 64);
+                      for (ii = 0; ii < c_N; ii++) {
+                        unsigned char *bi = cmiyc_tls_buf + ii * 64;
+                        int b; for (b = 0; b < 64; b++) c_acc[b] ^= bi[b];
+                      }
+                      mysha512((char *)c_acc, 64, c_dig);
+                      hashcnt++;
+                      { char c_b64[64];
+                        b64url_enc(c_dig, 32, c_b64);
+                        snprintf(linebuf, MAXLINE, "%s%s", cs, c_b64);
+                        if (Printall) { prfound(job, linebuf); }
+                        else {
+                          Word_t *PV2;
+                          JSLG(PV2, JUDYJ(JOB_CMIYC), (unsigned char *)linebuf);
+                          if (PV2) {
+                            PV_DEC(saltsnap[si].PV);
+                            if (*saltsnap[si].PV == 0) {
+                              saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                            }
+                            prfound(job, linebuf);
+                          }
+                        }
+                      }
+                    }
+                    if (!nsalts_job) TYPEDONE(job->op) = 1;
+                  }
+                break;
+
+              case JOB_SEVENZIP:
+                if (TYPEDONE(job->op)) break;
+                /* 7-Zip 7zAES (11600). Two stages, per MDXFIND-7Z-SPEC.md:
+                 *
+                 * Stage 1 (here, every candidate):
+                 *   key = SHA256 over 2^log2 repetitions of
+                 *         (salt || password_UTF16LE || uint64_le(counter)),
+                 *         ONE streaming context finalized once -- NOT 2^19
+                 *         successive hashes.
+                 *   Decrypt only the FINAL ciphertext block (CBC, using the
+                 *   preceding ciphertext block as its IV) and require the last
+                 *   `padsize` plaintext bytes to be zero. 7-Zip zero-pads the
+                 *   AES stream to a 16-byte boundary, so this identifies the
+                 *   key without decompressing anything -- which is the whole
+                 *   point: the challenge archives use Deflate64, and both
+                 *   hashcat and john silently fail them because their verify
+                 *   path decompresses and CRCs.
+                 *
+                 * Stage 2 (out of band): confirm a stage-1 hit with
+                 *   7zz t -p<password> archive.7z
+                 * False-positive rate is 2^(-8*padsize): 2^-80 at padsize 14,
+                 * 2^-24 at padsize 3, so hits are rare enough to confirm by hand.
+                 *
+                 * The KDF depends only on (salt, log2_iter), so it is computed
+                 * ONCE per group and reused across every archive sharing it.
+                 * With saltlen=0 that is all five challenge archives for the
+                 * price of one derivation -- the 5x the spec identifies.
+                 *
+                 * Password is UTF-16LE via the existing iconv descriptor: the
+                 * theme dictionary has non-ASCII entries and a zero-extend
+                 * would silently never crack them. */
+                if (len > MAXLINE) break;
+                  if (!snap_valid) {
+                    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                    TYPESALT(job->op), tsalt, Printall);
+                    snap_valid = 1;
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  if (!sevenzip_tls_md) sevenzip_tls_md = EVP_MD_CTX_new();
+                  if (!sevenzip_tls_md) break;
+                  { int si, u16len;
+                    icin = cur; ic_inleft = len;
+                    icout = (char *)wline; ic_outleft = MAXLINE * sizeof(wchar_t);
+                    iconv(cd, NULL, NULL, NULL, NULL);
+                    x = iconv(cd, &icin, &ic_inleft, &icout, &ic_outleft);
+                    u16len = (MAXLINE * sizeof(wchar_t)) - ic_outleft;
+                    if (u16len <= 0) break;
+                    for (si = 0; si < nsalts_job; si++) {
+                      const char *grp = saltsnap[si].salt;
+                      unsigned char sz_key[32], sz_salt[64];
+                      unsigned int sz_keylen = 32;
+                      long g_saltlen = 0, g_log2 = 0;
+                      int g_saltbin = 0;
+                      /* group is "saltlen:salthex:log2" */
+                      { const char *p1 = grp, *p2, *p3;
+                        g_saltlen = strtol(p1, NULL, 10);
+                        p2 = strchr(p1, ':'); if (!p2) continue; p2++;
+                        p3 = strchr(p2, ':'); if (!p3) continue;
+                        if (p3 > p2) {
+                          int hexlen = (int)(p3 - p2);
+                          if (hexlen > 128) continue;
+                          g_saltbin = get32((char *)p2, sz_salt, hexlen / 2);
+                          if (g_saltbin < 0) continue;
+                        }
+                        g_log2 = strtol(p3 + 1, NULL, 10);
+                      }
+                      if (g_log2 < 0 || g_log2 > 40) continue;  /* sanity cap */
+                      /* --- KDF: one streaming SHA-256 over 2^g_log2 records --- */
+                      EVP_DigestInit_ex(sevenzip_tls_md, EVP_sha256(), NULL);
+                      { unsigned char *stage = (unsigned char *)linebuf;
+                        const size_t stagecap = 32768;
+                        size_t rec = (size_t)g_saltbin + u16len + 8;
+                        size_t nrec, k, coff = (size_t)g_saltbin + u16len;
+                        unsigned long long i, total = 1ULL << g_log2;
+                        if (rec > stagecap) { continue; }
+                        nrec = stagecap / rec;
+                        /* The (salt || password) prefix is IDENTICAL in every
+                         * one of the 2^19 records -- only the 8-byte counter
+                         * changes. So stamp the prefix into each slot ONCE per
+                         * candidate, then per iteration write nothing but the
+                         * counter. Rebuilding the whole record each time made
+                         * the staging loop, not SHA-256, the bottleneck
+                         * (measured ~230 MB/s vs SHA-NI's multi-GB/s). */
+                        for (k = 0; k < nrec; k++) {
+                          unsigned char *slot = stage + k * rec;
+                          if (g_saltbin) memcpy(slot, sz_salt, g_saltbin);
+                          memcpy(slot + g_saltbin, (char *)wline, u16len);
+                        }
+                        for (i = 0; i < total; ) {
+                          size_t batch = (total - i) < (unsigned long long)nrec
+                                       ? (size_t)(total - i) : nrec;
+                          for (k = 0; k < batch; k++) {
+                            unsigned char *cp = stage + k * rec + coff;
+                            unsigned long long cv = i + k;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+                            memcpy(cp, &cv, 8);          /* one store on LE */
+#else
+                            { int b; for (b = 0; b < 8; b++) cp[b] = (unsigned char)(cv >> (8 * b)); }
+#endif
+                          }
+                          EVP_DigestUpdate(sevenzip_tls_md, stage, batch * rec);
+                          i += batch;
+                        }
+                      }
+                      EVP_DigestFinal_ex(sevenzip_tls_md, sz_key, &sz_keylen);
+                      hashcnt++;
+                      /* --- stage 1 against every archive in this group --- */
+                      { AES_KEY *sz_ak = (AES_KEY *)linebuf2;
+                        int r;
+                        AES_set_decrypt_key(sz_key, 256, sz_ak);
+                        for (r = 0; r < SevenZipCount; r++) {
+                          struct SevenZipRec *rp = &SevenZipRecs[r];
+                          unsigned char plain[16];
+                          int b, ok;
+                          if (strcmp(rp->group, grp) != 0) continue;
+                          AES_decrypt(rp->tail + 16, plain, sz_ak);
+                          for (b = 0; b < 16; b++) plain[b] ^= rp->tail[b];
+                          /* padsize 0 carries no zero-pad to test: stage 1
+                           * cannot decide, so never report it as a hit. */
+                          ok = (rp->padsize > 0);
+                          for (b = 16 - rp->padsize; ok && b < 16; b++)
+                            if (plain[b]) ok = 0;
+                          if (Printall) {
+                            /* -z: expose the KDF output and final block so a
+                             * wrong KDF is diagnosable against the spec vector
+                             * without a debugger. */
+                            prmd5(sz_key, linebuf + 4096, 64);
+                            linebuf[4096 + 64] = 0;
+                            prmd5(plain, linebuf + 4300, 32);
+                            linebuf[4300 + 32] = 0;
+                            snprintf(mdbuf, MAXLINE,
+                                     "%s:KEY=%s:LASTBLOCK=%s:PADSIZE=%d:PADOK=%d",
+                                     rp->line, linebuf + 4096, linebuf + 4300,
+                                     rp->padsize, ok);
+                            prfound(job, mdbuf);
+                          } else if (ok) {
+                            Word_t *PV2;
+                            JSLG(PV2, JUDYJ(JOB_SEVENZIP), (unsigned char *)rp->line);
+                            if (PV2) prfound(job, rp->line);
+                          }
+                        }
+                      }
+                    }
+                  }
+                break;
+
+              case JOB_SHA1CRYPT:
+                if (TYPEDONE(job->op)) break;
+                /* sha1crypt (15100), NetBSD lib/libcrypt/crypt-sha1.c rev 1.11.
+                 * Iterated HMAC-SHA1 with the PASSWORD as the persistent key:
+                 *   H = HMAC(pw, salt || "$sha1$" || decimal(iterations))
+                 *   repeat iterations-1 times:  H = HMAC(pw, H)
+                 * `iterations` is the TOTAL number of HMAC calls (1 prime +
+                 * iterations-1 loop), so iterations=1 runs the loop zero times.
+                 *
+                 * Note the primed message puts the magic AFTER the salt
+                 * ("75552156$sha1$20000"). It reads like a bug in the C; it is
+                 * not, and reversing it breaks every candidate.
+                 *
+                 * The HMAC key is the password, so it is constant across all
+                 * 5000 iterations AND across every salt. The ipad/opad blocks
+                 * are absorbed once per candidate and the midstates cloned per
+                 * HMAC: 2 SHA-1 compressions per iteration instead of 4 (~2x),
+                 * with key setup amortised to nothing over 8262 salts.
+                 *
+                 * Buffer layout (pre-allocated per-thread, 2x headroom;
+                 * sph_sha1_context is ~92 bytes):
+                 *   linebuf2[0..127]    ictx0  midstate after K^ipad
+                 *   linebuf2[128..255]  octx0  midstate after K^opad
+                 *   linebuf2[256..383]  wctx   working clone
+                 *   linebuf2[384..447]  tail   28 chars + NUL
+                 *   newbuf              primed message
+                 *   linebuf             assembled output line
+                 */
+                if (len > MAXLINE) break;
+                  if (!snap_valid) {
+                    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                    TYPESALT(job->op), tsalt, Printall);
+                    snap_valid = 1;
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  { int si, ki;
+                    /* sph_sha1 rather than OpenSSL SHA_CTX: on ARM/POWERPC
+                     * mdxfind #defines mysha1 -> SHA1 (mdxfind.c:232), so
+                     * including <openssl/sha.h> collides with the real
+                     * prototype. sph_sha1.h documents that its context may be
+                     * cloned by plain copy, which is exactly the midstate
+                     * primitive needed here, and it is already included. */
+                    sph_sha1_context *ictx0 = (sph_sha1_context *)(void *)linebuf2;
+                    sph_sha1_context *octx0 = (sph_sha1_context *)(void *)(linebuf2 + 128);
+                    sph_sha1_context *wctx  = (sph_sha1_context *)(void *)(linebuf2 + 256);
+                    char    *sc_tail = linebuf2 + 384;
+                    unsigned char sc_kb[64], sc_pad[64], sc_dig[20];
+
+                    if (len > 64) { mysha1(cur, len, sc_kb); memset(sc_kb + 20, 0, 44); }
+                    else { memcpy(sc_kb, cur, len); memset(sc_kb + len, 0, 64 - len); }
+                    for (ki = 0; ki < 64; ki++) sc_pad[ki] = sc_kb[ki] ^ 0x36;
+                    sph_sha1_init(ictx0); sph_sha1(ictx0, sc_pad, 64);
+                    for (ki = 0; ki < 64; ki++) sc_pad[ki] = sc_kb[ki] ^ 0x5c;
+                    sph_sha1_init(octx0); sph_sha1(octx0, sc_pad, 64);
+
+                    for (si = 0; si < nsalts_job; si++) {
+                      const char *setting = saltsnap[si].salt;
+                      int setlen = saltsnap[si].saltlen;
+                      unsigned long sc_iter;
+                      const char *sc_salt;
+                      int sc_saltlen, msglen;
+                      unsigned long it;
+                      /* setting is "$sha1$<iter>$<salt>$" */
+                      { const char *ip = setting + 6;
+                        const char *sp = memchr(ip, '$', setlen - 6);
+                        if (!sp) continue;
+                        sc_iter = strtoul(ip, NULL, 10);
+                        sc_salt = sp + 1;
+                        sc_saltlen = setlen - (int)(sc_salt - setting) - 1; /* drop trailing $ */
+                      }
+                      if (sc_iter < 1 || sc_saltlen < 1 || sc_saltlen > 64) continue;
+                      msglen = snprintf(newbuf, MAXLINE, "%.*s$sha1$%lu",
+                                        sc_saltlen, sc_salt, sc_iter);
+                      if (msglen < 0 || msglen >= MAXLINE) continue;
+                      /* prime */
+                      *wctx = *ictx0; sph_sha1(wctx, newbuf, msglen); sph_sha1_close(wctx, sc_dig);
+                      *wctx = *octx0; sph_sha1(wctx, sc_dig, 20);      sph_sha1_close(wctx, sc_dig);
+                      /* iterations-1 further HMACs, each over the previous digest */
+                      for (it = 1; it < sc_iter; it++) {
+                        *wctx = *ictx0; sph_sha1(wctx, sc_dig, 20); sph_sha1_close(wctx, sc_dig);
+                        *wctx = *octx0; sph_sha1(wctx, sc_dig, 20); sph_sha1_close(wctx, sc_dig);
+                      }
+                      hashcnt++;
+                      sha1crypt_b64encode(sc_dig, sc_tail);
+                      snprintf(linebuf, MAXLINE, "%.*s%s", setlen, setting, sc_tail);
+                      { Word_t *PV2;
+                        JSLG(PV2, JUDYJ(JOB_SHA1CRYPT), (unsigned char *)linebuf);
+                        if (Printall || PV2) {
+                          if (!Printall) {
+                            PV_DEC(saltsnap[si].PV);
+                            if (*saltsnap[si].PV == 0) {
+                              saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                            }
+                          }
+                          prfound(job, linebuf);
+                        }
+                      }
+                    }
+                    if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
               case JOB_MEDIAWIKI:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* md5($salt."-".md5($pass)) — iterate unique salts from Typesalt Judy */
                 if (len > MAXLINE)
                   break;
@@ -22945,11 +23965,11 @@ sha11saltmd5:
                 prmd5(curin.h, linebuf + MAXLINE, 32);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     int mw_slen = saltsnap[si].saltlen;
@@ -22968,7 +23988,7 @@ sha11saltmd5:
                     mw_full[4 + mw_slen + 32] = 0;
                     /* look up in JudyJ[JOB_MEDIAWIKI] */
                     { Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_MEDIAWIKI], (unsigned char *)mw_full);
+                      JSLG(PV2, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)mw_full);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         if (!Printall) {
                           *PV2 = 1;
@@ -22978,7 +23998,7 @@ sha11saltmd5:
                           }
                         }
                         (*job->found)++;
-                        atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                        atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                         if (RuleCnt)
                           atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                         if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -23005,12 +24025,12 @@ sha11saltmd5:
                       }
                     }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_DAHUA:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* md5($salt1.strtoupper(md5($salt2.$pass))) */
                 if (len > MAXLINE)
                   break;
@@ -23029,11 +24049,11 @@ sha11saltmd5:
                   prmd5UC(md5buf.h, linebuf + MAXLINE, 32);
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     saltlen = saltsnap[si].saltlen;
@@ -23055,7 +24075,7 @@ sha11saltmd5:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
                 break;
@@ -23067,7 +24087,7 @@ sha11saltmd5:
                   php64_encode((char *)curin.h, c4_enc, 32);
                   c4_enc[43] = 0; /* strip trailing '=' */
                   hashcnt++;
-                  JSLG(PV, JudyJ[JOB_CISCO4], (unsigned char *)c4_enc);
+                  JSLG(PV, JUDYJ(JOB_CISCO4), (unsigned char *)c4_enc);
                   if (Printall || (PV && *PV == 0)) {
                     if (!Printall)
                       *PV = 1;
@@ -23076,7 +24096,7 @@ sha11saltmd5:
 #endif
                     if (RuleCnt)
                       atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                    atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                    atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                     release(FreeWaiting);
 #endif
@@ -23107,17 +24127,17 @@ sha11saltmd5:
                 break;
 
               case JOB_CISCOISE:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* Cisco-ISE: iterate unique salts from Typesalt Judy */
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     /* saltsnap[si].salt = 64-hex salt string */
@@ -23135,7 +24155,7 @@ sha11saltmd5:
                       mdbuf[128] = 0;
                       /* look up in JudyJ[JOB_CISCOISE] */
                       { Word_t *PV2;
-                        JSLG(PV2, JudyJ[JOB_CISCOISE], (unsigned char *)mdbuf);
+                        JSLG(PV2, JUDYJ(JOB_CISCOISE), (unsigned char *)mdbuf);
                         if (Printall || (PV2 && *PV2 == 0)) {
                           if (!Printall) {
                             *PV2 = 1;
@@ -23145,7 +24165,7 @@ sha11saltmd5:
                             }
                           }
                           (*job->found)++;
-                          atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                          atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                           if (RuleCnt)
                             atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                           if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -23173,7 +24193,7 @@ sha11saltmd5:
                       }
                     }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -23181,15 +24201,15 @@ sha11saltmd5:
                 /* Samsung Android: 1024 iterations of SHA1(prev+str(i)+pass+salt) */
                 if (len > MAXLINE)
                   break;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -23221,7 +24241,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -23231,15 +24251,15 @@ sha11saltmd5:
                 /* AIX {ssha1}/{ssha256}/{ssha512}: JudyJ[JOB_PKCS5S2]-HMAC, Judy lookup */
                 if (len > MAXLINE)
                   break;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -23258,17 +24278,17 @@ sha11saltmd5:
                     if (job->op == JOB_AIXSHA1) {
                       dlen = 20;
                       pbkdf2_sha1(cur, len, (unsigned char *)asalt, asaltlen, rounds, (char *)curin.h, dlen);
-                      aixjudy = &JudyJ[JOB_AIXSHA1];
+                      aixjudy = &JUDYJ(JOB_AIXSHA1);
                       prefix = "{ssha1}";
                     } else if (job->op == JOB_AIXSHA256) {
                       dlen = 32;
                       pbkdf2_sha256(cur, len, (unsigned char *)asalt, asaltlen, rounds, (char *)curin.h, dlen);
-                      aixjudy = &JudyJ[JOB_AIXSHA256];
+                      aixjudy = &JUDYJ(JOB_AIXSHA256);
                       prefix = "{ssha256}";
                     } else {
                       dlen = 64;
                       pbkdf2_sha512(cur, len, (unsigned char *)asalt, asaltlen, rounds, (char *)curin.h, dlen);
-                      aixjudy = &JudyJ[JOB_AIXSHA512];
+                      aixjudy = &JUDYJ(JOB_AIXSHA512);
                       prefix = "{ssha512}";
                     }
                     hashcnt++;
@@ -23290,7 +24310,7 @@ sha11saltmd5:
 #endif
                         if (RuleCnt)
                           atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                        atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                        atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                         release(FreeWaiting);
 #endif
@@ -23320,7 +24340,7 @@ sha11saltmd5:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -23334,16 +24354,16 @@ sha11saltmd5:
                 mysha1(cur, len, curin.h);
                 cur = prmd5(curin.h, mdbuf, 40);
                 len = 40;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
               d = mdbuf+len;
               if (!snap_valid) {
                 nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                Typesalt[job->op], tsalt, Printall);
+                                TYPESALT(job->op), tsalt, Printall);
                 snap_valid = 1;
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
               }
-              if (!nsalts_job) { Typedone[job->op] = 1; break; }
+              if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
               { int si;
               for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -23370,7 +24390,7 @@ sha11saltmd5:
                     }
                   }
               }
-              if (!nsalts_job) Typedone[job->op] = 1;
+              if (!nsalts_job) TYPEDONE(job->op) = 1;
               }
               break;
 
@@ -23417,19 +24437,19 @@ sha1_MD5SALT:
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, mdbuf, 32);
 sha1md5salt:
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 d = mdbuf + 32;
 		j = 0;
 		if (job->op == JOB_SHA1_MD5SALT_CR ||
                     job->op == JOB_SHA1_MD5MD5SALT_CR) j++;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     saltlen = saltsnap[si].saltlen;
@@ -23490,7 +24510,7 @@ sha1md5salt:
                       }
                     }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 		if (job->op == JOB_SHA1_MD5PEPPER_MD5SALT ||
 		    job->op == JOB_SHA1_MD5CAPPEPPER_MD5SALT ||
@@ -23503,16 +24523,16 @@ sha1md5salt:
 		prmd5(curin.h, mdbuf,32);
 		/* Overlapping copy: mdbuf[0..16) <= mdbuf[8..24). Use memmove. */
 		memmove(mdbuf,mdbuf+8,16);
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
 		d = mdbuf+16;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		    saltlen = saltsnap[si].saltlen;
@@ -23537,12 +24557,12 @@ sha1md5salt:
 		      }
 		    }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
               case JOB_PHPS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 /* PHPS (2612): md5(md5(pass).salt) — iterate Typesalt Judy, lookup in JudyJ */
                 if (len > MAXLINE) break;
                   /* h1 = md5(pass) -> hex */
@@ -23550,11 +24570,11 @@ sha1md5salt:
                   prmd5(curin.h, mdbuf, 32);
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                       /* salt from snapshot (decoded raw bytes) */
@@ -23569,7 +24589,7 @@ sha1md5salt:
                       /* lookup h2_hex in JudyJ[JOB_PHPS] */
                       { Word_t *PV2;
                         char phps_buf[256];
-                        JSLG(PV2, JudyJ[JOB_PHPS], (unsigned char *)newbuf);
+                        JSLG(PV2, JUDYJ(JOB_PHPS), (unsigned char *)newbuf);
                         if (Printall || (PV2 && *PV2)) {
                           char *phps_orig;
                           if (PV2 && *PV2) {
@@ -23592,7 +24612,7 @@ sha1md5salt:
                           possess(FreeWaiting);
 #endif
                           if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                          atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                          atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
 #if ARM < 8
                           release(FreeWaiting);
 #endif
@@ -23624,7 +24644,7 @@ sha1md5salt:
                         }
                       }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 break;
 
@@ -23671,16 +24691,16 @@ MD5SALTstart:
 		  len = 32;
 		}
               MD5_salt:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
 #ifdef NOTINTEL
-                if (!Typesalt[job->op]) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
               { int si, compact_ctr = 0;
               d = mdbuf + len;
               {
@@ -23899,19 +24919,19 @@ MD5SALTstart:
                     saltsnap[si] = saltsnap[--nsalts_job];
                 }
               }
-              if (!nsalts_job) Typedone[job->op] = 1;
+              if (!nsalts_job) TYPEDONE(job->op) = 1;
               }
               break;
 #else
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 init_md5sse(cur, len, SSEBUF);
                 done2 = 0;
                 maxsaltlens = maxsaltlen = 0;
@@ -24141,14 +25161,14 @@ MD5SALTstart:
                       saltsnap[si] = saltsnap[--nsalts_job];
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 #endif
                 break;
 
               case JOB_MD5DSALT:
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op])
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op))
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
@@ -24157,7 +25177,7 @@ MD5SALTstart:
                   Word_t *PV2;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
 
 
 		    for (x=0; x < nsalts_job; x++) {
@@ -24165,9 +25185,9 @@ MD5SALTstart:
                         saltsnap[x] = saltsnap[--nsalts_job];
 		    }
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si_outer, si_inner;
                   for (si_outer = 0; si_outer < nsalts_job; si_outer++) {
                     saltlen = saltsnap[si_outer].saltlen;
@@ -24212,23 +25232,23 @@ MD5SALTstart:
                     if (!Printall && *saltsnap[si_outer].PV == 0)
                       saltsnap[si_outer] = saltsnap[--nsalts_job];
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 }
                 break;
 #else
                 {
                 int si_outer, si_inner;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op])
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op))
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 for (si_outer = 0; si_outer < nsalts_job; si_outer++) {
                   saltlen = saltsnap[si_outer].saltlen;
                   if (saltlen > 3) continue;
@@ -24389,7 +25409,7 @@ nextsalt1:
                   if (!Printall && *saltsnap[si].PV == 0)
                     saltsnap[si] = saltsnap[--nsalts_job];
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 }
 #endif
@@ -24716,15 +25736,15 @@ nextsalt1:
                 prmd5(curin.h, linebuf + 96, 32);
                 len = 128;
 
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -24751,17 +25771,17 @@ nextsalt1:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
 	      case JOB_SHA1DESCRYPT:
 	      case JOB_MD4UTF16DESCRYPT:
               case JOB_MD4DESCRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 if (!desblock) {
                   desblock = malloc_lock(102400, "desblock");
@@ -24770,11 +25790,11 @@ nextsalt1:
                   if (cur[x] == 0) len = x;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
 		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
@@ -24840,15 +25860,15 @@ nextsalt1:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5DESCRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 if (!desblock) {
                   desblock = malloc_lock(102400, "desblock");
@@ -24858,11 +25878,11 @@ nextsalt1:
                     len = x;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
 		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
@@ -24895,15 +25915,15 @@ nextsalt1:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_DESCRYPT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 if (!desblock) {
                   desblock = malloc_lock(102400, "desblock");
@@ -24914,11 +25934,11 @@ nextsalt1:
                 job->clen = len;  /* GPU needs null-truncated length */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 Word_t *HPV;
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
@@ -24932,7 +25952,7 @@ nextsalt1:
                   hashcnt++;
                   s = bsd_crypt_des(cur, s1, linebuf, desblock);
                   if (s) {
-                    JSLG(HPV, JudyJ[JOB_DESCRYPT],(unsigned char *)linebuf);
+                    JSLG(HPV, JUDYJ(JOB_DESCRYPT),(unsigned char *)linebuf);
                     if (Printall || (HPV && *HPV == 0)) {
                       i = len;
                       if (*s1 != '_' && i > 8) i = 8;
@@ -24953,7 +25973,7 @@ nextsalt1:
                         }
                       }
                       if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                      atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
   		      release(FreeWaiting);
                       (*job->found)++;
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -24978,16 +25998,16 @@ nextsalt1:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_BSDICRYPT:
                 /* BSDi extended DES: _CCCCSSSSHHHHHHHHHHH (9-char salt, variable rounds) */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                if (!Typesalt[job->op])
+                if (!TYPESALT(job->op))
                   break;
                 if (!desblock) {
                   desblock = malloc_lock(102400, "desblock");
@@ -24998,11 +26018,11 @@ nextsalt1:
                 job->clen = len;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { Word_t *BPVB;
                   int si;
                 for (si = 0; si < nsalts_job; si++) {
@@ -25018,7 +26038,7 @@ nextsalt1:
                   hashcnt++;
                   s = bsd_crypt_des(cur, s1, linebuf, desblock);
                   if (s) {
-                    JSLG(BPVB, JudyJ[JOB_BSDICRYPT],(unsigned char *)linebuf);
+                    JSLG(BPVB, JUDYJ(JOB_BSDICRYPT),(unsigned char *)linebuf);
                     if (Printall || (BPVB && *BPVB == 0)) {
                       i = len;
                       for (y = x = 0; x < i; x++) {
@@ -25038,7 +26058,7 @@ nextsalt1:
                         }
                       }
                       if (RuleCnt) atomic_fetch_add(&RuleCnt[job->Ruleindex],1);
-                      atomic_fetch_add(&Totalfound[job->op - 1][0],1);
+                      atomic_fetch_add(&TOTALFOUND(job->op - 1)[0],1);
   		      release(FreeWaiting);
                       (*job->found)++;
                       if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -25063,7 +26083,7 @@ nextsalt1:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -25475,15 +26495,15 @@ nextsalt1:
                 cur = prmd5(curin.h, linebuf+MAXLINE, 32);
 		len = 32;
 		hashcnt += 3;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -25505,7 +26525,7 @@ nextsalt1:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 		break;
 	
@@ -26305,7 +27325,7 @@ md5sha256:
               case JOB_MD5AM2:
                 if (len > MAXLINE / 2)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   Word_t *pvbuf_am[4];
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
@@ -26438,16 +27458,16 @@ md5sha256:
 
 
               case JOB_SHA1_SHA1SALTSHA1PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mysha1(cur, len, md5buf.h);
                 cur = prmd5(md5buf.h, linebuf + 40, 40);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -26474,12 +27494,12 @@ md5sha256:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 	      break;
 
               case JOB_MD5SHA1SALTMD5PASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 mymd5(cur, len, md5buf.h);
@@ -26487,11 +27507,11 @@ md5sha256:
 #ifdef NOTINTEL
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -26518,7 +27538,7 @@ md5sha256:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
               break;
 #else
@@ -26537,11 +27557,11 @@ md5sha256:
 
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     saltlen = saltsnap[si].saltlen;
@@ -26617,7 +27637,7 @@ md5sha256:
                     if (!Printall && *saltsnap[si].PV == 0)
                       saltsnap[si] = saltsnap[--nsalts_job];
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
                 } while (0);
 #endif
@@ -28187,7 +29207,7 @@ sha1md5md5uc:
                 goto SHA1_start;
 
               case JOB_YAF_SHA1:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 ic_inleft = len;
@@ -28202,11 +29222,11 @@ sha1md5md5uc:
                 /* iterate salts from Typesalt Judy */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                     i = b64_decode(saltsnap[si].salt, linebuf + len, &cryptlen);
@@ -28216,7 +29236,7 @@ sha1md5md5uc:
                     { char yaf_b64[32];
                       Word_t *PV2;
                       b64_encode((char *)curin.h, yaf_b64, 20);
-                      JSLG(PV2, JudyJ[JOB_YAF_SHA1], (unsigned char *)yaf_b64);
+                      JSLG(PV2, JUDYJ(JOB_YAF_SHA1), (unsigned char *)yaf_b64);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         if (!Printall) {
                           *PV2 = 1;
@@ -28226,7 +29246,7 @@ sha1md5md5uc:
                           }
                         }
                         (*job->found)++;
-                        atomic_fetch_add(&Totalfound[job->op - 1][0], 1);
+                        atomic_fetch_add(&TOTALFOUND(job->op - 1)[0], 1);
                         if (RuleCnt)
                           atomic_fetch_add(&RuleCnt[job->Ruleindex], 1);
                         if ((job->flags & JOBFLAG_PRINT) && *job->doneprint == 0) {
@@ -28253,21 +29273,21 @@ sha1md5md5uc:
                       }
                     }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1SALTSHA256:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		mysha256(cur,len,md5buf.h);
 		prmd5(md5buf.h,linebuf+MAXLINE,64);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -28289,7 +29309,7 @@ sha1md5md5uc:
 		    }
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 		break;
 
@@ -28475,17 +29495,17 @@ SHA1TRUNC64:
 		cur = prmd5(curin.h, mdbuf, 32);
 		len = 32;
 	      case JOB_SHA1SHA256TRUNCSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 mysha256(cur, len, curin.h);
 		prmd5(curin.h, linebuf,64);
 		prmd5(curin.h, linebuf2,64);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -28515,7 +29535,7 @@ SHA1TRUNC64:
 		    saltlen = i;
 		  }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
 		break;
 
@@ -29108,7 +30128,7 @@ sha1sha256:
                 break;
 
               case JOB_SHA1MD5xSALT:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 for (i = 1; i <= Maxniter; i++) {
                   mymd5(cur, len, curin.h);
                   cur = prmd5(curin.h, linebuf, 32);
@@ -29116,11 +30136,11 @@ sha1sha256:
                   j = sprintf(linebuf2, "%d ", i);
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                    Typesalt[job->op], tsalt, Printall);
+                                    TYPESALT(job->op), tsalt, Printall);
                     snap_valid = 1;
-                    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si;
                   for (si = 0; si < nsalts_job; si++) {
 		    saltlen = saltsnap[si].saltlen;
@@ -29139,7 +30159,7 @@ sha1sha256:
 		      }
 		    }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                   }
 		}
                 break;
@@ -29288,17 +30308,17 @@ sha1sha256:
 
               case JOB_SHA256PASSSALT:
               sha256passsalt_start:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -29316,7 +30336,7 @@ sha1sha256:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -29328,17 +30348,17 @@ sha1sha256:
               case JOB_SHA256SALTPASS:
               case JOB_SHA256RAWSALTPASS:
               sha256saltpass_start:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -29365,22 +30385,22 @@ sha1sha256:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA256MD5SALTPASS:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 fastcopy(linebuf + MAXLINE, cur, len);
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
@@ -29400,7 +30420,7 @@ sha1sha256:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -31182,7 +32202,7 @@ HAV256_5_start:
               HMAC_start:
                 if (len > MAXLINE)
                   break;
-                { Pvoid_t ujudy = (Pvoid_t)Typeuser[job->op];
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
@@ -31205,16 +32225,16 @@ HAV256_5_start:
 
               case JOB_WERKZEUG_MD5:
               case JOB_WERKZEUG_SHA256:
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   int wz_hmac = (job->op == JOB_WERKZEUG_MD5) ? MHASH_MD5 : MHASH_SHA256;
                   int wz_len = (job->op == JOB_WERKZEUG_MD5) ? 32 : 64;
@@ -31228,7 +32248,7 @@ HAV256_5_start:
                     hashcnt++;
                     checkhashwerkzeug(&curin, wz_len, saltsnap[si].salt, wz_prefix, job);
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -31276,15 +32296,15 @@ HAV256_5_start:
                 /* key=$pass: password is key, salt is message */
                 if (len > MAXLINE)
                   break;
-                if (Typedone[job->op]) break;
-                if (!Typesalt[job->op]) break;
+                if (TYPEDONE(job->op)) break;
+                if (!TYPESALT(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   MHASH td;
@@ -31302,7 +32322,7 @@ HAV256_5_start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -31311,16 +32331,16 @@ HAV256_5_start:
 	      sha384passsalt_start:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31346,7 +32366,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31355,16 +32375,16 @@ HAV256_5_start:
 	      sha384saltpass_start:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf + MAXLINE, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31390,7 +32410,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31412,16 +32432,16 @@ HAV256_5_start:
 	      case JOB_MD5_SHA1SALTPASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf + MAXLINE, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31445,7 +32465,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31453,18 +32473,18 @@ HAV256_5_start:
 	      case JOB_MD5_SALTMD5PASS_SALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		mymd5(cur, len, md5buf.h);
 		{ unsigned char saved_md5pass[16];
 		  memcpy(saved_md5pass, md5buf.h, 16);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31488,7 +32508,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		} /* saved_md5pass */
 		break;
@@ -31499,15 +32519,15 @@ HAV256_5_start:
 		 * Typesalt[] holds "salt1:salt2" combined */
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		mymd5(cur, len, md5buf.h);
 		prmd5(md5buf.h, linebuf + MAXLINE, 32);
 		hashcnt++;
@@ -31539,7 +32559,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31547,8 +32567,8 @@ HAV256_5_start:
 	      case JOB_MD5_MD5SALT_MD5MD5PASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		mymd5(cur, len, md5buf.h);
 		prmd5(md5buf.h, linebuf + 128, 32);
 		mymd5(linebuf + 128, 32, md5buf.h);
@@ -31557,11 +32577,11 @@ HAV256_5_start:
 		  hashcnt += 2;
 		  if (!snap_valid) {
 		    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                    Typesalt[job->op], tsalt, Printall);
+		                    TYPESALT(job->op), tsalt, Printall);
 		    snap_valid = 1;
-		    if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		  }
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		  { int si;
 		  for (si = 0; si < nsalts_job; si++) {
 		    saltlen = saltsnap[si].saltlen;
@@ -31585,7 +32605,7 @@ HAV256_5_start:
 		      }
 		    }
 		  }
-		  if (!nsalts_job) Typedone[job->op] = 1;
+		  if (!nsalts_job) TYPEDONE(job->op) = 1;
 		  }
 		}
 		break;
@@ -31596,15 +32616,15 @@ HAV256_5_start:
 		 * Typesalt[] holds "salt1:salt2" combined */
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  char *combined = saltsnap[si].salt;
@@ -31637,7 +32657,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31647,15 +32667,15 @@ HAV256_5_start:
 		 * Typesalt[] holds "salt1:salt2" combined */
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  char *combined = saltsnap[si].salt;
@@ -31687,7 +32707,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31695,15 +32715,15 @@ HAV256_5_start:
 	      case JOB_SHA1_SALTSHA1PASSSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31730,7 +32750,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31742,15 +32762,15 @@ HAV256_5_start:
 		if (Unicode) break;
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  char *combined = saltsnap[si].salt;
@@ -31782,7 +32802,7 @@ HAV256_5_start:
 		  } else {
 		    /* plain hex salt, use Typeuser/Userid/admin */
 		    salthexlen = combinedlen;
-		    { Pvoid_t uj = (Pvoid_t)Typeuser[job->op];
+		    { Pvoid_t uj = (Pvoid_t)TYPEUSER(job->op);
 		      if (!uj) uj = (Pvoid_t)UseridJudy;
 		      ukeys = "admin";
 		      if (uj) {
@@ -31833,7 +32853,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31841,16 +32861,16 @@ HAV256_5_start:
 	      case JOB_SHA256SALTPASSSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf + MAXLINE, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31873,7 +32893,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31881,17 +32901,17 @@ HAV256_5_start:
 	      case JOB_SHA256_SALTSHA256RAW:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		mysha256(cur, len, (unsigned char *)linebuf + 128);
 		hashcnt++;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31914,7 +32934,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31922,16 +32942,16 @@ HAV256_5_start:
 	      case JOB_WRLSALTPASSSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf + MAXLINE, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -31954,7 +32974,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -31962,15 +32982,15 @@ HAV256_5_start:
 	      case JOB_HMAC_BLAKE2S:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32012,7 +33032,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32020,15 +33040,15 @@ HAV256_5_start:
 	      case JOB_MURMUR64A:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32064,7 +33084,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32090,16 +33110,16 @@ HAV256_5_start:
 	      case JOB_SHA224PASSSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32125,7 +33145,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32133,16 +33153,16 @@ HAV256_5_start:
 	      case JOB_SHA224SALTPASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf + MAXLINE, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32168,7 +33188,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32176,16 +33196,16 @@ HAV256_5_start:
 	      case JOB_SHA1PASSHEXSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32209,22 +33229,22 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* {SSHA}base64(sha1($pass.$salt).$salt) — salt extracted from hash */
 	      case JOB_SSHA1BASE64:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		    /* saltsnap[si].salt = hex-encoded salt */
@@ -32244,7 +33264,7 @@ HAV256_5_start:
 		    memmove(ssha_out, "{SSHA}", 6);
 		    b64_encode(ssha_raw, ssha_out + 6, 20 + ssha_saltlen);
 		    Word_t *PV2;
-		    JSLG(PV2, JudyJ[JOB_SSHA1BASE64], (unsigned char *)ssha_out);
+		    JSLG(PV2, JUDYJ(JOB_SSHA1BASE64), (unsigned char *)ssha_out);
 		    if (Printall || PV2) {
 		      if (!Printall) {
 		        PV_DEC(saltsnap[si].PV);
@@ -32255,22 +33275,22 @@ HAV256_5_start:
 		      prfound(job, ssha_out);
 		    }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* {SSHA256}base64(sha256($pass.$salt).$salt) — iterate unique salts */
 	      case JOB_SSHA256BASE64:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		    int ssha_saltlen = saltsnap[si].saltlen / 2;
@@ -32288,7 +33308,7 @@ HAV256_5_start:
 		    memmove(ssha_out, "{SSHA256}", 9);
 		    b64_encode(ssha_raw, ssha_out + 9, 32 + ssha_saltlen);
 		    Word_t *PV2;
-		    JSLG(PV2, JudyJ[JOB_SSHA256BASE64], (unsigned char *)ssha_out);
+		    JSLG(PV2, JUDYJ(JOB_SSHA256BASE64), (unsigned char *)ssha_out);
 		    if (Printall || PV2) {
 		      if (!Printall) {
 		        PV_DEC(saltsnap[si].PV);
@@ -32299,22 +33319,22 @@ HAV256_5_start:
 		      prfound(job, ssha_out);
 		    }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* {SSHA512}base64(sha512($pass.$salt).$salt) — iterate unique salts */
 	      case JOB_SSHA512BASE64:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		    int ssha_saltlen = saltsnap[si].saltlen / 2;
@@ -32332,7 +33352,7 @@ HAV256_5_start:
 		    memmove(ssha_out, "{SSHA512}", 9);
 		    b64_encode(ssha_raw, ssha_out + 9, 64 + ssha_saltlen);
 		    Word_t *PV2;
-		    JSLG(PV2, JudyJ[JOB_SSHA512BASE64], (unsigned char *)ssha_out);
+		    JSLG(PV2, JUDYJ(JOB_SSHA512BASE64), (unsigned char *)ssha_out);
 		    if (Printall || PV2) {
 		      if (!Printall) {
 		        PV_DEC(saltsnap[si].PV);
@@ -32343,7 +33363,7 @@ HAV256_5_start:
 		      prfound(job, ssha_out);
 		    }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32353,15 +33373,15 @@ HAV256_5_start:
 	      case JOB_HMAC_STREEBOG256_KPASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32399,7 +33419,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32407,15 +33427,15 @@ HAV256_5_start:
 	      case JOB_HMAC_STREEBOG256_KSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32453,7 +33473,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32461,15 +33481,15 @@ HAV256_5_start:
 	      case JOB_HMAC_STREEBOG512_KPASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32506,7 +33526,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32514,15 +33534,15 @@ HAV256_5_start:
 	      case JOB_HMAC_STREEBOG512_KSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32559,7 +33579,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32578,16 +33598,16 @@ HAV256_5_start:
 	      case JOB_BLAKE2B512PASSSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32603,7 +33623,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32611,15 +33631,15 @@ HAV256_5_start:
 	      case JOB_BLAKE2B512SALTPASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32636,7 +33656,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32677,16 +33697,16 @@ HAV256_5_start:
 	      case JOB_BLAKE2B256PASSSALT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		fastcopy(linebuf, cur, len);
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32702,7 +33722,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32710,15 +33730,15 @@ HAV256_5_start:
 	      case JOB_BLAKE2B256SALTPASS:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32735,7 +33755,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32743,15 +33763,15 @@ HAV256_5_start:
 	      case JOB_DESENCRYPT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32776,7 +33796,7 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
@@ -32784,15 +33804,15 @@ HAV256_5_start:
 	      case JOB_DES3ENCRYPT:
 		if (len > MAXLINE)
 		  break;
-		if (Typedone[job->op]) break;
-		if (!Typesalt[job->op]) break;
+		if (TYPEDONE(job->op)) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32822,17 +33842,17 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* MSSQL 2000: 0x0100 + salt(8hex) + SHA1_cs(40hex) + SHA1_uc(40hex) */
 	      /* Stored as magic+salt+SHA1_uc (26 bytes); SHA1_cs computed on match for output */
 	      case JOB_MSSQL2000:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
-		if (!Typesalt[job->op]) break;
+		if (!TYPESALT(job->op)) break;
 		if (!Unicode) {
 		  ic_inleft = len;
 		  icin = cur;
@@ -32854,11 +33874,11 @@ HAV256_5_start:
 		}
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32918,16 +33938,16 @@ HAV256_5_start:
 		    }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* MSSQL 2005: 0x0100 + salt(8hex) + SHA1(utf16le(pass).salt)(40hex) */
 	      case JOB_MSSQL2005:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
-		if (!Typesalt[job->op]) break;
+		if (!TYPESALT(job->op)) break;
 		if (!Unicode) {
 		  ic_inleft = len;
 		  icin = cur;
@@ -32942,11 +33962,11 @@ HAV256_5_start:
 		}
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -32966,16 +33986,16 @@ HAV256_5_start:
 		      }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* MSSQL 2012: 0x0200 + salt(8hex) + SHA512(utf16le(pass).salt)(128hex) */
 	      case JOB_MSSQL2012:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
-		if (!Typesalt[job->op]) break;
+		if (!TYPESALT(job->op)) break;
 		if (!Unicode) {
 		  ic_inleft = len;
 		  icin = cur;
@@ -32990,11 +34010,11 @@ HAV256_5_start:
 		}
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -33014,23 +34034,23 @@ HAV256_5_start:
 		      }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* macOS v10.4-10.6: salt(8hex) + SHA1(salt_binary . pass)(40hex) */
 	      case JOB_MACOSX:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
-		if (!Typesalt[job->op]) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -33050,23 +34070,23 @@ HAV256_5_start:
 		      }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* ArubaOS: salt(10hex) + SHA1(salt_binary(5) . pass)(40hex) = 50hex */
 	      case JOB_ARUBAOS:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
-		if (!Typesalt[job->op]) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -33086,23 +34106,23 @@ HAV256_5_start:
 		      }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
 	      /* macOS v10.7: salt(8hex) + SHA512(salt_binary . pass)(128hex) */
 	      case JOB_MACOSX7:
-		if (Typedone[job->op]) break;
+		if (TYPEDONE(job->op)) break;
 		if (len > MAXLINE)
 		  break;
-		if (!Typesalt[job->op]) break;
+		if (!TYPESALT(job->op)) break;
 		if (!snap_valid) {
 		  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-		                  Typesalt[job->op], tsalt, Printall);
+		                  TYPESALT(job->op), tsalt, Printall);
 		  snap_valid = 1;
-		  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		}
-		if (!nsalts_job) { Typedone[job->op] = 1; break; }
+		if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		  saltlen = saltsnap[si].saltlen;
@@ -33122,22 +34142,22 @@ HAV256_5_start:
 		      }
 		  }
 		}
-		if (!nsalts_job) Typedone[job->op] = 1;
+		if (!nsalts_job) TYPEDONE(job->op) = 1;
 		}
 		break;
 
               case JOB_PS_TOKEN:
                 /* PS_TOKEN (13500): SHA1(bin_salt + UTF16LE(pass))
                  * Typesalt = hex_salt, JudyJ key = 40-hex SHA1 hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (Unicode) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Convert password to UTF-16LE once */
                   icin = cur; ic_inleft = len;
@@ -33160,7 +34180,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 40);
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_PS_TOKEN], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_PS_TOKEN), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
@@ -33173,22 +34193,22 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_WINPHONE:
                 /* WINPHONE (13800): SHA256(UTF16LE(pass) + bin_salt)
                  * Typesalt = 256-hex salt, JudyJ key = 64-hex SHA256 hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (Unicode) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Convert password to UTF-16LE once */
                   icin = cur; ic_inleft = len;
@@ -33211,7 +34231,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_WINPHONE], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_WINPHONE), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
@@ -33224,7 +34244,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33251,15 +34271,15 @@ HAV256_5_start:
                  *   mdbuf            hex output + full output string
                  *   curin.h          AES cipher output (16 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 8) break; /* RACF password max 8 chars */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *rk_header  = (unsigned char *)tsalt;
                   unsigned char *rk_salt16  = (unsigned char *)tsalt + 32;
@@ -33400,7 +34420,7 @@ HAV256_5_start:
                                rk_user, star1 + 1, star2 + 1, mdbuf);
                     }
                     { Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_RACF_KDFAES], (unsigned char *)(linebuf2 + 16));
+                      JSLG(PV2, JUDYJ(JOB_RACF_KDFAES), (unsigned char *)(linebuf2 + 16));
                       if (Printall || PV2) {
                         if (!Printall) {
                           PV_DEC(saltsnap[si].PV);
@@ -33412,7 +34432,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33428,14 +34448,14 @@ HAV256_5_start:
                  *   curin.h         MD5 pad output (16 bytes)
                  *   mdbuf           plaintext output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *tc_session = (unsigned char *)tsalt;
                   unsigned char *tc_seq = (unsigned char *)tsalt + 16;
@@ -33519,7 +34539,7 @@ HAV256_5_start:
                     }
                     if (valid) {
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_TACACS], (unsigned char *)saltsnap[si].salt);
+                      JSLG(PV2, JUDYJ(JOB_TACACS), (unsigned char *)saltsnap[si].salt);
                       if (PV2 && *PV2 == 0) {
                         snprintf(linebuf, MAXLINE, "$tacacs-plus$0$%.*s$%.*s$%s",
                                  8, ts, ct_hexlen, c1 + 1, c2 + 1);
@@ -33533,7 +34553,7 @@ HAV256_5_start:
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33548,14 +34568,14 @@ HAV256_5_start:
                  *   linebuf[0..511] AES_KEY structure
                  *   curin.h         AES decrypt output (16 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *an_salt = (unsigned char *)tsalt;
                   unsigned char *an_wkey = (unsigned char *)tsalt + 32;
@@ -33651,7 +34671,7 @@ HAV256_5_start:
                       snprintf(linebuf2, MAXLINE, "$ASN$*%d*%d*%.*s*%s",
                                zpk, iter, 32, c2 + 1, c3 + 1);
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_APPLE_SECURE_NOTES], (unsigned char *)linebuf2);
+                      JSLG(PV2, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)linebuf2);
                       if (PV2 && *PV2 == 0) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -33663,7 +34683,7 @@ HAV256_5_start:
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33675,7 +34695,7 @@ HAV256_5_start:
                  *   tsalt[64..127]  sph_md5_context (~80 bytes)
                  *   mdbuf           hex output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 { unsigned char *dc_opad = (unsigned char *)tsalt;
                   sph_md5_context *dc_ctx = (sph_md5_context *)(tsalt + 64);
                   /* Build opad block: password padded to 64 XOR 0x5c */
@@ -33690,7 +34710,7 @@ HAV256_5_start:
                   prmd5(curin.h, mdbuf, 32);
                   mdbuf[32] = 0;
                   Word_t *PV2;
-                  JSLG(PV2, JudyJ[JOB_CRAMMD5_DOVECOT], (unsigned char *)mdbuf);
+                  JSLG(PV2, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)mdbuf);
                   if (Printall || (PV2 && *PV2 == 0)) {
                     snprintf(linebuf, MAXLINE, "{CRAM-MD5}%s00000000000000000000000000000000", mdbuf);
                     if (!Printall) *PV2 = 1;
@@ -33707,14 +34727,14 @@ HAV256_5_start:
                  *   curin.h + mdbuf   HMAC output (up to 64 bytes)
                  *   linebuf           hex output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     char *jwt = saltsnap[si].salt;
@@ -33774,7 +34794,7 @@ HAV256_5_start:
                     prmd5(curin.h, linebuf, hmac_len * 2);
                     linebuf[hmac_len * 2] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_JWT], (unsigned char *)linebuf);
+                    JSLG(PV2, JUDYJ(JOB_JWT), (unsigned char *)linebuf);
                     if (PV2 && *PV2 == 0) {
                       /* Output = full JWT string */
                       snprintf(linebuf2, MAXLINE, "%s", jwt);
@@ -33787,7 +34807,7 @@ HAV256_5_start:
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33796,14 +34816,14 @@ HAV256_5_start:
                  * Typesalt = "iter:salt"
                  * JudyJ key = 32-hex lowercase
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -33825,7 +34845,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 32);
                     mdbuf[32] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_QNX_MD5], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_QNX_MD5), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "@m,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
@@ -33838,7 +34858,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33847,14 +34867,14 @@ HAV256_5_start:
                  * Typesalt = "iter:salt"
                  * JudyJ key = 64-hex lowercase
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -33876,7 +34896,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_QNX_SHA256], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_QNX_SHA256), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "@s,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
@@ -33889,7 +34909,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33900,14 +34920,14 @@ HAV256_5_start:
                  * Note: QNX has a SHA512 finalization bug for inputs >= 116 bytes.
                  * We compute the correct SHA512 only; buggy hashes won't match.
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -33929,7 +34949,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 128);
                     mdbuf[128] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_QNX_SHA512], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_QNX_SHA512), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "@S,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
@@ -33942,7 +34962,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -33955,14 +34975,14 @@ HAV256_5_start:
                  *   newbuf[0..63]   PBKDF2 output (64 bytes)
                  *   linebuf2        base64 encoded output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *qnx_salt = (unsigned char *)tsalt;
                   unsigned char *qnx_dk = (unsigned char *)newbuf;
@@ -33994,7 +35014,7 @@ HAV256_5_start:
                       snprintf(linebuf, MAXLINE, "@S,%d@%s@%s", iter, linebuf2, b64salt);
                       /* Try JudyJ with the computed format */
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_QNX7_SHA512], (unsigned char *)linebuf);
+                      JSLG(PV2, JUDYJ(JOB_QNX7_SHA512), (unsigned char *)linebuf);
                       if (PV2 && *PV2 == 0) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -34005,21 +35025,21 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_SHA1_S1PS2:
                 /* sha1(salt1+pass+salt2) (19300) — uses checkhashsalt2
                  * Typesalt = "salt1:salt2", JudyJ = 40-hex lowercase */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     char *combined = saltsnap[si].salt;
@@ -34046,7 +35066,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34055,14 +35075,14 @@ HAV256_5_start:
                  * 10 iterations: h = SHA1(site_key+"--"+salt+"--"+pass+"--"+site_key)
                  * then 9x: h = SHA1(hex_lc(h)+"--"+salt+"--"+pass+"--"+site_key)
                  * Typesalt = "salt:site_key", JudyJ = 40-hex lowercase */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     char *combined = saltsnap[si].salt;
@@ -34108,7 +35128,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34127,14 +35147,14 @@ HAV256_5_start:
                  *   mdbuf[0..63]    derived keys (ke, ki)
                  *   curin.h         HMAC output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   int is_17 = (job->op == JOB_KRB5PA_17);
                   int keylen = is_17 ? 16 : 32; /* AES-128 vs AES-256 */
@@ -34291,7 +35311,7 @@ HAV256_5_start:
                         Word_t *PV2;
                         snprintf(linebuf2, MAXLINE, "$krb5pa$%d$%.*s$%.*s$%s",
                                  is_17 ? 17 : 18, userlen, c1 + 1, realmlen, ts, hexdata);
-                        JSLG(PV2, JudyJ[job->op], (unsigned char *)linebuf2);
+                        JSLG(PV2, JUDYJ(job->op), (unsigned char *)linebuf2);
                         if (PV2 && *PV2 == 0) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -34303,7 +35323,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34319,14 +35339,14 @@ HAV256_5_start:
                  *   tsalt[32..51]     pmkid_data (20 bytes: "PMK Name" + macs)
                  *   curin.h[0..19]    HMAC-SHA1 output (20 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *wpa_pmk = (unsigned char *)newbuf;
                   unsigned char *wpa_essid = (unsigned char *)tsalt;
@@ -34357,7 +35377,7 @@ HAV256_5_start:
                     prmd5(curin.h, (char *)mdbuf, 32);
                     mdbuf[32] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_WPA_PMKID], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_WPA_PMKID), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: WPA*01*pmkid*macap*macsta*essid*** */
                       snprintf(linebuf2, MAXLINE, "WPA*01*%s*%.*s*%.*s*%.*s***",
@@ -34372,7 +35392,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34390,14 +35410,14 @@ HAV256_5_start:
                  *   (char*)wline      EAPOL binary (up to 256 bytes)
                  *   curin.h           HMAC output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *wpa_pmk = (unsigned char *)newbuf;
                   unsigned char *wpa_essid = (unsigned char *)tsalt;
@@ -34486,7 +35506,7 @@ HAV256_5_start:
                     prmd5(curin.h, (char *)mdbuf, 32);
                     mdbuf[32] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_WPA_EAPOL], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: WPA*02*mic*macap*macsta*essid*anonce*eapol*00 */
                       char *hp2 = linebuf2;
@@ -34506,7 +35526,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34524,14 +35544,14 @@ HAV256_5_start:
                  *   (char*)wline      EAPOL binary (up to 256 bytes)
                  *   curin.h           HMAC output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 /* Password must be 64 hex chars (32-byte PMK) */
                 if (len != 64) break;
                 { int si;
@@ -34566,7 +35586,7 @@ HAV256_5_start:
                       prmd5(curin.h, (char *)mdbuf, 32);
                       mdbuf[32] = 0;
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_WPA_PMK], (unsigned char *)mdbuf);
+                      JSLG(PV2, JUDYJ(JOB_WPA_PMK), (unsigned char *)mdbuf);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         snprintf(linebuf2, MAXLINE, "WPA*01*%s*%.*s*%.*s*%.*s***",
                                  mdbuf, 12, c1 + 1, 12, c2 + 1, essid_hexlen, essid_start);
@@ -34647,7 +35667,7 @@ HAV256_5_start:
                       prmd5(curin.h, (char *)mdbuf, 32);
                       mdbuf[32] = 0;
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_WPA_PMK], (unsigned char *)mdbuf);
+                      JSLG(PV2, JUDYJ(JOB_WPA_PMK), (unsigned char *)mdbuf);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         char *hp2 = linebuf2;
                         hp2 += sprintf(hp2, "WPA*02*%s*%.*s*%.*s*%.*s*%.*s*%.*s*00",
@@ -34667,21 +35687,21 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_MD5SALT1SALT2:
                 /* md5($salt1.$pass.$salt2) (33000) — uses checkhashsalt2
                  * Typesalt = "salt1:salt2" via hex fallthrough, compact table */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     char *combined = saltsnap[si].salt;
@@ -34708,7 +35728,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34722,15 +35742,15 @@ HAV256_5_start:
                  *   md5buf.h[0..31]     final SHA256 output
                  *   linebuf[0..383]     hex128 + salt concat
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Initial SHA512(password) → hex128 */
                   mysha512(cur, len, curin.h);
@@ -34757,7 +35777,7 @@ HAV256_5_start:
                     prmd5(md5buf.h, newbuf, 64);
                     hashcnt += 10001;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_SYMFONY256], (unsigned char *)newbuf);
+                    JSLG(PV2, JUDYJ(JOB_SYMFONY256), (unsigned char *)newbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", newbuf, salt_str);
                       if (!Printall) {
@@ -34770,7 +35790,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34785,15 +35805,15 @@ HAV256_5_start:
                  *   mdbuf[0..67]        base64 of HMAC (64 chars + null)
                  *   linebuf2[0..127]    crypt_rn output (BCRYPT_HASHSIZE)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned int hmac_outlen = 48;
                   cur[len] = 0;
@@ -34811,7 +35831,7 @@ HAV256_5_start:
                     if (!crypt_rn(mdbuf, setting, linebuf2, BCRYPT_HASHSIZE))
                       continue;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_WPBCRYPT], (unsigned char *)linebuf2);
+                    JSLG(PV2, JUDYJ(JOB_WPBCRYPT), (unsigned char *)linebuf2);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Format output: $wp$2y$NN$SALT22HASH31 */
                       /* setting = "$2b$NN$salt22", linebuf2 = "$2b$NN$salt22hash31" */
@@ -34828,7 +35848,7 @@ HAV256_5_start:
                       prfound(job, newbuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34844,14 +35864,14 @@ HAV256_5_start:
                  *   (char*)wline      ciphertext binary (up to 8KB)
                  *   curin.h           HMAC output (32 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *av_dk = (unsigned char *)newbuf;
                   unsigned char *av_salt = (unsigned char *)tsalt;
@@ -34881,7 +35901,7 @@ HAV256_5_start:
                     prmd5(curin.h, (char *)mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_ANSIBLE_VAULT], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: $ansible$0*0*salt*ct*hmac */
                       snprintf(linebuf2, MAXLINE, "$ansible$0*0*%.*s*%s*%s",
@@ -34896,7 +35916,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -34910,14 +35930,14 @@ HAV256_5_start:
                  *   newbuf[0..63]   PBKDF2 derived key (32 bytes)
                  *   linebuf[0..511] AES_KEY structure
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *ap_salt = (unsigned char *)tsalt;
                   unsigned char *ap_wkey = (unsigned char *)tsalt + 32;
@@ -35001,7 +36021,7 @@ HAV256_5_start:
                       snprintf(linebuf2, MAXLINE, "$fvde$2$16$%.*s$%d$%s",
                                32, c1 + 1, iter, c2 + 1);
                       Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_APFS], (unsigned char *)linebuf2);
+                      JSLG(PV2, JUDYJ(JOB_APFS), (unsigned char *)linebuf2);
                       if (PV2 && *PV2 == 0) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -35013,7 +36033,7 @@ HAV256_5_start:
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35025,14 +36045,14 @@ HAV256_5_start:
                  *   curin.h[0..31]   SHA256 digest (32 bytes)
                  *   mdbuf[0..127]    hex output (64 chars + null)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35056,7 +36076,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 64); /* 32 bytes → 64 hex */
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_OTM_SHA256], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_OTM_SHA256), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: otm_sha256:iter:salt:hash_b64 */
                       char *hp2 = linebuf;
@@ -35072,7 +36092,7 @@ HAV256_5_start:
                       prfound(job, hp2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35086,14 +36106,14 @@ HAV256_5_start:
                  *   curin.h[0..31]   SHA256 output (32 bytes)
                  *   mdbuf[0..127]    hex output (64 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *tg_salt = (unsigned char *)tsalt;
                   for (si = 0; si < nsalts_job; si++) {
@@ -35109,7 +36129,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_TELEGRAM_SHA256], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE, "$telegram$0*%s*%s", mdbuf, ts);
                       if (!Printall) {
@@ -35122,7 +36142,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35134,14 +36154,14 @@ HAV256_5_start:
                  *   newbuf[0..63]    PBKDF2 output (64 bytes, truncated to 20)
                  *   mdbuf[0..63]     hex output (40 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35158,7 +36178,7 @@ HAV256_5_start:
                     prmd5((unsigned char *)newbuf, mdbuf, 40); /* 20 bytes → 40 hex */
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_WEB2PY_SHA512], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "pbkdf2(%d,20,sha512)$%s$%s",
                                iter, salt, mdbuf);
@@ -35172,7 +36192,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35188,14 +36208,14 @@ HAV256_5_start:
                  *   tsalt[0..31]     processed salt (8 or 16 bytes)
                  *   mdbuf[0..255]    hex output (128 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   static const char swpad[] = "1244352345234";
                   for (si = 0; si < nsalts_job; si++) {
@@ -35226,7 +36246,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 128); /* 64 bytes → 128 hex */
                     mdbuf[128] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct output format */
                       if (job->op == JOB_SOLARWINDS) {
@@ -35250,7 +36270,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35265,14 +36285,14 @@ HAV256_5_start:
                  *   curin.h[0..15]   outer MD5 (16 bytes)
                  *   newbuf[0..63]    outer hex (32 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 /* Compute md5(pass) once, hex-encode */
                 mymd5(cur, len, md5buf.h);
                 prmd5(md5buf.h, mdbuf, 32); /* 16 bytes → 32 hex */
@@ -35289,7 +36309,7 @@ HAV256_5_start:
                     prmd5(curin.h, newbuf, 32);
                     newbuf[32] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_SIMPLACMS], (unsigned char *)newbuf);
+                    JSLG(PV2, JUDYJ(JOB_SIMPLACMS), (unsigned char *)newbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", newbuf, salt);
                       if (!Printall) {
@@ -35302,7 +36322,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35316,14 +36336,14 @@ HAV256_5_start:
                  *   linebuf[0..511]  DES_key_schedule × 3
                  *   curin.h[0..15]   DES output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35370,10 +36390,10 @@ HAV256_5_start:
                     Word_t *PV2;
                     char judykey[97];
                     judykey[0] = 0;
-                    JSLF(PV2, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)judykey);
+                    JSLF(PV2, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)judykey);
                     while (PV2) {
                       if (*PV2 != 0) {
-                        JSLN(PV2, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)judykey);
+                        JSLN(PV2, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)judykey);
                         continue;
                       }
                       /* Extract last 2 blocks: prev_ct[64..79] and last_ct[80..95] */
@@ -35403,11 +36423,11 @@ HAV256_5_start:
                         *PV2 = 1;
                         prfound(job, linebuf2);
                       }
-                      JSLN(PV2, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)judykey);
+                      JSLN(PV2, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)judykey);
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35421,14 +36441,14 @@ HAV256_5_start:
                  *   curin.h[0..63]   decrypted data / SHA256 output
                  *   tsalt[0..31]     salt binary
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35487,10 +36507,10 @@ HAV256_5_start:
                     Word_t *PV2;
                     char judykey[129];
                     judykey[0] = 0;
-                    JSLF(PV2, JudyJ[JOB_APPLE_IWORK], (unsigned char *)judykey);
+                    JSLF(PV2, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)judykey);
                     while (PV2) {
                       if (*PV2 != 0) {
-                        JSLN(PV2, JudyJ[JOB_APPLE_IWORK], (unsigned char *)judykey);
+                        JSLN(PV2, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)judykey);
                         continue;
                       }
                       /* Decode 128-hex ciphertext (64 bytes), decrypt first 48 */
@@ -35516,11 +36536,11 @@ HAV256_5_start:
                         *PV2 = 1;
                         prfound(job, linebuf2);
                       }
-                      JSLN(PV2, JudyJ[JOB_APPLE_IWORK], (unsigned char *)judykey);
+                      JSLN(PV2, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)judykey);
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35533,14 +36553,14 @@ HAV256_5_start:
                  *   newbuf[0..63]    master key (32 bytes), then final key (32 bytes)
                  *   tsalt[0..255]    decoded email salt
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35567,7 +36587,7 @@ HAV256_5_start:
                     prmd5((unsigned char *)newbuf + 32, mdbuf, 64);
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_BITWARDEN], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_BITWARDEN), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output: $bitwarden$2*iter1*iter2*salt_b64*hash_b64 */
                       b64_encode(newbuf + 32, linebuf2, 32);
@@ -35583,7 +36603,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35598,14 +36618,14 @@ HAV256_5_start:
                  *   curin.h[0..31]   HMAC-SHA1 output (20 bytes)
                  *   tsalt[0..31]     salt binary (16 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35638,7 +36658,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 40); /* 20 bytes → 40 hex */
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_MONGODB_SHA1], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Re-encode for output */
                       char user_b64[128], salt_b64[32], hash_b64[32];
@@ -35657,7 +36677,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35670,14 +36690,14 @@ HAV256_5_start:
                  *   curin.h[0..31]   HMAC-SHA256 output (32 bytes)
                  *   tsalt[0..31]     salt binary (28 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35699,7 +36719,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 64); /* 32 bytes → 64 hex */
                     mdbuf[64] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_MONGODB_SHA256], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Re-encode for output */
                       char salt_b64[64], hash_b64[64];
@@ -35717,7 +36737,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35730,15 +36750,15 @@ HAV256_5_start:
                  *   mdbuf[0..63]      hex output (64 chars)
                  *   tsalt[0..11]      salt binary (12 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE - 48) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   static const unsigned char fortigate_magic[24] = {
                     0xa3,0x88,0xba,0x2e,0x42,0x4c,0xb0,0x4a,
@@ -35756,7 +36776,7 @@ HAV256_5_start:
                   prmd5(curin.h, mdbuf, 64);
                   mdbuf[64] = 0;
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_FORTIGATE256], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_FORTIGATE256), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       char fg_raw[44], fg_out[68];
                       memcpy(fg_raw, tsalt, 12);
@@ -35775,7 +36795,7 @@ HAV256_5_start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35787,7 +36807,7 @@ HAV256_5_start:
                  *   curin.h[0..19]    HMAC-SHA1 output (20 bytes)
                  *   mdbuf[0..39]      hex output (40 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 { /* Convert password to UTF-16LE */
                   char *u16buf = (char *)wline;
                   int u16len = 0;
@@ -35816,7 +36836,7 @@ HAV256_5_start:
                   prmd5(curin.h, mdbuf, 40);
                   mdbuf[40] = 0;
                   Word_t *PV2;
-                  JSLG(PV2, JudyJ[JOB_UMBRACO], (unsigned char *)mdbuf);
+                  JSLG(PV2, JUDYJ(JOB_UMBRACO), (unsigned char *)mdbuf);
                   if (Printall || (PV2 && *PV2 == 0)) {
                     /* Base64 encode for output */
                     b64_encode((char *)curin.h, linebuf2, 20);
@@ -35835,7 +36855,7 @@ HAV256_5_start:
                  *   md5buf.h[0..15]   MD5(pass) (16 bytes)
                  *   mdbuf[0..7]       encoded 8 chars
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 {
                   static const char dahua_table[] =
                     "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -35858,7 +36878,7 @@ HAV256_5_start:
                   }
                   mdbuf[8] = 0;
                   Word_t *PV2;
-                  JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                  JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                   if (Printall || (PV2 && *PV2 == 0)) {
                     if (!Printall) *PV2 = 1;
                     prfound(job, mdbuf);
@@ -35877,14 +36897,14 @@ HAV256_5_start:
                  *   curin.h[0..31]   decrypted output / IV binary
                  *   mdbuf[0..31]     IV binary
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -35936,10 +36956,10 @@ HAV256_5_start:
                     Word_t *PV2;
                     char judykey[33];
                     judykey[0] = 0;
-                    JSLF(PV2, JudyJ[JOB_SQLCIPHER], (unsigned char *)judykey);
+                    JSLF(PV2, JUDYJ(JOB_SQLCIPHER), (unsigned char *)judykey);
                     while (PV2) {
                       if (*PV2 != 0) {
-                        JSLN(PV2, JudyJ[JOB_SQLCIPHER], (unsigned char *)judykey);
+                        JSLN(PV2, JUDYJ(JOB_SQLCIPHER), (unsigned char *)judykey);
                         continue;
                       }
                       unsigned char ct[16], pt[16];
@@ -35956,11 +36976,11 @@ HAV256_5_start:
                         *PV2 = 1;
                         prfound(job, linebuf2);
                       }
-                      JSLN(PV2, JudyJ[JOB_SQLCIPHER], (unsigned char *)judykey);
+                      JSLN(PV2, JUDYJ(JOB_SQLCIPHER), (unsigned char *)judykey);
                     }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -35978,15 +36998,15 @@ HAV256_5_start:
                  *   curin.h         md5 digest (16 bytes)
                  *   mdbuf           hex output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 8) break; /* BCODE password max 8 chars */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   int sb_cmpbytes = (job->op == JOB_SAP_BCODE) ? 8 : 4;
                   unsigned char *sb_tpass = (unsigned char *)tsalt;
@@ -36065,7 +37085,7 @@ HAV256_5_start:
                       memset(mdbuf + 8, '0', 8);
                     mdbuf[16] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE*3, "%.*s$%s", sp_slen, ts, mdbuf);
                       if (!Printall) {
@@ -36078,7 +37098,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36094,15 +37114,15 @@ HAV256_5_start:
                  *   tsalt[32..47]   DES output (8 bytes)
                  *   linebuf[0..511] DES_key_schedule
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 8) break; /* password max 8 chars */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *as_deskey = (unsigned char *)tsalt;
                   unsigned char *as_euser = (unsigned char *)tsalt + 16;
@@ -36137,7 +37157,7 @@ HAV256_5_start:
                     /* Build full format string for JudyJ lookup */
                     snprintf(linebuf2, MAXLINE*3, "$as400$des$*%.*s*%s", ulen, ts, mdbuf);
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_AS400_DES], (unsigned char *)linebuf2);
+                    JSLG(PV2, JUDYJ(JOB_AS400_DES), (unsigned char *)linebuf2);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -36149,7 +37169,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36160,15 +37180,15 @@ HAV256_5_start:
                  * SHA1(pass + theMagicArray[offset..length] + UC_salt)
                  * PASSCODE compares 20 bytes, PASSCODE5 compares 5 bytes
                  * Typesalt = salt string, JudyJ = 40-hex SHA1 */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   int sp_cmpbytes = (job->op == JOB_SAP_PASSCODE) ? 20 : 5;
                   for (si = 0; si < nsalts_job; si++) {
@@ -36205,7 +37225,7 @@ HAV256_5_start:
                       memset(mdbuf + 10, '0', 30);
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Output format: SALT$HASH */
                       snprintf(linebuf2, MAXLINE*3, "%.*s$%s", sp_slen, ts, mdbuf);
@@ -36219,7 +37239,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36231,15 +37251,15 @@ HAV256_5_start:
                  *   curin.h[0..19]  SHA1 output (20 bytes)
                  *   mdbuf[0..39]   hex output (40 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE - 50) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   const char *ts = saltsnap[si].salt;
@@ -36256,7 +37276,7 @@ HAV256_5_start:
                   prmd5(curin.h, mdbuf, 40);
                   mdbuf[40] = 0;
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_RORAILS_SHA1], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
@@ -36270,7 +37290,7 @@ HAV256_5_start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36286,14 +37306,14 @@ HAV256_5_start:
                  *   mdbuf[0..31]     hex output (32 chars)
                  *   tsalt[0..31]     key buffer (zero-padded password)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   int keybits;
                   switch (job->op) {
@@ -36322,7 +37342,7 @@ HAV256_5_start:
                   prmd5(ct, mdbuf, 32);
                   mdbuf[32] = 0;
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", mdbuf, pthex);
                       if (!Printall) {
@@ -36336,7 +37356,7 @@ HAV256_5_start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36351,14 +37371,14 @@ HAV256_5_start:
                  *   tsalt[0..63]     salt binary (max 64 bytes)
                  *   mdbuf[0..63]     hex output (64 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   const char *ts = saltsnap[si].salt;
@@ -36384,7 +37404,7 @@ HAV256_5_start:
                   prmd5(curin.h, mdbuf, 64);
                   mdbuf[64] = 0;
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_POSTGRESSCRAM256], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct SCRAM format for output */
                       char b64salt_out[128], b64stored_out[64];
@@ -36403,7 +37423,7 @@ HAV256_5_start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36419,15 +37439,15 @@ HAV256_5_start:
                  *   mdbuf[0..63]     hex output (64 chars)
                  *   curin.h          final HMAC output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 256) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* kSecret = "AWS4" + password */
                   unsigned char *kSecret = (unsigned char *)tsalt;
@@ -36477,7 +37497,7 @@ HAV256_5_start:
                   mdbuf[64] = 0;
                   /* Lookup computed signature in JudyJ */
                   { Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_AWSSIGV4], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_AWSSIGV4), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf((char *)wline, MAXLINE,
                         "$AWS-Sig-v4$0$%.*s$%.*s$%.*s$%s$%s",
@@ -36494,7 +37514,7 @@ HAV256_5_start:
                     }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36511,14 +37531,14 @@ HAV256_5_start:
                  *   linebuf[0..511]   AES_KEY structure (~244 bytes)
                  *   mdbuf[0..63]      hex output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   int is_17 = (job->op == JOB_KRB5DB17);
                   int keylen = is_17 ? 16 : 32;
@@ -36556,7 +37576,7 @@ HAV256_5_start:
                     prmd5(key_bytes, mdbuf, keylen * 2);
                     mdbuf[keylen * 2] = 0;
                     { Word_t *PV2;
-                      JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                      JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         snprintf(linebuf2, MAXLINE, "$krb5db$%d$%.*s$%.*s$%s",
                                  is_17 ? 17 : 18, userlen, c1 + 1, realmlen, ts, mdbuf);
@@ -36571,7 +37591,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36581,14 +37601,14 @@ HAV256_5_start:
                  * Buffer layout:
                  *   mdbuf[0..15]   hex output (8 chars)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -36637,7 +37657,7 @@ HAV256_5_start:
                     }
                     hashcnt++;
                     { Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_MURMUR3], (unsigned char *)mdbuf);
+                      JSLG(PV2, JUDYJ(JOB_MURMUR3), (unsigned char *)mdbuf);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                         if (!Printall) {
@@ -36651,7 +37671,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36664,14 +37684,14 @@ HAV256_5_start:
                  *   tsalt[96..111]  MD5 output (16 bytes)
                  *   mdbuf[0..63]    hex output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *ntlm_hash = (unsigned char *)tsalt;
                   unsigned char *salt_bin = (unsigned char *)tsalt + 32;
@@ -36698,7 +37718,7 @@ HAV256_5_start:
                     prmd5(md5_out, mdbuf, 32);
                     mdbuf[32] = 0;
                     { Word_t *PV2;
-                      JSLG(PV2, JudyJ[JOB_MSSNTP], (unsigned char *)mdbuf);
+                      JSLG(PV2, JUDYJ(JOB_MSSNTP), (unsigned char *)mdbuf);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         snprintf(linebuf, MAXLINE, "$sntp-ms$%s$%s", mdbuf, ts);
                         if (!Printall) {
@@ -36712,7 +37732,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36734,14 +37754,14 @@ HAV256_5_start:
                  *   newbuf[0..255]     decoded salt
                  *   mdbuf[0..255]      hex output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -36786,7 +37806,7 @@ HAV256_5_start:
                     hashcnt++;
                     prmd5(curin.h, mdbuf, hashlen2 * 2);
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[job->op], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       { int stype_out = (job->op == JOB_SSPR_MD5) ? 0 :
                                          (job->op == JOB_SSPR_SHA1) ? 1 :
@@ -36809,7 +37829,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36823,14 +37843,14 @@ HAV256_5_start:
                  *   newbuf[0..511]     intermediate concat buffer
                  *   linebuf[0..511]    final concat buffer
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Step 1: md5hex(pass) — same for all salts */
                   mymd5((unsigned char *)cur, len, curin.h);
@@ -36864,7 +37884,7 @@ HAV256_5_start:
                     hashcnt++;
                     prmd5(curin.h, linebuf2, 32);  /* linebuf2 = final hash */
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_EMPIRECMS], (unsigned char *)linebuf2);
+                    JSLG(PV2, JUDYJ(JOB_EMPIRECMS), (unsigned char *)linebuf2);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf, MAXLINE, "%s:%.*s:%.*s", linebuf2, salt1len, ts, salt2len, salt2);
                       if (!Printall) {
@@ -36877,7 +37897,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36890,14 +37910,14 @@ HAV256_5_start:
                  *   mdcur[0],[1]     alternating SHA1 buffers
                  *   mdbuf            b64 output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -36925,7 +37945,7 @@ HAV256_5_start:
                     int b64len = b64_encode((char *)curin.h, b64out, 20);
                     b64out[b64len] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_PBKDF1_SHA1], (unsigned char *)b64out);
+                    JSLG(PV2, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)b64out);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct PBKDF1:sha1:ITER:B64SALT:B64HASH */
                       char saltb64[400];
@@ -36942,7 +37962,7 @@ HAV256_5_start:
                       prfound(job, linebuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -36956,14 +37976,14 @@ HAV256_5_start:
                  *   newbuf[32..63]   decrypted data (16 bytes)
                  *   linebuf[0..255]  AES_KEY (~244 bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Convert pass to UTF16LE */
                   unsigned char *u16pass = (unsigned char *)wline;
@@ -37012,7 +38032,7 @@ HAV256_5_start:
                         Word_t *PV2;
                         snprintf(mdbuf, MAXLINE+16, "$MSONLINEACCOUNT$0$%d$%.*s", iter,
                           (int)(saltsnap[si].saltlen - (datahex - ts)), datahex);
-                        JSLG(PV2, JudyJ[JOB_MSONLINE], (unsigned char *)mdbuf);
+                        JSLG(PV2, JUDYJ(JOB_MSONLINE), (unsigned char *)mdbuf);
                         if (PV2 && *PV2 == 0) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -37024,7 +38044,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -37032,15 +38052,15 @@ HAV256_5_start:
                 /* WBB4 (33800): bcrypt(bcrypt($pass)) — double bcrypt with same salt
                  * Typesalt = "$2a$CC$22charsalt", JudyJ key = full 60-char bcrypt string
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 72) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   cur[len] = 0;
                   for (si = 0; si < nsalts_job; si++) {
@@ -37051,7 +38071,7 @@ HAV256_5_start:
                     /* Second bcrypt: bcrypt(bcrypt_output) with same salt */
                     crypt_rn(linebuf2, setting, mdbuf, BCRYPT_HASHSIZE);
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_WBB4], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_WBB4), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -37063,7 +38083,7 @@ HAV256_5_start:
                       prfound(job, mdbuf);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -37071,15 +38091,15 @@ HAV256_5_start:
                 /* SAP CODVN H SHA512 (35000): SHA512(pass+salt) iterated
                  * Same as SAPCODVNH but SHA512 (64-byte digest)
                  * Typesalt = iter:hex_salt, JudyJ = 128-hex SHA512 */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (len > 40) break;  /* pw_max = 40 */
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 {
                   int si;
                   for (si = 0; si < nsalts_job; si++) {
@@ -37107,7 +38127,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, 128);
                     mdbuf[128] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_SAPCODVNH512], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       /* Reconstruct {x-isSHA512, ITER}BASE64(hash+salt) */
                       unsigned char sh_raw[400];
@@ -37126,21 +38146,21 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
               case JOB_AS400SSHA1:
                 /* AS/400 SSHA1 (35200): SHA1(UTF16BE(UC(user_pad10)) + UTF16BE(pass))
                  * Typesalt = uppercase username, JudyJ = 40-hex UC hash */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *user = saltsnap[si].salt;
@@ -37159,7 +38179,7 @@ HAV256_5_start:
                     prmd5UC(curin.h, mdbuf, 40);
                     mdbuf[40] = 0;
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_AS400SSHA1], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_AS400SSHA1), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       snprintf(linebuf2, MAXLINE*3, "$as400$ssha1$*%.*s*%s", userlen, user, mdbuf);
                       if (!Printall) {
@@ -37172,7 +38192,7 @@ HAV256_5_start:
                       prfound(job, linebuf2);
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -37189,14 +38209,14 @@ HAV256_5_start:
                  *   linebuf[0..511] AES_KEY (~244 bytes)
                  *   mdbuf[0..]      formatted output
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   unsigned char *vbk_salt = (unsigned char *)tsalt;
                   unsigned char *vbk_dk = (unsigned char *)tsalt + 128;
@@ -37259,7 +38279,7 @@ HAV256_5_start:
                         snprintf(jkey, MAXLINE, "$vbk$*%.128s*%d*%.32s", salthex, iter, cthex);
                         { int jj; for (jj = 0; jkey[jj]; jj++) jkey[jj] = tolower(jkey[jj]); }
                         { Word_t *PV2;
-                          JSLG(PV2, JudyJ[JOB_VEEAM_VBK], (unsigned char *)jkey);
+                          JSLG(PV2, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)jkey);
                           if (PV2 && *PV2 == 0) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -37272,7 +38292,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -37287,14 +38307,14 @@ HAV256_5_start:
                  *   tsalt[0..15]     salt binary
                  *   mdbuf[0..15]     IV binary
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
                   const char *ts = saltsnap[si].salt;
@@ -37336,10 +38356,10 @@ HAV256_5_start:
                   Word_t *PV2;
                   char judykey[65];
                   judykey[0] = 0;
-                  JSLF(PV2, JudyJ[JOB_VMWARE_VMX], (unsigned char *)judykey);
+                  JSLF(PV2, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)judykey);
                   while (PV2) {
                     if (*PV2 != 0) {
-                      JSLN(PV2, JudyJ[JOB_VMWARE_VMX], (unsigned char *)judykey);
+                      JSLN(PV2, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)judykey);
                       continue;
                     }
                     unsigned char ct_bin[32], pt_bin[32];
@@ -37359,11 +38379,11 @@ HAV256_5_start:
                       *PV2 = 1;
                       prfound(job, linebuf2);
                     }
-                    JSLN(PV2, JudyJ[JOB_VMWARE_VMX], (unsigned char *)judykey);
+                    JSLN(PV2, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)judykey);
                   }
                   }
                 }
-                if (!nsalts_job) Typedone[job->op] = 1;
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -37379,14 +38399,14 @@ HAV256_5_start:
                  *   mdbuf           formatted output string
                  *   argon2_ws       pre-allocated workspace (Argon2_maxmem bytes)
                  */
-                if (Typedone[job->op]) break;
+                if (TYPEDONE(job->op)) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
-                                  Typesalt[job->op], tsalt, Printall);
+                                  TYPESALT(job->op), tsalt, Printall);
                   snap_valid = 1;
-                  if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 }
-                if (!nsalts_job) { Typedone[job->op] = 1; break; }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
@@ -37436,7 +38456,7 @@ HAV256_5_start:
                     snprintf(mdbuf, MAXLINE, "%sv=%d$m=%d,t=%d,p=%d$%s$%s",
                              a2sig, a2ver, a2m, a2t, a2p, b64salt, b64hash);
                     Word_t *PV2;
-                    JSLG(PV2, JudyJ[JOB_ARGON2], (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(JOB_ARGON2), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -37465,7 +38485,7 @@ HAV256_5_start:
                       }
                     }
                   }
-                  if (!nsalts_job) Typedone[job->op] = 1;
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
                 break;
 
@@ -37536,18 +38556,18 @@ gpu_packed_done: ;
 	break;
     }
     if (snap_valid)
-      Livesalts[job->op] = nsalts_job;
+      LIVESALTS(job->op) = nsalts_job;
     possess(FreeWaiting);
     if (lineproc) TotLines += lineproc;
     if (hashcnt) {
       Tothash += hashcnt;
       if (linehints && job->op > 0 && job->op < linehints_count)
-        __sync_fetch_and_add(&linehints[job->op].hashes_accum, hashcnt);
+        __sync_fetch_and_add(&LINEHINTS(job->op).hashes_accum, hashcnt);
     }
     if (found) Totfound += found;
     if (rulecnt) Totrules += rulecnt;
     if (lineproc && linehints && job->op > 0 && job->op < linehints_count)
-      __sync_fetch_and_add(&linehints[job->op].retired_line, lineproc);
+      __sync_fetch_and_add(&LINEHINTS(job->op).retired_line, lineproc);
     if (lineproc)
       __sync_fetch_and_sub(&InflightLines, lineproc);
     job->op = 0;
@@ -39537,6 +40557,56 @@ static const int gpu_ops[] = {
 };
 #endif
 
+/* Capacity helpers for the HashData entry arrays and byte buffer.
+ *
+ * addhash() sizes HashDataOff/Len/Flags for the hex hashes it loads, but
+ * build_compact_table() APPENDS more entries afterwards (bcrypt, sha512crypt,
+ * md5crypt digests). Each of those append sites has to grow the arrays itself.
+ * The bcrypt block did not: it checked only HashDataBufCap (the byte buffer)
+ * and then wrote HashDataOff[HashDataCount] unconditionally, one element past
+ * the end once HashDataCount reached HashDataCap. That corrupted the malloc
+ * heap; the damage surfaced later and elsewhere, as "free(): invalid pointer"
+ * inside compact_resize() when the compact table doubled.
+ *
+ * Reproduced 2026-08-07 on the CMIYC corpus: any run whose hash file mixes
+ * bcrypt with enough hex hashes to fill the entry arrays. Confirmed
+ * pre-existing (the RCS-tip baseline crashes identically).
+ *
+ * These two helpers centralise the growth so a future append site cannot
+ * forget it again. Both exit(1) on allocation failure, matching the existing
+ * behaviour at the other sites. */
+static void hashdata_reserve(size_t need) {
+    size_t newcap;
+    if (HashDataCount + need <= HashDataCap) return;
+    newcap = HashDataCap ? HashDataCap : 4096;
+    while (newcap < HashDataCount + need) newcap *= 2;
+    HashDataOff   = realloc(HashDataOff,   newcap * sizeof(size_t));
+    HashDataLen   = realloc(HashDataLen,   newcap * sizeof(unsigned short));
+    HashDataFlags = realloc(HashDataFlags, newcap * sizeof(unsigned short));
+    if (!HashDataOff || !HashDataLen || !HashDataFlags) {
+        fprintf(stderr, "Failed to grow hash entry arrays to %llu entries\n",
+                (unsigned long long)newcap);
+        exit(1);
+    }
+    memset(HashDataFlags + HashDataCap, 0,
+           (newcap - HashDataCap) * sizeof(unsigned short));
+    HashDataCap = newcap;
+}
+
+static void hashdatabuf_reserve(size_t need) {
+    size_t newcap;
+    if (HashDataBufUsed + need <= HashDataBufCap) return;
+    newcap = HashDataBufCap ? HashDataBufCap : 65536;
+    while (newcap < HashDataBufUsed + need) newcap *= 2;
+    HashDataBuf = realloc(HashDataBuf, newcap);
+    if (!HashDataBuf) {
+        fprintf(stderr, "Failed to grow hash data buffer to %llu bytes\n",
+                (unsigned long long)newcap);
+        exit(1);
+    }
+    HashDataBufCap = newcap;
+}
+
 void build_compact_table(void) {
   size_t i;
   uint64_t tsize;
@@ -39611,7 +40681,11 @@ void build_compact_table(void) {
 
       while (next) {
         if (hlen < next->len) break;
-        if (memcmp(hash + 8, next->hash, hlen - 8) <= 0) break;
+        /* Only compare bytes when the lengths match. The chain is ordered
+         * by length first, so hlen > next->len simply means keep walking --
+         * comparing here read hlen-8 bytes out of an entry that holds only
+         * next->len-8 (raw32 vs raw96 in one file overruns by 32 bytes). */
+        if (hlen == next->len && memcmp(hash + 8, next->hash, hlen - 8) <= 0) break;
         prev = next;
         next = next->next;
       }
@@ -39620,7 +40694,18 @@ void build_compact_table(void) {
         goto inserted;
       }
 
-      chain = mymalloc(sizeof(struct Hashchain) + hlen - 9, 4);
+      /* malloc(), NOT mymalloc(): compact_resize() releases overflow chain
+       * entries with free(). Entries carved out of the mymalloc arena are not
+       * individually free()-able, and handing one to free() aborts the process
+       * with "free(): invalid pointer" the next time the compact table doubles.
+       * The other two chain-allocation sites (compact_resize, compact_insert)
+       * already use malloc; this was the odd one out. Fixed 2026-08-07. */
+      chain = malloc(sizeof(struct Hashchain) + hlen - 9);
+      if (!chain) {
+        fprintf(stderr, "Failed to allocate overflow chain entry (%d bytes)\n",
+                (int)(sizeof(struct Hashchain) + hlen - 9));
+        exit(1);
+      }
       chain->len = hlen;
       chain->flags = 0;
       memmove(chain->hash, hash + 8, hlen - 8);
@@ -39660,7 +40745,7 @@ void build_compact_table(void) {
     Word_t *BPV;
     int bc_added = 0;
     bcline[0] = 0;
-    JSLF(BPV, JudyJ[JOB_BCRYPT], (unsigned char *)bcline);
+    JSLF(BPV, JUDYJ(JOB_BCRYPT), (unsigned char *)bcline);
     /* Ensure HashDataBuf is allocated (may be NULL if no hex hashes were loaded) */
     if (BPV && !HashDataBuf) {
       HashDataBufCap = 65536;
@@ -39694,8 +40779,15 @@ void build_compact_table(void) {
       /* Raw decoded bytes are BE from BF_encode. On a LE host, reading them
        * as native uint32 gives the same values the GPU kernel produces after
        * its BE-to-LE byte-swap. No additional swap needed here. */
-      /* Append to HashDataBuf and insert into compact table */
-      if (HashDataBufUsed + 24 <= HashDataBufCap) {
+      /* Append to HashDataBuf and insert into compact table.
+       * Grow BOTH the entry arrays and the byte buffer first. This used to
+       * test only HashDataBufCap, which meant (a) HashDataOff[HashDataCount]
+       * could be written one past the end of the entry arrays -- heap
+       * corruption -- and (b) once the byte buffer filled, the remaining
+       * bcrypt hashes were silently dropped instead of searched. */
+      hashdata_reserve(1);
+      hashdatabuf_reserve(24);
+      {
         HashDataOff[HashDataCount] = HashDataBufUsed;
         HashDataLen[HashDataCount] = 23;
         HashDataFlags[HashDataCount] = 0;
@@ -39706,7 +40798,7 @@ void build_compact_table(void) {
         HashDataCount++;
         bc_added++;
       }
-      JSLN(BPV, JudyJ[JOB_BCRYPT], (unsigned char *)bcline);
+      JSLN(BPV, JUDYJ(JOB_BCRYPT), (unsigned char *)bcline);
     }
     if (bc_added)
       fprintf(stderr, "Compact table: added %d bcrypt hashes for GPU probing\n", bc_added);
@@ -39726,19 +40818,19 @@ void build_compact_table(void) {
     int sc_added = 0;
     init_phpatoi64();
     sc_line[0] = 0;
-    JSLF(SC_PV, JudyJ[JOB_SHA512CRYPT], (unsigned char *)sc_line);
+    JSLF(SC_PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)sc_line);
     /* Ensure HashDataBuf is allocated (may be NULL if no hex hashes were loaded) */
-    if (SC_PV && !HashDataBuf) {
-      HashDataBufCap = 65536;
-      HashDataBuf = malloc(HashDataBufCap);
-      HashDataOff = malloc(65536 * sizeof(size_t));
-      HashDataLen = malloc(65536 * sizeof(unsigned short));
-      HashDataFlags = malloc(65536 * sizeof(unsigned short));
-      if (HashDataFlags) memset(HashDataFlags, 0, 65536 * sizeof(unsigned short));
-      HashDataCap = 65536;
-    } else if (SC_PV && HashDataCap == 0) {
-      /* Arrays exist (e.g. from bcrypt block) but HashDataCap not tracked */
-      HashDataCap = 65536;
+    if (SC_PV) {
+      /* Allocate/grow through the shared helpers rather than assuming a size.
+       *
+       * This previously had an "else if (HashDataCap == 0) HashDataCap = 65536"
+       * arm commented "arrays exist (e.g. from bcrypt block) but HashDataCap
+       * not tracked". That claimed 65536 entries of capacity the arrays might
+       * not actually have, so every later grow check compared against a
+       * fiction and the appends below could run far past the end. The bcrypt
+       * block now maintains HashDataCap correctly, so nothing has to guess. */
+      hashdata_reserve(1);
+      hashdatabuf_reserve(64);
     }
     while (SC_PV) {
       /* Find hash portion: $6$[rounds=N$]salt$HASH (86 chars) */
@@ -39775,28 +40867,9 @@ void build_compact_table(void) {
           }
         }
         if (decode_ok) {
-          /* Grow arrays if needed */
-          if (HashDataCount + 1 > HashDataCap) {
-            size_t newcap = HashDataCap ? HashDataCap * 2 : 4096;
-            HashDataOff = realloc(HashDataOff, newcap * sizeof(size_t));
-            HashDataLen = realloc(HashDataLen, newcap * sizeof(unsigned short));
-            HashDataFlags = realloc(HashDataFlags, newcap * sizeof(unsigned short));
-            if (!HashDataOff || !HashDataLen || !HashDataFlags) {
-              fprintf(stderr, "Failed to allocate hash entry arrays\n");
-              exit(1);
-            }
-            memset(HashDataFlags + HashDataCap, 0, (newcap - HashDataCap) * sizeof(unsigned short));
-            HashDataCap = newcap;
-          }
-          if (HashDataBufUsed + 16 > HashDataBufCap) {
-            size_t newcap = HashDataBufCap ? HashDataBufCap * 2 : 65536;
-            HashDataBuf = realloc(HashDataBuf, newcap);
-            if (!HashDataBuf) {
-              fprintf(stderr, "Failed to allocate hash data buffer\n");
-              exit(1);
-            }
-            HashDataBufCap = newcap;
-          }
+          /* Grow entry arrays + byte buffer via the shared helpers. */
+          hashdata_reserve(1);
+          hashdatabuf_reserve(16);
           HashDataOff[HashDataCount] = HashDataBufUsed;
           HashDataLen[HashDataCount] = 16;
           HashDataFlags[HashDataCount] = 0;
@@ -39807,7 +40880,7 @@ void build_compact_table(void) {
           sc_added++;
         }
       }
-      JSLN(SC_PV, JudyJ[JOB_SHA512CRYPT], (unsigned char *)sc_line);
+      JSLN(SC_PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)sc_line);
     }
     if (sc_added)
       fprintf(stderr, "Compact table: added %d SHA512CRYPT hashes for GPU probing\n", sc_added);
@@ -39830,7 +40903,7 @@ void build_compact_table(void) {
     int s5_added = 0;
     init_phpatoi64();
     s5_line[0] = 0;
-    JSLF(S5_PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)s5_line);
+    JSLF(S5_PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)s5_line);
     /* Ensure HashDataBuf is allocated (may be NULL if no hex hashes were loaded) */
     if (S5_PV && !HashDataBuf) {
       HashDataBufCap = 65536;
@@ -39883,28 +40956,9 @@ void build_compact_table(void) {
           }
         }
         if (decode_ok) {
-          /* Grow arrays if needed */
-          if (HashDataCount + 1 > HashDataCap) {
-            size_t newcap = HashDataCap ? HashDataCap * 2 : 4096;
-            HashDataOff = realloc(HashDataOff, newcap * sizeof(size_t));
-            HashDataLen = realloc(HashDataLen, newcap * sizeof(unsigned short));
-            HashDataFlags = realloc(HashDataFlags, newcap * sizeof(unsigned short));
-            if (!HashDataOff || !HashDataLen || !HashDataFlags) {
-              fprintf(stderr, "Failed to allocate hash entry arrays\n");
-              exit(1);
-            }
-            memset(HashDataFlags + HashDataCap, 0, (newcap - HashDataCap) * sizeof(unsigned short));
-            HashDataCap = newcap;
-          }
-          if (HashDataBufUsed + 16 > HashDataBufCap) {
-            size_t newcap = HashDataBufCap ? HashDataBufCap * 2 : 65536;
-            HashDataBuf = realloc(HashDataBuf, newcap);
-            if (!HashDataBuf) {
-              fprintf(stderr, "Failed to allocate hash data buffer\n");
-              exit(1);
-            }
-            HashDataBufCap = newcap;
-          }
+          /* Grow entry arrays + byte buffer via the shared helpers. */
+          hashdata_reserve(1);
+          hashdatabuf_reserve(16);
           HashDataOff[HashDataCount] = HashDataBufUsed;
           HashDataLen[HashDataCount] = 16;
           HashDataFlags[HashDataCount] = 0;
@@ -39915,7 +40969,7 @@ void build_compact_table(void) {
           s5_added++;
         }
       }
-      JSLN(S5_PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)s5_line);
+      JSLN(S5_PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)s5_line);
     }
     if (s5_added)
       fprintf(stderr, "Compact table: added %d SHA256CRYPT hashes for GPU probing\n", s5_added);
@@ -40082,8 +41136,8 @@ void build_compact_table(void) {
     if (gpu_ok == 0
         && (getenv("MDXFIND_HX_CODEGEN_JOB")
             || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
-        char hxhost[256] = "unknown";
-        gethostname(hxhost, sizeof(hxhost) - 1);
+        char hxhost[256];
+        mdx_gethostname(hxhost, sizeof(hxhost));
 
         /* Sub-phase 2a.2: look up e1 MD5 in the auto-generated
          * hx_specs_data[] (replaces 2a.1's hardcoded trivial spec).
@@ -40612,8 +41666,8 @@ void build_compact_table(void) {
     if (gpu_ok == 0
         && (getenv("MDXFIND_HX_CODEGEN_JOB")
             || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
-        char hxhost[256] = "unknown";
-        gethostname(hxhost, sizeof(hxhost) - 1);
+        char hxhost[256];
+        mdx_gethostname(hxhost, sizeof(hxhost));
 
         int target_job = 1;
         const char *job_env = getenv("MDXFIND_HX_CODEGEN_JOB");
@@ -41479,23 +42533,23 @@ MDXALIGN void ReportStats(void *dummy) {
       unsigned long long gpu_delta = tothash_now - tothash_snapshot;
       tothash_snapshot = tothash_now;
       if (gpu_delta > 0)
-        __sync_fetch_and_add(&linehints[JOB_MD5].hashes_accum, (long long)gpu_delta);
+        __sync_fetch_and_add(&LINEHINTS(JOB_MD5).hashes_accum, (long long)gpu_delta);
     }
     if (linehints) {
       unsigned long long lowest_line = ULLONG_MAX;
       for (x = 0; x < linehints_count; x++) {
-        long long accum = __sync_lock_test_and_set(&linehints[x].hashes_accum, 0);
+        long long accum = __sync_lock_test_and_set(&LINEHINTS(x).hashes_accum, 0);
         if (accum > 0) {
           long long measured = accum / 15;  /* hashes/sec over 15s window */
-          long long old = linehints[x].rate;
+          long long old = LINEHINTS(x).rate;
           if (old <= 0)
-            linehints[x].rate = measured;
+            LINEHINTS(x).rate = measured;
           else
-            linehints[x].rate = (long long)(0.3 * measured + 0.7 * old);
+            LINEHINTS(x).rate = (long long)(0.3 * measured + 0.7 * old);
         }
         /* Track lowest curline across active algorithms for progress */
-        if (linehints[x].curline > 0 && linehints[x].curline < lowest_line)
-          lowest_line = linehints[x].curline;
+        if (LINEHINTS(x).curline > 0 && LINEHINTS(x).curline < lowest_line)
+          lowest_line = LINEHINTS(x).curline;
       }
       if (lowest_line < ULLONG_MAX)
         Lowline = lowest_line;
@@ -41509,9 +42563,9 @@ MDXALIGN void ReportStats(void *dummy) {
     { unsigned long long lowest_retired = ULLONG_MAX;
       int any_retired_op = 0;
       for (x = 0; x < linehints_count; x++) {
-        if (linehints[x].curline == 0) continue;   /* skip inactive slots */
-        if (Typedone[x]) continue;
-        unsigned long long r = linehints[x].retired_line;
+        if (LINEHINTS(x).curline == 0) continue;   /* skip inactive slots */
+        if (TYPEDONE(x)) continue;
+        unsigned long long r = LINEHINTS(x).retired_line;
         if (r < lowest_retired) lowest_retired = r;
         any_retired_op = 1;
       }
@@ -41560,7 +42614,7 @@ MDXALIGN void ReportStats(void *dummy) {
         Word_t ti = 0; int trc;
         J1F(trc, Dohash, ti);
         while (trc) {
-          unsigned int ns = Livesalts[ti];
+          unsigned int ns = LIVESALTS(ti);
           multiplier += (ns > 0) ? ns : 1;
           J1N(trc, Dohash, ti);
         }
@@ -41620,7 +42674,7 @@ MDXALIGN void ReportStats(void *dummy) {
             { Word_t ti = 0; int trc;
               J1F(trc, Dohash, ti);
               while (trc) {
-                unsigned int ns = Livesalts[ti];
+                unsigned int ns = LIVESALTS(ti);
                 salt_mult += (ns > 0) ? ns : 1;
                 J1N(trc, Dohash, ti);
               }
@@ -41871,7 +42925,7 @@ static int store_typesalt(int job, const char *src, int slen) {
     if (slen >= 256) slen = 255;
     memcpy(ts, src, slen);
     ts[slen] = 0;
-    JSLI(PV, Typesalt[job], (unsigned char *)ts);
+    JSLI(PV, TYPESALT(job), (unsigned char *)ts);
     if (PV) { if ((*PV)++ == 0) return 1; }
     return 0;
 }
@@ -41910,17 +42964,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (ti < JOB_DONE) {
 	any = 1;
         lf[ti] = 1;
-        if (TypeOpts[ti] & TYPEOPT_NEEDSF)
+        if (TYPEOPTS(ti) & TYPEOPT_NEEDSF)
           LoadHex = 1;
-        if (TypeOpts[ti] & TYPEOPT_NEEDUSER) {
+        if (TYPEOPTS(ti) & TYPEOPT_NEEDUSER) {
           LoadUser = 1;
 	  Douser[Dousercnt++] = ti;
 	}
-        if ((TypeOpts[ti] & TYPEOPT_NEEDSALT)) {
+        if ((TYPEOPTS(ti) & TYPEOPT_NEEDSALT)) {
           LoadSalt = 1;
 	  Dosalt[Dosaltcnt++] = ti;
 	}
-	if (lf[ti] && !(TypeOpts[ti] & TYPEOPT_NEEDSF))
+	if (lf[ti] && !(TYPEOPTS(ti) & TYPEOPT_NEEDSF))
 	  LoadStructured = 1;
       }
       J1N(RC, *pDoload, ti);
@@ -41932,17 +42986,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (ti < JOB_DONE) {
 	any = 1;
         lf[ti] = 1;
-        if (TypeOpts[ti] & TYPEOPT_NEEDSF)
+        if (TYPEOPTS(ti) & TYPEOPT_NEEDSF)
           LoadHex = 1;
-        if (TypeOpts[ti] & TYPEOPT_NEEDUSER) {
+        if (TYPEOPTS(ti) & TYPEOPT_NEEDUSER) {
           LoadUser = 1;
 	  Douser[Dousercnt++] = ti;
 	}
-        if ((TypeOpts[ti] & TYPEOPT_NEEDSALT)) {
+        if ((TYPEOPTS(ti) & TYPEOPT_NEEDSALT)) {
           LoadSalt = 1;
 	  Dosalt[Dosaltcnt++] = ti;
 	}
-	if (lf[ti] && !(TypeOpts[ti] & TYPEOPT_NEEDSF))
+	if (lf[ti] && !(TYPEOPTS(ti) & TYPEOPT_NEEDSF))
 	  LoadStructured = 1;
       }
       J1N(RC, Dohash, ti);
@@ -41990,7 +43044,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       char *dollar = strchr(p, '$');
       if (dollar && (dollar - p) >= 1 && (dollar - p) <= 8 &&
           mystrlen(dollar + 1) == 22) {
-        JSLI(PV, JudyJ[JOB_AIXMD5], (unsigned char *)p);
+        JSLI(PV, JUDYJ(JOB_AIXMD5), (unsigned char *)p);
         Foundcnt[JOB_AIXMD5]++;
         continue;
       }
@@ -41998,14 +43052,14 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* AIX {ssha1}NN$salt$hash */
     if (lf[JOB_AIXSHA1] && len > 7 && strncmp(line, "{ssha1}", 7) == 0) {
       char *p = line + 7; /* points to NN$salt$hash */
-      JSLI(PV, JudyJ[JOB_AIXSHA1], (unsigned char *)p);
+      JSLI(PV, JUDYJ(JOB_AIXSHA1), (unsigned char *)p);
       char *last = strrchr(p, '$');
       if (last && last > p) {
         int slen = last - p;
         if (slen < 79) {
           memcpy(salttmp, p, slen);
           salttmp[slen] = 0;
-          JSLI(PV, Typesalt[JOB_AIXSHA1], (unsigned char *)salttmp);
+          JSLI(PV, TYPESALT(JOB_AIXSHA1), (unsigned char *)salttmp);
 	  if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_AIXSHA1]++;} }
         }
       }
@@ -42015,14 +43069,14 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* AIX {ssha256}NN$salt$hash */
     if (lf[JOB_AIXSHA256] && len > 9 && strncmp(line, "{ssha256}", 9) == 0) {
       char *p = line + 9;
-      JSLI(PV, JudyJ[JOB_AIXSHA256], (unsigned char *)p);
+      JSLI(PV, JUDYJ(JOB_AIXSHA256), (unsigned char *)p);
       char *last = strrchr(p, '$');
       if (last && last > p) {
         int slen = last - p;
         if (slen < 79) {
           memcpy(salttmp, p, slen);
           salttmp[slen] = 0;
-          JSLI(PV, Typesalt[JOB_AIXSHA256], (unsigned char *)salttmp);
+          JSLI(PV, TYPESALT(JOB_AIXSHA256), (unsigned char *)salttmp);
 	  if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_AIXSHA256]++;} }
         }
       }
@@ -42032,14 +43086,14 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* AIX {ssha512}NN$salt$hash */
     if (lf[JOB_AIXSHA512] && len > 9 && strncmp(line, "{ssha512}", 9) == 0) {
       char *p = line + 9;
-      JSLI(PV, JudyJ[JOB_AIXSHA512], (unsigned char *)p);
+      JSLI(PV, JUDYJ(JOB_AIXSHA512), (unsigned char *)p);
       char *last = strrchr(p, '$');
       if (last && last > p) {
         int slen = last - p;
         if (slen < 79) {
           memcpy(salttmp, p, slen);
           salttmp[slen] = 0;
-          JSLI(PV, Typesalt[JOB_AIXSHA512], (unsigned char *)salttmp);
+          JSLI(PV, TYPESALT(JOB_AIXSHA512), (unsigned char *)salttmp);
 	  if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_AIXSHA512]++;} }
         }
       }
@@ -42055,7 +43109,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
       if (ok) {
         *s = 0;
-        JSLI(PV, JudyJ[JOB_JUNIPERSSG], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)line);
         *s = ':';
         if (s[1])
           JSLI(PV, UserArray, (unsigned char *)(s + 1));
@@ -42075,7 +43129,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         }
       }
       if (ok) {
-        JSLI(PV, JudyJ[JOB_PEOPLESOFT], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)line);
         Foundcnt[JOB_PEOPLESOFT]++;
         continue;
       }
@@ -42103,7 +43157,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               ;
             if (y >= 26) {
               md5h[y] = 0;
-              JSLI(PV, JudyJ[JOB_JUNIPERIVE], (unsigned char *)md5h);
+              JSLI(PV, JUDYJ(JOB_JUNIPERIVE), (unsigned char *)md5h);
               /* store original base64 line keyed by md5crypt hash */
               JSLI(PV, JuniperIVE, (unsigned char *)md5h);
               if (*PV == 0) {
@@ -42128,7 +43182,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if (!strchr(phpitoa64, line[y])) { c4ok = 0; break; }
       }
       if (c4ok) {
-        JSLI(PV, JudyJ[JOB_CISCO4], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_CISCO4), (unsigned char *)line);
         Foundcnt[JOB_CISCO4]++;
         continue;
       }
@@ -42143,9 +43197,9 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         int slen = len - 17;
         memcpy(salttmp, line + 17, slen);
         salttmp[slen] = 0;
-	JSLI(PV, Typesalt[JOB_CISCOASA], (unsigned char *)salttmp);
+	JSLI(PV, TYPESALT(JOB_CISCOASA), (unsigned char *)salttmp);
 	if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_CISCOASA]++;} }
-        JSLI(PV, JudyJ[JOB_CISCOASA], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_CISCOASA), (unsigned char *)line);
         Foundcnt[JOB_CISCOASA]++;
         continue;
       }
@@ -42157,7 +43211,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if (!strchr(phpitoa64, line[y])) { pix_ok = 0; break; }
       }
       if (pix_ok) {
-        JSLI(PV, JudyJ[JOB_CISCOPIX], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)line);
         Foundcnt[JOB_CISCOPIX]++;
         continue;
       }
@@ -42174,7 +43228,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         }
       }
       if (wok) {
-        JSLI(PV, JudyJ[JOB_WBB3], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_WBB3), (unsigned char *)line);
         Saltloaded[JOB_WBB3] += store_typesalt(JOB_WBB3, line + 41, 40);
         Foundcnt[JOB_WBB3]++;
         continue;
@@ -42196,7 +43250,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           ipmi_key[40] = ':';
           memcpy(ipmi_key + 41, line, lastcolon - line);
           ipmi_key[41 + (lastcolon - line)] = 0;
-          JSLI(PV, JudyJ[JOB_IPMI_SHA1], (unsigned char *)ipmi_key);
+          JSLI(PV, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)ipmi_key);
           Saltloaded[JOB_IPMI_SHA1] += store_typesalt(JOB_IPMI_SHA1, ipmi_key + 41, lastcolon - line);
           Foundcnt[JOB_IPMI_SHA1]++;
           continue;
@@ -42216,7 +43270,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           ipmi_key[y] = line[y] | 0x20;
         ipmi_key[32] = ':';
         strcpy(ipmi_key + 33, line + 33);
-        JSLI(PV, JudyJ[JOB_IPMI_MD5], (unsigned char *)ipmi_key);
+        JSLI(PV, JUDYJ(JOB_IPMI_MD5), (unsigned char *)ipmi_key);
         Saltloaded[JOB_IPMI_MD5] += store_typesalt(JOB_IPMI_MD5, ipmi_key + 33, mystrlen(ipmi_key + 33));
         Foundcnt[JOB_IPMI_MD5]++;
         continue;
@@ -42245,7 +43299,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               chap_key[y] = line[y] | 0x20;
             chap_key[32] = ':';
             strcpy(chap_key + 33, line + 33);
-            JSLI(PV, JudyJ[JOB_ISCSI_CHAP], (unsigned char *)chap_key);
+            JSLI(PV, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)chap_key);
             /* salt = challenge:id */
             Saltloaded[JOB_ISCSI_CHAP] += store_typesalt(JOB_ISCSI_CHAP, chap_key + 33, mystrlen(chap_key + 33));
             Foundcnt[JOB_ISCSI_CHAP]++;
@@ -42326,7 +43380,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           if (trhex[(unsigned char)p[y]] > 15) { hexok = 0; break; }
         }
         if (hexok && y >= 72) {
-          JSLI(PV, JudyJ[JOB_KRB5PA23], (unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_KRB5PA23), (unsigned char *)line);
           /* store full hash as Typesalt key for dispatch iteration */
           Saltloaded[JOB_KRB5PA23] += store_typesalt(JOB_KRB5PA23, line, mystrlen(line));
           Foundcnt[JOB_KRB5PA23]++;
@@ -42349,7 +43403,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             /* trim trailing whitespace */
             while (hlen > 0 && (hash_start[hlen-1] == '\r' || hash_start[hlen-1] == '\n'))
               hash_start[--hlen] = 0;
-            JSLI(PV, JudyJ[JOB_MYSQL_SHA256CRYPT], (unsigned char *)line);
+            JSLI(PV, JUDYJ(JOB_MYSQL_SHA256CRYPT), (unsigned char *)line);
             /* extract $mysql$A$NNN*hex_salt into Typesalt */
             { char savec = *salt_end;
               *salt_end = 0;
@@ -42370,7 +43424,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         int sl = mystrlen(line);
         while (sl > 0 && (line[sl-1] == '\r' || line[sl-1] == '\n'))
           line[--sl] = 0;
-        JSLI(PV, JudyJ[JOB_DRUPAL7], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_DRUPAL7), (unsigned char *)line);
         Saltloaded[JOB_DRUPAL7] += store_typesalt(JOB_DRUPAL7, line + 3, 9);
         Foundcnt[JOB_DRUPAL7]++;
         continue;
@@ -42387,7 +43441,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           if (trhex[(unsigned char)line[y]] > 15) { hexok = 0; break; }
         }
         if (hexok) {
-          JSLI(PV, JudyJ[JOB_SYBASE_ASE], (unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)line);
           Saltloaded[JOB_SYBASE_ASE] += store_typesalt(JOB_SYBASE_ASE, line + 6, 16);
           Foundcnt[JOB_SYBASE_ASE]++;
           continue;
@@ -42405,7 +43459,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           if (trhex[(unsigned char)line[y]] > 15) { hexok = 0; break; }
         }
         if (hexok) {
-          JSLI(PV, JudyJ[JOB_NETSCALER], (unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_NETSCALER), (unsigned char *)line);
           Saltloaded[JOB_NETSCALER] += store_typesalt(JOB_NETSCALER, line + 1, 8);
           Foundcnt[JOB_NETSCALER]++;
           continue;
@@ -42430,7 +43484,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               int sl = mystrlen(line);
               while (sl > 0 && (line[sl-1] == '\r' || line[sl-1] == '\n'))
                 line[--sl] = 0;
-              JSLI(PV, JudyJ[JOB_NSEC3], (unsigned char *)line);
+              JSLI(PV, JUDYJ(JOB_NSEC3), (unsigned char *)line);
               /* extract domain:salt_hex:iterations into Typesalt */
               Saltloaded[JOB_NSEC3] += store_typesalt(JOB_NSEC3, colon1 + 1, mystrlen(colon1 + 1));
               Foundcnt[JOB_NSEC3]++;
@@ -42454,7 +43508,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             if (trhex[(unsigned char)star2[1+y]] > 15) { hexok = 0; break; }
           }
           if (hexok) {
-            JSLI(PV, JudyJ[JOB_RACF], (unsigned char *)line);
+            JSLI(PV, JUDYJ(JOB_RACF), (unsigned char *)line);
             /* extract username into Typesalt */
             Saltloaded[JOB_RACF] += store_typesalt(JOB_RACF, line + 7, star2 - (line + 7));
             Foundcnt[JOB_RACF]++;
@@ -42482,13 +43536,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 40; y++)
               ps_hashkey[y] = tolower(line[y]);
             ps_hashkey[40] = 0;
-            JSLI(PV, JudyJ[JOB_PS_TOKEN], (unsigned char *)ps_hashkey);
+            JSLI(PV, JUDYJ(JOB_PS_TOKEN), (unsigned char *)ps_hashkey);
             /* Salt can exceed 255 chars — use JSLI directly */
             { char *ps_salt = salttmp;
               if (slen < (int)sizeof(salttmp)) {
                 memcpy(ps_salt, line + 41, slen);
                 ps_salt[slen] = 0;
-                JSLI(PV, Typesalt[JOB_PS_TOKEN], (unsigned char *)ps_salt);
+                JSLI(PV, TYPESALT(JOB_PS_TOKEN), (unsigned char *)ps_salt);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_PS_TOKEN]++; }
               }
             }
@@ -42512,12 +43566,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           for (y = 0; y < 64; y++)
             wp_hashkey[y] = tolower(line[y]);
           wp_hashkey[64] = 0;
-          JSLI(PV, JudyJ[JOB_WINPHONE], (unsigned char *)wp_hashkey);
+          JSLI(PV, JUDYJ(JOB_WINPHONE), (unsigned char *)wp_hashkey);
           /* Salt is 256 hex — too long for store_typesalt (255 limit), use JSLI directly */
           { char wp_salt[257];
             memcpy(wp_salt, line + 65, 256);
             wp_salt[256] = 0;
-            JSLI(PV, Typesalt[JOB_WINPHONE], (unsigned char *)wp_salt);
+            JSLI(PV, TYPESALT(JOB_WINPHONE), (unsigned char *)wp_salt);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WINPHONE]++; }
           }
           Foundcnt[JOB_WINPHONE]++;
@@ -42547,7 +43601,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             }
             if (hexok) {
               /* JudyJ key = full line, Typesalt = USER*HEADER*SALT */
-              JSLI(PV, JudyJ[JOB_RACF_KDFAES], (unsigned char *)line);
+              JSLI(PV, JUDYJ(JOB_RACF_KDFAES), (unsigned char *)line);
               /* Typesalt: USER*HEADER*SALT (from f1 to s4-1) */
               Saltloaded[JOB_RACF_KDFAES] += store_typesalt(JOB_RACF_KDFAES, f1, s4 - f1);
               Foundcnt[JOB_RACF_KDFAES]++;
@@ -42587,8 +43641,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                        8, f1, ct_hexlen, f2, f3);
               /* Lowercase the salt */
               for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-              JSLI(PV, JudyJ[JOB_TACACS], (unsigned char *)salttmp);
-              JSLI(PV, Typesalt[JOB_TACACS], (unsigned char *)salttmp);
+              JSLI(PV, JUDYJ(JOB_TACACS), (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(JOB_TACACS), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_TACACS]++; }
               Foundcnt[JOB_TACACS]++;
               continue;
@@ -42632,7 +43686,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   snprintf(salttmp, MAXLINE, "%d:%d:%.*s:%s",
                            ver, iter, 32, f3, f5);
                   for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-                  JSLI(PV, Typesalt[JOB_APPLE_SECURE_NOTES], (unsigned char *)salttmp);
+                  JSLI(PV, TYPESALT(JOB_APPLE_SECURE_NOTES), (unsigned char *)salttmp);
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_APPLE_SECURE_NOTES]++; }
                   /* JudyJ key = $ASN$*... format (hex parts from lowered Typesalt) */
                   { const char *tc1 = strchr(salttmp, ':');
@@ -42642,7 +43696,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                       char judykey[256];
                       snprintf(judykey, sizeof(judykey), "$ASN$*%d*%d*%.*s*%s",
                                ver, iter, (int)(tc3 - tc2 - 1), tc2 + 1, tc3 + 1);
-                      JSLI(PV, JudyJ[JOB_APPLE_SECURE_NOTES], (unsigned char *)judykey);
+                      JSLI(PV, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)judykey);
                     }
                   }
                   Foundcnt[JOB_APPLE_SECURE_NOTES]++;
@@ -42680,13 +43734,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 if (trhex[(unsigned char)*hp] > 15) { hexok = 0; break; }
               if (hexok) {
                 /* JudyJ key = full format line */
-                JSLI(PV, JudyJ[JOB_APPLE_SECURE_NOTES], (unsigned char *)line);
+                JSLI(PV, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)line);
                 /* Typesalt = "zpk:iter:salt32hex:wrappedkey48hex" */
                 snprintf(salttmp, MAXLINE, "%d:%d:%.*s:%s",
                          zpk, iter, 32, f3, f4);
                 /* Lowercase */
                 for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-                JSLI(PV, Typesalt[JOB_APPLE_SECURE_NOTES], (unsigned char *)salttmp);
+                JSLI(PV, TYPESALT(JOB_APPLE_SECURE_NOTES), (unsigned char *)salttmp);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_APPLE_SECURE_NOTES]++; }
                 Foundcnt[JOB_APPLE_SECURE_NOTES]++;
                 continue;
@@ -42712,7 +43766,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           for (y = 0; y < 32; y++)
             dc_key[y] = tolower(line[10 + y]);
           dc_key[32] = 0;
-          JSLI(PV, JudyJ[JOB_CRAMMD5_DOVECOT], (unsigned char *)dc_key);
+          JSLI(PV, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)dc_key);
           Foundcnt[JOB_CRAMMD5_DOVECOT]++;
           continue;
         }
@@ -42752,7 +43806,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 { char *jwt_hexkey = salttmp + 68;
                   prmd5((unsigned char *)salttmp, jwt_hexkey, siglen * 2);
                   jwt_hexkey[siglen * 2] = 0;
-                  JSLI(PV, JudyJ[JOB_JWT], (unsigned char *)jwt_hexkey);
+                  JSLI(PV, JUDYJ(JOB_JWT), (unsigned char *)jwt_hexkey);
                 }
                 /* Typesalt = full JWT string (JSLI directly — can be very long) */
                 { char *jwt_copy = salttmp + 128;
@@ -42760,7 +43814,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   if (jwt_len < MAXLINE - 128) {
                     memcpy(jwt_copy, line, jwt_len);
                     jwt_copy[jwt_len] = 0;
-                    JSLI(PV, Typesalt[JOB_JWT], (unsigned char *)jwt_copy);
+                    JSLI(PV, TYPESALT(JOB_JWT), (unsigned char *)jwt_copy);
                     if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_JWT]++; }
                   }
                 }
@@ -42831,17 +43885,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char save = *at3; *at3 = 0;
                 snprintf(salttmp + MAXLINE/2, MAXLINE/2, "@S,%d@%s@%s", iter, hash_start, salt_start);
                 *at3 = save;
-                JSLI(PV, JudyJ[target_job], (unsigned char *)(salttmp + MAXLINE/2));
+                JSLI(PV, JUDYJ(target_job), (unsigned char *)(salttmp + MAXLINE/2));
               } else {
                 /* Lowercase the hex hash for JudyJ key */
                 { char *hp; for (hp = hash_start; hp < at3; hp++) *hp = tolower(*hp); }
                 char save = *at3; *at3 = 0;
-                JSLI(PV, JudyJ[target_job], (unsigned char *)hash_start);
+                JSLI(PV, JUDYJ(target_job), (unsigned char *)hash_start);
                 *at3 = save;
               }
               /* Typesalt = "iter:salt" */
               snprintf(salttmp, MAXLINE, "%d:%s", iter, salt_start);
-              JSLI(PV, Typesalt[target_job], (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(target_job), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[target_job]++; }
               Foundcnt[target_job]++;
               continue;
@@ -42871,7 +43925,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             { char *hp; for (hp = hexdata; *hp; hp++)
                 if (trhex[(unsigned char)*hp] > 15) { hexok = 0; break; } }
             if (hexok) {
-              JSLI(PV, JudyJ[JOB_KRB5PA_17], (unsigned char *)line);
+              JSLI(PV, JUDYJ(JOB_KRB5PA_17), (unsigned char *)line);
               /* Typesalt = "REALM:user:hexdata" (realm uppercased for PBKDF2 salt) */
               { char *hp;
                 int realmlen = d3 - realm;
@@ -42880,7 +43934,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 /* Uppercase realm portion */
                 for (hp = salttmp; hp < salttmp + realmlen; hp++) *hp = toupper(*hp);
               }
-              JSLI(PV, Typesalt[JOB_KRB5PA_17], (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(JOB_KRB5PA_17), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_KRB5PA_17]++; }
               Foundcnt[JOB_KRB5PA_17]++;
               continue;
@@ -42907,7 +43961,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             { char *hp; for (hp = hexdata; *hp; hp++)
                 if (trhex[(unsigned char)*hp] > 15) { hexok = 0; break; } }
             if (hexok) {
-              JSLI(PV, JudyJ[JOB_KRB5PA_18], (unsigned char *)line);
+              JSLI(PV, JUDYJ(JOB_KRB5PA_18), (unsigned char *)line);
               /* Typesalt = "REALM:user:hexdata" */
               { char *hp;
                 int realmlen = d3 - realm;
@@ -42915,7 +43969,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                          realmlen, realm, (int)(d2 - user), user, hexdata);
                 for (hp = salttmp; hp < salttmp + realmlen; hp++) *hp = toupper(*hp);
               }
-              JSLI(PV, Typesalt[JOB_KRB5PA_18], (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(JOB_KRB5PA_18), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_KRB5PA_18]++; }
               Foundcnt[JOB_KRB5PA_18]++;
               continue;
@@ -42965,7 +44019,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (x = 0; x < 32; x++) judykey[x] = tolower(f[2][x]);
             judykey[32] = 0;
             if (lf[JOB_WPA_PMKID]) {
-              JSLI(PV, JudyJ[JOB_WPA_PMKID], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_WPA_PMKID), (unsigned char *)judykey);
               /* Typesalt = "essid_hex:macap:macsta" (lowercased) */
               snprintf(salttmp, MAXLINE, "%s:%s:%s", f[5], f[3], f[4]);
               for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
@@ -42974,11 +44028,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             }
             /* Also load into WPA_PMK if enabled */
             if (lf[JOB_WPA_PMK]) {
-              JSLI(PV, JudyJ[JOB_WPA_PMK], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_WPA_PMK), (unsigned char *)judykey);
               /* Typesalt = "1:essid_hex:macap:macsta" */
               snprintf(salttmp, MAXLINE, "1:%s:%s:%s", f[5], f[3], f[4]);
               for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-              JSLI(PV, Typesalt[JOB_WPA_PMK], (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(JOB_WPA_PMK), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WPA_PMK]++; }
               Foundcnt[JOB_WPA_PMK]++;
             }
@@ -43023,25 +44077,25 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                     J1S(RC2, Dohash, JOB_WPA_EAPOL);
                   }
                   if (lf[JOB_WPA_EAPOL]) {
-                    JSLI(PV, JudyJ[JOB_WPA_EAPOL], (unsigned char *)judykey);
+                    JSLI(PV, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)judykey);
                   }
                   /* Typesalt for WPA_EAPOL */
                   if (lf[JOB_WPA_EAPOL]) {
                     snprintf(salttmp, MAXLINE, "%d:%s:%s:%s:%s:%s",
                              keyver, f[5], f[3], f[4], f[6], f[7]);
                     for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-                    JSLI(PV, Typesalt[JOB_WPA_EAPOL], (unsigned char *)salttmp);
+                    JSLI(PV, TYPESALT(JOB_WPA_EAPOL), (unsigned char *)salttmp);
                     if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WPA_EAPOL]++; }
                     Foundcnt[JOB_WPA_EAPOL]++;
                   }
                   /* Also load into WPA_PMK if enabled */
                   if (lf[JOB_WPA_PMK]) {
-                    JSLI(PV, JudyJ[JOB_WPA_PMK], (unsigned char *)judykey);
+                    JSLI(PV, JUDYJ(JOB_WPA_PMK), (unsigned char *)judykey);
                     /* Typesalt = "2:keyver:essid_hex:macap:macsta:anonce:eapol" */
                     snprintf(salttmp, MAXLINE, "2:%d:%s:%s:%s:%s:%s",
                              keyver, f[5], f[3], f[4], f[6], f[7]);
                     for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-                    JSLI(PV, Typesalt[JOB_WPA_PMK], (unsigned char *)salttmp);
+                    JSLI(PV, TYPESALT(JOB_WPA_PMK), (unsigned char *)salttmp);
                     if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WPA_PMK]++; }
                     Foundcnt[JOB_WPA_PMK]++;
                   }
@@ -43077,7 +44131,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               char judykey[64];
               for (x = 0; x < 32; x++) judykey[x] = tolower(line[x]);
               judykey[32] = 0;
-              JSLI(PV, JudyJ[JOB_WPA_PMKID], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_WPA_PMKID), (unsigned char *)judykey);
               /* Typesalt = "essid_hex:macap:macsta" */
               snprintf(salttmp, MAXLINE, "%.*s:%.*s:%.*s",
                        essid_hexlen, c3 + 1, 12, c1 + 1, 12, c2 + 1);
@@ -43122,11 +44176,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   char judykey[80];
                   for (x = 0; x < 64; x++) judykey[x] = tolower(f5[x]);
                   judykey[64] = 0;
-                  JSLI(PV, JudyJ[JOB_ANSIBLE_VAULT], (unsigned char *)judykey);
+                  JSLI(PV, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)judykey);
                   /* Typesalt = "salt64hex:ct_hex" (lowercased, uses JSLI for long ct) */
                   snprintf(salttmp, MAXLINE, "%.*s:%.*s", 64, f3, ct_hexlen, f4);
                   for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-                  JSLI(PV, Typesalt[JOB_ANSIBLE_VAULT], (unsigned char *)salttmp);
+                  JSLI(PV, TYPESALT(JOB_ANSIBLE_VAULT), (unsigned char *)salttmp);
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ANSIBLE_VAULT]++; }
                   Foundcnt[JOB_ANSIBLE_VAULT]++;
                   continue;
@@ -43165,11 +44219,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   snprintf(judykey, sizeof(judykey), "$fvde$2$16$%.*s$%d$%s",
                            32, f2, iter, f4);
                   for (hp = judykey; *hp; hp++) *hp = tolower(*hp);
-                  JSLI(PV, JudyJ[JOB_APFS], (unsigned char *)judykey);
+                  JSLI(PV, JUDYJ(JOB_APFS), (unsigned char *)judykey);
                   /* Typesalt = "iter:salt32hex:wkey80hex" */
                   snprintf(salttmp, MAXLINE, "%d:%.*s:%s", iter, 32, f2, f4);
                   for (hp = salttmp; *hp; hp++) *hp = tolower(*hp);
-                  JSLI(PV, Typesalt[JOB_APFS], (unsigned char *)salttmp);
+                  JSLI(PV, TYPESALT(JOB_APFS), (unsigned char *)salttmp);
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_APFS]++; }
                   Foundcnt[JOB_APFS]++;
                   continue;
@@ -43201,10 +44255,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char hexkey[65];
                 prmd5((unsigned char *)salttmp, hexkey, 64); /* 32 bytes → 64 hex chars */
                 hexkey[64] = 0;
-                JSLI(PV, JudyJ[JOB_OTM_SHA256], (unsigned char *)hexkey);
+                JSLI(PV, JUDYJ(JOB_OTM_SHA256), (unsigned char *)hexkey);
                 /* Typesalt = "iter:salt" */
                 snprintf(salttmp, MAXLINE, "%d:%.*s", iter, (int)(d2 - salt), salt);
-                JSLI(PV, Typesalt[JOB_OTM_SHA256], (unsigned char *)salttmp);
+                JSLI(PV, TYPESALT(JOB_OTM_SHA256), (unsigned char *)salttmp);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_OTM_SHA256]++; }
                 Foundcnt[JOB_OTM_SHA256]++;
                 continue;
@@ -43227,13 +44281,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           memcpy(hexkey, hash_hex, 64);
           hexkey[64] = 0;
           { char *hp; for (hp = hexkey; *hp; hp++) *hp = tolower(*hp); }
-          JSLI(PV, JudyJ[JOB_TELEGRAM_SHA256], (unsigned char *)hexkey);
+          JSLI(PV, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)hexkey);
           /* Typesalt = lowercase salt hex (32 chars) */
           char saltkey[33];
           memcpy(saltkey, salt_hex, 32);
           saltkey[32] = 0;
           { char *hp; for (hp = saltkey; *hp; hp++) *hp = tolower(*hp); }
-          JSLI(PV, Typesalt[JOB_TELEGRAM_SHA256], (unsigned char *)saltkey);
+          JSLI(PV, TYPESALT(JOB_TELEGRAM_SHA256), (unsigned char *)saltkey);
           if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_TELEGRAM_SHA256]++; }
           Foundcnt[JOB_TELEGRAM_SHA256]++;
           continue;
@@ -43258,11 +44312,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               memcpy(hexkey, hash_hex, 40);
               hexkey[40] = 0;
               { char *hp; for (hp = hexkey; *hp; hp++) *hp = tolower(*hp); }
-              JSLI(PV, JudyJ[JOB_WEB2PY_SHA512], (unsigned char *)hexkey);
+              JSLI(PV, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)hexkey);
               /* Typesalt = "iter:salt" */
               int slen = sep - salt;
               snprintf(salttmp, MAXLINE, "%d:%.*s", iter, slen, salt);
-              JSLI(PV, Typesalt[JOB_WEB2PY_SHA512], (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(JOB_WEB2PY_SHA512), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WEB2PY_SHA512]++; }
               Foundcnt[JOB_WEB2PY_SHA512]++;
               continue;
@@ -43287,11 +44341,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char hexkey[129];
             prmd5((unsigned char *)salttmp, hexkey, 128);
             hexkey[128] = 0;
-            JSLI(PV, JudyJ[JOB_SOLARWINDS], (unsigned char *)hexkey);
+            JSLI(PV, JUDYJ(JOB_SOLARWINDS), (unsigned char *)hexkey);
             /* Typesalt = username (will be processed: lc, pad/trunc to 8) */
             int ulen = sep - user;
             snprintf(salttmp, MAXLINE, "%.*s", ulen, user);
-            JSLI(PV, Typesalt[JOB_SOLARWINDS], (unsigned char *)salttmp);
+            JSLI(PV, TYPESALT(JOB_SOLARWINDS), (unsigned char *)salttmp);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SOLARWINDS]++; }
             Foundcnt[JOB_SOLARWINDS]++;
             continue;
@@ -43314,7 +44368,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char hexkey[129];
             prmd5((unsigned char *)salttmp, hexkey, 128);
             hexkey[128] = 0;
-            JSLI(PV, JudyJ[JOB_SOLARWINDS2], (unsigned char *)hexkey);
+            JSLI(PV, JUDYJ(JOB_SOLARWINDS2), (unsigned char *)hexkey);
             /* Typesalt = base64 salt (decoded to hex for storage) */
             int sb64len = sep - salt_b64;
             char salt_b64_copy[64];
@@ -43326,7 +44380,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               char salthex[33];
               prmd5((unsigned char *)salttmp + 256, salthex, 32);
               salthex[32] = 0;
-              JSLI(PV, Typesalt[JOB_SOLARWINDS2], (unsigned char *)salthex);
+              JSLI(PV, TYPESALT(JOB_SOLARWINDS2), (unsigned char *)salthex);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SOLARWINDS2]++; }
               Foundcnt[JOB_SOLARWINDS2]++;
               continue;
@@ -43347,7 +44401,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           memcpy(hexkey, line, 32);
           hexkey[32] = 0;
           { char *hp; for (hp = hexkey; *hp; hp++) *hp = tolower(*hp); }
-          JSLI(PV, JudyJ[JOB_SIMPLACMS], (unsigned char *)hexkey);
+          JSLI(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)hexkey);
           Saltloaded[JOB_SIMPLACMS] += store_typesalt(JOB_SIMPLACMS, salt, saltlen);
           Foundcnt[JOB_SIMPLACMS]++;
           continue;
@@ -43370,11 +44424,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             memcpy(judykey, data, 96);
             judykey[96] = 0;
             { char *hp; for (hp = judykey; *hp; hp++) *hp = tolower(*hp); }
-            JSLI(PV, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)judykey);
+            JSLI(PV, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)judykey);
             /* Typesalt = "salt40hex:iv16hex" */
             snprintf(salttmp, MAXLINE, "%.*s:%.*s", 40, f1, 16, iv);
             { char *hp; for (hp = salttmp; *hp; hp++) *hp = tolower(*hp); }
-            JSLI(PV, Typesalt[JOB_APPLE_KEYCHAIN], (unsigned char *)salttmp);
+            JSLI(PV, TYPESALT(JOB_APPLE_KEYCHAIN), (unsigned char *)salttmp);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_APPLE_KEYCHAIN]++; }
             Foundcnt[JOB_APPLE_KEYCHAIN]++;
             continue;
@@ -43407,12 +44461,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               memcpy(judykey, data, 128);
               judykey[128] = 0;
               { char *hp; for (hp = judykey; *hp; hp++) *hp = tolower(*hp); }
-              JSLI(PV, JudyJ[JOB_APPLE_IWORK], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)judykey);
               /* Typesalt = "hash_ver:iter:salthex:iv32hex" */
               snprintf(salttmp, MAXLINE, "%d:%d:%.*s:%.*s",
                        hash_ver, iter, saltlen, d4 + 1, 32, d5 + 1);
               { char *hp; for (hp = salttmp; *hp; hp++) *hp = tolower(*hp); }
-              JSLI(PV, Typesalt[JOB_APPLE_IWORK], (unsigned char *)salttmp);
+              JSLI(PV, TYPESALT(JOB_APPLE_IWORK), (unsigned char *)salttmp);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_APPLE_IWORK]++; }
               Foundcnt[JOB_APPLE_IWORK]++;
               continue;
@@ -43444,11 +44498,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char hexkey[65];
                 prmd5((unsigned char *)salttmp + 512, hexkey, 64);
                 hexkey[64] = 0;
-                JSLI(PV, JudyJ[JOB_BITWARDEN], (unsigned char *)hexkey);
+                JSLI(PV, JUDYJ(JOB_BITWARDEN), (unsigned char *)hexkey);
                 /* Typesalt = "iter1:iter2:salt_b64" */
                 int sb64len = s3 - salt_b64;
                 snprintf(salttmp, MAXLINE, "%d:%d:%.*s", iter1, iter2, sb64len, salt_b64);
-                JSLI(PV, Typesalt[JOB_BITWARDEN], (unsigned char *)salttmp);
+                JSLI(PV, TYPESALT(JOB_BITWARDEN), (unsigned char *)salttmp);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_BITWARDEN]++; }
                 Foundcnt[JOB_BITWARDEN]++;
                 continue;
@@ -43480,7 +44534,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char hexkey[41];
                 prmd5((unsigned char *)salttmp + 512, hexkey, 40);
                 hexkey[40] = 0;
-                JSLI(PV, JudyJ[JOB_MONGODB_SHA1], (unsigned char *)hexkey);
+                JSLI(PV, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)hexkey);
                 /* Decode user and salt for Typesalt */
                 char userbuf[128];
                 int userlen = b64_decode(user_b64, userbuf, &b64ic);
@@ -43500,7 +44554,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   prmd5(saltbin, salthex, 32);
                   salthex[32] = 0;
                   snprintf(salttmp, MAXLINE, "%s:%d:%s", userbuf, iter, salthex);
-                  JSLI(PV, Typesalt[JOB_MONGODB_SHA1], (unsigned char *)salttmp);
+                  JSLI(PV, TYPESALT(JOB_MONGODB_SHA1), (unsigned char *)salttmp);
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_MONGODB_SHA1]++; }
                   Foundcnt[JOB_MONGODB_SHA1]++;
                   continue;
@@ -43533,7 +44587,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char hexkey[65];
                 prmd5((unsigned char *)salttmp + 512, hexkey, 64);
                 hexkey[64] = 0;
-                JSLI(PV, JudyJ[JOB_MONGODB_SHA256], (unsigned char *)hexkey);
+                JSLI(PV, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)hexkey);
                 /* Decode salt */
                 int sb64len = s3 - salt_b64;
                 char saltbuf_b64[64];
@@ -43547,7 +44601,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   prmd5(saltbin, salthex, 56);
                   salthex[56] = 0;
                   snprintf(salttmp, MAXLINE, "%d:%s", iter, salthex);
-                  JSLI(PV, Typesalt[JOB_MONGODB_SHA256], (unsigned char *)salttmp);
+                  JSLI(PV, TYPESALT(JOB_MONGODB_SHA256), (unsigned char *)salttmp);
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_MONGODB_SHA256]++; }
                   Foundcnt[JOB_MONGODB_SHA256]++;
                   continue;
@@ -43574,7 +44628,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 40; y++)
               sp_hashkey[y] = tolower(line[sp_slen + 1 + y]);
             sp_hashkey[40] = 0;
-            JSLI(PV, JudyJ[JOB_SAP_PASSCODE], (unsigned char *)sp_hashkey);
+            JSLI(PV, JUDYJ(JOB_SAP_PASSCODE), (unsigned char *)sp_hashkey);
             /* Typesalt = salt string (as-is) */
             Saltloaded[JOB_SAP_PASSCODE] += store_typesalt(JOB_SAP_PASSCODE, line, sp_slen);
             Foundcnt[JOB_SAP_PASSCODE]++;
@@ -43599,7 +44653,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 40; y++)
               sp_hashkey[y] = tolower(line[sp_slen + 1 + y]);
             sp_hashkey[40] = 0;
-            JSLI(PV, JudyJ[JOB_SAP_PASSCODE5], (unsigned char *)sp_hashkey);
+            JSLI(PV, JUDYJ(JOB_SAP_PASSCODE5), (unsigned char *)sp_hashkey);
             /* Typesalt = salt string (as-is) */
             Saltloaded[JOB_SAP_PASSCODE5] += store_typesalt(JOB_SAP_PASSCODE5, line, sp_slen);
             Foundcnt[JOB_SAP_PASSCODE5]++;
@@ -43624,7 +44678,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 16; y++)
               sb_hashkey[y] = toupper(line[sb_slen + 1 + y]);
             sb_hashkey[16] = 0;
-            JSLI(PV, JudyJ[JOB_SAP_BCODE], (unsigned char *)sb_hashkey);
+            JSLI(PV, JUDYJ(JOB_SAP_BCODE), (unsigned char *)sb_hashkey);
             Saltloaded[JOB_SAP_BCODE] += store_typesalt(JOB_SAP_BCODE, line, sb_slen);
             Foundcnt[JOB_SAP_BCODE]++;
             continue;
@@ -43647,7 +44701,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 16; y++)
               sb_hashkey[y] = toupper(line[sb_slen + 1 + y]);
             sb_hashkey[16] = 0;
-            JSLI(PV, JudyJ[JOB_SAP_BCODE4], (unsigned char *)sb_hashkey);
+            JSLI(PV, JUDYJ(JOB_SAP_BCODE4), (unsigned char *)sb_hashkey);
             Saltloaded[JOB_SAP_BCODE4] += store_typesalt(JOB_SAP_BCODE4, line, sb_slen);
             Foundcnt[JOB_SAP_BCODE4]++;
             continue;
@@ -43670,7 +44724,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             if (trhex[(unsigned char)u_end[1+y]] > 15) { hexok = 0; break; }
           if (hexok) {
             /* JudyJ key = full format string */
-            JSLI(PV, JudyJ[JOB_AS400_DES], (unsigned char *)line);
+            JSLI(PV, JUDYJ(JOB_AS400_DES), (unsigned char *)line);
             /* Typesalt = username */
             int ulen = u_end - u_start;
             Saltloaded[JOB_AS400_DES] += store_typesalt(JOB_AS400_DES, u_start, ulen);
@@ -43695,7 +44749,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             d6_norm[0] = '('; d6_norm[1] = 'G';
             lotus64_encode(d6_dec, 14, d6_norm + 2, 20);
             d6_norm[21] = ')'; d6_norm[22] = 0;
-            JSLI(PV, JudyJ[JOB_DOMINO6], (unsigned char *)d6_norm);
+            JSLI(PV, JUDYJ(JOB_DOMINO6), (unsigned char *)d6_norm);
             /* extract 5-byte salt (with quirk removed) as hex into Typesalt */
             d6_dec[3] -= 4;
             char salthex[11];
@@ -43704,7 +44758,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               salthex[y*2+1] = hextab[d6_dec[y]&0xf];
             }
             salthex[10] = 0;
-            JSLI(PV, Typesalt[JOB_DOMINO6], (unsigned char *)salthex);
+            JSLI(PV, TYPESALT(JOB_DOMINO6), (unsigned char *)salthex);
             if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_DOMINO6]++;} }
           }
         }
@@ -43722,13 +44776,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char *p = line;
         while (*p) { if (*p == ':') nc++; p++; }
         if (nc >= 5) {
-          JSLI(PV, JudyJ[JOB_SCRYPT], (unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_SCRYPT), (unsigned char *)line);
           /* extract SCRYPT:N:r:p:base64_salt into Typesalt */
           { char *lastsep = strrchr(line, ':');
             if (lastsep && lastsep > line) {
               char savec = *lastsep;
               *lastsep = 0;
-              JSLI(PV, Typesalt[JOB_SCRYPT], (unsigned char *)line);
+              JSLI(PV, TYPESALT(JOB_SCRYPT), (unsigned char *)line);
               if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_SCRYPT]++;} }
               *lastsep = savec;
             }
@@ -43738,13 +44792,70 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         }
       }
     }
+    /* SCRYPT (8900) alternate input format: the $7$ crypt encoding used
+     * by libxcrypt / yescrypt.
+     *
+     *   $7$<log2N:1><r:5><p:5><salt>$<hash:43>
+     *
+     * Params are crypt64 (./0-9A-Za-z, little-endian 6-bit groups), the
+     * salt is RAW ASCII -- not base64, unlike every other field here --
+     * and the hash is 43 crypt64 chars decoding to 32 bytes. See
+     * yescrypt/yescrypt-common.c:335 for the reference parse.
+     *
+     * Normalized into the canonical SCRYPT:N:r:p:b64salt:b64hash key so
+     * that procjob, -z, the GPU path and the rest of e884 are untouched.
+     * Same scrypt parameters, different spelling on the wire. */
+    if (lf[JOB_SCRYPT] && strncmp(line, "$7$", 3) == 0) {
+      int sl = mystrlen(line);
+      while (sl > 0 && (line[sl-1] == '\r' || line[sl-1] == '\n'))
+        line[--sl] = 0;
+      /* 3 prefix + 11 param chars + >=1 salt + '$' + 43 hash */
+      if (sl >= 3 + 11 + 1 + 1 + 43) {
+        char *lastsep = strrchr(line, '$');
+        const char *pfields = line + 3;
+        const char *saltp = line + 3 + 11;
+        if (lastsep && lastsep > saltp && (int)(sl - (lastsep + 1 - line)) == 43) {
+          unsigned int n_log2v = 0, sc_r = 0, sc_p = 0;
+          int saltlen7 = (int)(lastsep - saltp);
+          int nlv = crypt64_val((unsigned char)pfields[0]);
+          if (nlv >= 1 && nlv <= 63 && saltlen7 > 0 &&
+              crypt64_uint32(pfields + 1, 5, &sc_r) == 0 &&
+              crypt64_uint32(pfields + 6, 5, &sc_p) == 0 &&
+              sc_r > 0 && sc_p > 0) {
+            unsigned char hashbin7[40];
+            char b64salt7[512], b64hash7[128], key7[MAXLINE];
+            n_log2v = (unsigned int)nlv;
+            if (crypt64_bytes(lastsep + 1, 43, hashbin7, sizeof(hashbin7)) == 32 &&
+                saltlen7 < (int)(sizeof(b64salt7) / 2)) {
+              /* b64_encode() takes a length, not a NUL-terminated string,
+               * so the raw salt bytes go in directly. */
+              b64_encode((char *)saltp, b64salt7, saltlen7);
+              b64_encode((char *)hashbin7, b64hash7, 32);
+              snprintf(key7, MAXLINE, "SCRYPT:%llu:%u:%u:%s:%s",
+                       (unsigned long long)1ULL << n_log2v,
+                       sc_r, sc_p, b64salt7, b64hash7);
+              JSLI(PV, JUDYJ(JOB_SCRYPT), (unsigned char *)key7);
+              { char *ls2 = strrchr(key7, ':');
+                if (ls2 && ls2 > key7) {
+                  *ls2 = 0;
+                  JSLI(PV, TYPESALT(JOB_SCRYPT), (unsigned char *)key7);
+                  if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_SCRYPT]++;} }
+                }
+              }
+              Foundcnt[JOB_SCRYPT]++;
+              continue;
+            }
+          }
+        }
+      }
+    }
     /* bcrypt: $2a$, $2b$, $2y$, $2x$, $2k$ */
     if ((lf[JOB_BCRYPT] || lf[JOB_BCRYPT256] || lf[JOB_BCRYPTMD5] || lf[JOB_BCRYPTSHA1] || lf[JOB_BCRYPTSHA512]) &&
         len >= 58 && line[0] == '$' && line[1] == '2' &&
         (line[2] == 'a' || line[2] == 'b' || line[2] == 'y' ||
          line[2] == 'x' || line[2] == 'k') && line[3] == '$') {
       if (len > 60) line[60] = 0;
-      JSLI(PV, JudyJ[JOB_BCRYPT],(unsigned char *)line);
+      JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
       /* extract salt prefix into Typesalt[job->op] */
       /* $2k$ has 21-char salt (28 prefix), others have 22 (29 prefix) */
       { char bc_salt[30];
@@ -43757,7 +44868,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         for (int ci = 0; bc_types[ci] >= 0; ci++) {
           int bj = bc_types[ci];
           if (!lf[bj]) continue;
-          JSLI(PV, Typesalt[bj], (unsigned char *)bc_salt);
+          JSLI(PV, TYPESALT(bj), (unsigned char *)bc_salt);
           if (PV) { if ((*PV)++ == 0) {
             Saltloaded[bj]++;
             Typesaltcnt[bj]++;
@@ -43781,11 +44892,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             /* JudyJ key = bcrypt output: $2b$NN$salt22hash31 */
             char bcout[64];
             snprintf(bcout, sizeof(bcout), "$2b$%02d$%.22s%.31s", rounds, salt22, salt22 + 23);
-            JSLI(PV, JudyJ[JOB_BCRYPTHMACSHA256], (unsigned char *)bcout);
+            JSLI(PV, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)bcout);
             /* Typesalt = bcrypt setting: $2b$NN$salt22 */
             char bcsetting[32];
             snprintf(bcsetting, sizeof(bcsetting), "$2b$%02d$%.22s", rounds, salt22);
-            JSLI(PV, Typesalt[JOB_BCRYPTHMACSHA256], (unsigned char *)bcsetting);
+            JSLI(PV, TYPESALT(JOB_BCRYPTHMACSHA256), (unsigned char *)bcsetting);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_BCRYPTHMACSHA256]++; }
             Foundcnt[JOB_BCRYPTHMACSHA256]++;
             continue;
@@ -43800,7 +44911,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if (!strchr(phpitoa64, line[y])) { desok = 0; break; }
       }
       if (desok) {
-        JSLI(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_DESCRYPT),(unsigned char *)line);
         /* Standard DES: decode base64 hash body to (r0,r1), apply IP for
          * pre-FP form, store in compact table for GPU (kernel skips FP) */
         if (inhashbuf && len == 13) {
@@ -43848,7 +44959,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if (!strchr(phpitoa64, line[y])) { desok = 0; break; }
       }
       if (desok) {
-        JSLI(PV, JudyJ[JOB_BSDICRYPT],(unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_BSDICRYPT),(unsigned char *)line);
         /* Extract 9-char salt (_CCCCSSSS) for Typesalt */
         strncpy(salttmp, line, 9);
         salttmp[9] = 0;
@@ -43873,7 +44984,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     }
     /* {SSHA}base64: variable length, >20 decoded bytes */
     if (lf[JOB_SSHA1BASE64] && strncmp(line, "{SSHA}", 6) == 0 && len > 10) {
-      JSLI(PV, JudyJ[JOB_SSHA1BASE64], (unsigned char *)line);
+      JSLI(PV, JUDYJ(JOB_SSHA1BASE64), (unsigned char *)line);
       { char ssha_tmp[256];
         int ssha_dlen, ssha_ic;
         ssha_dlen = b64_decode(line + 6, ssha_tmp, &ssha_ic);
@@ -43885,7 +44996,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             salthex[si*2+1] = hextab[(unsigned char)ssha_tmp[20+si]&0xf];
           }
           salthex[(ssha_dlen-20)*2] = 0;
-          JSLI(PV, Typesalt[JOB_SSHA1BASE64], (unsigned char *)salthex);
+          JSLI(PV, TYPESALT(JOB_SSHA1BASE64), (unsigned char *)salthex);
           if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_SSHA1BASE64]++;} }
         }
       }
@@ -43894,7 +45005,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     }
     /* {SSHA256}base64 */
     if (lf[JOB_SSHA256BASE64] && strncmp(line, "{SSHA256}", 9) == 0 && len > 12) {
-      JSLI(PV, JudyJ[JOB_SSHA256BASE64], (unsigned char *)line);
+      JSLI(PV, JUDYJ(JOB_SSHA256BASE64), (unsigned char *)line);
       { char ssha_tmp[256];
         int ssha_dlen, ssha_ic;
         ssha_dlen = b64_decode(line + 9, ssha_tmp, &ssha_ic);
@@ -43906,7 +45017,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             salthex[si*2+1] = hextab[(unsigned char)ssha_tmp[32+si]&0xf];
           }
           salthex[(ssha_dlen-32)*2] = 0;
-          JSLI(PV, Typesalt[JOB_SSHA256BASE64], (unsigned char *)salthex);
+          JSLI(PV, TYPESALT(JOB_SSHA256BASE64), (unsigned char *)salthex);
           if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_SSHA256BASE64]++;} }
         }
       }
@@ -43915,7 +45026,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     }
     /* {SSHA512}base64 */
     if (lf[JOB_SSHA512BASE64] && strncmp(line, "{SSHA512}", 9) == 0 && len > 12) {
-      JSLI(PV, JudyJ[JOB_SSHA512BASE64], (unsigned char *)line);
+      JSLI(PV, JUDYJ(JOB_SSHA512BASE64), (unsigned char *)line);
       { char ssha_tmp[256];
         int ssha_dlen, ssha_ic;
         ssha_dlen = b64_decode(line + 9, ssha_tmp, &ssha_ic);
@@ -43927,7 +45038,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             salthex[si*2+1] = hextab[(unsigned char)ssha_tmp[64+si]&0xf];
           }
           salthex[(ssha_dlen-64)*2] = 0;
-          JSLI(PV, Typesalt[JOB_SSHA512BASE64], (unsigned char *)salthex);
+          JSLI(PV, TYPESALT(JOB_SSHA512BASE64), (unsigned char *)salthex);
           if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_SSHA512BASE64]++;} }
         }
       }
@@ -43939,7 +45050,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         (line[12] == '0' || line[12] == '1') && line[13] == '*') {
       char *star2 = strchr(line + 14, '*');
       if (star2 && mystrlen(star2 + 1) >= 27) {
-        JSLI(PV, JudyJ[JOB_EPISERVER], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)line);
         /* extract "V*SALT_B64" into Typesalt */
         Saltloaded[JOB_EPISERVER] += store_typesalt(JOB_EPISERVER, line + 12, star2 - (line + 12));
         Foundcnt[JOB_EPISERVER]++;
@@ -43953,7 +45064,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if (trhex[(unsigned char)line[y]] > 15) { hms_ok = 0; break; }
       }
       if (hms_ok) {
-        JSLI(PV, JudyJ[JOB_HMAILSERVER], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_HMAILSERVER), (unsigned char *)line);
         Saltloaded[JOB_HMAILSERVER] += store_typesalt(JOB_HMAILSERVER, line, 6);
         Foundcnt[JOB_HMAILSERVER]++;
         continue;
@@ -43969,7 +45080,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           if (trhex[(unsigned char)hp[y]] > 15) { cise_ok = 0; break; }
         }
         if (cise_ok) {
-          JSLI(PV, JudyJ[JOB_CISCOISE], (unsigned char *)hp);
+          JSLI(PV, JUDYJ(JOB_CISCOISE), (unsigned char *)hp);
           Saltloaded[JOB_CISCOISE] += store_typesalt(JOB_CISCOISE, hp + 64, 64);
           Foundcnt[JOB_CISCOISE]++;
           continue;
@@ -43982,7 +45093,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (mw_hash && mystrlen(mw_hash + 1) >= 32) {
         int slen = mw_hash - (line + 3);
         if (slen > 0 && slen < 32) {
-          JSLI(PV, JudyJ[JOB_MEDIAWIKI], (unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)line);
           Saltloaded[JOB_MEDIAWIKI] += store_typesalt(JOB_MEDIAWIKI, line + 3, slen);
           Foundcnt[JOB_MEDIAWIKI]++;
           continue;
@@ -44012,7 +45123,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 32; y++)
               phps_key[y] = hexhash[y] | 0x20;
             phps_key[32] = 0;
-            JSLI(PV, JudyJ[JOB_PHPS], (unsigned char *)phps_key);
+            JSLI(PV, JUDYJ(JOB_PHPS), (unsigned char *)phps_key);
             if (PV && *PV == 0) {
               /* Store original $PHPS$... line as value for output */
               char *orig = malloc(mystrlen(line) + 1);
@@ -44022,7 +45133,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             }
             /* Store decoded salt in Typesalt[JOB_PHPS] Judy */
             phps_salt[slen] = 0;
-            JSLI(PV, Typesalt[JOB_PHPS], (unsigned char *)phps_salt);
+            JSLI(PV, TYPESALT(JOB_PHPS), (unsigned char *)phps_salt);
             if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_PHPS]++;} }
             Foundcnt[JOB_PHPS]++;
           }
@@ -44039,7 +45150,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         }
       }
       if (prok) {
-        JSLI(PV, JudyJ[JOB_PROGRESSENCODE], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)line);
         Foundcnt[JOB_PROGRESSENCODE]++;
         continue;
       }
@@ -44053,7 +45164,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           if (!strchr(b64, line[y]) && line[y] != '=') { cusok = 0; break; }
         }
         if (cusok && colon[1]) {
-          JSLI(PV, Typesalt[JOB_SHA1_CUSTOMUSERSALT], (unsigned char *)line);
+          JSLI(PV, TYPESALT(JOB_SHA1_CUSTOMUSERSALT), (unsigned char *)line);
           if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_SHA1_CUSTOMUSERSALT]++;} }
           Foundcnt[JOB_SHA1_CUSTOMUSERSALT]++;
           continue;
@@ -44106,13 +45217,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               pad = (4 - (hash_ab64_len % 4)) % 4;
               while (pad--) convbuf[offset++] = '=';
               convbuf[offset] = 0;
-              JSLI(PV, JudyJ[JOB_PKCS5S2], (unsigned char *)convbuf);
+              JSLI(PV, JUDYJ(JOB_PKCS5S2), (unsigned char *)convbuf);
               /* Extract prefix (everything before last :) for Typesalt */
               { char *lastsep = strrchr(convbuf, ':');
                 if (lastsep && lastsep > convbuf) {
                   char savec = *lastsep;
                   *lastsep = 0;
-                  JSLI(PV, Typesalt[job_id], (unsigned char *)convbuf);
+                  JSLI(PV, TYPESALT(job_id), (unsigned char *)convbuf);
                   if (PV) { if ((*PV)++ == 0) {Saltloaded[job_id]++;} }
                   *lastsep = savec;
                 }
@@ -44141,7 +45252,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if ((signed char)line[x] <= ' ' || (signed char)line[x] > 'z') break;
       if (x < 120) {
         line[x] = 0;
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)line);
         /* PKCS5S2: extract 16-byte salt into Typesalt */
         if (strncmp(line, "{PKCS5S2}", 9) == 0) {
           char pk_raw[64], pk_sb64[32];
@@ -44149,7 +45260,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           pk_len = b64_decode(line + 9, pk_raw, &cryptlen);
           if (pk_len >= 48) {
             b64_encode(pk_raw, pk_sb64, 16);
-            JSLI(PV, Typesalt[JOB_PKCS5S2], (unsigned char *)pk_sb64);
+            JSLI(PV, TYPESALT(JOB_PKCS5S2), (unsigned char *)pk_sb64);
             if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_PKCS5S2]++;} }
           }
         }
@@ -44178,7 +45289,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             if (job_id) {
               char savec = *lastsep;
               *lastsep = 0;
-              JSLI(PV, Typesalt[job_id], (unsigned char *)line);
+              JSLI(PV, TYPESALT(job_id), (unsigned char *)line);
               if (PV) { if ((*PV)++ == 0) {Saltloaded[job_id]++;} }
               *lastsep = savec;
             }
@@ -44211,13 +45322,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char *lastsep_v = strrchr(line, '$');
         if (lastsep_v && (int)strlen(lastsep_v + 1) == 128) {
         line[x] = 0;
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)line);
         /* extract prefix into Typesalt for PBKDF2_SHA512 */
         { char *lastsep = strrchr(line, '$');
           if (lastsep && lastsep > line) {
             char savec = *lastsep;
             *lastsep = 0;
-            JSLI(PV, Typesalt[JOB_PBKDF2_SHA512], (unsigned char *)line);
+            JSLI(PV, TYPESALT(JOB_PBKDF2_SHA512), (unsigned char *)line);
             if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_PBKDF2_SHA512]++;} }
             *lastsep = savec;
           }
@@ -44235,7 +45346,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char *salt_start = p + 1;
         char *salt_end = strchr(salt_start, '*');
         if (salt_end && salt_end > salt_start) {
-          JSLI(PV, JudyJ[JOB_MYSQL_SHA256CRYPT], (unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_MYSQL_SHA256CRYPT), (unsigned char *)line);
           { char savec = *salt_end;
             *salt_end = 0;
             Saltloaded[JOB_MYSQL_SHA256CRYPT] += store_typesalt(JOB_MYSQL_SHA256CRYPT, line, mystrlen(line));
@@ -44249,7 +45360,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* phpBB3 / phpass: $P$ or $H$.  Admit either JOB_PHPBB3 (e455) or
        JOB_PHPBB3MD5 (e537): both consume this identical hash format, and the
        e537 compute arm falls through to the e455 arm, so the salt stored here
-       under JOB_PHPBB3 is copied to Typesalt[JOB_PHPBB3MD5] in the post-load
+       under JOB_PHPBB3 is copied to TYPESALT(JOB_PHPBB3MD5) in the post-load
        pass.  Gating on JOB_PHPBB3 alone silently dropped e537-only loads. */
     if ((lf[JOB_PHPBB3] || lf[JOB_PHPBB3MD5]) && (line[0] == '$' && (line[1] == 'P' || line[1] == 'H') && line[2] == '$') && len >= 34) {
       { int pbbx = i64hex[line[3] & 0xff];
@@ -44302,7 +45413,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
       if (x >= 29) {
         line[x] = 0;
-        JSLI(PV, JudyJ[JOB_APR1], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_APR1), (unsigned char *)line);
         Foundcnt[JOB_APR1]++;
         continue;
       }
@@ -44315,15 +45426,15 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
       if (x > 10) {
         line[x] = 0;
-        if (line[1] == '5') { JSLI(PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)line); Foundcnt[JOB_SHA256CRYPT]++; }
-        if (line[1] == '6') { JSLI(PV, JudyJ[JOB_SHA512CRYPT], (unsigned char *)line); Foundcnt[JOB_SHA512CRYPT]++; }
+        if (line[1] == '5') { JSLI(PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)line); Foundcnt[JOB_SHA256CRYPT]++; }
+        if (line[1] == '6') { JSLI(PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)line); Foundcnt[JOB_SHA512CRYPT]++; }
         if (line[1] == '8' && x == 61) {
-          JSLI(PV, JudyJ[JOB_CISCO8],(unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_CISCO8),(unsigned char *)line);
           Saltloaded[JOB_CISCO8] += store_typesalt(JOB_CISCO8, line + 3, 14);
           Foundcnt[JOB_CISCO8]++;
         }
         if (line[1] == '9' && x == 61) {
-          JSLI(PV, JudyJ[JOB_CISCO9],(unsigned char *)line);
+          JSLI(PV, JUDYJ(JOB_CISCO9),(unsigned char *)line);
           Saltloaded[JOB_CISCO9] += store_typesalt(JOB_CISCO9, line + 3, 14);
           Foundcnt[JOB_CISCO9]++;
         }
@@ -44337,7 +45448,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
       if (x > 10) {
         line[x] = 0;
-        JSLI(PV, JudyJ[JOB_SM3CRYPT], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_SM3CRYPT), (unsigned char *)line);
         Foundcnt[JOB_SM3CRYPT]++;
         continue;
       }
@@ -44346,7 +45457,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     if (lf[JOB_DRUPAL7] && strncmp(line, "$S$", 3) == 0 && len >= 55) {
       char *p = line + 3;
       if (strchr(phpitoa64, p[0]) && mystrlen(p) >= 52) {
-        JSLI(PV, JudyJ[JOB_DRUPAL7], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_DRUPAL7), (unsigned char *)line);
         Saltloaded[JOB_DRUPAL7] += store_typesalt(JOB_DRUPAL7, line + 3, 9);
         Foundcnt[JOB_DRUPAL7]++;
         continue;
@@ -44371,7 +45482,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char msalt_hex[9];
         memcpy(msalt_hex, line + 6, 8);
         msalt_hex[8] = 0;
-        JSLI(PV, JudyJ[JOB_MSSQL2000], (unsigned char *)msalt_hex);
+        JSLI(PV, JUDYJ(JOB_MSSQL2000), (unsigned char *)msalt_hex);
         if (inhashbuf) {
           int hlen;
           if (x == 94) {
@@ -44412,21 +45523,21 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           char msalt_hex[9];
           memcpy(msalt_hex, line, 8);
           msalt_hex[8] = 0;
-          JSLI(PV, Typesalt[JOB_MACOSX], (unsigned char *)msalt_hex);
+          JSLI(PV, TYPESALT(JOB_MACOSX), (unsigned char *)msalt_hex);
           if (PV) (*PV)++;
           Foundcnt[JOB_MACOSX]++;
         } else if (hlen2 == 136) {
           char msalt_hex[9];
           memcpy(msalt_hex, line, 8);
           msalt_hex[8] = 0;
-          JSLI(PV, Typesalt[JOB_MACOSX7], (unsigned char *)msalt_hex);
+          JSLI(PV, TYPESALT(JOB_MACOSX7), (unsigned char *)msalt_hex);
           if (PV) (*PV)++;
           Foundcnt[JOB_MACOSX7]++;
         } else if (hlen2 == 50) {
           char msalt_hex[11];
           memcpy(msalt_hex, line, 10);
           msalt_hex[10] = 0;
-          JSLI(PV, Typesalt[JOB_ARUBAOS], (unsigned char *)msalt_hex);
+          JSLI(PV, TYPESALT(JOB_ARUBAOS), (unsigned char *)msalt_hex);
           if (PV) (*PV)++;
           Foundcnt[JOB_ARUBAOS]++;
         }
@@ -44455,8 +45566,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               yaf_salt[slen2] = sep[1 + slen2];
             yaf_salt[slen2] = 0;
             if (slen2 > 0) {
-              JSLI(PV, JudyJ[JOB_YAF_SHA1], (unsigned char *)yaf_hash);
-              JSLI(PV, Typesalt[JOB_YAF_SHA1], (unsigned char *)yaf_salt);
+              JSLI(PV, JUDYJ(JOB_YAF_SHA1), (unsigned char *)yaf_hash);
+              JSLI(PV, TYPESALT(JOB_YAF_SHA1), (unsigned char *)yaf_salt);
               if (PV) { if ((*PV)++ == 0) {Saltloaded[JOB_YAF_SHA1]++;} }
               Foundcnt[JOB_YAF_SHA1]++;
               continue;
@@ -44479,7 +45590,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           int f4len = col[2] - col[1] - 1;  /* ntlm_response */
           int f5len = strlen(col[2] + 1);    /* challenge */
           if (f4len == 48 && f5len == 16 && f3len <= 48 && (f3len == 0 || (f3len % 2) == 0)) {
-            JSLI(PV, JudyJ[JOB_NETNTLMV1], (unsigned char *)line);
+            JSLI(PV, JUDYJ(JOB_NETNTLMV1), (unsigned char *)line);
             Saltloaded[JOB_NETNTLMV1] += store_typesalt(JOB_NETNTLMV1, line, len);
             Foundcnt[JOB_NETNTLMV1]++;
             continue;
@@ -44500,7 +45611,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           int f4len = col[1] + 1 < col[2] ? col[2] - col[1] - 1 : 0;  /* response */
           int f5len = strlen(col[2] + 1);                               /* blob */
           if (f3len == 16 && f4len == 32 && f5len >= 2 && (f5len % 2) == 0) {
-            JSLI(PV, JudyJ[JOB_NETNTLMV2], (unsigned char *)line);
+            JSLI(PV, JUDYJ(JOB_NETNTLMV2), (unsigned char *)line);
             Saltloaded[JOB_NETNTLMV2] += store_typesalt(JOB_NETNTLMV2, line, len);
             Foundcnt[JOB_NETNTLMV2]++;
             continue;
@@ -44517,7 +45628,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (o7_ok) {
         /* uppercase the hash portion for consistent lookup */
         for (y = 0; y < 16; y++) line[y] = toupper(line[y]);
-        JSLI(PV, JudyJ[JOB_ORACLE7], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_ORACLE7), (unsigned char *)line);
         Saltloaded[JOB_ORACLE7] += store_typesalt(JOB_ORACLE7, line + 17, len - 17);
         Foundcnt[JOB_ORACLE7]++;
         continue;
@@ -44548,7 +45659,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               char jkey[33];
               memcpy(jkey, line, 32);
               jkey[32] = 0;
-              JSLI(PV, JudyJ[JOB_LASTPASS], (unsigned char *)jkey);
+              JSLI(PV, JUDYJ(JOB_LASTPASS), (unsigned char *)jkey);
               /* salt = "iterations:email:iv" */
               Saltloaded[JOB_LASTPASS] += store_typesalt(JOB_LASTPASS, c1 + 1, len - 33);
               Foundcnt[JOB_LASTPASS]++;
@@ -44568,7 +45679,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char fg_hashkey[41];
         prmd5(fg_decoded + 12, fg_hashkey, 40);
         fg_hashkey[40] = 0;
-        JSLI(PV, JudyJ[JOB_FORTIGATE], (unsigned char *)fg_hashkey);
+        JSLI(PV, JUDYJ(JOB_FORTIGATE), (unsigned char *)fg_hashkey);
         /* Typesalt = 24-hex salt */
         char fg_salthex[25];
         prmd5(fg_decoded, fg_salthex, 24);
@@ -44589,7 +45700,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char fg_hashkey[65];
         prmd5(fg_decoded + 12, fg_hashkey, 64);
         fg_hashkey[64] = 0;
-        JSLI(PV, JudyJ[JOB_FORTIGATE256], (unsigned char *)fg_hashkey);
+        JSLI(PV, JUDYJ(JOB_FORTIGATE256), (unsigned char *)fg_hashkey);
         char fg_salthex[25];
         prmd5(fg_decoded, fg_salthex, 24);
         fg_salthex[24] = 0;
@@ -44608,7 +45719,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char umb_hashkey[41];
         prmd5(umb_decoded, umb_hashkey, 40);
         umb_hashkey[40] = 0;
-        JSLI(PV, JudyJ[JOB_UMBRACO], (unsigned char *)umb_hashkey);
+        JSLI(PV, JUDYJ(JOB_UMBRACO), (unsigned char *)umb_hashkey);
         Foundcnt[JOB_UMBRACO]++;
         continue;
       }
@@ -44625,11 +45736,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (dahua_ok) {
         salttmp[0] = 0; memcpy(salttmp, line, 8); salttmp[8] = 0;
         if (lf[JOB_DAHUA_AUTH]) {
-          JSLI(PV, JudyJ[JOB_DAHUA_AUTH], (unsigned char *)salttmp);
+          JSLI(PV, JUDYJ(JOB_DAHUA_AUTH), (unsigned char *)salttmp);
           Foundcnt[JOB_DAHUA_AUTH]++;
         }
         if (lf[JOB_BESDER_AUTH]) {
-          JSLI(PV, JudyJ[JOB_BESDER_AUTH], (unsigned char *)salttmp);
+          JSLI(PV, JUDYJ(JOB_BESDER_AUTH), (unsigned char *)salttmp);
           Foundcnt[JOB_BESDER_AUTH]++;
         }
         continue;
@@ -44665,7 +45776,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char jkey[33];
                 for (x = 0; x < 32; x++) jkey[x] = tolower(f5[x]);
                 jkey[32] = 0;
-                JSLI(PV, JudyJ[JOB_SQLCIPHER], (unsigned char *)jkey);
+                JSLI(PV, JUDYJ(JOB_SQLCIPHER), (unsigned char *)jkey);
                 /* Typesalt = "type:iter:salt32hex_lc:iv32hex_lc" */
                 char tskey[128];
                 snprintf(tskey, sizeof(tskey), "%d:%d:", sc_type, sc_iter);
@@ -44674,7 +45785,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 tskey[toff + 32] = ':';
                 for (x = 0; x < 32; x++) tskey[toff + 33 + x] = tolower(f4[x]);
                 tskey[toff + 65] = 0;
-                JSLI(PV, Typesalt[JOB_SQLCIPHER], (unsigned char *)tskey);
+                JSLI(PV, TYPESALT(JOB_SQLCIPHER), (unsigned char *)tskey);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SQLCIPHER]++; }
                 Foundcnt[JOB_SQLCIPHER]++;
                 continue;
@@ -44695,7 +45806,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char rr_hash[41], rr_salt[41];
         for (x = 0; x < 40; x++) rr_hash[x] = tolower(line[x]);
         rr_hash[40] = 0;
-        JSLI(PV, JudyJ[JOB_RORAILS_SHA1], (unsigned char *)rr_hash);
+        JSLI(PV, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)rr_hash);
         for (x = 0; x < 40; x++) rr_salt[x] = tolower(line[41+x]);
         rr_salt[40] = 0;
         Saltloaded[JOB_RORAILS_SHA1] += store_typesalt(JOB_RORAILS_SHA1, rr_salt, 40);
@@ -44717,19 +45828,19 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         for (x = 0; x < 32; x++) ae_pt[x] = tolower(line[33+x]);
         ae_pt[32] = 0;
         if (lf[JOB_AES128_NOKDF]) {
-          JSLI(PV, JudyJ[JOB_AES128_NOKDF], (unsigned char *)ae_ct);
+          JSLI(PV, JUDYJ(JOB_AES128_NOKDF), (unsigned char *)ae_ct);
           snprintf(salttmp, MAXLINE, "128:%s", ae_pt);
           Saltloaded[JOB_AES128_NOKDF] += store_typesalt(JOB_AES128_NOKDF, salttmp, strlen(salttmp));
           Foundcnt[JOB_AES128_NOKDF]++;
         }
         if (lf[JOB_AES192_NOKDF]) {
-          JSLI(PV, JudyJ[JOB_AES192_NOKDF], (unsigned char *)ae_ct);
+          JSLI(PV, JUDYJ(JOB_AES192_NOKDF), (unsigned char *)ae_ct);
           snprintf(salttmp, MAXLINE, "192:%s", ae_pt);
           Saltloaded[JOB_AES192_NOKDF] += store_typesalt(JOB_AES192_NOKDF, salttmp, strlen(salttmp));
           Foundcnt[JOB_AES192_NOKDF]++;
         }
         if (lf[JOB_AES256_NOKDF]) {
-          JSLI(PV, JudyJ[JOB_AES256_NOKDF], (unsigned char *)ae_ct);
+          JSLI(PV, JUDYJ(JOB_AES256_NOKDF), (unsigned char *)ae_ct);
           snprintf(salttmp, MAXLINE, "256:%s", ae_pt);
           Saltloaded[JOB_AES256_NOKDF] += store_typesalt(JOB_AES256_NOKDF, salttmp, strlen(salttmp));
           Foundcnt[JOB_AES256_NOKDF]++;
@@ -44758,7 +45869,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char vmx_ct[33], vmx_tskey[128];
             for (x = 0; x < 32; x++) vmx_ct[x] = tolower(f_ivct[32+x]);
             vmx_ct[32] = 0;
-            JSLI(PV, JudyJ[JOB_VMWARE_VMX], (unsigned char *)vmx_ct);
+            JSLI(PV, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)vmx_ct);
             /* Typesalt = "iter:salt32hex_lc:iv32hex_lc" */
             snprintf(vmx_tskey, sizeof(vmx_tskey), "%d:", vmx_iter);
             int toff = strlen(vmx_tskey);
@@ -44766,7 +45877,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             vmx_tskey[toff+32] = ':';
             for (x = 0; x < 32; x++) vmx_tskey[toff+33+x] = tolower(f_ivct[x]);
             vmx_tskey[toff+65] = 0;
-            JSLI(PV, Typesalt[JOB_VMWARE_VMX], (unsigned char *)vmx_tskey);
+            JSLI(PV, TYPESALT(JOB_VMWARE_VMX), (unsigned char *)vmx_tskey);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_VMWARE_VMX]++; }
             Foundcnt[JOB_VMWARE_VMX]++;
             continue;
@@ -44800,14 +45911,14 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               char judykey[65];
               prmd5(stored_bin, judykey, 64);
               judykey[64] = 0;
-              JSLI(PV, JudyJ[JOB_POSTGRESSCRAM256], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)judykey);
               /* Typesalt = "iter:hex_salt" */
               char tskey[256];
               snprintf(tskey, sizeof(tskey), "%d:", sc_iter);
               int toff = strlen(tskey);
               prmd5(salt_bin, tskey + toff, slen * 2);
               tskey[toff + slen * 2] = 0;
-              JSLI(PV, Typesalt[JOB_POSTGRESSCRAM256], (unsigned char *)tskey);
+              JSLI(PV, TYPESALT(JOB_POSTGRESSCRAM256), (unsigned char *)tskey);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_POSTGRESSCRAM256]++; }
               Foundcnt[JOB_POSTGRESSCRAM256]++;
               continue;
@@ -44844,7 +45955,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char judykey[65];
                 for (x = 0; x < 64; x++) judykey[x] = tolower(aws_digest[x]);
                 judykey[64] = 0;
-                JSLI(PV, JudyJ[JOB_AWSSIGV4], (unsigned char *)judykey);
+                JSLI(PV, JUDYJ(JOB_AWSSIGV4), (unsigned char *)judykey);
                 /* Typesalt = "longdate:region:service:canonical".
                  * Reuse the thread-local salttmp (MAXLINE+16) so the canonical
                  * request payload (which can be ~40 KB for AWS V4) is not
@@ -44859,7 +45970,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
 #endif
                 snprintf(salttmp, MAXLINE, "%s:%s:%s:%s", aws_longdate, aws_region, aws_service, aws_canonical);
 #pragma GCC diagnostic pop
-                JSLI(PV, Typesalt[JOB_AWSSIGV4], (unsigned char *)salttmp);
+                JSLI(PV, TYPESALT(JOB_AWSSIGV4), (unsigned char *)salttmp);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_AWSSIGV4]++; }
                 Foundcnt[JOB_AWSSIGV4]++;
                 continue;
@@ -44900,11 +46011,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char judykey[65];
                 for (x = 0; x < hashlen; x++) judykey[x] = tolower(hash[x]);
                 judykey[hashlen] = 0;
-                JSLI(PV, JudyJ[target_job], (unsigned char *)judykey);
+                JSLI(PV, JUDYJ(target_job), (unsigned char *)judykey);
                 /* Typesalt = "REALM:user" (salt for PBKDF2 = realm + user) */
                 char tskey[256];
                 snprintf(tskey, sizeof(tskey), "%s:%s", realm, user);
-                JSLI(PV, Typesalt[target_job], (unsigned char *)tskey);
+                JSLI(PV, TYPESALT(target_job), (unsigned char *)tskey);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[target_job]++; }
                 Foundcnt[target_job]++;
                 continue;
@@ -44929,10 +46040,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char judykey[33];
             for (x = 0; x < 32; x++) judykey[x] = tolower(hash[x]);
             judykey[32] = 0;
-            JSLI(PV, JudyJ[JOB_SSPR_MD5], (unsigned char *)judykey);
+            JSLI(PV, JUDYJ(JOB_SSPR_MD5), (unsigned char *)judykey);
             char tskey[32];
             snprintf(tskey, sizeof(tskey), "%d:", iter);
-            JSLI(PV, Typesalt[JOB_SSPR_MD5], (unsigned char *)tskey);
+            JSLI(PV, TYPESALT(JOB_SSPR_MD5), (unsigned char *)tskey);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SSPR_MD5]++; }
             Foundcnt[JOB_SSPR_MD5]++;
             continue;
@@ -44970,14 +46081,14 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char judykey[130];
                 for (x = 0; x < hashlen2; x++) judykey[x] = tolower(hash[x]);
                 judykey[hashlen2] = 0;
-                JSLI(PV, JudyJ[job_id], (unsigned char *)judykey);
+                JSLI(PV, JUDYJ(job_id), (unsigned char *)judykey);
                 /* Typesalt = "iter:salt" (NONE → empty salt) */
                 char tskey[256];
                 if (saltlen2 == 4 && memcmp(salt, "NONE", 4) == 0)
                   snprintf(tskey, sizeof(tskey), "%d:", iter);
                 else
                   snprintf(tskey, sizeof(tskey), "%d:%.*s", iter, saltlen2, salt);
-                JSLI(PV, Typesalt[job_id], (unsigned char *)tskey);
+                JSLI(PV, TYPESALT(job_id), (unsigned char *)tskey);
                 if (PV) { if ((*PV)++ == 0) Saltloaded[job_id]++; }
                 Foundcnt[job_id]++;
                 continue;
@@ -45012,12 +46123,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               offset = mystrlen(convbuf);
               convbuf[offset++] = ':';
               b64_encode((char *)hashbin, convbuf + offset, hashbinlen);
-              JSLI(PV, JudyJ[JOB_PKCS5S2], (unsigned char *)convbuf);
+              JSLI(PV, JUDYJ(JOB_PKCS5S2), (unsigned char *)convbuf);
               /* Typesalt = everything before last : */
               { char *lastsep = strrchr(convbuf, ':');
                 if (lastsep) {
                   *lastsep = 0;
-                  JSLI(PV, Typesalt[JOB_PBKDF2_SHA1], (unsigned char *)convbuf);
+                  JSLI(PV, TYPESALT(JOB_PBKDF2_SHA1), (unsigned char *)convbuf);
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_PBKDF2_SHA1]++; }
                   *lastsep = ':';
                 }
@@ -45047,10 +46158,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               char judykey[33];
               for (x = 0; x < 32; x++) judykey[x] = tolower(line[x]);
               judykey[32] = 0;
-              JSLI(PV, JudyJ[JOB_EMPIRECMS], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_EMPIRECMS), (unsigned char *)judykey);
               char tskey[512];
               snprintf(tskey, sizeof(tskey), "%.*s:%.*s", salt1len, salt1, salt2len, salt2);
-              JSLI(PV, Typesalt[JOB_EMPIRECMS], (unsigned char *)tskey);
+              JSLI(PV, TYPESALT(JOB_EMPIRECMS), (unsigned char *)tskey);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_EMPIRECMS]++; }
               Foundcnt[JOB_EMPIRECMS]++;
               continue;
@@ -45081,7 +46192,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             if (saltdeclen > 0) {
               char judykey[256];
               snprintf(judykey, sizeof(judykey), "%.*s", hashb64len, hashb64);
-              JSLI(PV, JudyJ[JOB_PBKDF1_SHA1], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)judykey);
               /* Typesalt = "iter:hexsalt" */
               char tskey[600];
               int tsoff = snprintf(tskey, 20, "%d:", iter);
@@ -45090,7 +46201,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 tskey[tsoff++] = hextab[saltdec[y] & 0xf];
               }
               tskey[tsoff] = 0;
-              JSLI(PV, Typesalt[JOB_PBKDF1_SHA1], (unsigned char *)tskey);
+              JSLI(PV, TYPESALT(JOB_PBKDF1_SHA1), (unsigned char *)tskey);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_PBKDF1_SHA1]++; }
               Foundcnt[JOB_PBKDF1_SHA1]++;
               continue;
@@ -45116,10 +46227,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             if (hok) {
               char judykey[256];
               snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
-              JSLI(PV, JudyJ[JOB_MSONLINE], (unsigned char *)judykey);
+              JSLI(PV, JUDYJ(JOB_MSONLINE), (unsigned char *)judykey);
               char tskey[256];
               snprintf(tskey, sizeof(tskey), "%d:%.*s", iter, datahexlen, datahex);
-              JSLI(PV, Typesalt[JOB_MSONLINE], (unsigned char *)tskey);
+              JSLI(PV, TYPESALT(JOB_MSONLINE), (unsigned char *)tskey);
               if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_MSONLINE]++; }
               Foundcnt[JOB_MSONLINE]++;
               continue;
@@ -45134,11 +46245,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (line[6] == '$') {
         char judykey[61];
         memcpy(judykey, line, 60); judykey[60] = 0;
-        JSLI(PV, JudyJ[JOB_WBB4], (unsigned char *)judykey);
+        JSLI(PV, JUDYJ(JOB_WBB4), (unsigned char *)judykey);
         /* Typesalt = first 29 chars (prefix + salt) */
         char tskey[30];
         memcpy(tskey, line, 29); tskey[29] = 0;
-        JSLI(PV, Typesalt[JOB_WBB4], (unsigned char *)tskey);
+        JSLI(PV, TYPESALT(JOB_WBB4), (unsigned char *)tskey);
         if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WBB4]++; }
         Foundcnt[JOB_WBB4]++;
         continue;
@@ -45159,7 +46270,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char sh_jkey[129];
             prmd5(sh_dec, sh_jkey, 128);
             sh_jkey[128] = 0;
-            JSLI(PV, JudyJ[JOB_SAPCODVNH512], (unsigned char *)sh_jkey);
+            JSLI(PV, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)sh_jkey);
             /* Typesalt = "iter:hex_salt" */
             int sh_saltlen = sh_dlen - 64;
             char sh_ts[600];
@@ -45192,11 +46303,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char judykey[41];
             for (x = 0; x < 40; x++) judykey[x] = toupper(hash[x]);
             judykey[40] = 0;
-            JSLI(PV, JudyJ[JOB_AS400SSHA1], (unsigned char *)judykey);
+            JSLI(PV, JUDYJ(JOB_AS400SSHA1), (unsigned char *)judykey);
             char tskey[11];
             for (x = 0; x < userlen; x++) tskey[x] = toupper(user[x]);
             tskey[userlen] = 0;
-            JSLI(PV, Typesalt[JOB_AS400SSHA1], (unsigned char *)tskey);
+            JSLI(PV, TYPESALT(JOB_AS400SSHA1), (unsigned char *)tskey);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_AS400SSHA1]++; }
             Foundcnt[JOB_AS400SSHA1]++;
             continue;
@@ -45244,7 +46355,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                       char judykey[MAXLINE];
                       memcpy(judykey, line, len);
                       judykey[len] = 0;
-                      JSLI(PV, JudyJ[JOB_ARGON2], (unsigned char *)judykey);
+                      JSLI(PV, JUDYJ(JOB_ARGON2), (unsigned char *)judykey);
                       /* Build Typesalt: type:ver:m:t:p:saltlen:salthex:hashlen */
                       char salthex[512];
                       prmd5(saltbin, salthex, saltbinlen * 2);
@@ -45254,7 +46365,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                       snprintf(tskey, MAXLINE, "%d:%d:%d:%d:%d:%d:%s:%d",
                                a2type, ver, m_cost, t_cost, parallelism,
                                saltbinlen, salthex, hashbinlen);
-                      JSLI(PV, Typesalt[JOB_ARGON2], (unsigned char *)tskey);
+                      JSLI(PV, TYPESALT(JOB_ARGON2), (unsigned char *)tskey);
                       if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ARGON2]++; }
                       Foundcnt[JOB_ARGON2]++;
                       /* Track max workspace needed */
@@ -45319,7 +46430,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   prmd5((unsigned char *)saltstart, salthex, saltlen * 2);
                   snprintf(salttmp + 64, 256, "2:19:%d:%d:1:%d:%s:%d",
                            mg_m, mg_t, saltlen, salthex, mg_hashlen);
-                  JSLI(PV, Typesalt[JOB_ARGON2], (unsigned char *)(salttmp + 64));
+                  JSLI(PV, TYPESALT(JOB_ARGON2), (unsigned char *)(salttmp + 64));
                   if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ARGON2]++; }
                   /* Build JudyJ key: standard $argon2id$ format
                    * Decode hex hash to binary, then base64-encode salt and hash */
@@ -45344,7 +46455,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                   snprintf(salttmp + 704, MAXLINE - 704, "$argon2id$v=19$m=%d,t=%d,p=1$%s$%s",
                            mg_m, mg_t, b64salt, b64hash);
 #pragma GCC diagnostic pop
-                  JSLI(PV, JudyJ[JOB_ARGON2], (unsigned char *)(salttmp + 704));
+                  JSLI(PV, JUDYJ(JOB_ARGON2), (unsigned char *)(salttmp + 704));
                   Foundcnt[JOB_ARGON2]++;
                   { size_t needed = (size_t)mg_m * 1024;
                     if (needed > Argon2_maxmem) Argon2_maxmem = needed;
@@ -45366,7 +46477,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         char judykey[65];
         for (x = 0; x < 64; x++) judykey[x] = tolower(line[x]);
         judykey[64] = 0;
-        JSLI(PV, JudyJ[JOB_SYMFONY256], (unsigned char *)judykey);
+        JSLI(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)judykey);
         int sf_slen = len - 65;
         Saltloaded[JOB_SYMFONY256] += store_typesalt(JOB_SYMFONY256, line + 65, sf_slen);
         Foundcnt[JOB_SYMFONY256]++;
@@ -45385,13 +46496,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         judykey[0] = '$';
         memcpy(judykey + 1, bchash, 59);
         judykey[60] = 0;
-        JSLI(PV, JudyJ[JOB_WPBCRYPT], (unsigned char *)judykey);
+        JSLI(PV, JUDYJ(JOB_WPBCRYPT), (unsigned char *)judykey);
         /* Setting = first 29 chars: "$2y$NN$salt22" */
         char tskey[30];
         tskey[0] = '$';
         memcpy(tskey + 1, bchash, 28);
         tskey[29] = 0;
-        JSLI(PV, Typesalt[JOB_WPBCRYPT], (unsigned char *)tskey);
+        JSLI(PV, TYPESALT(JOB_WPBCRYPT), (unsigned char *)tskey);
         if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WPBCRYPT]++; }
         Foundcnt[JOB_WPBCRYPT]++;
         continue;
@@ -45409,7 +46520,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       if (lastsep && (len - (int)(lastsep + 1 - line)) == 86) {
         char judykey[512];
         snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
-        JSLI(PV, JudyJ[JOB_GOST12512CRYPT], (unsigned char *)judykey);
+        JSLI(PV, JUDYJ(JOB_GOST12512CRYPT), (unsigned char *)judykey);
         Foundcnt[JOB_GOST12512CRYPT]++;
         continue;
       }
@@ -45428,11 +46539,196 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           int setting_len = hash_start - line + 1; /* include trailing $ */
           snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
           snprintf(saltkey, sizeof(saltkey), "%.*s", setting_len, line);
-          JSLI(PV, JudyJ[JOB_YESCRYPT], (unsigned char *)judykey);
-          JSLI(PV, Typesalt[JOB_YESCRYPT], (unsigned char *)saltkey);
+          JSLI(PV, JUDYJ(JOB_YESCRYPT), (unsigned char *)judykey);
+          JSLI(PV, TYPESALT(JOB_YESCRYPT), (unsigned char *)saltkey);
           if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_YESCRYPT]++; }
           Foundcnt[JOB_YESCRYPT]++;
           continue;
+        }
+      }
+    }
+    /* GOST-YESCRYPT (46100): $gy$PARAMS$SALT$HASH (43 chars of itoa64)
+     * JudyJ key = full format string; Typesalt = setting ($gy$params$salt$).
+     *
+     * The prefix test is exact, lowercase and anchored on purpose. The CMIYC
+     * corpus salts three md5crypt decoys into the same file ($1$Gy$..., $1$gY$...)
+     * that a substring or case-insensitive match would happily swallow. */
+    if (lf[JOB_GOSTYESCRYPT] && strncmp(line, "$gy$", 4) == 0 && inhashbuf) {
+      char *p = line + 4;
+      char *salt_start = strchr(p, '$');
+      if (salt_start) {
+        salt_start++;
+        char *hash_start = strchr(salt_start, '$');
+        if (hash_start && (len - (int)(hash_start + 1 - line)) == 43) {
+          char judykey[512], saltkey[256];
+          int setting_len = hash_start - line + 1; /* include trailing $ */
+          if (setting_len < (int)sizeof(saltkey) && len < (int)sizeof(judykey)) {
+            snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
+            snprintf(saltkey, sizeof(saltkey), "%.*s", setting_len, line);
+            JSLI(PV, JUDYJ(JOB_GOSTYESCRYPT), (unsigned char *)judykey);
+            JSLI(PV, TYPESALT(JOB_GOSTYESCRYPT), (unsigned char *)saltkey);
+            if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_GOSTYESCRYPT]++; }
+            Foundcnt[JOB_GOSTYESCRYPT]++;
+            continue;
+          }
+        }
+      }
+    }
+    /* CMIYC contest hash (e1001), from challenge_3 (AIX PowerPC binary):
+     *   $cmiyc$<version>$<rounds>$<memlog>$<b64url salt>$<b64url hash>
+     * b64url = A-Za-z0-9-_ with NO padding; salt 22 chars -> 16 bytes,
+     * hash 43 chars -> 32 bytes. Parameter ranges from cmiyc_raw's own
+     * argument validation: rounds 1..32, memlog 10..24.
+     *
+     * PARSING ONLY. The digest is NOT computed -- see the JOB_CMIYC case in
+     * procjob for why (the buffer-expansion step is still undecoded). The
+     * loader exists so the type number is pinned in both mdxfind and
+     * hashpipe, and so the hashes can be counted and carried, without any
+     * risk of reporting a wrong answer. */
+    if (lf[JOB_CMIYC] && strncmp(line, "$cmiyc$", 7) == 0) {
+      char *f[5];
+      int nf = 0;
+      char *sp = line + 7;
+      f[nf++] = sp;
+      while (*sp && nf < 5) {
+        if (*sp == '$') { *sp = 0; f[nf++] = sp + 1; }
+        sp++;
+      }
+      if (nf == 5) {
+        long c_ver = strtol(f[0], NULL, 10);
+        long c_rounds = strtol(f[1], NULL, 10);
+        long c_memlog = strtol(f[2], NULL, 10);
+        int slen = (int)strlen(f[3]), hlen = (int)strlen(f[4]);
+        int okc = 1, q;
+        for (q = 0; q < slen + hlen && okc; q++) {
+          int ch2 = (q < slen) ? (unsigned char)f[3][q]
+                               : (unsigned char)f[4][q - slen];
+          if (!isalnum(ch2) && ch2 != '-' && ch2 != '_') okc = 0;
+        }
+        { int k; for (k = 0; k < nf - 1; k++) f[k][strlen(f[k])] = '$'; }
+        if (okc && c_ver > 0 && c_rounds >= 1 && c_rounds <= 32 &&
+            c_memlog >= 10 && c_memlog <= 24 && slen == 22 && hlen == 43) {
+          char cjudy[256], csalt[128];
+          int setting_len = (int)(f[4] - line);   /* through the salt's '$' */
+          if (len < (int)sizeof(cjudy) && setting_len < (int)sizeof(csalt)) {
+            snprintf(cjudy, sizeof(cjudy), "%.*s", (int)len, line);
+            snprintf(csalt, sizeof(csalt), "%.*s", setting_len, line);
+            JSLI(PV, JUDYJ(JOB_CMIYC), (unsigned char *)cjudy);
+            JSLI(PV, TYPESALT(JOB_CMIYC), (unsigned char *)csalt);
+            if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_CMIYC]++; }
+            Foundcnt[JOB_CMIYC]++;
+            continue;
+          }
+        }
+      }
+    }
+    /* 7-Zip 7zAES (11600):
+     *   $7z$type$log2iter$saltlen$salt$ivlen$iv$crc$packedlen$unpackedlen$data
+     *
+     * The `data` field in stock 7z2john output is the ENTIRE encrypted stream
+     * (112 KB for the test vector, 1.5 MB for the five challenge archives) --
+     * far past MAXLINE, so such a line can never be read here. Stage 1 only
+     * needs the final two ciphertext blocks, so mdxfind accepts a TRUNCATED
+     * data field: anything with at least 64 hex chars, of which the LAST 64
+     * (32 bytes) are used. tools/7z2mdx.py does the truncation. A short stock
+     * line (small archive) therefore also parses unchanged.
+     *
+     * Typesalt holds the KDF GROUP (saltlen:salt:log2iter), not the archive --
+     * see struct SevenZipRec. JudyJ holds the full line for dedup/output. */
+    if (lf[JOB_SEVENZIP] && strncmp(line, "$7z$", 4) == 0) {
+      /* After the "$7z$" prefix:
+       *   f[0]=type f[1]=log2 f[2]=saltlen f[3]=salt f[4]=ivlen f[5]=iv
+       *   f[6]=crc  f[7]=packedlen f[8]=unpackedlen f[9]=data
+       * LZMA archives (type 1) carry two EXTRA trailing fields -- the coder
+       * property length and the LZMA properties, e.g. $200000$5d00000400 --
+       * which Deflate64 (type 0) does not have. So the count is 10 or 12.
+       * Nothing past f[9] matters to stage 1; accept and ignore the tail. */
+      char *f[12];
+      int nf = 0;
+      char *sp = line + 4;
+      f[nf++] = sp;
+      while (*sp && nf < 12) {
+        if (*sp == '$') { *sp = 0; f[nf++] = sp + 1; }
+        sp++;
+      }
+      if (nf >= 10) {
+        long sz_log2 = strtol(f[1], NULL, 10);
+        long sz_saltlen = strtol(f[2], NULL, 10);
+        long sz_packed = strtol(f[7], NULL, 10);
+        long sz_unpacked = strtol(f[8], NULL, 10);
+        int dlen = (int)strlen(f[9]);
+        int padsize = (int)(sz_packed - sz_unpacked);
+        /* restore the separators we punched out, so the JudyJ key and the
+         * reported line are byte-identical to the input */
+        { int k; for (k = 0; k < nf - 1; k++) f[k][strlen(f[k])] = '$'; }
+        if (sz_log2 >= 0 && sz_log2 <= 63 && dlen >= 64 && (dlen & 1) == 0 &&
+            padsize >= 0 && padsize <= 16 && sz_saltlen >= 0 && sz_saltlen <= 64) {
+          unsigned char tail[32];
+          char grp[96];
+          const char *tailhex = f[9] + dlen - 64;   /* LAST 32 bytes */
+          if (get32((char *)tailhex, tail, 32) == 32) {
+            snprintf(grp, sizeof(grp), "%ld:%.*s:%ld",
+                     sz_saltlen, (int)(strchr(f[3], '$') - f[3]), f[3], sz_log2);
+            sevenzip_addrec(grp, tail, padsize, line);
+            JSLI(PV, JUDYJ(JOB_SEVENZIP), (unsigned char *)line);
+            JSLI(PV, TYPESALT(JOB_SEVENZIP), (unsigned char *)grp);
+            if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SEVENZIP]++; }
+            Foundcnt[JOB_SEVENZIP]++;
+            continue;
+          }
+        }
+      }
+    }
+    /* SHA1CRYPT (15100): $sha1$ITERATIONS$SALT$DIGEST(28 chars)
+     * JudyJ key = full format string; Typesalt = setting ($sha1$iter$salt$).
+     * The salt is raw ASCII text, never base64-decoded. Iterations are
+     * parsed, never assumed -- NetBSD randomises them by design (the CMIYC
+     * corpus happens to be uniformly 5000, hashcat's example is 20000). */
+    if (lf[JOB_SHA1CRYPT] && strncmp(line, "$sha1$", 6) == 0) {
+      char *iter_start = line + 6;
+      char *salt_start = strchr(iter_start, '$');
+      if (salt_start && salt_start > iter_start) {
+        int itok = 1;
+        char *q;
+        for (q = iter_start; q < salt_start; q++)
+          if (!isdigit((unsigned char)*q)) { itok = 0; break; }
+        if (itok) {
+          salt_start++;
+          char *dig_start = strchr(salt_start, '$');
+          if (dig_start && (dig_start - salt_start) >= 1 &&
+              (dig_start - salt_start) <= 64 &&
+              (len - (int)(dig_start + 1 - line)) == 28) {
+            char judykey[256], saltkey[128];
+            unsigned char sc_raw[24];
+            char sc_canon[32];
+            int setting_len = dig_start - line + 1; /* include trailing $ */
+            /* Liberal in what we accept, conformant in what we emit.
+             *
+             * The 28-char field encodes 21 bytes, but SHA-1 only produces 20:
+             * the 21st is digest[0] wrapped around, so it carries no
+             * information. Some producers put something else there --
+             * hashcat's own published -m 15100 example uses 0x00 -- and such a
+             * hash is perfectly crackable, it is just spelled differently.
+             *
+             * So decode the field, discard whatever the 21st byte was, and key
+             * the Judy on the RE-ENCODED canonical form. A nonconformant input
+             * therefore matches and is reported in the NetBSD/corpus spelling.
+             * Note this also validates the alphabet, which the shape test above
+             * does not. Two lines differing only in that byte collapse to one
+             * unique hash, which is correct -- they are the same hash. */
+            if (setting_len < (int)sizeof(saltkey) && len < (int)sizeof(judykey) &&
+                sha1crypt_b64decode(dig_start + 1, sc_raw) == 0) {
+              sha1crypt_b64encode(sc_raw, sc_canon);  /* re-wraps from byte 0 */
+              snprintf(judykey, sizeof(judykey), "%.*s%s",
+                       setting_len, line, sc_canon);
+              snprintf(saltkey, sizeof(saltkey), "%.*s", setting_len, line);
+              JSLI(PV, JUDYJ(JOB_SHA1CRYPT), (unsigned char *)judykey);
+              JSLI(PV, TYPESALT(JOB_SHA1CRYPT), (unsigned char *)saltkey);
+              if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SHA1CRYPT]++; }
+              Foundcnt[JOB_SHA1CRYPT]++;
+              continue;
+            }
+          }
         }
       }
     }
@@ -45446,7 +46742,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         judykey[8] = 0;
         for (x = 0; x < 8; x++) seedkey[x] = tolower(line[x + 9]);
         seedkey[8] = 0;
-        JSLI(PV, JudyJ[JOB_MURMUR3], (unsigned char *)judykey);
+        JSLI(PV, JUDYJ(JOB_MURMUR3), (unsigned char *)judykey);
         Saltloaded[JOB_MURMUR3] += store_typesalt(JOB_MURMUR3, seedkey, 8);
         Foundcnt[JOB_MURMUR3]++;
         continue;
@@ -45472,13 +46768,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char judykey[512];
             snprintf(judykey, sizeof(judykey), "%.*s", len, line);
             for (x = 0; judykey[x]; x++) judykey[x] = tolower(judykey[x]);
-            JSLI(PV, JudyJ[JOB_VEEAM_VBK], (unsigned char *)judykey);
+            JSLI(PV, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)judykey);
             /* Typesalt = "iter:128hex_salt:32hex_ct" */
             char tskey[256];
             *d1 = 0;
             snprintf(tskey, sizeof(tskey), "%d:%s:%s", iter, p, ct);
             for (x = 0; tskey[x]; x++) tskey[x] = tolower(tskey[x]);
-            JSLI(PV, Typesalt[JOB_VEEAM_VBK], (unsigned char *)tskey);
+            JSLI(PV, TYPESALT(JOB_VEEAM_VBK), (unsigned char *)tskey);
             if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_VEEAM_VBK]++; }
             Foundcnt[JOB_VEEAM_VBK]++;
             continue;
@@ -45502,12 +46798,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           char judykey[33];
           for (x = 0; x < 32; x++) judykey[x] = tolower(hash[x]);
           judykey[32] = 0;
-          JSLI(PV, JudyJ[JOB_MSSNTP], (unsigned char *)judykey);
+          JSLI(PV, JUDYJ(JOB_MSSNTP), (unsigned char *)judykey);
           /* Typesalt = 96-hex salt */
           char tskey[97];
           for (x = 0; x < 96; x++) tskey[x] = tolower(salt[x]);
           tskey[96] = 0;
-          JSLI(PV, Typesalt[JOB_MSSNTP], (unsigned char *)tskey);
+          JSLI(PV, TYPESALT(JOB_MSSNTP), (unsigned char *)tskey);
           if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_MSSNTP]++; }
           Foundcnt[JOB_MSSNTP]++;
           continue;
@@ -45531,7 +46827,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           char d8_jkey[17];
           prmd5(d8_dec + 28, d8_jkey, 16);
           d8_jkey[16] = 0;
-          JSLI(PV, JudyJ[JOB_DOMINO8], (unsigned char *)d8_jkey);
+          JSLI(PV, JUDYJ(JOB_DOMINO8), (unsigned char *)d8_jkey);
           /* Typesalt = 32-hex salt16 + ":" + iter_str + ":" + 4-hex chars */
           char d8_salt[64];
           prmd5(d8_dec, d8_salt, 32);
@@ -45565,7 +46861,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         /* lowercase the hash key for consistent lookup */
         for (y = 0; y < 16; y++)
           if (sh_jkey[y] >= 'A' && sh_jkey[y] <= 'F') sh_jkey[y] += 32;
-        JSLI(PV, JudyJ[JOB_SIPHASH], (unsigned char *)sh_jkey);
+        JSLI(PV, JUDYJ(JOB_SIPHASH), (unsigned char *)sh_jkey);
         char sh_salt[33];
         memcpy(sh_salt, line + 21, 32);
         sh_salt[32] = 0;
@@ -45597,7 +46893,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               cm_jkey[32] = 0;
               for (y = 0; y < 32; y++)
                 if (cm_jkey[y] >= 'A' && cm_jkey[y] <= 'F') cm_jkey[y] += 32;
-              JSLI(PV, JudyJ[JOB_CRAMMD5], (unsigned char *)cm_jkey);
+              JSLI(PV, JUDYJ(JOB_CRAMMD5), (unsigned char *)cm_jkey);
               /* Typesalt = everything after $cram_md5$ */
               int cm_tslen = len - 10;
               Saltloaded[JOB_CRAMMD5] += store_typesalt(JOB_CRAMMD5, line + 10, cm_tslen);
@@ -45622,7 +46918,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             char sh_jkey[41];
             prmd5(sh_dec, sh_jkey, 40);
             sh_jkey[40] = 0;
-            JSLI(PV, JudyJ[JOB_SAPCODVNH], (unsigned char *)sh_jkey);
+            JSLI(PV, JUDYJ(JOB_SAPCODVNH), (unsigned char *)sh_jkey);
             /* Typesalt = "iter:hex_salt" */
             int sh_saltlen = sh_dlen - 20;
             char sh_ts[600];
@@ -45653,7 +46949,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           char rh_jkey[65];
           prmd5(rh_dec + 68, rh_jkey, 64);
           rh_jkey[64] = 0;
-          JSLI(PV, JudyJ[JOB_REDHAT389DS], (unsigned char *)rh_jkey);
+          JSLI(PV, JUDYJ(JOB_REDHAT389DS), (unsigned char *)rh_jkey);
           /* Typesalt = "iter:hex_salt128" */
           char rh_ts[160];
           int rh_off = snprintf(rh_ts, 20, "%d:", rh_iter);
@@ -45690,7 +46986,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             pg_jkey[32] = 0;
             for (y = 0; y < 32; y++)
               if (pg_jkey[y] >= 'A' && pg_jkey[y] <= 'F') pg_jkey[y] += 32;
-            JSLI(PV, JudyJ[JOB_POSTGRESCRAM], (unsigned char *)pg_jkey);
+            JSLI(PV, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)pg_jkey);
             /* Typesalt = user:challenge_hex */
             int pg_ulen = star1 - (line + 10);
             char pg_ts[256];
@@ -45724,7 +47020,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         mc_jkey[40] = 0;
         for (y = 0; y < 40; y++)
           if (mc_jkey[y] >= 'A' && mc_jkey[y] <= 'F') mc_jkey[y] += 32;
-        JSLI(PV, JudyJ[JOB_MYSQLCRAM], (unsigned char *)mc_jkey);
+        JSLI(PV, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)mc_jkey);
         /* Typesalt = 40-hex nonce (lowercase) */
         char mc_ts[41];
         memcpy(mc_ts, line + 9, 40);
@@ -45760,7 +47056,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 char sh_jkey[65];
                 prmd5(sh_hash, sh_jkey, 64);
                 sh_jkey[64] = 0;
-                JSLI(PV, JudyJ[JOB_SHIRO1], (unsigned char *)sh_jkey);
+                JSLI(PV, JUDYJ(JOB_SHIRO1), (unsigned char *)sh_jkey);
                 /* Typesalt = iter:hex_salt32 */
                 char sh_ts[80];
                 int sh_off = snprintf(sh_ts, 20, "%d:", sh_iter);
@@ -45810,7 +47106,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           /* Lowercase hash for JudyJ key */
           for (y = 0; y < 16; y++)
             if (ec_hash_hex[y] >= 'A' && ec_hash_hex[y] <= 'F') ec_hash_hex[y] += 32;
-          JSLI(PV, JudyJ[JOB_ECRYPTFS], (unsigned char *)ec_hash_hex);
+          JSLI(PV, JUDYJ(JOB_ECRYPTFS), (unsigned char *)ec_hash_hex);
           /* Lowercase salt for Typesalt */
           for (y = 0; y < 16; y++)
             if (ec_salt_hex[y] >= 'A' && ec_salt_hex[y] <= 'F') ec_salt_hex[y] += 32;
@@ -45832,7 +47128,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         or_jkey[64] = 0;
         for (y = 0; y < 64; y++)
           if (or_jkey[y] >= 'A' && or_jkey[y] <= 'F') or_jkey[y] += 32;
-        JSLI(PV, JudyJ[JOB_ORACLE12], (unsigned char *)or_jkey);
+        JSLI(PV, JUDYJ(JOB_ORACLE12), (unsigned char *)or_jkey);
         char or_ts[33];
         memcpy(or_ts, line + 128, 32);
         or_ts[32] = 0;
@@ -45855,7 +47151,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         memcpy(cf_jkey, line, 64); cf_jkey[64] = 0;
         for (y = 0; y < 64; y++)
           if (cf_jkey[y] >= 'A' && cf_jkey[y] <= 'F') cf_jkey[y] += 32;
-        JSLI(PV, JudyJ[JOB_COLDFUSION10], (unsigned char *)cf_jkey);
+        JSLI(PV, JUDYJ(JOB_COLDFUSION10), (unsigned char *)cf_jkey);
         int cf_slen = len - 65;
         Saltloaded[JOB_COLDFUSION10] += store_typesalt(JOB_COLDFUSION10, line + 65, cf_slen);
         Foundcnt[JOB_COLDFUSION10]++;
@@ -45888,7 +47184,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
               memcpy(az_jkey, f3, 64); az_jkey[64] = 0;
               for (y = 0; y < 64; y++)
                 if (az_jkey[y] >= 'A' && az_jkey[y] <= 'F') az_jkey[y] += 32;
-              JSLI(PV, JudyJ[JOB_AZURESYNC], (unsigned char *)az_jkey);
+              JSLI(PV, JUDYJ(JOB_AZURESYNC), (unsigned char *)az_jkey);
               char az_ts[40];
               int az_off = snprintf(az_ts, 20, "%d:", az_iter);
               memcpy(az_ts + az_off, f1, 20);
@@ -45915,7 +47211,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         memcpy(af_jkey, line + 64, 64); af_jkey[64] = 0;
         for (y = 0; y < 64; y++)
           if (af_jkey[y] >= 'A' && af_jkey[y] <= 'F') af_jkey[y] += 32;
-        JSLI(PV, JudyJ[JOB_ANDROIDFDE], (unsigned char *)af_jkey);
+        JSLI(PV, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)af_jkey);
         /* Typesalt = salt2_hex(64):salt_hex(32) */
         char af_ts[98];
         memcpy(af_ts, line, 64); af_ts[64] = ':'; memcpy(af_ts + 65, line + 128, 32); af_ts[97] = 0;
@@ -45945,7 +47241,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                 if (trhex[(unsigned char)dcheck[y]] > 15) { ck_ok = 0; break; }
             }
             if (ck_ok && dcheck[32] == '$' && mystrlen(dcheck + 33) >= 64) {
-              JSLI(PV, JudyJ[JOB_KRB5TGS23], (unsigned char *)line);
+              JSLI(PV, JUDYJ(JOB_KRB5TGS23), (unsigned char *)line);
               Saltloaded[JOB_KRB5TGS23] += store_typesalt(JOB_KRB5TGS23, line, len);
               Foundcnt[JOB_KRB5TGS23]++;
               continue;
@@ -45972,7 +47268,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 32; y++)
               dcc_tmp[y] = tolower(hash_hex[1+y]);
             dcc_tmp[32] = 0;
-            JSLI(PV, JudyJ[JOB_DCC2], (unsigned char *)dcc_tmp);
+            JSLI(PV, JUDYJ(JOB_DCC2), (unsigned char *)dcc_tmp);
             /* Typesalt = iter:username */
             int iter_val = atoi(p);
             if (iter_val < 1) iter_val = 10240;
@@ -46010,7 +47306,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         for (y = 0; y < 64; y++)
           pw_tmp[y] = tolower(line[80+y]);
         pw_tmp[64] = 0;
-        JSLI(PV, JudyJ[JOB_PWSAFE3], (unsigned char *)pw_tmp);
+        JSLI(PV, JUDYJ(JOB_PWSAFE3), (unsigned char *)pw_tmp);
         /* Typesalt = iter:salt64hex */
         int toff = snprintf(pw_tmp, 250, "%u:", pw_iter);
         for (y = 0; y < 64; y++)
@@ -46048,10 +47344,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           for (y = 0; y < hlen; y++)
             if (trhex[(unsigned char)hash_start[y]] > 15) { ike_ok = 0; break; }
           if (ike_ok) {
-            JSLI(PV, JudyJ[ike_job], (unsigned char *)line);
+            JSLI(PV, JUDYJ(ike_job), (unsigned char *)line);
             /* Direct JSLI for Typesalt — line too long for store_typesalt */
             { Word_t *SPV;
-              JSLI(SPV, Typesalt[ike_job], (unsigned char *)line);
+              JSLI(SPV, TYPESALT(ike_job), (unsigned char *)line);
               if (SPV && (*SPV)++ == 0) {
                 Saltloaded[ike_job]++;
                 Typesaltcnt[ike_job]++;
@@ -46082,7 +47378,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
             for (y = 0; y < 48; y++)
               if (trhex[(unsigned char)s2[1+y]] > 15) { ax_ok = 0; break; }
           if (ax_ok) {
-            JSLI(PV, JudyJ[JOB_AXCRYPT], (unsigned char *)line);
+            JSLI(PV, JUDYJ(JOB_AXCRYPT), (unsigned char *)line);
             /* Typesalt = iter:salt32:wrapped48 */
             char ax_ts[100];
             int ax_off = snprintf(ax_ts, 20, "%d:", ax_iter);
@@ -46113,7 +47409,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           memcpy(ax_jkey, line + 14, 32); ax_jkey[32] = 0;
           for (y = 0; y < 32; y++)
             if (ax_jkey[y] >= 'A' && ax_jkey[y] <= 'F') ax_jkey[y] += 32;
-          JSLI(PV, JudyJ[JOB_AXCRYPTSHA1], (unsigned char *)ax_jkey);
+          JSLI(PV, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)ax_jkey);
           Foundcnt[JOB_AXCRYPTSHA1]++;
           continue;
         }
@@ -46126,7 +47422,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if (trhex[(unsigned char)line[y]] > 15) { ns_ok = 0; break; }
       }
       if (ns_ok) {
-        JSLI(PV, JudyJ[JOB_NETSCALER_PBKDF2], (unsigned char *)line);
+        JSLI(PV, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)line);
         Saltloaded[JOB_NETSCALER_PBKDF2] += store_typesalt(JOB_NETSCALER_PBKDF2, line + 1, 64);
         Foundcnt[JOB_NETSCALER_PBKDF2]++;
         continue;
@@ -46222,12 +47518,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         if ((LoadSalt || LoadUser) && line[hlen * 2] == ':' && line[hlen * 2 + 1]) {
           char *suffix = line + hlen * 2 + 1;
 	  for (x=0;  x < Dosaltcnt; x++) {
-	     JSLI(PV, Typesalt[Dosalt[x]],(unsigned char *)suffix);
+	     JSLI(PV, TYPESALT(Dosalt[x]),(unsigned char *)suffix);
 	     if (PV) { if ((*PV)++ == 0) {Saltloaded[Dosalt[x]]++;} }
 	     /* Typehashsalt populated in main() after all salts loaded */
           }
 	  for (x=0;  x < Dousercnt; x++) {
-	     JSLI(PV, Typeuser[Douser[x]],(unsigned char *)suffix);
+	     JSLI(PV, TYPEUSER(Douser[x]),(unsigned char *)suffix);
 	     if (PV) { if ((*PV)++ == 0) {Userloaded[Douser[x]]++;} }
           }
         }
@@ -46235,20 +47531,23 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
     }
   }
+  /* TYPENAME(), not Types[]: these walk the whole op range and a
+   * user-defined type's op is past the end of Types[]. Reading it was
+   * out of bounds the moment any user type loaded hashes. */
   for (x = 0; x < JOB_DONE; x++) {
     if (Foundcnt[x])
       fprintf(stderr, "%d %s hashes read from %s\n", Foundcnt[x],
-              Types[x], filename);
+              TYPENAME(x), filename);
   }
   for (x = 0; x < JOB_DONE; x++) {
     if (Saltloaded[x])
       fprintf(stderr, "%s: found %lu unique salts for %s\n",
-              filename, Saltloaded[x], Types[x]);
+              filename, Saltloaded[x], TYPENAME(x));
   }
   for (x = 0; x < JOB_DONE; x++) {
     if (Userloaded[x])
       fprintf(stderr, "%s: found %lu unique users for %s\n",
-              filename, Userloaded[x], Types[x]);
+              filename, Userloaded[x], TYPENAME(x));
   }
 }
 void *Stack;
@@ -46327,8 +47626,8 @@ union HashU curin;
   Word_t RC, NextX;
   Word_t *PV = NULL, CurHash;
   /* Dohash, Doload, SaltArray, UserArray, KeyArray, RuleArray, NRuleArray,
-     PepperArray, JudyJ[JOB_PHPBB3], JudyJ[JOB_APR1], JudyJ[JOB_MD5CRYPT], JudyJ[JOB_SHA256CRYPT], JudyJ[JOB_SHA512CRYPT],
-     JudyJ[JOB_MSSQL2000] are now file-scope globals for load_hash_file() access */
+     PepperArray, JUDYJ(JOB_PHPBB3), JUDYJ(JOB_APR1), JUDYJ(JOB_MD5CRYPT), JUDYJ(JOB_SHA256CRYPT), JUDYJ(JOB_SHA512CRYPT),
+     JUDYJ(JOB_MSSQL2000) are now file-scope globals for load_hash_file() access */
   pcre *regex;
   int ovec[30], pcre_erroff;
   const char *pcre_err;
@@ -46365,6 +47664,34 @@ union HashU curin;
   tsfprintf_origin_set = 1;
   ServerState = new_lock(0);
   for (maxtype=0; Types[maxtype]; maxtype++);
+  /* ---- Phase A: built-in / user-defined op address separation ------------
+   *
+   * The user-defined range used to start at a hand-maintained constant. When
+   * the built-in range grew into it, a new built-in type silently ALIASED a
+   * user-defined op -- both index the same [JOB_DONE]-sized per-op arrays
+   * (JudyJ, Typesalt, TypeOpts, Totalfound, ...) and nothing complained. It
+   * reached 999 against a base of 1000: zero slots left.
+   *
+   * The base is now DERIVED from the actual Types[] length, rounded up to
+   * leave a visible gap, and handed to userdef.c BEFORE userdef_load()
+   * assigns any ops. Adding a built-in type moves the base with it, so the
+   * two ranges cannot collide however many built-ins are added. There is no
+   * longer a constant for anyone to forget to raise.
+   *
+   * Op numbers never escape the process -- found lines carry TYPENAME(op) and
+   * Hashchain.flags is in-memory only -- so the base moving between runs is
+   * invisible externally. That is what makes deriving it safe.
+   * ---------------------------------------------------------------------- */
+  Userdef_base = ((unsigned)maxtype + 63u) & ~63u;   /* round up, gap is visible */
+  if (Userdef_base + USERDEF_MAX > JOB_DONE) {
+    fprintf(stderr,
+      "FATAL: %u built-in hash types leaves no room for the user-defined\n"
+      "       range (%u user slots) below JOB_DONE=%u. Raise JOB_DONE and the\n"
+      "       [JOB_DONE]-sized per-op arrays together.\n",
+      (unsigned)maxtype - 1, (unsigned)USERDEF_MAX, (unsigned)JOB_DONE);
+    exit(1);
+  }
+  userdef_set_base(Userdef_base);
 
 
 #if ARM > 6
@@ -46401,9 +47728,9 @@ union HashU curin;
 #endif
 
   Minhashlen = 256;
-  JudyJ[JOB_SHA512CRYPT] = JudyJ[JOB_SHA256CRYPT] = JudyJ[JOB_MD5CRYPT] = JudyJ[JOB_APR1] = Dohash = NULL;
+  JUDYJ(JOB_SHA512CRYPT) = JUDYJ(JOB_SHA256CRYPT) = JUDYJ(JOB_MD5CRYPT) = JUDYJ(JOB_APR1) = Dohash = NULL;
   Doload = NULL;
-  JudyJ[JOB_PHPBB3] = RuleArray = PepperArray = UserArray = KeyArray = NULL;
+  JUDYJ(JOB_PHPBB3) = RuleArray = PepperArray = UserArray = KeyArray = NULL;
   NRuleArray = NULL;
   RuleCnt = NULL;
   rhash_library_init();
@@ -46425,19 +47752,22 @@ union HashU curin;
   Readindex = malloc_lock(MAXLINEPERCHUNK * 2 * sizeof(struct LineInfo) + 16,"Read index");
 
   for (x = 1; Types[x]; x++) {
-    if (!TypeOpts[x]) {
-      fprintf(stderr, "Program error: TypeOpts[%d] (%s) is zero\n", x, Types[x]);
+    if (!TYPEOPTS(x)) {
+      fprintf(stderr, "Program error: TYPEOPTS(%d) (%s) is zero\n", x, Types[x]);
       exit(1);
     }
   }
   Typesalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "Typesalt");
+  UserTypesalt = (Pvoid_t *)malloc_lock(USERDEF_MAX * sizeof(Pvoid_t), "UserTypesalt");
   Typehashsalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "Typehashsalt");
   Typesaltcnt = (int *)malloc_lock(JOB_DONE * sizeof(int), "Typesaltcnt");
   Typesaltbytes = (long long *)malloc_lock(JOB_DONE * sizeof(long long), "Typesaltbytes");
   Typesalt2 = (char **)malloc_lock(JOB_DONE * sizeof(char *), "Typesalt2");
   Typeuser = (void **)malloc_lock(JOB_DONE * sizeof(void *), "Typeuser");
+  UserTypeuser = (void **)malloc_lock(USERDEF_MAX * sizeof(void *), "UserTypeuser");
   Typepepper = (char **)malloc_lock(JOB_DONE * sizeof(char *), "Typepepper");
   Livesalts = (volatile unsigned int *)malloc_lock(JOB_DONE * sizeof(unsigned int), "Livesalts");
+  UserLivesalts = (volatile unsigned int *)malloc_lock(USERDEF_MAX * sizeof(unsigned int), "UserLivesalts");
   J1S(RC, Dohash, JOB_MD5);
   donedashh = 0;
   Doip = Dighex = Dodigits = 0;
@@ -46458,11 +47788,11 @@ union HashU curin;
         for (x = 1; Types[x]; x++) {
           char optbuf[16];
           int oi = 0;
-          if (TypeOpts[x] & TYPEOPT_NEEDSF) optbuf[oi++] = 'f';
-          if (TypeOpts[x] & TYPEOPT_NEEDSJ) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'J'; }
-          if (TypeOpts[x] & TYPEOPT_NEEDSALT) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 's'; }
-          if (TypeOpts[x] & TYPEOPT_NEEDUSER) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'u'; }
-          if (TypeOpts[x] & TYPEOPT_NEEDPEPPER) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'j'; }
+          if (TYPEOPTS(x) & TYPEOPT_NEEDSF) optbuf[oi++] = 'f';
+          if (TYPEOPTS(x) & TYPEOPT_NEEDSJ) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'J'; }
+          if (TYPEOPTS(x) & TYPEOPT_NEEDSALT) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 's'; }
+          if (TYPEOPTS(x) & TYPEOPT_NEEDUSER) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'u'; }
+          if (TYPEOPTS(x) & TYPEOPT_NEEDPEPPER) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'j'; }
           optbuf[oi] = 0;
           { char hcbuf[64];
             int hci = 0;
@@ -46561,7 +47891,7 @@ union HashU curin;
   {
     int _uc = userdef_count(), _ui;
     for (_ui = 0; _ui < _uc; _ui++) {
-      int _uop = JOB_USERDEF_BASE + _ui;
+      int _uop = (int)user_id_op(_ui);
       struct userdef_type *_ut = userdef_get(_uop);
       unsigned short _opts;
       if (_uop >= JOB_DONE || !_ut) continue;
@@ -46570,7 +47900,7 @@ union HashU curin;
         _opts |= TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY;
       if (_ut->slot_mask & USERDEF_SLOT_USER)
         _opts |= TYPEOPT_NEEDUSER | TYPEOPT_USERJUDY;
-      TypeOpts[_uop] = _opts;
+      TYPEOPTS(_uop) = _opts;
     }
   }
 
@@ -46634,6 +47964,14 @@ union HashU curin;
                         "(not found in $MDXFIND_CACHE/userdef.txt)\n", idbuf);
               exit(1);
             }
+            /* Phase A: record the selection in the SEPARATE user bitfield
+             * (keyed by user id), then mirror it into Dohash for iteration.
+             * DoUser is authoritative for "is this user type selected"; a
+             * built-in op can never appear in it, and a user id can never be
+             * mistaken for a built-in op. */
+            { Word_t _uid = (Word_t)op_user_id((unsigned)uop);
+              J1S(RC, DoUser, _uid);
+            }
             J1S(RC, Dohash, uop);
             continue;
           }
@@ -46644,6 +47982,9 @@ union HashU curin;
 	      s++;
 	    }
 	    if (y <= 0 || y >= (int)maxtype) {
+	      /* Phase A: eN addresses BUILT-IN types only. maxtype is the real
+	       * Types[] length, so this can no longer reach the user range even
+	       * if that range moves. */
 	      fprintf(stderr, "Internal type e%d out of range (valid: e1 to e%d)\n", y, maxtype - 1);
 	      exit(1);
 	    }
@@ -47358,7 +48699,7 @@ badrule:
                 tline[0] = 0;
                 JSLF(PV, TmpSalt, (unsigned char *)tline);
                 while (PV) {
-                  JSLI(TPV, Typesalt[ti], (unsigned char *)tline);
+                  JSLI(TPV, TYPESALT(ti), (unsigned char *)tline);
                   if (TPV) (*TPV)++;
                   JSLN(PV, TmpSalt, (unsigned char *)tline);
                 }
@@ -47410,7 +48751,7 @@ badrule:
                 tline[0] = 0;
                 JSLF(PV, TmpUser, (unsigned char *)tline);
                 while (PV) {
-                  JSLI(TPV, Typeuser[ti], (unsigned char *)tline);
+                  JSLI(TPV, TYPEUSER(ti), (unsigned char *)tline);
                   if (TPV) *TPV = 1000000;
                   JSLN(PV, TmpUser, (unsigned char *)tline);
                 }
@@ -47548,15 +48889,15 @@ badrule:
 
   fprintf(stderr, "Working on hash types: ");
   for (y = 0, x = 1; Types[x]; x++) {
-    Totalfound[x - 1] = NULL;
+    TOTALFOUND(x - 1) = NULL;
     J1T(RC, Dohash, x);
     if (RC) {
       y++;
       fprintf(stderr, "%s ", Types[x]);
-      Totalfound[x - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
+      TOTALFOUND(x - 1) = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
       if (x == JOB_MD5SPECAM) {
-        Totalfound[JOB_MD5AM - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
-        Totalfound[JOB_MD5AM2 - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
+        TOTALFOUND(JOB_MD5AM - 1) = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
+        TOTALFOUND(JOB_MD5AM2 - 1) = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
       }
     }
   }
@@ -47566,16 +48907,16 @@ badrule:
   {
     int _uc = userdef_count(), _ui;
     for (_ui = 0; _ui < _uc; _ui++) {
-      int _uop = JOB_USERDEF_BASE + _ui;
+      int _uop = (int)user_id_op(_ui);
       if (_uop >= JOB_DONE) break;
-      Totalfound[_uop - 1] = NULL;
+      TOTALFOUND(_uop - 1) = NULL;
       J1T(RC, Dohash, _uop);
       if (RC) {
         const char *_gs;
         struct userdef_type *_ut;
         y++;
         fprintf(stderr, "%s ", userdef_name(_uop));
-        Totalfound[_uop - 1] = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
+        TOTALFOUND(_uop - 1) = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
         /*
          * Sub-phase D4: honest GPU-eligibility status for the SELECTED
          * user type.  Enum-agnostic shape detection on the compiled
@@ -47810,8 +49151,8 @@ badrule:
 	    for (di = 0; hcdefaults[di].salt; di++) {
 	      int j = hcdefaults[di].job;
 	      J1T(RC, Dohash, j);
-	      if (RC && !Typesalt[j] && !SaltArray) {
-	        JSLI(PV, Typesalt[j], (unsigned char *)hcdefaults[di].salt);
+	      if (RC && !TYPESALT(j) && !SaltArray) {
+	        JSLI(PV, TYPESALT(j), (unsigned char *)hcdefaults[di].salt);
 	        if (PV) *PV = 1000000;
 	      }
 	    }
@@ -48294,20 +49635,20 @@ usage:
   ProgressEnccnt = 0;
   {
     line[0] = 0;
-    JSLF(PV, JudyJ[JOB_PROGRESSENCODE], (unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)line);
     while (PV) {
       ProgressEnccnt++;
-      JSLN(PV, JudyJ[JOB_PROGRESSENCODE], (unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)line);
     }
     if (ProgressEnccnt) {
       fprintf(stderr, "Searching through %s unique PROGRESSENCODE hashes\n", commify(ProgressEnccnt));
     }
 
     line[0] = 0;
-    JSLF(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_DESCRYPT),(unsigned char *)line);
     while (PV) {
       DEScryptcnt++;
-      JSLN(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_DESCRYPT),(unsigned char *)line);
     }
     if (DEScryptcnt) {
       /* Standard descrypt only: all entries are 13-char/2-char-salt */
@@ -48317,7 +49658,7 @@ usage:
       Pvoid_t salt_counts = NULL;
       Word_t *SPV;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_DESCRYPT),(unsigned char *)line);
       while (PV) {
         y = mystrlen(line);
         if (y >= 10) {
@@ -48326,7 +49667,7 @@ usage:
           JSLI(SPV, salt_counts, (unsigned char *)last);
           if (SPV) (*SPV)++;
         }
-        JSLN(PV, JudyJ[JOB_DESCRYPT],(unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_DESCRYPT),(unsigned char *)line);
       }
       last[0] = 0;
       JSLF(PV, salt_counts, (unsigned char *)last);
@@ -48334,7 +49675,7 @@ usage:
         for (dt = 0; des_types[dt]; dt++) {
           J1T(RC, Dohash, des_types[dt]);
           if (RC) {
-            JSLI(SPV, Typesalt[des_types[dt]], (unsigned char *)last);
+            JSLI(SPV, TYPESALT(des_types[dt]), (unsigned char *)last);
             if (SPV) *SPV += *PV;
           }
         }
@@ -48351,12 +49692,12 @@ usage:
       char dsalt[4];
       for (dt = 0; des_types[dt]; dt++) {
         J1T(RC, Dohash, des_types[dt]);
-        if (RC && !Typesalt[des_types[dt]]) {
+        if (RC && !TYPESALT(des_types[dt])) {
           for (x = 0; x < 64; x++) {
             for (y = 0; y < 64; y++) {
               dsalt[0] = phpitoa64[x]; dsalt[1] = phpitoa64[y]; dsalt[2] = 0;
               Word_t *TPV;
-              JSLI(TPV, Typesalt[des_types[dt]], (unsigned char *)dsalt);
+              JSLI(TPV, TYPESALT(des_types[dt]), (unsigned char *)dsalt);
               if (TPV) *TPV = 1000000;
             }
           }
@@ -48368,17 +49709,17 @@ usage:
 
     /* BSDICRYPT bootstrap: BSDi extended DES (_CCCCSSSS 9-char salt) */
     line[0] = 0;
-    JSLF(PV, JudyJ[JOB_BSDICRYPT],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_BSDICRYPT),(unsigned char *)line);
     while (PV) {
       BSDIcryptcnt++;
-      JSLN(PV, JudyJ[JOB_BSDICRYPT],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_BSDICRYPT),(unsigned char *)line);
     }
     if (BSDIcryptcnt) {
       fprintf(stderr, "Searching through %s unique BSDICRYPT hashes\n", commify(BSDIcryptcnt));
     } else if (Printall) {
       /* -z mode: generate 4096 extended DES salts (_J9..XXXX format, 725 rounds) */
       J1T(RC, Dohash, JOB_BSDICRYPT);
-      if (RC && !Typesalt[JOB_BSDICRYPT]) {
+      if (RC && !TYPESALT(JOB_BSDICRYPT)) {
         char edsalt[10];
         Word_t *EPV;
         int a, b;
@@ -48388,12 +49729,12 @@ usage:
           for (b = 0; b < 64; b++) {
             edsalt[5] = phpitoa64[a]; edsalt[6] = phpitoa64[b];
             edsalt[7] = '.'; edsalt[8] = '.'; edsalt[9] = 0;
-            JSLI(EPV, Typesalt[JOB_BSDICRYPT], (unsigned char *)edsalt);
+            JSLI(EPV, TYPESALT(JOB_BSDICRYPT), (unsigned char *)edsalt);
             if (EPV) *EPV = 1000000;
           }
         }
         /* Dummy JudyJ entry so Printall lookup doesn't gate output */
-        JSLI(EPV, JudyJ[JOB_BSDICRYPT], (unsigned char *)"_J9.......zz");
+        JSLI(EPV, JUDYJ(JOB_BSDICRYPT), (unsigned char *)"_J9.......zz");
         if (EPV) *EPV = 0;
         Numsalts += 4096;
         fprintf(stderr, "Generated 4096 extended DES salts for BSDICRYPT\n");
@@ -48403,19 +49744,19 @@ usage:
     }
 
     line[0] = 0;
-    JSLF(PV, JudyJ[JOB_BCRYPT],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
     while (PV) {
       Bcryptcnt++;
-      JSLN(PV, JudyJ[JOB_BCRYPT],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
     }
     if (Bcryptcnt) {
       fprintf(stderr, "Searching through %s unique BCRYPT hashes\n", commify(Bcryptcnt));
     } else if (Printall) {
       /* -z mode: generate a default bcrypt salt so all bcrypt variants can produce output */
       char bcrypt_defsalt[] = "$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-      JSLI(PV, JudyJ[JOB_BCRYPT],(unsigned char *)bcrypt_defsalt);
-      if (!Typesalt[job->op]) {
-        JSLI(PV, Typesalt[job->op], (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
+      JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)bcrypt_defsalt);
+      if (!TYPESALT(job->op)) {
+        JSLI(PV, TYPESALT(job->op), (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
         if (PV) (*PV)++;
       }
       Bcryptcnt = 1;
@@ -48427,19 +49768,19 @@ usage:
     }
     { long sshacnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSHA1BASE64], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_SSHA1BASE64), (unsigned char *)line);
       while (PV) {
         sshacnt++;
-        JSLN(PV, JudyJ[JOB_SSHA1BASE64], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_SSHA1BASE64), (unsigned char *)line);
       }
       if (sshacnt) {
         fprintf(stderr, "Searching through %ld unique SSHA hashes\n", sshacnt);
       } else {
         J1T(RC, Dohash, JOB_SSHA1BASE64);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSHA1BASE64], (unsigned char *)"{SSHA}AAAAAAAAAAAAAAAAAAAAAAAAAABTYWx0");
-          if (!Typesalt[JOB_SSHA1BASE64]) {
-            JSLI(PV, Typesalt[JOB_SSHA1BASE64], (unsigned char *)"53616c74");
+          JSLI(PV, JUDYJ(JOB_SSHA1BASE64), (unsigned char *)"{SSHA}AAAAAAAAAAAAAAAAAAAAAAAAAABTYWx0");
+          if (!TYPESALT(JOB_SSHA1BASE64)) {
+            JSLI(PV, TYPESALT(JOB_SSHA1BASE64), (unsigned char *)"53616c74");
             if (PV) *PV = 1;
           }
           sshacnt = 1;
@@ -48451,19 +49792,19 @@ usage:
     }
     { long ssha256cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSHA256BASE64], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_SSHA256BASE64), (unsigned char *)line);
       while (PV) {
         ssha256cnt++;
-        JSLN(PV, JudyJ[JOB_SSHA256BASE64], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_SSHA256BASE64), (unsigned char *)line);
       }
       if (ssha256cnt) {
         fprintf(stderr, "Searching through %ld unique SSHA256 hashes\n", ssha256cnt);
       } else {
         J1T(RC, Dohash, JOB_SSHA256BASE64);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSHA256BASE64], (unsigned char *)"{SSHA256}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          if (!Typesalt[JOB_SSHA256BASE64]) {
-            JSLI(PV, Typesalt[JOB_SSHA256BASE64], (unsigned char *)"00000000");
+          JSLI(PV, JUDYJ(JOB_SSHA256BASE64), (unsigned char *)"{SSHA256}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          if (!TYPESALT(JOB_SSHA256BASE64)) {
+            JSLI(PV, TYPESALT(JOB_SSHA256BASE64), (unsigned char *)"00000000");
             if (PV) *PV = 1;
           }
           ssha256cnt = 1;
@@ -48475,19 +49816,19 @@ usage:
     }
     { long ssha512cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSHA512BASE64], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_SSHA512BASE64), (unsigned char *)line);
       while (PV) {
         ssha512cnt++;
-        JSLN(PV, JudyJ[JOB_SSHA512BASE64], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_SSHA512BASE64), (unsigned char *)line);
       }
       if (ssha512cnt) {
         fprintf(stderr, "Searching through %ld unique SSHA512 hashes\n", ssha512cnt);
       } else {
         J1T(RC, Dohash, JOB_SSHA512BASE64);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSHA512BASE64], (unsigned char *)"{SSHA512}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          if (!Typesalt[JOB_SSHA512BASE64]) {
-            JSLI(PV, Typesalt[JOB_SSHA512BASE64], (unsigned char *)"0000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SSHA512BASE64), (unsigned char *)"{SSHA512}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          if (!TYPESALT(JOB_SSHA512BASE64)) {
+            JSLI(PV, TYPESALT(JOB_SSHA512BASE64), (unsigned char *)"0000000000000000000000");
             if (PV) *PV = 1;
           }
           ssha512cnt = 1;
@@ -48504,19 +49845,19 @@ usage:
       long mssql_total = 0;
       Word_t *SPV;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MSSQL2000], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_MSSQL2000), (unsigned char *)line);
       while (PV) {
         mssql_total++;
         for (dt = 0; mssql_types[dt]; dt++) {
           J1T(RC, Dohash, mssql_types[dt]);
           if (RC) {
-            JSLI(SPV, Typesalt[mssql_types[dt]], (unsigned char *)line);
+            JSLI(SPV, TYPESALT(mssql_types[dt]), (unsigned char *)line);
             if (SPV && *SPV == 0) *SPV = 1;
           }
         }
-        JSLN(PV, JudyJ[JOB_MSSQL2000], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_MSSQL2000), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_MSSQL2000]);
+      JSLFA(RC, JUDYJ(JOB_MSSQL2000));
       if (mssql_total) {
         Numsalts += mssql_total;
         fprintf(stderr, "%ld unique MSSQL/macOS salts loaded\n", mssql_total);
@@ -48524,8 +49865,8 @@ usage:
       if (!mssql_total && Printall) {
         for (dt = 0; mssql_types[dt]; dt++) {
           J1T(RC, Dohash, mssql_types[dt]);
-          if (RC && !Typesalt[mssql_types[dt]]) {
-            JSLI(SPV, Typesalt[mssql_types[dt]], (unsigned char *)"12345678");
+          if (RC && !TYPESALT(mssql_types[dt])) {
+            JSLI(SPV, TYPESALT(mssql_types[dt]), (unsigned char *)"12345678");
             if (SPV) *SPV = 1000000;
             Numsalts++;
           }
@@ -48535,28 +49876,28 @@ usage:
         J1U(RC, Dohash, JOB_MSSQL2000);
         J1U(RC, Dohash, JOB_MSSQL2005);
         J1U(RC, Dohash, JOB_MSSQL2012);
-        if (!Typesalt[JOB_MACOSX])
+        if (!TYPESALT(JOB_MACOSX))
           J1U(RC, Dohash, JOB_MACOSX);
-        if (!Typesalt[JOB_MACOSX7])
+        if (!TYPESALT(JOB_MACOSX7))
           J1U(RC, Dohash, JOB_MACOSX7);
-        if (!Typesalt[JOB_ARUBAOS])
+        if (!TYPESALT(JOB_ARUBAOS))
           J1U(RC, Dohash, JOB_ARUBAOS);
       }
     }
     /* JudyJ[JOB_JUNIPERSSG]: count entries, add default for -z, or disable */
     { long junipercnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_JUNIPERSSG], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)line);
       while (PV) {
         junipercnt++;
-        JSLN(PV, JudyJ[JOB_JUNIPERSSG], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)line);
       }
       if (junipercnt) {
         fprintf(stderr, "Searching through %ld unique JUNIPERSSG hashes\n", junipercnt);
       } else {
         J1T(RC, Dohash, JOB_JUNIPERSSG);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_JUNIPERSSG], (unsigned char *)"nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAn");
+          JSLI(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)"nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAn");
           junipercnt = 1;
         } else {
           J1U(RC, Dohash, JOB_JUNIPERSSG);
@@ -48566,17 +49907,17 @@ usage:
     /* JudyJ[JOB_PEOPLESOFT]: count entries, add default for -z, or disable */
     { long psoftcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_PEOPLESOFT], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)line);
       while (PV) {
         psoftcnt++;
-        JSLN(PV, JudyJ[JOB_PEOPLESOFT], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)line);
       }
       if (psoftcnt) {
         fprintf(stderr, "Searching through %ld unique PEOPLESOFT hashes\n", psoftcnt);
       } else {
         J1T(RC, Dohash, JOB_PEOPLESOFT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_PEOPLESOFT], (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+          JSLI(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAA=");
           psoftcnt = 1;
         } else {
           J1U(RC, Dohash, JOB_PEOPLESOFT);
@@ -48586,22 +49927,22 @@ usage:
     /* JudyJ[JOB_EPISERVER]: count entries, add default for -z, or disable */
     { long episervercnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_EPISERVER], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)line);
       while (PV) {
         episervercnt++;
-        JSLN(PV, JudyJ[JOB_EPISERVER], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)line);
       }
       if (episervercnt) {
         fprintf(stderr, "Searching through %ld unique EPISERVER hashes\n", episervercnt);
       } else {
         J1T(RC, Dohash, JOB_EPISERVER);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_EPISERVER], (unsigned char *)"$episerver$*0*RGVm*AAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          JSLI(PV, JudyJ[JOB_EPISERVER], (unsigned char *)"$episerver$*1*RGVm*AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          if (!Typesalt[JOB_EPISERVER]) {
-            JSLI(PV, Typesalt[JOB_EPISERVER], (unsigned char *)"0*RGVm");
+          JSLI(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)"$episerver$*0*RGVm*AAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          JSLI(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)"$episerver$*1*RGVm*AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          if (!TYPESALT(JOB_EPISERVER)) {
+            JSLI(PV, TYPESALT(JOB_EPISERVER), (unsigned char *)"0*RGVm");
             if (PV) (*PV)++;
-            JSLI(PV, Typesalt[JOB_EPISERVER], (unsigned char *)"1*RGVm");
+            JSLI(PV, TYPESALT(JOB_EPISERVER), (unsigned char *)"1*RGVm");
             if (PV) (*PV)++;
           }
           episervercnt = 2;
@@ -48613,19 +49954,19 @@ usage:
     /* hMailServer: count entries, add default for -z, or disable */
     { long hmcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_HMAILSERVER], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_HMAILSERVER), (unsigned char *)line);
       while (PV) {
         hmcnt++;
-        JSLN(PV, JudyJ[JOB_HMAILSERVER], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_HMAILSERVER), (unsigned char *)line);
       }
       if (hmcnt) {
         fprintf(stderr, "Searching through %ld unique HMAILSERVER hashes\n", hmcnt);
       } else {
         J1T(RC, Dohash, JOB_HMAILSERVER);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_HMAILSERVER], (unsigned char *)"123456AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          if (!Typesalt[JOB_HMAILSERVER]) {
-            JSLI(PV, Typesalt[JOB_HMAILSERVER], (unsigned char *)"123456");
+          JSLI(PV, JUDYJ(JOB_HMAILSERVER), (unsigned char *)"123456AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          if (!TYPESALT(JOB_HMAILSERVER)) {
+            JSLI(PV, TYPESALT(JOB_HMAILSERVER), (unsigned char *)"123456");
             if (PV) (*PV)++;
           }
           hmcnt = 1;
@@ -48637,19 +49978,19 @@ usage:
     /* YAF-SHA1: count entries, add default for -z, or disable */
     { long yafcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_YAF_SHA1], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_YAF_SHA1), (unsigned char *)line);
       while (PV) {
         yafcnt++;
-        JSLN(PV, JudyJ[JOB_YAF_SHA1], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_YAF_SHA1), (unsigned char *)line);
       }
       if (yafcnt) {
         fprintf(stderr, "Searching through %ld unique YAF-SHA1 hashes\n", yafcnt);
       } else {
         J1T(RC, Dohash, JOB_YAF_SHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_YAF_SHA1], (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          if (!Typesalt[JOB_YAF_SHA1]) {
-            JSLI(PV, Typesalt[JOB_YAF_SHA1], (unsigned char *)"RJF/o8S5AhK+DA9rkaiE2Q==");
+          JSLI(PV, JUDYJ(JOB_YAF_SHA1), (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          if (!TYPESALT(JOB_YAF_SHA1)) {
+            JSLI(PV, TYPESALT(JOB_YAF_SHA1), (unsigned char *)"RJF/o8S5AhK+DA9rkaiE2Q==");
             if (PV) (*PV)++;
           }
           yafcnt = 1;
@@ -48661,19 +50002,19 @@ usage:
     /* CiscoISE: count entries, add default for -z, or disable */
     { long cisecnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_CISCOISE], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_CISCOISE), (unsigned char *)line);
       while (PV) {
         cisecnt++;
-        JSLN(PV, JudyJ[JOB_CISCOISE], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_CISCOISE), (unsigned char *)line);
       }
       if (cisecnt) {
         fprintf(stderr, "Searching through %ld unique CISCOISE hashes\n", cisecnt);
       } else {
         J1T(RC, Dohash, JOB_CISCOISE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_CISCOISE], (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000004d65737361676544696765737400000000000000000000000000000000000000");
-          if (!Typesalt[JOB_CISCOISE]) {
-            JSLI(PV, Typesalt[JOB_CISCOISE], (unsigned char *)"4d65737361676544696765737400000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_CISCOISE), (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000004d65737361676544696765737400000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_CISCOISE)) {
+            JSLI(PV, TYPESALT(JOB_CISCOISE), (unsigned char *)"4d65737361676544696765737400000000000000000000000000000000000000");
             if (PV) (*PV)++;
           }
           cisecnt = 1;
@@ -48685,19 +50026,19 @@ usage:
     /* MediaWiki: count entries, add default for -z, or disable */
     { long mwcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MEDIAWIKI], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)line);
       while (PV) {
         mwcnt++;
-        JSLN(PV, JudyJ[JOB_MEDIAWIKI], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)line);
       }
       if (mwcnt) {
         fprintf(stderr, "Searching through %ld unique MEDIAWIKI hashes\n", mwcnt);
       } else {
         J1T(RC, Dohash, JOB_MEDIAWIKI);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MEDIAWIKI], (unsigned char *)"$B$56668501$00000000000000000000000000000000");
-          if (!Typesalt[JOB_MEDIAWIKI]) {
-            JSLI(PV, Typesalt[JOB_MEDIAWIKI], (unsigned char *)"56668501");
+          JSLI(PV, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)"$B$56668501$00000000000000000000000000000000");
+          if (!TYPESALT(JOB_MEDIAWIKI)) {
+            JSLI(PV, TYPESALT(JOB_MEDIAWIKI), (unsigned char *)"56668501");
             if (PV) (*PV)++;
           }
           mwcnt = 1;
@@ -48709,17 +50050,17 @@ usage:
     /* JudyJ[JOB_CISCOPIX]: count entries, add default for -z, or disable */
     { long pixcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_CISCOPIX], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)line);
       while (PV) {
         pixcnt++;
-        JSLN(PV, JudyJ[JOB_CISCOPIX], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)line);
       }
       if (pixcnt) {
         fprintf(stderr, "Searching through %ld unique CISCOPIX hashes\n", pixcnt);
       } else {
         J1T(RC, Dohash, JOB_CISCOPIX);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_CISCOPIX], (unsigned char *)"AAAAAAAAAAAAAAAA");
+          JSLI(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)"AAAAAAAAAAAAAAAA");
           pixcnt = 1;
         } else {
           J1U(RC, Dohash, JOB_CISCOPIX);
@@ -48729,18 +50070,18 @@ usage:
     /* JudyJ[JOB_CISCOASA]: count entries, add default for -z, or disable */
     { long asacnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_CISCOASA], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_CISCOASA), (unsigned char *)line);
       while (PV) {
         asacnt++;
-        JSLN(PV, JudyJ[JOB_CISCOASA], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_CISCOASA), (unsigned char *)line);
       }
       if (asacnt) {
         fprintf(stderr, "Searching through %ld unique CISCOASA hashes\n", asacnt);
       } else {
         J1T(RC, Dohash, JOB_CISCOASA);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_CISCOASA], (unsigned char *)"AAAAAAAAAAAAAAAA:aa");
-          JSLI(PV, Typesalt[JOB_CISCOASA], (unsigned char *)"42");
+          JSLI(PV, JUDYJ(JOB_CISCOASA), (unsigned char *)"AAAAAAAAAAAAAAAA:aa");
+          JSLI(PV, TYPESALT(JOB_CISCOASA), (unsigned char *)"42");
           if (PV) *PV = 1000000;
           asacnt = 1;
         } else {
@@ -48751,17 +50092,17 @@ usage:
     /* JudyJ[JOB_CISCO4]: count entries, add default for -z, or disable */
     { long c4cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_CISCO4], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_CISCO4), (unsigned char *)line);
       while (PV) {
         c4cnt++;
-        JSLN(PV, JudyJ[JOB_CISCO4], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_CISCO4), (unsigned char *)line);
       }
       if (c4cnt) {
         fprintf(stderr, "Searching through %ld unique CISCO4 hashes\n", c4cnt);
       } else {
         J1T(RC, Dohash, JOB_CISCO4);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_CISCO4], (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          JSLI(PV, JUDYJ(JOB_CISCO4), (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
           c4cnt = 1;
         } else {
           J1U(RC, Dohash, JOB_CISCO4);
@@ -48772,7 +50113,7 @@ usage:
     if (Printall) {
       J1T(RC, Dohash, JOB_DAHUA);
       if (RC) {
-	JSLI(PV, Typesalt[JOB_DAHUA], (unsigned char *)"229381927");
+	JSLI(PV, TYPESALT(JOB_DAHUA), (unsigned char *)"229381927");
 	if (PV) *PV = 1000000;
         if (!Typepepper[JOB_DAHUA])
           Typepepper[JOB_DAHUA] = memndup("\x09""182719643\0\xff", 12);
@@ -48781,15 +50122,15 @@ usage:
     /* AIX-MD5: insert JudyJ[JOB_AIXMD5] entries into Typesalt */
     { long aixmd5cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AIXMD5], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_AIXMD5), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_AIXMD5], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_AIXMD5), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         aixmd5cnt++;
-        JSLN(PV, JudyJ[JOB_AIXMD5], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_AIXMD5), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_AIXMD5]);
+      JSLFA(RC, JUDYJ(JOB_AIXMD5));
       if (aixmd5cnt) {
         Numsalts += aixmd5cnt;
         fprintf(stderr, "Searching through %ld unique AIX-MD5 hashes\n", aixmd5cnt);
@@ -48797,7 +50138,7 @@ usage:
         J1T(RC, Dohash, JOB_AIXMD5);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_AIXMD5], (unsigned char *)"rndSa1t$");
+          JSLI(SPV, TYPESALT(JOB_AIXMD5), (unsigned char *)"rndSa1t$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else {
@@ -48808,18 +50149,18 @@ usage:
     /* AIX-SHA1: count entries, add default for -z, or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AIXSHA1], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_AIXSHA1), (unsigned char *)line);
       while (PV) {
         cnt++;
-        JSLN(PV, JudyJ[JOB_AIXSHA1], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_AIXSHA1), (unsigned char *)line);
       }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AIX-SHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AIXSHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AIXSHA1], (unsigned char *)"06$rndSa1trndSa1tr$...........................");
-	  JSLI(PV, Typesalt[JOB_AIXSHA1], (unsigned char *)"06$rndSa1trndSa1tr");
+          JSLI(PV, JUDYJ(JOB_AIXSHA1), (unsigned char *)"06$rndSa1trndSa1tr$...........................");
+	  JSLI(PV, TYPESALT(JOB_AIXSHA1), (unsigned char *)"06$rndSa1trndSa1tr");
 	    if (PV) *PV = 1000000;
         } else {
           J1U(RC, Dohash, JOB_AIXSHA1);
@@ -48829,18 +50170,18 @@ usage:
     /* AIX-SHA256: count entries, add default for -z, or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AIXSHA256], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_AIXSHA256), (unsigned char *)line);
       while (PV) {
         cnt++;
-        JSLN(PV, JudyJ[JOB_AIXSHA256], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_AIXSHA256), (unsigned char *)line);
       }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AIX-SHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AIXSHA256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AIXSHA256], (unsigned char *)"06$rndSa1trndSa1tr$...........................................");
-	  JSLI(PV, Typesalt[JOB_AIXSHA256], (unsigned char *)"06$rndSa1trndSa1tr");
+          JSLI(PV, JUDYJ(JOB_AIXSHA256), (unsigned char *)"06$rndSa1trndSa1tr$...........................................");
+	  JSLI(PV, TYPESALT(JOB_AIXSHA256), (unsigned char *)"06$rndSa1trndSa1tr");
 	    if (PV) *PV = 1000000;
         } else {
           J1U(RC, Dohash, JOB_AIXSHA256);
@@ -48850,18 +50191,18 @@ usage:
     /* AIX-SHA512: count entries, add default for -z, or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AIXSHA512], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_AIXSHA512), (unsigned char *)line);
       while (PV) {
         cnt++;
-        JSLN(PV, JudyJ[JOB_AIXSHA512], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_AIXSHA512), (unsigned char *)line);
       }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AIX-SHA512 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AIXSHA512);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AIXSHA512], (unsigned char *)"06$rndSa1trndSa1tr$....................................................................................");
-	  JSLI(PV, Typesalt[JOB_AIXSHA512], (unsigned char *)"06$rndSa1trndSa1tr");
+          JSLI(PV, JUDYJ(JOB_AIXSHA512), (unsigned char *)"06$rndSa1trndSa1tr$....................................................................................");
+	  JSLI(PV, TYPESALT(JOB_AIXSHA512), (unsigned char *)"06$rndSa1trndSa1tr");
 	    if (PV) *PV = 1000000;
         } else {
           J1U(RC, Dohash, JOB_AIXSHA512);
@@ -48871,19 +50212,19 @@ usage:
     /* IPMI2_SHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_IPMI_SHA1], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)line);
       while (PV) {
         cnt++;
-        JSLN(PV, JudyJ[JOB_IPMI_SHA1], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)line);
       }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique IPMI2 HMAC-SHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_IPMI_SHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_IPMI_SHA1], (unsigned char *)"0000000000000000000000000000000000000000:00");
-          if (!Typesalt[JOB_IPMI_SHA1]) {
-            JSLI(PV, Typesalt[JOB_IPMI_SHA1], (unsigned char *)"00");
+          JSLI(PV, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)"0000000000000000000000000000000000000000:00");
+          if (!TYPESALT(JOB_IPMI_SHA1)) {
+            JSLI(PV, TYPESALT(JOB_IPMI_SHA1), (unsigned char *)"00");
             if (PV) (*PV)++;
           }
         } else {
@@ -48894,19 +50235,19 @@ usage:
     /* IPMI2_MD5: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_IPMI_MD5], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_IPMI_MD5), (unsigned char *)line);
       while (PV) {
         cnt++;
-        JSLN(PV, JudyJ[JOB_IPMI_MD5], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_IPMI_MD5), (unsigned char *)line);
       }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique IPMI2 HMAC-MD5 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_IPMI_MD5);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_IPMI_MD5], (unsigned char *)"00000000000000000000000000000000:00");
-          if (!Typesalt[JOB_IPMI_MD5]) {
-            JSLI(PV, Typesalt[JOB_IPMI_MD5], (unsigned char *)"00");
+          JSLI(PV, JUDYJ(JOB_IPMI_MD5), (unsigned char *)"00000000000000000000000000000000:00");
+          if (!TYPESALT(JOB_IPMI_MD5)) {
+            JSLI(PV, TYPESALT(JOB_IPMI_MD5), (unsigned char *)"00");
             if (PV) (*PV)++;
           }
         } else {
@@ -48917,19 +50258,19 @@ usage:
     /* KRB5PA23: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_KRB5PA23], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_KRB5PA23), (unsigned char *)line);
       while (PV) {
         cnt++;
-        JSLN(PV, JudyJ[JOB_KRB5PA23], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_KRB5PA23), (unsigned char *)line);
       }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Kerberos 5 etype 23 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_KRB5PA23);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_KRB5PA23], (unsigned char *)"$krb5pa$23$x$x$x$000000000000000000000000000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_KRB5PA23]) {
-            JSLI(PV, Typesalt[JOB_KRB5PA23], (unsigned char *)"$krb5pa$23$x$x$x$000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_KRB5PA23), (unsigned char *)"$krb5pa$23$x$x$x$000000000000000000000000000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_KRB5PA23)) {
+            JSLI(PV, TYPESALT(JOB_KRB5PA23), (unsigned char *)"$krb5pa$23$x$x$x$000000000000000000000000000000000000000000000000000000000000000000000000");
             if (PV) (*PV)++;
           }
         } else {
@@ -48940,16 +50281,16 @@ usage:
     /* MySQL $A$ sha256crypt: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MYSQL_SHA256CRYPT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MYSQL_SHA256CRYPT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MYSQL_SHA256CRYPT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MYSQL_SHA256CRYPT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MySQL $A$ sha256crypt hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MYSQL_SHA256CRYPT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MYSQL_SHA256CRYPT], (unsigned char *)"$mysql$A$005*0000000000*00000000000000000000000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_MYSQL_SHA256CRYPT]) {
-            JSLI(PV, Typesalt[JOB_MYSQL_SHA256CRYPT], (unsigned char *)"$mysql$A$005*0000000000");
+          JSLI(PV, JUDYJ(JOB_MYSQL_SHA256CRYPT), (unsigned char *)"$mysql$A$005*0000000000*00000000000000000000000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_MYSQL_SHA256CRYPT)) {
+            JSLI(PV, TYPESALT(JOB_MYSQL_SHA256CRYPT), (unsigned char *)"$mysql$A$005*0000000000");
             if (PV) *PV = 1;
           }
         } else {
@@ -48960,16 +50301,16 @@ usage:
     /* JudyJ[JOB_DRUPAL7]: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_DRUPAL7], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_DRUPAL7], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_DRUPAL7), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DRUPAL7), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Drupal7 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_DRUPAL7);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_DRUPAL7], (unsigned char *)"$S$C00000000AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-          if (!Typesalt[JOB_DRUPAL7]) {
-            JSLI(PV, Typesalt[JOB_DRUPAL7], (unsigned char *)"C00000000");
+          JSLI(PV, JUDYJ(JOB_DRUPAL7), (unsigned char *)"$S$C00000000AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          if (!TYPESALT(JOB_DRUPAL7)) {
+            JSLI(PV, TYPESALT(JOB_DRUPAL7), (unsigned char *)"C00000000");
             if (PV) (*PV)++;
           }
         } else {
@@ -48980,16 +50321,16 @@ usage:
     /* Sybase ASE: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SYBASE_ASE], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SYBASE_ASE], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Sybase ASE hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SYBASE_ASE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SYBASE_ASE], (unsigned char *)"0xc00700000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_SYBASE_ASE]) {
-            JSLI(PV, Typesalt[JOB_SYBASE_ASE], (unsigned char *)"0000000000000000");
+          JSLI(PV, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)"0xc00700000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_SYBASE_ASE)) {
+            JSLI(PV, TYPESALT(JOB_SYBASE_ASE), (unsigned char *)"0000000000000000");
             if (PV) (*PV)++;
           }
         } else {
@@ -49000,16 +50341,16 @@ usage:
     /* NetScaler: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_NETSCALER], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_NETSCALER], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_NETSCALER), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_NETSCALER), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Citrix NetScaler hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_NETSCALER);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_NETSCALER], (unsigned char *)"10000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_NETSCALER]) {
-            JSLI(PV, Typesalt[JOB_NETSCALER], (unsigned char *)"00000000");
+          JSLI(PV, JUDYJ(JOB_NETSCALER), (unsigned char *)"10000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_NETSCALER)) {
+            JSLI(PV, TYPESALT(JOB_NETSCALER), (unsigned char *)"00000000");
             if (PV) (*PV)++;
           }
         } else {
@@ -49020,16 +50361,16 @@ usage:
     /* NSEC3: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_NSEC3], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_NSEC3], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_NSEC3), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_NSEC3), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique NSEC3 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_NSEC3);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_NSEC3], (unsigned char *)"00000000000000000000000000000000:.x.net:1:00");
-          if (!Typesalt[JOB_NSEC3]) {
-            JSLI(PV, Typesalt[JOB_NSEC3], (unsigned char *)".x.net:1:00");
+          JSLI(PV, JUDYJ(JOB_NSEC3), (unsigned char *)"00000000000000000000000000000000:.x.net:1:00");
+          if (!TYPESALT(JOB_NSEC3)) {
+            JSLI(PV, TYPESALT(JOB_NSEC3), (unsigned char *)".x.net:1:00");
             if (PV) *PV = 1;
           }
         } else {
@@ -49040,16 +50381,16 @@ usage:
     /* JudyJ[JOB_WBB3]: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WBB3], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WBB3], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WBB3), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WBB3), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WBB3 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WBB3);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WBB3], (unsigned char *)"0000000000000000000000000000000000000000:0000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_WBB3]) {
-            JSLI(PV, Typesalt[JOB_WBB3], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_WBB3), (unsigned char *)"0000000000000000000000000000000000000000:0000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_WBB3)) {
+            JSLI(PV, TYPESALT(JOB_WBB3), (unsigned char *)"0000000000000000000000000000000000000000");
             if (PV) (*PV)++;
           }
         } else {
@@ -49060,8 +50401,8 @@ usage:
     /* PHPS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_PHPS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_PHPS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_PHPS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_PHPS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique PHPS hashes\n", cnt);
       } else if (!Printall) {
@@ -49071,16 +50412,16 @@ usage:
     /* RACF: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_RACF], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_RACF], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_RACF), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_RACF), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique RACF hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_RACF);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_RACF], (unsigned char *)"$racf$*USER*0000000000000000");
-          if (!Typesalt[JOB_RACF]) {
-            JSLI(PV, Typesalt[JOB_RACF], (unsigned char *)"USER");
+          JSLI(PV, JUDYJ(JOB_RACF), (unsigned char *)"$racf$*USER*0000000000000000");
+          if (!TYPESALT(JOB_RACF)) {
+            JSLI(PV, TYPESALT(JOB_RACF), (unsigned char *)"USER");
             if (PV) (*PV)++;
           }
         } else {
@@ -49091,14 +50432,14 @@ usage:
     /* RACF-KDFAES: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_RACF_KDFAES], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_RACF_KDFAES], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_RACF_KDFAES), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_RACF_KDFAES), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique RACF-KDFAES hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_RACF_KDFAES);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_RACF_KDFAES], (unsigned char *)"$racf-kdfaes$*USER*E7D7E66D000180000008003200100010*00112233445566778899AABBCCDDEEFF*0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_RACF_KDFAES), (unsigned char *)"$racf-kdfaes$*USER*E7D7E66D000180000008003200100010*00112233445566778899AABBCCDDEEFF*0000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_RACF_KDFAES);
         }
@@ -49107,14 +50448,14 @@ usage:
     /* TACACS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_TACACS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_TACACS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_TACACS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_TACACS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique TACACS hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_TACACS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_TACACS], (unsigned char *)"5fde8e68:4e13e8fb33df:c006");
+          JSLI(PV, JUDYJ(JOB_TACACS), (unsigned char *)"5fde8e68:4e13e8fb33df:c006");
         } else {
           J1U(RC, Dohash, JOB_TACACS);
         }
@@ -49123,14 +50464,14 @@ usage:
     /* APPLE-SECURE-NOTES: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_APPLE_SECURE_NOTES], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_APPLE_SECURE_NOTES], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique APPLE-SECURE-NOTES hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_APPLE_SECURE_NOTES);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_APPLE_SECURE_NOTES], (unsigned char *)"$ASN$*1*20000*80771171105233481004850004085037*d04b17af7f6b184346aad3efefe8bec0987ee73418291a41");
+          JSLI(PV, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)"$ASN$*1*20000*80771171105233481004850004085037*d04b17af7f6b184346aad3efefe8bec0987ee73418291a41");
         } else {
           J1U(RC, Dohash, JOB_APPLE_SECURE_NOTES);
         }
@@ -49139,14 +50480,14 @@ usage:
     /* CRAMMD5-DOVECOT: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_CRAMMD5_DOVECOT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_CRAMMD5_DOVECOT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique CRAMMD5-DOVECOT hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_CRAMMD5_DOVECOT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_CRAMMD5_DOVECOT], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)"00000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_CRAMMD5_DOVECOT);
         }
@@ -49155,14 +50496,14 @@ usage:
     /* JWT: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_JWT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_JWT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_JWT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_JWT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique JWT hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_JWT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_JWT], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_JWT), (unsigned char *)"00000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_JWT);
         }
@@ -49171,14 +50512,14 @@ usage:
     /* QNX-MD5: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_QNX_MD5], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_QNX_MD5], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_QNX_MD5), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_QNX_MD5), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique QNX-MD5 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_QNX_MD5);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_QNX_MD5], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_QNX_MD5), (unsigned char *)"00000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_QNX_MD5);
         }
@@ -49187,14 +50528,14 @@ usage:
     /* QNX-SHA256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_QNX_SHA256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_QNX_SHA256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_QNX_SHA256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_QNX_SHA256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique QNX-SHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_QNX_SHA256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_QNX_SHA256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_QNX_SHA256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_QNX_SHA256);
         }
@@ -49203,14 +50544,14 @@ usage:
     /* QNX-SHA512: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_QNX_SHA512], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_QNX_SHA512], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_QNX_SHA512), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_QNX_SHA512), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique QNX-SHA512 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_QNX_SHA512);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_QNX_SHA512], (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_QNX_SHA512), (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_QNX_SHA512);
         }
@@ -49219,14 +50560,14 @@ usage:
     /* QNX7-SHA512: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_QNX7_SHA512], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_QNX7_SHA512], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_QNX7_SHA512), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_QNX7_SHA512), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique QNX7-SHA512 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_QNX7_SHA512);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_QNX7_SHA512], (unsigned char *)"dummy_qnx7");
+          JSLI(PV, JUDYJ(JOB_QNX7_SHA512), (unsigned char *)"dummy_qnx7");
         } else {
           J1U(RC, Dohash, JOB_QNX7_SHA512);
         }
@@ -49237,14 +50578,14 @@ usage:
     /* KRB5PA-17: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_KRB5PA_17], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_KRB5PA_17], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_KRB5PA_17), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_KRB5PA_17), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique KRB5PA-17 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_KRB5PA_17);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_KRB5PA_17], (unsigned char *)"$krb5pa$17$x$X$dummy");
+          JSLI(PV, JUDYJ(JOB_KRB5PA_17), (unsigned char *)"$krb5pa$17$x$X$dummy");
         } else {
           J1U(RC, Dohash, JOB_KRB5PA_17);
         }
@@ -49253,14 +50594,14 @@ usage:
     /* KRB5PA-18: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_KRB5PA_18], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_KRB5PA_18], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_KRB5PA_18), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_KRB5PA_18), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique KRB5PA-18 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_KRB5PA_18);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_KRB5PA_18], (unsigned char *)"$krb5pa$18$x$X$dummy");
+          JSLI(PV, JUDYJ(JOB_KRB5PA_18), (unsigned char *)"$krb5pa$18$x$X$dummy");
         } else {
           J1U(RC, Dohash, JOB_KRB5PA_18);
         }
@@ -49269,14 +50610,14 @@ usage:
     /* WPA-PMKID: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WPA_PMKID], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WPA_PMKID], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WPA_PMKID), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WPA_PMKID), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WPA-PMKID hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WPA_PMKID);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WPA_PMKID], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_WPA_PMKID), (unsigned char *)"00000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_WPA_PMKID);
         }
@@ -49285,14 +50626,14 @@ usage:
     /* WPA-EAPOL: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WPA_EAPOL], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WPA_EAPOL], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WPA-EAPOL hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WPA_EAPOL);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WPA_EAPOL], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)"00000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_WPA_EAPOL);
         }
@@ -49301,14 +50642,14 @@ usage:
     /* ANSIBLE-VAULT: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ANSIBLE_VAULT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ANSIBLE_VAULT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique ANSIBLE-VAULT hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_ANSIBLE_VAULT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ANSIBLE_VAULT], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_ANSIBLE_VAULT);
         }
@@ -49317,14 +50658,14 @@ usage:
     /* APFS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_APFS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_APFS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_APFS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_APFS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique APFS hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_APFS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_APFS], (unsigned char *)"$fvde$2$16$00000000000000000000000000000000$20000$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_APFS), (unsigned char *)"$fvde$2$16$00000000000000000000000000000000$20000$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_APFS);
         }
@@ -49333,14 +50674,14 @@ usage:
     /* OTM-SHA256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_OTM_SHA256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_OTM_SHA256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_OTM_SHA256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_OTM_SHA256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique OTM-SHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_OTM_SHA256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_OTM_SHA256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_OTM_SHA256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_OTM_SHA256);
         }
@@ -49349,14 +50690,14 @@ usage:
     /* TELEGRAM-SHA256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_TELEGRAM_SHA256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_TELEGRAM_SHA256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique TELEGRAM-SHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_TELEGRAM_SHA256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_TELEGRAM_SHA256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_TELEGRAM_SHA256);
         }
@@ -49365,14 +50706,14 @@ usage:
     /* WEB2PY-SHA512: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WEB2PY_SHA512], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WEB2PY_SHA512], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WEB2PY-SHA512 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WEB2PY_SHA512);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WEB2PY_SHA512], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)"0000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_WEB2PY_SHA512);
         }
@@ -49381,14 +50722,14 @@ usage:
     /* SOLARWINDS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SOLARWINDS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SOLARWINDS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SOLARWINDS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SOLARWINDS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SOLARWINDS hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SOLARWINDS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SOLARWINDS], (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SOLARWINDS), (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_SOLARWINDS);
         }
@@ -49397,14 +50738,14 @@ usage:
     /* SOLARWINDS2: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SOLARWINDS2], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SOLARWINDS2], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SOLARWINDS2), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SOLARWINDS2), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SOLARWINDS2 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SOLARWINDS2);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SOLARWINDS2], (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SOLARWINDS2), (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_SOLARWINDS2);
         }
@@ -49413,100 +50754,100 @@ usage:
     /* SIMPLACMS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SIMPLACMS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SIMPLACMS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SIMPLACMS hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SIMPLACMS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SIMPLACMS], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SIMPLACMS); }
       }
     }
     /* APPLE-KEYCHAIN: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique APPLE-KEYCHAIN hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_APPLE_KEYCHAIN);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_APPLE_KEYCHAIN], (unsigned char *)"cfc13fbe9043b537f82101e5ff7c1dcda68e546fa1d225004969db9aaa8ffa0a09391a6ea5acc434da322198378f3cd0");
+          JSLI(PV, JUDYJ(JOB_APPLE_KEYCHAIN), (unsigned char *)"cfc13fbe9043b537f82101e5ff7c1dcda68e546fa1d225004969db9aaa8ffa0a09391a6ea5acc434da322198378f3cd0");
         } else { J1U(RC, Dohash, JOB_APPLE_KEYCHAIN); }
       }
     }
     /* APPLE-IWORK: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_APPLE_IWORK], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_APPLE_IWORK], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique APPLE-IWORK hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_APPLE_IWORK);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_APPLE_IWORK], (unsigned char *)"be7d23232a5fc51d875ef4343586aff0603cf9df10f24e33c34edd813eb5e770ba0b6251af83186a097820a8fabc4d1effa198a5d4556e21a8a32d3ea60781db");
+          JSLI(PV, JUDYJ(JOB_APPLE_IWORK), (unsigned char *)"be7d23232a5fc51d875ef4343586aff0603cf9df10f24e33c34edd813eb5e770ba0b6251af83186a097820a8fabc4d1effa198a5d4556e21a8a32d3ea60781db");
         } else { J1U(RC, Dohash, JOB_APPLE_IWORK); }
       }
     }
     /* BITWARDEN: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_BITWARDEN], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_BITWARDEN], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_BITWARDEN), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_BITWARDEN), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique BITWARDEN hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_BITWARDEN);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_BITWARDEN], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_BITWARDEN), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_BITWARDEN); }
       }
     }
     /* MONGODB-SHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MONGODB_SHA1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MONGODB_SHA1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MONGODB-SHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MONGODB_SHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MONGODB_SHA1], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)"0000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_MONGODB_SHA1); }
       }
     }
     /* MONGODB-SHA256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MONGODB_SHA256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MONGODB_SHA256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MONGODB-SHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MONGODB_SHA256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MONGODB_SHA256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_MONGODB_SHA256); }
       }
     }
     /* FORTIGATE256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_FORTIGATE256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_FORTIGATE256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_FORTIGATE256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_FORTIGATE256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique FortiGate256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_FORTIGATE256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_FORTIGATE256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_FORTIGATE256]) {
-            JSLI(PV, Typesalt[JOB_FORTIGATE256], (unsigned char *)"142221334214210545260703");
+          JSLI(PV, JUDYJ(JOB_FORTIGATE256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_FORTIGATE256)) {
+            JSLI(PV, TYPESALT(JOB_FORTIGATE256), (unsigned char *)"142221334214210545260703");
             if (PV) *PV = 1;
           }
         } else { J1U(RC, Dohash, JOB_FORTIGATE256); }
@@ -49515,70 +50856,70 @@ usage:
     /* UMBRACO: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_UMBRACO], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_UMBRACO], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_UMBRACO), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_UMBRACO), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Umbraco hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_UMBRACO);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_UMBRACO], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_UMBRACO), (unsigned char *)"0000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_UMBRACO); }
       }
     }
     /* DAHUA-AUTH: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_DAHUA_AUTH], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_DAHUA_AUTH], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_DAHUA_AUTH), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DAHUA_AUTH), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Dahua Auth hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_DAHUA_AUTH);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_DAHUA_AUTH], (unsigned char *)"00000000");
+          JSLI(PV, JUDYJ(JOB_DAHUA_AUTH), (unsigned char *)"00000000");
         } else { J1U(RC, Dohash, JOB_DAHUA_AUTH); }
       }
     }
     /* BESDER-AUTH: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_BESDER_AUTH], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_BESDER_AUTH], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_BESDER_AUTH), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_BESDER_AUTH), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Besder Auth hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_BESDER_AUTH);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_BESDER_AUTH], (unsigned char *)"00000000");
+          JSLI(PV, JUDYJ(JOB_BESDER_AUTH), (unsigned char *)"00000000");
         } else { J1U(RC, Dohash, JOB_BESDER_AUTH); }
       }
     }
     /* SQLCIPHER: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SQLCIPHER], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SQLCIPHER], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SQLCIPHER), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SQLCIPHER), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SQLCipher hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SQLCIPHER);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SQLCIPHER], (unsigned char *)"33265289beab040faf0d638861cba205");
+          JSLI(PV, JUDYJ(JOB_SQLCIPHER), (unsigned char *)"33265289beab040faf0d638861cba205");
         } else { J1U(RC, Dohash, JOB_SQLCIPHER); }
       }
     }
     /* SAP-PASSCODE: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SAP_PASSCODE], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SAP_PASSCODE], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SAP_PASSCODE), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAP_PASSCODE), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SAP-PASSCODE hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SAP_PASSCODE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SAP_PASSCODE], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SAP_PASSCODE), (unsigned char *)"0000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_SAP_PASSCODE);
         }
@@ -49587,14 +50928,14 @@ usage:
     /* SAP-PASSCODE5: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SAP_PASSCODE5], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SAP_PASSCODE5], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SAP_PASSCODE5), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAP_PASSCODE5), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SAP-PASSCODE5 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SAP_PASSCODE5);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SAP_PASSCODE5], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SAP_PASSCODE5), (unsigned char *)"0000000000000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_SAP_PASSCODE5);
         }
@@ -49603,14 +50944,14 @@ usage:
     /* SAP-BCODE: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SAP_BCODE], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SAP_BCODE], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SAP_BCODE), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAP_BCODE), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SAP-BCODE hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SAP_BCODE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SAP_BCODE], (unsigned char *)"0000000000000000");
+          JSLI(PV, JUDYJ(JOB_SAP_BCODE), (unsigned char *)"0000000000000000");
         } else {
           J1U(RC, Dohash, JOB_SAP_BCODE);
         }
@@ -49619,14 +50960,14 @@ usage:
     /* SAP-BCODE4: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SAP_BCODE4], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SAP_BCODE4], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SAP_BCODE4), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAP_BCODE4), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SAP-BCODE4 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SAP_BCODE4);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SAP_BCODE4], (unsigned char *)"0000000000000000");
+          JSLI(PV, JUDYJ(JOB_SAP_BCODE4), (unsigned char *)"0000000000000000");
         } else {
           J1U(RC, Dohash, JOB_SAP_BCODE4);
         }
@@ -49635,14 +50976,14 @@ usage:
     /* AS400-DES: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AS400_DES], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AS400_DES], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AS400_DES), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AS400_DES), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AS400-DES hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AS400_DES);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AS400_DES], (unsigned char *)"$as400$des$*USER*0000000000000000");
+          JSLI(PV, JUDYJ(JOB_AS400_DES), (unsigned char *)"$as400$des$*USER*0000000000000000");
         } else {
           J1U(RC, Dohash, JOB_AS400_DES);
         }
@@ -49651,16 +50992,16 @@ usage:
     /* Domino 6: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_DOMINO6], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_DOMINO6], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_DOMINO6), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DOMINO6), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Lotus Domino 6 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_DOMINO6);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_DOMINO6], (unsigned char *)"(G0000000000000000000)");
-          if (!Typesalt[JOB_DOMINO6]) {
-            JSLI(PV, Typesalt[JOB_DOMINO6], (unsigned char *)"0000000000");
+          JSLI(PV, JUDYJ(JOB_DOMINO6), (unsigned char *)"(G0000000000000000000)");
+          if (!TYPESALT(JOB_DOMINO6)) {
+            JSLI(PV, TYPESALT(JOB_DOMINO6), (unsigned char *)"0000000000");
             if (PV) *PV = 1;
           }
         } else {
@@ -49671,16 +51012,16 @@ usage:
     /* scrypt: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SCRYPT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SCRYPT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SCRYPT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SCRYPT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique scrypt hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SCRYPT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SCRYPT], (unsigned char *)"SCRYPT:1024:1:1:AA==:AA==");
-          if (!Typesalt[JOB_SCRYPT]) {
-            JSLI(PV, Typesalt[JOB_SCRYPT], (unsigned char *)"SCRYPT:1024:1:1:AA==");
+          JSLI(PV, JUDYJ(JOB_SCRYPT), (unsigned char *)"SCRYPT:1024:1:1:AA==:AA==");
+          if (!TYPESALT(JOB_SCRYPT)) {
+            JSLI(PV, TYPESALT(JOB_SCRYPT), (unsigned char *)"SCRYPT:1024:1:1:AA==");
             if (PV) *PV = 1;
           }
         } else {
@@ -49691,16 +51032,16 @@ usage:
     /* ISCSI-CHAP: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ISCSI_CHAP], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ISCSI_CHAP], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique iSCSI CHAP hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_ISCSI_CHAP);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ISCSI_CHAP], (unsigned char *)"0000000000000000000000000000000000:01020304050607080910111213141516:01");
-          if (!Typesalt[JOB_ISCSI_CHAP]) {
-            JSLI(PV, Typesalt[JOB_ISCSI_CHAP], (unsigned char *)"01020304050607080910111213141516:01");
+          JSLI(PV, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)"0000000000000000000000000000000000:01020304050607080910111213141516:01");
+          if (!TYPESALT(JOB_ISCSI_CHAP)) {
+            JSLI(PV, TYPESALT(JOB_ISCSI_CHAP), (unsigned char *)"01020304050607080910111213141516:01");
             if (PV) *PV = 1;
           }
         } else {
@@ -49711,16 +51052,16 @@ usage:
     /* NetScaler PBKDF2: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_NETSCALER_PBKDF2], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_NETSCALER_PBKDF2], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique NetScaler PBKDF2 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_NETSCALER_PBKDF2);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_NETSCALER_PBKDF2], (unsigned char *)"500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_NETSCALER_PBKDF2]) {
-            JSLI(PV, Typesalt[JOB_NETSCALER_PBKDF2], (unsigned char *)"567243c55099b6b10a714a350db53beea8be6ac9c247fd40fea7e96d206a9f11");
+          JSLI(PV, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)"500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_NETSCALER_PBKDF2)) {
+            JSLI(PV, TYPESALT(JOB_NETSCALER_PBKDF2), (unsigned char *)"567243c55099b6b10a714a350db53beea8be6ac9c247fd40fea7e96d206a9f11");
             if (PV) *PV = 1;
           }
         } else {
@@ -49731,16 +51072,16 @@ usage:
     /* NetNTLMv1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_NETNTLMV1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_NETNTLMV1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_NETNTLMV1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_NETNTLMV1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique NetNTLMv1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_NETNTLMV1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_NETNTLMV1], (unsigned char *)"::X:00000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000:0000000000000000");
-          if (!Typesalt[JOB_NETNTLMV1]) {
-            JSLI(PV, Typesalt[JOB_NETNTLMV1], (unsigned char *)"::5V4T:ada06359242920a500000000000000000000000000000000:0556d5297b5daa70eaffde82ef99293a3f3bb59b7c9704ea:9c23f6c094853920");
+          JSLI(PV, JUDYJ(JOB_NETNTLMV1), (unsigned char *)"::X:00000000000000000000000000000000000000000000000000:000000000000000000000000000000000000000000000000:0000000000000000");
+          if (!TYPESALT(JOB_NETNTLMV1)) {
+            JSLI(PV, TYPESALT(JOB_NETNTLMV1), (unsigned char *)"::5V4T:ada06359242920a500000000000000000000000000000000:0556d5297b5daa70eaffde82ef99293a3f3bb59b7c9704ea:9c23f6c094853920");
             if (PV) *PV = 1;
           }
         } else {
@@ -49751,16 +51092,16 @@ usage:
     /* NetNTLMv2: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_NETNTLMV2], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_NETNTLMV2], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_NETNTLMV2), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_NETNTLMV2), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique NetNTLMv2 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_NETNTLMV2);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_NETNTLMV2], (unsigned char *)"X::X:0000000000000000:00000000000000000000000000000000:0000");
-          if (!Typesalt[JOB_NETNTLMV2]) {
-            JSLI(PV, Typesalt[JOB_NETNTLMV2], (unsigned char *)"0UL5G37JOI0SX::6VB1IS0KA74:ebe1afa18b7fbfa6:aab8bf8675658dd2a939458a1077ba08:010100000000000031c8aa092510945398b9f7b7dde1a9fb00000000f7876f2b04b700");
+          JSLI(PV, JUDYJ(JOB_NETNTLMV2), (unsigned char *)"X::X:0000000000000000:00000000000000000000000000000000:0000");
+          if (!TYPESALT(JOB_NETNTLMV2)) {
+            JSLI(PV, TYPESALT(JOB_NETNTLMV2), (unsigned char *)"0UL5G37JOI0SX::6VB1IS0KA74:ebe1afa18b7fbfa6:aab8bf8675658dd2a939458a1077ba08:010100000000000031c8aa092510945398b9f7b7dde1a9fb00000000f7876f2b04b700");
             if (PV) *PV = 1;
           }
         } else {
@@ -49771,16 +51112,16 @@ usage:
     /* Oracle7: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ORACLE7], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ORACLE7], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ORACLE7), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ORACLE7), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Oracle7 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_ORACLE7);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ORACLE7], (unsigned char *)"0000000000000000:DEFAULTUSER");
-          if (!Typesalt[JOB_ORACLE7]) {
-            JSLI(PV, Typesalt[JOB_ORACLE7], (unsigned char *)"7284616727");
+          JSLI(PV, JUDYJ(JOB_ORACLE7), (unsigned char *)"0000000000000000:DEFAULTUSER");
+          if (!TYPESALT(JOB_ORACLE7)) {
+            JSLI(PV, TYPESALT(JOB_ORACLE7), (unsigned char *)"7284616727");
             if (PV) *PV = 1;
           }
         } else {
@@ -49791,16 +51132,16 @@ usage:
     /* LastPass: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_LASTPASS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_LASTPASS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_LASTPASS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_LASTPASS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique LastPass hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_LASTPASS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_LASTPASS], (unsigned char *)"02eb97e869e0ddc7dc760fc633b4b54d");
-          if (!Typesalt[JOB_LASTPASS]) {
-            JSLI(PV, Typesalt[JOB_LASTPASS], (unsigned char *)"100100:pmix@trash-mail.com:9b071db7b8e265d4cadd3eb65ac0864a");
+          JSLI(PV, JUDYJ(JOB_LASTPASS), (unsigned char *)"02eb97e869e0ddc7dc760fc633b4b54d");
+          if (!TYPESALT(JOB_LASTPASS)) {
+            JSLI(PV, TYPESALT(JOB_LASTPASS), (unsigned char *)"100100:pmix@trash-mail.com:9b071db7b8e265d4cadd3eb65ac0864a");
             if (PV) *PV = 1;
           }
         } else {
@@ -49811,16 +51152,16 @@ usage:
     /* FortiGate: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_FORTIGATE], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_FORTIGATE], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_FORTIGATE), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_FORTIGATE), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique FortiGate hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_FORTIGATE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_FORTIGATE], (unsigned char *)"1702c2322ec6a69770b51cccc83a45385c5da47f");
-          if (!Typesalt[JOB_FORTIGATE]) {
-            JSLI(PV, Typesalt[JOB_FORTIGATE], (unsigned char *)"142221334214210545260703");
+          JSLI(PV, JUDYJ(JOB_FORTIGATE), (unsigned char *)"1702c2322ec6a69770b51cccc83a45385c5da47f");
+          if (!TYPESALT(JOB_FORTIGATE)) {
+            JSLI(PV, TYPESALT(JOB_FORTIGATE), (unsigned char *)"142221334214210545260703");
             if (PV) *PV = 1;
           }
         } else {
@@ -49831,16 +51172,16 @@ usage:
     /* Domino 8: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_DOMINO8], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_DOMINO8], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_DOMINO8), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DOMINO8), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Domino 8 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_DOMINO8);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_DOMINO8], (unsigned char *)"6285cb9d56551256");
-          if (!Typesalt[JOB_DOMINO8]) {
-            JSLI(PV, Typesalt[JOB_DOMINO8], (unsigned char *)"30313730353737313232383031313430:0000005000:3032");
+          JSLI(PV, JUDYJ(JOB_DOMINO8), (unsigned char *)"6285cb9d56551256");
+          if (!TYPESALT(JOB_DOMINO8)) {
+            JSLI(PV, TYPESALT(JOB_DOMINO8), (unsigned char *)"30313730353737313232383031313430:0000005000:3032");
             if (PV) *PV = 1;
           }
         } else {
@@ -49851,16 +51192,16 @@ usage:
     /* SipHash: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SIPHASH], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SIPHASH], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SIPHASH), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SIPHASH), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SipHash hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SIPHASH);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SIPHASH], (unsigned char *)"583e6f51e52ba296");
-          if (!Typesalt[JOB_SIPHASH]) {
-            JSLI(PV, Typesalt[JOB_SIPHASH], (unsigned char *)"47356410265714355482333327356688");
+          JSLI(PV, JUDYJ(JOB_SIPHASH), (unsigned char *)"583e6f51e52ba296");
+          if (!TYPESALT(JOB_SIPHASH)) {
+            JSLI(PV, TYPESALT(JOB_SIPHASH), (unsigned char *)"47356410265714355482333327356688");
             if (PV) *PV = 1;
           }
         } else {
@@ -49871,16 +51212,16 @@ usage:
     /* CRAM-MD5: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_CRAMMD5], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_CRAMMD5], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_CRAMMD5), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_CRAMMD5), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique CRAM-MD5 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_CRAMMD5);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_CRAMMD5], (unsigned char *)"b8f0699114b057889223df084f82246f");
-          if (!Typesalt[JOB_CRAMMD5]) {
-            JSLI(PV, Typesalt[JOB_CRAMMD5], (unsigned char *)"MTI=$dXNlciBiOGYwNjk5MTE0YjA1Nzg4OTIyM2RmMDg0ZjgyMjQ2Zg==");
+          JSLI(PV, JUDYJ(JOB_CRAMMD5), (unsigned char *)"b8f0699114b057889223df084f82246f");
+          if (!TYPESALT(JOB_CRAMMD5)) {
+            JSLI(PV, TYPESALT(JOB_CRAMMD5), (unsigned char *)"MTI=$dXNlciBiOGYwNjk5MTE0YjA1Nzg4OTIyM2RmMDg0ZjgyMjQ2Zg==");
             if (PV) *PV = 1;
           }
         } else {
@@ -49891,16 +51232,16 @@ usage:
     /* SAP CODVN H: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SAPCODVNH], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SAPCODVNH], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SAPCODVNH), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAPCODVNH), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SAP CODVN H hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SAPCODVNH);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SAPCODVNH], (unsigned char *)"0678d732a70d4f06b707376750e7f5880bba770d");
-          if (!Typesalt[JOB_SAPCODVNH]) {
-            JSLI(PV, Typesalt[JOB_SAPCODVNH], (unsigned char *)"1024:363735383331363130");
+          JSLI(PV, JUDYJ(JOB_SAPCODVNH), (unsigned char *)"0678d732a70d4f06b707376750e7f5880bba770d");
+          if (!TYPESALT(JOB_SAPCODVNH)) {
+            JSLI(PV, TYPESALT(JOB_SAPCODVNH), (unsigned char *)"1024:363735383331363130");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -49911,16 +51252,16 @@ usage:
     /* RedHat 389-DS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_REDHAT389DS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_REDHAT389DS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_REDHAT389DS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_REDHAT389DS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique RedHat 389-DS hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_REDHAT389DS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_REDHAT389DS], (unsigned char *)"1da633927318853496cd727b13aa959d371a9d8dd970952e04dd89fc63f666d6");
-          if (!Typesalt[JOB_REDHAT389DS]) {
-            JSLI(PV, Typesalt[JOB_REDHAT389DS], (unsigned char *)"8192:41414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141");
+          JSLI(PV, JUDYJ(JOB_REDHAT389DS), (unsigned char *)"1da633927318853496cd727b13aa959d371a9d8dd970952e04dd89fc63f666d6");
+          if (!TYPESALT(JOB_REDHAT389DS)) {
+            JSLI(PV, TYPESALT(JOB_REDHAT389DS), (unsigned char *)"8192:41414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -49931,16 +51272,16 @@ usage:
     /* PostgreSQL CRAM: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_POSTGRESCRAM], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_POSTGRESCRAM], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique PostgreSQL CRAM hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_POSTGRESCRAM);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_POSTGRESCRAM], (unsigned char *)"e189d76dcdaf3bb15764784e2f24eee3");
-          if (!Typesalt[JOB_POSTGRESCRAM]) {
-            JSLI(PV, Typesalt[JOB_POSTGRESCRAM], (unsigned char *)"postgres:41414141");
+          JSLI(PV, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)"e189d76dcdaf3bb15764784e2f24eee3");
+          if (!TYPESALT(JOB_POSTGRESCRAM)) {
+            JSLI(PV, TYPESALT(JOB_POSTGRESCRAM), (unsigned char *)"postgres:41414141");
             if (PV) *PV = 1;
           }
         } else {
@@ -49951,16 +51292,16 @@ usage:
     /* MySQL CRAM: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MYSQLCRAM], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MYSQLCRAM], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MySQL CRAM hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MYSQLCRAM);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MYSQLCRAM], (unsigned char *)"024763fc7fa983ef4c424bb91c4c9ca58a4c6a20");
-          if (!Typesalt[JOB_MYSQLCRAM]) {
-            JSLI(PV, Typesalt[JOB_MYSQLCRAM], (unsigned char *)"4141414141414141414141414141414141414141");
+          JSLI(PV, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)"024763fc7fa983ef4c424bb91c4c9ca58a4c6a20");
+          if (!TYPESALT(JOB_MYSQLCRAM)) {
+            JSLI(PV, TYPESALT(JOB_MYSQLCRAM), (unsigned char *)"4141414141414141414141414141414141414141");
             if (PV) *PV = 1;
           }
         } else {
@@ -49971,16 +51312,16 @@ usage:
     /* Apache Shiro 1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SHIRO1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SHIRO1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SHIRO1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SHIRO1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Apache Shiro hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SHIRO1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SHIRO1], (unsigned char *)"3c6a09f379b4a6162e7358b5ae1ed5aafdbe924b92ab18045fe021d25b9310e5");
-          if (!Typesalt[JOB_SHIRO1]) {
-            JSLI(PV, Typesalt[JOB_SHIRO1], (unsigned char *)"1024:41414141414141414141414141414141");
+          JSLI(PV, JUDYJ(JOB_SHIRO1), (unsigned char *)"3c6a09f379b4a6162e7358b5ae1ed5aafdbe924b92ab18045fe021d25b9310e5");
+          if (!TYPESALT(JOB_SHIRO1)) {
+            JSLI(PV, TYPESALT(JOB_SHIRO1), (unsigned char *)"1024:41414141414141414141414141414141");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -49991,16 +51332,16 @@ usage:
     /* eCryptfs: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ECRYPTFS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ECRYPTFS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ECRYPTFS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ECRYPTFS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique eCryptfs hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_ECRYPTFS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ECRYPTFS], (unsigned char *)"a07ae5f28a1db69d");
-          if (!Typesalt[JOB_ECRYPTFS]) {
-            JSLI(PV, Typesalt[JOB_ECRYPTFS], (unsigned char *)"4141414141414141");
+          JSLI(PV, JUDYJ(JOB_ECRYPTFS), (unsigned char *)"a07ae5f28a1db69d");
+          if (!TYPESALT(JOB_ECRYPTFS)) {
+            JSLI(PV, TYPESALT(JOB_ECRYPTFS), (unsigned char *)"4141414141414141");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -50011,16 +51352,16 @@ usage:
     /* Oracle 12+: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ORACLE12], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ORACLE12], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ORACLE12), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ORACLE12), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Oracle 12+ hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_ORACLE12);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ORACLE12], (unsigned char *)"00a4881893c78287cd84eb39d3da49f05a4df2fc48a97a70b0a9fc941c3cb465");
-          if (!Typesalt[JOB_ORACLE12]) {
-            JSLI(PV, Typesalt[JOB_ORACLE12], (unsigned char *)"41414141414141414141414141414141");
+          JSLI(PV, JUDYJ(JOB_ORACLE12), (unsigned char *)"00a4881893c78287cd84eb39d3da49f05a4df2fc48a97a70b0a9fc941c3cb465");
+          if (!TYPESALT(JOB_ORACLE12)) {
+            JSLI(PV, TYPESALT(JOB_ORACLE12), (unsigned char *)"41414141414141414141414141414141");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -50031,16 +51372,16 @@ usage:
     /* ColdFusion 10+: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_COLDFUSION10], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_COLDFUSION10], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_COLDFUSION10), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_COLDFUSION10), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique ColdFusion 10+ hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_COLDFUSION10);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_COLDFUSION10], (unsigned char *)"443120b78d8eede52f25e291ce6621499348ba363b0b563a4e98c69a7f24993b");
-          if (!Typesalt[JOB_COLDFUSION10]) {
-            JSLI(PV, Typesalt[JOB_COLDFUSION10], (unsigned char *)"1234567890123456789012345678901234567890123456789012345678901234");
+          JSLI(PV, JUDYJ(JOB_COLDFUSION10), (unsigned char *)"443120b78d8eede52f25e291ce6621499348ba363b0b563a4e98c69a7f24993b");
+          if (!TYPESALT(JOB_COLDFUSION10)) {
+            JSLI(PV, TYPESALT(JOB_COLDFUSION10), (unsigned char *)"1234567890123456789012345678901234567890123456789012345678901234");
             if (PV) *PV = 1;
           }
         } else {
@@ -50051,16 +51392,16 @@ usage:
     /* MS-AzureSync: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AZURESYNC], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AZURESYNC], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AZURESYNC), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AZURESYNC), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MS-AzureSync hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AZURESYNC);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AZURESYNC], (unsigned char *)"9bd986554189ab1bdf2c85eed4d381cc6be472be53b9a54e08816680e93987f9");
-          if (!Typesalt[JOB_AZURESYNC]) {
-            JSLI(PV, Typesalt[JOB_AZURESYNC], (unsigned char *)"100:41414141414141414141");
+          JSLI(PV, JUDYJ(JOB_AZURESYNC), (unsigned char *)"9bd986554189ab1bdf2c85eed4d381cc6be472be53b9a54e08816680e93987f9");
+          if (!TYPESALT(JOB_AZURESYNC)) {
+            JSLI(PV, TYPESALT(JOB_AZURESYNC), (unsigned char *)"100:41414141414141414141");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -50071,16 +51412,16 @@ usage:
     /* Android FDE: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ANDROIDFDE], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ANDROIDFDE], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Android FDE hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_ANDROIDFDE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ANDROIDFDE], (unsigned char *)"4eb9e9cc64cf5d82eb7aaa88119a411233a1b93c15db5fcf1cee1aecf9bf8442");
-          if (!Typesalt[JOB_ANDROIDFDE]) {
-            JSLI(PV, Typesalt[JOB_ANDROIDFDE], (unsigned char *)"4242424242424242424242424242424242424242424242424242424242424242:41414141414141414141414141414141");
+          JSLI(PV, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)"4eb9e9cc64cf5d82eb7aaa88119a411233a1b93c15db5fcf1cee1aecf9bf8442");
+          if (!TYPESALT(JOB_ANDROIDFDE)) {
+            JSLI(PV, TYPESALT(JOB_ANDROIDFDE), (unsigned char *)"4242424242424242424242424242424242424242424242424242424242424242:41414141414141414141414141414141");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -50091,16 +51432,16 @@ usage:
     /* KRB5TGS23: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_KRB5TGS23], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_KRB5TGS23], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_KRB5TGS23), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_KRB5TGS23), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Kerberos TGS-REP hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_KRB5TGS23);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_KRB5TGS23], (unsigned char *)"$krb5tgs$23$*x$x$x*$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_KRB5TGS23]) {
-            JSLI(PV, Typesalt[JOB_KRB5TGS23], (unsigned char *)"$krb5tgs$23$*x$x$x*$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_KRB5TGS23), (unsigned char *)"$krb5tgs$23$*x$x$x*$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_KRB5TGS23)) {
+            JSLI(PV, TYPESALT(JOB_KRB5TGS23), (unsigned char *)"$krb5tgs$23$*x$x$x*$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
             if (PV) *PV = 1;
           }
         } else {
@@ -50111,16 +51452,16 @@ usage:
     /* AxCrypt: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AXCRYPT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AXCRYPT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AXCRYPT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AXCRYPT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AxCrypt hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AXCRYPT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AXCRYPT], (unsigned char *)"$axcrypt$*1*10467*41414141414141414141414141414141*000000000000000000000000000000000000000000000000");
-          if (!Typesalt[JOB_AXCRYPT]) {
-            JSLI(PV, Typesalt[JOB_AXCRYPT], (unsigned char *)"10467:41414141414141414141414141414141:000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_AXCRYPT), (unsigned char *)"$axcrypt$*1*10467*41414141414141414141414141414141*000000000000000000000000000000000000000000000000");
+          if (!TYPESALT(JOB_AXCRYPT)) {
+            JSLI(PV, TYPESALT(JOB_AXCRYPT), (unsigned char *)"10467:41414141414141414141414141414141:000000000000000000000000000000000000000000000000");
             if (PV) *PV = 1000000;
           }
         } else {
@@ -50131,14 +51472,14 @@ usage:
     /* AxCrypt SHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AXCRYPTSHA1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AXCRYPTSHA1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AxCrypt SHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AXCRYPTSHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AXCRYPTSHA1], (unsigned char *)"cbfdac6008f9cab4083784cbd1874f76");
+          JSLI(PV, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)"cbfdac6008f9cab4083784cbd1874f76");
         } else {
           J1U(RC, Dohash, JOB_AXCRYPTSHA1);
         }
@@ -50147,324 +51488,324 @@ usage:
     /* RORAILS-SHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_RORAILS_SHA1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_RORAILS_SHA1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Ruby on Rails Restful Auth hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_RORAILS_SHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_RORAILS_SHA1], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)"0000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_RORAILS_SHA1); }
       }
     }
     /* AES128-NOKDF: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AES128_NOKDF], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AES128_NOKDF], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AES128_NOKDF), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AES128_NOKDF), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AES-128-ECB NOKDF hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AES128_NOKDF);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AES128_NOKDF], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_AES128_NOKDF), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_AES128_NOKDF); }
       }
     }
     /* AES192-NOKDF: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AES192_NOKDF], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AES192_NOKDF], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AES192_NOKDF), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AES192_NOKDF), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AES-192-ECB NOKDF hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AES192_NOKDF);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AES192_NOKDF], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_AES192_NOKDF), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_AES192_NOKDF); }
       }
     }
     /* AES256-NOKDF: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AES256_NOKDF], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AES256_NOKDF], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AES256_NOKDF), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AES256_NOKDF), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AES-256-ECB NOKDF hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AES256_NOKDF);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AES256_NOKDF], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_AES256_NOKDF), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_AES256_NOKDF); }
       }
     }
     /* VMWARE-VMX: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_VMWARE_VMX], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_VMWARE_VMX], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique VMware VMX hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_VMWARE_VMX);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_VMWARE_VMX], (unsigned char *)"a6e18a778759e00378c50087feaf1552");
+          JSLI(PV, JUDYJ(JOB_VMWARE_VMX), (unsigned char *)"a6e18a778759e00378c50087feaf1552");
         } else { J1U(RC, Dohash, JOB_VMWARE_VMX); }
       }
     }
     /* POSTGRESSCRAM256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_POSTGRESSCRAM256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_POSTGRESSCRAM256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique PostgreSQL SCRAM-SHA-256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_POSTGRESSCRAM256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_POSTGRESSCRAM256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_POSTGRESSCRAM256); }
       }
     }
     /* AWSSIGV4: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AWSSIGV4], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AWSSIGV4], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AWSSIGV4), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AWSSIGV4), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AWS Signature v4 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AWSSIGV4);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AWSSIGV4], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_AWSSIGV4), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_AWSSIGV4); }
       }
     }
     /* KRB5DB17: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_KRB5DB17], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_KRB5DB17], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_KRB5DB17), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_KRB5DB17), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Kerberos 5 DB etype 17 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_KRB5DB17);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_KRB5DB17], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_KRB5DB17), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_KRB5DB17); }
       }
     }
     /* KRB5DB18: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_KRB5DB18], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_KRB5DB18], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_KRB5DB18), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_KRB5DB18), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Kerberos 5 DB etype 18 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_KRB5DB18);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_KRB5DB18], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_KRB5DB18), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_KRB5DB18); }
       }
     }
     /* MURMUR3: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MURMUR3], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MURMUR3], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MURMUR3), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MURMUR3), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MurmurHash3 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MURMUR3);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MURMUR3], (unsigned char *)"00000000");
+          JSLI(PV, JUDYJ(JOB_MURMUR3), (unsigned char *)"00000000");
         } else { J1U(RC, Dohash, JOB_MURMUR3); }
       }
     }
     /* VEEAM-VBK: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_VEEAM_VBK], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_VEEAM_VBK], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Veeam VBK hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_VEEAM_VBK);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_VEEAM_VBK], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_VEEAM_VBK); }
       }
     }
     /* MSSNTP: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MSSNTP], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MSSNTP], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MSSNTP), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MSSNTP), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MS SNTP hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MSSNTP);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MSSNTP], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_MSSNTP), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_MSSNTP); }
       }
     }
     /* SSPR-MD5: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSPR_MD5], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SSPR_MD5], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SSPR_MD5), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SSPR_MD5), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SSPR MD5 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SSPR_MD5);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSPR_MD5], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SSPR_MD5), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SSPR_MD5); }
       }
     }
     /* SSPR-SHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSPR_SHA1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SSPR_SHA1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SSPR_SHA1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SSPR_SHA1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SSPR SHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SSPR_SHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSPR_SHA1], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SSPR_SHA1), (unsigned char *)"0000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SSPR_SHA1); }
       }
     }
     /* SSPR-SHA1S: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSPR_SHA1S], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SSPR_SHA1S], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SSPR_SHA1S), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SSPR_SHA1S), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SSPR SHA1 salted hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SSPR_SHA1S);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSPR_SHA1S], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SSPR_SHA1S), (unsigned char *)"0000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SSPR_SHA1S); }
       }
     }
     /* SSPR-SHA256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSPR_SHA256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SSPR_SHA256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SSPR_SHA256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SSPR_SHA256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SSPR SHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SSPR_SHA256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SSPR_SHA256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SSPR_SHA256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SSPR_SHA256); }
       }
     }
     /* SSPR-SHA512: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SSPR_SHA512], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SSPR_SHA512], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SSPR_SHA512), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SSPR_SHA512), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SSPR SHA512 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SSPR_SHA512);
         if (RC && Printall) {
           char *dummy512 = "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
-          JSLI(PV, JudyJ[JOB_SSPR_SHA512], (unsigned char *)dummy512);
+          JSLI(PV, JUDYJ(JOB_SSPR_SHA512), (unsigned char *)dummy512);
         } else { J1U(RC, Dohash, JOB_SSPR_SHA512); }
       }
     }
     /* EMPIRECMS: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_EMPIRECMS], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_EMPIRECMS], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_EMPIRECMS), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_EMPIRECMS), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Empire CMS hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_EMPIRECMS);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_EMPIRECMS], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_EMPIRECMS), (unsigned char *)"00000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_EMPIRECMS); }
       }
     }
     /* PBKDF1-SHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_PBKDF1_SHA1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_PBKDF1_SHA1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique PBKDF1-SHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_PBKDF1_SHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_PBKDF1_SHA1], (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          JSLI(PV, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         } else { J1U(RC, Dohash, JOB_PBKDF1_SHA1); }
       }
     }
     /* MSONLINE: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_MSONLINE], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_MSONLINE], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_MSONLINE), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MSONLINE), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique MSONLINE hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_MSONLINE);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_MSONLINE], (unsigned char *)"$MSONLINEACCOUNT$0$10000$0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_MSONLINE), (unsigned char *)"$MSONLINEACCOUNT$0$10000$0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_MSONLINE); }
       }
     }
     /* WBB4: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WBB4], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WBB4], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WBB4), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WBB4), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WBB4 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WBB4);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WBB4], (unsigned char *)"$2a$08$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+          JSLI(PV, JUDYJ(JOB_WBB4), (unsigned char *)"$2a$08$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         } else { J1U(RC, Dohash, JOB_WBB4); }
       }
     }
     /* SAPCODVNH512: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SAPCODVNH512], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SAPCODVNH512], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SAP CODVN H SHA512 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SAPCODVNH512);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SAPCODVNH512], (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)"00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SAPCODVNH512); }
       }
     }
     /* SM3CRYPT: insert JudyJ entries into Typesalt, free JudyJ */
     { long sm3cryptcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SM3CRYPT], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_SM3CRYPT), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_SM3CRYPT], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_SM3CRYPT), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         sm3cryptcnt++;
-        JSLN(PV, JudyJ[JOB_SM3CRYPT], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_SM3CRYPT), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_SM3CRYPT]);
+      JSLFA(RC, JUDYJ(JOB_SM3CRYPT));
       if (sm3cryptcnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = sm3cryptcnt;
@@ -50474,7 +51815,7 @@ usage:
         J1T(RC, Dohash, JOB_SM3CRYPT);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_SM3CRYPT], (unsigned char *)"$sm3$aaaaaaaaaaaaaaaa$");
+          JSLI(SPV, TYPESALT(JOB_SM3CRYPT), (unsigned char *)"$sm3$aaaaaaaaaaaaaaaa$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else {
@@ -50485,29 +51826,29 @@ usage:
     /* AS400SSHA1: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_AS400SSHA1], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_AS400SSHA1], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_AS400SSHA1), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_AS400SSHA1), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique AS/400 SSHA1 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_AS400SSHA1);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_AS400SSHA1], (unsigned char *)"0000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_AS400SSHA1), (unsigned char *)"0000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_AS400SSHA1); }
       }
     }
     /* ARGON2: count entries or disable, set Argon2_maxmem for -z */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_ARGON2], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_ARGON2], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_ARGON2), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_ARGON2), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique Argon2 hashes (max workspace %zu KB)\n",
                 cnt, Argon2_maxmem / 1024);
       } else {
         J1T(RC, Dohash, JOB_ARGON2);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_ARGON2], (unsigned char *)"$argon2id$v=19$m=65536,t=3,p=1$aaaaaaaaaaaaaaaaaaaaaa$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+          JSLI(PV, JUDYJ(JOB_ARGON2), (unsigned char *)"$argon2id$v=19$m=65536,t=3,p=1$aaaaaaaaaaaaaaaaaaaaaa$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
           if (Argon2_maxmem < 65536 * 1024)
             Argon2_maxmem = 65536 * 1024;
         } else { J1U(RC, Dohash, JOB_ARGON2); }
@@ -50516,20 +51857,20 @@ usage:
     /* BCRYPTHMACSHA256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_BCRYPTHMACSHA256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_BCRYPTHMACSHA256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique BCRYPTHMACSHA256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_BCRYPTHMACSHA256);
         if (RC && Printall) {
           /* Default: $2b$05$RndSa1tRndSa1tRndSa1tu + 31-char dummy hash */
-          JSLI(PV, JudyJ[JOB_BCRYPTHMACSHA256], (unsigned char *)"$2b$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+          JSLI(PV, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)"$2b$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
           /* Ensure shared bcrypt infrastructure has a salt too */
           if (Bcryptcnt == 0) {
-            JSLI(PV, JudyJ[JOB_BCRYPT],(unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-            if (!Typesalt[job->op]) {
-              JSLI(PV, Typesalt[job->op], (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
+            JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+            if (!TYPESALT(job->op)) {
+              JSLI(PV, TYPESALT(job->op), (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
               if (PV) (*PV)++;
             }
             Bcryptcnt = 1;
@@ -50540,14 +51881,14 @@ usage:
     /* WPA_PMK: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WPA_PMK], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WPA_PMK], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WPA_PMK), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WPA_PMK), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WPA-PMK hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WPA_PMK);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WPA_PMK], (unsigned char *)"00000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_WPA_PMK), (unsigned char *)"00000000000000000000000000000000");
         } else {
           J1U(RC, Dohash, JOB_WPA_PMK);
         }
@@ -50557,50 +51898,50 @@ usage:
     /* SYMFONY256: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SYMFONY256], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_SYMFONY256], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique SYMFONY256 hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_SYMFONY256);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_SYMFONY256], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_SYMFONY256); }
       }
     }
     /* WPBCRYPT: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_WPBCRYPT], (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JudyJ[JOB_WPBCRYPT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_WPBCRYPT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_WPBCRYPT), (unsigned char *)line); }
       if (cnt) {
         fprintf(stderr, "Searching through %ld unique WPBCRYPT hashes\n", cnt);
       } else {
         J1T(RC, Dohash, JOB_WPBCRYPT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_WPBCRYPT], (unsigned char *)"$2b$05$000000000000000000000000000000000000000000000000000000000000");
+          JSLI(PV, JUDYJ(JOB_WPBCRYPT), (unsigned char *)"$2b$05$000000000000000000000000000000000000000000000000000000000000");
         } else { J1U(RC, Dohash, JOB_WPBCRYPT); }
       }
     }
     /* GOST12512CRYPT: copy JudyJ → Typesalt, free JudyJ (like SHA512CRYPT) */
     { long gost12cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_GOST12512CRYPT], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_GOST12512CRYPT), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_GOST12512CRYPT], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_GOST12512CRYPT), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         gost12cnt++;
-        JSLN(PV, JudyJ[JOB_GOST12512CRYPT], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_GOST12512CRYPT), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_GOST12512CRYPT]);
+      JSLFA(RC, JUDYJ(JOB_GOST12512CRYPT));
       if (gost12cnt) {
         Numsalts += gost12cnt;
         fprintf(stderr, "Searching through %ld unique GOST12512CRYPT hashes\n", gost12cnt);
       } else {
         J1T(RC, Dohash, JOB_GOST12512CRYPT);
         if (RC && Printall) {
-          JSLI(PV, Typesalt[JOB_GOST12512CRYPT], (unsigned char *)"$gost12512hash$defaultS$");
+          JSLI(PV, TYPESALT(JOB_GOST12512CRYPT), (unsigned char *)"$gost12512hash$defaultS$");
           if (PV && *PV == 0) *PV = 1;
         } else { J1U(RC, Dohash, JOB_GOST12512CRYPT); }
       }
@@ -50608,17 +51949,95 @@ usage:
     /* YESCRYPT: count entries or disable */
     { long yecnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_YESCRYPT], (unsigned char *)line);
-      while (PV) { yecnt++; JSLN(PV, JudyJ[JOB_YESCRYPT], (unsigned char *)line); }
+      JSLF(PV, JUDYJ(JOB_YESCRYPT), (unsigned char *)line);
+      while (PV) { yecnt++; JSLN(PV, JUDYJ(JOB_YESCRYPT), (unsigned char *)line); }
       if (yecnt) {
         fprintf(stderr, "Searching through %ld unique YESCRYPT hashes\n", yecnt);
       } else {
         J1T(RC, Dohash, JOB_YESCRYPT);
         if (RC && Printall) {
-          JSLI(PV, JudyJ[JOB_YESCRYPT], (unsigned char *)"$y$j9T$oJqQoBLMgF5$0000000000000000000000000000000000000000000");
-          JSLI(PV, Typesalt[JOB_YESCRYPT], (unsigned char *)"$y$j9T$oJqQoBLMgF5$");
+          JSLI(PV, JUDYJ(JOB_YESCRYPT), (unsigned char *)"$y$j9T$oJqQoBLMgF5$0000000000000000000000000000000000000000000");
+          JSLI(PV, TYPESALT(JOB_YESCRYPT), (unsigned char *)"$y$j9T$oJqQoBLMgF5$");
           if (PV && *PV == 0) *PV = 1;
         } else { J1U(RC, Dohash, JOB_YESCRYPT); }
+      }
+    }
+    /* GOST-YESCRYPT: count entries or disable */
+    { long gycnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_GOSTYESCRYPT), (unsigned char *)line);
+      while (PV) { gycnt++; JSLN(PV, JUDYJ(JOB_GOSTYESCRYPT), (unsigned char *)line); }
+      if (gycnt) {
+        fprintf(stderr, "Searching through %ld unique GOST-YESCRYPT hashes\n", gycnt);
+      } else {
+        J1T(RC, Dohash, JOB_GOSTYESCRYPT);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_GOSTYESCRYPT), (unsigned char *)"$gy$j9T$2WmURad1wKLkIzjayhv/41$0000000000000000000000000000000000000000000");
+          JSLI(PV, TYPESALT(JOB_GOSTYESCRYPT), (unsigned char *)"$gy$j9T$2WmURad1wKLkIzjayhv/41$");
+          if (PV && *PV == 0) *PV = 1;
+        } else { J1U(RC, Dohash, JOB_GOSTYESCRYPT); }
+      }
+    }
+    /* SHA1CRYPT: count entries or disable */
+    { long sccnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_SHA1CRYPT), (unsigned char *)line);
+      while (PV) { sccnt++; JSLN(PV, JUDYJ(JOB_SHA1CRYPT), (unsigned char *)line); }
+      if (sccnt) {
+        fprintf(stderr, "Searching through %ld unique SHA1CRYPT hashes\n", sccnt);
+      } else {
+        J1T(RC, Dohash, JOB_SHA1CRYPT);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_SHA1CRYPT), (unsigned char *)"$sha1$5000$rndSa1t$0000000000000000000000000000");
+          JSLI(PV, TYPESALT(JOB_SHA1CRYPT), (unsigned char *)"$sha1$5000$rndSa1t$");
+          if (PV && *PV == 0) *PV = 1;
+        } else { J1U(RC, Dohash, JOB_SHA1CRYPT); }
+      }
+    }
+    /* CMIYC: count entries or disable */
+    { long cmcnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_CMIYC), (unsigned char *)line);
+      while (PV) { cmcnt++; JSLN(PV, JUDYJ(JOB_CMIYC), (unsigned char *)line); }
+      if (cmcnt) {
+        fprintf(stderr, "Searching through %ld unique CMIYC hashes\n", cmcnt);
+      } else {
+        J1T(RC, Dohash, JOB_CMIYC);
+        if (RC && Printall) {
+          JSLI(PV, TYPESALT(JOB_CMIYC),
+               (unsigned char *)"$cmiyc$2026$1$10$AAAAAAAAAAAAAAAAAAAAAA$");
+          if (PV && *PV == 0) *PV = 1;
+        } else { J1U(RC, Dohash, JOB_CMIYC); }
+      }
+    }
+    /* 7ZIP: count entries or disable */
+    { long szcnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_SEVENZIP), (unsigned char *)line);
+      while (PV) { szcnt++; JSLN(PV, JUDYJ(JOB_SEVENZIP), (unsigned char *)line); }
+      if (szcnt) {
+        fprintf(stderr, "Searching through %ld unique 7ZIP archives\n", szcnt);
+      } else {
+        J1T(RC, Dohash, JOB_SEVENZIP);
+        if (RC && Printall) {
+          /* -z also needs a synthetic ARCHIVE record: the compute loop walks
+           * SevenZipRecs, which is empty with no hash file, so a Typesalt
+           * group alone produced no output at all. Tail bytes are arbitrary
+           * (stage 1 cannot pass against them) -- under Printall the key and
+           * decrypted final block are reported regardless, which is the point
+           * of -z for this type. */
+          static const unsigned char sz_ztail[32] = {
+            0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
+            0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,
+            0x0f,0x1e,0x2d,0x3c,0x4b,0x5a,0x69,0x78,
+            0x87,0x96,0xa5,0xb4,0xc3,0xd2,0xe1,0xf0 };
+          JSLI(PV, TYPESALT(JOB_SEVENZIP), (unsigned char *)"0::19");
+          if (PV && *PV == 0) *PV = 1;
+          if (!SevenZipCount)
+            sevenzip_addrec("0::19", sz_ztail, 16,
+                            "$7z$0$19$0$$16$00000000000000000000000000000000$0$16$0$"
+                            "00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        } else { J1U(RC, Dohash, JOB_SEVENZIP); }
       }
     }
     /* -z mode: ensure DES/3DES have 16-char salts in SaltArray */
@@ -50635,16 +52054,16 @@ usage:
      * Also populate Typesalt[JOB_PHPBB3MD5] for the fallthrough case. */
     { long phpbb3cnt = 0;
       line[0] = 0;
-      JSLF(PV, Typesalt[JOB_PHPBB3], (unsigned char *)line);
+      JSLF(PV, TYPESALT(JOB_PHPBB3), (unsigned char *)line);
       while (PV) {
         J1T(RC, Dohash, JOB_PHPBB3MD5);
         if (RC) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_PHPBB3MD5], (unsigned char *)line);
+          JSLI(SPV, TYPESALT(JOB_PHPBB3MD5), (unsigned char *)line);
           if (SPV && *SPV == 0) *SPV = 1;
         }
         phpbb3cnt++;
-        JSLN(PV, Typesalt[JOB_PHPBB3], (unsigned char *)line);
+        JSLN(PV, TYPESALT(JOB_PHPBB3), (unsigned char *)line);
       }
       Numsalts += phpbb3cnt;
       if (phpbb3cnt) {
@@ -50664,11 +52083,11 @@ usage:
           for (x = 0; x < 8; x++)
             dsalt[4 + x] = phpitoa64[(seed = seed * 1103515245 + 12345) >> 16 & 63];
           dsalt[12] = 0;
-          JSLI(SPV, Typesalt[JOB_PHPBB3], (unsigned char *)dsalt);
+          JSLI(SPV, TYPESALT(JOB_PHPBB3), (unsigned char *)dsalt);
           if (SPV) *SPV = 1000000;
           J1T(RC, Dohash, JOB_PHPBB3MD5);
           if (RC) {
-            JSLI(SPV, Typesalt[JOB_PHPBB3MD5], (unsigned char *)dsalt);
+            JSLI(SPV, TYPESALT(JOB_PHPBB3MD5), (unsigned char *)dsalt);
             if (SPV) *SPV = 1000000;
           }
           Numsalts++;
@@ -50680,15 +52099,15 @@ usage:
     /* APR1: insert JudyJ[JOB_APR1] entries into Typesalt */
     { long apr1cnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_APR1], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_APR1), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_APR1], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_APR1), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         apr1cnt++;
-        JSLN(PV, JudyJ[JOB_APR1], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_APR1), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_APR1]);
+      JSLFA(RC, JUDYJ(JOB_APR1));
       if (apr1cnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = apr1cnt;
@@ -50698,7 +52117,7 @@ usage:
         J1T(RC, Dohash, JOB_APR1);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_APR1], (unsigned char *)"$apr1$rndSa1t$");
+          JSLI(SPV, TYPESALT(JOB_APR1), (unsigned char *)"$apr1$rndSa1t$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else {
@@ -50710,8 +52129,8 @@ usage:
      * Count salts and set up for -z mode if needed. */
     { long md5cryptcnt = 0;
       line[0] = 0;
-      JSLF(PV, Typesalt[JOB_MD5CRYPT], (unsigned char *)line);
-      while (PV) { md5cryptcnt++; JSLN(PV, Typesalt[JOB_MD5CRYPT], (unsigned char *)line); }
+      JSLF(PV, TYPESALT(JOB_MD5CRYPT), (unsigned char *)line);
+      while (PV) { md5cryptcnt++; JSLN(PV, TYPESALT(JOB_MD5CRYPT), (unsigned char *)line); }
       Numsalts += md5cryptcnt;
       if (md5cryptcnt) {
         if (Bcryptcnt == 0)
@@ -50721,7 +52140,7 @@ usage:
         J1T(RC, Dohash, JOB_MD5CRYPT);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_MD5CRYPT], (unsigned char *)"$1$rndSa1t$");
+          JSLI(SPV, TYPESALT(JOB_MD5CRYPT), (unsigned char *)"$1$rndSa1t$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else {
@@ -50732,15 +52151,15 @@ usage:
     /* JUNIPERIVE: insert JudyJ[JOB_JUNIPERIVE] entries into Typesalt */
     { long juniperivecnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_JUNIPERIVE], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_JUNIPERIVE), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_JUNIPERIVE], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_JUNIPERIVE), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         juniperivecnt++;
-        JSLN(PV, JudyJ[JOB_JUNIPERIVE], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_JUNIPERIVE), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_JUNIPERIVE]);
+      JSLFA(RC, JUDYJ(JOB_JUNIPERIVE));
       if (juniperivecnt) {
         Numsalts += juniperivecnt;
         fprintf(stderr, "Searching through %ld unique JUNIPERIVE hashes\n", juniperivecnt);
@@ -50751,15 +52170,15 @@ usage:
     /* SHA256CRYPT: insert JudyJ[JOB_SHA256CRYPT] entries into Typesalt */
     { long sha256cryptcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_SHA256CRYPT], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_SHA256CRYPT), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         sha256cryptcnt++;
-        JSLN(PV, JudyJ[JOB_SHA256CRYPT], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_SHA256CRYPT]);
+      JSLFA(RC, JUDYJ(JOB_SHA256CRYPT));
       if (sha256cryptcnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = sha256cryptcnt;
@@ -50769,7 +52188,7 @@ usage:
         J1T(RC, Dohash, JOB_SHA256CRYPT);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_SHA256CRYPT], (unsigned char *)"$5$rndSa1t$");
+          JSLI(SPV, TYPESALT(JOB_SHA256CRYPT), (unsigned char *)"$5$rndSa1t$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else {
@@ -50781,20 +52200,20 @@ usage:
     /* Also insert into Typesalt[JOB_SHA512CRYPTMD5] since it falls through to crypt_round */
     { long sha512cryptcnt = 0;
       line[0] = 0;
-      JSLF(PV, JudyJ[JOB_SHA512CRYPT], (unsigned char *)line);
+      JSLF(PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)line);
       while (PV) {
         Word_t *SPV;
-        JSLI(SPV, Typesalt[JOB_SHA512CRYPT], (unsigned char *)line);
+        JSLI(SPV, TYPESALT(JOB_SHA512CRYPT), (unsigned char *)line);
         if (SPV && *SPV == 0) *SPV = 1;
         J1T(RC, Dohash, JOB_SHA512CRYPTMD5);
         if (RC) {
-          JSLI(SPV, Typesalt[JOB_SHA512CRYPTMD5], (unsigned char *)line);
+          JSLI(SPV, TYPESALT(JOB_SHA512CRYPTMD5), (unsigned char *)line);
           if (SPV && *SPV == 0) *SPV = 1;
         }
         sha512cryptcnt++;
-        JSLN(PV, JudyJ[JOB_SHA512CRYPT], (unsigned char *)line);
+        JSLN(PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)line);
       }
-      JSLFA(RC, JudyJ[JOB_SHA512CRYPT]);
+      JSLFA(RC, JUDYJ(JOB_SHA512CRYPT));
       if (sha512cryptcnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = sha512cryptcnt;
@@ -50804,7 +52223,7 @@ usage:
         J1T(RC, Dohash, JOB_SHA512CRYPT);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_SHA512CRYPT], (unsigned char *)"$6$rndSa1t$");
+          JSLI(SPV, TYPESALT(JOB_SHA512CRYPT), (unsigned char *)"$6$rndSa1t$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else {
@@ -50813,7 +52232,7 @@ usage:
         J1T(RC, Dohash, JOB_SHA512CRYPTMD5);
         if (RC && Printall) {
           Word_t *SPV;
-          JSLI(SPV, Typesalt[JOB_SHA512CRYPTMD5], (unsigned char *)"$6$rndSa1t$");
+          JSLI(SPV, TYPESALT(JOB_SHA512CRYPTMD5), (unsigned char *)"$6$rndSa1t$");
           if (SPV) *SPV = 1000000;
           Numsalts++;
         } else if (!Printall) {
@@ -50822,10 +52241,10 @@ usage:
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_CISCO8],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_CISCO8),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_CISCO8],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_CISCO8),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique CISCO8 hashes\n", commify(x));
@@ -50835,19 +52254,19 @@ usage:
       J1T(RC, Dohash, JOB_CISCO8);
       if (RC && Printall) {
         char cisco8_def[] = "$8$rndSa1tRndSa1t$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        JSLI(PV, JudyJ[JOB_CISCO8],(unsigned char *)cisco8_def);
-        if (!Typesalt[JOB_CISCO8]) {
-          JSLI(PV, Typesalt[JOB_CISCO8], (unsigned char *)"rndSa1tRndSa1t");
+        JSLI(PV, JUDYJ(JOB_CISCO8),(unsigned char *)cisco8_def);
+        if (!TYPESALT(JOB_CISCO8)) {
+          JSLI(PV, TYPESALT(JOB_CISCO8), (unsigned char *)"rndSa1tRndSa1t");
           if (PV) (*PV)++;
         }
         Bcryptcnt = 1;
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_CISCO9],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_CISCO9),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_CISCO9],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_CISCO9),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique CISCO9 hashes\n", commify(x));
@@ -50857,19 +52276,19 @@ usage:
       J1T(RC, Dohash, JOB_CISCO9);
       if (RC && Printall) {
         char cisco9_def[] = "$9$rndSa1tRndSa1t$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        JSLI(PV, JudyJ[JOB_CISCO9],(unsigned char *)cisco9_def);
-        if (!Typesalt[JOB_CISCO9]) {
-          JSLI(PV, Typesalt[JOB_CISCO9], (unsigned char *)"rndSa1tRndSa1t");
+        JSLI(PV, JUDYJ(JOB_CISCO9),(unsigned char *)cisco9_def);
+        if (!TYPESALT(JOB_CISCO9)) {
+          JSLI(PV, TYPESALT(JOB_CISCO9), (unsigned char *)"rndSa1tRndSa1t");
           if (PV) (*PV)++;
         }
         Bcryptcnt = 1;
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_DCC2],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_DCC2),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_DCC2],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_DCC2),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique DCC2 hashes\n", commify(x));
@@ -50878,19 +52297,19 @@ usage:
     } else {
       J1T(RC, Dohash, JOB_DCC2);
       if (RC && Printall) {
-        JSLI(PV, JudyJ[JOB_DCC2], (unsigned char *)"00000000000000000000000000000000");
-        if (!Typesalt[JOB_DCC2]) {
-          JSLI(PV, Typesalt[JOB_DCC2], (unsigned char *)"10240:6848");
+        JSLI(PV, JUDYJ(JOB_DCC2), (unsigned char *)"00000000000000000000000000000000");
+        if (!TYPESALT(JOB_DCC2)) {
+          JSLI(PV, TYPESALT(JOB_DCC2), (unsigned char *)"10240:6848");
           if (PV) (*PV)++;
         }
         Bcryptcnt = 1;
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_PWSAFE3],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_PWSAFE3),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_PWSAFE3],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_PWSAFE3),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique PWSAFE3 hashes\n", commify(x));
@@ -50899,19 +52318,19 @@ usage:
     } else {
       J1T(RC, Dohash, JOB_PWSAFE3);
       if (RC && Printall) {
-        JSLI(PV, JudyJ[JOB_PWSAFE3], (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
-        if (!Typesalt[JOB_PWSAFE3]) {
-          JSLI(PV, Typesalt[JOB_PWSAFE3], (unsigned char *)"2048:e4e2a590a5e5c8269f57ec04a8a1c0c03da55b311c51236dab8c6b96b0afca02");
+        JSLI(PV, JUDYJ(JOB_PWSAFE3), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+        if (!TYPESALT(JOB_PWSAFE3)) {
+          JSLI(PV, TYPESALT(JOB_PWSAFE3), (unsigned char *)"2048:e4e2a590a5e5c8269f57ec04a8a1c0c03da55b311c51236dab8c6b96b0afca02");
           if (PV) (*PV)++;
         }
         Bcryptcnt = 1;
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_IKEPSK_MD5],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_IKEPSK_MD5),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_IKEPSK_MD5],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_IKEPSK_MD5),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique IKEPSK-MD5 hashes\n", commify(x));
@@ -50919,32 +52338,32 @@ usage:
       J1T(RC, Dohash, JOB_IKEPSK_MD5);
       if (RC && Printall) {
         /* default_salts already set up Typesalt; add JudyJ dummy */
-        JSLI(PV, JudyJ[JOB_IKEPSK_MD5], (unsigned char *)"dummy");
+        JSLI(PV, JUDYJ(JOB_IKEPSK_MD5), (unsigned char *)"dummy");
       } else if (RC) {
         J1U(RC, Dohash, JOB_IKEPSK_MD5);
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_IKEPSK_SHA1],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_IKEPSK_SHA1),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_IKEPSK_SHA1],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_IKEPSK_SHA1),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique IKEPSK-SHA1 hashes\n", commify(x));
     } else {
       J1T(RC, Dohash, JOB_IKEPSK_SHA1);
       if (RC && Printall) {
-        JSLI(PV, JudyJ[JOB_IKEPSK_SHA1], (unsigned char *)"dummy");
+        JSLI(PV, JUDYJ(JOB_IKEPSK_SHA1), (unsigned char *)"dummy");
       } else if (RC) {
         J1U(RC, Dohash, JOB_IKEPSK_SHA1);
       }
     }
     line[0] = 0;x=0;
-    JSLF(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)line);
+    JSLF(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)line);
     while (PV) {
       x++;
-      JSLN(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)line);
+      JSLN(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)line);
     }
     if (x) {
       fprintf(stderr, "Searching through %s unique PBKDF2 hashes\n", commify(x));
@@ -50958,29 +52377,29 @@ usage:
         char pbkdf2_md5[]    = "md5:100:dGVzdA:AAAAAAAAAAAAAAAAAAAAAA==";
         char pbkdf2_sha512[] = "sha512:100:dGVzdA:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
         char pkcs5s2[]       = "{PKCS5S2}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)pbkdf2_sha256);
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)pbkdf2_sha1);
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)pbkdf2_md5);
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)pbkdf2_sha512);
-        JSLI(PV, JudyJ[JOB_PKCS5S2],(unsigned char *)pkcs5s2);
-        if (!Typesalt[JOB_PKCS5S2]) {
-          JSLI(PV, Typesalt[JOB_PKCS5S2], (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAA==");
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)pbkdf2_sha256);
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)pbkdf2_sha1);
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)pbkdf2_md5);
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)pbkdf2_sha512);
+        JSLI(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)pkcs5s2);
+        if (!TYPESALT(JOB_PKCS5S2)) {
+          JSLI(PV, TYPESALT(JOB_PKCS5S2), (unsigned char *)"AAAAAAAAAAAAAAAAAAAAAA==");
           if (PV) (*PV)++;
         }
-        if (!Typesalt[JOB_PBKDF2_SHA256]) {
-          JSLI(PV, Typesalt[JOB_PBKDF2_SHA256], (unsigned char *)"sha256:100:dGVzdA");
+        if (!TYPESALT(JOB_PBKDF2_SHA256)) {
+          JSLI(PV, TYPESALT(JOB_PBKDF2_SHA256), (unsigned char *)"sha256:100:dGVzdA");
           if (PV) (*PV)++;
         }
-        if (!Typesalt[JOB_PBKDF2_SHA1]) {
-          JSLI(PV, Typesalt[JOB_PBKDF2_SHA1], (unsigned char *)"sha1:100:dGVzdA");
+        if (!TYPESALT(JOB_PBKDF2_SHA1)) {
+          JSLI(PV, TYPESALT(JOB_PBKDF2_SHA1), (unsigned char *)"sha1:100:dGVzdA");
           if (PV) (*PV)++;
         }
-        if (!Typesalt[JOB_PBKDF2_MD5]) {
-          JSLI(PV, Typesalt[JOB_PBKDF2_MD5], (unsigned char *)"md5:100:dGVzdA");
+        if (!TYPESALT(JOB_PBKDF2_MD5)) {
+          JSLI(PV, TYPESALT(JOB_PBKDF2_MD5), (unsigned char *)"md5:100:dGVzdA");
           if (PV) (*PV)++;
         }
-        if (!Typesalt[JOB_PBKDF2_SHA512]) {
-          JSLI(PV, Typesalt[JOB_PBKDF2_SHA512], (unsigned char *)"sha512:100:dGVzdA");
+        if (!TYPESALT(JOB_PBKDF2_SHA512)) {
+          JSLI(PV, TYPESALT(JOB_PBKDF2_SHA512), (unsigned char *)"sha512:100:dGVzdA");
           if (PV) (*PV)++;
         }
         Bcryptcnt = 5;
@@ -50990,9 +52409,9 @@ usage:
       /* -z mode: insert a synthetic SHA1-CUSTOMUSERSALT entry into Typesalt Judy */
       char custom_def[] = "AAAAAAAAAAAAAAAAAAAAAAAAAAA:rndSa1t";
       line[0] = 0;
-      JSLF(PV, Typesalt[JOB_SHA1_CUSTOMUSERSALT], (unsigned char *)line);
+      JSLF(PV, TYPESALT(JOB_SHA1_CUSTOMUSERSALT), (unsigned char *)line);
       if (!PV) {
-        JSLI(PV, Typesalt[JOB_SHA1_CUSTOMUSERSALT], (unsigned char *)custom_def);
+        JSLI(PV, TYPESALT(JOB_SHA1_CUSTOMUSERSALT), (unsigned char *)custom_def);
         if (PV) (*PV)++;
       }
     }
@@ -51017,22 +52436,22 @@ usage:
       Word_t ti = 0;
       J1F(RC, Dohash, ti);
       while (RC) {
-        if (ti < JOB_DONE && (TypeOpts[ti] & TYPEOPT_SALTJUDY) &&
-            (TypeOpts[ti] & TYPEOPT_NEEDSALT) && !Typesalt[ti]) {
+        if (ti < JOB_DONE && (TYPEOPTS(ti) & TYPEOPT_SALTJUDY) &&
+            (TYPEOPTS(ti) & TYPEOPT_NEEDSALT) && !TYPESALT(ti)) {
           { int _sc = 0;
             int _sp = (Numsalts > 500000);
             line[0] = 0;
             JSLF(PV, SaltArray, (unsigned char *)line);
             while (PV) {
               Word_t *TPV;
-              JSLI(TPV, Typesalt[ti], (unsigned char *)line);
+              JSLI(TPV, TYPESALT(ti), (unsigned char *)line);
               if (TPV) *TPV = 1000000;
               if (_sp && (++_sc % 100000) == 0)
-                fprintf(stderr, "Loading salts for %s: %d of %ld\r", Types[ti], _sc, Numsalts);
+                fprintf(stderr, "Loading salts for %s: %d of %ld\r", TYPENAME(ti), _sc, Numsalts);
               JSLN(PV, SaltArray, (unsigned char *)line);
             }
             if (_sp)
-              fprintf(stderr, "Loading salts for %s: %d done                    \n", Types[ti], _sc);
+              fprintf(stderr, "Loading salts for %s: %d done                    \n", TYPENAME(ti), _sc);
           }
         }
         J1N(RC, Dohash, ti);
@@ -51045,15 +52464,15 @@ usage:
     Word_t ti = 0;
     J1F(RC, Dohash, ti);
     while (RC) {
-      if (ti < JOB_DONE && Typesalt[ti]) {
+      if (ti < JOB_DONE && TYPESALT(ti)) {
         int cnt = 0;
         long long bytes = 0;
         int salt_progress = (Numsalts > 500000);
         line[0] = 0;
-        JSLF(PV, Typesalt[ti], (unsigned char *)line);
+        JSLF(PV, TYPESALT(ti), (unsigned char *)line);
         while (PV) {
           if (salt_progress && (cnt % 100000) == 0 && cnt > 0)
-            fprintf(stderr, "Preparing salts for %s: %d of %u\r", Types[ti], cnt, Numsalts);
+            fprintf(stderr, "Preparing salts for %s: %d of %u\r", TYPENAME(ti), cnt, Numsalts);
           /* Precompute MD5(salt) for types that need it */
           if (ti == JOB_MD5_MD5SALTMD5PASS || ti == JOB_SHA1_MD5_MD5SALTMD5PASS ||
               ti == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT || ti == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) {
@@ -51088,13 +52507,13 @@ usage:
             cnt++;
             bytes += mystrlen(line) + 1;
           }
-          JSLN(PV, Typesalt[ti], (unsigned char *)line);
+          JSLN(PV, TYPESALT(ti), (unsigned char *)line);
         }
         if (salt_progress)
           fprintf(stderr, "Preparing salts for %s: %d done                    \n", Types[ti], cnt);
         Typesaltcnt[ti] = cnt;
         Typesaltbytes[ti] = bytes;
-        Livesalts[ti] = cnt;
+        LIVESALTS(ti) = cnt;
       }
       J1N(RC, Dohash, ti);
     }
@@ -51103,8 +52522,8 @@ usage:
       Word_t ti = 0;
       J1F(RC, Dohash, ti);
       while (RC) {
-          if (ti < JOB_DONE && (TypeOpts[ti] & TYPEOPT_NEEDUSER) && !Typeuser[ti]) {
-              Typeuser[ti] = (void *)UseridJudy;
+          if (ti < JOB_DONE && (TYPEOPTS(ti) & TYPEOPT_NEEDUSER) && !TYPEUSER(ti)) {
+              TYPEUSER(ti) = (void *)UseridJudy;
           }
           J1N(RC, Dohash, ti);
       }
@@ -51113,7 +52532,7 @@ usage:
       Word_t ti = 0;
       J1F(RC, Dohash, ti);
       while (RC) {
-          if (ti < JOB_DONE && (TypeOpts[ti] & TYPEOPT_NEEDPEPPER) && !Typepepper[ti])
+          if (ti < JOB_DONE && (TYPEOPTS(ti) & TYPEOPT_NEEDPEPPER) && !Typepepper[ti])
               Typepepper[ti] = combo_pepper;
           J1N(RC, Dohash, ti);
       }
@@ -51172,14 +52591,14 @@ usage:
   J1F(RC,Dohash,lsi);
   x = 0;
   while (RC) {
-    linehints[lsi].curline = linehints[lsi].numline = 0;
-    linehints[lsi].gpu = 0;
+    LINEHINTS(lsi).curline = LINEHINTS(lsi).numline = 0;
+    LINEHINTS(lsi).gpu = 0;
     for (; bench_rates[x].idx < lsi; x++);
 
     if (lsi == bench_rates[x].idx) 
-      linehints[lsi].rate = bench_rates[x].rate;
+      LINEHINTS(lsi).rate = bench_rates[x].rate;
     else
-      linehints[lsi].rate = 1000000LL;
+      LINEHINTS(lsi).rate = 1000000LL;
     J1N(RC,Dohash,lsi);
   }
 
@@ -51359,8 +52778,8 @@ usage:
             case JOB_BLAKE2B512: fam |= 1u << FAM_BLAKE2S256UNSALTED; break;
           }
 	  if (fam & FAM_MD5SALT) {
-	    linehints[lsi].lineswanted = UINT_MAX;
-	    linehints[lsi].gpu = 1;
+	    LINEHINTS(lsi).lineswanted = UINT_MAX;
+	    LINEHINTS(lsi).gpu = 1;
 	  }
 	  finalfam |= fam;
           J1N(RC, Dohash, lsi);
@@ -51483,8 +52902,8 @@ usage:
         J1F(RC_mt, Dohash, lsi_mt);
         while (RC_mt) {
           if ((int)lsi_mt == JOB_MD5SALT) {
-            linehints[lsi_mt].lineswanted = UINT_MAX;
-            linehints[lsi_mt].gpu = 1;
+            LINEHINTS(lsi_mt).lineswanted = UINT_MAX;
+            LINEHINTS(lsi_mt).gpu = 1;
           }
           J1N(RC_mt, Dohash, lsi_mt);
         }
@@ -51829,7 +53248,7 @@ usage:
           J1F(RC, Dohash, NextX);
           while (RC) {
             x = NextX;
-            if (!Typedone[x]) {
+            if (!TYPEDONE(x)) {
               /* BF chunk-as-job + Phase 1.4 adaptive servo (2026-05-10):
                * for ALL GPU_CAT_MASK ops (unsalted + salted post-Phase-2),
                * produce N chunk-jobs per op. Each chunk is sized via
@@ -51991,7 +53410,7 @@ usage:
                       int _bf_fast_ok =
                           (x == JOB_MD5) &&
                           (Numrules <= 1) &&
-                          (Typesalt[x] == NULL) &&
+                          (TYPESALT(x) == NULL) &&
                           (MaskPrependLen == 0) &&
                           (MaskAppendLen >= 1) && (MaskAppendLen <= 8);
                       if (_bf_fast_ok &&
@@ -52259,7 +53678,7 @@ usage:
       lsi = 0;
       J1F(RC, Dohash, lsi);
       while (RC) {
-	linehints[lsi].curline = chunk_skip_offset;
+	LINEHINTS(lsi).curline = chunk_skip_offset;
 	/* NOTE: retired_line is NOT reset here — it must remain monotonic across
 	 * chunks for the rate calculation in the 15s tick at 38866 to work
 	 * (rate = (now - lasttick)/15s would go negative on reset, dropping to
@@ -52278,12 +53697,12 @@ reprocess:
         J1F(RC, Dohash, NextX);
         while (RC) {
           x = NextX;
-	  curline = linehints[x].curline;
-          if (Typedone[x] || curline >= Linecount) { 
+	  curline = LINEHINTS(x).curline;
+          if (TYPEDONE(x) || curline >= Linecount) { 
 	    J1N(RC, Dohash, NextX); 
 	    continue; 
 	  }
-	  if (linehints[x].gpu && !NoMetal && !Rules) {
+	  if (LINEHINTS(x).gpu && !NoMetal && !Rules) {
 	    /* Phase 2f experiment 2026-05-18: cap numline at 32K for GPU+salted
 	     * to preserve in-order jobg slot packing. Was ULLONG_MAX (one big
 	     * job per chunk → procjob #2 picks up the NEXT chunk concurrently,
@@ -52291,27 +53710,48 @@ reprocess:
 	     * procjob job produces exactly one ordered slot. Per user 2026-05-18
 	     * dispatch goal: approach 1000s on dev1 e31+sm-saltfull+rockyou
 	     * (baseline ~2400s). */
-	    linehints[x].lineswanted = 32768;
+	    LINEHINTS(x).lineswanted = 32768;
 	    numline = 32768;
 	  } else {
-	    linehints[x].lineswanted = linehints[x].rate;
+	    LINEHINTS(x).lineswanted = LINEHINTS(x).rate;
 	    if (maxt > 1)
-	      linehints[x].lineswanted /= maxt;
-	    if (Livesalts[x])
-	      linehints[x].lineswanted /= Livesalts[x];
+	      LINEHINTS(x).lineswanted /= maxt;
+	    if (LIVESALTS(x))
+	      LINEHINTS(x).lineswanted /= LIVESALTS(x);
 	    if (MaskTotal > 1)
-	      linehints[x].lineswanted /= MaskTotal;
+	      LINEHINTS(x).lineswanted /= MaskTotal;
 	    /* Numrules division removed: packed GPU buffers handle all rules per word */
-	    if (linehints[x].rate < 100)
-	      linehints[x].lineswanted = 1;
-	    else if (linehints[x].lineswanted < 512)
-	      linehints[x].lineswanted = 512;
-	    numline = linehints[x].lineswanted;
+	    /* Gate the one-word fan-out on work per WORD, not on the raw rate.
+	     *
+	     * bench_rates[] counts candidate x salt operations per second, so a
+	     * type's cost per wordlist line is rate/Livesalts. Testing the raw
+	     * rate missed every expensive-because-many-salts type: SCRYPT at
+	     * 3403 h/s against 1800 salts is ~1 word/sec, but 3403 >= 100 sent
+	     * it to the 512 floor -- which is worse than useless here, because
+	     * lineswanted had ALREADY been divided down to 0 by the salt count.
+	     * The code computed "one word is a full dispatch" and then overrode
+	     * it back up to 512, so a 290-word run became a single dispatch on
+	     * a single core with the other 15 idle.
+	     *
+	     * Same failure hit SHA1CRYPT (618 h/s / 8262 salts) and would hit
+	     * any future high-salt-count type. BCRYPT/ARGON2/GOST-YESCRYPT only
+	     * escaped it because their raw rates happen to sit under 100 too.
+	     *
+	     * The 512 floor still applies to genuinely cheap types, where per-
+	     * dispatch overhead would otherwise dominate. Fixed 2026-08-08. */
+	    { long long perword = LINEHINTS(x).rate;
+	      if (LIVESALTS(x)) perword /= LIVESALTS(x);
+	      if (perword < 100)
+	        LINEHINTS(x).lineswanted = 1;
+	      else if (LINEHINTS(x).lineswanted < 512)
+	        LINEHINTS(x).lineswanted = 512;
+	    }
+	    numline = LINEHINTS(x).lineswanted;
 	    if (Email) numline = 1;
 	  }
 	  if ((curline + numline) > Linecount)
 	    numline = Linecount - curline;
-	  linehints[x].curline += numline;
+	  LINEHINTS(x).curline += numline;
 	  isdone = 0;
           /* Mask-iteration thread fanout (2026-05-26): when a mask is configured
            * AND MaskTotal is large AND maxt > 1 AND no real rules are active, split
@@ -52494,23 +53934,23 @@ bf_done:
 
   fprintf(stderr, "%s total files\n", commify(Totalfiles));
   for (y = 1; Types[y]; y++) {
-    if (!Totalfound[y - 1])
+    if (!TOTALFOUND(y - 1))
       continue;
     for (x = 0; x < Maxiter; x++) {
-      if (Totalfound[y - 1][x]) fprintf(stderr, "%s %sx%02d hashes found\n", commify(Totalfound[y - 1][x]), Types[y], x + 1);
+      if (TOTALFOUND(y - 1)[x]) fprintf(stderr, "%s %sx%02d hashes found\n", commify(TOTALFOUND(y - 1)[x]), Types[y], x + 1);
     }
   }
   /* User-defined hash types (Milestone 1): per-op found counts. */
   {
     int _uc = userdef_count(), _ui;
     for (_ui = 0; _ui < _uc; _ui++) {
-      int _uop = JOB_USERDEF_BASE + _ui;
+      int _uop = (int)user_id_op(_ui);
       if (_uop >= JOB_DONE) break;
-      if (!Totalfound[_uop - 1]) continue;
+      if (!TOTALFOUND(_uop - 1)) continue;
       for (x = 0; x < Maxiter; x++) {
-        if (Totalfound[_uop - 1][x])
+        if (TOTALFOUND(_uop - 1)[x])
           fprintf(stderr, "%s %sx%02d hashes found\n",
-                  commify(Totalfound[_uop - 1][x]), userdef_name(_uop), x + 1);
+                  commify(TOTALFOUND(_uop - 1)[x]), userdef_name(_uop), x + 1);
       }
     }
   }

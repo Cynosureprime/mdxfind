@@ -1,8 +1,11 @@
 /*
  * userdef.c - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.7 $
+ * $Revision: 1.8 $
  * $Log: userdef.c,v $
+ * Revision 1.8  2026/08/09 20:13:37  dlr
+ * Phase A: runtime synthetic-op base. Userdef_base_val defaults to JOB_USERDEF_BASE and is overridden by userdef_set_base before any op is assigned; userdef_is_userop and the registration site now read it. userdef_set_base is a no-op once ops have been handed out. hashpipe never sets it and keeps the default - it walks userdef_get_by_index and does not use op numbers at all.
+ *
  * Revision 1.7  2026/06/10 15:41:40  dlr
  * v1.527: program_slot_mask() replaces program_uses_salt(); finalize_stanza accepts SALT + USER, rejects SALT2 + PEPPER only (v2 load grammar still needed). slot_mask propagates through struct + load report.
  *
@@ -160,9 +163,36 @@ struct userdef_type *userdef_get_by_index(int idx)
 	return &Userdefs[idx];
 }
 
+/* Runtime base for synthetic user-defined ops.
+ *
+ * Phase A of the built-in / user-defined address separation: the base is no
+ * longer a hand-maintained constant that a new built-in type can silently
+ * grow into. mdxfind derives it from the actual Types[] length at startup and
+ * calls userdef_set_base() BEFORE userdef_load(), so the two ranges cannot
+ * collide no matter how many built-in types are added.
+ *
+ * JOB_USERDEF_BASE remains only as the compile-time default, used by callers
+ * that never set a base (hashpipe walks userdef_get_by_index() and does not
+ * care about op numbers at all). */
+static unsigned Userdef_base_val = JOB_USERDEF_BASE;
+
+void userdef_set_base(unsigned base)
+{
+	/* Must be called before userdef_load(); ops are assigned at load. */
+	if (Userdef_count) return;          /* too late: ops already handed out */
+	if (base < 1) return;
+	Userdef_base_val = base;
+}
+
+unsigned userdef_base(void)
+{
+	return Userdef_base_val;
+}
+
 int userdef_is_userop(int op)
 {
-	return op >= JOB_USERDEF_BASE && op < JOB_USERDEF_BASE + USERDEF_MAX;
+	return op >= (int)Userdef_base_val &&
+	       op <  (int)Userdef_base_val + USERDEF_MAX;
 }
 
 struct userdef_type *userdef_get(int op)
@@ -548,7 +578,7 @@ static void finalize_stanza(const char *name, const char *idstr,
 	strncpy(u->hx, hx, sizeof(u->hx) - 1);
 	snprintf(u->dispname, sizeof(u->dispname), "USER_%s", name);
 	u->prog       = prog;
-	u->op         = JOB_USERDEF_BASE + Userdef_count;
+	u->op         = (int)Userdef_base_val + Userdef_count;
 	u->diglen_hex = diglen;
 	u->slot_mask  = slot_mask;
 	u->uses_salt  = (slot_mask != 0);   /* legacy field — nonzero iff any salt-class slot referenced */

@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.h,v 1.4 2026/05/19 20:57:52 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.h,v 1.5 2026/08/09 20:13:37 dlr Exp dlr $
  *
  * gpu_kernel_cache — bare-files cache for OpenCL device-binary programs.
  *
@@ -61,6 +61,18 @@ int gpu_kernel_cache_init(const char *mdxfind_rev);
 
 /* True if the cache is initialized AND enabled. */
 int gpu_kernel_cache_enabled(void);
+
+/* Build "<cache dir><native sep><name>" into `out` for callers that need
+ * somewhere to write a debug artifact. The cache directory is the only
+ * writable location mdxfind knows about that is valid on every target
+ * platform, because the user named it via MDXFIND_CACHE; there is no
+ * portable fixed scratch path (/tmp is POSIX-only, absent on Windows).
+ *
+ * Returns 0 on success. Returns -1 -- with out[0] set to 0 -- when the
+ * cache is disabled or the path will not fit. A -1 means "do not write
+ * this artifact"; it is NOT an invitation to substitute a default
+ * location. Callers should skip the write silently. */
+int gpu_kernel_cache_path(char *out, size_t outlen, const char *name);
 
 /* Build (or load from cache) an OpenCL program for `dev`. This is the
  * single-call wrapper that does the entire cache-or-compile flow:

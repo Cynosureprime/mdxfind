@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.7 2026/05/19 20:57:57 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.8 2026/08/09 20:13:37 dlr Exp dlr $
  *
  * Implementation. See gpu_kernel_cache.h for the design overview.
  */
@@ -349,6 +349,29 @@ int gpu_kernel_cache_init(const char *mdxfind_rev) {
 
 int gpu_kernel_cache_enabled(void) {
     return CacheInited && CacheEnabled;
+}
+
+/* Public form of cache_path(): build "<CacheDir><DIRSEP><name>" for a
+ * caller that wants to drop a debug artifact next to the kernel cache.
+ *
+ * This exists so no other translation unit has to invent a writable
+ * directory of its own. There is no portable fixed scratch location
+ * across the platforms mdxfind targets -- /tmp does not exist on
+ * Windows -- so the only correct root is the one the user named via
+ * MDXFIND_CACHE. When the cache is disabled the answer is "nowhere",
+ * and the caller is expected to skip the artifact entirely rather
+ * than fall back to a guessed path.
+ *
+ * Returns 0 with `out` populated, or -1 (and out[0]=0) if the cache is
+ * disabled, `name` is empty, or the joined path would not fit. */
+int gpu_kernel_cache_path(char *out, size_t outlen, const char *name) {
+    if (!out || outlen == 0) return -1;
+    out[0] = '\0';
+    if (!gpu_kernel_cache_enabled()) return -1;
+    if (!name || !*name) return -1;
+    int n = snprintf(out, outlen, "%s%c%s", CacheDir, DIRSEP_NATIVE, name);
+    if (n <= 0 || n >= (int)outlen) { out[0] = '\0'; return -1; }
+    return 0;
 }
 
 /* ============================================================

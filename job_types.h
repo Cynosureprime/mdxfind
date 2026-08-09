@@ -997,5 +997,9 @@
 #define JOB_YESCRYPT        995
 #define JOB_MD5SHA256SHA256 996
 #define JOB_BSDICRYPT       997
+#define JOB_GOSTYESCRYPT    998
+#define JOB_SHA1CRYPT       999
+#define JOB_SEVENZIP        1000
+#define JOB_CMIYC           1001
 #define JOB_DONE 2000
 #endif

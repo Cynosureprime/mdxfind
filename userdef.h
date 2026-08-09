@@ -1,8 +1,11 @@
 /*
  * userdef.h - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.6 $
+ * $Revision: 1.7 $
  * $Log: userdef.h,v $
+ * Revision 1.7  2026/08/09 20:13:23  dlr
+ * Phase A of built-in / user-defined op address separation. JOB_USERDEF_BASE 1000 to 1100 becomes a compile-time DEFAULT only; the live base is derived at runtime from the Types array length and set via the new userdef_set_base before userdef_load. Declares userdef_set_base and userdef_base. Adding a built-in type can no longer grow into the user range - the base moves with it.
+ *
  * Revision 1.6  2026/06/10 15:41:40  dlr
  * v1.527: USERDEF_SLOT_* bitmask + uses_salt legacy field; struct userdef_type gains slot_mask. Forward-compat with v2 load grammar.
  *
@@ -46,8 +49,26 @@
  * match-flag field (struct Hashchain.flags) is a 16-bit unsigned short.
  * Both ceilings forbid the originally-suggested 100000 base.
  */
-#define JOB_USERDEF_BASE  1000
-#define USERDEF_MAX       900   /* ids 1000..1899, leaves headroom below 2000 */
+/*
+ * 2026-08-07: raised 1000 -> 1100. The built-in range had actually reached
+ * 999 (SHA1CRYPT), leaving ZERO free slots -- the next built-in type would
+ * have silently aliased user-defined op 1000. The two ranges are now
+ * separated by a deliberate 100-slot gap:
+ *
+ *      1 .. 1099   built-in types      (Types[] index == op number)
+ *   1100 .. 1999   user-defined types  (JOB_USERDEF_BASE + id)
+ *
+ * mdxfind checks this boundary at startup (see the Numtypes guard in main)
+ * so an overrun is a loud, immediate failure rather than silent aliasing.
+ *
+ * NOTE (design debt): the ranges still share one op number space, which is
+ * why this needed a manual bump at all. The durable fix is to give built-in
+ * and user-defined types genuinely separate address spaces -- e.g. a tagged
+ * op (kind + index) or a dedicated user table -- so a collision becomes
+ * structurally impossible instead of a number nobody remembered to raise.
+ */
+#define JOB_USERDEF_BASE  1100
+#define USERDEF_MAX       900   /* ids 1100..1999, leaves headroom below 2000 */
 
 /*
  * Load-time message verbosity (defined in userdef.c).  Default 0 = SILENT:
@@ -105,6 +126,13 @@ const char *userdef_name(int op);
 
 /* Number of loaded user types. */
 int userdef_count(void);
+
+/* Phase A address separation: set the synthetic-op base BEFORE userdef_load().
+ * mdxfind derives it from the built-in Types[] length so adding a built-in
+ * type can never collide with the user range. Callers that never set it get
+ * JOB_USERDEF_BASE. Calling after load() is a no-op (ops already assigned). */
+void userdef_set_base(unsigned base);
+unsigned userdef_base(void);
 
 /*
  * Milestone 3 (hashpipe parity): registry iterator.  Returns the loaded

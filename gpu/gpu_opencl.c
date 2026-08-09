@@ -21,6 +21,7 @@
 #include <errno.h>      /* strerror() — Phase 1a kernel A1 trace dump (2026-05-20) */
 #include "gpu_opencl.h"
 #include "gpu_kernel_cache.h"
+#include "../mdxhost.h" /* mdx_gethostname() -- gethostname() is Winsock-only on Windows */
 #include "job_types.h"
 #include "gpujob.h"
 #include "yarn.h"      /* launch()/join() for parallel device init (Memo C) */
@@ -3458,8 +3459,8 @@ void gpu_opencl_finalize_active_count(void) {
 int gpu_opencl_jit_compile_source(int dev_idx, const char *src,
                                   const char *build_opts)
 {
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     if (!ocl_ready) {
         fprintf(stderr,
@@ -3530,8 +3531,8 @@ int gpu_opencl_jit_compile_source(int dev_idx, const char *src,
 int gpu_opencl_jit_compile_source_with_common(int dev_idx, const char *src,
                                               const char *build_opts)
 {
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     if (!ocl_ready) {
         fprintf(stderr,
@@ -3609,8 +3610,8 @@ int gpu_opencl_jit_compile_source_with_common_keep(
     const char *entry_point_name,
     cl_program *out_program, cl_kernel *out_kernel)
 {
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     if (!ocl_ready) {
         fprintf(stderr,
@@ -3715,8 +3716,8 @@ int gpu_opencl_e347_validate_dispatch(
     uint32_t num_salts,
     uint32_t *out_hits, int *out_n_hits, int max_hits)
 {
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) {
         fprintf(stderr,
@@ -4040,8 +4041,8 @@ int gpu_opencl_kernelb_family_validate_dispatch(
     const uint32_t *word_offset, uint32_t num_words,
     uint32_t *out_hits, int *out_n_hits, int max_hits)
 {
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) {
         fprintf(stderr,
@@ -12913,8 +12914,8 @@ gpu_opencl_kernelb_codegen_kernel_for(struct gpu_device *d, int dev_idx,
         }
     }
 
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     /* 2. Resolve entry + validate. */
     const struct hx_spec_entry *entry = hx_specs_lookup(job_enum);
@@ -12970,21 +12971,39 @@ gpu_opencl_kernelb_codegen_kernel_for(struct gpu_device *d, int dev_idx,
         exit(1);
     }
 
-    /* 5. Source dump per-job for post-mortem. */
-    char dump_path[256];
-    snprintf(dump_path, sizeof(dump_path),
-             "/tmp/mdxfind-codegen-e%d-%d-dev%d.cl",
-             job_enum, (int)getpid(), dev_idx);
+    /* 5. Source dump per-job for post-mortem.
+     *
+     * Written next to the kernel cache, i.e. under the directory the
+     * user named via MDXFIND_CACHE. This used to hardcode /tmp, which
+     * is a POSIX-only convention that does not exist on Windows: every
+     * dump on a Windows rig failed with ENOENT and logged a warning
+     * per device per job (2026-08-05). MDXFIND_CACHE is the one
+     * location mdxfind is allowed to assume, on any platform.
+     *
+     * If the cache is disabled there is nowhere correct to put this,
+     * so the dump is skipped. Do NOT add a fallback path here.
+     *
+     * Failure to write is SILENT -- no warning, on any platform. This
+     * is a post-mortem convenience artifact, and its absence is a
+     * non-event: nothing downstream reads it and no result changes.
+     * Announcing it once per device per job is pure clutter in the
+     * output of a multi-GPU run. Whether the dump exists is already
+     * reported, accurately, by the dump= field of the JIT line below. */
+    char dump_path[4096];
+    int  dumped = 0;
     {
-        FILE *df = fopen(dump_path, "w");
-        if (df) {
-            fwrite(src, 1, strlen(src), df);
-            fclose(df);
-        } else {
-            fprintf(stderr,
-                "hx codegen: source dump to %s failed on %s dev[%d] "
-                "(errno=%d %s) -- proceeding without dump\n",
-                dump_path, hostname, dev_idx, errno, strerror(errno));
+        char dump_name[128];
+        snprintf(dump_name, sizeof(dump_name),
+                 "codegen-e%d-%d-dev%d.cl",
+                 job_enum, (int)getpid(), dev_idx);
+        if (gpu_kernel_cache_path(dump_path, sizeof(dump_path),
+                                  dump_name) == 0) {
+            FILE *df = fopen(dump_path, "w");
+            if (df) {
+                size_t slen = strlen(src);
+                if (fwrite(src, 1, slen, df) == slen) dumped = 1;
+                fclose(df);
+            }
         }
     }
 
@@ -13067,7 +13086,7 @@ gpu_opencl_kernelb_codegen_kernel_for(struct gpu_device *d, int dev_idx,
         "OpenCL GPU[%d]: hx codegen e%d kernel B JIT'd via cache "
         "(source %zu bytes, entry=%s sentinel=%s slot=%d dump=%s) on %s\n",
         dev_idx, job_enum, strlen(src), entry_name, sentinel,
-        placed_slot, dump_path, hostname);
+        placed_slot, dumped ? dump_path : "(none)", hostname);
 
     free(src);
     return kern;
@@ -13164,8 +13183,8 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
     int exp_md5, int *nhits_out)
 {
     cl_int err;
-    char hostname[256] = "unknown";
-    gethostname(hostname, sizeof(hostname) - 1);
+    char hostname[256];
+    mdx_gethostname(hostname, sizeof(hostname));
 
     *nhits_out = 0;
     d->proto_resolved_active = 1;          /* accessor uses the arena */
@@ -14473,8 +14492,8 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * snapshots dated before 2026-05-22) get a clear deprecation message
      * rather than a silent behavior change. */
     if (!gpu_opencl_hx_codegen_enabled()) {
-        char hostname[256] = "unknown";
-        gethostname(hostname, sizeof(hostname) - 1);
+        char hostname[256];
+        mdx_gethostname(hostname, sizeof(hostname));
         fprintf(stderr,
             "FATAL: %s:%d OpenCL GPU[%d] on %s: MDXFIND_HX_CODEGEN=0 "
             "opt-out removed in Phase 4a.3 (hand-written kernel B "

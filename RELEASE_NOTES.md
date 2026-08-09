@@ -1,3 +1,39 @@
+# mdxfind v1.531 — Four new hash types; fixes a heap corruption that aborted multi-type runs, and a dispatch bug that pinned expensive types to one core
+
+Source: mdxfind.c rev 1.530 → 1.531; gpu/gpu_opencl.c rev 1.209 → 1.210; gpu/gpu_kernel_cache.{c,h} rev 1.7 → 1.8 / 1.4 → 1.5; userdef.{c,h} rev 1.7 → 1.8 / 1.6 → 1.7; bench_rates.h rev 1.2 → 1.3; new mdxhost.h (companion release: hashpipe v1.100).
+
+## Fixes
+
+**Heap corruption during hash loading.** `build_compact_table()` allocated compact-table overflow chain entries from the `mymalloc` arena, while `compact_resize()` releases them with `free()`. Arena slices are not individually freeable, so the first time the compact table doubled, `free()` was handed a pointer into the middle of a slab and the process aborted with `free(): invalid pointer`. A second defect in the same block wrote one element past the end of the hash entry arrays, because it checked only the byte-buffer capacity and not the entry-array capacity.
+
+Chain entries are now allocated with `malloc`, matching the two other chain-allocation sites. New `hashdata_reserve()` / `hashdatabuf_reserve()` helpers grow both the entry arrays and the byte buffer, and every append site uses them. A hardcoded `HashDataCap = 65536` that claimed capacity the arrays might not have was removed. AddressSanitizer is clean on a 55,404-hash corpus.
+
+**Dispatch: expensive types with many salts ran on a single core.** The one-word-per-dispatch fan-out gated on a type's raw hashes/sec rather than its cost per wordlist line. SCRYPT at 3,403 h/s against 1,800 salts is about one word per *second*, but 3,403 cleared the threshold, so 512 words were batched into a single dispatch. The gate now uses `rate / Livesalts`. Measured on 1,800 scrypt hashes: 1× → 4.3× parallel (scrypt is memory-bound, so it does not reach core count; compute-bound types gain more). SHA1CRYPT was affected the same way. Output is unchanged — this is a throughput fix only.
+
+## New hash types
+
+**`-m e999` SHA1CRYPT** — NetBSD/Juniper sha1crypt, `$sha1$` (hashcat 15100). Iterated HMAC-SHA1 with the password as the persistent key. Input is liberal and output is conformant: the 28-character digest field encodes 21 bytes where SHA-1 produces only 20, and NetBSD pads the final group with `digest[0]` wrapped around. hashcat's published `-m 15100` example hash uses `0` for that byte and is therefore **nonconformant**; mdxfind accepts that spelling and reports the correct NetBSD/corpus one. The wrap convention was confirmed against 8,262 real hashes, 8,262 of 8,262.
+
+**`-m e998` GOST-YESCRYPT** — `$gy$`. `HMAC-Streebog256(HMAC-Streebog256(Streebog256(K), M), yescrypt(K, S))`, where the inner HMAC message is the setting **without** its trailing `$`. Validated 25 of 25 against libxcrypt 4.4.27 across distinct real salts, plus salt lengths 4/8/12/16 and empty, and against an independently written third-party implementation.
+
+**`-m e1001` CMIYC** — `$cmiyc$`, a contest-local type recovered from a stripped AIX PowerPC binary. Memory-hard: 64 MiB working set and 9,437,184 SHA-512 operations per candidate per salt. Validated against real hashes with known plaintexts.
+
+**`-m e884` SCRYPT now also accepts the `$7$` crypt spelling** in addition to `SCRYPT:N:r:p:b64salt:b64hash`. The `$7$` form packs N/r/p as crypt64 characters and uses the salt as raw ASCII rather than base64, so it is normalised at load into the canonical form; both spellings are emitted on a crack.
+
+**`-m e1000` 7ZIP** — 7-Zip AES, `$7z$` (hashcat 11600). Verifies by checking the AES zero-padding on the final ciphertext block rather than decrypting and decompressing, so **Deflate64 archives crack** — hashcat and john both report "exhausted" on those even when the password is in the wordlist, because neither implements a Deflate64 decompressor in its verify path. Stock `7z2john` output exceeds mdxfind's line limit — the entire encrypted stream sits in the final field, roughly 113 KB even for a small archive — so `tools/7z2mdx.py` truncates that field to the two ciphertext blocks stage 1 actually needs.
+
+## Internal
+
+**Built-in and user-defined hash types now have separate address spaces.** The user-defined op base was a hand-maintained constant that the built-in range had already grown into — built-ins reached 999 against a base of 1,000, leaving zero free slots, so the next built-in type would have silently aliased a user-defined op and shared its per-op state. The base is now derived from the `Types[]` length at startup, all 2,417 per-op array accesses route through accessors, and built-in and user state live in genuinely separate storage. Aliasing is structurally impossible rather than arithmetically avoided, and adding a built-in type needs no constant bumped.
+
+This also fixed six sites that indexed `Types[]` by op across the whole range, reading past the end of the array for any user-defined type that had loaded hashes.
+
+**Windows: the hx codegen source dump no longer targets `/tmp`.** `/tmp` is a POSIX convention that does not exist on Windows, so every dump on a Windows rig failed with `ENOENT` and logged a warning once per device per job. The dump is now written under the `MDXFIND_CACHE` directory, and when the cache is disabled it is skipped **silently** — a missing debug artifact is a non-event and does not deserve a message per device per job.
+
+**Windows: diagnostics reported the host as `unknown`.** `gethostname()` is a Winsock call that fails with `WSANOTINITIALISED` unless `WSAStartup()` has run, and mdxfind never calls it, so the hostname in every FATAL and warning line was the fallback string. All ten call sites now use a portable helper (`GetComputerNameA` on Windows).
+
+---
+
 # mdxfind v1.530 — KRB5TGS23 / KRB5PA23: definitive HMAC checksum verification (fixes false positives)
 
 Source: mdxfind.c rev 1.529 → 1.530 (companion hashpipe fix released as hashpipe v1.99).
