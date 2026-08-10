@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.531 2026/08/09 20:14:45 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.532 2026/08/10 14:50:14 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.531 2026/08/09 20:14:45 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.532 2026/08/10 14:50:14 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.532  2026/08/10 14:50:14  dlr
+ * Fix silent drop of sub-32-hex-char hashes in the slow-path hex loader. The fallthrough gate in load_hash_file required hlen >= 16 bytes while the fast path at line 43025 and the storage layer beneath both allow 8. Selecting any salted or user-bearing type together with -F forces the slow path, so MYSQL3 e456 8-byte digests were advertised in Working on hash types but never reached the compact table, silently, with no warning or count. Gate lowered to hlen >= 8, matching the compact-table uint64 key floor and the addhash len < 8 validation. Validated on fpga GTX 1080: -h ALL over a 22-type fixture now loads 330 hashes and finds 22 of 22 types at 15 of 15 each, GPU and CPU byte-identical, and no per-type count changed except MYSQL3 going from 0 to 15.
+ *
  * Revision 1.531  2026/08/09 20:14:45  dlr
  * Four new hash types, a heap-corruption fix, a dispatch fan-out fix, and the built-in / user-defined op address separation.
  *
@@ -47512,7 +47515,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* Plain hex hashes: load into compact table */
     if (LoadHex && inhashbuf) {
       int hlen = get32(line, inhashbuf + 2, 256);
-      if (hlen >= 16 && hlen <= 255) {
+      /* Floor is 8 bytes, not 16, to match the fast path above and the
+       * storage layer beneath. The compact-table key is a single uint64_t
+       * read off the hash bytes, so 8 is the real minimum; addhash()
+       * enforces exactly that and zero-pads sub-16-byte entries to 16 so
+       * the GPU 4xuint32 probe cannot spill into the next entry. This gate
+       * read >= 16, so any digest shorter than 32 hex chars was dropped
+       * silently whenever a salted or user-bearing type forced the slow
+       * path (LoadSalt/LoadUser with -F). MYSQL3 (e456, 8 bytes) was
+       * unloadable in exactly that combination while still being listed
+       * in "Working on hash types". */
+      if (hlen >= 8 && hlen <= 255) {
         commit_compact(hlen);
         /* Check for :suffix on hex hashes (salt and/or user) */
         if ((LoadSalt || LoadUser) && line[hlen * 2] == ':' && line[hlen * 2 + 1]) {
