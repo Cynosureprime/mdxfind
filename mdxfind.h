@@ -1,5 +1,8 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.25  2026/08/12 01:22:09  dlr
+ * Add MYSHA256 streaming workspace struct and mysha256_begin/add/end plus mysha256_cpu_detect prototypes. Caller-owned fixed-size struct carved from the existing per-thread work buffers like any other procjob workspace, so there is no allocation and nothing to free.
+ *
  * Revision 1.24  2026/05/19 01:20:01  dlr
  * word-retirement ETA: move struct Linehints to mdxfind.h + add retired_line field + InflightLines global. CPU retirement updates at procjob mid-job checkpoint and job-return site. InflightLines increment at dispatch. Chunk-reset clears retired_line. 15s tick aggregator computes RetiredLines_rate. Display arm uses retirement-based ETA with bootstrap fallback to hash-rate until first tick fires.
  *
@@ -301,3 +304,27 @@ extern struct Linehints *linehints;
 extern int linehints_count;
 extern volatile unsigned long long InflightLines;
 
+
+/* Streaming SHA-256 workspace.
+ *
+ * Caller-owned fixed-size struct, carved from the existing per-thread work
+ * buffers like any other procjob workspace -- no allocation, no teardown,
+ * nothing to free. Thread-safe because every mutable byte is the caller's;
+ * the only shared state is the dispatch pointer set once by arm_ce_detect()
+ * before any worker thread starts. Implementation and the per-processor
+ * gating both live in mymd5.c with the rest of the primitives.
+ *
+ * mysha256() (one-shot) remains the right interface for fixed-size buffers.
+ * These three exist for types that must feed a digest incrementally and
+ * previously had to escape to sph_sha256 or OpenSSL EVP to do it. */
+typedef struct {
+  unsigned int  h[8];
+  unsigned long long bits;
+  unsigned int  nbuf;
+  unsigned char buf[64];
+} MYSHA256;
+
+extern void mysha256_begin(MYSHA256 *s);
+extern void mysha256_add(MYSHA256 *s, const void *p, size_t len);
+extern void mysha256_end(MYSHA256 *s, unsigned char *out);
+extern void mysha256_cpu_detect(void);

@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.532 2026/08/10 14:50:14 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.534 2026/08/12 01:33:40 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.532 2026/08/10 14:50:14 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.534 2026/08/12 01:33:40 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.534  2026/08/12 01:33:40  dlr
+ * Fix build break on non-GPU targets introduced in 1.533. The lineswanted gate referenced gpu_ops[] directly, but that table lives inside ifdef GPU_ENABLED, so the plain macOS x86_64 target (no GPU backend) failed to compile with use of undeclared identifier gpu_ops. Replaced with op_can_reach_gpu(), defined in BOTH configurations: it scans gpu_ops[] under GPU_ENABLED and returns 0 otherwise, which is the honest answer when no GPU backend is compiled in -- nothing can reach a kernel, so every expensive type takes the CPU-only fan-out path. Caught by the release build, which covers configurations the .205 and dev1 development builds do not. Both regression fixtures re-validated after the refactor on fpga GTX 1080: PHPBB3 5000x20000 stays 4.9s against 55.9s regressed, SCRYPT 1800 salts by 290 words stays 272 percent CPU against 99 percent pre-1.531.
+ *
+ * Revision 1.533  2026/08/12 01:22:22  dlr
+ * Fix a dispatch regression that made salted GPU-hybrid types up to 11x slower, and rewire e1000 off OpenSSL EVP. (1) The lineswanted gate introduced in 1.531 tested cost per word, which sent every GPU hybrid to one word per dispatch. PHPBB3 e455 at 2931 h/s over 5000 salts is 0.59 words/sec, MORE expensive per word than the SCRYPT case the 1.531 change was written for, yet it must keep the 512 floor because gpu_try_pack batches words for the device. Measured on fpga GTX 1080 at 5000 hashes by 20000 words: 4.9s on 1.524, 55.9s on 1.531, 4.9s restored. The discriminator is now gpu_ops[] membership, not cost: an op that can reach a GPU kernel keeps the floor, a CPU-only op fans out. SCRYPT fan-out is preserved and verified at 278 percent CPU versus 99 percent pre-1.531. Comparison is by multiplication since rate over salts truncates to zero whenever rate is below the salt count. The block carries a FRAGILE header naming both fixtures, because this gate has now caused two production regressions in opposite directions. (2) JOB_SEVENZIP now uses the streaming mysha256 workspace instead of a thread-local EVP_MD_CTX that was malloc-ed once per thread and never freed; mdxfind no longer calls the EVP interface anywhere. (3) Call mysha256_cpu_detect unconditionally at startup.
+ *
  * Revision 1.532  2026/08/10 14:50:14  dlr
  * Fix silent drop of sub-32-hex-char hashes in the slow-path hex loader. The fallthrough gate in load_hash_file required hlen >= 16 bytes while the fast path at line 43025 and the storage layer beneath both allow 8. Selecting any salted or user-bearing type together with -F forces the slow path, so MYSQL3 e456 8-byte digests were advertised in Working on hash types but never reached the compact table, silently, with no warning or count. Gate lowered to hlen >= 8, matching the compact-table uint64 key floor and the addhash len < 8 validation. Validated on fpga GTX 1080: -h ALL over a 22-type fixture now loads 330 hashes and finds 22 of 22 types at 15 of 15 each, GPU and CPU byte-identical, and no per-type count changed except MYSQL3 going from 0 to 15.
  *
@@ -2422,7 +2428,6 @@ extern char *crypt_rn(const char *key, const char *setting, void *data, int size
 #include "argon2/argon2.h"
 
 /* 7-Zip KDF digest context, per thread (2^19 updates per candidate) */
-static __thread EVP_MD_CTX *sevenzip_tls_md;
 
 /* CMIYC (e1001) per-thread block arena: N*64 bytes, 64 MiB at memlog=20.
  * Grown on demand and kept across candidates -- reallocating 64 MiB per
@@ -23748,8 +23753,6 @@ sha11saltmd5:
                     if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   }
                   if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
-                  if (!sevenzip_tls_md) sevenzip_tls_md = EVP_MD_CTX_new();
-                  if (!sevenzip_tls_md) break;
                   { int si, u16len;
                     icin = cur; ic_inleft = len;
                     icout = (char *)wline; ic_outleft = MAXLINE * sizeof(wchar_t);
@@ -23760,7 +23763,12 @@ sha11saltmd5:
                     for (si = 0; si < nsalts_job; si++) {
                       const char *grp = saltsnap[si].salt;
                       unsigned char sz_key[32], sz_salt[64];
-                      unsigned int sz_keylen = 32;
+                      /* Streaming SHA-256 workspace, carved from linebuf2
+                       * (MAXLINE*3) past the AES_KEY that sits at offset 0,
+                       * per the procjob buffer convention. Replaces a
+                       * thread-local EVP_MD_CTX that was malloc'd once per
+                       * thread and never freed. No allocation on any path. */
+                      MYSHA256 *sz_ms = (MYSHA256 *)(linebuf2 + 2048);
                       long g_saltlen = 0, g_log2 = 0;
                       int g_saltbin = 0;
                       /* group is "saltlen:salthex:log2" */
@@ -23778,7 +23786,7 @@ sha11saltmd5:
                       }
                       if (g_log2 < 0 || g_log2 > 40) continue;  /* sanity cap */
                       /* --- KDF: one streaming SHA-256 over 2^g_log2 records --- */
-                      EVP_DigestInit_ex(sevenzip_tls_md, EVP_sha256(), NULL);
+                      mysha256_begin(sz_ms);
                       { unsigned char *stage = (unsigned char *)linebuf;
                         const size_t stagecap = 32768;
                         size_t rec = (size_t)g_saltbin + u16len + 8;
@@ -23810,11 +23818,11 @@ sha11saltmd5:
                             { int b; for (b = 0; b < 8; b++) cp[b] = (unsigned char)(cv >> (8 * b)); }
 #endif
                           }
-                          EVP_DigestUpdate(sevenzip_tls_md, stage, batch * rec);
+                          mysha256_add(sz_ms, stage, batch * rec);
                           i += batch;
                         }
                       }
-                      EVP_DigestFinal_ex(sevenzip_tls_md, sz_key, &sz_keylen);
+                      mysha256_end(sz_ms, sz_key);
                       hashcnt++;
                       /* --- stage 1 against every archive in this group --- */
                       { AES_KEY *sz_ak = (AES_KEY *)linebuf2;
@@ -40560,6 +40568,28 @@ static const int gpu_ops[] = {
 };
 #endif
 
+/* op_can_reach_gpu: can this op reach a GPU kernel at all?
+ *
+ * Defined in BOTH build configurations on purpose. gpu_ops[] lives inside
+ * #ifdef GPU_ENABLED, so a plain CPU build (e.g. the macOS x86_64 target)
+ * does not have it -- referencing it directly from the dispatch gate broke
+ * that build. When no GPU backend is compiled in, nothing can reach a
+ * kernel, so the honest answer is 0 and every expensive type takes the
+ * CPU-only fan-out path.
+ *
+ * Sole consumer is the FRAGILE lineswanted gate; see the header there. */
+#ifdef GPU_ENABLED
+static int op_can_reach_gpu(int op) {
+    int i;
+    for (i = 0; gpu_ops[i] >= 0; i++)
+        if (gpu_ops[i] == op) return 1;
+    return 0;
+}
+#else
+static int op_can_reach_gpu(int op) { (void)op; return 0; }
+#endif
+
+
 /* Capacity helpers for the HashData entry arrays and byte buffer.
  *
  * addhash() sizes HashDataOff/Len/Flags for the hex hashes it loads, but
@@ -47739,6 +47769,12 @@ union HashU curin;
 #if defined(ARM) && ARM >= 8 && defined(__aarch64__)
   { extern void arm_ce_detect(void); arm_ce_detect(); }
 #endif
+  /* Streaming SHA-256 dispatch. Defined on every arch (a no-op where there
+   * is nothing to detect), called unconditionally and before any worker
+   * thread starts, so the function pointer is read-only for the whole
+   * threaded phase. arm_ce_detect() above cannot serve this role: it is
+   * compiled and called only under the aarch64 guard. */
+  { extern void mysha256_cpu_detect(void); mysha256_cpu_detect(); }
 
   Minhashlen = 256;
   JUDYJ(JOB_SHA512CRYPT) = JUDYJ(JOB_SHA256CRYPT) = JUDYJ(JOB_MD5CRYPT) = JUDYJ(JOB_APR1) = Dohash = NULL;
@@ -53752,9 +53788,55 @@ reprocess:
 	     *
 	     * The 512 floor still applies to genuinely cheap types, where per-
 	     * dispatch overhead would otherwise dominate. Fixed 2026-08-08. */
-	    { long long perword = LINEHINTS(x).rate;
-	      if (LIVESALTS(x)) perword /= LIVESALTS(x);
-	      if (perword < 100)
+	    /* ================= FRAGILE -- READ BEFORE EDITING =================
+	     *
+	     * This gate has now caused two production regressions in opposite
+	     * directions. It looks like a two-line heuristic; it is not. Any
+	     * change here MUST be validated against BOTH fixtures below, on a
+	     * host with a working GPU, before it ships. A change that fixes one
+	     * case and is merely "reasoned about" for the other WILL regress.
+	     *
+	     *   Case A -- GPU hybrid, large wordlist. PHPBB3 e455:
+	     *     mdxfind -M 400 -F <5000 hashes> <20000 words>
+	     *     fpga GTX 1080: 4.9s correct, 55.9s regressed (11.4x).
+	     *     Source: docs/BENCHMARK.md sm-salt400 (bench fixtures live on
+	     *     fpga.local:~/src/mdfind/sm-salt400*).
+	     *
+	     *   Case B -- CPU-only, small wordlist, many salts. SCRYPT e884:
+	     *     ~290 words against ~1800 salted hashes.
+	     *     Correct = every core busy. Regressed = ONE core busy.
+	     *
+	     * Why it is fragile: the two cases pull opposite ways and cost per
+	     * word cannot separate them. PHPBB3 at 2931 h/s over 5000 salts is
+	     * 0.59 words/sec -- MORE expensive per word than SCRYPT's ~2 -- yet
+	     * PHPBB3 must keep the 512 floor and SCRYPT must not. Any heuristic
+	     * built on rate, salt count, or their ratio alone will get one of
+	     * them wrong. Ask instead: can this op reach a GPU kernel?
+	     *
+	     *   - op in gpu_ops[]  -> gpu_try_pack accumulates words and
+	     *     dispatches them to the device together. One word per dispatch
+	     *     starves it. KEEP THE FLOOR. (RCS 1.263/1.264 built the PHPBB3
+	     *     hybrid around exactly this: "GPU assists while CPU processes
+	     *     concurrently".)
+	     *   - op absent from gpu_ops[] -> pure CPU. With many salts a single
+	     *     word is already a full dispatch, and the floor collapses a
+	     *     short wordlist onto one core. FAN OUT.
+	     *
+	     * History: pre-1.531 tested the raw rate, which sent every
+	     * expensive-because-many-salts CPU type to the floor (Case B broken).
+	     * 1.531 switched to cost per word, which sent every GPU hybrid to
+	     * one word per dispatch (Case A broken, reported by a user against
+	     * -M 400). Both were single-case changes.
+	     *
+	     * Note the comparison is by multiplication, not division: rate /
+	     * salts truncates to 0 whenever rate < salts, which is most salted
+	     * types at scale, so the divided form silently discards the very
+	     * magnitude it is testing.
+	     * ================================================================= */
+	    { long long lh_rate  = LINEHINTS(x).rate;
+	      long long lh_salts = LIVESALTS(x) ? (long long)LIVESALTS(x) : 1;
+	      int lh_gpu = op_can_reach_gpu((int)x);
+	      if (!lh_gpu && lh_rate < 100LL * lh_salts)
 	        LINEHINTS(x).lineswanted = 1;
 	      else if (LINEHINTS(x).lineswanted < 512)
 	        LINEHINTS(x).lineswanted = 512;

@@ -1,3 +1,31 @@
+# mdxfind v1.534 — Fixes an 11x dispatch regression in v1.531/v1.532, and gives SHA-256 a hardware path on every architecture
+
+Source: mdxfind.c rev 1.532 → 1.534; mymd5.c rev 1.34 → 1.35; mdxfind.h rev 1.24 → 1.25; sha1_shani.c rev 1.1 → 1.2.
+
+**If you are running v1.531 or v1.532, upgrade.** Both carry a dispatch regression that makes salted types with a GPU path several times slower on large wordlists. Results were always correct — this cost time, not cracks.
+
+## Fixes
+
+**Salted GPU-hybrid types ran up to 11x slower (regression, v1.531).** v1.531 changed how many wordlist lines go into one dispatch, switching the test from a type's raw rate to its cost per word. That was right for CPU-only types — SCRYPT against 1,800 salts is about two words per second and genuinely wants one word per dispatch so the work spreads across cores. It was wrong for anything with a GPU kernel, because `gpu_try_pack` accumulates words and sends them to the device together, and one word per dispatch starves it.
+
+Cost per word cannot tell the two apart. PHPBB3 (`-m e455`, hashcat 400) at 2,931 h/s against 5,000 salts is 0.59 words/sec — *more* expensive per word than SCRYPT — yet it needs the opposite treatment. The test is now whether the type can reach a GPU kernel at all.
+
+Measured on a GTX 1080, 5,000 hashes against 20,000 words: **4.9 s before the regression, 55.9 s with it, 4.9 s restored** — identical crack counts throughout. The SCRYPT fan-out that v1.531 added is preserved and verified at 278% CPU against 99% before it.
+
+The affected set is wider than PHPBB3: any type with a GPU kernel whose bench rate is below its salt count, which at a few thousand salts is most of the salted catalog. The gate now carries a prominent FRAGILE header naming both regression fixtures, since it has failed in opposite directions twice.
+
+## New
+
+**SHA-256 now has a hardware path on x86 as well as ARM.** `mysha256()` is one-shot, so any type needing to hash incrementally had nowhere to go inside mymd5.c and escaped to portable-C fallbacks or to OpenSSL — meaning those types ran at reference speed no matter what the processor could do.
+
+A streaming interface now sits alongside the one-shot: `mysha256_begin/add/end` over a caller-owned fixed-size workspace carved from the existing per-thread buffers. No allocation on any path, nothing to free, and thread-safe by construction. Behind it are three arms chosen by one gate — x86 SHA-NI, ARM crypto extensions, portable C — with the pointer starting NULL so a CPU that lacks the feature degrades to correct-and-slow rather than crashing. `MDXFIND_SHA256_DEBUG=1` reports which arm won.
+
+**`-m e1000` (7-Zip) uses it.** The KDF streams roughly 12 MB per candidate; it previously did so through OpenSSL EVP. End-to-end on an Apple M1: **131 → 646 candidates/sec**. Gains elsewhere depend on how OpenSSL was built for that platform — Windows and macOS x86 builds ship a no-asm OpenSSL and benefit most, while Linux x86-64 already had assembly and is at parity, but is now independent of it. mdxfind no longer calls the OpenSSL EVP interface anywhere.
+
+The x86 routine was validated on an AMD Ryzen against published SHA-256 vectors and differentially against the portable implementation; the same binary was then confirmed to produce identical output on a CPU with the feature and one without.
+
+---
+
 # mdxfind v1.532 — Two silent-miss fixes: WRL found nothing on any OpenCL GPU, and short hashes were dropped at load
 
 Source: mdxfind.c rev 1.531 → 1.532; gpu/gpu_wrl_core.cl rev 1.2 → 1.3; gpu/gpu_wrl_core_str.h rev 1.1 → 1.2.

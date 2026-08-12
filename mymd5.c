@@ -1,5 +1,8 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.35  2026/08/12 01:22:09  dlr
+ * Streaming SHA-256 over a caller-owned workspace, plus an x86 SHA-NI arm. mysha256() is one-shot, so any type needing incremental hashing had nowhere to go inside this file and escaped to sph_sha256 or OpenSSL EVP, both unaccelerated -- so every incremental type ran at reference speed regardless of CPU. Adds mysha256_begin/add/end over a caller-owned fixed-size MYSHA256 struct carved from the existing per-thread buffers: no allocation on any path, no teardown, and thread-safe because every mutable byte is the callers and the dispatch pointer is written once at startup before workers exist. mysha256_add dispatches ONCE per run of blocks rather than once per 64 bytes. Three arms behind one gate: x86 SHA-NI via sha256_blocks_shani, ARM CE via sha256_compress_armce, portable C otherwise. Pointer starts NULL so a missed detection degrades to correct-and-slow, never SIGILL. New mysha256_cpu_detect called unconditionally from main; arm_ce_detect could not serve since it is compiled and called only under the aarch64 guard. MDXFIND_SHA256_DEBUG=1 reports which arm won. Measured dev1 M1 e1000 131 to 646 cand/s end-to-end.
+ *
  * Revision 1.34  2026/06/04 16:03:42  dlr
  * ARM NEON + PowerPC AltiVec MD5 padding fix for two-block mymd5salt2 (CPU analog of GPU eom_in_first 2026-06-03). The ARM NEON sibling at line 1077-1158 and POWERPC AltiVec sibling at line 622-703 of mymd5.c had a single-block compression where Intel SSE at line 1575-1735 has two-block. Callers of mymd5salt2(SSEBUF3, hashes) (mdxfind.c:23724/23761 NEON salt loop and equivalents for MD5SALT family) pack salt-length 24..63 messages into a 2-block SSEBUF3 layout: inner_hash + salt-up-to-byte-32-of-block-0 plus optional spillover into block 1, 0x80 sentinel, and length at block-1 word 14. The Intel pattern: FINAL stores post-block-0 chained state into hash[], X += 16, reload chained state, run another 64 OPs, FINAL2 adds block-1 result. The broken NEON/POWERPC paths only did block 0 then FINAL2 added that to stale hash[] = wrong digest for slen 24..31 (block 1 = length+0x80 only; matches the GPU eom_in_first symptom) and collisions for slen 32..35 (block 1 = 0..3 spillover salt bytes; identical block-0 across the 4 SIMD lanes). Fix mirrors the Intel two-block pattern: NEON uses the sval_load round-trip; POWERPC uses temporary-register chaining to avoid the AIX swap_128 round-trip issue. Validated on dev1 M1 + dev3 M2 Max + ubpower8 PowerPC + iMac x86 SSE + .205 Ubuntu Intel SSE: all 5 hosts produce byte-identical e31 sweep slen 22..40 output (md5=003f7c00bcdbe9c342355eea4f60a65e) and 4/4 slen 32..35 collision-fixture cracks. iMac x86 regression-clean (Intel mymd5salt2 unchanged). User-fixture work2711.txt 100-hash subset cracks 100/100 byte-identical across iMac + dev1 + ubpower8. Affects all callers of mymd5salt2 on ARM and PowerPC: JOB_MD5SALT (e31), JOB_MD5UCSALT (e350), JOB_MD5revMD5SALT (e541), JOB_MD5sub8_24SALT (e542), JOB_MD5_MD5SALTMD5PASS (e367), JOB_MD5SALTPASS, JOB_MD5SALTPASSSALT, JOB_MD5SALTMD5PASS, and the SHA1+MD5SALT variant. The mymd5salt / mymd5salt_pre / mymd5salt_post fast-path callers (slen less than 24) are unchanged and remain correct.
  *
@@ -2934,6 +2937,212 @@ extern void SHA512(char *cur, int len, unsigned char *dest);
 void mysha256(char *cur, int len, unsigned char *dest) { SHA256(cur, len, dest); }
 void mysha512(char *cur, int len, unsigned char *dest) { SHA512(cur, len, dest); }
 #endif
+
+/* ------------------------------------------------------------------
+ * Streaming SHA-256 over a caller-owned fixed-size workspace.
+ *
+ * mysha256() is one-shot: it initialises, hashes a whole buffer, pads and
+ * finalises in a single call. Any type that must feed a digest incrementally
+ * therefore had nowhere to go inside this file and escaped to sph_sha256
+ * (portable C) or to OpenSSL EVP -- both unaccelerated, so every incremental
+ * type ran at reference speed no matter what the CPU could do. JOB_SEVENZIP
+ * (e1000) streams ~12 MB per candidate and was the only EVP user in mdxfind.
+ *
+ * MYSHA256 is a plain struct, sized and owned by the caller, carved from the
+ * existing per-thread work buffers exactly like any other procjob workspace.
+ * There is no _new/_free pair, no allocation on any path, and nothing to tear
+ * down. Thread safety needs no argument: every mutable byte lives in the
+ * caller's workspace, and the only shared object is the dispatch pointer,
+ * written once by arm_ce_detect() before any worker thread starts.
+ *
+ * The per-processor decision stays in this file, where all the others are.
+ * mysha256_add() dispatches ONCE for a run of blocks rather than once per
+ * 64 bytes, so the indirect call is amortised over the run -- which matters
+ * when a single candidate is 196,608 blocks.
+ * ------------------------------------------------------------------ */
+
+static const uint32_t mysha256_K[64] = {
+  0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,
+  0x923f82a4u,0xab1c5ed5u,0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,
+  0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,0xe49b69c1u,0xefbe4786u,
+  0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+  0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,
+  0x06ca6351u,0x14292967u,0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,
+  0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,0xa2bfe8a1u,0xa81a664bu,
+  0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+  0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,
+  0x5b9cca4fu,0x682e6ff3u,0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,
+  0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+};
+
+#define MYSHA256_ROR(x,n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+/* Portable reference compression. Declarations sit at block scope so this
+ * still builds under gnu89 (gp.bungi.com is GCC 4.9, which defaults there). */
+static void mysha256_compress_c(uint32_t *h, const unsigned char *blk)
+{
+  uint32_t W[64], a, b, c, d, e, f, g, hh, t1, t2, s0, s1, ch, maj;
+  int i;
+
+  for (i = 0; i < 16; i++)
+    W[i] = ((uint32_t)blk[i*4] << 24) | ((uint32_t)blk[i*4+1] << 16) |
+           ((uint32_t)blk[i*4+2] << 8) | ((uint32_t)blk[i*4+3]);
+  for (i = 16; i < 64; i++) {
+    s0 = MYSHA256_ROR(W[i-15],7) ^ MYSHA256_ROR(W[i-15],18) ^ (W[i-15] >> 3);
+    s1 = MYSHA256_ROR(W[i-2],17) ^ MYSHA256_ROR(W[i-2],19) ^ (W[i-2] >> 10);
+    W[i] = W[i-16] + s0 + W[i-7] + s1;
+  }
+  a = h[0]; b = h[1]; c = h[2]; d = h[3];
+  e = h[4]; f = h[5]; g = h[6]; hh = h[7];
+  for (i = 0; i < 64; i++) {
+    s1 = MYSHA256_ROR(e,6) ^ MYSHA256_ROR(e,11) ^ MYSHA256_ROR(e,25);
+    ch = (e & f) ^ ((~e) & g);
+    t1 = hh + s1 + ch + mysha256_K[i] + W[i];
+    s0 = MYSHA256_ROR(a,2) ^ MYSHA256_ROR(a,13) ^ MYSHA256_ROR(a,22);
+    maj = (a & b) ^ (a & c) ^ (b & c);
+    t2 = s0 + maj;
+    hh = g; g = f; f = e; e = d + t1;
+    d = c; c = b; b = a; a = t1 + t2;
+  }
+  h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+  h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+/* ---- x86 SHA-NI arm ------------------------------------------------
+ *
+ * GATING CONTRACT -- this must stay correct for the oldest machine in the
+ * fleet as well as the newest:
+ *
+ *  1. sha1_shani.c is the ONLY translation unit compiled with -msha
+ *     -msse4.1, and it is linked ONLY on x86 hosts (ARM links sha_armce.o
+ *     instead; PowerPC and SPARC link neither). Nothing here is even
+ *     present in a non-x86 binary.
+ *  2. The pointer starts NULL. A CPU that does not advertise the feature
+ *     never gets it set, and mysha256_run() falls through to the portable
+ *     C routine. NULL is the safe state, so a missed detection degrades to
+ *     correct-and-slow, never to SIGILL.
+ *  3. The gate is CPUID.(EAX=7,ECX=0):EBX bit 29 -- the same bit the
+ *     existing SHA-1 dispatch uses. That single bit covers the whole SHA
+ *     extension family (sha1rnds4/sha1nexte/sha1msg1/sha1msg2 AND
+ *     sha256rnds2/sha256msg1/sha256msg2), so SHA-256 needs no extra probe.
+ *     Every CPU that sets it also has SSSE3/SSE4.1 for the _mm_shuffle_epi8
+ *     and _mm_alignr_epi8/_mm_blend_epi16 used alongside.
+ *  4. CPUID leaf 7 itself only exists if leaf 0 reports max >= 7. On a
+ *     pre-Nehalem part __get_cpuid_count returns 0 and we leave the pointer
+ *     NULL. The GCC < 5 shim above provides __get_cpuid_count where the
+ *     header does not (gp.bungi.com, GCC 4.9).
+ *  5. Set ONCE at startup from mysha256_cpu_detect(), before any worker
+ *     thread exists, then read-only. No lazy first-call initialisation, so
+ *     no race on the pointer.
+ *
+ * Deliberately NOT gated on a compile-time __SHA__ test: the file is always
+ * built with -msha on x86, and using a runtime pointer means one binary
+ * runs correctly on both an ancient Xeon and a Zen 5. */
+#if !defined(ARM) && !defined(POWERPC) && !defined(SPARC) && \
+    (defined(__i386__) || defined(__x86_64__) || defined(_M_IX86) || defined(_M_X64))
+#define MYSHA256_HAVE_X86_SHANI 1
+extern void sha256_blocks_shani(uint32_t *state, const void *data, size_t nblocks);
+static void (*sha256_x86_fn)(uint32_t *, const void *, size_t) = NULL;
+#endif
+
+/* Called once from main() before threads start. Safe to call on any arch
+ * and safe to call more than once. */
+void mysha256_cpu_detect(void)
+{
+#ifdef MYSHA256_HAVE_X86_SHANI
+  unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+  if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) && (ebx & (1u << 29)))
+    sha256_x86_fn = sha256_blocks_shani;
+#endif
+  /* MDXFIND_SHA256_DEBUG=1 reports which arm won. Kept deliberately: a
+   * silent fallback to the portable routine is correct but slow, and that
+   * is exactly the failure mode that is otherwise invisible. */
+  if (getenv("MDXFIND_SHA256_DEBUG")) {
+#if defined(MYSHA256_HAVE_X86_SHANI)
+    fprintf(stderr, "sha256 dispatch: x86 SHA-NI %s\n",
+            sha256_x86_fn ? "ENGAGED" : "unavailable (CPUID bit clear)");
+#elif defined(ARM) && ARM >= 8 && defined(__aarch64__)
+    fprintf(stderr, "sha256 dispatch: ARM CE %s\n",
+            sha256_arm_fn ? "ENGAGED" : "unavailable");
+#else
+    fprintf(stderr, "sha256 dispatch: portable C (no accelerated arm compiled)\n");
+#endif
+  }
+}
+
+/* The single per-processor gate for streaming SHA-256. One call covers a run
+ * of nblocks; add a SHA-NI arm here and every caller inherits it unchanged. */
+static void mysha256_run(uint32_t *h, const unsigned char *p, size_t nblocks)
+{
+#ifdef MYSHA256_HAVE_X86_SHANI
+  if (sha256_x86_fn) { sha256_x86_fn(h, p, nblocks); return; }
+#endif
+#if defined(ARM) && ARM >= 8 && defined(__aarch64__)
+  if (sha256_arm_fn) {
+    for (; nblocks; nblocks--, p += 64)
+      sha256_arm_fn(h, (const uint32_t *)p);
+    return;
+  }
+#endif
+  for (; nblocks; nblocks--, p += 64)
+    mysha256_compress_c(h, p);
+}
+
+void mysha256_begin(MYSHA256 *s)
+{
+  s->h[0] = 0x6a09e667u; s->h[1] = 0xbb67ae85u;
+  s->h[2] = 0x3c6ef372u; s->h[3] = 0xa54ff53au;
+  s->h[4] = 0x510e527fu; s->h[5] = 0x9b05688cu;
+  s->h[6] = 0x1f83d9abu; s->h[7] = 0x5be0cd19u;
+  s->bits = 0;
+  s->nbuf = 0;
+}
+
+void mysha256_add(MYSHA256 *s, const void *p, size_t len)
+{
+  const unsigned char *b = (const unsigned char *)p;
+  size_t want, nb;
+
+  s->bits += (unsigned long long)len * 8ULL;
+  if (s->nbuf) {
+    want = 64 - s->nbuf;
+    if (want > len) want = len;
+    memcpy(s->buf + s->nbuf, b, want);
+    s->nbuf += (unsigned int)want;
+    b += want; len -= want;
+    if (s->nbuf == 64) { mysha256_run(s->h, s->buf, 1); s->nbuf = 0; }
+  }
+  if (len >= 64) {
+    nb = len >> 6;
+    mysha256_run(s->h, b, nb);          /* one dispatch, nb blocks */
+    b += nb << 6; len -= nb << 6;
+  }
+  if (len) { memcpy(s->buf, b, len); s->nbuf = (unsigned int)len; }
+}
+
+void mysha256_end(MYSHA256 *s, unsigned char *out)
+{
+  unsigned long long bits = s->bits;
+  unsigned int n = s->nbuf;
+  int i;
+
+  s->buf[n++] = 0x80;
+  if (n > 56) {
+    memset(s->buf + n, 0, 64 - n);
+    mysha256_run(s->h, s->buf, 1);
+    n = 0;
+  }
+  memset(s->buf + n, 0, 56 - n);
+  for (i = 0; i < 8; i++)
+    s->buf[56 + i] = (unsigned char)(bits >> (56 - 8 * i));
+  mysha256_run(s->h, s->buf, 1);
+  for (i = 0; i < 8; i++) {
+    out[i*4+0] = (unsigned char)(s->h[i] >> 24);
+    out[i*4+1] = (unsigned char)(s->h[i] >> 16);
+    out[i*4+2] = (unsigned char)(s->h[i] >> 8);
+    out[i*4+3] = (unsigned char)(s->h[i]);
+  }
+}
 
 void pbkdf2_md5(char *cur, int len, unsigned char *salt, int saltlen, int rounds, char *curin, int outlen)
 {
