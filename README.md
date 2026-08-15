@@ -4,7 +4,7 @@
 
 # mdxfind
 
-Multi-threaded, multi-algorithm hash search engine. Searches wordlists against large hash collections across 994 hash types simultaneously, using Judy arrays for memory-efficient hash storage and SIMD acceleration on supported platforms. Includes **mdsplit**, a companion tool that separates solved hashes by type into organized output files.
+Multi-threaded, multi-algorithm hash search engine. Searches wordlists against large hash collections across 1001 hash types simultaneously, using Judy arrays for memory-efficient hash storage and SIMD acceleration on supported platforms. Includes **mdsplit**, a companion tool that separates solved hashes by type into organized output files.
 
 See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons.
 
@@ -470,7 +470,7 @@ The `-g` flag enables hash rotation: after computing a hash, mdxfind rotates the
 
 ## Supported Hash Types
 
-mdxfind supports 994 hash types, covering 297 hashcat mode mappings. Run `mdxfind -h` (with no other arguments) to see the complete list.
+mdxfind supports 1001 hash types, covering 327 hashcat mode mappings. Run `mdxfind -h` (with no other arguments) to see the complete list.
 
 ### Options column key
 

@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.534 2026/08/12 01:33:40 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.536 2026/08/15 03:09:15 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.534 2026/08/12 01:33:40 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.536 2026/08/15 03:09:15 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.536  2026/08/15 03:09:15  dlr
+ * Hash-type correctness pass. Maphashcat: 3500 to MD5 iter 3 (was 303 MD5-2xMD5), 4521/4522 Redmine/PunBB to 520 SHA1SALTSHA1PASS (were 579, operands reversed), 6000 to 17 RMD160 (was 118 RIPEMD-128). DOMINO5 882 to NEEDSF; as NEEDSJ no loader admitted it and selecting it alone always found nothing. store_typesalt no longer truncates silently at 255 bytes: MAXSALTLEN 4096, heap fallback above 256, one-time warning and refusal beyond; SSHA saltlen guards added since the fix made a latent stack overflow reachable. SAP BCODE sum20 and PASSCODE5 compare width corrected. BCRYPT256 final sha256 round; SYMFONY256 iteration count. KRB5PA23 reads the matched salt before compaction. prmd5 NUL-clobber fixed in e603, e715 and e440; e440 had diverged x86 vs ARM. e584 lacked its op in the uppercase test and computed the non-UC type, mislabelling 21 crack files. e535 SHA1-CUSTOMUSERSALT restored to the 1.110 construction: 1.174 dropped the two lines deriving sha1(pass) and sha1(sha1(pass)) along with the JSLF preamble it replaced, so the type ignored the password entirely and hashed a constant per username; pepper and a bounds guard restored. MD5AM, MD5AM2 and MD5SPECAM SSE readback now gates on actlen to match the packing loop, so a lane whose assembled string reached 56 bytes and took the scalar path is no longer read back as MD5 of the zeroed buffer, a constant that matched any list containing it.
+ *
+ * Revision 1.535  2026/08/14 14:04:52  dlr
+ * Fix SAP BCODE sum20, SAP PASSCODE5 width, AIX Judy key, DECBASE64 guards. BCODE sum20 took hashcat u32 byte-lane shifts as bit shifts, giving a wrong walld0rf length; correct value is the low 2 bits of the first five digest bytes. Coincidental agreement on 12-char usernames let 7701 pass while 7700 failed. PASSCODE5 kept 5 bytes; RFC_READ_TABLE returns half the hash, so 10. Zero-padding now derives from the width instead of testing for 5. AIX built no lookup key, so JSLG read an uninitialised buffer. DECBASE64 hashed an empty buffer on decode failure, matching md5 of empty string for every candidate. Verified against hashcat 7700 7701 7800 7801 8500 8501 14200.
+ *
  * Revision 1.534  2026/08/12 01:33:40  dlr
  * Fix build break on non-GPU targets introduced in 1.533. The lineswanted gate referenced gpu_ops[] directly, but that table lives inside ifdef GPU_ENABLED, so the plain macOS x86_64 target (no GPU backend) failed to compile with use of undeclared identifier gpu_ops. Replaced with op_can_reach_gpu(), defined in BOTH configurations: it scans gpu_ops[] under GPU_ENABLED and returns 0 otherwise, which is the honest answer when no GPU backend is compiled in -- nothing can reach a kernel, so every expensive type takes the CPU-only fan-out path. Caught by the release build, which covers configurations the .205 and dev1 development builds do not. Both regression fixtures re-validated after the refactor on fpga GTX 1080: PHPBB3 5000x20000 stays 4.9s against 55.9s regressed, SCRYPT 1800 salts by 290 words stays 272 percent CPU against 99 percent pre-1.531.
  *
@@ -5165,7 +5171,12 @@ struct MapHashcat {
     {3000, 379},  /* LM */
     {3100, 896},  /* 3100 | Oracle H: Type (Oracle 7+) */
     {3200, 450},  /* bcrypt */
-    {3500, 303},  /* 3500 | md5(md5(md5($pass))) */
+    /* 3500 is MD5 at iteration 3, exactly as 2600 above is MD5 at iteration 2.
+     * It had pointed at 303 MD5-2xMD5, which is h=md5(pass); md5(h . h) -- a
+     * different construction, so -m 3500 ran the wrong algorithm and found
+     * nothing. Verified: hashcat's vector 9882d0778518b095917eb589f6998441
+     * recovers as MD5x03. */
+    {3500, 1},    /* 3500 | md5(md5(md5($pass))) -> MD5 iter 3 */
     {3610, 356},  /* 3610 | md5(md5(md5($pass)).$salt) */
     {3710, 441},
     {3711, 863},  /* 3711 | MediaWiki B type */
@@ -5182,8 +5193,16 @@ struct MapHashcat {
     {4500, 8},
     {4510, 310},  /* 4510 | sha1(sha1($pass).$salt) */
     {4520, 520},
-    {4521, 579},  /* 4521 | Redmine -> SHA1SHA1PASSSALT */
-    {4522, 579},  /* 4522 | PunBB -> SHA1SHA1PASSSALT */
+    /* Redmine and PunBB are both sha1(salt . sha1(pass)) -- the same
+     * construction as 4520 directly above, which already points at 520. They
+     * had pointed at 579 SHA1SHA1PASSSALT, which is sha1(sha1(pass) . salt),
+     * the operands the other way round, so neither mode could ever match.
+     * Verified against hashcat's own vectors:
+     *   4521 c18e826af2a78c7b9b7261452613233417e65817:2824653572...
+     *   4522 9038129c474caa3f0de56f38db84033d0fe1d4b8:365563602032
+     * both recover with e520 and both fail with e579. */
+    {4521, 520},  /* 4521 | Redmine -> SHA1SALTSHA1PASS */
+    {4522, 520},  /* 4522 | PunBB -> SHA1SALTSHA1PASS */
     {4700, 160},
     {4710, 587},  /* 4710 | sha1(md5($pass).$salt) */
     {4711, 308},  /* 4711 | Huawei sha1(md5($pass).$salt) */
@@ -5199,7 +5218,11 @@ struct MapHashcat {
     {5700, 865},  /* 5700 | Cisco-IOS type 4 (SHA256) */
     {5720, 866},  /* 5720 | Cisco-ISE (SHA256, binary salt, 129 iter) */
     {5800, 867},  /* 5800 | Samsung Android Password/PIN  */
-    {6000, 118},
+    /* hashcat 6000 is RIPEMD-160. Type 118 RIPEMD is RIPEMD-128, so -m 6000
+     * silently ran a 128-bit algorithm against 160-bit hashes and could never
+     * match. 17 is RMD160. Verified: hashcat's vector
+     * 012cb9b334ec1aeb71a9c8ce85586082467f7eb6 recovers as RMD160x01. */
+    {6000, 17},   /* 6000 | RIPEMD-160 */
     {6050, 798},  /* 6050 | HMAC-RIPEMD160 (key = $pass) */
     {6060, 211},  /* 6060 | HMAC-RIPEMD160 (key = $salt) */
     {6100, 5},
@@ -7912,7 +7935,17 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [879] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* NSEC3 */
     [880] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* JUDYJ(JOB_WBB3) */
     [881] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* RACF */
-    [882] = TYPEOPT_NEEDSJ,  /* DOMINO5 */
+    /* DOMINO5 hashes a bare 32-hex digest and its dispatch ends in
+     * checkhash(), i.e. the compact hex table -- so it needs NEEDSF, the same
+     * flag MD5/SHA1/RMD160 carry. It was marked NEEDSJ, but no loader ever
+     * references lf[JOB_DOMINO5], so selecting it alone admitted nothing:
+     * "Searching through 0 unique hex hashes" and a guaranteed "None found".
+     * It only worked when some NEEDSF type happened to be selected alongside
+     * it, which pulled the hash into the table. That also made -m 8600
+     * useless, since the hashcat mode maps to this type on its own.
+     * The algorithm was never wrong -- verified by -z against the documented
+     * vector 173127311326bb6eeacdfef5c2791514 for password123. */
+    [882] = TYPEOPT_NEEDSF,  /* DOMINO5 */
     [883] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* DOMINO6 */
     [884] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* SCRYPT */
     [885] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* JUNIPERIVE (count-only, loads as md5crypt) */
@@ -13420,6 +13453,13 @@ do {
 	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	}
 	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+	/* Derive the two password-dependent values the inner loop consumes.
+	   These lived in the JSLF/while(PV) preamble that 1.174 replaced with
+	   the salt snapshot, and were dropped with it; without them curin and
+	   mdcur[0] are read uninitialised and every password hashes alike. */
+	mysha1((char *)cur,len,curin.h);
+	mysha1((char *)curin.h,20,mdcur[0].h);
+	hashcnt += 2;
 	{ int si;
 	for (si = 0; si < nsalts_job; si++) {
 	  x = saltsnap[si].saltlen;
@@ -13440,9 +13480,11 @@ do {
 		saltlen++;
 		s++;
 	      }
+	      if (saltlen + 15 + 20 > MAXLINE) continue;
 	      memcpy(newbuf,s1,saltlen);
-	      memcpy(newbuf+saltlen,mdcur[0].h,20);
-	      mysha1((char *)newbuf,saltlen+20,md5buf.h);
+	      memcpy(newbuf+saltlen,"r2chYO214w>1a32",15);
+	      memcpy(newbuf+saltlen+15,mdcur[0].h,20);
+	      mysha1((char *)newbuf,saltlen+15+20,md5buf.h);
 	      hashcnt++;
 	      md5buf.v[0] ^= curin.v[0];md5buf.v[1] ^= curin.v[1];
 	      md5buf.v[2] ^= curin.v[2];
@@ -15832,7 +15874,26 @@ nextbb:
                   }
                   JSLN(PV, TYPESALT(job->op), (unsigned char *)linebuf);
                 }
-                break;
+                /* Everything above only fires for a $2k$ salt. The ordinary
+                 * $2a$/$2b$/$2y$ form of this type is bcrypt(hexlower(sha256
+                 * (pass))) -- hashcat 30600, and what hx.8 has always
+                 * documented -- and nothing computed it, so those hashes could
+                 * never match. (The $2k$ block is the same construction as
+                 * e989 BCRYPTHMACSHA256, which has its own case just below;
+                 * it is kept here because $2k$ salts are routed to this type.)
+                 * cur/len are still the candidate password at this point: the
+                 * loop above only reads them. Hand off to BC_Start the way
+                 * BCRYPTMD5/BCRYPTSHA1/BCRYPTSHA512 do.
+                 * Verified against hashcat 30600
+                 * $2b$10$FxDtpTNaL303lLcWtd6LFO2U6Gc63VJ07qycHcfqbQQ71GhO/qSzu
+                 * with password "hashcat". */
+                if (len > MAXLINE)
+                  break;
+                hashcnt++;
+                mysha256((char *)cur, len, curin.h);
+                cur = prmd5(curin.h, newbuf, 64);
+                len = 64;
+                goto BC_Start;
 
               case JOB_BCRYPTHMACSHA256:
                 /* BCRYPTHMACSHA256 (30601):
@@ -18369,11 +18430,20 @@ md4utf16:
                 }
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
+                /* prmd5() writes its NUL terminator at out[len], so the salt
+                 * hex written at linebuf[0..31] lands a 0 on linebuf[32] --
+                 * the first character of the md5(pass) hex staged above. Save
+                 * and restore it, exactly as the e367 dispatch does (see the
+                 * "Fix prmd5 null-terminator bug in e367 dispatch" revision).
+                 * Without this, e603 hashes md5(salt)hex . NUL . md5(pass)hex[1:]
+                 * and cannot find hashes it previously cracked. */
+                char passmd5 = linebuf[32];
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
 		  mymd5(s1, saltlen, curin.h);
 		  prmd5(curin.h, linebuf, 32);
+		  linebuf[32] = passmd5;
 		  mysha1(linebuf, 64, md5buf.h);
                   for (x = 1; x <= Maxiter; x++) {
                     hashcnt++;
@@ -20816,6 +20886,15 @@ sha11saltmd5:
                             pa_match = (memcmp(pa_mac, checksum, 16) == 0);
                           }
                           if (pa_match) {
+                            /* Save the salt pointer before the compaction
+                             * below. The compaction does si-- , so with a
+                             * single salt si becomes -1 and the output printed
+                             * saltsnap[-1].salt -- an out-of-bounds read that
+                             * surfaced as "KRB5PA23 (null):password123", i.e.
+                             * a cracked hash with no way to match it back to
+                             * its input line. Same defect fixed earlier for
+                             * IPMI2 salt output. */
+                            const char *matched_salt = saltsnap[si].salt;
                             if (!Printall) {
                               PV_DEC(saltsnap[si].PV);
                               { Word_t *PV2;
@@ -20845,13 +20924,13 @@ sha11saltmd5:
                                 }
                               }
                               if (dohex) {
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), saltsnap[si].salt);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), matched_salt);
                                 prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                                 job->outlen += job->clen*2;
                                 job->outbuf[job->outlen++] = ']';
                                 job->outbuf[job->outlen++] = '\n';
                               } else
-                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), saltsnap[si].salt, job->pass);
+                                job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), matched_salt, job->pass);
                             }
                           }
                         }
@@ -24307,6 +24386,19 @@ sha11saltmd5:
                     aix_encode(curin.h, dlen, aix_enc);
                     { char jkey[256];
                       Word_t *PV2;
+                      /* Build the lookup key. The loader stores everything
+                       * AFTER the {sshaN} prefix, i.e. "NN$salt$encoded"
+                       * (mdxfind.c JSLI sites in load_hash_file), and the salt
+                       * snapshot holds the "NN$salt" part. This key was never
+                       * being formed: JSLG was called on an uninitialised
+                       * jkey[] and aix_enc was computed and discarded, so the
+                       * lookup could not match anything and the whole AIX
+                       * family silently found nothing -- loader fine, salts
+                       * loaded, "None found, sorry!". Verified against
+                       * {ssha1}/{ssha256}/{ssha512} vectors with password
+                       * "hashcat". */
+                      snprintf(jkey, sizeof(jkey), "%.*s$%s",
+                               saltlen, s1, aix_enc);
                       JSLG(PV2, *aixjudy, (unsigned char *)jkey);
                       if (Printall || (PV2 && *PV2 == 0)) {
                         if (!Printall) {
@@ -26205,6 +26297,8 @@ nextsalt1:
    		mymd5(cur, len, curin.h);
 	        cur = prmd5(curin.h, mdbuf, 32);
 		len = b64_decode(cur, linebuf,&cryptlen);
+		if (len <= 0)		/* defensive: see JOB_MD5DECBASE64 */
+		  break;
 		cur = linebuf;
                 x = 1;
                 goto MDstart;
@@ -26217,6 +26311,17 @@ nextsalt1:
 	        if (len > MAXLINE/2)
 		  break;
 		len = b64_decode(cur, linebuf,&cryptlen);
+		/* A failed base64 decode yields a zero-length buffer, and
+		 * hashing that produces md5("") = d41d8cd98f00b204e9800998ecf8427e
+		 * for EVERY candidate that fails to decode -- so any hash list
+		 * containing that value matched a flood of unrelated passwords
+		 * and reported them all. b64_decode() stops at the first
+		 * character outside the base64 alphabet, so ordinary passwords
+		 * (' 8981...', '_1898...', '1.0161...', anything with ':') decode
+		 * to nothing. A conversion that produced no output has failed;
+		 * do not proceed to the hash. */
+		if (len <= 0)
+		  break;
 		cur = linebuf;
                 x = 1;
                 goto MDstart;
@@ -26225,6 +26330,17 @@ nextsalt1:
 	        if (len > MAXLINE/2)
 		  break;
 		len = b64_decode(cur, linebuf,&cryptlen);
+		/* A failed base64 decode yields a zero-length buffer, and
+		 * hashing that produces md5("") = d41d8cd98f00b204e9800998ecf8427e
+		 * for EVERY candidate that fails to decode -- so any hash list
+		 * containing that value matched a flood of unrelated passwords
+		 * and reported them all. b64_decode() stops at the first
+		 * character outside the base64 alphabet, so ordinary passwords
+		 * (' 8981...', '_1898...', '1.0161...', anything with ':') decode
+		 * to nothing. A conversion that produced no output has failed;
+		 * do not proceed to the hash. */
+		if (len <= 0)
+		  break;
 		cur = linebuf;
                 x = 1;
                 goto SHA1_start;
@@ -27307,7 +27423,9 @@ md5sha256:
 #ifndef NOTINTEL
                     mymd5salt(SSEBUF, hashes);
                     for (y = 0; y < ljobi; y++) {
-                      if (ljob[y].len < 56) {
+                      /* Gate on actlen, matching the packing loop above -- see
+                         the note in the MD5AM/MD5AM2 dispatch. */
+                      if (actlen[y] < 56) {
                         curin.i[0] = f32[y];
                         curin.i[1] = f32[4 + y];
                         curin.i[2] = f32[8 + y];
@@ -27434,7 +27552,12 @@ md5sha256:
 #ifndef NOTINTEL
                       mymd5salt(SSEBUF, hashes);
                       for (y = 0; y < ljobi; y++) {
-                        if (ljob[y].len < 56) {
+                        /* Must match the packing gate above (actlen, not the
+                           password length): a lane whose assembled string was
+                           >= 56 took the scalar path and was never packed, so
+                           reading it back yields MD5 of the zeroed buffer -- a
+                           constant that "matches" any list containing it. */
+                        if (actlen[y] < 56) {
                           curin.i[0] = f32[y];
                           curin.i[1] = f32[4 + y];
                           curin.i[2] = f32[8 + y];
@@ -27480,12 +27603,19 @@ md5sha256:
                 }
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
+                /* prmd5() NUL-terminates at out[len], so writing the 40-char
+                 * salt hex at linebuf[0..39] drops a 0 on linebuf[40] -- the
+                 * first character of the sha1(pass) hex staged above. Save and
+                 * restore it, as the e367 dispatch does. Same defect class as
+                 * e603 and e440. */
+                char passsha1 = linebuf[40];
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   i = saltlen;
                   mysha1(s1, saltlen, mdcur[0].h);
                   prmd5(mdcur[0].h, linebuf, 40);
+                  linebuf[40] = passsha1;
                   mysha1(linebuf,40+40,curin.h);
                   hashcnt += Maxiter;
                   if (checkhashkey(&curin, 40, s1,job)) {
@@ -27524,12 +27654,20 @@ md5sha256:
                 }
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
+                /* As e715 above: the 40-char salt hex NUL-terminates onto
+                 * linebuf[40], clobbering the first character of the md5(pass)
+                 * hex. This is the NOTINTEL path only -- the SSE branch below
+                 * stages the salt hex in sha1saltbuf[] and is unaffected, so
+                 * before this fix x86 and ARM builds computed different
+                 * digests for the same type. */
+                char passmd5 = linebuf[40];
                 for (si = 0; si < nsalts_job; si++) {
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   i = saltlen;
                   mysha1(s1, saltlen, mdcur[0].h);
                   prmd5(mdcur[0].h, linebuf, 40);
+                  linebuf[40] = passmd5;
                   mymd5(linebuf,40+32,curin.h);
                   hashcnt += Maxiter;
                   if (checkhashkey(&curin, 32, s1,job)) {
@@ -29686,7 +29824,12 @@ sha1sha256:
               case JOB_SHA1SHA256:
 	      case JOB_SHA1SHA256UC:
                 mysha256(cur, len, curin.h);
-		if (job->op == JOB_SHA1SHA256UC || job->op == JOB_SHA1SHA256UCSHA256) 
+		/* JOB_SHA1SHA256UCSHA256SHA256 shares the goto sha1sha256 with
+		 * JOB_SHA1SHA256UCSHA256 but was missing from this test, so it
+		 * took the lowercase branch and computed the non-UC variant --
+		 * hashpipe identifies its output as SHA1SHA256SHA256SHA256. */
+		if (job->op == JOB_SHA1SHA256UC || job->op == JOB_SHA1SHA256UCSHA256 ||
+		    job->op == JOB_SHA1SHA256UCSHA256SHA256) 
                   cur = prmd5UC(curin.h, linebuf, 64);
 		else
                   cur = prmd5(curin.h, linebuf, 64);
@@ -33260,6 +33403,14 @@ HAV256_5_start:
 		for (si = 0; si < nsalts_job; si++) {
 		    /* saltsnap[si].salt = hex-encoded salt */
 		    int ssha_saltlen = saltsnap[si].saltlen / 2;
+		    /* Bound before use: ssha_out[256] holds a prefix plus
+		     * base64(digest . salt), which for SSHA512 overflows past a
+		     * 119-byte salt. This was unreachable only because
+		     * store_typesalt clamped every salt to 255 bytes; that clamp
+		     * is gone, so the bound has to be explicit. Real SSHA salts
+		     * are ~16 bytes. Skip rather than truncate -- a truncated
+		     * salt would silently produce a wrong digest. */
+		    if (ssha_saltlen > 96) continue;
 		    unsigned char ssha_salt[256];
 		    for (x = 0; x < ssha_saltlen; x++)
 		      ssha_salt[x] = (trhex[(unsigned char)saltsnap[si].salt[x*2]] << 4) | trhex[(unsigned char)saltsnap[si].salt[x*2+1]];
@@ -33305,6 +33456,14 @@ HAV256_5_start:
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		    int ssha_saltlen = saltsnap[si].saltlen / 2;
+		    /* Bound before use: ssha_out[256] holds a prefix plus
+		     * base64(digest . salt), which for SSHA512 overflows past a
+		     * 119-byte salt. This was unreachable only because
+		     * store_typesalt clamped every salt to 255 bytes; that clamp
+		     * is gone, so the bound has to be explicit. Real SSHA salts
+		     * are ~16 bytes. Skip rather than truncate -- a truncated
+		     * salt would silently produce a wrong digest. */
+		    if (ssha_saltlen > 96) continue;
 		    unsigned char ssha_salt[256];
 		    for (x = 0; x < ssha_saltlen; x++)
 		      ssha_salt[x] = (trhex[(unsigned char)saltsnap[si].salt[x*2]] << 4) | trhex[(unsigned char)saltsnap[si].salt[x*2+1]];
@@ -33349,6 +33508,14 @@ HAV256_5_start:
 		{ int si;
 		for (si = 0; si < nsalts_job; si++) {
 		    int ssha_saltlen = saltsnap[si].saltlen / 2;
+		    /* Bound before use: ssha_out[256] holds a prefix plus
+		     * base64(digest . salt), which for SSHA512 overflows past a
+		     * 119-byte salt. This was unreachable only because
+		     * store_typesalt clamped every salt to 255 bytes; that clamp
+		     * is gone, so the bound has to be explicit. Real SSHA salts
+		     * are ~16 bytes. Skip rather than truncate -- a truncated
+		     * salt would silently produce a wrong digest. */
+		    if (ssha_saltlen > 96) continue;
 		    unsigned char ssha_salt[256];
 		    for (x = 0; x < ssha_saltlen; x++)
 		      ssha_salt[x] = (trhex[(unsigned char)saltsnap[si].salt[x*2]] << 4) | trhex[(unsigned char)saltsnap[si].salt[x*2+1]];
@@ -35771,8 +35938,16 @@ HAV256_5_start:
                     int salt_len = saltsnap[si].saltlen;
                     /* Copy initial hex digest to working buffer */
                     memcpy(linebuf, mdbuf, 128);
-                    /* 10000 iterations of SHA512 */
-                    for (x = 0; x < 10000; x++) {
+                    /* ROUNDS_SYMFONY is 10000 but the loop runs
+                     * ROUNDS_SYMFONY - 1 times: hashcat sets
+                     * salt->salt_iter = ROUNDS_SYMFONY - 1, and the initial
+                     * SHA512(pass) above is the first round. This ran the full
+                     * 10000, i.e. one extra iteration, so every Symfony hash
+                     * came out wrong. The type's own test vector was generated
+                     * by this same loop and so agreed with it.
+                     * Verified against hashcat 35800
+                     * e65e9e4f...05ca0c9c:3fd6486e...952c15b5 / "hashcat". */
+                    for (x = 0; x < 9999; x++) {
                       if (x > 4999) {
                         /* SHA512(hex128 + salt) */
                         memcpy(linebuf + 128, salt_str, salt_len);
@@ -35786,7 +35961,7 @@ HAV256_5_start:
                     /* Final SHA256(hex128) */
                     mysha256(linebuf, 128, md5buf.h);
                     prmd5(md5buf.h, newbuf, 64);
-                    hashcnt += 10001;
+                    hashcnt += 10000;   /* 1 initial SHA512 + 9999 loop + 1 SHA256 */
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SYMFONY256), (unsigned char *)newbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
@@ -37052,11 +37227,25 @@ HAV256_5_start:
                     sb_md5len += sp_slen;
                     mymd5(sb_md5in, sb_md5len, curin.h);
                     /* walld0rf_magic */
-                    { unsigned int sum20 = ((curin.h[0] >> 0) & 3)
-                                         + ((curin.h[0] >> 2) & 3)
-                                         + ((curin.h[1] >> 0) & 3)
-                                         + ((curin.h[1] >> 2) & 3)
-                                         + ((curin.h[2] >> 2) & 3);
+                    /* sum20 is the low 2 bits of each of the FIRST FIVE BYTES
+                     * of the digest. hashcat expresses this over u32 words as
+                     * (d[0]>>0)&3, (d[0]>>8)&3, (d[0]>>16)&3, (d[0]>>24)&3,
+                     * (d[1]>>0)&3 -- those shifts select byte lanes, not bits.
+                     * They were transcribed here as >>2 byte shifts, which
+                     * reads bits 0-1 and 2-3 of bytes 0 and 1 plus bits 2-3 of
+                     * byte 2. Wrong sum20 means a wrong walld0rf buffer length,
+                     * so the second MD5 covers the wrong span and the result is
+                     * wrong -- except when the two formulas happen to agree,
+                     * which they do for the 12-char username in hashcat's 7701
+                     * vector. That coincidence let BCODE4 and the catalog
+                     * example pass while 7700 (user "USER") failed.
+                     * Verified against hashcat 7700 USER$C8B48F26B87B7EA7 and
+                     * 7701 027642760180$77EC386300000000, password "hashcat". */
+                    { unsigned int sum20 = (curin.h[0] & 3)
+                                         + (curin.h[1] & 3)
+                                         + (curin.h[2] & 3)
+                                         + (curin.h[3] & 3)
+                                         + (curin.h[4] & 3);
                       sum20 |= 0x20;
                       unsigned int i1 = 0, i2 = 0, i3 = 0;
                       memset(sb_tbuf, 0, 64);
@@ -37201,7 +37390,16 @@ HAV256_5_start:
                 }
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
-                  int sp_cmpbytes = (job->op == JOB_SAP_PASSCODE) ? 20 : 5;
+                  /* RFC_READ_TABLE returns HALF the stored hash, so the
+                   * truncated variants keep half as many bytes: BCODE 8 -> 4
+                   * (e923) and PASSCODE 20 -> 10 (e925). This was 5, i.e. half
+                   * again, so every 7801 hash failed to match while the full
+                   * 7800 value it derives from was computed correctly.
+                   * Verified against hashcat 7801
+                   * 604020408266$32837BA7B97672BA4E5A00000000000000000000.
+                   * NOTE: the type name says 5 but the correct width is 10;
+                   * the name is kept for catalog stability. */
+                  int sp_cmpbytes = (job->op == JOB_SAP_PASSCODE) ? 20 : 10;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     int sp_slen = saltsnap[si].saltlen;
@@ -37231,9 +37429,13 @@ HAV256_5_start:
                     hashcnt += 2;
                     /* Hex encode — full 40 hex for both types (JudyJ stores full hash) */
                     prmd5(curin.h, mdbuf, 40);
-                    /* For PASSCODE5, zero out bytes 5-19 for the JudyJ lookup */
-                    if (sp_cmpbytes == 5)
-                      memset(mdbuf + 10, '0', 30);
+                    /* For the truncated variant, zero the tail for the JudyJ
+                     * lookup. Derived from sp_cmpbytes rather than hardcoded:
+                     * this tested "== 5" and so silently stopped padding at all
+                     * when the width was corrected to 10, turning a wrong-answer
+                     * bug into a no-match bug. */
+                    if (sp_cmpbytes < 20)
+                      memset(mdbuf + sp_cmpbytes * 2, '0', 40 - sp_cmpbytes * 2);
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
@@ -42952,15 +43154,61 @@ static void commit_compact(int hlen) {
 }
 
 /* Store a salt string (or substring) into Typesalt[job] Judy array */
+/* Store a salt in the per-type Typesalt Judy.
+ *
+ * This silently truncated any salt of 256 bytes or more to 255. The JudyJ hash
+ * key built by the loaders keeps the FULL salt, so for a long salt the two
+ * disagreed: the compute path recovered a truncated salt from the snapshot,
+ * hashed the wrong message, and produced a value that could never match the
+ * stored key. IPMI2-SHA1 and IPMI2-MD5 carry RAKP blobs well over 255 bytes
+ * (hashcat's 7300 vector is 316), so both were unfindable -- the hash loaded,
+ * the salt loaded, and every candidate simply failed to match.
+ *
+ * Truncation is never the desired behaviour here, so the buffer now follows
+ * the salt. The consumers are sized for it already: tsalt is MAXLINE and
+ * saltpool is allocated from the measured Judy key lengths. */
+/* Upper bound on a stored salt. The old limit was 256, which silently cut
+ * IPMI2's 316-byte RAKP blob and the KRB5TGS23 blob. No known type needs
+ * anywhere near this, but the ceiling is deliberately generous because an
+ * as-yet-unsupported type could carry a longer salt, and a bound that is too
+ * tight fails the same silent way the 256 did. Salts beyond this are refused
+ * with a one-time diagnostic rather than truncated: a truncated salt hashes
+ * the wrong message and reports "not found" on a hash that should have
+ * cracked, which is indistinguishable from a genuine miss. */
+#define MAXSALTLEN 4096
+
 static int store_typesalt(int job, const char *src, int slen) {
-    char ts[256];
+    static int oversize_warned = 0;
+    char stackts[256];
+    char *ts = stackts;
     Word_t *PV;
-    if (slen >= 256) slen = 255;
+    int ret = 0;
+    if (slen < 0) slen = 0;
+    if (slen > MAXSALTLEN) {
+        if (!oversize_warned) {
+            oversize_warned = 1;
+            fprintf(stderr,
+                "Warning: salt of %d bytes for type %d exceeds MAXSALTLEN %d; "
+                "salt not loaded. Hashes using it cannot be found. "
+                "Raise MAXSALTLEN in %s if this type is legitimate.\n",
+                slen, job, MAXSALTLEN, __FILE__);
+        }
+        return 0;
+    }
+    if (slen >= (int)sizeof(stackts)) {
+        ts = malloc(slen + 1);
+        if (!ts) {
+            fprintf(stderr, "%s:%d: store_typesalt: malloc of %d bytes failed: %s\n",
+                    __FILE__, __LINE__, slen + 1, strerror(errno));
+            exit(1);
+        }
+    }
     memcpy(ts, src, slen);
     ts[slen] = 0;
     JSLI(PV, TYPESALT(job), (unsigned char *)ts);
-    if (PV) { if ((*PV)++ == 0) return 1; }
-    return 0;
+    if (PV) { if ((*PV)++ == 0) ret = 1; }
+    if (ts != stackts) free(ts);
+    return ret;
 }
 
 /* Load structured hash formats from a file into Judy arrays.
@@ -48079,6 +48327,8 @@ union HashU curin;
           } else {
             if ((y == 4500 || y == 2600 || y == 2630 || y == 34400 || y == 21000 || y == 21400) && Maxiter < 2)
               Maxiter = 2;
+            if (y == 3500 && Maxiter < 3)
+              Maxiter = 3;
             if (y == 14400 && Maxiter < 10)
               Maxiter = 10;
             /* Default salts for modes 24/124/125 deferred to post-load */
@@ -48666,6 +48916,8 @@ badrule:
             }
             if ((y == 4500 || y == 2600 || y == 2630 || y == 34400 || y == 21000 || y == 21400) && Maxiter < 2)
               Maxiter = 2;
+            if (y == 3500 && Maxiter < 3)
+              Maxiter = 3;
             if (y == 14400 && Maxiter < 10)
               Maxiter = 10;
             /* Default salts for modes 24/124/125 deferred to post-load */

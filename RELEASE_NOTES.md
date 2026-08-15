@@ -1,3 +1,31 @@
+# mdxfind v1.536 — Four types were computing the wrong hash; one had stopped using the password entirely
+
+Source: mdxfind.c rev 1.534 → 1.536.
+
+Every hash type was cross-checked against hashpipe, and where the two disagreed, against live cracks and an independent implementation. **If you have run `-m e535`, `-m e584`, `-m e603`, `-m e715` or `-m e440`, re-run them** — those types were not computing what they claimed, so a negative result from them means nothing.
+
+## Fixes
+
+**SHA1-CUSTOMUSERSALT (`-m e535`) ignored the password.** It hashed a constant per username, so `password123`, `hunter2` and `abc` all produced the same value. Two lines deriving `sha1(pass)` and `sha1(sha1(pass))` lived inside the Judy-walk preamble that the per-job salt-snapshot conversion replaced wholesale in rev 1.174; the replacement carried the loop but not the computation. Nothing warned, because both variables stayed declared and read — the type went on emitting stable, plausible hex for two and a half years. Restored to its original construction, including the pepper that a separate change had dropped two revisions earlier.
+
+**`-m e584` computed a different type's hash.** The uppercase test omitted `SHA1SHA256UCSHA256SHA256`, so it produced the non-uppercase variant. Anything it found was really `-m e614`. Twenty-one crack files were mislabelled as a result and have been renamed.
+
+**Three types truncated a staged digest.** `prmd5()` writes its hex *and* a NUL at `out[len]`, so staging one digest next to another in the same buffer destroys the first byte of the neighbour. `-m e603` (a regression — it could no longer find hashes it had cracked before), `-m e715`, and `-m e440`, where only the non-SSE branch was affected, meaning x86 and ARM builds had been computing different digests for the same type.
+
+**MD5AM, MD5AM2 and MD5SPECAM emitted a constant.** The SSE batch packs a lane only when the assembled string fits, but the readback tested the *password* length. A lane that took the scalar path was never packed, so reading it back returned MD5 of the zeroed buffer — one fixed value, emitted for every password, that would "crack" any list containing it.
+
+**Salts longer than 255 bytes were silently truncated** rather than rejected, quietly corrupting any type whose salt exceeded the buffer. Salts now use a 4096-byte limit with a heap fallback, and anything beyond it is refused with a warning naming the type rather than mangled. This made a latent stack overflow in the SSHA paths reachable, so those are now bounds-checked.
+
+**Four hashcat modes mapped to the wrong type and could never match.** `-m 3500` pointed at `md5(h . h)` instead of MD5 at iteration 3. `-m 4521` (Redmine) and `-m 4522` (PunBB) pointed at `sha1(sha1(pass) . salt)` — the operands the wrong way round. `-m 6000` ran RIPEMD-128 against RIPEMD-160 hashes. All four verified against hashcat's own published vectors.
+
+**`-m 8600` (DOMINO5) admitted no hashes when selected alone.** It was flagged for the Judy loader, but no loader references it, so the hash table came up empty and the run reported "None found". It only appeared to work when some other type happened to be selected alongside it. The algorithm was never wrong.
+
+Also: SAP BCODE checksum and PASSCODE compare width, BCRYPT256's final round, SYMFONY256's iteration count, and a KRB5PA23 salt read that ran off the front of the array.
+
+## Documentation
+
+`docs/HASH_TYPES.md` now covers all 1001 types, 998 with a verified example. Each example was fed back through hashpipe pinned to its own type, so the table cannot list a value that no longer computes. The three without one are the two evaluation instruments and the MD5SPECAM parsing wrapper, for which no example is possible.
+
 # mdxfind v1.534 — Fixes an 11x dispatch regression in v1.531/v1.532, and gives SHA-256 a hardware path on every architecture
 
 Source: mdxfind.c rev 1.532 → 1.534; mymd5.c rev 1.34 → 1.35; mdxfind.h rev 1.24 → 1.25; sha1_shani.c rev 1.1 → 1.2.
