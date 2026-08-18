@@ -1,3 +1,40 @@
+# mdxfind v1.537 — Six hash types compared 1-3 bytes short, producing false positives and output no other tool would accept
+
+Source: mdxfind.c rev 1.536 → 1.537.
+
+**If you have cracked MSSQL2000, MSSQL2005, MSSQL2012, HMAILSERVER, SYBASE-ASE or ARUBAOS hashes, re-verify them.** Those six were matched on a truncated comparison, and the plaintexts mdxfind reported for them may be wrong. Their found-lines were also short and will not validate in hashcat or hashpipe.
+
+## The defect
+
+The compact-table loader rounded each stored hash length **down** to a 4-byte boundary, so the GPU's 4×uint32 probe could never read past the end of an entry. It then recorded that rounded value as the hash's length — directly under a comment asserting the real length was preserved. It was not: the true length was computed and used only to advance the input cursor.
+
+Every hash whose byte length is not a multiple of 4 was therefore compared short, and the same wrong length was returned as the match length, which drives both the comparison and the width of the printed result. One misplaced assignment, three symptoms.
+
+| type | hashcat | bytes | compared | lost |
+|---|---|---:|---:|---:|
+| HMAILSERVER | 1421 | 35 | 32 | **3** |
+| MSSQL2000 | 131 | 46 | 44 | 2 |
+| MSSQL2005 | 132 | 26 | 24 | 2 |
+| MSSQL2012 | 1731 | 70 | 68 | 2 |
+| SYBASE-ASE | 8000 | 42 | 40 | 2 |
+| ARUBAOS | 125 | 25 | 24 | **1** |
+
+**False positives.** Any two hashes agreeing on the compared prefix were indistinguishable. ARUBAOS is the worst case at one byte lost — roughly one collision in 256. Feeding a correct hash and a copy with a deliberately wrong final byte, mdxfind read two hashes and reported one, having merged them.
+
+**Unusable output.** A canonical mode-1731 hash came back two bytes shorter than it went in, so the result could not be resubmitted or re-verified anywhere else. That is how this was found.
+
+## The fix
+
+The stored buffer is still padded up to a 4-byte boundary with a 16-byte minimum, so the GPU probe still cannot spill into the following entry. Only the *recorded* length changes, from the rounded value to the real one.
+
+The change is provably identity whenever a length is already a multiple of 4 — same recorded length, same copy, same buffer advance — so no type outside those six can move.
+
+## Verification
+
+All six now round-trip byte-for-byte and reject a corrupted final byte, on macOS ARM64 and Linux x86-64. Forty aligned types were re-checked and are unchanged.
+
+The GPU path needed its own test, because the rounding existed for the GPU in the first place. These six have no GPU kernel, so forcing `-G` on them proves nothing — the meaningful case is a mixed hash list, since the length table is uploaded whole rather than per type. A compact table holding a 70-byte MSSQL2012 entry alongside a GPU-dispatched MD5 runs correctly on a GTX 1080, with both hashes found and the MSSQL2012 line at full canonical length.
+
 # mdxfind v1.536 — Four types were computing the wrong hash; one had stopped using the password entirely
 
 Source: mdxfind.c rev 1.534 → 1.536.

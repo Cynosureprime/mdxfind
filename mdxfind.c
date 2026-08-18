@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.536 2026/08/15 03:09:15 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.537 2026/08/18 15:16:41 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.536 2026/08/15 03:09:15 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.537 2026/08/18 15:16:41 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.537  2026/08/18 15:16:41  dlr
+ * Record the real hash length in the compact table. The loader rounded the stored length DOWN to a 4-byte boundary for the GPU 4xuint32 probe and then recorded that rounded value, despite the comment above it asserting the real length was kept. Any hash whose byte length is not a multiple of 4 was therefore compared 1 to 3 bytes short, and hybrid_check returned the short length as match_len, which drove both the memcmp and the print width. Six types are affected: HMAILSERVER 35 bytes lost 3, ARUBAOS 25 lost 1, MSSQL2000 46, MSSQL2005 26, MSSQL2012 70 and SYBASE-ASE 42 each lost 2. Consequences were silent false positives (ARUBAOS matched on 24 of 25 bytes, so roughly one in 256), distinct hashes collapsing to one entry, and output that no other tool would validate: a canonical hashcat mode 1731 hash came back 2 bytes short and could not be resubmitted. The stored buffer is still padded up to a 4-byte boundary with a 16-byte minimum so the GPU probe cannot spill into the next entry; only the recorded length changes. Provably identity when the length is already a multiple of 4, so no other type can move. Verified on macOS ARM64 and Linux x86-64: all six round-trip byte-for-byte and now reject a corrupted final byte, 40 aligned types unchanged, and a mixed compact table holding a 70-byte entry alongside a GPU-dispatched MD5 runs correctly on the GTX 1080.
+ *
  * Revision 1.536  2026/08/15 03:09:15  dlr
  * Hash-type correctness pass. Maphashcat: 3500 to MD5 iter 3 (was 303 MD5-2xMD5), 4521/4522 Redmine/PunBB to 520 SHA1SALTSHA1PASS (were 579, operands reversed), 6000 to 17 RMD160 (was 118 RIPEMD-128). DOMINO5 882 to NEEDSF; as NEEDSJ no loader admitted it and selecting it alone always found nothing. store_typesalt no longer truncates silently at 255 bytes: MAXSALTLEN 4096, heap fallback above 256, one-time warning and refusal beyond; SSHA saltlen guards added since the fix made a latent stack overflow reachable. SAP BCODE sum20 and PASSCODE5 compare width corrected. BCRYPT256 final sha256 round; SYMFONY256 iteration count. KRB5PA23 reads the matched salt before compaction. prmd5 NUL-clobber fixed in e603, e715 and e440; e440 had diverged x86 vs ARM. e584 lacked its op in the uppercase test and computed the non-UC type, mislabelling 21 crack files. e535 SHA1-CUSTOMUSERSALT restored to the 1.110 construction: 1.174 dropped the two lines deriving sha1(pass) and sha1(sha1(pass)) along with the JSLF preamble it replaced, so the type ignored the password entirely and hashed a constant per username; pepper and a bounds guard restored. MD5AM, MD5AM2 and MD5SPECAM SSE readback now gates on actlen to match the packing loop, so a lane whose assembled string reached 56 bytes and took the scalar path is no longer read back as MD5 of the zeroed buffer, a constant that matched any list containing it.
  *
@@ -39397,22 +39400,27 @@ MDXALIGN void addhash(void *dummy) {
        * to 16 bytes so the GPU 4xuint32 probe never spills into the next entry.
        * HashDataLen[i] keeps the real length (CPU memcmp is unaffected). */
       { int rawlen = len;
-        len &= ~3;
-        if (len < 8) { cur += rawlen; continue; }
+        int padlen;
+        if (rawlen < 8) { cur += rawlen; continue; }
+        /* Pad the STORED buffer up to a 4-byte boundary (16 minimum) so the GPU
+         * 4xuint32 probe never spills into the next entry, but record the REAL
+         * length. Rounding the recorded length DOWN to the alignment made every
+         * hash whose byte length is not a multiple of 4 compare short: MSSQL2012
+         * is 70 bytes and was matched on 68, so any two hashes agreeing in the
+         * first 68 bytes were indistinguishable, and the emitted line was 2
+         * bytes shorter than the input and validated nowhere else. */
+        padlen = (rawlen + 3) & ~3;
+        if (padlen < 16) padlen = 16;
         HashDataOff[HashDataCount] = HashDataBufUsed;
-        HashDataLen[HashDataCount] = len;
+        HashDataLen[HashDataCount] = rawlen;
         HashDataFlags[HashDataCount] = 0;
-        memcpy(HashDataBuf + HashDataBufUsed, cur, len);
-        if (len < 16) {
-          memset(HashDataBuf + HashDataBufUsed + len, 0, 16 - len);
-          HashDataBufUsed += 16;
-        } else {
-          HashDataBufUsed += len;
-        }
+        memcpy(HashDataBuf + HashDataBufUsed, cur, rawlen);
+        memset(HashDataBuf + HashDataBufUsed + rawlen, 0, padlen - rawlen);
+        HashDataBufUsed += padlen;
         HashDataCount++;
 
-        if (len < minhashlenl)
-          minhashlenl = len;
+        if (rawlen < minhashlenl)
+          minhashlenl = rawlen;
         insizel++;
         cur += rawlen;
       }
