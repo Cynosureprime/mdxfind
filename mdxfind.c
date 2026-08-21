@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.537 2026/08/18 15:16:41 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.539 2026/08/21 17:44:58 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.537 2026/08/18 15:16:41 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.539 2026/08/21 17:44:58 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.539  2026/08/21 17:44:58  dlr
+ * 7ZIP e1000 tier 2 refinement. A tier 2 miss is no longer treated as a refutation when a real decompressor reached the expected output length: that means the plaintext was genuine and a filter was erased from the type field, not that the password is wrong. Measured on ARM64 plus LZMA2 with the correct password, LZMA2 decompresses cleanly and the CRC still differs, and the previous rule rejected it. Such a result now contributes 32 bits of evidence instead. LZMA2 additionally retries with a 16MB window when the declared property byte belongs to an erased Delta filter rather than to LZMA2. Restores correct handling of ARM64 and Delta filtered archives while still refuting the reported false positives.
+ *
+ * Revision 1.538  2026/08/21 17:23:06  dlr
+ * 7ZIP e1000: load-time triage plus tiered verification. The loader now rejects records that cannot be decided and says why - malformed field count, declared vs actual salt and iv lengths, non-hex fields, log2 above 40, the 0x3F special-case KDF, padsize out of range, fewer than two ciphertext blocks with an incomplete stream, a line past MAXLINE that therefore arrived truncated, and padsize 0 with no complete stream. Rejections are counted, capped at ten messages, and excluded from the searched-archive total. Evidence below 32 bits warns with the expected false-positive rate. New capability: type 128 truncated records load via iv followed by data as the 32-byte tail, and a complete single-block archive is now usable because the archive iv supplies the CBC predecessor. SevenZipRec now retains crc_len, coder attributes, iv, head block and the full stream. Adds tier 1 head-structure checks and tier 2 decompress plus CRC32 with a codec oracle over stored, LZMA2, LZMA1, Deflate and BZip2, each also tried under inverse ARM64 and Delta filters; a tier 2 miss refutes only when the declared codec is implemented and no preprocessor is declared, otherwise it is no opinion. Tunable via MDXFIND_7Z_MIN_BITS and MDXFIND_7Z_STRICT. -z gains HEADBITS, TIER2, CODEC and BITS. Eliminates the four reported false positives at padsize 1 and fixes two silent misses at padsize 0; validated by tools/7z_validate.sh at 18 of 19 archives cracked and independently confirmed with 7zz t, zero false positives.
+ *
  * Revision 1.537  2026/08/18 15:16:41  dlr
  * Record the real hash length in the compact table. The loader rounded the stored length DOWN to a 4-byte boundary for the GPU 4xuint32 probe and then recorded that rounded value, despite the comment above it asserting the real length was kept. Any hash whose byte length is not a multiple of 4 was therefore compared 1 to 3 bytes short, and hybrid_check returned the short length as match_len, which drove both the memcmp and the print width. Six types are affected: HMAILSERVER 35 bytes lost 3, ARUBAOS 25 lost 1, MSSQL2000 46, MSSQL2005 26, MSSQL2012 70 and SYBASE-ASE 42 each lost 2. Consequences were silent false positives (ARUBAOS matched on 24 of 25 bytes, so roughly one in 256), distinct hashes collapsing to one entry, and output that no other tool would validate: a canonical hashcat mode 1731 hash came back 2 bytes short and could not be resubmitted. The stored buffer is still padded up to a 4-byte boundary with a 16-byte minimum so the GPU probe cannot spill into the next entry; only the recorded length changes. Provably identity when the length is already a multiple of 4, so no other type can move. Verified on macOS ARM64 and Linux x86-64: all six round-trip byte-for-byte and now reject a corrupted final byte, 40 aligned types unchanged, and a mixed compact table holding a 70-byte entry alongside a GPU-dispatched MD5 runs correctly on the GTX 1080.
  *
@@ -2457,31 +2463,323 @@ static __thread size_t cmiyc_tls_bufsz;
  * ------------------------------------------------------------------ */
 struct SevenZipRec {
   char group[96];            /* KDF group key: saltlen:salthex:log2 */
-  unsigned char tail[32];    /* final two ciphertext blocks */
-  int padsize;               /* packedlen - unpackedlen */
+  unsigned char tail[32];    /* final two ciphertext blocks; tail[0..15] is the
+                              * CBC IV for tail[16..31] */
+  unsigned char head[32];    /* first two ciphertext blocks (tier 1) */
+  unsigned char iv[16];      /* archive IV -- decrypts from offset 0 */
+  unsigned char *attrs;      /* coder properties, NULL when absent */
+  unsigned char *data;       /* whole ciphertext stream, NULL when tail-only */
   char *line;                /* full input line: JudyJ key + output */
+  long datalen;              /* bytes in data */
+  long packed, unpacked;     /* declared lengths */
+  long crc_len;              /* bytes the stored CRC32 covers; 0 when absent */
+  unsigned int crc;          /* stored CRC32 */
+  int attrlen;
+  int type;                  /* $7z$ data type indicator -- see hx.8 / the spec */
+  int padsize;               /* packedlen - unpackedlen, 0..15 */
+  int bits;                  /* tier-0 evidence strength, 8 * padsize */
+  int havehead;              /* head[] is populated */
+  int tier2;                 /* whole stream retained -> decompress+CRC possible */
 };
 static struct SevenZipRec *SevenZipRecs = NULL;
 static int SevenZipCount = 0, SevenZipCap = 0;
+/* Load-time triage tally, reported once after the hash file is read. */
+static long SevenZipRejected = 0, SevenZipWarned = 0, SevenZipNoisy = 0;
 
-static void sevenzip_addrec(const char *group, const unsigned char *tail,
-                            int padsize, const char *line) {
+/* Largest log2(iterations) the KDF loop will actually run. 2^40 already takes
+ * geological time; anything above it is a corrupt or hostile record, and 0x3F
+ * is the format's "no hashing" special case, which needs a different KDF. */
+#define SEVENZIP_MAX_LOG2 40
+/* Tier-0-only records below this many bits are warned about (and rejected when
+ * MDXFIND_7Z_STRICT is set). 32 keeps the expected false-positive count under
+ * one for any run up to 4.3e9 candidates, and matches 7z2john.pl's own
+ * "length_difference > 3" threshold for trusting the padding attack. */
+static long SevenZipMinBits = 32;
+static int  SevenZipStrict = 0;
+/* Per-line reject messages are capped so a bad file cannot flood the terminal;
+ * the tally at the end is always printed in full. */
+#define SEVENZIP_MAX_REJECT_MSGS 10
+static long SevenZipRejectMsgs = 0;
+
+static void sevenzip_reject(const char *why, const char *line) {
+  SevenZipRejected++;
+  if (SevenZipRejectMsgs < SEVENZIP_MAX_REJECT_MSGS) {
+    SevenZipRejectMsgs++;
+    fprintf(stderr, "7ZIP: rejected (%s): %.72s%s\n",
+            why, line, strlen(line) > 72 ? "..." : "");
+  } else if (SevenZipRejectMsgs == SEVENZIP_MAX_REJECT_MSGS) {
+    SevenZipRejectMsgs++;
+    fprintf(stderr, "7ZIP: further rejections suppressed; see the summary\n");
+  }
+}
+
+/* Returns a zeroed slot for the caller to fill. Returning the slot rather than
+ * taking a dozen arguments keeps the loader readable as the record grows. */
+static struct SevenZipRec *sevenzip_addrec(void) {
   if (SevenZipCount >= SevenZipCap) {
     int nc = SevenZipCap ? SevenZipCap * 2 : 16;
     struct SevenZipRec *nr = realloc(SevenZipRecs, nc * sizeof(*nr));
     if (!nr) { fprintf(stderr, "Failed to grow 7zip record table\n"); exit(1); }
     SevenZipRecs = nr; SevenZipCap = nc;
   }
-  { struct SevenZipRec *r = &SevenZipRecs[SevenZipCount];
-    snprintf(r->group, sizeof(r->group), "%s", group);
-    memcpy(r->tail, tail, 32);
-    r->padsize = padsize;
-    r->line = strdup(line);
-    if (!r->line) { fprintf(stderr, "Failed to store 7zip hash line\n"); exit(1); }
+  { struct SevenZipRec *r = &SevenZipRecs[SevenZipCount++];
+    memset(r, 0, sizeof(*r));
+    return r;
   }
-  SevenZipCount++;
 }
 
+
+/* ------------------------------------------------------------------
+ * 7-Zip verification tiers.  See MDXFIND-7Z-SPEC.md section 4.4.
+ *
+ * Tier 0 (zero-pad) is in the hot path and stays inline in procjob. The
+ * routines below are tiers 1 and 2, which run ONLY after tier 0 has passed --
+ * i.e. about once per 2^(8*padsize) candidates -- so their cost is irrelevant
+ * to throughput and correctness is the only thing that matters here.
+ * ------------------------------------------------------------------ */
+
+/* Per-thread scratch for the tier-2 decrypt and decompress. Grown on demand
+ * and kept, so a run that trips tier 2 often does not malloc per candidate. */
+static __thread unsigned char *sz_plain_buf;   static __thread size_t sz_plain_sz;
+static __thread unsigned char *sz_unp_buf;     static __thread size_t sz_unp_sz;
+static __thread unsigned char *sz_work_buf;    static __thread size_t sz_work_sz;
+#define SEVENZIP_MAX_UNPACK (16u * 1024u * 1024u)   /* refuse decompression bombs */
+
+static unsigned char *sz_grow(unsigned char **b, size_t *have, size_t want) {
+  if (*have >= want && *b) return *b;
+  { unsigned char *n = realloc(*b, want);
+    if (!n) return NULL;
+    *b = n; *have = want; return n; }
+}
+
+/* ---- tier 1: is the decrypted HEAD consistent with the declared type? ----
+ * Returns bits of evidence gained, 0 for "no opinion", or -1 for "the head
+ * contradicts the type", which is a definitive reject.
+ *
+ * The strongest case is an -mhe=on archive, whose plaintext IS a raw 7z
+ * header: measured across Copy/LZMA2/Deflate64/BZip2 archives, 14 of the
+ * first 16 bytes are constant. We check only the structural prefix, not the
+ * measured constants, so this stays correct for archive shapes not sampled. */
+static int sevenzip_head_bits(const struct SevenZipRec *r, const unsigned char *p) {
+  int lownib = r->type & 0x0f;
+  int prepro = (r->type >> 4) & 0x07;
+
+  /* kHeader(0x01) followed by kMainStreamsInfo(0x04) or kFilesInfo(0x05):
+   * an encrypted-header archive, whatever its codec. */
+  if (p[0] == 0x01 && (p[1] == 0x04 || p[1] == 0x05)) return 16;
+
+  if (prepro) return 0;              /* filtered: head is not the codec's */
+  switch (lownib) {
+    case 1:                          /* LZMA1: range coder init byte is 0 */
+      return p[0] == 0x00 ? 8 : -1;
+    case 2:                          /* LZMA2: control byte 1,2 or 0x80..0xff */
+      if (p[0] == 0x01 || p[0] == 0x02 || p[0] >= 0x80) return 5;
+      return -1;
+    case 6:                          /* BZip2: "BZh" + level '1'..'9' */
+      if (p[0]=='B' && p[1]=='Z' && p[2]=='h' && p[3]>='1' && p[3]<='9') return 32;
+      return -1;
+    case 7:                          /* Deflate: BTYPE 3 is reserved/invalid */
+      return ((p[0] >> 1) & 3) == 3 ? -1 : 2;
+    default:
+      return 0;                      /* type 0: stored, or a codec we cannot name */
+  }
+}
+
+/* ---- decompressors, each returning bytes produced (0 on failure) ---- */
+
+static size_t sz_try_lzma(int lzma2, const unsigned char *props, int proplen,
+                          const unsigned char *in, size_t inlen,
+                          unsigned char *out, size_t outcap) {
+  lzma_filter filt[2];
+  lzma_stream strm = LZMA_STREAM_INIT;
+  size_t produced = 0;
+  filt[0].id = lzma2 ? LZMA_FILTER_LZMA2 : LZMA_FILTER_LZMA1;
+  filt[0].options = NULL;
+  filt[1].id = LZMA_VLI_UNKNOWN;
+  filt[1].options = NULL;
+  if (lzma_properties_decode(&filt[0], NULL, props, (size_t)proplen) != LZMA_OK)
+    return 0;
+  if (lzma_raw_decoder(&strm, filt) == LZMA_OK) {
+    lzma_ret rc;
+    strm.next_in = in;   strm.avail_in = inlen;
+    strm.next_out = out; strm.avail_out = outcap;
+    rc = lzma_code(&strm, LZMA_FINISH);
+    /* The stream is legitimately short: 7z2john keeps only enough of it to
+     * cover the first file, so running out of input is expected, not an error. */
+    if (rc == LZMA_OK || rc == LZMA_STREAM_END || rc == LZMA_BUF_ERROR)
+      produced = strm.total_out;
+    lzma_end(&strm);
+  }
+  free(filt[0].options);
+  return produced;
+}
+
+static size_t sz_try_inflate(const unsigned char *in, size_t inlen,
+                             unsigned char *out, size_t outcap) {
+  z_stream zs;
+  size_t produced = 0;
+  memset(&zs, 0, sizeof(zs));
+  if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) return 0;
+  zs.next_in = (Bytef *)in;   zs.avail_in = (uInt)inlen;
+  zs.next_out = (Bytef *)out; zs.avail_out = (uInt)outcap;
+  { int rc = inflate(&zs, Z_FINISH);
+    if (rc == Z_OK || rc == Z_STREAM_END || rc == Z_BUF_ERROR)
+      produced = zs.total_out; }
+  inflateEnd(&zs);
+  return produced;
+}
+
+static size_t sz_try_bzip2(const unsigned char *in, size_t inlen,
+                           unsigned char *out, size_t outcap) {
+  bz_stream bs;
+  size_t produced = 0;
+  memset(&bs, 0, sizeof(bs));
+  if (BZ2_bzDecompressInit(&bs, 0, 0) != BZ_OK) return 0;
+  bs.next_in = (char *)in;   bs.avail_in = (unsigned int)inlen;
+  bs.next_out = (char *)out; bs.avail_out = (unsigned int)outcap;
+  { int rc = BZ2_bzDecompress(&bs);
+    if (rc == BZ_OK || rc == BZ_STREAM_END)
+      produced = ((size_t)bs.total_out_hi32 << 32) | bs.total_out_lo32; }
+  BZ2_bzDecompressEnd(&bs);
+  return produced;
+}
+
+/* ---- inverse branch filters (7-Zip Bra.c), applied before the CRC ----
+ * Only the ones that arrive here mislabelled are worth having: 7z2john has no
+ * codec id for ARM64 or Delta, so both are erased from the type field and an
+ * otherwise-correct password fails the CRC. Measured: an ARM64+LZMA2 archive
+ * decompresses cleanly and still mismatches without this. */
+static void sz_filter_arm64(unsigned char *d, size_t n) {
+  size_t i;
+  for (i = 0; i + 4 <= n; i += 4) {
+    unsigned int v = (unsigned int)d[i] | ((unsigned int)d[i+1] << 8)
+                   | ((unsigned int)d[i+2] << 16) | ((unsigned int)d[i+3] << 24);
+    if ((v >> 26) == 0x25) {                     /* BL */
+      unsigned int src = v & 0x03FFFFFF;
+      unsigned int dest = src - (unsigned int)(i >> 2);
+      v = 0x94000000u | (dest & 0x03FFFFFF);
+      d[i] = (unsigned char)v; d[i+1] = (unsigned char)(v >> 8);
+      d[i+2] = (unsigned char)(v >> 16); d[i+3] = (unsigned char)(v >> 24);
+    }
+  }
+}
+static void sz_filter_delta(unsigned char *d, size_t n, unsigned dist) {
+  unsigned char hist[256];
+  size_t i; unsigned j = 0;
+  memset(hist, 0, sizeof(hist));
+  for (i = 0; i < n; i++) {
+    d[i] = (unsigned char)(d[i] + hist[j]);
+    hist[j] = d[i];
+    j = (j + 1) % dist;
+  }
+}
+
+/* ---- tier 2: decrypt the whole stream, decompress, compare CRC32 ----
+ * Returns  +1 the stored CRC was reproduced -> the password is CONFIRMED
+ *           0 nothing matched, but we are not confident we could have
+ *             decompressed this archive at all -> no opinion
+ *          -1 nothing matched and the declared codec is one we fully
+ *             implement -> the password is REFUTED
+ *
+ * The codec is brute-forced rather than trusted, because the type field lies:
+ * an unrecognised codec (Deflate64) reaches us as type 0, and an unrecognised
+ * filter (ARM64, Delta) is erased entirely. Trying every combination is free
+ * here -- a wrong key fails each decompressor's header check in microseconds. */
+static int sevenzip_tier2(const struct SevenZipRec *r, const unsigned char key[32],
+                          const char **how) {
+  unsigned char *plain, *unp;
+  unsigned char ivcopy[16];
+  AES_KEY ak;
+  size_t aeslen, uselen, outcap;
+  int authoritative, lownib, prepro, ci, plausible = 0;
+  static const char *nm[5] = { "stored", "LZMA2", "LZMA1", "Deflate", "BZip2" };
+
+  if (!r->data || r->datalen < 16) return 0;
+  aeslen = (size_t)r->datalen & ~(size_t)15;
+  if (!aeslen) return 0;
+
+  plain = sz_grow(&sz_plain_buf, &sz_plain_sz, aeslen);
+  if (!plain) return 0;
+  memcpy(ivcopy, r->iv, 16);
+  AES_set_decrypt_key(key, 256, &ak);
+  AES_cbc_encrypt(r->data, plain, aeslen, &ak, ivcopy, AES_DECRYPT);
+
+  /* strip the AES zero padding: only `unpacked` bytes are real */
+  uselen = (r->unpacked > 0 && (size_t)r->unpacked <= aeslen)
+         ? (size_t)r->unpacked : aeslen;
+
+  lownib = r->type & 0x0f;
+  prepro = (r->type >> 4) & 0x07;
+  /* We can only call a miss a refutation when the line names a codec we
+   * implement AND declares no filter we would have to undo. */
+  authoritative = (prepro == 0) &&
+                  (lownib == 1 || lownib == 2 || lownib == 6 || lownib == 7);
+
+  outcap = r->crc_len > 0 ? (size_t)r->crc_len : SEVENZIP_MAX_UNPACK;
+  if (outcap > SEVENZIP_MAX_UNPACK) outcap = SEVENZIP_MAX_UNPACK;
+  unp = sz_grow(&sz_unp_buf, &sz_unp_sz, outcap + 16);
+  if (!unp) return 0;
+
+  for (ci = 0; ci < 5; ci++) {
+    size_t got = 0;
+    int fi;
+    switch (ci) {
+      case 0:                                  /* stored */
+        got = uselen < outcap ? uselen : outcap;
+        memcpy(unp, plain, got);
+        break;
+      case 1:
+        /* The declared attribute may not even belong to LZMA2: for a
+         * Delta-filtered archive 7z2john reports Delta's distance byte,
+         * because the filter has no codec id and the attribute of the coder it
+         * did recognise is what gets emitted. A dictionary LARGER than the
+         * encoder used still decodes correctly, so fall back to a 16 MB window
+         * when the declared property fails. */
+        got = sz_try_lzma(1, r->attrlen ? r->attrs : (const unsigned char *)"\x18",
+                          r->attrlen ? r->attrlen : 1, plain, uselen, unp, outcap);
+        if (!got) got = sz_try_lzma(1, (const unsigned char *)"\x18", 1,
+                                    plain, uselen, unp, outcap);
+        break;
+      case 2:
+        if (r->attrlen == 5)
+          got = sz_try_lzma(0, r->attrs, 5, plain, uselen, unp, outcap);
+        break;
+      case 3: got = sz_try_inflate(plain, uselen, unp, outcap); break;
+      case 4: got = sz_try_bzip2(plain, uselen, unp, outcap); break;
+    }
+    if (!got) continue;
+
+    /* crc_len bounds what the stored CRC covers; without it (type 0 / 128)
+     * the whole decompressed output is the first file. */
+    { size_t clen = r->crc_len > 0 ? (size_t)r->crc_len : got;
+      unsigned char *work;
+      if (clen > got) continue;
+      /* Filters mutate in place, so each variant works on its own copy of the
+       * pristine decompressed bytes rather than on unp itself. */
+      work = sz_grow(&sz_work_buf, &sz_work_sz, clen + 16);
+      if (!work) continue;
+      for (fi = 0; fi < 3; fi++) {
+        unsigned int c;
+        memcpy(work, unp, clen);
+        if (fi == 1)      sz_filter_arm64(work, clen);
+        else if (fi == 2) sz_filter_delta(work, clen, 4);
+        c = (unsigned int)crc32(0L, work, (uInt)clen);
+        if (c == r->crc) {
+          if (how) *how = fi ? (fi == 1 ? "ARM64+codec" : "Delta+codec") : nm[ci];
+          return 1;
+        }
+      }
+      /* A real decompressor (not the stored passthrough) reaching the full
+       * expected length means the plaintext was genuine, so a CRC mismatch
+       * here says a filter was erased from the type field -- NOT that the
+       * password is wrong. Measured on ARM64+LZMA2 with the correct password:
+       * LZMA2 decompresses cleanly and the CRC still differs. */
+      if (ci != 0 && got >= clen) plausible = 1;
+    }
+  }
+  if (plausible) return 2;
+  return authoritative ? -1 : 0;
+}
 
 /* Yescrypt per-thread local memory (reused across calls) */
 static __thread yescrypt_local_t *yescrypt_tls_local;
@@ -23912,33 +24210,75 @@ sha11saltmd5:
                         AES_set_decrypt_key(sz_key, 256, sz_ak);
                         for (r = 0; r < SevenZipCount; r++) {
                           struct SevenZipRec *rp = &SevenZipRecs[r];
-                          unsigned char plain[16];
-                          int b, ok;
+                          unsigned char plain[16], hplain[16];
+                          const char *how = NULL;
+                          int b, ok, hbits = 0, t2 = 0, evidence;
                           if (strcmp(rp->group, grp) != 0) continue;
                           AES_decrypt(rp->tail + 16, plain, sz_ak);
                           for (b = 0; b < 16; b++) plain[b] ^= rp->tail[b];
-                          /* padsize 0 carries no zero-pad to test: stage 1
-                           * cannot decide, so never report it as a hit. */
-                          ok = (rp->padsize > 0);
+                          /* ---- tier 0: trailing zero pad. padsize 0 carries
+                           * nothing to test, so it is "no opinion" here rather
+                           * than a pass or a fail -- tiers 1 and 2 decide it. */
+                          ok = 1;
                           for (b = 16 - rp->padsize; ok && b < 16; b++)
                             if (plain[b]) ok = 0;
+
+                          /* ---- tier 1: does the decrypted head match the
+                           * declared type? One extra AES block, and the only
+                           * evidence available when padsize is 0. */
+                          if (ok && rp->havehead) {
+                            AES_decrypt(rp->head, hplain, sz_ak);
+                            for (b = 0; b < 16; b++) hplain[b] ^= rp->iv[b];
+                            hbits = sevenzip_head_bits(rp, hplain);
+                            if (hbits < 0) { ok = 0; hbits = 0; }
+                          }
+
+                          /* ---- tier 2: decompress and compare CRC32. Runs
+                           * only on a tier-0/1 pass, so its cost is off the
+                           * hot path entirely. */
+                          if (ok && rp->tier2) {
+                            t2 = sevenzip_tier2(rp, sz_key, &how);
+                            if (t2 < 0) ok = 0;      /* definitively refuted */
+                            else if (t2 == 2) hbits += 32;  /* filter erased */
+                          }
+
+                          evidence = 8 * rp->padsize + hbits;
                           if (Printall) {
-                            /* -z: expose the KDF output and final block so a
-                             * wrong KDF is diagnosable against the spec vector
-                             * without a debugger. */
+                            /* -z: expose the KDF output, the final block and
+                             * every tier's verdict, so a wrong KDF or a
+                             * misread type is diagnosable without a debugger. */
                             prmd5(sz_key, linebuf + 4096, 64);
                             linebuf[4096 + 64] = 0;
                             prmd5(plain, linebuf + 4300, 32);
                             linebuf[4300 + 32] = 0;
                             snprintf(mdbuf, MAXLINE,
-                                     "%s:KEY=%s:LASTBLOCK=%s:PADSIZE=%d:PADOK=%d",
+                                     "%s:KEY=%s:LASTBLOCK=%s:PADSIZE=%d:PADOK=%d"
+                                     ":HEADBITS=%d:TIER2=%d:CODEC=%s:BITS=%d",
                                      rp->line, linebuf + 4096, linebuf + 4300,
-                                     rp->padsize, ok);
+                                     rp->padsize, ok, hbits, t2,
+                                     how ? how : "-", evidence);
                             prfound(job, mdbuf);
-                          } else if (ok) {
+                          } else if (ok && (t2 == 1 || evidence > 0)) {
+                            /* Report when tier 2 confirmed it, or when the
+                             * cheap tiers carry any evidence at all. A hit
+                             * resting on less than the threshold is announced
+                             * once on stderr so it is never mistaken for a
+                             * verified crack. */
                             Word_t *PV2;
                             JSLG(PV2, JUDYJ(JOB_SEVENZIP), (unsigned char *)rp->line);
-                            if (PV2) prfound(job, rp->line);
+                            if (PV2) {
+                              if (!t2 && evidence < SevenZipMinBits) {
+                                static int warned_weak;
+                                if (!warned_weak) {
+                                  warned_weak = 1;
+                                  fprintf(stderr,
+                                          "7ZIP: reporting a hit backed by only %d bits "
+                                          "(no decompress+CRC available). Confirm with: "
+                                          "7zz t -p<password> <archive>\n", evidence);
+                                }
+                              }
+                              prfound(job, rp->line);
+                            }
                           }
                         }
                       }
@@ -46928,43 +47268,190 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       /* After the "$7z$" prefix:
        *   f[0]=type f[1]=log2 f[2]=saltlen f[3]=salt f[4]=ivlen f[5]=iv
        *   f[6]=crc  f[7]=packedlen f[8]=unpackedlen f[9]=data
-       * LZMA archives (type 1) carry two EXTRA trailing fields -- the coder
-       * property length and the LZMA properties, e.g. $200000$5d00000400 --
-       * which Deflate64 (type 0) does not have. So the count is 10 or 12.
-       * Nothing past f[9] matters to stage 1; accept and ignore the tail. */
+       *   f[10]=crc_len f[11]=coder_attributes        (types 1..127 only)
+       *
+       * The type field does NOT name the codec directly, and an earlier
+       * comment here claiming "type 0 = Deflate64, type 1 = LZMA" was wrong.
+       * Per 7z2john.pl's own definition: 0 means the data needs no
+       * decompression to check the CRC32 -- which is ALSO what an
+       * unrecognised codec degrades to, so Deflate64 arrives here as 0.
+       * 1..127 pack a decompressor in the low nibble (1 LZMA1, 2 LZMA2,
+       * 3 PPMd, 6 BZip2, 7 Deflate) and a BCJ-family preprocessor in the
+       * high nibble, and carry the two extra fields. 128 means the data was
+       * truncated to its final block, with the penultimate block moved into
+       * the iv field. So the field count is 10 or 12, and both are exact.
+       *
+       * See contest/cmiyc26/challenge/MDXFIND-7Z-SPEC.md sections 2 and 8. */
       char *f[12];
-      int nf = 0;
+      int flen[12];
+      int nf = 0, k;
       char *sp = line + 4;
+      const char *why = NULL;         /* non-NULL => reject, and this says why */
+      /* MUST be taken before the splitter punches NULs over the separators;
+       * afterwards strlen(line) only reaches the first '$'. */
+      size_t rawlen = strlen(line);
       f[nf++] = sp;
       while (*sp && nf < 12) {
         if (*sp == '$') { *sp = 0; f[nf++] = sp + 1; }
         sp++;
       }
-      if (nf >= 10) {
-        long sz_log2 = strtol(f[1], NULL, 10);
-        long sz_saltlen = strtol(f[2], NULL, 10);
-        long sz_packed = strtol(f[7], NULL, 10);
-        long sz_unpacked = strtol(f[8], NULL, 10);
-        int dlen = (int)strlen(f[9]);
-        int padsize = (int)(sz_packed - sz_unpacked);
+      /* Field lengths must be taken BEFORE the separators go back, because
+       * afterwards every f[k] runs to end of line. */
+      for (k = 0; k < nf; k++) flen[k] = (int)strlen(f[k]);
+      { long sz_type = 0, sz_log2 = 0, sz_saltlen = 0, sz_ivlen = 0;
+        long sz_packed = 0, sz_unpacked = 0, sz_crclen = 0;
+        unsigned long sz_crc = 0;
+        int dbytes = 0, padsize = 0, bits = 0, tier2 = 0;
+        long minbits = SevenZipMinBits;
+
+        /* A line longer than the read buffer arrives here already cut short,
+         * and the bytes at its end are NOT the end of the stream -- so the
+         * pad check would run against the wrong ciphertext and could never
+         * pass. Nothing downstream can detect that, so catch it here. */
+        if (rawlen >= MAXLINE - 64)
+          why = "line exceeds MAXLINE and was read truncated; shorten the data "
+                "field with tools/7z2mdx.py";
+        else if (nf != 10 && nf != 12) why = "field count is not 10 or 12";
+        else {
+          sz_type     = strtol(f[0], NULL, 10);
+          sz_log2     = strtol(f[1], NULL, 10);
+          sz_saltlen  = strtol(f[2], NULL, 10);
+          sz_ivlen    = strtol(f[4], NULL, 10);
+          sz_crc      = strtoul(f[6], NULL, 10);
+          sz_packed   = strtol(f[7], NULL, 10);
+          sz_unpacked = strtol(f[8], NULL, 10);
+          if (nf == 12) sz_crclen = strtol(f[10], NULL, 10);
+          dbytes  = flen[9] / 2;
+          padsize = (int)(sz_packed - sz_unpacked);
+          /* 7z2john encodes unpackedlen mod 16 when it truncates, so a
+           * stream that was already block-aligned reports 16 -- which means
+           * no padding at all, not sixteen bytes of it. */
+          if (sz_type == 128 && padsize == 16) padsize = 0;
+
+          /* R1/R2: shape and declared-vs-actual field lengths. */
+          if (flen[9] & 1)                     why = "data field has an odd hex length";
+          else if (sz_saltlen < 0 || sz_saltlen > 64) why = "saltlen out of range";
+          else if (flen[3] != sz_saltlen * 2)  why = "saltlen disagrees with the salt field";
+          else if (sz_ivlen < 0 || sz_ivlen > 32)     why = "ivlen out of range";
+          else if (flen[5] != sz_ivlen * 2)    why = "ivlen disagrees with the iv field";
+          /* R3/R4: is the KDF reachable at all? */
+          else if (sz_log2 == 63)              why = "log2=0x3F special KDF is not implemented";
+          else if (sz_log2 < 0 || sz_log2 > SEVENZIP_MAX_LOG2)
+                                               why = "iteration count 2^log2 is unreachable";
+          /* R5 */
+          else if (padsize < 0 || padsize > 16) why = "padsize out of range (packedlen < unpackedlen?)";
+          /* R6: enough ciphertext to work with. A record carrying the WHOLE
+           * stream is usable even when that stream is a single block -- the
+           * archive IV supplies the CBC predecessor, and tier 2 can decide it
+           * outright. Only a partial record needs two blocks of its own. */
+          else {
+            tier2 = (sz_type != 128) && sz_packed > 0 && (long)dbytes == sz_packed;
+            if (sz_type == 128) {
+              if (sz_ivlen != 16 || dbytes != 16)
+                why = "truncated record needs a 16-byte iv and 16-byte data";
+            } else if (dbytes < 32 &&
+                       !(tier2 && dbytes == 16 && sz_ivlen == 16))
+              why = "data holds fewer than two ciphertext blocks";
+          }
+        }
+
         /* restore the separators we punched out, so the JudyJ key and the
          * reported line are byte-identical to the input */
-        { int k; for (k = 0; k < nf - 1; k++) f[k][strlen(f[k])] = '$'; }
-        if (sz_log2 >= 0 && sz_log2 <= 63 && dlen >= 64 && (dlen & 1) == 0 &&
-            padsize >= 0 && padsize <= 16 && sz_saltlen >= 0 && sz_saltlen <= 64) {
-          unsigned char tail[32];
+        for (k = 0; k < nf - 1; k++) f[k][flen[k]] = '$';
+
+        if (!why) {
+          /* tier2 was set above. It needs the WHOLE stream: 7z2john keeps
+           * packedlen in step when it shortens, so a mismatch is the exact
+           * signature of a tail-only record (what tools/7z2mdx.py produces).
+           * Type 128 rewrites both fields to 16, so it never qualifies. */
+          bits  = 8 * padsize;
+
+          if (!tier2 && bits == 0)
+            why = "padsize 0 and no complete stream: undecidable by any implemented tier";
+          else if (!tier2 && bits < minbits && SevenZipStrict)
+            why = "evidence below the strict threshold";
+        }
+
+        if (why) {
+          sevenzip_reject(why, line);
+          continue;                    /* never counted, never searched */
+        }
+
+        { unsigned char tail[32];
           char grp[96];
-          const char *tailhex = f[9] + dlen - 64;   /* LAST 32 bytes */
-          if (get32((char *)tailhex, tail, 32) == 32) {
-            snprintf(grp, sizeof(grp), "%ld:%.*s:%ld",
-                     sz_saltlen, (int)(strchr(f[3], '$') - f[3]), f[3], sz_log2);
-            sevenzip_addrec(grp, tail, padsize, line);
-            JSLI(PV, JUDYJ(JOB_SEVENZIP), (unsigned char *)line);
-            JSLI(PV, TYPESALT(JOB_SEVENZIP), (unsigned char *)grp);
-            if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SEVENZIP]++; }
-            Foundcnt[JOB_SEVENZIP]++;
-            continue;
+          struct SevenZipRec *r;
+          const char *tailhex = f[9] + flen[9] - 64;
+
+          if (dbytes == 16 && sz_ivlen == 16) {
+            /* A single ciphertext block: its CBC predecessor is the archive
+             * IV. This is the shape 7z2john writes when it truncates (it moves
+             * the penultimate block into the iv field), and it is also what a
+             * genuinely 16-byte archive looks like. */
+            if (get32(f[5], tail, 16) != 16 ||
+                get32(f[9], tail + 16, 16) != 16) {
+              sevenzip_reject("bad hex in iv or data", line); continue;
+            }
+          } else if (get32((char *)tailhex, tail, 32) != 32) {
+            sevenzip_reject("bad hex in data", line); continue;
           }
+
+          snprintf(grp, sizeof(grp), "%ld:%.*s:%ld",
+                   sz_saltlen, flen[3], f[3], sz_log2);
+
+          r = sevenzip_addrec();
+          snprintf(r->group, sizeof(r->group), "%s", grp);
+          memcpy(r->tail, tail, 32);
+          r->type = (int)sz_type;
+          r->padsize = padsize;
+          r->bits = bits;
+          r->packed = sz_packed;
+          r->unpacked = sz_unpacked;
+          r->crc = (unsigned int)sz_crc;
+          r->crc_len = sz_crclen;
+          r->tier2 = tier2;
+          if (sz_ivlen == 16) get32(f[5], r->iv, 16);
+          /* head[] is only genuinely the START of the stream when the data
+           * field holds the whole stream. On a tail-only record (what
+           * tools/7z2mdx.py emits) the first 32 bytes ARE the last two
+           * blocks, and running the tier-1 check on them rejects correct
+           * candidates. So tier 1 is gated on the same predicate as tier 2. */
+          if (tier2 && flen[9] >= 64) {
+            if (get32(f[9], r->head, 32) == 32) r->havehead = 1;
+          } else if (tier2 && flen[9] == 32) {
+            /* whole stream is one block: that block IS the head */
+            if (get32(f[9], r->head, 16) == 16) r->havehead = 1;
+          }
+          if (nf == 12 && flen[11] > 0 && (flen[11] & 1) == 0 && flen[11] <= 16) {
+            r->attrs = malloc(flen[11] / 2);
+            if (r->attrs && get32(f[11], r->attrs, flen[11] / 2) == flen[11] / 2)
+              r->attrlen = flen[11] / 2;
+            else { free(r->attrs); r->attrs = NULL; }
+          }
+          if (tier2) {
+            r->data = malloc(dbytes);
+            if (r->data && get32(f[9], r->data, dbytes) == dbytes)
+              r->datalen = dbytes;
+            else { free(r->data); r->data = NULL; r->tier2 = tier2 = 0; }
+          }
+          r->line = strdup(line);
+          if (!r->line) { fprintf(stderr, "Failed to store 7zip hash line\n"); exit(1); }
+
+          if (!tier2 && bits < minbits) {
+            fprintf(stderr,
+                    "7ZIP: padsize %d gives only %d bits of evidence; expect "
+                    "~1 false hit per 2^%d candidates. Supply the complete "
+                    "stream (do not run tools/7z2mdx.py on a line that already "
+                    "fits) to enable decompress+CRC verification.\n",
+                    padsize, bits, bits);
+            SevenZipWarned++;
+            SevenZipNoisy++;
+          }
+
+          JSLI(PV, JUDYJ(JOB_SEVENZIP), (unsigned char *)line);
+          JSLI(PV, TYPESALT(JOB_SEVENZIP), (unsigned char *)grp);
+          if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_SEVENZIP]++; }
+          Foundcnt[JOB_SEVENZIP]++;
+          continue;
         }
       }
     }
@@ -47954,6 +48441,18 @@ union HashU curin;
     printf("Mainline stack at %lx\n",&sb);
 */
   Memlock = new_lock(0);
+  /* 7ZIP (e1000) load-time triage tunables. Read BEFORE getopt, because -F
+   * loads its hash file at the moment getopt reaches it, which is when the
+   * triage runs. */
+  { const char *e7 = getenv("MDXFIND_7Z_MIN_BITS");
+    if (e7 && *e7) {
+      long v = strtol(e7, NULL, 10);
+      if (v >= 0 && v <= 128) SevenZipMinBits = v;
+      else fprintf(stderr, "MDXFIND_7Z_MIN_BITS=%s out of range 0..128, ignored\n", e7);
+    }
+    e7 = getenv("MDXFIND_7Z_STRICT");
+    if (e7 && *e7 && *e7 != '0') SevenZipStrict = 1;
+  }
   TsfLock = new_lock(0);   /* tsfprintf() stderr serialization (startup-phase diagnostics) */
   /* Seed the tsfprintf monotonic origin now so every later timestamp
    * is relative to a known mdxfind-start point. Without this the
@@ -52326,7 +52825,21 @@ usage:
       while (PV) { szcnt++; JSLN(PV, JUDYJ(JOB_SEVENZIP), (unsigned char *)line); }
       if (szcnt) {
         fprintf(stderr, "Searching through %ld unique 7ZIP archives\n", szcnt);
+        if (SevenZipRejected || SevenZipWarned) {
+          long dec = 0; int q;
+          for (q = 0; q < SevenZipCount; q++)
+            if (SevenZipRecs[q].tier2) dec++;
+          fprintf(stderr,
+                  "7ZIP triage: %ld loaded (%ld verifiable by decompress+CRC, "
+                  "%ld pad-check only), %ld rejected, %ld below %ld bits\n",
+                  (long)SevenZipCount, dec, (long)SevenZipCount - dec,
+                  SevenZipRejected, SevenZipWarned, SevenZipMinBits);
+        }
       } else {
+        if (SevenZipRejected)
+          fprintf(stderr,
+                  "7ZIP: all %ld archive(s) were rejected at load; nothing to search\n",
+                  SevenZipRejected);
         J1T(RC, Dohash, JOB_SEVENZIP);
         if (RC && Printall) {
           /* -z also needs a synthetic ARCHIVE record: the compute loop walks
@@ -52342,10 +52855,19 @@ usage:
             0x87,0x96,0xa5,0xb4,0xc3,0xd2,0xe1,0xf0 };
           JSLI(PV, TYPESALT(JOB_SEVENZIP), (unsigned char *)"0::19");
           if (PV && *PV == 0) *PV = 1;
-          if (!SevenZipCount)
-            sevenzip_addrec("0::19", sz_ztail, 16,
-                            "$7z$0$19$0$$16$00000000000000000000000000000000$0$16$0$"
-                            "00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+          if (!SevenZipCount) {
+            struct SevenZipRec *zr = sevenzip_addrec();
+            snprintf(zr->group, sizeof(zr->group), "%s", "0::19");
+            memcpy(zr->tail, sz_ztail, 32);
+            memcpy(zr->head, sz_ztail, 32);
+            zr->havehead = 1;
+            zr->padsize = 16;
+            zr->bits = 128;
+            zr->packed = 16; zr->unpacked = 0;
+            zr->line = strdup("$7z$0$19$0$$16$00000000000000000000000000000000$0$16$0$"
+                              "00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+            if (!zr->line) { fprintf(stderr, "Failed to store 7zip hash line\n"); exit(1); }
+          }
         } else { J1U(RC, Dohash, JOB_SEVENZIP); }
       }
     }

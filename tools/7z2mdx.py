@@ -10,11 +10,14 @@ Stock 7z2john emits the ENTIRE encrypted stream in the final field: 112 KB for
 a small archive, 1.5 MB for the CMIYC challenge_2 set. mdxfind's MAXLINE is
 40 KB, so such a line can never be read.
 
-mdxfind's stage-1 check needs only the last TWO ciphertext blocks (32 bytes) --
+mdxfind's tier-0 check needs only the last TWO ciphertext blocks (32 bytes) --
 it decrypts the final block in CBC using the preceding block as its IV and
 requires the trailing `packedlen - unpackedlen` plaintext bytes to be zero.
-So this strips the data field down to those 32 bytes and leaves every other
-field untouched. Result is ~130 bytes per archive.
+
+But tier 2 (decompress + CRC32) needs the WHOLE stream, and that is what turns
+a pad-check hit into a confirmed crack. So this only truncates a line that
+would otherwise exceed mdxfind's MAXLINE, and warns when it does. A record
+that fits is passed through untouched.
 
 That truncation is why mdxfind can attack Deflate64 archives at all: it never
 decompresses, which is exactly where hashcat and john silently fail.
@@ -28,6 +31,10 @@ Leading "filename:" from john is stripped automatically.
 Confirm a stage-1 hit out of band:  7zz t -p'<password>' archive.7z
 """
 import sys
+
+# mdxfind reads hash lines with gzgets(line, MAXLINE); anything longer arrives
+# truncated, and its trailing bytes are then NOT the end of the AES stream.
+MAXLINE = 40 * 1024
 
 
 def convert(line):
@@ -45,9 +52,6 @@ def convert(line):
         sys.stderr.write('skip: only %d fields: %.60s...\n' % (len(f), line))
         return None
     data = f[11]
-    if len(data) < 64:
-        sys.stderr.write('skip: data field under 32 bytes\n')
-        return None
     try:
         pad = int(f[9]) - int(f[10])
     except ValueError:
@@ -59,6 +63,28 @@ def convert(line):
         # it rather than produce a meaningless hit -- but say so loudly.
         sys.stderr.write('WARNING: padsize %d: stage 1 cannot verify this '
                          'archive; it needs full decrypt+CRC.\n' % pad)
+    # Truncating destroys tier-2 verification (decompress + CRC32), which is
+    # the only thing that can turn a pad-check hit into a confirmed crack. So
+    # only truncate when the record genuinely will not fit, and say so.
+    line_out = '$'.join(f)
+    if len(line_out) < MAXLINE - 64:
+        return line_out                # fits whole: keep every byte of evidence
+
+    if len(data) < 64:
+        sys.stderr.write(
+            'skip: line needs truncating but its data field is already under '
+            '32 bytes\n')
+        return None
+    if pad <= 0:
+        sys.stderr.write(
+            'skip: padsize %d and the line needs truncating to fit mdxfind\'s '
+            '%d-byte limit; nothing would be left to verify with.\n'
+            % (pad, MAXLINE))
+        return None
+    sys.stderr.write(
+        'NOTE: truncating a %d-byte line to the final two blocks. This drops '
+        'decompress+CRC verification, leaving %d bits of pad check; expect ~1 '
+        'false hit per 2^%d candidates.\n' % (len(line_out), 8 * pad, 8 * pad))
     f[11] = data[-64:]                 # keep only the final two blocks
     return '$'.join(f)
 

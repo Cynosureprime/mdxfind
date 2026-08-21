@@ -1,3 +1,50 @@
+# mdxfind v1.539 — 7-Zip (e1000) confirmed wrong passwords, and silently skipped archives it could have cracked
+
+Source: mdxfind.c rev 1.537 → 1.539. Companion release: hashpipe v1.103, which had the same defect in a more dangerous place.
+
+**If you have cracked 7-Zip archives with `-m e1000`, re-check them.** A reported crack was backed by as little as 8 bits of evidence, so on some archives roughly one candidate in 256 was reported as a hit. Confirm any e1000 result with `7zz t -p'<password>' <archive>` (exit 0 = correct).
+
+## The defect
+
+`e1000` verifies a candidate by decrypting the final AES-CBC block and requiring the trailing `packedlen - unpackedlen` bytes to be zero — 7-Zip zero-pads its stream to a 16-byte boundary. That check never decompresses, which is exactly why mdxfind can attack archives hashcat and john fail silently.
+
+But its strength is `8 × padsize` bits, and `padsize` is `compressed_size mod 16` — uniformly distributed. Measured over 240 generated archives:
+
+| padsize | share | evidence |
+|---|---:|---:|
+| 0 | ~6% | none — undecidable |
+| 1–3 | ~19% | 8–24 bits |
+| ≥ 4 | ~75% | ≥ 32 bits |
+
+At padsize 1 the check is **8 bits wide**. A reported run against one such archive returned four "cracks" from about a thousand candidates; all four were disproved by decompressing the stream and checking its CRC32 — using data that was present in the hash line the whole time and discarded at parse.
+
+Four further failures were silent rather than wrong:
+
+- `padsize 0` archives loaded, consumed the full KDF per candidate, and could never report anything.
+- `log2 > 40` and the `0x3F` special-case KDF loaded, reported `Searching through 1 unique 7ZIP archives`, performed **0 hash calculations**, and exited cleanly — indistinguishable from an honest negative.
+- Truncated records (`$7z$128$`) were rejected outright, reading `0 unique hex hashes`, even though the data they need is in the `iv` field.
+- A line longer than `MAXLINE` arrived already cut short, so its trailing bytes were not the stream's trailing bytes and the pad check could never pass. It was accepted anyway.
+
+## The fix
+
+**Load-time triage.** Records that cannot be decided are rejected with a reason, counted, and excluded from the `Searching through N unique 7ZIP archives` total. Evidence below 32 bits is reported with its expected false-positive rate. `MDXFIND_7Z_MIN_BITS` and `MDXFIND_7Z_STRICT` tune it.
+
+**A verification ladder.** Tier 0 is the pad check. Tier 1 checks the first decrypted block against the structure the type promises — for a header-encrypted archive that block is a raw 7z header, worth far more than the padding. Tier 2 decrypts the whole stream, decompresses and compares CRC32. Tiers 1 and 2 run only after tier 0 passes, so throughput is unchanged.
+
+**A codec oracle.** The `type` field cannot be trusted: `7z2john.pl` has no codec id for Deflate64, ARM64, Delta or RISCV, so it emits Deflate64 as `type 0` (indistinguishable from a stored archive) and erases filters entirely. Rather than trust it, tier 2 tries stored, LZMA2, LZMA1, Deflate and BZip2, each also under inverse ARM64 and Delta filters.
+
+A tier-2 miss refutes a candidate only when nothing decompressed *and* the declared codec is implemented. When a real decompressor reached the expected length but no CRC matched, the plaintext was genuine and a filter was erased — that counts as evidence, not refutation. Measured on an ARM64+LZMA2 archive with the correct password, LZMA2 decompresses cleanly and the CRC still differs.
+
+**New capability.** Truncated `$7z$128$` records and complete single-block archives now load and crack.
+
+## Also in this release
+
+`tools/7z2mdx.py` now truncates only a line that will not otherwise fit, because truncating destroys tier 2; it warns when it must, and refuses when padsize is 0 and nothing would be left to verify against.
+
+`tools/7z_validate.sh` is a new acceptance test. It builds archives covering every codec, the branch filters, both header-encryption modes, multi-file and single-block archives and padsizes 0–3; validates each fixture with `7zz t` before the attack; cracks with a short mostly-invalid wordlist; and re-verifies every hit with `7zz t`. Result: 18 of 19 archives cracked and independently confirmed, zero false positives, and the one decline reported rather than hidden.
+
+`docs/SEVENZIP.md` documents the type, the tiers, the support tools, and the silent false negatives that affect other 7-Zip crackers.
+
 # mdxfind v1.537 — Six hash types compared 1-3 bytes short, producing false positives and output no other tool would accept
 
 Source: mdxfind.c rev 1.536 → 1.537.
