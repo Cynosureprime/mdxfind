@@ -6,6 +6,10 @@ mdxfind's own output format.
 
 **1001 types.** 998 carry a verified example; the remaining 3 are evaluation instruments or a parsing wrapper for which no example is possible (see [Types without a published example](#types-without-a-published-example)).
 
+Some types have a document of their own. `e1000` (7ZIP) is one: see
+[SEVENZIP.md](SEVENZIP.md) for the hash format, the verification tiers, the
+support tools, and the silent false negatives that affect other 7-Zip crackers.
+
 Examples are the literal line mdxfind prints on a crack:
 
 ```
