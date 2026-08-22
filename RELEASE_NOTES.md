@@ -1,3 +1,59 @@
+# mdxfind v1.540 — user-defined types were unreachable from -M, lost their salt on output, and a typo in userdef.txt silently registered the wrong hash
+
+Source: mdxfind.c rev 1.539 → 1.540; userdef.c 1.8 → 1.9; hx.c 1.3 → 1.4; hx.l 1.2 → 1.3; hx.y 1.2 → 1.3; hx_vm.h 1.3 → 1.4. Companion release: hashpipe v1.105.
+
+**If you use `userdef.txt`, re-read it after upgrading.** A stanza whose expression did not lex cleanly used to register anyway, as a type that was silently not what you wrote. Those stanzas are now rejected, and the load is fatal — so a file that "worked" before may now refuse to run, correctly.
+
+## `-M` could not select a user-defined type at all
+
+`-m u<id>` worked; `-M` had no `u` branch, and its regex fallback scans `for (x = 1; Types[x]; x++)`. User-defined names are not in `Types[]` — `TYPENAME()` routes them to a separate registry and their ops start above `Userdef_base`, past that array's terminator. So both `-M u0` and `-M USER_NAME` exited 1 with "No hash types matched pattern".
+
+`-M u<id>` now works, accepts a comma-separated list, and uses an exact keyed lookup rather than the regex path, because a freeform id may contain regex metacharacters.
+
+`-M` with a regex now searches the **user-defined registry first**, matching against both the display name and the raw id, and falls through to the built-in table only when a token matches no user type.
+
+This also closes a gap that had no workaround: `-S`, `-U` and `-P` are per-type when `Doload` is set and global otherwise, and only `-M` populates `Doload`. `-m u<id>` sets `DoUser` and `Dohash` but never `Doload`, so **per-type salt, userid and pepper targeting was unreachable for user-defined types by any route**. `-M u<id>` sets it.
+
+Note the channel rule is unchanged and `-F` never required `-M`: `load_hash_file` falls back to `Dohash` when `Doload` is empty, so `-m u<id> -F file` always worked and still does.
+
+## Salted user-defined types lost the salt on output
+
+The dispatch arm reported matches through `checkhash()`, which emits `TYPE hash:password`. For a salted type that drops the one field needed to re-verify the result or file it with mdsplit:
+
+```
+before   USER_MYSALTEDx01 eea217b4a6b96a76a1ef42b71f9bbdce:password123
+after    USER_MYSALTEDx01 eea217b4a6b96a76a1ef42b71f9bbdce:Xk7Qm2Rz:password123
+built-in MD5SALT          eea217b4a6b96a76a1ef42b71f9bbdce:Xk7Qm2Rz:password123
+```
+
+It now reports through `checkhashsalt()` and `checkhashsalt2()`, giving `hash:salt:password` and `hash:salt:user:password`, matching the built-in salted format.
+
+Salt *iteration* was already correct and is unchanged: five salts produce five hash calculations, identical to the `e31` control, and `-z` emits all five pairs.
+
+## A typo in userdef.txt registered the wrong hash type
+
+The hx lexer's catch-all prints an unknown character and then **drops** it. So `md5(md5($p))` — using `$p` instead of the correct `pass` — lexed as `md5(md5(p))`, compiled, and registered a working hash type that was not the one written. The only signal was `hx:1: unexpected character '$'` scrolling past, immediately followed by `userdef: loaded ...`.
+
+A new `hx_diag_count`, incremented by the lexer catch-all and by `yyerror`, lets the loader reset it before compiling and reject any stanza whose expression produced a diagnostic even when a program came back. `hx_compile_expr()` itself is deliberately unchanged, so the 994-entry catalog and the `hx` tool behave exactly as before; only user-defined types get the strict treatment.
+
+## userdef.txt parse errors are fatal, after the complete read
+
+Rejected stanzas were reported only under `-Y`, because the message macro was gated on verbose. A normal run with a broken file printed nothing and continued with fewer types than the file declares.
+
+Every rejection now reports unconditionally, and the load exits 1 — but only after the **whole file** has been read, so one pass shows every broken stanza instead of one fix-and-rerun cycle per typo:
+
+```
+userdef: ...: stanza [BROKEN1] (near line 1): hx expression has 1 syntax error(s): md5(md5($p))
+userdef: ...: stanza [BROKEN2] (near line 9): hx expression failed to compile: md5(nosuchfunc(pass)
+userdef: ...: stanza [BROKEN3] (near line 13) reuses id '1' (already used by [GOOD]); rejected
+userdef: ...: stanza [BROKEN4] (near line 17) has no 'hx =' expression; rejected
+userdef: 4 bad stanza(s) in ...; refusing to run.
+```
+
+`-Y` now exits 1 on a bad file rather than 0 — correct for a validator, but a behaviour change if anything scripts it.
+
+`userdef.c` is shared with hashpipe, so hashpipe refuses the same file with the same report.
+
 # mdxfind v1.539 — 7-Zip (e1000) confirmed wrong passwords, and silently skipped archives it could have cracked
 
 Source: mdxfind.c rev 1.537 → 1.539. Companion release: hashpipe v1.103, which had the same defect in a more dangerous place.
