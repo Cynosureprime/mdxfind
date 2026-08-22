@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.539 2026/08/21 17:44:58 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.540 2026/08/22 12:09:06 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.539 2026/08/21 17:44:58 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.540 2026/08/22 12:09:06 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.540  2026/08/22 12:09:06  dlr
+ * User-defined hash types: make -M able to select them, and report their salt. -M previously could not reach a user-defined type at all: it has no u prefix branch, and its regex fallback scans only Types[], which holds built-ins and is NULL-terminated well below Userdef_base, so both -M u<id> and -M <name> exited 1 with No hash types matched. Adds an exact string-keyed -M u<id> branch accepting a comma-separated list, mirroring -m but ALSO setting Doload, so -S -U -P per-type salt userid and pepper targeting now works for user types; -m sets only DoUser and Dohash, which is why that targeting was previously unreachable however the type was selected. The -M regex path now searches the user-defined registry FIRST, matching against both the display name and the raw id, and only falls through to the built-in table when a token matches no user type. Separately, the userdef dispatch arm reported matches through checkhash, which emits only TYPE hash:password - for a salted type that drops the salt the hash was solved with, so the found line could not be re-verified or filed by mdsplit. It now reports through checkhashsalt and checkhashsalt2, giving TYPE hash:salt:password and TYPE hash:salt:user:password, matching the built-in salted format. Salt iteration itself was already correct: 5 salts produce 5 hash calculations, identical to the e31 control.
+ *
  * Revision 1.539  2026/08/21 17:44:58  dlr
  * 7ZIP e1000 tier 2 refinement. A tier 2 miss is no longer treated as a refutation when a real decompressor reached the expected output length: that means the plaintext was genuine and a filter was erased from the type field, not that the password is wrong. Measured on ARM64 plus LZMA2 with the correct password, LZMA2 decompresses cleanly and the CRC still differs, and the previous rule rejected it. Such a result now contributes 32 bits of evidence instead. LZMA2 additionally retries with a 16MB window when the declared property byte belongs to an erased Delta filter rather than to LZMA2. Restores correct handling of ARM64 and Delta filtered archives while still refuting the reported false positives.
  *
@@ -13690,7 +13693,16 @@ do {
                     if (hlen > 0 && !(hlen & 1) &&
                         hlen <= (int)sizeof(curin.h) * 2) {
                       get32((char *)r.data, curin.h, hlen);
-                      checkhash(&curin, hlen, x, job);
+                      /* Report through the salt-aware variant so the found
+                       * line carries the salt (and username) it was solved
+                       * with. checkhash() emits only TYPE hash:password, which
+                       * for a salted type loses the one field needed to
+                       * re-verify or to file the result with mdsplit. */
+                      if (uses_salt)
+                        checkhashsalt2(&curin, hlen, (char *)ssalt, slen,
+                                       ubuf, ulen, x, job);
+                      else
+                        checkhashsalt(&curin, hlen, ubuf, ulen, x, job);
                       last_hlen = hlen;
                       last_hex  = (const char *)r.data;
                     }
@@ -13707,7 +13719,10 @@ do {
                 if (hlen > 0 && !(hlen & 1) &&
                     hlen <= (int)sizeof(curin.h) * 2) {
                   get32((char *)r.data, curin.h, hlen);
-                  checkhash(&curin, hlen, x, job);
+                  if (uses_salt)
+                    checkhashsalt(&curin, hlen, (char *)ssalt, slen, x, job);
+                  else
+                    checkhash(&curin, hlen, x, job);
                   last_hlen = hlen;
                   last_hex  = (const char *)r.data;
                 }
@@ -49367,7 +49382,38 @@ badrule:
         s = optarg;
         if (strcmp(s, "RESET") == 0)
           break;
-        if (*s == 'e') {
+        if (*s == 'u') {
+          /* -M u<id>[,u<id>...]: user-defined types, EXACT string-keyed lookup --
+           * never the regex path below, because a freeform id may contain regex
+           * metacharacters. Mirrors the -m u<id> branch, but ALSO records the op in
+           * Doload, so -S/-U/-P can target a user type; -m sets only DoUser and
+           * Dohash, which is why per-type salt, userid and pepper loading was
+           * previously unreachable for user-defined types however they were
+           * selected. */
+          while (*s) {
+            char idbuf[128];
+            int il = 0, uop;
+            if (*s == ',' || *s == ':' || *s == '.') { s++; continue; }
+            if (*s == 'u') s++;
+            while (*s && *s != ',' && il < (int)sizeof(idbuf) - 1) idbuf[il++] = *s++;
+            idbuf[il] = '\0';
+            if (!il) continue;
+            uop = userdef_lookup_by_id(idbuf);
+            if (uop < 0) {
+              const char *why = userdef_skip_reason(idbuf);
+              if (why)
+                fprintf(stderr, "-M: user-defined hash type u%s failed to load: %s\n", idbuf, why);
+              else
+                fprintf(stderr, "-M: Unknown user-defined hash type u%s "
+                        "(not found in $MDXFIND_CACHE/userdef.txt)\n", idbuf);
+              exit(1);
+            }
+            { Word_t _uid = (Word_t)op_user_id((unsigned)uop);
+              J1S(RC, DoUser, _uid); }
+            J1S(RC, Dohash, uop);
+            J1S(RC, Doload, uop);
+          }
+        } else if (*s == 'e') {
           /* internal type indices: eN, eN-eM, comma-separated */
           while (*s) {
             if (*s == ',' || *s == ':' || *s == '.') { s++; continue; }
@@ -49449,6 +49495,28 @@ badrule:
             if (tok[0] == '!') { y = 1; tok++; }
             regex = pcre_compile(tok, PCRE_CASELESS, &pcre_err, &pcre_erroff, NULL);
             if (regex) {
+              /* User-defined types are searched FIRST; only if this token matches none
+               * of them does it fall through to the built-in table below. They live in
+               * a separate registry -- Types[] holds built-ins only and is
+               * NULL-terminated well below Userdef_base -- so the built-in loop cannot
+               * reach them however the pattern is written. Both the display name
+               * (USER_<name>) and the raw id are offered to the pattern. */
+              int umatched = 0;
+              { int ui, un = userdef_count();
+                for (ui = 0; ui < un; ui++) {
+                  struct userdef_type *ut = userdef_get_by_index(ui);
+                  Word_t _uid;
+                  if (!ut) continue;
+                  if (pcre_exec(regex, NULL, ut->dispname, mystrlen(ut->dispname), 0, 0, ovec, 30) < 0 &&
+                      pcre_exec(regex, NULL, ut->idstr, mystrlen(ut->idstr), 0, 0, ovec, 30) < 0)
+                    continue;
+                  _uid = (Word_t)op_user_id((unsigned)ut->op);
+                  if (y) { J1U(RC, DoUser, _uid); J1U(RC, Dohash, ut->op); J1U(RC, Doload, ut->op); }
+                  else   { J1S(RC, DoUser, _uid); J1S(RC, Dohash, ut->op); J1S(RC, Doload, ut->op); matched++; }
+                  umatched++;
+                }
+              }
+              if (!umatched)
               for (x = 1; Types[x]; x++) {
                 if (pcre_exec(regex, NULL, Types[x], mystrlen(Types[x]), 0, 0, ovec, 30) < 0)
                   continue;

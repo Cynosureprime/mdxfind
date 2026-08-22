@@ -38,6 +38,15 @@ extern void yy_delete_buffer(YY_BUFFER_STATE buf);
  * Returns a compiled program ready for hx_vm_init/hx_vm_run.
  * If script_file is non-NULL, reads from file; otherwise parses expr.
  */
+/* Count of diagnostics emitted by the hx lexer and parser since it was
+ * last reset. The lexer's catch-all rule PRINTS an unknown character and
+ * then drops it, so an expression like md5(md5($p)) lexes as md5(md5(p)),
+ * compiles, and yields a program that silently is not what was written.
+ * Callers that must not accept that -- the user-defined type loader --
+ * reset this before compiling and check it after. hx_compile_expr itself
+ * deliberately does NOT consult it, so catalog behaviour is unchanged. */
+int hx_diag_count = 0;
+
 hx_program *hx_compile_expr(const char *expr, const char *script_file)
 {
 	hx_node *ast;

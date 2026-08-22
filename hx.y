@@ -40,6 +40,7 @@ typedef struct {
 extern int  yylex(void);
 extern int  hx_line;
 void        yyerror(const char *s);
+extern int  hx_diag_count;
 
 hx_node *hx_parse_result = NULL;
 
@@ -200,5 +201,6 @@ arglist:
 
 void yyerror(const char *s)
 {
+	hx_diag_count++;
 	fprintf(stderr, "hx:%d: %s\n", hx_line, s);
 }

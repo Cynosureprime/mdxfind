@@ -15,6 +15,7 @@
 
 int hx_line = 1;
 static int brace_depth = 0;
+extern int hx_diag_count;   /* defined in hx.c */
 %}
 
 %option noyywrap
@@ -90,7 +91,8 @@ static int brace_depth = 0;
 "%"                 { return '%'; }
 
  /* ---- catch-all ---- */
-.                   { fprintf(stderr, "hx:%d: unexpected character '%c'\n",
+.                   { hx_diag_count++;
+                      fprintf(stderr, "hx:%d: unexpected character '%c'\n",
                               hx_line, yytext[0]); }
 
 %%

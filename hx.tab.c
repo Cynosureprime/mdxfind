@@ -153,6 +153,7 @@ typedef enum yysymbol_kind_t yysymbol_kind_t;
 extern int  yylex(void);
 extern int  hx_line;
 void        yyerror(const char *s);
+extern int  hx_diag_count;
 
 hx_node *hx_parse_result = NULL;
 
@@ -172,7 +173,7 @@ static void nl_push(nodelist *nl, hx_node *n)
 	nl->items[nl->count++] = n;
 }
 
-#line 176 "hx.tab.c"
+#line 177 "hx.tab.c"
 
 #ifdef short
 # undef short
@@ -555,11 +556,11 @@ static const yytype_int8 yytranslate[] =
 /* YYRLINE[YYN] -- Source line where rule number YYN was defined.  */
 static const yytype_uint8 yyrline[] =
 {
-       0,   100,   100,   105,   106,   107,   114,   115,   118,   120,
-     126,   133,   134,   135,   136,   140,   144,   150,   152,   159,
-     160,   161,   162,   163,   164,   170,   171,   175,   176,   177,
-     178,   179,   180,   181,   182,   183,   184,   188,   190,   195,
-     196
+       0,   101,   101,   106,   107,   108,   115,   116,   119,   121,
+     127,   134,   135,   136,   137,   141,   145,   151,   153,   160,
+     161,   162,   163,   164,   165,   171,   172,   176,   177,   178,
+     179,   180,   181,   182,   183,   184,   185,   189,   191,   196,
+     197
 };
 #endif
 
@@ -1167,199 +1168,199 @@ yyreduce:
   switch (yyn)
     {
   case 2: /* program: sep_opt stmt_list sep_opt  */
-#line 101 "hx.y"
+#line 102 "hx.y"
                         { hx_parse_result = hx_block((yyvsp[-1].nlist).items, (yyvsp[-1].nlist).count, 1); }
-#line 1173 "hx.tab.c"
+#line 1174 "hx.tab.c"
     break;
 
   case 3: /* stmt_list: %empty  */
-#line 105 "hx.y"
+#line 106 "hx.y"
                         { nl_init(&(yyval.nlist)); }
-#line 1179 "hx.tab.c"
+#line 1180 "hx.tab.c"
     break;
 
   case 4: /* stmt_list: stmt  */
-#line 106 "hx.y"
+#line 107 "hx.y"
                         { nl_init(&(yyval.nlist)); nl_push(&(yyval.nlist), (yyvsp[0].node)); }
-#line 1185 "hx.tab.c"
+#line 1186 "hx.tab.c"
     break;
 
   case 5: /* stmt_list: stmt_list seps stmt  */
-#line 108 "hx.y"
+#line 109 "hx.y"
                         { (yyval.nlist) = (yyvsp[-2].nlist); nl_push(&(yyval.nlist), (yyvsp[0].node)); }
-#line 1191 "hx.tab.c"
+#line 1192 "hx.tab.c"
     break;
 
   case 10: /* block: '{' sep_opt stmt_list sep_opt '}'  */
-#line 127 "hx.y"
+#line 128 "hx.y"
                         { (yyval.node) = hx_block((yyvsp[-2].nlist).items, (yyvsp[-2].nlist).count, hx_line); }
-#line 1197 "hx.tab.c"
+#line 1198 "hx.tab.c"
     break;
 
   case 14: /* stmt: expr  */
-#line 136 "hx.y"
+#line 137 "hx.y"
                         { (yyval.node) = (yyvsp[0].node); }
-#line 1203 "hx.tab.c"
+#line 1204 "hx.tab.c"
     break;
 
   case 15: /* assignment: IDENT '=' expr  */
-#line 140 "hx.y"
+#line 141 "hx.y"
                         { (yyval.node) = hx_assign((yyvsp[-2].str), (yyvsp[0].node), hx_line); }
-#line 1209 "hx.tab.c"
+#line 1210 "hx.tab.c"
     break;
 
   case 16: /* for_stmt: FOR IDENT '=' expr TO expr block  */
-#line 145 "hx.y"
+#line 146 "hx.y"
                         { (yyval.node) = hx_for((yyvsp[-5].str), (yyvsp[-3].node), (yyvsp[-1].node), (yyvsp[0].node), hx_line); }
-#line 1215 "hx.tab.c"
+#line 1216 "hx.tab.c"
     break;
 
   case 17: /* if_stmt: IF condition block  */
-#line 151 "hx.y"
+#line 152 "hx.y"
                         { (yyval.node) = hx_if((yyvsp[-1].node), (yyvsp[0].node), NULL, hx_line); }
-#line 1221 "hx.tab.c"
+#line 1222 "hx.tab.c"
     break;
 
   case 18: /* if_stmt: IF condition block ELSE block  */
-#line 153 "hx.y"
+#line 154 "hx.y"
                         { (yyval.node) = hx_if((yyvsp[-3].node), (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1227 "hx.tab.c"
+#line 1228 "hx.tab.c"
     break;
 
   case 19: /* condition: expr EQ expr  */
-#line 159 "hx.y"
+#line 160 "hx.y"
                         { (yyval.node) = hx_binop_node(HX_OP_EQ, (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1233 "hx.tab.c"
+#line 1234 "hx.tab.c"
     break;
 
   case 20: /* condition: expr NE expr  */
-#line 160 "hx.y"
+#line 161 "hx.y"
                         { (yyval.node) = hx_binop_node(HX_OP_NE, (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1239 "hx.tab.c"
+#line 1240 "hx.tab.c"
     break;
 
   case 21: /* condition: expr '<' expr  */
-#line 161 "hx.y"
+#line 162 "hx.y"
                         { (yyval.node) = hx_binop_node(HX_OP_LT, (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1245 "hx.tab.c"
+#line 1246 "hx.tab.c"
     break;
 
   case 22: /* condition: expr '>' expr  */
-#line 162 "hx.y"
+#line 163 "hx.y"
                         { (yyval.node) = hx_binop_node(HX_OP_GT, (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1251 "hx.tab.c"
+#line 1252 "hx.tab.c"
     break;
 
   case 23: /* condition: expr LE expr  */
-#line 163 "hx.y"
+#line 164 "hx.y"
                         { (yyval.node) = hx_binop_node(HX_OP_LE, (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1257 "hx.tab.c"
+#line 1258 "hx.tab.c"
     break;
 
   case 24: /* condition: expr GE expr  */
-#line 164 "hx.y"
+#line 165 "hx.y"
                         { (yyval.node) = hx_binop_node(HX_OP_GE, (yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1263 "hx.tab.c"
+#line 1264 "hx.tab.c"
     break;
 
   case 25: /* expr: primary  */
-#line 170 "hx.y"
+#line 171 "hx.y"
                         { (yyval.node) = (yyvsp[0].node); }
-#line 1269 "hx.tab.c"
+#line 1270 "hx.tab.c"
     break;
 
   case 26: /* expr: expr '.' primary  */
-#line 171 "hx.y"
+#line 172 "hx.y"
                         { (yyval.node) = hx_concat((yyvsp[-2].node), (yyvsp[0].node), hx_line); }
-#line 1275 "hx.tab.c"
+#line 1276 "hx.tab.c"
     break;
 
   case 27: /* primary: IDENT  */
-#line 175 "hx.y"
+#line 176 "hx.y"
                         { (yyval.node) = hx_variable((yyvsp[0].str), hx_line); }
-#line 1281 "hx.tab.c"
+#line 1282 "hx.tab.c"
     break;
 
   case 28: /* primary: PASS  */
-#line 176 "hx.y"
+#line 177 "hx.y"
                         { (yyval.node) = hx_variable((yyvsp[0].str), hx_line); }
-#line 1287 "hx.tab.c"
+#line 1288 "hx.tab.c"
     break;
 
   case 29: /* primary: SALT  */
-#line 177 "hx.y"
+#line 178 "hx.y"
                         { (yyval.node) = hx_variable((yyvsp[0].str), hx_line); }
-#line 1293 "hx.tab.c"
+#line 1294 "hx.tab.c"
     break;
 
   case 30: /* primary: SALT2  */
-#line 178 "hx.y"
+#line 179 "hx.y"
                         { (yyval.node) = hx_variable((yyvsp[0].str), hx_line); }
-#line 1299 "hx.tab.c"
+#line 1300 "hx.tab.c"
     break;
 
   case 31: /* primary: PEPPER  */
-#line 179 "hx.y"
+#line 180 "hx.y"
                         { (yyval.node) = hx_variable((yyvsp[0].str), hx_line); }
-#line 1305 "hx.tab.c"
+#line 1306 "hx.tab.c"
     break;
 
   case 32: /* primary: USER  */
-#line 180 "hx.y"
+#line 181 "hx.y"
                         { (yyval.node) = hx_variable((yyvsp[0].str), hx_line); }
-#line 1311 "hx.tab.c"
+#line 1312 "hx.tab.c"
     break;
 
   case 33: /* primary: NUMBER  */
-#line 181 "hx.y"
+#line 182 "hx.y"
                         { (yyval.node) = hx_number((yyvsp[0].num), hx_line); }
-#line 1317 "hx.tab.c"
+#line 1318 "hx.tab.c"
     break;
 
   case 34: /* primary: STRING  */
-#line 182 "hx.y"
+#line 183 "hx.y"
                         { (yyval.node) = hx_literal((yyvsp[0].str), strlen((yyvsp[0].str)), hx_line); }
-#line 1323 "hx.tab.c"
+#line 1324 "hx.tab.c"
     break;
 
   case 35: /* primary: funcall  */
-#line 183 "hx.y"
+#line 184 "hx.y"
                         { (yyval.node) = (yyvsp[0].node); }
-#line 1329 "hx.tab.c"
+#line 1330 "hx.tab.c"
     break;
 
   case 36: /* primary: '(' expr ')'  */
-#line 184 "hx.y"
+#line 185 "hx.y"
                         { (yyval.node) = (yyvsp[-1].node); }
-#line 1335 "hx.tab.c"
+#line 1336 "hx.tab.c"
     break;
 
   case 37: /* funcall: IDENT '(' arglist ')'  */
-#line 189 "hx.y"
+#line 190 "hx.y"
                         { (yyval.node) = hx_funcall((yyvsp[-3].str), (yyvsp[-1].nlist).items, (yyvsp[-1].nlist).count, hx_line); }
-#line 1341 "hx.tab.c"
+#line 1342 "hx.tab.c"
     break;
 
   case 38: /* funcall: IDENT '^' NUMBER '(' arglist ')'  */
-#line 191 "hx.y"
+#line 192 "hx.y"
                         { (yyval.node) = hx_iter((yyvsp[-5].str), (int)(yyvsp[-3].num), (yyvsp[-1].nlist).items, (yyvsp[-1].nlist).count, hx_line); }
-#line 1347 "hx.tab.c"
+#line 1348 "hx.tab.c"
     break;
 
   case 39: /* arglist: expr  */
-#line 195 "hx.y"
+#line 196 "hx.y"
                         { nl_init(&(yyval.nlist)); nl_push(&(yyval.nlist), (yyvsp[0].node)); }
-#line 1353 "hx.tab.c"
+#line 1354 "hx.tab.c"
     break;
 
   case 40: /* arglist: arglist ',' expr  */
-#line 196 "hx.y"
+#line 197 "hx.y"
                         { (yyval.nlist) = (yyvsp[-2].nlist); nl_push(&(yyval.nlist), (yyvsp[0].node)); }
-#line 1359 "hx.tab.c"
+#line 1360 "hx.tab.c"
     break;
 
 
-#line 1363 "hx.tab.c"
+#line 1364 "hx.tab.c"
 
       default: break;
     }
@@ -1552,10 +1553,11 @@ yyreturnlab:
   return yyresult;
 }
 
-#line 199 "hx.y"
+#line 200 "hx.y"
 
 
 void yyerror(const char *s)
 {
+	hx_diag_count++;
 	fprintf(stderr, "hx:%d: %s\n", hx_line, s);
 }

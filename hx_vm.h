@@ -228,4 +228,9 @@ void    hx_vm_free(hx_vm *vm);
 
 hx_program *hx_compile_expr(const char *expr, const char *script_file);
 
+/* Diagnostics emitted by the lexer/parser; see hx.c. Reset to 0 before a
+ * compile and test after it to detect an expression that lexed with errors
+ * yet still produced a program. */
+extern int hx_diag_count;
+
 #endif /* HX_VM_H */

@@ -507,9 +507,10 @@ char *yytext;
 
 int hx_line = 1;
 static int brace_depth = 0;
-#line 510 "hx.lex.c"
+extern int hx_diag_count;   /* defined in hx.c */
+#line 511 "hx.lex.c"
 #define YY_NO_INPUT 1
-#line 512 "hx.lex.c"
+#line 513 "hx.lex.c"
 
 #define INITIAL 0
 
@@ -724,10 +725,10 @@ YY_DECL
 		}
 
 	{
-#line 24 "hx.l"
+#line 25 "hx.l"
 
 
-#line 730 "hx.lex.c"
+#line 731 "hx.lex.c"
 
 	while ( /*CONSTCOND*/1 )		/* loops until end-of-file is reached */
 		{
@@ -786,18 +787,18 @@ do_action:	/* This label is used only to access EOF actions. */
 
 case 1:
 YY_RULE_SETUP
-#line 26 "hx.l"
+#line 27 "hx.l"
 { /* comment — skip to end of line */ }
 	YY_BREAK
 case 2:
 YY_RULE_SETUP
-#line 27 "hx.l"
+#line 28 "hx.l"
 { /* whitespace */ }
 	YY_BREAK
 case 3:
 /* rule 3 can match eol */
 YY_RULE_SETUP
-#line 29 "hx.l"
+#line 30 "hx.l"
 { hx_line++;
                       if (brace_depth == 0)
                           return SEP;
@@ -806,70 +807,70 @@ YY_RULE_SETUP
 	YY_BREAK
 case 4:
 YY_RULE_SETUP
-#line 35 "hx.l"
+#line 36 "hx.l"
 { return SEP; }
 	YY_BREAK
 /* ---- keywords ---- */
 case 5:
 YY_RULE_SETUP
-#line 38 "hx.l"
+#line 39 "hx.l"
 { return FOR; }
 	YY_BREAK
 case 6:
 YY_RULE_SETUP
-#line 39 "hx.l"
+#line 40 "hx.l"
 { return TO; }
 	YY_BREAK
 case 7:
 YY_RULE_SETUP
-#line 40 "hx.l"
+#line 41 "hx.l"
 { return IF; }
 	YY_BREAK
 case 8:
 YY_RULE_SETUP
-#line 41 "hx.l"
+#line 42 "hx.l"
 { return ELSE; }
 	YY_BREAK
 /* ---- built-in variables (reserved words) ---- */
 case 9:
 YY_RULE_SETUP
-#line 44 "hx.l"
+#line 45 "hx.l"
 { yylval.str = strdup("pass");    return PASS; }
 	YY_BREAK
 case 10:
 YY_RULE_SETUP
-#line 45 "hx.l"
+#line 46 "hx.l"
 { yylval.str = strdup("salt");    return SALT; }
 	YY_BREAK
 case 11:
 YY_RULE_SETUP
-#line 46 "hx.l"
+#line 47 "hx.l"
 { yylval.str = strdup("salt2");   return SALT2; }
 	YY_BREAK
 case 12:
 YY_RULE_SETUP
-#line 47 "hx.l"
+#line 48 "hx.l"
 { yylval.str = strdup("pepper");  return PEPPER; }
 	YY_BREAK
 case 13:
 YY_RULE_SETUP
-#line 48 "hx.l"
+#line 49 "hx.l"
 { yylval.str = strdup("user");    return USER; }
 	YY_BREAK
 /* ---- literals ---- */
 case 14:
 YY_RULE_SETUP
-#line 51 "hx.l"
+#line 52 "hx.l"
 { yylval.num = strtol(yytext, NULL, 10); return NUMBER; }
 	YY_BREAK
 case 15:
 YY_RULE_SETUP
-#line 52 "hx.l"
+#line 53 "hx.l"
 { yylval.num = strtol(yytext, NULL, 10); return NUMBER; }
 	YY_BREAK
 case 16:
 YY_RULE_SETUP
-#line 54 "hx.l"
+#line 55 "hx.l"
 {
                       /* strip quotes, handle backslash escapes */
                       yytext[yyleng - 1] = '\0';
@@ -879,7 +880,7 @@ YY_RULE_SETUP
 	YY_BREAK
 case 17:
 YY_RULE_SETUP
-#line 61 "hx.l"
+#line 62 "hx.l"
 {
                       yytext[yyleng - 1] = '\0';
                       yylval.str = strdup(yytext + 1);
@@ -889,7 +890,7 @@ YY_RULE_SETUP
 /* ---- identifiers (hash names, variable names) ---- */
 case 18:
 YY_RULE_SETUP
-#line 68 "hx.l"
+#line 69 "hx.l"
 {
                       yylval.str = strdup(yytext);
                       return IDENT;
@@ -898,93 +899,94 @@ YY_RULE_SETUP
 /* ---- multi-char operators ---- */
 case 19:
 YY_RULE_SETUP
-#line 74 "hx.l"
+#line 75 "hx.l"
 { return EQ; }
 	YY_BREAK
 case 20:
 YY_RULE_SETUP
-#line 75 "hx.l"
+#line 76 "hx.l"
 { return NE; }
 	YY_BREAK
 case 21:
 YY_RULE_SETUP
-#line 76 "hx.l"
+#line 77 "hx.l"
 { return LE; }
 	YY_BREAK
 case 22:
 YY_RULE_SETUP
-#line 77 "hx.l"
+#line 78 "hx.l"
 { return GE; }
 	YY_BREAK
 /* ---- single-char operators and delimiters ---- */
 case 23:
 YY_RULE_SETUP
-#line 80 "hx.l"
+#line 81 "hx.l"
 { return '.'; }
 	YY_BREAK
 case 24:
 YY_RULE_SETUP
-#line 81 "hx.l"
+#line 82 "hx.l"
 { return '^'; }
 	YY_BREAK
 case 25:
 YY_RULE_SETUP
-#line 82 "hx.l"
+#line 83 "hx.l"
 { return '='; }
 	YY_BREAK
 case 26:
 YY_RULE_SETUP
-#line 83 "hx.l"
+#line 84 "hx.l"
 { return ','; }
 	YY_BREAK
 case 27:
 YY_RULE_SETUP
-#line 84 "hx.l"
+#line 85 "hx.l"
 { return '('; }
 	YY_BREAK
 case 28:
 YY_RULE_SETUP
-#line 85 "hx.l"
+#line 86 "hx.l"
 { return ')'; }
 	YY_BREAK
 case 29:
 YY_RULE_SETUP
-#line 86 "hx.l"
+#line 87 "hx.l"
 { brace_depth++; return '{'; }
 	YY_BREAK
 case 30:
 YY_RULE_SETUP
-#line 87 "hx.l"
+#line 88 "hx.l"
 { brace_depth--; return '}'; }
 	YY_BREAK
 case 31:
 YY_RULE_SETUP
-#line 88 "hx.l"
+#line 89 "hx.l"
 { return '<'; }
 	YY_BREAK
 case 32:
 YY_RULE_SETUP
-#line 89 "hx.l"
+#line 90 "hx.l"
 { return '>'; }
 	YY_BREAK
 case 33:
 YY_RULE_SETUP
-#line 90 "hx.l"
+#line 91 "hx.l"
 { return '%'; }
 	YY_BREAK
 /* ---- catch-all ---- */
 case 34:
 YY_RULE_SETUP
-#line 93 "hx.l"
-{ fprintf(stderr, "hx:%d: unexpected character '%c'\n",
+#line 94 "hx.l"
+{ hx_diag_count++;
+                      fprintf(stderr, "hx:%d: unexpected character '%c'\n",
                               hx_line, yytext[0]); }
 	YY_BREAK
 case 35:
 YY_RULE_SETUP
-#line 96 "hx.l"
+#line 98 "hx.l"
 ECHO;
 	YY_BREAK
-#line 987 "hx.lex.c"
+#line 989 "hx.lex.c"
 case YY_STATE_EOF(INITIAL):
 	yyterminate();
 
@@ -1952,6 +1954,6 @@ void yyfree (void * ptr )
 
 #define YYTABLES_NAME "yytables"
 
-#line 96 "hx.l"
+#line 98 "hx.l"
 
 

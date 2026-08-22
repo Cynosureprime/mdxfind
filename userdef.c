@@ -1,8 +1,11 @@
 /*
  * userdef.c - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.8 $
+ * $Revision: 1.9 $
  * $Log: userdef.c,v $
+ * Revision 1.9  2026/08/22 12:38:43  dlr
+ * Make a userdef parse error fatal, after the complete read. Previously a bad stanza was reported only under -Y verbose and then skipped, so a normal run silently continued with fewer types than the file declares, and the run looked healthy. Every rejection path now reports unconditionally via a new UD_ERR macro, increments a counter, and the load exits 1 once the WHOLE file has been read - so a single pass shows every broken stanza instead of making the user fix and re-run one typo at a time. Also closes a worse hole: the hx lexer catch-all PRINTS an unknown character and then drops it, so md5(md5($p)) lexed as md5(md5(p)), compiled, and registered a hash type that was silently not what was written - the only signal was a diagnostic scrolling past. New global hx_diag_count, defined in hx.c and declared in hx_vm.h, is incremented by the lexer catch-all and by yyerror; the userdef loader resets it before hx_compile_expr and rejects any stanza whose expression produced a diagnostic even when a program came back. hx_compile_expr itself is deliberately unchanged, so catalog and hx tool behaviour are untouched and only user-defined types get the strict treatment. hx.lex.c and hx.tab.c regenerated with flex and bison; the round trip is byte-identical apart from line directives. userdef.c is shared with hashpipe, so hashpipe now refuses the same broken file with the same report.
+ *
  * Revision 1.8  2026/08/09 20:13:37  dlr
  * Phase A: runtime synthetic-op base. Userdef_base_val defaults to JOB_USERDEF_BASE and is overridden by userdef_set_base before any op is assigned; userdef_is_userop and the registration site now read it. userdef_set_base is a no-op once ops have been handed out. hashpipe never sets it and keeps the default - it walks userdef_get_by_index and does not use op numbers at all.
  *
@@ -74,6 +77,13 @@
  */
 int userdef_verbose = 0;
 #define UD_MSG(...) do { if (userdef_verbose) fprintf(stderr, __VA_ARGS__); } while (0)
+/* Errors are ALWAYS reported, never gated on verbose: a stanza that does not
+ * load is now fatal, so the reason has to be visible in a normal run. */
+#define UD_ERR(...) do { fprintf(stderr, __VA_ARGS__); } while (0)
+/* Stanzas rejected during this load. userdef_load() reports every bad stanza
+ * and only then exits, so one run surfaces ALL the breakage in the file rather
+ * than making the user fix and re-run once per typo. */
+static int userdef_errors = 0;
 
 /*
  * USERDEF_HAVE_CODEGEN gates the two Milestone 2 "nicety" features that
@@ -502,21 +512,24 @@ static void finalize_stanza(const char *name, const char *idstr,
 	if (!name[0]) return;             /* no header seen yet */
 
 	if (!idstr[0]) {
-		UD_MSG( "userdef: %s: stanza [%s] (near line %d) has no "
-		        "'id =' key; skipping\n", path, name, lineno);
+		userdef_errors++;
+		UD_ERR( "userdef: %s: stanza [%s] (near line %d) has no "
+		        "'id =' key; rejected\n", path, name, lineno);
 		return;
 	}
 	if (!hx[0]) {
-		UD_MSG( "userdef: %s: stanza [%s] (near line %d) has no "
-		        "'hx =' expression; skipping\n", path, name, lineno);
+		userdef_errors++;
+		UD_ERR( "userdef: %s: stanza [%s] (near line %d) has no "
+		        "'hx =' expression; rejected\n", path, name, lineno);
 		return;
 	}
 
 	/* duplicate-id guard within this load */
 	for (i = 0; i < Userdef_count; i++) {
 		if (strcmp(Userdefs[i].idstr, idstr) == 0) {
-			UD_MSG( "userdef: %s: stanza [%s] (near line %d) "
-			        "reuses id '%s' (already used by [%s]); skipping\n",
+			userdef_errors++;
+			UD_ERR( "userdef: %s: stanza [%s] (near line %d) "
+			        "reuses id '%s' (already used by [%s]); rejected\n",
 			        path, name, lineno, idstr, Userdefs[i].name);
 			/* NB: the FIRST loaded type owns this id; the duplicate
 			 * is the skipped one.  -m u<id> still resolves to the
@@ -527,15 +540,32 @@ static void finalize_stanza(const char *name, const char *idstr,
 	}
 
 	if (Userdef_count >= USERDEF_MAX) {
-		UD_MSG( "userdef: too many user types (max %d); "
-		        "skipping [%s]\n", USERDEF_MAX, name);
+		userdef_errors++;
+		UD_ERR( "userdef: too many user types (max %d); "
+		        "rejected [%s]\n", USERDEF_MAX, name);
 		record_skip(idstr, "too many user types (registry full)");
 		return;
 	}
 
+	/* An hx lexer diagnostic does NOT stop the parse: the catch-all rule
+	 * prints the offending character and drops it, so md5(md5($p)) lexes as
+	 * md5(md5(p)) and compiles into a program that is silently not what was
+	 * written. Reset the counter, compile, and treat any diagnostic as a
+	 * failed stanza -- otherwise a typo becomes a wrong hash type rather
+	 * than an error. */
+	hx_diag_count = 0;
 	prog = hx_compile_expr(hx, NULL);
+	if (prog && hx_diag_count > 0) {
+		userdef_errors++;
+		UD_ERR( "userdef: %s: stanza [%s] (near line %d): hx "
+		        "expression has %d syntax error(s): %s\n",
+		        path, name, lineno, hx_diag_count, hx);
+		record_skip(idstr, "hx expression has syntax errors");
+		return;
+	}
 	if (!prog) {
-		UD_MSG( "userdef: %s: stanza [%s] (near line %d): hx "
+		userdef_errors++;
+		UD_ERR( "userdef: %s: stanza [%s] (near line %d): hx "
 		        "expression failed to compile: %s\n",
 		        path, name, lineno, hx);
 		record_skip(idstr, "hx expression failed to compile (parse error)");
@@ -551,9 +581,10 @@ static void finalize_stanza(const char *name, const char *idstr,
 	 */
 	slot_mask = program_slot_mask(prog);
 	if (slot_mask & (USERDEF_SLOT_SALT2 | USERDEF_SLOT_PEPPER)) {
-		UD_MSG( "userdef: %s (u%s): salt2 / pepper slots "
+		userdef_errors++;
+		UD_ERR( "userdef: %s (u%s): salt2 / pepper slots "
 		        "are not yet supported (v2 load grammar "
-		        "needed); skipping\n",
+		        "needed); rejected\n",
 		        name, idstr);
 		record_skip(idstr, "salt2/pepper slots not yet "
 		            "supported (v2 load grammar needed)");
@@ -563,8 +594,9 @@ static void finalize_stanza(const char *name, const char *idstr,
 
 	diglen = probe_diglen_hex(prog);
 	if (diglen <= 0 || (diglen & 1)) {
-		UD_MSG( "userdef: %s: stanza [%s] (id %s): expression "
-		        "produced an unusable digest (len %d); skipping\n",
+		userdef_errors++;
+		UD_ERR( "userdef: %s: stanza [%s] (id %s): expression "
+		        "produced an unusable digest (len %d); rejected\n",
 		        path, name, idstr, diglen);
 		record_skip(idstr, "expression produced an unusable digest");
 		hx_program_free(prog);
@@ -658,8 +690,9 @@ int userdef_load(const char *cache_env)
 			s++;
 			close = strchr(s, ']');
 			if (!close) {
-				UD_MSG( "userdef: %s line %d: malformed "
-				        "stanza header (no ']'); skipping\n",
+				userdef_errors++;
+				UD_ERR( "userdef: %s line %d: malformed "
+				        "stanza header (no ']'); rejected\n",
 				        path, lineno);
 				continue;
 			}
@@ -675,7 +708,8 @@ int userdef_load(const char *cache_env)
 		/* key = value line */
 		eq = strchr(s, '=');
 		if (!eq) {
-			UD_MSG( "userdef: %s line %d: not a "
+			userdef_errors++;
+			UD_ERR( "userdef: %s line %d: not a "
 			        "'key = value' line; ignoring\n", path, lineno);
 			continue;
 		}
@@ -711,7 +745,8 @@ int userdef_load(const char *cache_env)
 				idstr[sizeof(idstr) - 1] = '\0';
 			} else {
 				/* forward-compat: unknown key warn-and-ignore */
-				UD_MSG( "userdef: %s line %d: unknown "
+				userdef_errors++;
+				UD_ERR( "userdef: %s line %d: unknown "
 				        "key '%s' ignored (forward-compat)\n",
 				        path, lineno, key);
 			}
@@ -724,7 +759,15 @@ int userdef_load(const char *cache_env)
 	fclose(fp);
 
 	if (Userdef_count > 0)
-		UD_MSG( "userdef: %d user-defined hash type(s) loaded "
+		if (userdef_errors) {
+		fprintf(stderr,
+		        "userdef: %d bad stanza(s) in %s; refusing to run.\n"
+		        "userdef: all errors above are reported before exiting, so "
+		        "one pass shows the whole file.\n",
+		        userdef_errors, path);
+		exit(1);
+	}
+	UD_MSG( "userdef: %d user-defined hash type(s) loaded "
 		        "from %s\n", Userdef_count, path);
 
 	return Userdef_count;

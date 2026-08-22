@@ -91,7 +91,7 @@ typedef struct {
 #if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED
 union YYSTYPE
 {
-#line 65 "hx.y"
+#line 66 "hx.y"
 
 	char    *str;
 	int64_t  num;
