@@ -1,0 +1,201 @@
+.\" mdsplit(1) -- man-macro reference page
+.\" $Revision: 1.3 $
+.\" $Log: mdsplit.1,v $
+.\" Revision 1.3  2026/08/29 17:35:32  dlr
+.\" Document $HEX[] passthrough. mdsplit matches on the hash and treats the remainder as opaque, so a wrapped password is filed through unexamined; shows the result lines going in and the solution-file lines coming out, verified on a real three-hash fixture. Explains why it matters -- a password containing a colon would otherwise make the solution file ambiguous -- and points at getpass -u and rehex -u for recovery.
+.\"
+.\" Revision 1.2  2026/08/29 17:16:00  dlr
+.\" Remove the redundant .PP immediately after .SH EXAMPLES. mandoc reports it as "skipping paragraph macro: PP after SH"; groff does not flag it at all, which is how it survived a groff-only check. macOS and the BSDs render with mandoc, so mandoc is what most readers of these pages actually see. No rendered output changes.
+.\"
+.\" Revision 1.1  2026/08/29 16:30:16  dlr
+.\" Initial revision: mdsplit(1) man page. All 13 options including -d, -e and -S which the built-in usage omits. Documents the basename/type filename convention and the prefix, infix and suffix modifiers.
+.\"
+.TH MDSPLIT 1 "2026-08-29" "mdsplit 1.30" "Password Recovery"
+.SH NAME
+mdsplit \- split hash lists into solved and unsolved files by hash type
+.SH SYNOPSIS
+.B mdsplit
+.RI [ options ]
+.IR hashfile " [" hashfile " ...]"
+.SH DESCRIPTION
+.B mdsplit
+reads
+.BR mdxfind (1)
+result lines from standard input, or from the file named by
+.BR \-f ,
+and uses them to partition the named
+.I hashfile
+arguments.  Each hash that appears in the results is removed from its
+unsolved file and written to a per-type solution file; each hash that does
+not is left behind.  The unsolved list shrinks as the campaign progresses.
+.PP
+The naming convention it maintains is:
+.PP
+.RS
+.TP 16
+.IB name .txt
+the unsolved hashes
+.TP
+.IB name .MD5x01
+solved hashes of that type and iteration depth
+.TP
+.IB name .SHA1x02
+and so on, one file per distinct
+.IB TYPE x NN
+seen
+.RE
+.PP
+Only
+.B .txt
+files are examined by default.  Use
+.B \-a
+to process every file whose basename matches.
+.PP
+A result line is
+.IB TYPE x NN
+.IB hash : password
+or
+.IB TYPE x NN
+.IB hash : salt : password\fR.
+Lines with no type label are attributed to the type given by
+.BR \-t .
+.PP
+.B mdsplit
+matches on the hash and treats everything after it as opaque, so a password
+that
+.BR mdxfind (1)
+wrapped in
+.BI $HEX[ ... ]
+is filed through unchanged and unexamined.  Given the result lines
+.PP
+.RS
+.nf
+MD5x01 48c83cd71d44bbe192c77258b567c417:$HEX[706173733a776f7264]
+MD5x01 07117fe4a1ebd544965dc19573183da2:$HEX[636166c3a9]
+.fi
+.RE
+.PP
+the two hashes leave
+.B list.txt
+and arrive in
+.B list.MD5x01
+with their wrappers intact:
+.PP
+.RS
+.nf
+48c83cd71d44bbe192c77258b567c417:$HEX[706173733a776f7264]
+07117fe4a1ebd544965dc19573183da2:$HEX[636166c3a9]
+.fi
+.RE
+.PP
+This matters because a password containing a colon would otherwise make the
+solution file ambiguous.  Use
+.BR getpass (1)
+.B \-u
+to recover the plaintext, or
+.BR rehex (1)
+.B \-u
+to decode the wrapper directly.
+Hashes are matched by longest prefix, so truncated hashes still resolve, and
+by default reversed hashes are also recognised.
+.SH OPTIONS
+.TP
+.BI \-f " file"
+Read result lines from
+.I file
+instead of standard input.
+.TP
+.BI \-t " TYPExNN"
+Assume this type for result lines that carry no type label, e.g.
+.BR MD5x01 .
+Between 3 and 64 characters.
+.TP
+.B \-a
+Process all files matching the basename, not just
+.BR .txt .
+.TP
+.B \-e
+Require an exact match.  Disables the longest-prefix matching used for
+truncated hashes.
+.TP
+.B \-r
+Do not scan for reversed hashes.  The default is to try both orientations.
+.TP
+.BI \-S " char"
+Field separator character.  Default
+.BR : .
+.TP
+.BI \-p " string"
+Prepend
+.I string
+to each solution filename.  When a prefix is given the directory part of
+the input basename is stripped, so solutions can be collected somewhere
+other than beside their source.
+.TP
+.BI \-i " string"
+Insert
+.I string
+between the basename and the type in each solution filename.
+.TP
+.BI \-s " string"
+Append
+.I string
+to each solution filename.
+.TP
+.BI \-b " size"
+Buffer size, with an optional
+.BR B ,
+.BR K ,
+.B M
+or
+.B G
+suffix.  Bare numbers are kilobytes.  Not supported on Windows.
+.TP
+.B \-l
+Do not lock files.  Use on filesystems that cannot lock, such as some
+network mounts.  Concurrent
+.B mdsplit
+runs against the same files then become unsafe.
+.TP
+.B \-d
+Print detailed per-type statistics at the end of the run.
+.TP
+.B \-V
+Print the version and exit.
+.TP
+.B \-h, \-?
+Print the usage summary and exit.
+.SH "EXIT STATUS"
+0 on normal completion.  Non-zero on a usage error or an unreadable input.
+.SH EXAMPLES
+The common pipeline \(em search, then split the results back over the
+unsolved lists in one pass:
+.PP
+.RS
+.nf
+cat *.txt | mdxfind \-i 3 /tmp/words | mdsplit *.txt
+.fi
+.RE
+.PP
+Apply results collected earlier to a different set of unsolved lists:
+.PP
+.RS
+.nf
+cat foo.res bar.res | mdsplit /other/unsolved
+.fi
+.RE
+.PP
+Split from a saved result file, labelling untyped lines as MD5x01:
+.PP
+.RS
+.nf
+mdsplit \-f foo.res \-t MD5x01 biglist.txt
+.fi
+.RE
+.SH "SEE ALSO"
+.BR mdxfind (1),
+.BR getpass (1),
+.BR hashpipe (1),
+.BR rling (1)
+.SH AUTHOR
+Waffle.

@@ -1,0 +1,187 @@
+.\" mdxpause(1) -- man-macro reference page
+.\" $Revision: 1.1 $
+.\" $Log: mdxpause.1,v $
+.\" Revision 1.1  2026/08/29 17:16:18  dlr
+.\" Initial revision: mdxpause(1) man page. Written from mdxpause.c and the mdxfind signal handlers. Covers the pause and resume verbs, direct-pid and interactive forms, the SIGUSR1 and SIGUSR2 mechanism with its two-second polled checkpoints, and the Windows named-event equivalent. Documents the platform difference in process discovery: macOS matches the executable basename while Linux and FreeBSD match anywhere in the whole command line, so an editor or grep naming mdxfind appears in the list, which matters because selection 0 acts on everything and the default disposition of both signals is to terminate. Also records that an explicit pid is never checked against the process list.
+.\"
+.TH MDXPAUSE 1 "2026-08-29" "mdxpause" "Password Recovery"
+.SH NAME
+mdxpause \- pause and resume running mdxfind instances
+.SH SYNOPSIS
+.B mdxpause
+.BR pause | resume
+.RI [ pid ]
+.SH DESCRIPTION
+.B mdxpause
+suspends and resumes a running
+.BR mdxfind (1)
+without killing it, so that a long search can yield the machine to something
+more urgent and then pick up exactly where it left off.  Nothing is lost: no
+wordlist position, no loaded hash table, no GPU context, no accumulated
+results.
+.PP
+This matters because
+.BR mdxfind (1)
+start-up is not free.  A large hash list takes real time to read, index and
+upload to the devices, and a job interrupted with
+.B ^C
+pays that cost again from the beginning.  Pausing does not.
+.PP
+With a
+.I pid
+argument the signal is sent directly and
+.B mdxpause
+exits.  Without one it discovers the running instances itself and either acts
+on the only one it finds or presents a numbered menu.
+.SH ARGUMENTS
+.TP
+.BR pause | resume
+Required.  Only the first character is examined, so
+.B p
+and
+.B r
+are accepted, as is any word beginning with either.  Anything else prints
+the usage summary.
+.TP
+.I pid
+Act on this process directly, without listing anything.
+.SH "INTERACTIVE SELECTION"
+With no
+.I pid
+argument,
+.B mdxpause
+scans for running
+.B mdxfind
+processes, excluding itself, and stops after 64.  Then:
+.TP 3
+.B \(bu
+No instances found: it says so and exits 1.
+.TP
+.B \(bu
+Exactly one instance: it acts on that one immediately.  There is no
+confirmation prompt, so on a machine running a single search
+.B "mdxpause pause"
+is a complete command.
+.TP
+.B \(bu
+More than one: it prints a table of index, PID and command line, and prompts
+for a selection.  Entering
+.B 0
+acts on every listed instance.
+.SH "HOW IT WORKS"
+On Unix,
+.B pause
+sends
+.B SIGUSR1
+and
+.B resume
+sends
+.BR SIGUSR2 .
+.BR mdxfind (1)
+installs handlers for both that do nothing but set a flag.  Its worker
+threads test that flag at checkpoints in the search loop and park on it,
+polling every two seconds.
+.PP
+Two consequences follow from that design, and both are features rather than
+defects.  A pause takes effect at the next checkpoint, not instantly, so
+work in flight is completed rather than abandoned \(em which is why nothing
+is lost.  A resume is likewise noticed within about two seconds rather than
+immediately.
+.PP
+On Windows there are no such signals, so
+.BR mdxfind (1)
+creates two named events per process,
+.BI Global\e\emdxfind_pause_ pid
+and
+.BI Global\e\emdxfind_resume_ pid\fR,
+and a background thread waits on them.
+.B mdxpause
+opens the appropriate event and sets it.  If the event cannot be opened \(em
+because the process is not an
+.B mdxfind
+that installed them, or is not responding \(em it reports the failure
+rather than signalling blindly.
+.SH "PROCESS DISCOVERY"
+How instances are found differs by platform, and so does how precisely the
+match is drawn.
+.TP
+.B macOS
+Every PID is enumerated and its executable path retrieved; a process
+matches if the
+.I basename
+of that path contains
+.BR mdxfind .
+The displayed command line is recovered separately from the kernel process
+arguments.
+.TP
+.B "Linux, FreeBSD"
+.B /proc/\fIpid\fB/cmdline
+is read and the process matches if
+.B mdxfind
+appears
+.I anywhere
+in it.
+.PP
+The Linux and FreeBSD test is the looser of the two: it matches on the whole
+command line, so an editor open on
+.BR mdxfind.c ,
+or a
+.BR grep (1)
+whose pattern is the word, appears in the list alongside real searches.
+Read the command-line column before selecting, and be especially careful
+with
+.BR 0 ,
+which acts on everything listed.  Sending
+.B SIGUSR1
+to a process that does not expect it is not harmless \(em the default
+disposition of both signals is to terminate.
+.PP
+A
+.I pid
+given explicitly is not checked against the process list at all.  It is
+signalled as given.
+.SH "EXIT STATUS"
+0 when a signal was delivered.  1 on a usage error, when no instances were
+found, when the selection was out of range, or when the signal could not be
+delivered.
+.SH EXAMPLES
+Pause the only search running on this machine:
+.PP
+.RS
+.nf
+mdxpause pause
+.fi
+.RE
+.PP
+Resume it:
+.PP
+.RS
+.nf
+mdxpause resume
+.fi
+.RE
+.PP
+Pause one specific instance without being prompted, and without the process
+scan:
+.PP
+.RS
+.nf
+mdxpause pause 48213
+.fi
+.RE
+.PP
+Free the machine for an interactive job, then hand it back:
+.PP
+.RS
+.nf
+mdxpause p          # select 0 to pause every instance
+\&...
+mdxpause r          # and again to resume them all
+.fi
+.RE
+.SH "SEE ALSO"
+.BR mdxfind (1),
+.BR kill (1),
+.BR signal (3)
+.SH AUTHOR
+Waffle.

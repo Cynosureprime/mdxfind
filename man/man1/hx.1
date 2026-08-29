@@ -1,0 +1,299 @@
+.\" hx(1) -- man-macro reference page
+.\" NOTE: this is the man page for the hx COMMAND.  The hx LANGUAGE
+.\" specification is a separate mm-macro document of the same stem, kept in
+.\" a different directory.  Neither is derived from the other.
+.\" $Revision: 1.3 $
+.\" $Log: hx.1,v $
+.\" Revision 1.3  2026/08/29 17:35:32  dlr
+.\" Document the $HEX[] asymmetry, all verified by running. Input: -p and stdin lines decode $HEX[] and $TESTVEC[], shown with a pair of equivalent runs, and this is how a password containing a colon or a high-bit byte is supplied on a command line at all. Output: NOT wrapped -- a _bin expression writes raw bytes, unsafe to pipe into a line-oriented tool, so either encode inside the expression with hex() or wrap on the way out with rehex(1). Also notes that hashpipe -X does not perform the input decoding despite running the same language.
+.\"
+.\" Revision 1.2  2026/08/29 17:16:18  dlr
+.\" Add BUILDING section per Dave: hx is not distributed as a binary, only built from source. Documents make hx in-tree (the target exists but is deliberately absent from all, which is why a normal build does not produce the command) and a portable hand-build using $PREFIX rather than a hardcoded local prefix. Records the three ways the build goes wrong: HX_STANDALONE without HX_NO_MAIN, since defining both gates out main and yields a library-flavoured object; myprogress.c required or myprogress is undefined at link; and HX_HAS_KDF only with the KDF objects linked. Also states that options precede the expression, and adds a tested example with its output. Removes the redundant .PP after .SH EXAMPLES.
+.\"
+.\" Revision 1.1  2026/08/29 16:30:16  dlr
+.\" Initial revision: hx(1) man page for the hx COMMAND. All 8 options plus the $HEX[] and $TESTVEC[] input decoding. Defers the language itself to the mm-macro hx specification, which stays authoritative.
+.\"
+.TH HX 1 "2026-08-29" "hx" "Password Recovery"
+.SH NAME
+hx \- evaluate hash expressions
+.SH SYNOPSIS
+.B hx
+.RI [ options ]
+.I expression
+.br
+.B hx
+.RI [ options ]
+.BI \-f " script.hx"
+.SH DESCRIPTION
+.B hx
+compiles and runs a program in the hx hash expression language: a notation
+for stating exactly which cryptographic operations, in which order, turn a
+password into a digest.
+.PP
+.B hx
+is not distributed as a binary.  It is built from the source tree on demand;
+see
+.BR BUILDING .
+.PP
+The command is a calculator.  It computes and prints; it reads no hash file
+and verifies nothing.  Its uses are working out what an unfamiliar hash
+construction actually is, producing test vectors, and drafting an
+expression before installing it as a user-defined type in
+.BR userdef.txt ,
+where
+.BR mdxfind (1)
+and
+.BR hashpipe (1)
+can search on it.
+.PP
+Options precede the
+.IR expression ,
+which is the sole non-option argument.  Either an
+.I expression
+or a
+.B \-f
+script is required, and not both.  Without
+.BR \-p ,
+passwords are read from standard input, one per line, and one result is
+printed per input line.  Results are lowercase hexadecimal unless the
+expression says otherwise.
+.PP
+A password argument or input line beginning with
+.BI $HEX[ ... ]
+is hex-decoded before use, as is
+.BI $TESTVEC[ ... ]\fR,
+which exists for large binary vectors and accepts up to 2 MB decoded.  Hex
+decoding stops at the first non-hex character, so the closing bracket is
+optional.  These two are therefore the same run:
+.PP
+.RS
+.nf
+$ hx \-p alpha 'md5(pass)'
+2c1743a391305fbf367df8e4f069f9f9
+
+$ hx \-p '$HEX[616c706861]' 'md5(pass)'
+2c1743a391305fbf367df8e4f069f9f9
+.fi
+.RE
+.PP
+The wrapper is how a password containing a colon, a control character or a
+high-bit byte is supplied on a command line at all.  Note that
+.B hashpipe \-X
+does
+.I not
+perform this decoding, though it runs the same language.
+.PP
+Output is
+.I not
+wrapped.  A
+.B _bin
+expression writes raw bytes to standard output, which is unsafe to pipe into
+a line-oriented tool; either encode inside the expression with
+.BR hex (),
+or wrap on the way out with
+.BR rehex (1):
+.PP
+.RS
+.nf
+$ hx \-p alpha 'md5_bin(pass)' | rehex
+$HEX[2c1743a391305fbf367df8e4f069f9f9]
+.fi
+.RE
+.SH OPTIONS
+.TP
+.BI \-p " password"
+Evaluate for this single password instead of reading standard input.
+.TP
+.BI \-f " file"
+Read the program from
+.I file
+rather than the command line.
+.TP
+.BI \-s " salt"
+Bind the
+.B salt
+variable.
+.TP
+.BI \-S " salt2"
+Bind the
+.B salt2
+variable.
+.TP
+.BI \-P " pepper"
+Bind the
+.B pepper
+variable.
+.TP
+.BI \-u " user"
+Bind the
+.B user
+variable.
+.TP
+.B \-d
+Dump the abstract syntax tree and exit without compiling further.
+.TP
+.B \-b
+Dump the compiled bytecode and exit without running.
+.TP
+.B \-h
+Print the usage summary and exit.
+.SH BUILDING
+No
+.B hx
+binary is shipped.  The source tree carries a target for it, so inside a
+checkout the whole job is:
+.PP
+.RS
+.nf
+make hx
+.fi
+.RE
+.PP
+That target is deliberately absent from
+.BR all ,
+which is why a normal build does not produce the command.  To build it by
+hand, or outside the tree:
+.PP
+.RS
+.nf
+cc \-DHX_STANDALONE \-O3 \-I. \-I$PREFIX/include \e
+   \-o hx hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c \e
+         hx.tab.c hx.lex.c myprogress.c \e
+   \-L$PREFIX/lib \-lssl \-lcrypto $PREFIX/lib/libiconv.a
+.fi
+.RE
+.PP
+.I $PREFIX
+is wherever OpenSSL and libiconv are installed \(em
+.BR /usr ,
+.BR /usr/local ,
+.B /opt/local
+and
+.B /opt/homebrew
+are the usual candidates, and the two need not share a prefix.
+.PP
+Three things go wrong if you deviate:
+.TP 3
+.B \(bu
+Define
+.B HX_STANDALONE
+and
+.I not
+.BR HX_NO_MAIN .
+The
+.BR main ()
+function is gated on
+.B HX_STANDALONE
+and the absence of
+.BR HX_NO_MAIN ,
+so defining both compiles the same sources into a library-flavoured object
+with no entry point.  The in-tree codegen tooling defines both on purpose;
+that recipe is not a template for building the command.
+.TP
+.B \(bu
+.B myprogress.c
+is required.  Omitting it leaves
+.B myprogress
+undefined at link time.
+.TP
+.B \(bu
+Do not define
+.B HX_HAS_KDF
+unless you also link the KDF objects, or the link fails on
+.BR crypto_scrypt ,
+.BR yescrypt_r ,
+.B yescrypt_init_local
+and
+.BR bsd_crypt_des .
+Without it the binary builds and every hash primitive works; only the
+password-based key derivation functions are absent.
+.SH "EXPRESSION LANGUAGE"
+The bound variables are
+.BR pass ,
+.BR salt ,
+.BR salt2 ,
+.B pepper
+and
+.BR user .
+Concatenation is
+.BR . ;
+a hash function applied to an argument yields its lowercase hex by default;
+the
+.B _bin
+suffix yields raw bytes instead; and
+.BI ^ n
+after a function name iterates it
+.I n
+times.
+.PP
+.RS
+.TP 30
+.B md5(pass)
+plain MD5
+.TP
+.B sha1(md5(pass) . salt)
+SHA1 over the MD5 hex, then the salt
+.TP
+.B md5_bin(pass)
+raw 16-byte MD5 output
+.TP
+.B md5^1000(pass)
+MD5 iterated 1000 times
+.TP
+.B hex(md5_bin(salt . pass))
+explicit hex encoding of a binary result
+.RE
+.PP
+The full language \(em every function, encoding, control construct and the
+catalogued expression for each of the supported hash types \(em is
+specified in the mm-macro hx reference document, which is the authority.
+This page covers the command only.
+.SH "EXIT STATUS"
+0 on success, 1 on a usage error, a compile failure, or an allocation
+failure.
+.SH EXAMPLES
+The simplest possible run, showing the option-before-expression order and the
+default lowercase-hex output:
+.PP
+.RS
+.nf
+$ hx \-p alpha 'md5(pass)'
+2c1743a391305fbf367df8e4f069f9f9
+.fi
+.RE
+.PP
+Identify a construction by computing candidates for a known pair:
+.PP
+.RS
+.nf
+hx \-p password123 \-s 3f2a 'md5(salt . md5(pass))'
+.fi
+.RE
+.PP
+Generate vectors for a whole wordlist:
+.PP
+.RS
+.nf
+hx \-s deadbeef 'sha256(pass . salt)' < words.txt
+.fi
+.RE
+.PP
+Inspect what an expression compiles to before trusting it:
+.PP
+.RS
+.nf
+hx \-b 'sha1(md5(pass) . salt)'
+.fi
+.RE
+.SH "SEE ALSO"
+.BR mdxfind (1),
+.BR hashpipe (1)
+.PP
+.B hashpipe \-X
+evaluates the same language with the full hashpipe function registry
+available, and
+.B hashpipe \-D
+is the equivalent of
+.BR "hx \-b" .
+.SH AUTHOR
+Waffle.

@@ -1,0 +1,745 @@
+.\" mdxfind(1) -- man-macro reference page
+.\" This file is a man page.  The mm-macro reference document of the same
+.\" stem is a separate, unrelated deliverable and is not derived from this.
+.\" $Revision: 1.3 $
+.\" $Log: mdxfind.1,v $
+.\" Revision 1.3  2026/08/29 17:35:32  dlr
+.\" OUTPUT FORMAT: show the $HEX[] wrapper instead of only naming it. Adds two real output lines, for a password containing a colon and for one containing a high-bit byte, and states that the wrapper is what keeps the colon-delimited format parseable. Records that the form is accepted on input wherever a candidate or key is read, verified by running: $HEX[706173733a776f7264] and pass:word as wordlist candidates produce the identical digest. Cross-references rehex(1).
+.\"
+.\" Revision 1.2  2026/08/29 17:16:00  dlr
+.\" Remove the redundant .PP immediately after .SH EXAMPLES. mandoc reports it as "skipping paragraph macro: PP after SH"; groff does not flag it at all, which is how it survived a groff-only check. macOS and the BSDs render with mandoc, so mandoc is what most readers of these pages actually see. No rendered output changes.
+.\"
+.\" Revision 1.1  2026/08/29 16:29:54  dlr
+.\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
+.\"
+.TH MDXFIND 1 "2026-08-29" "mdxfind 1.543" "Password Recovery"
+.SH NAME
+mdxfind \- multi-algorithm hash search over candidate password lists
+.SH SYNOPSIS
+.B mdxfind
+.RI [ options ]
+.IR wordlist " [" wordlist " ...]"
+.br
+.B mdxfind
+.RI [ options ]
+.I mask
+.br
+.B mdxfind
+.B \-?
+.SH DESCRIPTION
+.B mdxfind
+reads a list of hashes and a list of candidate passwords, computes every
+selected hash type over every candidate, and reports the matches.  It
+differs from a conventional cracker in that it tests
+.I many
+hash types in a single pass, at
+.I several
+iteration depths simultaneously, which makes it the tool of choice when the
+construction of a hash is unknown.
+.PP
+Candidate passwords come from the trailing
+.I wordlist
+arguments.  The literal name
+.B stdin
+may be used as a wordlist to read candidates from standard input.  Wordlists
+may be gzip, xz, bzip2, zstd or zip compressed; they are decompressed
+transparently.  Directories are skipped unless
+.B \-y
+is given.
+.PP
+If exactly one trailing argument is supplied and it does not name an existing
+file,
+.B mdxfind
+attempts to parse it as a mask (see
+.BR "MASK SYNTAX" )
+and runs in brute-force mode over that keyspace.
+.PP
+Hashes come from standard input by default, or from one of the three
+loading options
+.BR \-f ,
+.B \-F
+and
+.BR \-J .
+.PP
+With no trailing arguments,
+.B mdxfind
+prints its usage summary and exits.
+.SH "OPTION ORDER MATTERS"
+.B mdxfind
+performs work
+.I during
+option parsing, not after it.  Options that load a file act on the
+selection state as it stands at the moment
+.BR getopt (3)
+reaches them.  Three consequences:
+.TP
+.B \-M must precede \-F
+.B \-F
+parses its hash file immediately, using the type set that
+.B \-M
+has established.  A
+.B \-M
+that appears
+.I after
+.B \-F
+has no effect on that file, which is then parsed against whatever
+.B \-m
+or
+.B \-h
+had selected so far \(em or against the MD5 default if nothing had.  The run
+still prints a plausible
+.RB \(lq "Working on hash types:" \(rq
+line and simply finds nothing.  This failure is silent.
+.TP
+.B \-M must precede \-S, \-U and \-P
+Those three load per-type salts, userids and peppers for the types
+.B \-M
+selected.  With no preceding
+.BR \-M ,
+each falls back to loading into the corresponding
+.I global
+array, which is a different and usually wrong thing.
+.TP
+.B "each \-M resets the load selection"
+.B \-M
+clears the previous load set before adding to it.  Use one
+.B \-M
+per group of
+.BR \-S / \-U / \-P
+options.
+.B "\-M RESET"
+clears the load set without selecting anything.
+.SH "SELECTING HASH TYPES"
+Until the first
+.BR \-m ,
+.B \-h
+or
+.B \-M
+option, the selected set is MD5 alone.  The first such option clears that
+default; subsequent ones accumulate.
+.TP
+.BI \-m " spec"
+Select types for the
+.B \-f
+channel.
+.I spec
+is a comma-separated list of:
+.RS
+.IP \(bu 3
+a bare number \(em a
+.BR hashcat (1)
+mode, e.g.
+.B 1000
+for NTLM;
+.IP \(bu 3
+.BI e N
+\(em an internal type index, e.g.
+.B e1
+for MD5;
+.IP \(bu 3
+.BI e N \- e M
+\(em an inclusive range of internal indices;
+.IP \(bu 3
+.BI u id
+\(em a user-defined type from
+.BR userdef.txt ,
+matched as an exact string, never as a regex.
+.RE
+.IP
+Selecting certain hashcat modes raises the minimum iteration count
+automatically: modes 4500, 2600, 2630, 34400, 21000 and 21400 force at least
+2; mode 3500 forces at least 3; mode 14400 forces at least 10.
+.TP
+.BI \-h " regex"
+Select types whose
+.I name
+matches a PCRE, case-insensitively.  Comma-separated; a leading
+.B !
+on a token
+.I deselects
+the matching types.  The literal tokens
+.B ALL
+and
+.B .
+select a curated set of about 22 commonly encountered types rather than
+everything.
+.IP
+.BR "\-h is not help" .
+It is a regex, and an unanchored pattern matches far more than intended \(em
+.B \-h md5
+selects every type with MD5 anywhere in its name, which is dozens.  Help is
+.B \-?
+or no arguments at all.
+.TP
+.BI \-M " spec"
+Select types
+.I and mark them for loading.
+Accepts everything
+.B \-m
+accepts, plus bare regex patterns with the same
+.B !
+negation as
+.BR \-h .
+Unlike
+.BR \-m ,
+this also populates the load set consulted by
+.BR \-F ,
+.BR \-S ,
+.B \-U
+and
+.BR \-P .
+Prints the number of types selected.
+.PP
+Run
+.B \-h
+with no other option to list every supported type name.
+.SH "HASH INPUT CHANNELS"
+.TP
+.BI \-f " file"
+Read the hash list from
+.IR file .
+Suited to plain hex digests: when only hex-input types are selected this
+channel takes a vectorised fast path that bypasses the format recognisers
+entirely.  Types are chosen with
+.BR \-m .
+.TP
+.BI \-F " file"
+Read the hash list from
+.IR file ,
+with the structured-format recognisers and the embedded salt/userid
+extractor enabled.  Use this for anything that is not bare hex \(em
+.BI $ id $ salt $ hash
+crypt forms, base64 digests,
+.BI hash : salt
+pairs,
+.BI {ssha1} NN$salt$hash
+and the rest.  Types are chosen with
+.BR \-M ,
+which
+.I must
+appear first.  The filename
+.B stdin
+reads from standard input.
+.TP
+.BI \-J " file"
+As
+.BR \-F ,
+but without a load-set restriction: every currently selected type is offered
+the file.  The filename
+.B stdin
+reads from standard input.
+.PP
+.BR \-f ,
+.B \-F
+and
+.B \-J
+may be combined; each contributes to the same hash table.  If none is given,
+the hash list is read from standard input.
+.SH "SALTS, USERIDS, PEPPERS AND KEYS"
+.TP
+.BI \-s " file"
+Load salts into the global salt array, one per line.
+.TP
+.BI \-u " file"
+Load userids into the global userid array, one per line.  Empty lines are
+ignored.
+.TP
+.BI \-j " file"
+Load
+.I peppers
+into the global pepper array, one per line.  A global pepper is tried
+against every selected type that takes one; it is not associated with any
+particular type.
+.TP
+.BI \-P " file"
+Load peppers for the types named by the preceding
+.BR \-M .
+With no preceding
+.BR \-M ,
+.B \-P
+degenerates to exactly what
+.B \-j
+does and loads the global array instead.
+.IP
+.B \-j
+and
+.B \-P
+are easy to confuse.  The distinction is scope, not content:
+.B \-j
+is always global and never type-aware;
+.B \-P
+is type-aware only when
+.B \-M
+has run first.
+.TP
+.BI \-S " file"
+Load salts for the types named by the preceding
+.BR \-M ;
+global otherwise.  The filename
+.B stdin
+or
+.B \-
+reads standard input.
+.TP
+.BI \-U " file"
+Load userids for the types named by the preceding
+.BR \-M ;
+global otherwise.  The filename
+.B stdin
+or
+.B \-
+reads standard input.
+.TP
+.BI \-k " file"
+Load keys (suffixes) from
+.IR file .
+Lines wrapped in
+.BI $HEX[ ... ]
+are decoded.  Each key is truncated to 255 bytes.
+.TP
+.BI \-x " file"
+As
+.BR \-k ,
+but every line is taken as raw hexadecimal with no
+.B $HEX[]
+wrapper.
+.SH "RULES AND CANDIDATE MUTATION"
+.TP
+.BI \-r " file"
+Read mangling rules from
+.IR file ,
+one per line.  Comments begin with
+.BR # .
+Multiple
+.B \-r
+options concatenate their rule sets.  Each rule is validated at load time
+against the probe word
+.RB \(lq Password \(rq;
+a rule that fails validation is reported with its line number and dropped.
+.TP
+.BI \-R " file"
+As
+.BR \-r ,
+but forms the
+.I dot product
+of the new rules with the rules already loaded: every existing rule is
+concatenated with every new one.  Two 100-rule files loaded with
+.B \-R
+yield 10,000 rules.
+.TP
+.BI \-n " spec"
+Append generated text to each candidate.
+.I spec
+is either a mask (see
+.BR "MASK SYNTAX" ),
+a digit count such as
+.B 2
+for 00\(en99, a digit count with
+.B x
+or
+.B X
+for lowercase or uppercase hexadecimal, or
+.B i
+for the full IPv4 space.
+.TP
+.BI \-N " spec"
+As
+.BR \-n ,
+but prepends.  A run may use both;
+.B \-n
+and
+.B \-N
+compose, and the combined keyspace is their product.
+.TP
+.B \-a
+Email address munging.
+.TP
+.B \-b
+Expand each word into Unicode, best effort.
+.TP
+.B \-c
+Replace
+.BR < ,
+.B >
+and
+.B &
+with their XML entity spellings.
+.TP
+.B \-d
+De-duplicate candidates, best effort.
+.TP
+.B \-l
+Also try each candidate with a trailing NUL, CR, LF and CRLF, and report
+results in hex.
+.TP
+.BI \-w " count"
+Skip the first
+.I count
+lines of the first wordlist.
+.TP
+.B \-y
+Recurse into directories named as wordlists.
+.SH "SEARCH DEPTH AND MATCHING"
+.TP
+.BI \-i " count"
+Set the maximum iteration count.
+.B mdxfind
+tests
+.I every
+depth from 1 to
+.I count
+in a single pass, not just the final one, and reports which depth matched.
+This is the option that finds
+.BR md5(md5(md5(pass))) .
+.TP
+.BI \-q " count"
+Set the internal iteration count for the types that have one of their own,
+such as SHA1MD5x.  Distinct from
+.BR \-i .
+.TP
+.BI \-g " n"
+Rotate each computed hash by up to
+.I n
+characters when comparing, to catch hashes that were stored rotated.
+Matches are reported with a
+.BI rot NN _
+prefix on the type name.
+.TP
+.B \-e
+Extended match: accept truncated hashes, matching on a prefix rather than
+the full digest.
+.TP
+.B \-v
+Do not mark salts as found.  A salt that has produced one crack is normally
+retired; this keeps it live.
+.SH "OUTPUT AND DIAGNOSTICS"
+.TP
+.B \-p
+Print the source filename of each found plaintext.
+.TP
+.B \-z
+.BR "Generate mode" .
+Emits the computed hashes for the candidates rather than searching for
+them, and explores long hash chains.  Output lines look very much like
+solves; they are not.  This is a test and bootstrap mode \(em it is how you
+produce a known-good hash of a known password for a given type.  Also
+implies
+.BR \-v .
+.TP
+.B \-Z
+Print a histogram of which rules produced hits.
+.TP
+.BI \-W " spec"
+Wordlist ETA control.
+.I spec
+is a line count with an optional
+.BR K ,
+.B M
+or
+.B G
+suffix;
+.B auto
+to count lines in a background thread;
+.BI auto: path
+to do so with an explicit cache database; or
+.B none
+to disable the estimate.  Setting
+.B MDXFIND_CACHE
+enables
+.B auto
+implicitly;
+.B \-W none
+overrides that.
+.TP
+.B \-V
+Print the program version and exit.  The exit status is 1.
+.TP
+.B \-Y
+Load
+.B userdef.txt
+(see
+.BR ENVIRONMENT ),
+print the load report, and exit.  A run without
+.B \-Y
+loads the same file silently.  This option is recognised by a pre-scan of
+the argument vector, before ordinary option parsing.
+.TP
+.B \-?
+Print the usage summary and exit.
+.SH "GPU CONTROL"
+.TP
+.BI \-G " spec"
+.I spec
+is one of:
+.RS
+.IP "\fBlist\fP" 10
+Enumerate the visible GPU devices and exit.
+.IP "\fBnone\fP" 10
+Disable GPU dispatch entirely; run on the CPU.
+.IP "\fBforce\fP" 10
+Dispatch every eligible candidate to the GPU.
+.IP "\fBserial\fP" 10
+Initialise devices one at a time rather than in parallel.
+.IP "\fIlist\fP" 10
+A comma-separated list of device indices and ranges, e.g.
+.B 0,2,4
+or
+.BR 0\-2,5,7\-9 .
+.RE
+.IP
+On a build with no GPU support,
+.B \-G
+with a device list is a fatal error.
+.TP
+.BI \-t " count"
+Worker thread count.  Defaults to the number of online processors.  Valid
+range is 1 to 32768.
+.SH "MASK SYNTAX"
+Masks are accepted by
+.BR \-n ,
+.BR \-N ,
+and as a lone trailing argument for brute-force mode.  A mask is a sequence
+of literal bytes and class references.
+.RS
+.TP 6
+.B ?d
+digits 0\-9
+.TP
+.B ?l
+lowercase a\-z
+.TP
+.B ?u
+uppercase A\-Z
+.TP
+.B ?s
+printable non-alphanumerics, including space
+.TP
+.B ?a
+all printable, 0x20\-0x7e
+.TP
+.B ?b
+all byte values, 0x00\-0xff
+.TP
+.B ?h
+lowercase hex, 0\-9a\-f
+.TP
+.B ?H
+uppercase hex, 0\-9A\-F
+.RE
+.PP
+A custom class is written
+.BI ?[ set ]\fR,
+where
+.I set
+is a list of literal characters, ranges such as
+.BR a\-f ,
+and escapes:
+.BI \e\ex NN
+for a hexadecimal byte,
+.BI \e NNN
+for an octal byte, and
+.BI \e c
+for a literal
+.IR c .
+Any character not introduced by
+.B ?
+is a literal.
+.PP
+Masks may be up to 256 positions.  GPU dispatch handles at most 16 variable
+positions per side; longer masks are computed on the CPU and a notice is
+printed.
+.SH "OUTPUT FORMAT"
+A solve is written to standard output as
+.PP
+.RS
+.I TYPE
+.BI x NN
+.I hash\fB:\fIpassword
+.RE
+.PP
+for an unsalted type, or
+.PP
+.RS
+.I TYPE
+.BI x NN
+.I hash\fB:\fIsalt\fB:\fIpassword
+.RE
+.PP
+for a salted one.
+.I NN
+is the zero-padded iteration depth at which the match occurred, so
+.B MD5x03
+means
+.BR md5(md5(md5(pass))) .
+A password containing bytes that do not survive a line-oriented format \(em
+a colon, a control character, a high-bit byte \(em is emitted wrapped in
+.BI $HEX[ ... ]\fR,
+holding the password's bytes in lowercase hexadecimal.  Both of these are
+real output lines, the first for the password
+.BR pass:word ,
+the second for
+.B cafe
+with an acute accent on the final e:
+.PP
+.RS
+.nf
+MD5x01 48c83cd71d44bbe192c77258b567c417:$HEX[706173733a776f7264]
+MD5x01 07117fe4a1ebd544965dc19573183da2:$HEX[636166c3a9]
+.fi
+.RE
+.PP
+The wrapper is what keeps the colon-delimited format parseable when the
+password itself contains a colon.  It is accepted on input wherever a
+candidate or a key is read, so results can be fed straight back in as a
+wordlist.  See
+.BR rehex (1)
+to apply or remove it.
+.PP
+Progress, counts and diagnostics go to standard error, so the two streams
+may be separated safely.
+.PP
+.BR mdsplit (1)
+consumes this format.
+.SH ENVIRONMENT
+.TP
+.B MDXFIND_CACHE
+Path to the
+.B mdxfind.db
+SQLite line-count cache.  Setting it implicitly enables
+.BR "\-W auto" .
+Its
+.I directory component
+is also where
+.B userdef.txt
+and the compiled GPU kernel cache are looked up; if the value contains no
+directory separator, the current directory is used.  With
+.B MDXFIND_CACHE
+unset, no user-defined types are loaded and the GPU kernel cache is
+disabled with a warning.
+.TP
+.B MDXFIND_GPU_BACKEND
+Select the GPU backend explicitly on a build that has more than one.
+.TP
+.B MDXFIND_GPU_MAX_GLOBAL
+Ceiling on the one-dimensional global work size.  Lower this if a device
+rejects a dispatch with
+.BR CL_INVALID_GLOBAL_WORK_SIZE .
+.PP
+A number of further
+.BR MDXFIND_ *
+variables exist for tracing and kernel selection.  They are development
+diagnostics, are not part of the stable interface, and may change or vanish
+between releases.
+.SH FILES
+.TP
+.B userdef.txt
+User-defined hash types, one INI-style stanza per type, each carrying an
+.BR hx (1)
+expression.  Located in the directory component of
+.BR MDXFIND_CACHE .
+Validate it with
+.BR "mdxfind \-Y" .
+.SH "EXIT STATUS"
+.B mdxfind
+exits 0 on normal completion, whether or not anything was found.  It exits
+1 on a usage error, an unreadable input file, an unknown type selector, and
+after
+.BR \-V .
+.SH EXAMPLES
+Test a hex hash list against a wordlist for MD5, SHA1 and NTLM at three
+iteration depths:
+.PP
+.RS
+.nf
+mdxfind \-m e1,e8,1000 \-i 3 \-f hashes.txt wordlist.txt
+.fi
+.RE
+.PP
+Crack a file of
+.B $2y$
+bcrypt hashes.  bcrypt carries its salt inside the hash, so the structured
+channel is required, and
+.B \-M
+comes first:
+.PP
+.RS
+.nf
+mdxfind \-M 3200 \-F bcrypt.txt wordlist.txt
+.fi
+.RE
+.PP
+Try a per-type pepper against two salted MD5 constructions, and a separate
+global pepper across everything:
+.PP
+.RS
+.nf
+mdxfind \-M e10,e11 \-P site\-peppers.txt \e
+        \-j global\-peppers.txt \-F hashes.txt wordlist.txt
+.fi
+.RE
+.PP
+Generate the SHA1 of a known password to confirm a type is what you think
+it is:
+.PP
+.RS
+.nf
+echo password123 | mdxfind \-m e8 \-z \-f /dev/null stdin
+.fi
+.RE
+.PP
+Brute-force an eight-character lowercase-plus-digit keyspace:
+.PP
+.RS
+.nf
+mdxfind \-m e1 \-f hashes.txt '?l?l?l?l?l?l?d?d'
+.fi
+.RE
+.PP
+Append a two-digit year to every candidate, with a rule file:
+.PP
+.RS
+.nf
+mdxfind \-m e1 \-r best64.rule \-n '19?d' \-f hashes.txt words.txt
+.fi
+.RE
+.SH CAVEATS
+.IP \(bu 3
+.B \-h
+is a regex, not help.  See
+.BR "SELECTING HASH TYPES" .
+.IP \(bu 3
+.B \-M
+after
+.B \-F
+fails silently.  See
+.BR "OPTION ORDER MATTERS" .
+.IP \(bu 3
+.B \-z
+generates hashes; it does not solve them.  Output that looks like a crack
+is arithmetic, not a discovery.
+.IP \(bu 3
+The
+.B r
+mangling rule reverses
+.IR bytes ,
+not code points, and will produce mojibake on non-ASCII input.  Generate
+reversals externally if the wordlist is not ASCII.
+.IP \(bu 3
+.B \-f
+pointed at an empty file, without
+.BR \-z ,
+is a guaranteed no-op that will still consume the entire wordlist.
+.SH "SEE ALSO"
+.BR hashpipe (1),
+.BR mdsplit (1),
+.BR procrule (1),
+.BR rling (1),
+.BR getpass (1),
+.BR hx (1)
+.PP
+The mm-macro reference manual for
+.B mdxfind
+covers the algorithm catalog, the internal type numbering and the hash
+construction notation in full.
+.SH AUTHOR
+Waffle.
