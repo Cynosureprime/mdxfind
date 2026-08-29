@@ -1,3 +1,80 @@
+# mdxfind v1.545 — `-X '$HEX[...]'` used the wrong key, and the usage text now lists every option
+
+Source: mdxfind.c rev 1.543 → 1.545. Companion release: hashpipe v1.116.
+
+**If you have ever used `-X` with a `$HEX[...]` key, those runs were wrong.** The bare `HEX[...]` form was always correct.
+
+## `-X '$HEX[...]'` XORed with the wrong key
+
+`-X` takes an XOR key applied to each computed digest before it is looked up. Given a `$HEX[...]` wrapper, the `$` was skipped for parsing but the decoded bytes were written one byte further along than the XOR loop reads. The key therefore began with the literal `$` (0x24) left behind, and its last decoded byte was never used.
+
+Measured against `md5("alpha")`:
+
+```
+-X HEX[ff]      XOR ff        correct
+-X $HEX[ff]     XOR 24        wrong — the dollar sign
+-X HEX[ffee]    XOR ff,ee     correct
+-X $HEX[ffee]   XOR 24,ff     wrong — off by one
+```
+
+Nothing was reported. The run announced a key and produced wrong digests, so a search would simply find nothing and look like an honest negative. Both spellings now agree.
+
+## The usage text was missing ten options
+
+`mdxfind` accepts 40 options and its usage described 30. The undocumented ten were `-G -J -M -P -S -U -X -Y -j -x`, and the omissions had teeth:
+
+- **`-j` and `-P` are different pepper mechanisms.** `-j` loads the global array, tried against every selected type; `-P` loads peppers for the types named by a preceding `-M`, and degenerates to `-j` if there is no `-M`. Neither appeared. They are now documented adjacently, because they are confusable by construction.
+- **`-M` must precede `-F`.** `-F` parses its file at the moment it is reached, so a later `-M` cannot affect it — and the run still prints a plausible "Working on hash types:" line while finding nothing.
+- **`-Y`** is matched before ordinary option parsing, so it was invisible to anyone reading the getopt string.
+
+A new check, `tools/usage_option_audit.sh`, compares the getopt string against the usage text and fails on any disagreement in either direction, so the gap cannot silently reopen.
+
+## Manual pages
+
+`mdxfind`, `mdsplit`, `getpass` and `mdxpause` now ship manual pages under `man/man1`, installable with `make install-man`. `man -M ./man mdxfind` works from a clone without installing anything.
+
+Writing them found this release's `-X` bug, a `procrule -B` fall-through that created a file named after the benchmark count, and a `pcfg` flag that had never worked.
+
+---
+
+# mdxfind v1.543 — e607 computed the wrong hash and now computes the right one, RMD256 added, 7z accepts John's dialect
+
+Source: mdxfind.c rev 1.540 → 1.543. Companion release: hashpipe v1.113.
+
+**Read this before upgrading if you have ever cracked `e607 SHA1MD5SALTPASSPEPPER`.** Its output changes in this release. Nothing else in the catalog changes value.
+
+## `e607 SHA1MD5SALTPASSPEPPER` computed a salt-length-dependent hash
+
+The type is `sha1(md5(salt . pass) . pepper)`. It did not compute that.
+
+The inner digest was staged as hex immediately after the salt in a shared buffer, but the pepper was written at a **fixed** offset of 32 bytes rather than after the digest, and the SHA-1 then ran from the start of the buffer for `32 + pepperlen` bytes. The three steps disagreed about where the digest lived. For any non-empty salt the pepper landed on top of the tail of the digest, and the value hashed was the salt, then only as much of the digest as fitted before offset 32, then the pepper. With a 16-byte salt that is the salt followed by just the first 16 hex characters of the digest.
+
+The output therefore depended on the salt length, which no other type in this family does.
+
+The fix stages the digest at the start of the buffer, so the pepper offset and the SHA-1 length that were already written for that layout become correct. One line.
+
+**Consequence:** a hash cracked as `e607` before v1.543 will not verify against v1.543. Existing result files carrying this type should be re-checked. No results for this type were found in the archives available to us, so this is expected to affect nobody, but the change is real and is called out here rather than buried.
+
+The previous construction is recorded in the hx catalog documentation (`hx.8`, Note 27) and is expressible if you need to reproduce it: `sha1(cut(salt . md5(salt . pass), 0, 32) . pepper)`.
+
+## RMD256 added as `e1002`
+
+Bare RIPEMD-256 of the password. The primitive was already compiled in and already used by `e212 HMAC-RMD256`; only the bare form was missing, which left RMD128, RMD160 and RMD320 with a gap between 160 and 320.
+
+Strictly add-only. No existing type changes number, name or value.
+
+## 7z accepts John the Ripper's dialect
+
+Three producer differences were rejected at load as malformed, so a hash from John's `7z2john.pl` could not be read at all while the same archive via `7z2hashcat` could:
+
+- `saltlen 0` with a populated salt field
+- `ivlen 8` in a zero-padded 16-byte IV field
+- `type 128` on a record carrying the whole stream
+
+`saltlen` and `ivlen` are now a floor rather than an equality. `saltlen` stays authoritative for the KDF, so both dialects derive the same key and share one KDF group; the IV field is taken as `min(field, 16)` and zero-padded, since that is what AES-CBC consumes. Truncation is now decided structurally, from data length against `packedlen`, instead of from bit 7 of the type byte.
+
+---
+
 # mdxfind v1.540 — user-defined types were unreachable from -M, lost their salt on output, and a typo in userdef.txt silently registered the wrong hash
 
 Source: mdxfind.c rev 1.539 → 1.540; userdef.c 1.8 → 1.9; hx.c 1.3 → 1.4; hx.l 1.2 → 1.3; hx.y 1.2 → 1.3; hx_vm.h 1.3 → 1.4. Companion release: hashpipe v1.105.

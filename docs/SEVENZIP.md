@@ -102,8 +102,39 @@ High nibble (`(type >> 4) & 0x07`):
 Not representable, and therefore silently erased: **Deflate64, ARM64, RISCV, Delta,
 Swap2/4**, and anything added to 7-Zip later.
 
-For `type 128`, the extractor moves the *penultimate* ciphertext block into the `iv` field
-and leaves only the final block in `data`. mdxfind reads `iv || data` as the 32-byte tail.
+When `7z2john.pl` truncates a record it moves the *penultimate* ciphertext block into the
+`iv` field and leaves only the final block in `data`; mdxfind reads `iv || data` as the
+32-byte tail. That shape — not bit 7 of the type byte — is what identifies a truncated
+record. See *Input dialects* below.
+
+### Input dialects
+
+Three producers write `$7z$`, and they do not agree on how the length fields relate to the
+fields beside them. mdxfind accepts all three.
+
+| field | `7z2john.pl` / `7z2hashcat` | John the Ripper's own vectors |
+|---|---|---|
+| `saltlen` | exact byte count of the salt field | `0`, with the salt field still populated |
+| `ivlen` | `16`, matching a 32-hex field | `8`, in the same 32-hex zero-padded field |
+| `type 128` | truncated: 16-byte `data`, `packedlen` rewritten to 16 | whole stream retained |
+
+The resolution is to treat the declared lengths as a **floor**, not an equality:
+
+* `saltlen` stays authoritative for the KDF. A producer may leave stale bytes in the salt
+  field beyond it — John does — and those bytes must not reach the hash. The KDF group key
+  is built from the effective salt, so a record from either producer lands in the same
+  group and is derived once.
+* The `iv` **field** is what AES-CBC consumes. 7-Zip zero-pads it out to the block size and
+  records the significant length separately, so taking `min(field, 16)` bytes and
+  zero-filling the rest reproduces both dialects exactly.
+* Truncation is decided **structurally**, from `len(data)` against `packedlen`, rather than
+  from the type byte. A record whose data field holds the whole declared stream is complete
+  whatever `type` says, and is therefore eligible for tier 2.
+
+Two of John's four published vectors carry `padsize 0`, which the zero-padding check alone
+cannot decide at all. mdxfind recovers both from the tier-1 head signature. The vectors are
+kept as a regression fixture in `tools/testdata/john-7z-vectors.txt` and are exercised by
+stage 5 of `tools/7z_validate.sh`.
 
 ### Key derivation
 
@@ -197,7 +228,7 @@ Rejected outright, each with a reason on stderr:
 | condition | why |
 |---|---|
 | field count is not 10 or 12 | malformed |
-| `saltlen` / `ivlen` disagree with their fields | malformed |
+| salt or iv field is *shorter* than its declared length | malformed (a longer field is legal — see *Input dialects*) |
 | non-hex salt, iv or data | malformed |
 | `log2 > 40` | `2^N` iterations unreachable |
 | `log2 == 63` | the special KDF is not implemented |
@@ -376,6 +407,9 @@ with `TrustPadding=Y` in `john.conf`.
 | `saltlen != 0` | rejects | handles | handles |
 | stream over 8 MB | rejects | handles | needs only 32 bytes |
 | `type 128` (truncated) | **rejects** | handles | **handles** |
+| `type 128` carrying the whole stream | rejects | handles (its own vectors) | **handles** |
+| declared `saltlen`/`ivlen` shorter than the field | not tested | handles (its own vectors) | **handles** |
+| John vector with `padsize 0` | — | undecidable without `TrustPadding` | **cracks** (tier 1) |
 | archives sharing a KDF group | one derivation each | one derivation each | **one derivation for all** |
 
 ## Limits

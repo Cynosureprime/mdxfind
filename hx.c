@@ -11,6 +11,10 @@
  * password.  Salt provided via -s flag.
  */
 
+/*
+ * $Log$
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

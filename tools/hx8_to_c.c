@@ -336,6 +336,62 @@ static char *slurp(const char *path, size_t *out_len)
  *
  * Returns 1 if the field is an outlier.
  */
+/*
+ * Does the expression rely on a byte escape the hx lexer cannot express?
+ *
+ * hx string literals have no escape processing: "\x00" is the four characters
+ * backslash, x, 0, 0 -- not a NUL byte. mdxfind's implementations DO use the
+ * real byte, so a row written md5(user . "\x00" . pass) compiles to a program
+ * that is not the algorithm it documents. Both hx engines agree with each
+ * other and disagree with mdxfind, so this is a language gap rather than a
+ * build mismatch.
+ *
+ * Compiling such a row is worse than leaving it alone: it puts a wrong program
+ * into the generated catalog, which is what the dedup gate and the drift
+ * auditor then compare against. Until the lexer grows byte escapes, these rows
+ * are held back as outliers -- absent rather than false.
+ */
+/*
+ * `md5^N(pass)`: the grammar accepts IDENT^NUMBER(...), and a literal count
+ * compiles fine.  But several catalog rows iterate a count that is supplied
+ * at RUNTIME -- in the salt field for the ...x family, in the record for
+ * NSEC3, in the header for the SSPR types -- so the row names a metavariable
+ * rather than a constant.  Those rows are documentation, not compilable
+ * expressions, and each already states inline where its N comes from.
+ * Classify them as intentional outliers rather than reporting them as
+ * compile failures, which implied there was something here to repair.
+ *
+ * Matched narrowly: `^` directly after an identifier character and followed
+ * by a non-digit.  A bare `x ^ y` (XOR, which the language does not have)
+ * has a space before the caret and is deliberately not caught here.
+ */
+static int has_metavariable_iteration(const char *s)
+{
+	const char *p;
+
+	if (!s) return 0;
+	for (p = s; (p = strchr(p, '^')) != NULL; p++) {
+		if (p == s) continue;
+		if (!isalnum((unsigned char)p[-1]) && p[-1] != '_') continue;
+		if (p[1] && !isdigit((unsigned char)p[1])) return 1;
+	}
+	return 0;
+}
+
+static int needs_byte_escape(const char *s)
+{
+    if (!s) return 0;
+    for (const char *p = s; p[0] && p[1]; p++) {
+        if (p[0] != '\\') continue;
+        switch (p[1]) {
+            case 'x': case 'n': case 'r': case 't': case '0':
+                return 1;
+            default: break;
+        }
+    }
+    return 0;
+}
+
 static int is_markup_outlier(const char *s)
 {
     if (!s || !*s) return 1;
@@ -389,6 +445,50 @@ static int extract_note_ref(const char *s)
  * verbatim so strip_troff_escapes + hx_compile_expr see the real
  * expression.
  */
+/*
+ * Remove a trailing troff italic group -- "\fI ... \fP" at the end of the
+ * field -- and any whitespace before it. Caller frees.
+ *
+ * hx.8 annotates rows with a note set in italics after the expression:
+ *
+ *     md5(pass . salt) \fI(see Note [24])\fP
+ *     sha1(md5^N(pass)) \fI(N = iteration count)\fP
+ *     sha256(pass) \fI(Cisco Type 4)\fP
+ *
+ * Only the FIRST of those matches strip_note_markup(), which keys on the
+ * literal "(see Note". Keying on the italic group instead catches every
+ * annotation regardless of wording, which is what makes the leading
+ * expression reachable by the compiler.
+ *
+ * A row whose ENTIRE body is italic prose -- "\fI(complex: iterates over
+ * single-char salts)\fP" -- reduces to the empty string, which
+ * is_markup_outlier() already rejects, so prose stays an outlier rather than
+ * becoming a compile failure.
+ */
+static char *strip_trailing_italic(const char *s)
+{
+    size_t n = strlen(s);
+    char *out = (char *)malloc(n + 1);
+    if (!out) return NULL;
+    memcpy(out, s, n + 1);
+
+    /* The group must actually close at the end of the field, otherwise the
+     * \fI belongs to something structural and must not be touched. */
+    char *fp = strstr(out, "\\fP");
+    if (!fp) return out;
+    char *tail = fp + 3;
+    while (*tail == ' ' || *tail == '\t') tail++;
+    if (*tail != '\0') return out;          /* not a trailing group */
+
+    /* Cut at the LAST \fI that precedes it. */
+    char *fi = NULL, *scan = out;
+    while ((scan = strstr(scan, "\\fI")) != NULL && scan < fp) { fi = scan; scan += 3; }
+    if (!fi) return out;
+    while (fi > out && (fi[-1] == ' ' || fi[-1] == '\t')) fi--;
+    *fi = '\0';
+    return out;
+}
+
 static char *strip_note_markup(const char *s)
 {
     size_t n = strlen(s);
@@ -721,7 +821,24 @@ int main(int argc, char **argv)
             int activate_multi = (type == 123 && note_ref == 24);
             int is_out;
             char *clean;
-            if (activate_multi) {
+            /*
+             * Clean EVERY row, not just e123. hx.8 annotates many rows with a
+             * trailing note in troff italics -- "md5(pass . salt)
+             * \fI(see Note [24])\fP" -- where the leading text is a perfectly
+             * good hx expression and only the annotation makes it unparseable.
+             * is_markup_outlier() rejects anything containing \fI, so 154 of
+             * the 235 non-parsing rows were real expressions discarded for
+             * their man-page formatting. They compile fine once the escapes
+             * and the note are removed, and until now every one was invisible
+             * to tools/hx_dedup_check -- carrying exactly the duplicate risk
+             * an absent catalog row implies.
+             *
+             * Cleaning is unconditional; emit_class stays gated on e123,
+             * because that is a statement about multi-emit SEMANTICS, not
+             * about formatting. Rows whose whole body is prose still yield no
+             * program and are still counted as outliers.
+             */
+            if (1) {
                 /* e123's leading text is a real 6-op FAMILY_MD5PASS
                  * expression; the "(see Note [24])" is wrapped in troff
                  * italics (\fI ... \fP) in hx.8. Strip troff FIRST, then
@@ -730,18 +847,36 @@ int main(int argc, char **argv)
                  * text (it should now be a non-outlier real expression).
                  * Other Note-[N] members do NOT take this path -- they
                  * keep their existing outlier/override routing. */
-                char *troff_clean = strip_troff_escapes(expr);
+                char *no_italic = strip_trailing_italic(expr);
+                char *troff_clean = strip_troff_escapes(no_italic);
+                free(no_italic);
                 clean = strip_note_markup(troff_clean);
                 free(troff_clean);
                 /* Trim any trailing whitespace left after the cut. */
                 size_t cl = strlen(clean);
                 while (cl > 0 && (clean[cl-1] == ' ' || clean[cl-1] == '\t'))
                     clean[--cl] = '\0';
-                is_out = is_markup_outlier(clean);
-                emit_class = 1;            /* HX_EMIT_MULTI */
-            } else {
-                is_out = is_markup_outlier(expr);
-                clean  = strip_troff_escapes(expr);
+                /* A literal byte escape cannot be lexed, so the row is
+                 * excluded rather than compiled wrong. Say so: an excluded row
+                 * is invisible to the dedup gate and to the drift audit, and
+                 * four of the nine rows that once carried escapes were hiding
+                 * real documentation drift because nothing ever compiled them.
+                 * Write the bytes with fromhex() instead, which the language
+                 * has always had and which troff cannot mangle. */
+                if (has_metavariable_iteration(clean)) {
+                    WARN("hx8_to_c: note: line %d e%d: iteration count is a "
+                         "runtime parameter, row is documentation not an "
+                         "expression\n", lineno, type);
+                    is_out = 1;
+                } else if (needs_byte_escape(clean)) {
+                    WARN("hx8_to_c: line %d e%d: literal byte escape in `%s` "
+                         "-- rewrite using fromhex(); row excluded from the "
+                         "catalog and from the audit\n", lineno, type, clean);
+                    is_out = 1;
+                } else {
+                    is_out = is_markup_outlier(clean);
+                }
+                if (activate_multi) emit_class = 1;   /* HX_EMIT_MULTI */
             }
             /* Strip any troff escapes from the NAME column too -- the
              * \s-2 ... \s+2 size markers used on long names slip through

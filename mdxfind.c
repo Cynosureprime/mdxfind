@@ -269,10 +269,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.540 2026/08/22 12:09:06 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.545 2026/08/29 18:11:59 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.540 2026/08/22 12:09:06 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.545 2026/08/29 18:11:59 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +290,193 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.545  2026/08/29 18:11:59  dlr
+ * -X $HEX[..] used the wrong key, silently.
+ *
+ * case X decoded the hex payload into s rather than into XOR_key. For the
+ * $HEX[..] form s is XOR_key+1, because the dollar is skipped with s++, while
+ * checkhash reads the key from XOR_key. The key was therefore off by one: byte 0
+ * stayed the literal dollar sign that strncpy had left there, 0x24, and the last
+ * decoded byte was never read. The length was wrong too, since XOR_key_len still
+ * counted the dollar, so the decode was handed one character too many.
+ *
+ * The bare HEX[..] form was correct throughout, because there s equals XOR_key.
+ * That is what made this survivable and invisible: the option worked, for one of
+ * its two spellings.
+ *
+ * Measured against md5 of alpha, 2c1743a391305fbf367df8e4f069f9f9:
+ *
+ *   -X HEX[ff]      d3e8bc5c...   correct, XOR ff
+ *   -X $HEX[ff]     08336787...   XOR 24, the dollar sign
+ *   -X HEX[ffee]    d3f9bc4d...   correct, cycles ff,ee
+ *   -X $HEX[ffee]   08e8675c...   cycles 24,ff
+ *
+ * The two-byte case is what makes the diagnosis certain rather than plausible: a
+ * key of 24,ff is exactly what an off-by-one predicts, and it was predicted from
+ * the pointer arithmetic before it was measured. No diagnostic was printed. The
+ * run announced a key and produced wrong digests, so a search using this option
+ * would simply fail to find anything and look like an honest negative.
+ *
+ * Fixed by decoding into XOR_key and decrementing the length alongside the skip,
+ * which makes both spellings take the same path the working one already took.
+ * All four cases above now agree with an independent computation.
+ *
+ * Edge cases verified unchanged: a plain non-hex key still XORs bytewise and
+ * cycles, and HEX[], $HEX[] and HEX[zz] all still leave the option disabled,
+ * since a zero-length decode sets XOR_key to NULL and the gate is on
+ * XOR_key_len.
+ *
+ * Found by mdx-doc while tracing XOR_key to its point of use in order to write
+ * the mdxfind.1 entry, the option having been undocumented until today. Reading
+ * the case body alone would not have shown it; the bug is only visible when the
+ * decode destination is compared against where the key is later read.
+ *
+ * Regression: hashpipe -T 1001 passed 0 failed 0 skipped; john_mode_test PASS;
+ * usage_option_audit PASS for both programs.
+ *
+ * Revision 1.544  2026/08/29 18:00:58  dlr
+ * Document the ten options the usage text omitted.
+ *
+ * mdxfind accepted 40 options and described 30. tools/usage_option_audit.sh now
+ * reports 40 of 40.
+ *
+ * The ten were -G -J -M -P -S -U -X -Y -j and -x, and the omissions were not
+ * harmless. -j and -P are separate pepper mechanisms, the global array and the
+ * per-type load set, and neither appeared; that pair was gotten wrong twice
+ * during analysis, once by me and once in the correction, before the source
+ * settled it. They are now documented adjacently and contrastively, because they
+ * are confusable by construction rather than by accident.
+ *
+ * -M carries the ordering rule as part of its own entry rather than a footnote:
+ * it must precede -F, since -F parses its file at the moment getopt reaches it,
+ * so a later -M cannot affect that file. Out of order the run still prints a
+ * plausible "Working on hash types:" line and finds nothing.
+ *
+ * -Y is the option a getopt-only reader cannot see at all: it is matched by a
+ * pre-scan of the argument vector before parsing, because a getopt case would set
+ * userdef_verbose too late to print the load report it exists to produce.
+ *
+ * Descriptions were taken from the man pages written this week, which were
+ * derived from the case bodies rather than from this text, so the two now agree
+ * by construction rather than by coincidence.
+ *
+ * Revision 1.543  2026/08/29 02:22:43  dlr
+ * e607 SHA1MD5SALTPASSPEPPER: hash the digest, not the salt and half the digest.
+ *
+ * The inner md5(salt . pass) was staged as hex at linebuf+saltlen while the
+ * pepper was written at the fixed offset 32 and the sha1 ran from linebuf for
+ * 32+peplen bytes. The three lines disagreed about where the digest lived, so
+ * for any non-empty salt the pepper landed on top of the tail of the digest and
+ * the hash covered the salt followed by a truncated digest. With a 16-byte salt
+ * the sha1 input was the salt, then only the first 16 hex characters, then the
+ * pepper. The output depended on the salt length, which no other type in the
+ * family does.
+ *
+ * Repaired by staging the hex at linebuf, one line, so that the pepper offset
+ * and the sha1 length that were already written for that layout become correct:
+ *
+ *   prmd5(md5buf.h, linebuf+saltlen, 32);   ->   prmd5(md5buf.h, linebuf, 32);
+ *
+ * Overwriting linebuf is safe. Its contents are dead after the md5 on the
+ * preceding line, and the reporting buffer linebuf2 independently holds the salt
+ * and pepper. prmd5 NUL-terminates at out[32] and the pepper copy immediately
+ * overwrites that byte, so the ordering is right.
+ *
+ * Dave identified the sha1 call as the fault. It is one of the three
+ * inconsistent lines and the place the damage shows, but it and the pepper copy
+ * are already correct for a digest anchored at linebuf; the misplaced write is
+ * the prmd5 destination. Both repairs produce identical output, this one is a
+ * single line.
+ *
+ * The intended form is settled by the type name, not by inference. In this
+ * family a SALT token immediately after SHA1 marks a salt in the outer
+ * concatenation, as in e602 SHA1SALTMD5PASSPEPPER, sha1(salt . md5(pass) .
+ * pepper). e607 has no such token, so the outer hash covers the digest and the
+ * pepper alone. The sibling cases in the same block confirm the discipline: they
+ * anchor the digest at linebuf+MAXLINE, place the salt before it and the pepper
+ * after it, and hash the whole span. hashpipe corroborates it independently. Its
+ * verifier header has always described the type as MD5(salt+pass) then
+ * SHA1(hex + pepper), and the body underneath carried a comment explaining that
+ * it was reproducing mdxfind layout instead. A previous session found this and
+ * mirrored the defect rather than diverge from mdxfind.
+ *
+ * This is the adjacent-slice family recorded for e367, e603, e715 and e440. e596
+ * handles the same hazard correctly a few hundred lines away by saving and
+ * restoring the byte prmd5 terminates.
+ *
+ * Behaviour change, not a documentation change: any hash cracked as e607 before
+ * this revision will not verify against it. hx.8 Note [27] records the old
+ * construction and gives it in hx form, sha1(cut(salt . md5(salt . pass), 0, 32)
+ * . pepper), which was documented as the truth at hx.8 1.30 and verified exact
+ * at salt lengths 2, 10, 16, 36 and 42.
+ *
+ * Changed together: mdxfind.c, the hashpipe verifier and its stored test vector,
+ * which was computed under the old layout, and the hx.8 row.
+ *
+ * Verified: mdxfind -z at salt lengths 2, 10, 16, 36 and 42 agrees with an
+ * independent Python computation and with hashpipe -X evaluating the new row.
+ * The new hashpipe vector was computed in Python, not by the code under test.
+ * mdxfind -z output for a 10-byte salt, a length the stored vector does not
+ * cover, verifies and labels correctly end to end through hashpipe.
+ *
+ * Regression: hashpipe -T 1001 passed 0 failed 0 skipped, e607 Pass.
+ * tools/john_mode_test.sh PASS. Catalog census unchanged at total=1000
+ * non_outlier=902 outlier=77 compile_failed=21.
+ *
+ * Revision 1.542  2026/08/27 05:17:55  dlr
+ * Add RMD256 (e1002): bare RIPEMD-256 of the password.
+ *
+ * The 256-bit RIPEMD primitive was already compiled in and in use by
+ * JOB_HMAC_RMD256 (e212, which emits a genuine 64-hex digest); only the bare
+ * form was absent from the catalog, leaving RMD128, RMD160 and RMD320 with a
+ * gap between 160 and 320.
+ *
+ * Strictly add-only. JOB_RMD256 takes 1002, the next free built-in slot -
+ * JOB_USERDEF_BASE is 1100, so there is no collision with user-defined ops.
+ * Types[] is positional, since TYPENAME(op) indexes it directly, so the name is
+ * appended at index 1002 ahead of the NULL terminator. Typeopt gets
+ * TYPEOPT_NEEDSF, the plain-hex loader fast path, matching its RMD320 sibling.
+ * The compute case is modelled on JOB_RMD320: mhash_init with MHASH_RIPEMD256,
+ * digest width 64 hex, and the same prmd5 re-feed so -i iteration chains.
+ *
+ * hx.8 gains e1002 RMD256 rmd256(pass) in the catalog section. Placement
+ * matters: an earlier attempt landed the row inside the troff function table
+ * near the end of the file, which parsed but would have rendered a stray row in
+ * the Output function table. codegen/hx_specs_data.c regenerates cleanly with
+ * the new entry at eidx 994 and the pre-existing compile-failure count unchanged
+ * at 2, both of which are the NTLM and NTLMH rows whose trailing markup the hx
+ * parser has always rejected.
+ *
+ * Verified against the published RIPEMD-256 vectors, not against our own output:
+ * a, abc, message digest and the lowercase alphabet all reproduce the values
+ * from the algorithm authors exactly. A real cracking run recovers abc from its
+ * digest, and -i 3 produces a correctly chained x01 x02 x03.
+ *
+ * The dedup gate now reports MATCH e1002 for rmd256(pass), so a future proposal
+ * for the same algorithm is caught rather than waved through.
+ *
+ * Regression: hashpipe self-test 1000 passed 0 failed; tools/john_mode_test.sh
+ * all checks pass; tools/7z_validate.sh 18 verified, 0 wrong, 1 declined, 4 of 4
+ * John dialect vectors. Type count 1001 to 1002.
+ *
+ * Revision 1.541  2026/08/27 00:56:57  dlr
+ * 7z: accept John the Ripper dialect alongside 7z2john/7z2hashcat.
+ *
+ * Three producer differences were being rejected at load as malformed:
+ * saltlen 0 with a populated salt field, ivlen 8 in a zero-padded 16-byte
+ * iv field, and type 128 on a record carrying the whole stream.
+ *
+ * saltlen and ivlen are now treated as a floor rather than an equality --
+ * saltlen stays authoritative for the KDF (surplus field bytes ignored, and
+ * the group key is built from the effective salt so both dialects share one
+ * KDF group), while the iv field itself is what AES-CBC consumes, taken as
+ * min(field,16) and zero-padded. Truncation is decided structurally from
+ * data length vs packedlen instead of from bit 7 of the type byte.
+ *
+ * Tier 0/1/2, the codec oracle and the load-time triage are unchanged; two
+ * of the four John vectors carry padsize 0 and are recovered by the tier-1
+ * head signature, which John itself cannot decide.
+ *
  * Revision 1.540  2026/08/22 12:09:06  dlr
  * User-defined hash types: make -M able to select them, and report their salt. -M previously could not reach a user-defined type at all: it has no u prefix branch, and its regex fallback scans only Types[], which holds built-ins and is NULL-terminated well below Userdef_base, so both -M u<id> and -M <name> exited 1 with No hash types matched. Adds an exact string-keyed -M u<id> branch accepting a comma-separated list, mirroring -m but ALSO setting Doload, so -S -U -P per-type salt userid and pepper targeting now works for user types; -m sets only DoUser and Dohash, which is why that targeting was previously unreachable however the type was selected. The -M regex path now searches the user-defined registry FIRST, matching against both the display name and the raw id, and only falls through to the built-in table when a token matches no user type. Separately, the userdef dispatch arm reported matches through checkhash, which emits only TYPE hash:password - for a salted type that drops the salt the hash was solved with, so the found line could not be re-verified or filed by mdsplit. It now reports through checkhashsalt and checkhashsalt2, giving TYPE hash:salt:password and TYPE hash:salt:user:password, matching the built-in salted format. Salt iteration itself was already correct: 5 salts produce 5 hash calculations, identical to the e31 control.
  *
@@ -6271,6 +6458,7 @@ char *Types[] = {
     "SHA1CRYPT",
     "7ZIP",
     "CMIYC",
+    "RMD256",
 
 NULL
 
@@ -7300,6 +7488,7 @@ NULL
 #define JOB_SHA1CRYPT       999
 #define JOB_SEVENZIP        1000
 #define JOB_CMIYC           1001
+#define JOB_RMD256          1002
 
 #define JOB_DONE 2000
 
@@ -8369,6 +8558,7 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [999] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* SHA1CRYPT */
     [1000] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* 7ZIP */
     [1001] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CMIYC */
+    [1002] = TYPEOPT_NEEDSF,  /* RMD256 */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -19361,7 +19551,7 @@ sha1_truncsalt:
 		  linebuf2[saltlen]=' ';
 		  fastcopy(linebuf+saltlen, cur, len);
 		  mymd5(linebuf, len+saltlen, md5buf.h);
-		  prmd5(md5buf.h, linebuf+saltlen, 32);
+		  prmd5(md5buf.h, linebuf, 32);
 		  fastcopy(linebuf+32, p1, peplen);
 		  fastcopy(linebuf2+saltlen+1, p1, peplen);
 		  i = saltlen+peplen+1;
@@ -32937,6 +33127,22 @@ HAV256_5_start:
 		  len = 80;
 		  cur = prmd5(curin.h, mdbuf, len);
 		  checkhash(&curin, 80, x, job);
+		}
+		break;
+
+	      /* RMD256: ripemd256($pass) via mhash.  The 256-bit primitive
+	       * was already compiled in and used by JOB_HMAC_RMD256 (e212);
+	       * only the bare form was missing from the catalog. */
+	      case JOB_RMD256:
+		hashcnt += Maxiter;
+		for (x = 1; x <= Maxiter; x++) {
+		  { MHASH td2 = mhash_init(MHASH_RIPEMD256);
+		    mhash(td2, cur, len);
+		    mhash_deinit(td2, curin.h);
+		  }
+		  len = 64;
+		  cur = prmd5(curin.h, mdbuf, len);
+		  checkhash(&curin, 64, x, job);
 		}
 		break;
 
@@ -47316,7 +47522,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       { long sz_type = 0, sz_log2 = 0, sz_saltlen = 0, sz_ivlen = 0;
         long sz_packed = 0, sz_unpacked = 0, sz_crclen = 0;
         unsigned long sz_crc = 0;
-        int dbytes = 0, padsize = 0, bits = 0, tier2 = 0;
+        int dbytes = 0, padsize = 0, bits = 0, tier2 = 0, truncated = 0;
         long minbits = SevenZipMinBits;
 
         /* A line longer than the read buffer arrives here already cut short,
@@ -47341,14 +47547,17 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           /* 7z2john encodes unpackedlen mod 16 when it truncates, so a
            * stream that was already block-aligned reports 16 -- which means
            * no padding at all, not sixteen bytes of it. */
-          if (sz_type == 128 && padsize == 16) padsize = 0;
+          truncated = (sz_type == 128 && dbytes == 16 && sz_packed == 16);
+          if (truncated && padsize == 16) padsize = 0;
 
           /* R1/R2: shape and declared-vs-actual field lengths. */
           if (flen[9] & 1)                     why = "data field has an odd hex length";
           else if (sz_saltlen < 0 || sz_saltlen > 64) why = "saltlen out of range";
-          else if (flen[3] != sz_saltlen * 2)  why = "saltlen disagrees with the salt field";
+          else if (flen[3] & 1)                why = "salt field has an odd hex length";
+          else if (flen[3] < sz_saltlen * 2)   why = "salt field is shorter than saltlen declares";
           else if (sz_ivlen < 0 || sz_ivlen > 32)     why = "ivlen out of range";
-          else if (flen[5] != sz_ivlen * 2)    why = "ivlen disagrees with the iv field";
+          else if (flen[5] & 1)                why = "iv field has an odd hex length";
+          else if (flen[5] < sz_ivlen * 2)     why = "iv field is shorter than ivlen declares";
           /* R3/R4: is the KDF reachable at all? */
           else if (sz_log2 == 63)              why = "log2=0x3F special KDF is not implemented";
           else if (sz_log2 < 0 || sz_log2 > SEVENZIP_MAX_LOG2)
@@ -47360,12 +47569,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
            * archive IV supplies the CBC predecessor, and tier 2 can decide it
            * outright. Only a partial record needs two blocks of its own. */
           else {
-            tier2 = (sz_type != 128) && sz_packed > 0 && (long)dbytes == sz_packed;
-            if (sz_type == 128) {
-              if (sz_ivlen != 16 || dbytes != 16)
-                why = "truncated record needs a 16-byte iv and 16-byte data";
-            } else if (dbytes < 32 &&
-                       !(tier2 && dbytes == 16 && sz_ivlen == 16))
+            tier2 = !truncated && sz_packed > 0 && (long)dbytes == sz_packed;
+            if (dbytes < 32 && dbytes != 16)
               why = "data holds fewer than two ciphertext blocks";
           }
         }
@@ -47392,26 +47597,39 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           continue;                    /* never counted, never searched */
         }
 
-        { unsigned char tail[32];
+        { unsigned char tail[32], ivbuf[16];
           char grp[96];
           struct SevenZipRec *r;
           const char *tailhex = f[9] + flen[9] - 64;
+          int ivb = flen[5] / 2;
 
-          if (dbytes == 16 && sz_ivlen == 16) {
-            /* A single ciphertext block: its CBC predecessor is the archive
-             * IV. This is the shape 7z2john writes when it truncates (it moves
-             * the penultimate block into the iv field), and it is also what a
-             * genuinely 16-byte archive looks like. */
-            if (get32(f[5], tail, 16) != 16 ||
-                get32(f[9], tail + 16, 16) != 16) {
-              sevenzip_reject("bad hex in iv or data", line); continue;
+          /* 7z stores the iv length beside a field that is zero-padded out to
+           * the AES block size, so the field -- not the declared length -- is
+           * what the cipher actually consumes. Taking min(field,16) and
+           * relying on the zeroed record for the rest reproduces both the
+           * 7z2john form (ivlen 16, 32 hex) and John's (ivlen 8, 32 hex). */
+          if (ivb > 16) ivb = 16;
+          memset(ivbuf, 0, sizeof(ivbuf));
+          if (ivb > 0 && get32(f[5], ivbuf, ivb) != ivb) {
+            sevenzip_reject("bad hex in iv", line); continue;
+          }
+
+          if (dbytes == 16) {
+            /* A single ciphertext block: its CBC predecessor is the iv field
+             * -- the archive IV when the whole stream is one block, or the
+             * penultimate block that 7z2john moves there when it truncates. */
+            memcpy(tail, ivbuf, 16);
+            if (get32(f[9], tail + 16, 16) != 16) {
+              sevenzip_reject("bad hex in data", line); continue;
             }
           } else if (get32((char *)tailhex, tail, 32) != 32) {
             sevenzip_reject("bad hex in data", line); continue;
           }
 
+          /* saltlen is authoritative: a producer may leave stale bytes in the
+           * salt field beyond it (John does), and the KDF must not see them. */
           snprintf(grp, sizeof(grp), "%ld:%.*s:%ld",
-                   sz_saltlen, flen[3], f[3], sz_log2);
+                   sz_saltlen, (int)(sz_saltlen * 2), f[3], sz_log2);
 
           r = sevenzip_addrec();
           snprintf(r->group, sizeof(r->group), "%s", grp);
@@ -47424,7 +47642,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           r->crc = (unsigned int)sz_crc;
           r->crc_len = sz_crclen;
           r->tier2 = tier2;
-          if (sz_ivlen == 16) get32(f[5], r->iv, 16);
+          memcpy(r->iv, ivbuf, 16);
           /* head[] is only genuinely the START of the stream when the data
            * field holds the whole stream. On a tail-only record (what
            * tools/7z2mdx.py emits) the first 32 bytes ARE the last two
@@ -48731,11 +48949,21 @@ union HashU curin;
         XOR_key = malloc_lock(XOR_key_len+1,"XOR Key");
         strncpy(XOR_key, s, XOR_key_len);
         s = XOR_key;
-        if (strncmp(s, "$HEX[", 5) == 0)
+        if (strncmp(s, "$HEX[", 5) == 0) {
+          /* Skip the '$'. The length has to follow, or the decode is handed
+           * one character too many for this form. */
           s++;
+          XOR_key_len--;
+        }
         fprintf(stderr, "Setting XOR key to %s\n", s);
         if (strncmp(s, "HEX[", 4) == 0) {
-          XOR_key_len = get32(s + 4, (unsigned char *)s, XOR_key_len - 5);
+          /* Decode into XOR_key, NOT into s. checkhash() reads the key from
+           * XOR_key, so decoding into s left the key off by one for the
+           * $HEX[..] form: byte 0 stayed the literal '$' that strncpy put
+           * there, and the last decoded byte was never read. -X '$HEX[ffee]'
+           * XORed with 24,ff rather than ff,ee, silently, while the bare
+           * HEX[..] form was correct because there s == XOR_key. */
+          XOR_key_len = get32(s + 4, (unsigned char *)XOR_key, XOR_key_len - 5);
           if (XOR_key_len == 0)
             XOR_key = NULL;
         }
@@ -50099,19 +50327,35 @@ usage:
     printf("-q\tInternal iteration counts for SHA1MD5x, and others\n");
     printf("-g\tRotate calculated hashes to attempt match to input hash\n");
     printf("-s\tFile to read salts from\n");
+    printf("-S\tAs -s, for the types named by the preceding -M (global otherwise)\n");
     printf("-u\tFile to read Userid/Usernames from\n");
+    printf("-U\tAs -u, for the types named by the preceding -M (global otherwise)\n");
     printf("-k\tFile to read suffixes from\n");
+    printf("-x\tAs -k, but every line is raw hex with no $HEX[] wrapper\n");
+    printf("-j\tFile of peppers for the GLOBAL pepper array (tried against every\n");
+    printf("  \tselected type that takes one; not tied to any type)\n");
+    printf("-P\tFile of peppers for the types named by the preceding -M.\n");
+    printf("  \tWith no preceding -M, -P behaves exactly as -j\n");
     printf("-n\tAppend mask/digits to passwords (e.g. -n 2, -n 3x, -n '?l?d', -n '?[0-9a-f]?[0-9a-f]')\n");
     printf("-N\tPrepend mask/digits to passwords (same syntax as -n)\n");
     printf("-i\tThe number of iterations for each hash\n");
     printf("-t\tThe number of threads to run\n");
+    printf("-G\tGPU device select: list, a comma-separated device list, or none\n");
     printf("-f\tfile to read hashes from, else stdin\n");
     printf("-F\tFile to read hashes with embedded salts (-M selects types)\n");
+    printf("-M\tAs -m, and ALSO marks those types for loading by -F, -S, -U and -P.\n");
+    printf("  \tMUST precede -F: -F parses its file at the moment getopt reaches\n");
+    printf("  \tit, so a later -M cannot affect that file\n");
+    printf("-J\tAs -F, but with no load-set restriction: every selected type is\n");
+    printf("  \toffered the file. The name stdin reads standard input\n");
     printf("-l\tAppend CR/LF/CRLF and print in hex\n");
     printf("-r\tFile to read rules from (concatenated)\n");
     printf("-R\tFile to read rules from (dot-product form)\n");
     printf("-v\tDo not mark salts as found.\n");
     printf("-V\tDisplay version\n");
+    printf("-Y\tLoad userdef.txt, print the load report, and exit\n");
+    printf("-X\tXOR key applied to computed hashes. Accepts a bare string, or\n");
+    printf("  \t$HEX[..] / HEX[..] for a hex key\n");
     printf("-w\tNumber of lines to skip from first wordlist\n");
     printf("-W\tETA display: -W <count>[K|M|G] set estimated lines,\n");
     printf("\t-W auto count in background (cached in mdxfind.db),\n");

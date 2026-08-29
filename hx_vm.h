@@ -44,7 +44,7 @@ typedef struct {
  * ---- output-role enum ----
  *
  * Each call site selects one of five output roles via the function-name
- * suffix (`_bin`, `_hex`, `_b64`, `_mcf`).  The bare name (no suffix)
+ * suffix (`_bin`, `_hex`, `_b64`, `_mcf`, `_uc`).  The bare name (no suffix)
  * resolves to the function's `default_role` — typically ROLE_HEX for
  * digests/HMAC/KDF, ROLE_MCF for crypt-family built-ins (bcrypt, yescrypt).
  *
@@ -65,12 +65,14 @@ enum hx_role {
 	ROLE_HEX     = 2,
 	ROLE_B64     = 3,
 	ROLE_MCF     = 4,
+	ROLE_UC      = 5,   /* uppercase hex */
 };
 
 #define ROLE_CAP_BIN  (1u << ROLE_BIN)
 #define ROLE_CAP_HEX  (1u << ROLE_HEX)
 #define ROLE_CAP_B64  (1u << ROLE_B64)
 #define ROLE_CAP_MCF  (1u << ROLE_MCF)
+#define ROLE_CAP_UC   (1u << ROLE_UC)
 
 /* ---- hash function registry ---- */
 
@@ -108,7 +110,7 @@ struct hx_func_entry {
 	hx_bridge_fn  bridge;    /* hashpipe compute_* function, or NULL */
 	int           bridge_bytes; /* digest size in bytes */
 	/* role-capability metadata (see enum hx_role) */
-	uint8_t       supported_roles; /* bitmask: ROLE_CAP_BIN|HEX|B64|MCF */
+	uint8_t       supported_roles; /* bitmask: ROLE_CAP_BIN|HEX|B64|MCF|UC */
 	uint8_t       default_role;    /* ROLE_HEX, ROLE_MCF, or ROLE_DEFAULT */
 };
 

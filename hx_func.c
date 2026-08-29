@@ -35,6 +35,7 @@ static int val_to_int(hx_val *v)
 /* ---- hex encoding helper ---- */
 
 static const char hex_lc[] = "0123456789abcdef";
+static const char hex_uc[] = "0123456789ABCDEF";
 
 static void to_hex(const unsigned char *bin, int binlen, char *out)
 {
@@ -42,6 +43,24 @@ static void to_hex(const unsigned char *bin, int binlen, char *out)
 	for (i = 0; i < binlen; i++) {
 		out[i * 2]     = hex_lc[bin[i] >> 4];
 		out[i * 2 + 1] = hex_lc[bin[i] & 0x0f];
+	}
+	out[binlen * 2] = '\0';
+}
+
+/*
+ * Uppercase hex, the ROLE_UC representation.  This is a representation of
+ * the same digest, not a different digest, which is why it belongs with the
+ * other output-role suffixes rather than being a function of its own: under
+ * iteration the role is what feeds the next round, so md5_uc^N(pass) chains
+ * uppercase where upper(md5^N(pass)) would only uppercase the final result.
+ * The two agree at N=1 and diverge from N=2 onward.
+ */
+static void to_hex_uc(const unsigned char *bin, int binlen, char *out)
+{
+	int i;
+	for (i = 0; i < binlen; i++) {
+		out[i * 2]     = hex_uc[bin[i] >> 4];
+		out[i * 2 + 1] = hex_uc[bin[i] & 0x0f];
 	}
 	out[binlen * 2] = '\0';
 }
@@ -118,6 +137,10 @@ void hx_bridge_hash(hx_func_entry *self, hx_val *args, int nargs,
 		int max = ((n + 2) / 3) * 4 + 1;
 		result->data = hx_arena_alloc(arena, max);
 		result->len = to_b64(digest, n, result->data);
+	} else if (role == ROLE_UC) {
+		result->data = hx_arena_alloc(arena, n * 2 + 1);
+		to_hex_uc(digest, n, result->data);
+		result->len = n * 2;
 	} else {
 		/* ROLE_HEX (default) */
 		result->data = hx_arena_alloc(arena, n * 2 + 1);
@@ -143,6 +166,10 @@ static void emit_digest(unsigned char *digest, int dlen, hx_val *result,
 		int max = ((dlen + 2) / 3) * 4 + 1;
 		result->data = hx_arena_alloc(arena, max);
 		result->len = to_b64(digest, dlen, result->data);
+	} else if (role == ROLE_UC) {
+		result->data = hx_arena_alloc(arena, dlen * 2 + 1);
+		to_hex_uc(digest, dlen, result->data);
+		result->len = dlen * 2;
 	} else {
 		/* ROLE_HEX */
 		result->data = hx_arena_alloc(arena, dlen * 2 + 1);
@@ -213,8 +240,16 @@ static void fn_hmac_sha1(hx_func_entry *self, hx_val *args, int nargs,
 	unsigned char digest[20];
 	unsigned int dlen = 20;
 	(void)self; (void)nargs;
-	HMAC(EVP_sha1(), args[0].data, args[0].len,
-	     (unsigned char *)args[1].data, args[1].len, digest, &dlen);
+	/* hx spells HMAC as hmac_X(MESSAGE, KEY): the second operand is the
+	 * key. mdxfind takes it from the -u channel, hashpipe resolves the
+	 * same name from its registered Hashtypes[] the same way, and the
+	 * catalogs KPASS entries (e798 hmac_rmd160(salt, pass), "key is
+	 * pass") only parse under that reading. This standalone copy had the
+	 * operands the other way round, so hx_dedup_check and hx8_to_c
+	 * evaluated every hmac expression with pass as the key -- disagreeing
+	 * with both real engines for the same expression text. */
+	HMAC(EVP_sha1(), args[1].data, args[1].len,
+	     (unsigned char *)args[0].data, args[0].len, digest, &dlen);
 	emit_digest(digest, 20, result, arena, role);
 }
 
@@ -224,8 +259,16 @@ static void fn_hmac_sha256(hx_func_entry *self, hx_val *args, int nargs,
 	unsigned char digest[32];
 	unsigned int dlen = 32;
 	(void)self; (void)nargs;
-	HMAC(EVP_sha256(), args[0].data, args[0].len,
-	     (unsigned char *)args[1].data, args[1].len, digest, &dlen);
+	/* hx spells HMAC as hmac_X(MESSAGE, KEY): the second operand is the
+	 * key. mdxfind takes it from the -u channel, hashpipe resolves the
+	 * same name from its registered Hashtypes[] the same way, and the
+	 * catalogs KPASS entries (e798 hmac_rmd160(salt, pass), "key is
+	 * pass") only parse under that reading. This standalone copy had the
+	 * operands the other way round, so hx_dedup_check and hx8_to_c
+	 * evaluated every hmac expression with pass as the key -- disagreeing
+	 * with both real engines for the same expression text. */
+	HMAC(EVP_sha256(), args[1].data, args[1].len,
+	     (unsigned char *)args[0].data, args[0].len, digest, &dlen);
 	emit_digest(digest, 32, result, arena, role);
 }
 #endif /* HX_STANDALONE */
@@ -3943,7 +3986,7 @@ static void fn_or(hx_func_entry *self, hx_val *args, int nargs,
  *   ROLES_HEXBIN = BIN               — `hex` (special: identity for _bin)
  *   ROLES_CRYPT  = BIN|HEX|B64|MCF   — bcrypt, yescrypt (full MCF available)
  */
-#define ROLES_DIGEST  (ROLE_CAP_BIN | ROLE_CAP_HEX | ROLE_CAP_B64)
+#define ROLES_DIGEST  (ROLE_CAP_BIN | ROLE_CAP_HEX | ROLE_CAP_B64 | ROLE_CAP_UC)
 #define ROLES_NONE    (0)
 #define ROLES_HEXBIN  (ROLE_CAP_BIN)
 #define ROLES_CRYPT   (ROLE_CAP_BIN | ROLE_CAP_HEX | ROLE_CAP_B64 | ROLE_CAP_MCF)

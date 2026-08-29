@@ -4,7 +4,7 @@
  * Single recursive walk of the AST, emitting instructions into a
  * growable array.  Variable names are resolved to slot indices,
  * function names are looked up in the registry, and the four
- * output-role suffixes (`_bin`, `_hex`, `_b64`, `_mcf`) are stripped
+ * output-role suffixes (`_bin`, `_hex`, `_b64`, `_mcf`, `_uc`) are stripped
  * and recorded as an `enum hx_role` value on the OP_CALL instruction.
  *
  * Suffix-validation: the registry entry advertises a `supported_roles`
@@ -145,6 +145,7 @@ static const char *role_name(uint8_t role)
 	case ROLE_HEX: return "hex";
 	case ROLE_B64: return "b64";
 	case ROLE_MCF: return "mcf";
+	case ROLE_UC:  return "uc";
 	default:       return "default";
 	}
 }
@@ -171,6 +172,8 @@ static const char *role_caps_str(uint8_t caps)
 	                                       "%s_b64", o ? ", " : "");
 	if (caps & ROLE_CAP_MCF) o += snprintf(buf + o, sizeof(buf) - o,
 	                                       "%s_mcf", o ? ", " : "");
+	if (caps & ROLE_CAP_UC)  o += snprintf(buf + o, sizeof(buf) - o,
+	                                       "%s_uc", o ? ", " : "");
 	return buf;
 }
 
@@ -192,7 +195,7 @@ static const char *default_role_str(uint8_t default_role)
 /*
  * Resolve a function name and any output-role suffix.
  *
- * Suffix grammar (longest match): `_bin`, `_hex`, `_b64`, `_mcf`.
+ * Suffix grammar (longest match): `_bin`, `_hex`, `_b64`, `_mcf`, `_uc`.
  * Only one suffix is allowed.  If a suffix is present, it is stripped
  * before registry lookup and *role is set accordingly.  If no suffix,
  * *role = ROLE_DEFAULT (the function's `default_role` is applied at
@@ -209,13 +212,20 @@ static hx_func_entry *resolve_func(const char *name, uint8_t *role)
 	uint8_t r = ROLE_DEFAULT;
 	int suffix_len = 0;
 
-	/* longest-match suffix scan: all 4 candidates are length 4 */
+	/* longest-match suffix scan: four candidates of length 4, then the
+	 * length-3 `_uc`.  Longest first, so a hypothetical function whose
+	 * name ends in `_uc` is still reachable through the fall-through
+	 * below rather than being shadowed here. */
 	if (len > 4 && name[len - 4] == '_') {
 		const char *s = name + len - 3;
 		if      (memcmp(s, "bin", 3) == 0) { r = ROLE_BIN; suffix_len = 4; }
 		else if (memcmp(s, "hex", 3) == 0) { r = ROLE_HEX; suffix_len = 4; }
 		else if (memcmp(s, "b64", 3) == 0) { r = ROLE_B64; suffix_len = 4; }
 		else if (memcmp(s, "mcf", 3) == 0) { r = ROLE_MCF; suffix_len = 4; }
+	}
+	if (suffix_len == 0 && len > 3 && name[len - 3] == '_' &&
+	    memcmp(name + len - 2, "uc", 2) == 0) {
+		r = ROLE_UC; suffix_len = 3;
 	}
 
 	*role = r;
