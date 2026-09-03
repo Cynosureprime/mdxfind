@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.2 $
+ * $Revision: 1.3 $
  * $Log: gpu_sha384raw_core.cl,v $
+ * Revision 1.3  2026/08/30 14:35:34  dlr
+ * Restore the RAW-family iteration rule in the GPU kernels to match mdxfind.c 1.549. These kernels were written against the post-1.290 CPU regression and validated byte-exact against it, which is why CPU-vs-GPU conformance testing never caught the error: both sides agreed on the wrong answer. The correct rule is ONE binary feed at the base, giving X(X_bin(pass)), followed by STANDARD hex iteration. The former template_iterate already implemented exactly that binary absorb, so it is renamed template_raw_refeed, moved ahead of template_finalize and called once at the end of it; template_iterate is replaced by the plain siblings hex step. For the Metal MD5 variant the algo_mode parameter is dropped since RAW has no uppercase form and the call site uses the legacy single-argument shape. Validated on fpga.local GTX 1080 via OpenCL: 15 of 15 lines identical between CPU and GPU across five types and three depths, with a bogus-hash negative control returning zero. On dev1.local Apple M1 via Metal the base is correct and matches CPU at x01 for all five types, but iterations beyond x01 are not returned; that is a coverage gap and not a wrong answer, confirmed by comm showing zero Metal lines absent from the CPU set.
+ *
  * Revision 1.2  2026/05/11 05:22:02  dlr
  * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.
  *
@@ -113,6 +116,43 @@ static inline void template_transform(template_state *st,
 
 /* template_finalize: byte-identical to gpu_sha384_core.cl. SHA384
  * compression + 128-bit length + 12-uint32 truncation. */
+/* template_raw_refeed: absorb the raw digest as a fresh message. This is the
+ * ONE binary feed that defines the RAW family -- the base is X(X_bin(pass)).
+ * It is NOT the -i step; iteration is hex (see template_iterate below).
+ * Body is verbatim the pre-2026-08-30 template_iterate, which implemented
+ * exactly this absorb; only its ROLE was wrong. */
+static inline void template_raw_refeed(template_state *st)
+{
+    ulong M[16];
+    /* Copy the BE-packed digest directly into M[0..5]. state[i] is
+     * already the BE uint64 of digest bytes [i*8..i*8+7] — matches the
+     * sha512_block M-load convention exactly. */
+    M[0] = st->state[0];
+    M[1] = st->state[1];
+    M[2] = st->state[2];
+    M[3] = st->state[3];
+    M[4] = st->state[4];
+    M[5] = st->state[5];
+    M[6] = 0x8000000000000000UL;   /* 0x80 BE at byte 48 */
+    M[7] = 0UL;
+    for (int j = 8; j < 14; j++) M[j] = 0UL;
+    M[14] = 0UL;
+    M[15] = 48UL * 8UL;            /* 48 binary bytes = 384 bits */
+
+    /* Reset state to SHA384 IV; absorb the prepared block. */
+    st->state[0] = 0xcbbb9d5dc1059ed8UL;
+    st->state[1] = 0x629a292a367cd507UL;
+    st->state[2] = 0x9159015a3070dd17UL;
+    st->state[3] = 0x152fecd8f70e5939UL;
+    st->state[4] = 0x67332667ffc00b31UL;
+    st->state[5] = 0x8eb44a8768581511UL;
+    st->state[6] = 0xdb0c2e0d64f98fa7UL;
+    st->state[7] = 0x47b5481dbefa4fa4UL;
+    sha512_block(&st->state[0], M);
+
+    template_state_to_h(st);
+}
+
 static inline void template_finalize(template_state *st,
                                      const uchar *data, int len)
 {
@@ -163,6 +203,9 @@ static inline void template_finalize(template_state *st,
     }
 
     template_state_to_h(st);
+
+    /* the one binary feed that makes this a RAW type */
+    template_raw_refeed(st);
 }
 
 /* template_iterate: SHA384RAW iter — re-feed the 48-byte BINARY digest
@@ -196,22 +239,26 @@ static inline void template_finalize(template_state *st,
 static inline void template_iterate(template_state *st)
 {
     ulong M[16];
-    /* Copy the BE-packed digest directly into M[0..5]. state[i] is
-     * already the BE uint64 of digest bytes [i*8..i*8+7] — matches the
-     * sha512_block M-load convention exactly. */
-    M[0] = st->state[0];
-    M[1] = st->state[1];
-    M[2] = st->state[2];
-    M[3] = st->state[3];
-    M[4] = st->state[4];
-    M[5] = st->state[5];
-    M[6] = 0x8000000000000000UL;   /* 0x80 BE at byte 48 */
-    M[7] = 0UL;
-    for (int j = 8; j < 14; j++) M[j] = 0UL;
-    M[14] = 0UL;
-    M[15] = 48UL * 8UL;            /* 48 binary bytes = 384 bits */
+    /* Encode 6 state words → 12 hex ulong words. Same byte-by-byte
+     * pattern as sha512_to_hex_lc (gpu_common.cl line 780) but limited
+     * to 6 input words. */
+    for (int i = 0; i < 6; i++) {
+        ulong s = st->state[i];
+        uint b0 = (uint)((s >> 56) & 0xff), b1 = (uint)((s >> 48) & 0xff);
+        uint b2 = (uint)((s >> 40) & 0xff), b3 = (uint)((s >> 32) & 0xff);
+        uint b4 = (uint)((s >> 24) & 0xff), b5 = (uint)((s >> 16) & 0xff);
+        uint b6 = (uint)((s >> 8)  & 0xff), b7 = (uint)(s & 0xff);
+        M[i*2]   = (hex_byte_be64(b0) << 48) | (hex_byte_be64(b1) << 32)
+                  | (hex_byte_be64(b2) << 16) | hex_byte_be64(b3);
+        M[i*2+1] = (hex_byte_be64(b4) << 48) | (hex_byte_be64(b5) << 32)
+                  | (hex_byte_be64(b6) << 16) | hex_byte_be64(b7);
+    }
+    M[12] = 0x8000000000000000UL;   /* 0x80 BE at byte position 96 */
+    M[13] = 0UL;
+    M[14] = 0UL;                    /* high 64 bits of bit count */
+    M[15] = 96UL * 8UL;             /* 96 hex chars = 768 bits */
 
-    /* Reset state to SHA384 IV; absorb the prepared block. */
+    /* Reset state to SHA384 IV; absorb the hex block. */
     st->state[0] = 0xcbbb9d5dc1059ed8UL;
     st->state[1] = 0x629a292a367cd507UL;
     st->state[2] = 0x9159015a3070dd17UL;

@@ -1,8 +1,14 @@
 /*
  * userdef.c - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.9 $
+ * $Revision: 1.11 $
  * $Log: userdef.c,v $
+ * Revision 1.11  2026/08/31 02:54:53  dlr
+ * An unknown key in userdef.txt is now a WARNING, not an error. It was counted in userdef_errors, which gates the refusal to run, so the moment a newer key appeared in a shared userdef.txt an older binary printed unknown key ignored (forward-compat) and then refused to run and exited 1, processing NOTHING at all rather than skipping the affected type. The two halves of that message contradict each other. The practical effect is that every future key addition becomes a fleet-wide outage that arrives with CONFIG propagation rather than with the deploy, which is exactly backwards: the config is the easy thing to distribute. Found by the contest session when the new form key reached a host still running 1.116, and confirmed here against mdxfind 1.549 and hashpipe 1.116, both of which refuse every input whenever MDXFIND_CACHE points at a file carrying the key. Unknown keys are now tallied separately and reported at the end of the load so they stay visible without being fatal. This does not repair binaries built before it; those must still be updated ahead of any config that uses a new key.
+ *
+ * Revision 1.10  2026/08/31 02:07:28  dlr
+ * Add an optional stored-form declaration to userdef.txt, and the split and build routines that consume it. A user-defined type's hx expression says how the digest is COMPUTED and nothing about how it is STORED, and the two differ often enough to matter: KoreLogic's bwtdt stores an 8-hex salt immediately followed by its 32-hex digest in one 40-character field, so the salt never reached the salt slot and the type could not verify its own hashes however it was selected. The new form key reuses hx's concatenation notation so the two read alike, for example salt(8) . digest(32), and supports quoted literals for leading characters, trailing characters and separators, plus optional widths so a field may be variable. At most one variable-width field is allowed per form, because with two the boundary is not determined by the text; the loader refuses rather than guessing. A malformed form is a hard skip rather than a silent ignore, since the type would otherwise load and then fail to read its own hashes, which is the quiet failure this declaration exists to remove. The parsed form is printed in the load report, because a form that parsed but was never mentioned is indistinguishable from one that was dropped. userdef_form_build is the inverse of the split and exists because a form governs OUTPUT as well as input: a found line must come back in the shape it was read, or the emitting tool's output is not accepted by the consuming one. Expect the grammar to grow.
+ *
  * Revision 1.9  2026/08/22 12:38:43  dlr
  * Make a userdef parse error fatal, after the complete read. Previously a bad stanza was reported only under -Y verbose and then skipped, so a normal run silently continued with fewer types than the file declares, and the run looked healthy. Every rejection path now reports unconditionally via a new UD_ERR macro, increments a counter, and the load exits 1 once the WHOLE file has been read - so a single pass shows every broken stanza instead of making the user fix and re-run one typo at a time. Also closes a worse hole: the hx lexer catch-all PRINTS an unknown character and then drops it, so md5(md5($p)) lexed as md5(md5(p)), compiled, and registered a hash type that was silently not what was written - the only signal was a diagnostic scrolling past. New global hx_diag_count, defined in hx.c and declared in hx_vm.h, is incremented by the lexer catch-all and by yyerror; the userdef loader resets it before hx_compile_expr and rejects any stanza whose expression produced a diagnostic even when a program came back. hx_compile_expr itself is deliberately unchanged, so catalog and hx tool behaviour are untouched and only user-defined types get the strict treatment. hx.lex.c and hx.tab.c regenerated with flex and bison; the round trip is byte-identical apart from line directives. userdef.c is shared with hashpipe, so hashpipe now refuses the same broken file with the same report.
  *
@@ -84,6 +90,16 @@ int userdef_verbose = 0;
  * and only then exits, so one run surfaces ALL the breakage in the file rather
  * than making the user fix and re-run once per typo. */
 static int userdef_errors = 0;
+/*
+ * Unknown keys are a WARNING, not an error. They must not feed userdef_errors,
+ * which gates the refusal to run: an unknown key made an older binary exit(1)
+ * and process NOTHING -- not just skip the affected type -- the moment a newer
+ * key appeared in a shared userdef.txt. The handler said "ignored
+ * (forward-compat)" and then refused to run, which is a contradiction, and it
+ * turns every future key addition into a fleet-wide outage that arrives with
+ * config propagation rather than with the deploy.
+ */
+static int userdef_warnings = 0;
 
 /*
  * USERDEF_HAVE_CODEGEN gates the two Milestone 2 "nicety" features that
@@ -501,8 +517,206 @@ const char *userdef_gpu_status(int op)
 #endif /* USERDEF_HAVE_CODEGEN */
 
 /* finalize one accumulated stanza into the registry */
+/*
+ * Parse a "form =" value into a struct userdef_form.
+ *
+ * Grammar, deliberately the same concatenation notation hx uses so the two
+ * read alike:
+ *
+ *     form = salt(8) . digest(32)
+ *     form = "$IPB2$" . salt(10) . "$" . digest(32)
+ *     form = salt . "$" . digest(128)
+ *
+ * Returns 0 on success, -1 on a malformed declaration (message already
+ * emitted). A form is optional; absence is not an error.
+ */
+static int parse_form(const char *val, struct userdef_form *out,
+                      const char *path, const char *name, int lineno)
+{
+	const char *p = val;
+	int nvar = 0;
+
+	memset(out, 0, sizeof(*out));
+
+	while (*p) {
+		struct userdef_piece *pc;
+		while (*p == ' ' || *p == '\t' || *p == '.') p++;
+		if (!*p || *p == '\n' || *p == '\r') break;
+
+		if (out->npieces >= USERDEF_FORM_MAX) {
+			UD_ERR("userdef: %s: [%s] near line %d: form has more "
+			       "than %d pieces\n", path, name, lineno,
+			       USERDEF_FORM_MAX);
+			return -1;
+		}
+		pc = &out->piece[out->npieces];
+
+		if (*p == '"') {                      /* literal */
+			int n = 0;
+			p++;
+			while (*p && *p != '"') {
+				if (n >= USERDEF_LIT_MAX - 1) {
+					UD_ERR("userdef: %s: [%s] near line %d: "
+					       "form literal longer than %d\n",
+					       path, name, lineno,
+					       USERDEF_LIT_MAX - 1);
+					return -1;
+				}
+				pc->lit[n++] = *p++;
+			}
+			if (*p != '"') {
+				UD_ERR("userdef: %s: [%s] near line %d: form "
+				       "literal is not closed\n",
+				       path, name, lineno);
+				return -1;
+			}
+			p++;
+			pc->lit[n] = '\0';
+			pc->kind = UDF_LITERAL;
+			pc->len  = n;
+		} else {                              /* field name */
+			char nm[16];
+			int n = 0;
+			while (*p && (isalpha((unsigned char)*p))) {
+				if (n < (int)sizeof(nm) - 1) nm[n++] = *p;
+				p++;
+			}
+			nm[n] = '\0';
+			if      (!strcmp(nm, "digest")) pc->kind = UDF_DIGEST;
+			else if (!strcmp(nm, "salt"))   pc->kind = UDF_SALT;
+			else if (!strcmp(nm, "user"))   pc->kind = UDF_USER;
+			else {
+				UD_ERR("userdef: %s: [%s] near line %d: form "
+				       "field '%s' is not one of digest, salt, "
+				       "user\n", path, name, lineno, nm);
+				return -1;
+			}
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p == '(') {
+				p++;
+				pc->len = 0;
+				while (isdigit((unsigned char)*p))
+					pc->len = pc->len * 10 + (*p++ - '0');
+				while (*p == ' ' || *p == '\t') p++;
+				if (*p != ')') {
+					UD_ERR("userdef: %s: [%s] near line %d: "
+					       "form width is not closed\n",
+					       path, name, lineno);
+					return -1;
+				}
+				p++;
+				if (pc->len <= 0) {
+					UD_ERR("userdef: %s: [%s] near line %d: "
+					       "form width must be positive\n",
+					       path, name, lineno);
+					return -1;
+				}
+			} else {
+				pc->len = 0;          /* variable width */
+				nvar++;
+			}
+		}
+		out->npieces++;
+	}
+
+	if (nvar > 1) {
+		/* Two unbounded fields leave the boundary undetermined by the
+		 * text itself; refuse rather than guess a split. */
+		UD_ERR("userdef: %s: [%s] near line %d: form has %d "
+		       "variable-width fields, at most 1 is allowed\n",
+		       path, name, lineno, nvar);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Split a stored field per a declared form.  See userdef.h.
+ *
+ * A variable-width field takes whatever the fixed pieces do not claim, so the
+ * total fixed width is measured first and the remainder assigned to it.
+ */
+int userdef_form_split(const struct userdef_form *f,
+                       const char *field, int fieldlen,
+                       const char **digest, int *digestlen,
+                       const char **salt,   int *saltlen,
+                       const char **user,   int *userlen)
+{
+	int i, fixed = 0, varlen;
+	const char *p = field;
+	const char *end = field + fieldlen;
+
+	if (!f || f->npieces == 0) return 0;
+
+	for (i = 0; i < f->npieces; i++)
+		fixed += f->piece[i].len;
+	varlen = fieldlen - fixed;
+	if (varlen < 0) return 0;             /* field too short for the form */
+
+	for (i = 0; i < f->npieces; i++) {
+		const struct userdef_piece *pc = &f->piece[i];
+		int take = pc->len ? pc->len : varlen;
+
+		if (p + take > end) return 0;
+		switch (pc->kind) {
+		case UDF_LITERAL:
+			if (memcmp(p, pc->lit, (size_t)pc->len) != 0) return 0;
+			break;
+		case UDF_DIGEST:
+			if (digest)    *digest    = p;
+			if (digestlen) *digestlen = take;
+			break;
+		case UDF_SALT:
+			if (salt)    *salt    = p;
+			if (saltlen) *saltlen = take;
+			break;
+		case UDF_USER:
+			if (user)    *user    = p;
+			if (userlen) *userlen = take;
+			break;
+		}
+		p += take;
+	}
+	return (p == end);                    /* must consume the field exactly */
+}
+
+int userdef_form_build(const struct userdef_form *f,
+                       const char *digest, int digestlen,
+                       const char *salt,   int saltlen,
+                       const char *user,   int userlen,
+                       char *out, int outsz)
+{
+	int i, n = 0;
+
+	if (!f || f->npieces == 0) return -1;
+
+	for (i = 0; i < f->npieces; i++) {
+		const struct userdef_piece *pc = &f->piece[i];
+		const char *src = NULL;
+		int len = 0;
+
+		switch (pc->kind) {
+		case UDF_LITERAL: src = pc->lit;  len = pc->len;    break;
+		case UDF_DIGEST:  src = digest;   len = digestlen;  break;
+		case UDF_SALT:    src = salt;     len = saltlen;    break;
+		case UDF_USER:    src = user;     len = userlen;    break;
+		}
+		if (!src) return -1;
+		/* A declared width is authoritative: emitting a different number of
+		 * characters than the form promises would produce a line that the
+		 * split side then rejects. */
+		if (pc->len && pc->kind != UDF_LITERAL && len != pc->len) return -1;
+		if (n + len >= outsz) return -1;
+		memcpy(out + n, src, (size_t)len);
+		n += len;
+	}
+	out[n] = '\0';
+	return n;
+}
+
 static void finalize_stanza(const char *name, const char *idstr,
-                            const char *hx, const char *path, int lineno)
+                            const char *hx, const char *form,
+                            const char *path, int lineno)
 {
 	struct userdef_type *u;
 	hx_program *prog;
@@ -613,6 +827,21 @@ static void finalize_stanza(const char *name, const char *idstr,
 	u->op         = (int)Userdef_base_val + Userdef_count;
 	u->diglen_hex = diglen;
 	u->slot_mask  = slot_mask;
+	/*
+	 * Stored-form layout, if the stanza declared one. A malformed form is
+	 * a hard skip rather than a silent ignore: the type would otherwise
+	 * load and then fail to read its own hashes, which is exactly the
+	 * quiet failure this declaration exists to remove.
+	 */
+	memset(&u->form, 0, sizeof(u->form));
+	if (form && form[0]) {
+		if (parse_form(form, &u->form, path, name, lineno) != 0) {
+			userdef_errors++;
+			memset(&u->form, 0, sizeof(u->form));
+			record_skip(idstr, "malformed form declaration");
+			return;
+		}
+	}
 	u->uses_salt  = (slot_mask != 0);   /* legacy field — nonzero iff any salt-class slot referenced */
 	Userdef_count++;
 
@@ -621,6 +850,37 @@ static void finalize_stanza(const char *name, const char *idstr,
 	        (slot_mask & USERDEF_SLOT_SALT)  ? ", uses salt"  : "",
 	        (slot_mask & USERDEF_SLOT_USER)  ? ", uses user"  : "",
 	        u->hx);
+
+	/*
+	 * Report the stored form when one is declared. A form that parsed but
+	 * was never mentioned would be indistinguishable from one that was
+	 * ignored, and the whole point of the declaration is that the operator
+	 * can see how the field will be cut.
+	 */
+	if (u->form.npieces) {
+		char fb[256];
+		int i, n = 0;
+		for (i = 0; i < u->form.npieces && n < (int)sizeof(fb) - 24; i++) {
+			const struct userdef_piece *pc = &u->form.piece[i];
+			if (i) n += snprintf(fb + n, sizeof(fb) - n, " . ");
+			switch (pc->kind) {
+			case UDF_LITERAL:
+				n += snprintf(fb + n, sizeof(fb) - n, "\"%s\"", pc->lit);
+				break;
+			case UDF_DIGEST: case UDF_SALT: case UDF_USER: {
+				const char *nm = pc->kind == UDF_DIGEST ? "digest" :
+				                 pc->kind == UDF_SALT   ? "salt"   : "user";
+				if (pc->len)
+					n += snprintf(fb + n, sizeof(fb) - n, "%s(%d)", nm, pc->len);
+				else
+					n += snprintf(fb + n, sizeof(fb) - n, "%s", nm);
+				break; }
+			}
+		}
+		fb[sizeof(fb) - 1] = '\0';
+		UD_MSG("userdef: %s (-m u%s): stored form %s\n",
+		       u->dispname, u->idstr, fb);
+	}
 
 	/*
 	 * Sub-phase D5: content-hash identity suggestion.  Compute a stable
@@ -654,6 +914,7 @@ int userdef_load(const char *cache_env)
 	FILE *fp;
 	char line[2200];
 	char name[128] = {0}, idstr[128] = {0}, hx[2048] = {0};
+	char form[512] = {0};
 	int lineno = 0, stanza_line = 0;
 
 	if (derive_userdef_path(cache_env, path, sizeof(path)) != 0)
@@ -683,8 +944,8 @@ int userdef_load(const char *cache_env)
 		if (*s == '[') {
 			/* new stanza header => finalize the previous one */
 			char *close;
-			finalize_stanza(name, idstr, hx, path, stanza_line);
-			name[0] = idstr[0] = hx[0] = '\0';
+			finalize_stanza(name, idstr, hx, form, path, stanza_line);
+			name[0] = idstr[0] = hx[0] = form[0] = '\0';
 			stanza_line = lineno;
 
 			s++;
@@ -739,13 +1000,29 @@ int userdef_load(const char *cache_env)
 					val[--vlen] = '\0';
 				strncpy(hx, val, sizeof(hx) - 1);
 				hx[sizeof(hx) - 1] = '\0';
+			} else if (keyis(key, "form")) {
+				/*
+				 * Stored-form layout. Verbatim to end of line
+				 * like hx, since it contains quoted literals
+				 * and spaces that must not be tokenised here.
+				 */
+				char *val = eq + 1;
+				size_t vlen;
+				if (*val == ' ') val++;
+				vlen = strlen(val);
+				while (vlen > 0 && (val[vlen-1] == '\n' ||
+				                    val[vlen-1] == '\r'))
+					val[--vlen] = '\0';
+				strncpy(form, val, sizeof(form) - 1);
+				form[sizeof(form) - 1] = '\0';
 			} else if (keyis(key, "id")) {
 				char *val = trim(eq + 1);
 				strncpy(idstr, val, sizeof(idstr) - 1);
 				idstr[sizeof(idstr) - 1] = '\0';
 			} else {
-				/* forward-compat: unknown key warn-and-ignore */
-				userdef_errors++;
+				/* forward-compat: unknown key warn-and-ignore. Counted as a WARNING;
+				 * incrementing userdef_errors here would refuse to run the whole file. */
+				userdef_warnings++;
 				UD_ERR( "userdef: %s line %d: unknown "
 				        "key '%s' ignored (forward-compat)\n",
 				        path, lineno, key);
@@ -754,7 +1031,7 @@ int userdef_load(const char *cache_env)
 	}
 
 	/* finalize the last stanza */
-	finalize_stanza(name, idstr, hx, path, stanza_line);
+	finalize_stanza(name, idstr, hx, form, path, stanza_line);
 
 	fclose(fp);
 
@@ -767,6 +1044,9 @@ int userdef_load(const char *cache_env)
 		        userdef_errors, path);
 		exit(1);
 	}
+	if (userdef_warnings)
+		UD_ERR( "userdef: %d unknown key(s) ignored in %s; a newer tool "
+		        "may understand them\n", userdef_warnings, path);
 	UD_MSG( "userdef: %d user-defined hash type(s) loaded "
 		        "from %s\n", Userdef_count, path);
 

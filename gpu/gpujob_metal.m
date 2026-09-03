@@ -501,6 +501,12 @@ static int metal_gpu_hash_words(int op)
     case JOB_WRLMD5PASS:       /* Sub-phase 5b.2a Tier 2: e173 = 64 bytes = 16 uint32 (family codegen) */
         return 16;
     case JOB_MD5:         /* 128-bit MD5 / MD4 / MD5RAW / MD4UTF16 = 4 uint32 */
+    case JOB_MD5UC:       /* 2026-08-30: e2 uppercase-hex-feedback MD5;
+                           * same 4 uint32 digest as MD5 (the default arm
+                           * would already return 4, but per feedback_-
+                           * metal_hash_words_width_helper.md every live
+                           * op is listed explicitly rather than relying
+                           * on the default). */
     case JOB_MD4:
     case JOB_MD5RAW:
     case JOB_MD4UTF16:
@@ -1874,6 +1880,26 @@ static void gpujob_metal_worker(void *arg) {
 
                     if (widx >= g->packed_count) continue;
                     if ((int)ridx >= gpu_rule_count) continue;
+
+                    /* MD5UC iteration-1 suppression (2026-08-30).
+                     *
+                     * The CPU JOB_MD5UC arm (mdxfind.c case JOB_MD5UC)
+                     * computes the iter-1 digest md5(pass) but does NOT
+                     * call checkhash on it -- it falls into MDstart with
+                     * x = 2, because the iter-1 digest is byte-identical
+                     * to MD5x01 and is reported by the MD5 op instead.
+                     *
+                     * The shared MD5 template kernel has no such notion:
+                     * it probes the compact table at EVERY iteration
+                     * including the first (the algo_mode=1 uppercase-hex
+                     * branch only fires between iterations). Dropping the
+                     * iter-1 hit here is what keeps Metal MD5UC output
+                     * byte-identical to the CPU. Doing it host-side rather
+                     * than in the kernel is deliberate: params.algo_mode
+                     * == 1u means different things to other families
+                     * (MD5UCSALT, SHA512CRYPTMD5), so a kernel-side skip
+                     * in the shared metal_template.metal would misfire. */
+                    if (g->op == JOB_MD5UC && iter_num == 1) continue;
                     if (b71_mask_active && (uint64_t)mask_idx >= b71_mask_size) continue;
                     if (is_salted_op &&
                         (int)salt_idx_global >= nsalts_packed) continue;

@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.33 $
+ * $Revision: 1.34 $
  * $Log: metal_common.metal,v $
+ * Revision 1.34  2026/08/30 23:47:41  dlr
+ * Replace the divergent threadgroup_barrier in all eight EMIT_HIT_N_DEDUP_OR_OVERFLOW macros with a new MTL_EMIT_HIT_DEVICE_FENCE. The OpenCL twin gpu_common.cl closes each macro body with mem_fence CLK_GLOBAL_MEM_FENCE, a per-thread MEMORY fence that is legal anywhere; the Metal port translated it to threadgroup_barrier mem_flags::mem_device, which is an EXECUTION barrier that MSL requires every thread in the threadgroup to reach. It sat inside the hit-emit conditional inside the carrier iterated probe loop, the most divergent point in the kernel, so the constraint was violated on every emit - undefined behaviour inherited by all eight digest widths and therefore by every Metal family that emits a hit. The new macro expands to atomic_thread_fence mem_flags::mem_device memory_order_relaxed thread_scope_device on MSL 3.2 and above, and to nothing below, because atomic_thread_fence is undeclared under the -std=metal3.0 pin in gpu/build_metallib.sh and MSL exposes no ordering stronger than relaxed for device-scope atomics in any case. Correct either way: no thread in the kernel reads hits or hit_count, and the host reads both only after command-buffer completion, which is a full memory synchronisation point. Offline xcrun metal clean for both the metallib 3.0 path and the driver-default JIT path; emitted AIR shows air.atomic.fence and no threadgroup barrier. Companion to the same-day gpu_metal.m revision; validated on dev1 Apple M1 and dev3 Apple M2 Max.
+ *
  * Revision 1.33  2026/05/28 04:44:25  dlr
  * 5b.4b.2: Metal twin gost_block + MTL_GOST_SBOX_1..4; byte-for-byte mirror of gpu_common.cl gost_block modulo constant vs underscore-constant, static inline Pattern 3, thread uint pointers, MTL macro prefix; R11 scalar bitselect NOT in play XOR add shift sbox-lookup only; R8 line comments
  *
@@ -4349,8 +4352,51 @@ static inline int probe_compact_idx(
  *   - atomic_and      -> atomic_fetch_and_explicit(..., memory_order_relaxed)
  *   - atomic_add      -> atomic_fetch_add_explicit(..., memory_order_relaxed)
  *   - atomic_cmpxchg  -> atomic_compare_exchange_weak_explicit
- *   - mem_fence(GLOBAL_MEM_FENCE) -> threadgroup_barrier(mem_flags::mem_device)
+ *   - mem_fence(GLOBAL_MEM_FENCE) -> MTL_EMIT_HIT_DEVICE_FENCE() (see below;
+ *     was threadgroup_barrier(mem_flags::mem_device) through 2026-08-30,
+ *     which is an EXECUTION barrier and is undefined behaviour here)
  */
+/* MTL_EMIT_HIT_DEVICE_FENCE (2026-08-30, mdx-gpu) -- the Metal analogue
+ * of the OpenCL `mem_fence(CLK_GLOBAL_MEM_FENCE)` that closes every
+ * EMIT_HIT_N_DEDUP_OR_OVERFLOW body in gpu_common.cl.
+ *
+ * Through 2026-08-30 this expanded to
+ *     threadgroup_barrier(mem_flags::mem_device)
+ * which is NOT the same thing. OpenCL's mem_fence is a per-thread
+ * MEMORY fence and is legal anywhere. Metal's threadgroup_barrier is an
+ * EXECUTION barrier: MSL requires that every thread in the threadgroup
+ * reach it. Here it sat inside `if (hit)` inside the carrier's iterated
+ * probe loop -- the most divergent point in the kernel, reached by a
+ * handful of lanes out of a 64-wide threadgroup -- so the constraint was
+ * violated on every emit. That is undefined behaviour, and it was
+ * inherited by all eight EMIT_HIT_N widths, hence by every Metal family
+ * that emits a hit.
+ *
+ * MSL exposes only memory_order_relaxed for device-scope atomics (Metal
+ * 3.2 / Xcode 26 toolchain: memory_order_release and memory_order_seq_cst
+ * are undeclared identifiers), so the honest translation is a relaxed
+ * device-scope thread fence. It carries no ordering guarantee, which is
+ * fine: nothing inside the kernel ever reads hits[], and the host reads
+ * it only after the command buffer completes, which is a full memory
+ * synchronisation point.
+ *
+ * atomic_thread_fence itself only exists from MSL 3.2 (Xcode 26), and
+ * the offline metallib build in gpu/build_metallib.sh pins
+ * -std=metal3.0, where the identifier is undeclared -- so below 3.2 the
+ * macro expands to nothing at all. That is correct rather than merely
+ * expedient, for the reason just given. The macro is kept, in both
+ * arms, so the OpenCL twin's shape stays visible at the same place.
+ *
+ * Whatever this expands to, it is legal in divergent control flow --
+ * unlike what it replaces. Do NOT put an execution barrier back. */
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 320
+#define MTL_EMIT_HIT_DEVICE_FENCE()                                                    \
+    atomic_thread_fence(mem_flags::mem_device, memory_order_relaxed,                   \
+                        thread_scope_device)
+#else
+#define MTL_EMIT_HIT_DEVICE_FENCE()  do { } while (0)
+#endif
+
 #define MTL_OVR_CASMIN_GID(ovr_gid, lane_gid)                                          \
     do {                                                                               \
         uint _cur, _new = (uint)(lane_gid);                                            \
@@ -4384,7 +4430,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+5] = (c);                                                 \
                 (hits)[_base+6] = (d);                                                 \
                 for (uint _z = 7u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;       \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4435,7 +4481,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 5u; _i++) (hits)[_base+3u+_i] = (h)[_i];       \
                 for (uint _z = 8u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;       \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4477,7 +4523,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 6u; _i++) (hits)[_base+3u+_i] = (h)[_i];       \
                 for (uint _z = 9u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;       \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4517,7 +4563,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 7u; _i++) (hits)[_base+3u+_i] = (h)[_i];       \
                 for (uint _z = 10u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;      \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4564,7 +4610,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 8u; _i++) (hits)[_base+3u+_i] = (h)[_i];       \
                 for (uint _z = 11u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;      \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4613,7 +4659,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 12u; _i++) (hits)[_base+3u+_i] = (h)[_i];      \
                 for (uint _z = 15u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;      \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4662,7 +4708,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 16u; _i++) (hits)[_base+3u+_i] = (h)[_i];      \
                 for (uint _z = 19u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;      \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \
@@ -4706,7 +4752,7 @@ static inline int probe_compact_idx(
                 (hits)[_base+2] = (iter);                                              \
                 for (uint _i = 0u; _i < 10u; _i++) (hits)[_base+3u+_i] = (h)[_i];      \
                 for (uint _z = 13u; _z < HIT_STRIDE; _z++) (hits)[_base+_z] = 0u;      \
-                threadgroup_barrier(mem_flags::mem_device);                            \
+                MTL_EMIT_HIT_DEVICE_FENCE();                                          \
             } else {                                                                   \
                 atomic_fetch_and_explicit(&(hashes_shown)[_mi], ~_dm,                  \
                                           memory_order_relaxed);                       \

@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.1 $
+ * $Revision: 1.2 $
  * $Log: metal_md5raw_core.metal,v $
+ * Revision 1.2  2026/08/30 14:35:34  dlr
+ * Restore the RAW-family iteration rule in the GPU kernels to match mdxfind.c 1.549. These kernels were written against the post-1.290 CPU regression and validated byte-exact against it, which is why CPU-vs-GPU conformance testing never caught the error: both sides agreed on the wrong answer. The correct rule is ONE binary feed at the base, giving X(X_bin(pass)), followed by STANDARD hex iteration. The former template_iterate already implemented exactly that binary absorb, so it is renamed template_raw_refeed, moved ahead of template_finalize and called once at the end of it; template_iterate is replaced by the plain siblings hex step. For the Metal MD5 variant the algo_mode parameter is dropped since RAW has no uppercase form and the call site uses the legacy single-argument shape. Validated on fpga.local GTX 1080 via OpenCL: 15 of 15 lines identical between CPU and GPU across five types and three depths, with a bogus-hash negative control returning zero. On dev1.local Apple M1 via Metal the base is correct and matches CPU at x01 for all five types, but iterations beyond x01 are not returned; that is a coverage gap and not a wrong answer, confirmed by comm showing zero Metal lines absent from the CPU set.
+ *
  * Revision 1.1  2026/05/15 19:51:48  dlr
  * Initial revision
  *
@@ -105,6 +108,28 @@ static inline void template_transform(thread template_state &st,
 }
 
 /* template_finalize: byte-identical to gpu_md5_core.cl. */
+/* template_raw_refeed: absorb the raw digest as a fresh message -- the ONE
+ * binary feed that defines the RAW family. NOT the -i step; iteration is hex.
+ * Body is verbatim the pre-2026-08-30 template_iterate; only its role was wrong. */
+static inline void template_raw_refeed(thread template_state &st)
+{
+    uint M[16];
+    M[0] = st.h[0];
+    M[1] = st.h[1];
+    M[2] = st.h[2];
+    M[3] = st.h[3];
+    M[4] = 0x80u;
+    for (int j = 5; j < 14; j++) M[j] = 0u;
+    M[14] = 16u * 8u;
+    M[15] = 0u;
+    /* Reset state to MD5 IV; absorb the prepared block. */
+    st.h[0] = 0x67452301u;
+    st.h[1] = 0xEFCDAB89u;
+    st.h[2] = 0x98BADCFEu;
+    st.h[3] = 0x10325476u;
+    md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
+}
+
 static inline void template_finalize(thread template_state &st,
                                 device const uchar *data,
                                 int len)
@@ -145,6 +170,9 @@ static inline void template_finalize(thread template_state &st,
         M[15] = 0;
         md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
     }
+
+    /* the one binary feed that makes this a RAW type */
+    template_raw_refeed(st);
 }
 
 /* template_iterate: MD5RAW iter — re-feed the 16-byte BINARY digest
@@ -171,15 +199,12 @@ static inline void template_finalize(thread template_state &st,
 static inline void template_iterate(thread template_state &st)
 {
     uint M[16];
-    M[0] = st.h[0];
-    M[1] = st.h[1];
-    M[2] = st.h[2];
-    M[3] = st.h[3];
-    M[4] = 0x80u;
-    for (int j = 5; j < 14; j++) M[j] = 0u;
-    M[14] = 16u * 8u;
+        md5_to_hex_lc(st.h[0], st.h[1], st.h[2], st.h[3], M);
+    M[8] = 0x80u;
+    for (int j = 9; j < 14; j++) M[j] = 0u;
+    M[14] = 32u * 8u;     /* 32 hex chars = 256 bits */
     M[15] = 0u;
-    /* Reset state to MD5 IV; absorb the prepared block. */
+    /* Reinitialize state to IV, then absorb. */
     st.h[0] = 0x67452301u;
     st.h[1] = 0xEFCDAB89u;
     st.h[2] = 0x98BADCFEu;

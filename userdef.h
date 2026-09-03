@@ -1,8 +1,11 @@
 /*
  * userdef.h - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.7 $
+ * $Revision: 1.8 $
  * $Log: userdef.h,v $
+ * Revision 1.8  2026/08/31 02:07:28  dlr
+ * Add an optional stored-form declaration to userdef.txt, and the split and build routines that consume it. A user-defined type's hx expression says how the digest is COMPUTED and nothing about how it is STORED, and the two differ often enough to matter: KoreLogic's bwtdt stores an 8-hex salt immediately followed by its 32-hex digest in one 40-character field, so the salt never reached the salt slot and the type could not verify its own hashes however it was selected. The new form key reuses hx's concatenation notation so the two read alike, for example salt(8) . digest(32), and supports quoted literals for leading characters, trailing characters and separators, plus optional widths so a field may be variable. At most one variable-width field is allowed per form, because with two the boundary is not determined by the text; the loader refuses rather than guessing. A malformed form is a hard skip rather than a silent ignore, since the type would otherwise load and then fail to read its own hashes, which is the quiet failure this declaration exists to remove. The parsed form is printed in the load report, because a form that parsed but was never mentioned is indistinguishable from one that was dropped. userdef_form_build is the inverse of the split and exists because a form governs OUTPUT as well as input: a found line must come back in the shape it was read, or the emitting tool's output is not accepted by the consuming one. Expect the grammar to grow.
+ *
  * Revision 1.7  2026/08/09 20:13:23  dlr
  * Phase A of built-in / user-defined op address separation. JOB_USERDEF_BASE 1000 to 1100 becomes a compile-time DEFAULT only; the live base is derived at runtime from the Types array length and set via the new userdef_set_base before userdef_load. Declares userdef_set_base and userdef_base. Adding a built-in type can no longer grow into the user range - the base moves with it.
  *
@@ -92,6 +95,50 @@ extern int userdef_verbose;
 #define USERDEF_SLOT_PEPPER  0x04   /* rejected: needs v2 load grammar */
 #define USERDEF_SLOT_USER    0x08
 
+/*
+ * Stored-form declaration -- the optional "form =" key in userdef.txt.
+ *
+ * A user-defined type's hx expression says how the digest is COMPUTED; it says
+ * nothing about how the result is STORED. Those differ often enough to matter:
+ * KoreLogic's bwtdt stores an 8-hex salt immediately followed by its 32-hex
+ * digest in one 40-character field, so the salt never reaches the salt slot and
+ * the type cannot verify its own hashes however it is selected.
+ *
+ * The declaration reuses hx's concatenation notation so it reads the same way:
+ *
+ *     form = salt(8) . digest(32)                     bwtdt
+ *     form = digest(40) . salt(20)                    Oracle 11g shape
+ *     form = "$IPB2$" . salt(10) . "$" . digest(32)   literal prefix/separator
+ *     form = salt . "$" . digest(128)                 variable-width field
+ *
+ * A piece is a quoted literal, or a field name optionally followed by a
+ * character width in parentheses. A field with no width is variable, and at
+ * most ONE variable piece is allowed per form: with two, the split is not
+ * determined by the text. Expect this grammar to grow -- trailing literals,
+ * more separators, and further field kinds are all deliberately expressible
+ * without changing the shape of the descriptor.
+ */
+#define USERDEF_FORM_MAX   12   /* pieces per form */
+#define USERDEF_LIT_MAX    32   /* bytes per literal piece */
+
+enum userdef_piece_kind {
+	UDF_LITERAL = 0,   /* fixed text: prefix, separator or suffix */
+	UDF_DIGEST,
+	UDF_SALT,
+	UDF_USER
+};
+
+struct userdef_piece {
+	int  kind;                     /* enum userdef_piece_kind        */
+	int  len;                      /* width in characters; 0 = variable */
+	char lit[USERDEF_LIT_MAX];     /* text when kind == UDF_LITERAL  */
+};
+
+struct userdef_form {
+	int npieces;                   /* 0 = no form declared           */
+	struct userdef_piece piece[USERDEF_FORM_MAX];
+};
+
 struct userdef_type {
 	char        name[128];   /* stanza header => USER_<name>            */
 	char        dispname[160]; /* "USER_<name>" precomputed for output   */
@@ -102,6 +149,7 @@ struct userdef_type {
 	int         diglen_hex;  /* hex-string digest length (2 * bytes)    */
 	int         uses_salt;   /* legacy: nonzero iff slot_mask != 0       */
 	int         slot_mask;   /* USERDEF_SLOT_* bits referenced by prog   */
+	struct userdef_form form;   /* stored-form layout; npieces 0 = none */
 };
 
 /*
@@ -146,6 +194,35 @@ unsigned userdef_base(void);
  * types (USER_<name>) in pipe mode, not just at load time.
  */
 struct userdef_type *userdef_get_by_index(int idx);
+
+/*
+ * Split a stored hash field according to a declared form.
+ *
+ * Returns 1 when the field matches the form and fills the requested pieces
+ * (any out parameter may be NULL). Returns 0 when it does not match, which is
+ * the normal answer for a line of some other type -- callers must treat a 0 as
+ * "not this type", never as an error.
+ *
+ * Pointers returned point INTO field; nothing is copied or allocated.
+ */
+int userdef_form_split(const struct userdef_form *f,
+                       const char *field, int fieldlen,
+                       const char **digest, int *digestlen,
+                       const char **salt,   int *saltlen,
+                       const char **user,   int *userlen);
+
+/*
+ * Assemble a stored field from its parts, the inverse of userdef_form_split().
+ *
+ * A declared form governs OUTPUT as well as input: a found line must come back
+ * in the shape it was read, or the emitting tool's output is not accepted by
+ * the consuming one. Returns the length written, or -1 if it does not fit.
+ */
+int userdef_form_build(const struct userdef_form *f,
+                       const char *digest, int digestlen,
+                       const char *salt,   int saltlen,
+                       const char *user,   int userlen,
+                       char *out, int outsz);
 
 /*
  * Milestone 2, sub-phase C2 (fatal-if-selected).  A stanza that fails to

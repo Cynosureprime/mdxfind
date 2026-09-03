@@ -145,7 +145,12 @@ static inline void template_finalize(thread template_state &st,
  * NOT use this (max_iter==1 only); pre-declared for Phase 2.
  *
  * algo_mode == 0 (JOB_MD5): lowercase hex.
- * algo_mode == 1 (JOB_MD5UC): uppercase hex (B7.7a 2026-05-07). */
+ * algo_mode == 1 (JOB_MD5UC): uppercase hex (B7.7a 2026-05-07).
+ *
+ * GPU_TEMPLATE_ITERATE_HAS_ALGO_MODE mirrors gpu_md5_core.cl line 200 and
+ * is set ONLY in this core; metal_template.metal #ifdefs on it at the call
+ * site so every other core keeps the legacy one-argument shape. */
+#define GPU_TEMPLATE_ITERATE_HAS_ALGO_MODE 1
 static inline void template_iterate(thread template_state &st, uint algo_mode)
 {
     uint M[16];

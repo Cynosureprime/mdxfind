@@ -65,6 +65,7 @@
 #include "md6.h"
 #include <sph_blake.h>
 #include "gosthash/gost2012/streebog.h"
+#include "gosthash/gosthash.h"
 #include "openssl/des.h"
 #include "openssl/aes.h"
 #include "openssl/rc4.h"
@@ -106,7 +107,7 @@
 #include "sqlite3.h"
 
 #include "mdxfind.h"
-#include "userdef.h"
+#include "userdef.h"  /* unknown-key forward-compat fix: userdef.c r1.11 */
 
 /*
  * TYPENAME(op): display name for a hash op.  Built-in ops index Types[]
@@ -193,7 +194,7 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 
 #ifdef GPU_ENABLED
 #if defined(__APPLE__) && defined(METAL_GPU)
-#include "gpu_metal.h"
+#include "gpu_metal.h"  /* Metal iter-axis dispatch budget: gpu_metal.m r1.133, gpu/metal_common.metal r1.34 */
 #elif defined(CUDA_GPU)
 #include "cuda_md5salt.h"
 #elif defined(OPENCL_GPU)
@@ -269,10 +270,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.545 2026/08/29 18:11:59 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.576 2026/09/02 22:11:25 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.545 2026/08/29 18:11:59 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.576 2026/09/02 22:11:25 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -290,6 +291,99 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.576  2026/09/02 22:11:25  dlr
+ * Pad the PROGRESSENCODE candidate by the right amount. The code zeroed len modulo 16 bytes after the candidate, which is the complement of what padding to a 16-byte boundary needs: for a three-byte candidate it cleared three bytes where thirteen were required, so myprogress consumed stale buffer content past the padding and the digest depended on what an earlier job had left there. Candidates whose length left no gap, such as eleven bytes, were unaffected, which is why only some failed and why the type looked intermittent. With the count corrected the type verifies 11 of 11, closing the last outstanding family.
+ *
+ * Revision 1.575  2026/09/02 22:04:22  dlr
+ * Terminate the PROGRESSENCODE value before reporting it. myprogress writes sixteen characters into linebuf and does not terminate them, so prfound emitted the value followed by whatever the buffer already held. Run on its own the buffer happened to be clean and the line looked right; in a full pass it carried a fixed thirty-six character tail left by an earlier job, and every line was unverifiable. The corpus generated before this fix has 53-character hash fields where it should have 16. Note the emitted value now round-trips, but three candidates whose first byte is high or NUL still disagree with hashpipe for a separate and so far unexplained reason.
+ *
+ * Revision 1.574  2026/09/02 21:00:59  dlr
+ * Keep the LM 14-byte limit out of the reported candidate. MD5-LMNTLM hashes lm(pass) alongside md4(utf16le(pass)); the LM half is limited to fourteen characters, but the limit was written back into job->clen and job->len, which are what the emitted line reports. The NTLM half above had already consumed the full candidate, so for any password longer than fourteen bytes the line showed a truncated password that does not produce the hash beside it: feeding that reported password back to mdxfind gives a different digest. The limit is now a local length used only for the LM step. 50 of 55 becomes 55 of 55, and the emitted line round-trips.
+ *
+ * Revision 1.573  2026/09/02 19:46:50  dlr
+ * Take the PBKDF2 salt length from the decoder rather than from mystrlen. All four PBKDF2 cases base64-decoded the salt and then measured it with mystrlen, which stops at the first NUL, so a salt whose decoded bytes contain one was hashed shorter than the salt printed on the emitted line: the line said twelve bytes and the digest was computed over eleven. b64_decode already returns the decoded length and another call site in the file already uses it that way. One of the ten salts in the regression def files decodes with a trailing NUL, which is why exactly eleven of the hundred and ten lines failed for each type. All four now verify 110 of 110. Note incount is the count of base64 characters consumed, not the output length; using it instead breaks every line, which is worth knowing before anyone reaches for it.
+ *
+ * Revision 1.572  2026/09/02 17:25:02  dlr
+ * Give PHPBB3MD5 a legal default salt. PHPass salts are exactly eight characters; the built-in default carried the ten-character string saltstring, so -z on the default path emitted a malformed line that nothing could verify. Every one of the eleven default-path lines failed while the def-file path was fine. The salt is now eight characters and all eleven verify.
+ *
+ * Revision 1.571  2026/09/02 17:07:15  dlr
+ * Two salted-type generation fixes. SHA1-MD5sub8-24SALT set the width of its iterated digest from the variable y, which that case never assigns, so it used whatever a previous job had left in the thread and the emitted depths depended on unrelated state; a sha1 digest is 40 hex characters, which is what the following line hashes, so the width is now written out. MD5DSALT reports its two salts concatenated, and the iterated emissions passed only the first salt length, so every line below the base depth dropped salt2: three distinct digests came out labelled with the same salt and none could be verified. The full NUL-terminated key is now reported, matching what the base depth already did and what the non-SSE branch of the same case does. Verified by regeneration: SHA1-MD5sub8-24SALT 55 of 275 becomes 275 of 275, and MD5DSALT 55 of 495 becomes 275, then 495 of 495 once hashpipe also searches the salt split.
+ *
+ * Revision 1.570  2026/09/02 16:21:55  dlr
+ * Use memcpy, not strncpy, to stage the candidate alongside a digest. Thirty-two sites built the input for a PASS-family type by copying the password after the hex of a preceding digest with strncpy, which stops at the first NUL in the source. A password containing a NUL was therefore truncated at that byte and the remainder never hashed, so mdxfind emitted a digest for a different input than the one it reported. The regression corpus exercises a three-byte password whose first byte is NUL, and every PASS-family line carrying it disagreed with hashpipe: 110 unresolved lines across eighteen types traced to this. strncpy only pads when the source is shorter than the count, and the count here is the true length, so for NUL-free passwords memcpy is byte-identical; verified by regenerating the NUL-free vectors and getting all fifteen back unchanged. The NUL password now verifies for HAV160-5MD5PASS, HAV192-3MD5PASS and HAV224-4MD5PASS where it previously failed every time.
+ *
+ * Revision 1.569  2026/09/02 15:59:11  dlr
+ * Fix two ARGON2 generation defects. The default salt was sixteen zero bytes, and the Magento forms print the salt with a percent-s, so the field rendered empty and -z produced lines carrying no salt at all: hash, empty field, parameters, password. The default is now printable ASCII. Separately the bare version-2 Magento shape carries no parameters and can only mean a 32-byte digest at t=2 and m=65536 KiB, but it was emitted unconditionally, so a hash computed with any other cost produced a line that could never verify. It is now emitted only when those fixed parameters actually hold. Both ARGON2 and ARGON2MD5 now generate output that hashpipe verifies completely, where the Magento forms previously failed every time.
+ *
+ * Revision 1.568  2026/09/02 15:39:45  dlr
+ * Fix the chain clobber in the MD4UTF16 x-family. MD4UTF16SHA1x, MD4UTF16MD5x and MD4UTF16SHA256x each keep their chain state in mdbuf and re-derive it once per outer round, but the inner iteration wrote the running digest straight back into that buffer and also reassigned len to 32. The next outer round therefore hashed the previous round inner result at the wrong width instead of its own chain value, so only the first round matched anything. The inner loop now runs over a private cursor into linebuf and leaves mdbuf and len untouched. Verified by regenerating: every emitted digest is explained by the clean chain, 25 of 25, and hashpipe verifies 275 of 275 for both MD4UTF16MD5x and MD4UTF16SHA1x where it previously managed 55.
+ *
+ * Revision 1.567  2026/09/02 12:57:34  dlr
+ * Fix two more buffer-reuse defects in the CAP family. SHA1SHA1CAPSALT iterated through newbuf, the same buffer holding the capped hex and the salt that the next cap position needs, and prmd5 NUL-terminates at out[40], which landed on the salt first byte. From the second cap position both the capping and the hashing therefore ran over corrupted data. It now iterates through mdbuf, which is unused in that case. The SHA1MD5x1CAP family, reached by fallthrough from SHA1MD51CAPMD5 and SHA1MD51CAPMD5MD5, built its six letter-class variants by capitalising mdbuf in place and never restoring it, and the next round md5 reads that same buffer, so the chain was not md5 applied i times to the password and every round after the first diverged. The variants are now built in linebuf and mdbuf is left holding the clean hex. Also removed a stray restore that ran after the position loop with the index at 32, one past the hex. Verified by regenerating each type and confirming every emitted digest is explained by the clean model: 325 of 325 for the x1CAP chain, and hashpipe now verifies 100 percent of regenerated output for all of e632, e666, e669, e733, e749 and e758.
+ *
+ * Revision 1.566  2026/09/02 12:40:46  dlr
+ * Fix salt-list contamination in SHA1SHA256TRUNCSALT and SHA1SHA256TRUNCMD5SALT. The 64-character hex was written into linebuf once, above the salt loop, but the truncation loop copies the salt into that same buffer at descending offsets 63 through 21 and never restores it. The first salt was unaffected, because each read covers only offsets below the current N and every write so far sat at or above it, but the buffer it left behind was wrecked from offset 21 up. Every later salt then truncated its predecessor salt bytes in place of the hex, so the emitted digest for the left-truncated shape depended on the whole salt list, its content and which salt sorted first. Same password, same salt and same N gave a different hash when a longer salt appeared elsewhere in the run. Restoring the hex from linebuf2, which holds the same value and is only ever written from offset 64, costs one 64-byte copy per salt. The right-truncated shape was always correct and is unchanged. Verified: identical output across three different salt-list contexts; e678 regenerates its published vectors byte for byte; e679 changes exactly the 9230 contaminated lines of 23650 and hashpipe now verifies all 23650.
+ *
+ * Revision 1.565  2026/09/01 20:43:05  dlr
+ * Generate and solve the $2k$ form of BCRYPT256. Real samples exist at last - 5179 of them in contest/history/2024 - and KoreLogic own write-up names the algorithm: "$2k$: Hashes generated using Python passlib.hash.bcrypt_sha256". The stored form is 59 characters, being the 7-character prefix, 21 of the 22 salt characters and a 31-character checksum; the 22nd salt character holds only 2 significant bits and is recovered by trying the four canonical values ".euO", which this code already enumerated. Three changes. First, crypt_rn returns the ordinary 60-character $2b$ form, and that was used both for the JudyJ lookup and for the emitted hash. The loader files the $2k$ line, so the lookup could never hit and a real $2k$ hash was unsolvable, while -z output did not round-trip. The $2k$ form is now rebuilt after crypt_rn - prefix k, 21 salt characters, then the checksum - and used for both. It is built at linebuf2 + MAXLINE*2, which is free: linebuf2 is MAXLINE*3 and only [0,60) and [MAXLINE,MAXLINE+30) are in use. Second, -z stopped after the first candidate, so it emitted the ".": variant for every salt and could not reproduce a stored hash whose character was one of the other three. Under Printall it now emits all four, as other multi-emit families do. Third, a $2k$ default salt is seeded alongside the $2a$ one for JOB_BCRYPT256, so bare -z exercises the construction at all; with only a $2a$ default it could reach the bcrypt(sha256(pass)) path and nothing else. Also corrected while there: the break after a successful crack abandoned any OTHER stored hash sharing the same 21-character prefix with a different 22nd character. It is now gated on the salt refcount, which PV_DEC has just decremented, so it still breaks immediately in the normal one-hash-per-salt case and costs nothing. Real 126-bit salts never collide, but -z has a single default salt and produced exactly that case. Result: bare -z now emits FIVE hashes per password as Dave specified - one $2a$ bcrypt(sha256(pass)) and four $2k$ - and all five crack back through -M and -F. Validated against vectors generated INDEPENDENTLY with the python bcrypt and hmac modules rather than by either tool: 4 of 4 solve, a cost-12 vector matching the contest cost solves, and mdxfind own -z output for a loaded $2k$ salt is byte-identical to the python round-trip, which is the first confirmation the algorithm itself is right. hashpipe verifies all five generated hashes both under -m e577 and under bare auto-detect. No collateral: BCRYPT, BCRYPTMD5, BCRYPTSHA1, BCRYPTSHA512, BCRYPTHMACSHA256 and WPBCRYPT all still generate under -z and all still crack back; 0 false positives on the five generated hashes fed a wrong password, in both tools; hashpipe self-test 1026 passed 0 failed.
+ *
+ * Revision 1.564  2026/09/01 14:08:46  dlr
+ * Fix SHA1WRLUCTRUNCSALT (e672) to uppercase the whirlpool hex digest. It shared the lowercase sha1_truncsalt path with e683/e739, so despite its UC name and hx.8 definition it emitted lowercase. Verified 108/108 against sha1(cut(upper(wrl(pass)),0,N).salt). Also carries the GOSTHEXSALT rhash-to-gosthash correction.
+ *
+ * Revision 1.563  2026/09/01 04:12:55  dlr
+ * Fix heap corruption when ARGON2MD5 is selected on its own. Reported by Dave as yarn internal pthread error 22 while aborting on -h argon2md5 -f /dev/null -z, reproducing 15 to 19 times in 20 across every invocation shape and at every thread count including -t 1. The yarn message was a symptom, not the fault. A crash report caught the other face of it: abort inside malloc_report, called from yarn ignition, which is heap corruption detected on a later allocation. Cause: Argon2_maxmem is the size the argon2 workspace is allocated from. It is computed in the loader from the loaded hashes, and for -z there is a floor of 64 MB in the bootstrap. That floor sits INSIDE the ARGON2 arm and is gated on ARGON2 itself being selected, so choosing ARGON2MD5 alone left Argon2_maxmem at zero, argon2_ws was malloc_lock of 0 plus 16 bytes, and argon2 then wrote its full 64 MB m_cost into a 16-byte allocation. Selecting both types together masks it, which is what made it look intermittent and is also why it was missed when the type was added. The bug is mine, from the ARGON2MD5 addition in 1.556. Two changes. First the cause: the bootstrap now sets the same floor when ARGON2MD5 is selected, whether or not ARGON2 is. Second the class: argon2_prealloc_cb now records the bytes actually allocated and REFUSES a request larger than the workspace instead of handing back a buffer that cannot hold it. That converts any future recurrence from silent corruption surfacing far away into a clean argon2_ctx failure and a skipped candidate. The callback previously checked only for a NULL workspace and never for size. Verified: the reported command now completes 20 times out of 20 and its output cracks back, with hashpipe independently verifying the generated hash as ARGON2MD5; e987 ARGON2 is unaffected at 0 failures in 10 and still round-trips; the registered ARGON2 and ARGON2MD5 vectors still crack through the ordinary loader path where Argon2_maxmem comes from the hashes; 22 assorted types complete -z without error; all six bcrypt types still emit exactly one validating line; and the MSSQL shared-salt and iSCSI long-password fixes both still hold.
+ *
+ * Revision 1.562  2026/09/01 03:43:31  dlr
+ * BCRYPT256 -z emitted two hashes and the first was wrong. The type has two code paths: a loop over the salt table that handles the dollar 2k form, and a fall-through to BC_Start that computes the ordinary form, bcrypt of the lowercase hex of sha256 of the password, which is what hx.8 documents and what hashcat 30600 does. A note directly under the loop asserts that everything in it fires only for a dollar 2k salt. That was not true: the loop had an else arm which, for any OTHER salt form, computed e989 BCRYPTHMACSHA256 construction and emitted it under the BCRYPT256 label. So a dollar 2a salt produced the HMAC shape AND then the correct shape, two lines, and only the second verified. The loop now skips any salt that is not dollar 2k, which makes the note true rather than merely intended. Also fixed, found while testing the above: the dollar 2k arm built its salt with strncpy of exactly 28 bytes, which does not NUL-pad at that length, then wrote the extra salt character at index 28 and never terminated the string. The HMAC key below it is passed with an explicit length of 22 and was unaffected, but crypt_rn takes the salt as a C string and was reading past the end. And BC_Start now skips dollar 2k salts, because crypt_rn does not know that prefix and returns its error marker star zero, which was being emitted as though it were a hash. NOT done, deliberately: -z does not generate the dollar 2k variant. It can be generated, but the result is unverifiable in both directions, and this is pre-existing rather than anything introduced here. Generation produces the internal dollar 2b rewrite, 7 char prefix plus a 22 char salt plus the hash, 60 characters. A stored dollar 2k line is 59, a 7 char prefix plus a 21 char salt plus the hash, because the extra salt character the loop appends is not part of the stored form. The loop compares its 60 character crypt output against the stored 59 character lines, so they can never be equal: a correctly reconstructed dollar 2k line loads and then fails to crack under its own password, which was measured. Making the two sides agree without a real vector would only make them consistently wrong while LOOKING validated, which is the trap that let SAP-BCODE report Pass for months on self-generated vectors. Dave has no legitimate dollar 2k sample and agrees to leave it ungenerated until one turns up. Verified: all six bcrypt types now emit exactly one -z line each and every one validates in BOTH mdxfind and hashpipe; the registered e450, e577 and e989 vectors still crack; 11 of 11 sampled non-bcrypt types still produce -z output; the MSSQL shared-salt and iSCSI long-password fixes from 1.560 both still hold; hashpipe self-test 1026 passed 0 failed.
+ *
+ * Revision 1.561  2026/09/01 02:07:25  dlr
+ * Fix -z producing no output at all for the entire bcrypt family. Two independent bugs stacked in the same bootstrap, and the type was not disabled, so the run printed Working on hash types BCRYPT and then emitted nothing - an honest-looking empty result rather than an error. First bug: the Printall branch seeded the default salt with TYPESALT(job->op). That code is in main(), not procjob, where job is the last struct off the free-list build loop and job->op is still 0 from its initialiser, so the salt went into type 0 and BCRYPT own salt table stayed empty. procjob then walks TYPESALT(job->op) with op equal to JOB_BCRYPT, found an empty Judy, and returned without computing anything. Second bug: even with that corrected, only JOB_BCRYPT was seeded, but the compound variants each walk their OWN TYPESALT(job->op), so e451 BCRYPTMD5 and e452 BCRYPTSHA1 still had nothing to iterate. The bootstrap now mirrors what the loader already does for real input and seeds Typesalt for every SELECTED bcrypt variant, gated on Dohash, across JOB_BCRYPT, BCRYPT256, BCRYPTMD5, BCRYPTSHA1 and BCRYPTSHA512. Both Printall sites carried both bugs and both are fixed. This is pre-existing and not a regression from 1.560: a 1.553 binary on gp2 is equally empty, so it has been broken for some time and was found only because a post-deploy smoke test across twelve assorted types came back 11 of 12. All six bcrypt types now generate under -z and every one CRACKS BACK through -M and -F, which is the check that matters since a wrong generator would still print something; hashpipe independently verifies five of the six generated hashes, BCRYPT256 being the exception and noted separately rather than fixed here. No collateral: a real registered bcrypt vector still cracks normally, 11 of 11 sampled non-bcrypt types still produce -z output, and the MSSQL shared-salt and iSCSI long-password fixes from 1.560 both still hold. hashpipe self-test 1026 passed 0 failed.
+ *
+ * Revision 1.560  2026/09/01 01:15:40  dlr
+ * Two bug fixes, authored and validated by Dave in a separate session. iSCSI CHAP: the length guard admitted a password of up to MAXLINE, but the case builds id_byte then password then challenge into mdbuf, which is only MAXLINE+16, so a maximum-length password overran it before the challenge was even appended. The guard now reserves 1024 bytes, enough for the id byte and the 255-byte challenge that the chall_hexlen cap of 510 allows. MSSQL salt accounting: the loader inserted the 8-hex salt into JudyJ without ever incrementing its counter, and the bootstrap then hardcoded the Typesalt refcount to 1 regardless of how many hashes actually shared that salt. Because that refcount is what PV_DEC decrements in the per-job salt snapshot, the salt was retired after the FIRST hash matched and every other hash carrying it was silently never tried. The loader now increments on insert and the bootstrap propagates the real count. The failure mode is worth recording: it yields cracks for some hashes and silence for the rest sharing a salt, so a run looks partially successful rather than broken. Audited as a class before check-in. Twelve other bootstraps use the same hardcoded refcount idiom - AIXMD5, SM3CRYPT, SUNMD5, GOST12256CRYPT, GOST94CRYPT, GOST12512CRYPT, PHPBB3MD5, APR1, JUNIPERIVE, SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5 - but every one of them keys Typesalt on the WHOLE stored line, so each entry maps to exactly one hash and a count of 1 is correct by construction. MSSQL was the only type keying on a bare shared salt, so no companion fixes are needed. hashpipe needs no mirror of either fix: its verify_iscsi_chap already builds into the WS workspace with an explicit bound rather than a fixed buffer, and it verifies one pair per line so it has no salt snapshot to count.
+ *
+ * Revision 1.559  2026/08/31 16:44:31  dlr
+ * Add e1027 SUNMD5, the Solaris crypt, completing the crypt(3) group sourced from John the Ripper. The initial digest is md5 of pass then salt; thereafter 4096 plus the rounds= value are run, each computing md5 of the previous digest, optionally a fixed 1517-byte phrase, and the decimal round number in ASCII. Whether the phrase is included is decided per round by a coin flip derived from bits of the previous digest: two seven-bit indices are assembled from digest bytes and the XOR of the bits they address gives the flip, so roughly half the rounds hash an extra 1517 bytes and the cost is data dependent rather than fixed by rounds= alone. The phrase is 1516 characters of Hamlet PLUS its terminating NUL, because Sun passed sizeof() - dropping the NUL yields a plausible but wrong digest for every candidate. The salt is everything before the LAST dollar sign, which also covers the variant whose salt itself ends in a dollar sign, with no special case. Digest is emitted with the md5crypt transposition, 22 characters. All 8 of John vectors verify in hashpipe and crack in mdxfind, including its 120-character password and the two vectors that share a salt, and mdxfind -z output cracks back in both tools. Two mdxfind-side traps worth recording: Typesalt for these structured types holds the WHOLE stored line, not the salt, so the salt must be re-derived inside the compute case; and the bootstrap FREES JudyJ after copying it into Typesalt, so a JSLG lookup there can never hit - compare the computed encoding against the stored line, as GOST12512CRYPT does. Both mistakes presented identically as a clean 0 of 8 with the hashes correctly loaded. New hx.8 row plus Note [46]; notes contiguous 1 through 46. Types[] APPENDED and verified identical between mdxfind.c and hashpipe.c. Self-test 1026 passed 0 failed; genbad 103 of 103; John corpus sweep shows the new types matching only their own vectors; bench rate measured on dev1.
+ *
+ * Revision 1.558  2026/08/31 16:28:30  dlr
+ * Add e1025 GOST12256CRYPT and e1026 GOST94CRYPT, completing the GOST crypt family alongside e994 GOST12512CRYPT. Both are the Drepper schedule that SHA256CRYPT and SHA512CRYPT use, with the SHA replaced by a GOST digest, defaulting to 5000 rounds and honouring an explicit rounds= field. e1025 substitutes Streebog-256 and e1026 substitutes GOST R 34.11-94; both yield a 32-byte digest and so use the sha256crypt transposition with a 43-character stored hash, where e994 uses the sha512crypt transposition with 86. In mdxfind both reuse the existing shared crypt_round path, setting only the four function pointers, cryptlen 32 and the prefix length, so no new schedule code was written; the cryptlen 32 encode branch already existed for SHA256CRYPT and SM3CRYPT. e1026 uses the TEST parameter S-box, not CryptoPro, matching e13 GOST rather than e14 GOST-CRYPTO: John gost94hash carries a john_gost_cryptopro_init override but leaves it commented out, and the bundled gosthash is the test-parameter build. Streebog output is byte-reversed by the bundled Saarinen implementation, so e1025 reverses each digest exactly as e994 does. All 3 of John vectors for each type verify in hashpipe and crack through mdxfind -M and -F, and the cracked set is exactly the input set with nothing spurious. Also recorded: John streebog512crypt needed NO new type - it was already covered by e994 unchanged, and only appeared missing because the earlier sweep ran with -L too low and the cost guard silently declined the verify. New hx.8 rows plus Note [45]; notes contiguous 1 through 45. Types[] APPENDED and verified identical between mdxfind.c and hashpipe.c. Self-test 1025 passed 0 failed; genbad 103 of 103; bench rates measured on dev1.
+ *
+ * Revision 1.557  2026/08/31 16:13:21  dlr
+ * Add e1021 through e1024, the four DragonFly BSD crypt variants, sourced from John the Ripper. Each is a SINGLE sha256 or sha512 of pass, magic, salt with no round loop, which makes them among the cheapest salted types in the catalogue. The magic is the format tag INCLUDING its NUL terminator; on 64-bit builds its length was taken as 8 rather than 4, so four adjacent rodata bytes ride along after the NUL (sha5 for the 3 tag, /etc for the 4 tag). That is the bug the variant names refer to, and both variants are in the wild. Because the NUL is interior to the hashed string, neither can be expressed as an ordinary salted type with a textual salt. Output uses the sha256crypt and sha512crypt transposition, but the 4 tag encodes only 62 of the 64 digest bytes, so bytes 62 and 63 never appear in the stored form and we encode forward and compare strings rather than decoding. The stored forms of the 32- and 64-bit variants are IDENTICAL, so a line is loaded into both types of its pair and only the correct one verifies. All 24 of John the Ripper vectors were reproduced by an INDEPENDENT Python implementation before this code was written, so the check is not circular; mdxfind -z regenerates John published strings byte for byte, and all 24 crack through -M and -F with no cross-matching and no false positives. Types were APPENDED to the end of Types[] because the index is the type identity. The hx.8 rows spell the NUL as fromhex 00 rather than a troff escape: hx8_to_c copies the expression column verbatim, so a troff escape bakes the literal characters into the generated catalog and silently disables the dedup gate. Self-test 1023 passed 0 failed; genbad 103 of 103; bench rates measured on dev1.
+ *
+ * Revision 1.556  2026/08/31 15:47:21  dlr
+ * Add e1020 ARGON2MD5, Argon2 over the MD5 hex of the password, which is vBulletin 6's scheme and the successor to e451 BCRYPTMD5 for vBulletin 5. hashpipe splits the existing Argon2 body into argon2_core and wraps it twice, so the two types share one parser and differ only in what is fed as the password. mdxfind shares the procjob case on job->op for the same reason. The stored form carries no marker saying whether the password was pre-hashed, so whichever type is selected gets its own JudyJ entry AND its own Typesalt entry; keying the salt only under ARGON2, as the first cut did, left a selected ARGON2MD5 with an empty snapshot computing nothing while still reporting hashes read. Verified both ways: the vBulletin vector is claimed by ARGON2MD5 and refused by ARGON2, and John's nine plain Argon2 vectors still verify under ARGON2 and are refused by ARGON2MD5. Benchmarked on dev1; every registered type still has a rate. Self-test 1019 passed 0 failed.
+ *
+ * Revision 1.555  2026/08/31 15:24:20  dlr
+ * Add e1018 MONGODB and e1019 H3C, sourced from John the Ripper and verified against its own test vectors. Both constructions were reproduced by an INDEPENDENT implementation before this code was written, so neither check is circular. MONGODB is md5 of user, colon mongo colon, and password, loaded and reported in the stored dollar mongodb dollar 0 form; John's type 1 is a sniffed challenge and response and is deliberately not loaded. H3C is sha512 of the password including its terminating NUL, the salt, then the password and NUL again, reported base64 in the dollar h dollar 6 form. Structured loaders, compute cases and -z bootstraps mirror JOB_SAPCODVNH512, and -z regenerates stored forms that crack back. Both types were APPENDED to the end of Types[]; the index is the type identity and inserting anywhere else renumbers everything above it. John's vectors: MongoDB type 0 one of one, h3c three of three.
+ *
+ * Revision 1.554  2026/08/31 13:25:17  dlr
+ * Add e1016 SAPCODVNH256 and e1017 SAPCODVNH384, sourced from John the Ripper and verified against all four of its own saph SHA-256 and SHA-384 test vectors. The construction was first reproduced by an INDEPENDENT implementation, so the check is not circular: a vector generated by the code under test would have proved nothing. Stored form is the algorithm tag and iteration count in braces followed by base64 of digest concatenated with salt; round zero is H of pass and salt, the remaining rounds are H of pass and the running digest, and the password is truncated at 40 bytes as SAP does. Structured loader, compute case and -z bootstrap all mirror JOB_SAPCODVNH512, and -z regenerates a stored form that cracks back. SHA-384 uses the sph_sha384 idiom already used by SHA384PASSSALT, since there is no mysha384. Both types were appended to the END of Types[]: an earlier attempt inserted them beside their SHA-512 sibling, which renumbered every type above index 984 and handed the new types e985 and e986 along with hashcat modes 35100 and 35200 that belong to SM3CRYPT and AS400SSHA1. Adding a type is append-only for exactly this reason.
+ *
+ * Revision 1.553  2026/08/31 02:55:02  dlr
+ * Force a revision for a shared-source behaviour change so -V reflects it; mdxfind.c itself carries only the note on the userdef.h include. userdef.c 1.11 stops counting an unknown key in userdef.txt as an error. It was feeding userdef_errors, which gates the refusal to run, so an older binary meeting a newer key printed unknown key ignored (forward-compat) and then refused to run and exited 1, processing nothing at all. mdxfind 1.549 was confirmed to do exactly this against a userdef.txt carrying the new form key whenever MDXFIND_CACHE was set.
+ *
+ * Revision 1.552  2026/08/31 02:07:40  dlr
+ * User-defined types now load through the structured -M and -F channel instead of the plain-hex fast path, and honour a declared stored form on input and on output. Their stored field may carry a salt, a user, literals or separators, none of which the hex loader can see; it would take the whole field as the digest, which is why a salted user type could not read its own hashes. The format parser offers each SELECTED user type the line in turn and the first whose layout matches claims it. A type that was not selected never sees the line, so an unselected type cannot quietly absorb input meant for something else. Layout comes from the form declaration when the type has one; without one the default shapes apply, chosen by which slots the expression references: digest alone, digest colon salt, digest colon user, or digest colon salt colon user. On output a declared form OVERRIDES the default reporting shape. The defaults through checkhashsalt and checkhash are right when the stored field is only the digest, but a form means the field carries the salt as well, and reporting hash colon salt colon plain there would both duplicate the salt and emit a line this loader would not read back. Verified end to end on KoreLogic bwtdt: the stored form is read, cracked, and reported in the same shape, and that output feeds straight into hashpipe. ORACLE11 and the built-in hex and structured paths are unchanged. Known gap, pre-existing and not introduced here: -z cannot generate for a SALTED user type, because init_default_salts walks only the static default_salts table of built-in jobs and user ops are not in it. An unsalted user type generates correctly.
+ *
+ * Revision 1.551  2026/08/31 01:05:53  dlr
+ * Add e1015 ORACLE11, sourced from John the Ripper and verified against all 5 unique oracle11 test vectors that John itself computed. Oracle 11g stores a 40-hex SHA1 digest immediately followed by a 20-hex salt in ONE 60-character field. The digest is upper(sha1(pass . fromhex(salt))), the same value e834 SHA1PASSHEXSALT computes, but e834 takes digest and salt as separate fields. This type owns Oracle's stored form on input and reproduces it on output, so a found line can be handed straight back to Oracle. The dedup gate confirms the two are distinct expressions, and that the bare form still resolves to e834. 60 hex is unique in the catalogue, no other type has a 30-byte digest, so the width identifies the format with no wrapper and the loader needs no prefix. A dedicated parser in load_hash_file normalises to uppercase, keys JudyJ on the full 60-character stored form as PKCS5S2 does, and stores the trailing 20 hex as the salt; procjob reports through prfound rather than checkhashsalt because the stored form is one field and not hash colon salt. Recovers a real harvest class: 3622 lines of a 1003754 line intake were correct Oracle 11g cracks that no type could read.
+ *
+ * Revision 1.550  2026/08/31 00:48:12  dlr
+ * Force a revision for a GPU-side behaviour change so -V reflects it; mdxfind.c itself carries only the note on the gpu_metal.h include. gpu_metal.m 1.133 divides the per-command-buffer dispatch budget by the iteration axis. The two existing scale-downs considered only the salt axis, so -i N multiplied the budget uncompensated and tripped Apple's roughly 2 second command-buffer watchdog on M1 at large rule counts; M2 Max fires at about 4 times the budget, proportional to device speed. The failure was already fatal and loud, what was silent was a harness that recorded the crack tally without checking the exit status. The reported 24 of 50 was not a defect: that fixture contains only 15 of the 50 targets verbatim and dive.rule reaches 9 more, and -i 1 reproduces the same line. gpu/metal_common.metal 1.34 replaces threadgroup_barrier with a device memory fence in all eight emit macros, a mistranslation of the OpenCL mem_fence that was undefined behaviour inside a conditional in the probe loop; it changed no observed behaviour and is not credited with the fix. Validated 7 of 7 at 50 of 50 on M1 and 3 of 3 on M2 Max with no measurable performance cost.
+ *
+ * Revision 1.549  2026/08/30 13:58:48  dlr
+ * Restore the pre-1.290 semantics of the RAW hash family: MD5RAW, SHA1RAW, SHA224RAW, SHA256RAW, SHA384RAW, SHA512RAW, and MD5RAWMD5RAW which falls through into MD5RAW. Revision 1.290 on 2026-04-09 replaced a goto handoff into the plain handler with a self-contained loop, as collateral to a genuine buffer-aliasing fix. That silently changed two things: the base was reported one round early, so x01 became X(pass) instead of X(X_bin(pass)), and iteration re-fed the RAW digest instead of the hex. The effect was that every RAW type became numerically identical to its plain sibling at x01, so MD5RAW duplicated MD5 and SHA1RAW duplicated SHA1, losing SHA1RAWs identity as MySQL 4.1 which the 1.290 log itself noted as SHA1RAW equals SQL5. The correct rule is one binary feed at the base then standard hex iteration. Recovered by brute-forcing raw and hex chaining paths against real crack files on gp, and confirmed three ways: 32_hex.MD5RAWx01 through x03 now carry their recorded labels, MD5RAWMD5RAWx01 likewise, and a SHA512RAWx01 entry whose stored 8-character hash matches only as the tail of the corrected digest and not the regressed one. The buffer-aliasing fix from 1.290 is retained by hashing into newbuf and back. No crack file has been written for this family since 2026-01-06, three months before the regression, so no filed result carries the wrong semantics.
+ *
+ * Revision 1.548  2026/08/30 06:08:19  dlr
+ * Add 3 hash types sourced from John the Ripper, all verified against Johns own test vectors: e1012 RVARY, e1013 SHA512RAWPASSSALT, e1014 EPISERVER-SID. RVARY is IBM DES-ECB of the EBCDIC password keyed by the RACF key schedule from that same password; it differs from e881 RACF only in that the plaintext is the password rather than the username and is NOT uppercased. Johns rvary has no toupper and both of its vectors use uppercase passwords, so the vectors cannot distinguish the two forms; this follows the source. Note that racf_encrypt() uppercases its user operand, so upper(racf_encrypt(pass,pass)) agrees with the vectors but diverges for lowercase passwords. e1013 is sha512_bin(pass . salt) iterated on the RAW 64-byte digest, the same convention as e447; BlackBerry Enterprise Server 10 is this type at -i 100, so the generic construction covers the named vendor algorithm through iteration alone. e1014 reproduces two off-by-ones in EPiServer tblSID: the salt decodes to 30 bytes but only 29 are hashed, and the password is hashed with its trailing NUL. It is NOT e859 EPISERVER, which is a different EPiServer storage format.
+ *
+ * Revision 1.547  2026/08/30 05:36:11  dlr
+ * Wire -i iteration into the three user-bearing types added in 1.546: e1005 SHA1UCUSERPASS, e1006 SHA1USERCOLONPASS, e1011 MD5USERMD5PASSSALT. They previously reported through checkhashkey, or checkhashsalt2 with x=0, and so emitted a bare label that could never match beyond the first round. e1005 and e1006 now report through checkhashsalt with a real x, and e1011 passes x rather than 0; all three loop to Maxiter, re-hashing the lowercase hex of the previous digest, which is the same convention as MD5SALTPASS and SHA256SALTPASS. Output at -i 1 is byte-identical to 1.546 apart from the new xNN suffix, so this is purely additive. Motivated by measurement of the gp crack corpus, where 3159 of 7467 crack files are at x02 or deeper, reaching x1000000, and SHA1UC specifically appears 26 times at x02 or deeper. e540 MANGOS is deliberately NOT changed: it has historical cracks filed under its bare label and 508 corpus files use bare labels, so adding a suffix there would orphan them.
+ *
+ * Revision 1.546  2026/08/30 04:42:00  dlr
+ * Add 9 hash types sourced from John the Ripper, all verified against Johns own published test vectors: e1003 MD4SALTPASS md4(salt.pass), e1004 MD4PASSSALT md4(pass.salt), e1005 SHA1UCUSERPASS sha1(upper(user).colon.pass), e1006 SHA1USERCOLONPASS sha1(user.colon.pass), e1007 MD5PASSSALTMD5PASSSALT, e1008 QAS-VASAUTH sha256(hash.salt.dash.pass), e1009 POSTOFFICE, e1010 IPB2 hex-decoded salt, e1011 MD5USERMD5PASSSALT salt and user combined in one field so input round-trips with -z output. John dynamic_35 and dynamic_36 differ only by the Setup flag MGF_USERNAME_UPCASE, not by their function lists which are identical; Johns dynamic_35 vectors all use uppercase usernames and cannot distinguish them. Two candidates were NOT added because they already exist: dynamic_1588 is e911 COLDFUSION10, dynamic_1560 is e991 MD5SALT1SALT2.
+ *
  * Revision 1.545  2026/08/29 18:11:59  dlr
  * -X $HEX[..] used the wrong key, silently.
  *
@@ -2570,6 +2664,33 @@ static void streebog512_final_wrap(void *ctx, void *dest) {
     unsigned char *d = (unsigned char *)dest;
     for (int i = 0; i < 64; i++) d[i] = tmp[63 - i];
 }
+
+/* Streebog-256 wrappers (GOST12256CRYPT) -- same byte-order reversal */
+static void streebog256_init_wrap(void *ctx) {
+    streebog_init((streebog_t *)ctx, 32);
+}
+static void streebog256_update_wrap(void *ctx, const void *data, size_t len) {
+    streebog_update((streebog_t *)ctx, data, len);
+}
+static void streebog256_final_wrap(void *ctx, void *dest) {
+    unsigned char tmp[32];
+    streebog_final(tmp, (streebog_t *)ctx);
+    unsigned char *d = (unsigned char *)dest;
+    for (int i = 0; i < 32; i++) d[i] = tmp[31 - i];
+}
+
+/* GOST R 34.11-94 wrappers (GOST94CRYPT). The bundled gosthash uses the TEST
+ * parameter S-box, which is what John gost94crypt uses -- its
+ * john_gost_cryptopro_init override is commented out. */
+static void gost94_init_wrap(void *ctx) {
+    gosthash_reset((GostHashCtx *)ctx);
+}
+static void gost94_update_wrap(void *ctx, const void *data, size_t len) {
+    gosthash_update((GostHashCtx *)ctx, (const unsigned char *)data, len);
+}
+static void gost94_final_wrap(void *ctx, void *dest) {
+    gosthash_final((GostHashCtx *)ctx, (unsigned char *)dest);
+}
 /* Streebog-256 with STANDARD byte order.
  *
  * The bundled Saarinen streebog.c emits the digest byte-reversed relative to
@@ -2626,6 +2747,86 @@ static void gost2012_64_std(char *data, int len, unsigned char *dest) {
     unsigned char tmp[64];
     gost2012_64(data, len, tmp);
     for (int i = 0; i < 64; i++) dest[i] = tmp[63 - i];
+}
+
+/* All-in-one Streebog-256 with standard byte order (GOST12256CRYPT) */
+static void gost2012_32_std(char *data, int len, unsigned char *dest) {
+    unsigned char tmp[32];
+    gost2012_32(data, len, tmp);
+    for (int i = 0; i < 32; i++) dest[i] = tmp[31 - i];
+}
+
+/* ---- SunMD5 (Solaris crypt) constant + bit helpers ----------------------
+ * The phrase is 1516 characters of Hamlet PLUS its terminating NUL: Sun's
+ * code passed sizeof(), so 1517 bytes are hashed. Copied verbatim from John
+ * the Ripper's sunmd5_fmt_plug.c. Each round hashes it only when the
+ * data-dependent coin flip comes up, so cost varies with the candidate.
+ */
+static const char sunmd5_phrase[] =
+    "To be, or not to be,--that is the question:--\n"
+    "Whether 'tis nobler in the mind to suffer\n"
+    "The slings and arrows of outrageous fortune\n"
+    "Or to take arms against a sea of troubles,\n"
+    "And by opposing end them?--To die,--to sleep,--\n"
+    "No more; and by a sleep to say we end\n"
+    "The heartache, and the thousand natural shocks\n"
+    "That flesh is heir to,--'tis a consummation\n"
+    "Devoutly to be wish'd. To die,--to sleep;--\n"
+    "To sleep! perchance to dream:--ay, there's the rub;\n"
+    "For in that sleep of death what dreams may come,\n"
+    "When we have shuffled off this mortal coil,\n"
+    "Must give us pause: there's the respect\n"
+    "That makes calamity of so long life;\n"
+    "For who would bear the whips and scorns of time,\n"
+    "The oppressor's wrong, the proud man's contumely,\n"
+    "The pangs of despis'd love, the law's delay,\n"
+    "The insolence of office, and the spurns\n"
+    "That patient merit of the unworthy takes,\n"
+    "When he himself might his quietus make\n"
+    "With a bare bodkin? who would these fardels bear,\n"
+    "To grunt and sweat under a weary life,\n"
+    "But that the dread of something after death,--\n"
+    "The undiscover'd country, from whose bourn\n"
+    "No traveller returns,--puzzles the will,\n"
+    "And makes us rather bear those ills we have\n"
+    "Than fly to others that we know not of?\n"
+    "Thus conscience does make cowards of us all;\n"
+    "And thus the native hue of resolution\n"
+    "Is sicklied o'er with the pale cast of thought;\n"
+    "And enterprises of great pith and moment,\n"
+    "With this regard, their currents turn awry,\n"
+    "And lose the name of action.--Soft you now!\n"
+    "The fair Ophelia!--Nymph, in thy orisons\n"
+    "Be all my sins remember'd.\n";
+#define SUNMD5_BIT(d,b) ((((d)[(((b)>>3)&0xF)]>>((b)&7)))&1)
+
+static int sunmd5_coin(const unsigned char *d, int i, int j, int shift)
+{
+    return SUNMD5_BIT(d, d[(d[i] >> (d[j] % 5)) & 0x0F] >>
+                         ((d[j] >> (d[i] & 0x07)) & 0x01)) << shift;
+}
+
+/* One SunMD5 round: returns the coin flip for the current digest+round. */
+static int sunmd5_flip(const unsigned char *dig, int round)
+{
+    int ia, ib;
+    ia = SUNMD5_BIT(dig, round) ?
+         sunmd5_coin(dig,1,4,0)|sunmd5_coin(dig,2,5,1)|sunmd5_coin(dig,3,6,2)|
+         sunmd5_coin(dig,4,7,3)|sunmd5_coin(dig,5,8,4)|sunmd5_coin(dig,6,9,5)|
+         sunmd5_coin(dig,7,10,6)
+         :
+         sunmd5_coin(dig,0,3,0)|sunmd5_coin(dig,1,4,1)|sunmd5_coin(dig,2,5,2)|
+         sunmd5_coin(dig,3,6,3)|sunmd5_coin(dig,4,7,4)|sunmd5_coin(dig,5,8,5)|
+         sunmd5_coin(dig,6,9,6);
+    ib = SUNMD5_BIT(dig, round + 64) ?
+         sunmd5_coin(dig,9,12,0)|sunmd5_coin(dig,10,13,1)|sunmd5_coin(dig,11,14,2)|
+         sunmd5_coin(dig,12,15,3)|sunmd5_coin(dig,13,0,4)|sunmd5_coin(dig,14,1,5)|
+         sunmd5_coin(dig,15,2,6)
+         :
+         sunmd5_coin(dig,8,11,0)|sunmd5_coin(dig,9,12,1)|sunmd5_coin(dig,10,13,2)|
+         sunmd5_coin(dig,11,14,3)|sunmd5_coin(dig,12,15,4)|sunmd5_coin(dig,13,0,5)|
+         sunmd5_coin(dig,14,1,6);
+    return SUNMD5_BIT(dig, ia) ^ SUNMD5_BIT(dig, ib);
 }
 
 extern char *crypt_rn(const char *key, const char *setting, void *data, int size);
@@ -2978,8 +3179,16 @@ static __thread yescrypt_local_t *yescrypt_tls_local;
 static __thread uint8_t *argon2_tls_ws;
 static size_t Argon2_maxmem;  /* max workspace bytes needed across all loaded hashes */
 
+static size_t Argon2_ws_bytes;  /* bytes actually allocated for argon2_ws */
 static int argon2_prealloc_cb(uint8_t **memory, size_t bytes_to_allocate) {
     if (!argon2_tls_ws || bytes_to_allocate == 0) return -1;
+    /* Refuse rather than overrun.  The workspace is sized from Argon2_maxmem,
+     * derived from the loaded hashes or, under -z, from a floor set in the
+     * bootstrap.  If any path reaches here without that floor, the allocation is
+     * 16 bytes and argon2 writes its full m_cost into it -- silent heap
+     * corruption that surfaces far away as a malloc abort or as yarn failing
+     * with EINVAL.  Returning -1 makes argon2_ctx fail cleanly instead. */
+    if (bytes_to_allocate > Argon2_ws_bytes) return -1;
     *memory = argon2_tls_ws;
     return 0;
 }
@@ -6459,6 +6668,31 @@ char *Types[] = {
     "7ZIP",
     "CMIYC",
     "RMD256",
+    "MD4SALTPASS",
+    "MD4PASSSALT",
+    "SHA1UCUSERPASS",
+    "SHA1USERCOLONPASS",
+    "MD5PASSSALTMD5PASSSALT",
+    "QAS-VASAUTH",
+    "POSTOFFICE",
+    "IPB2",
+    "MD5USERMD5PASSSALT",
+    "RVARY",
+    "SHA512RAWPASSSALT",
+    "EPISERVER-SID",
+    "ORACLE11",
+    "SAPCODVNH256",
+    "SAPCODVNH384",
+    "MONGODB",
+    "H3C",
+    "ARGON2MD5",
+    "DRAGONFLY3-32",
+    "DRAGONFLY3-64",
+    "DRAGONFLY4-32",
+    "DRAGONFLY4-64",
+    "GOST12256CRYPT",
+    "GOST94CRYPT",
+    "SUNMD5",
 
 NULL
 
@@ -7489,6 +7723,31 @@ NULL
 #define JOB_SEVENZIP        1000
 #define JOB_CMIYC           1001
 #define JOB_RMD256          1002
+#define JOB_MD4SALTPASS     1003
+#define JOB_MD4PASSSALT     1004
+#define JOB_SHA1UCUSERPASS  1005
+#define JOB_SHA1USERCOLONPASS 1006
+#define JOB_MD5PASSSALTMD5PASSSALT 1007
+#define JOB_QASVASAUTH      1008
+#define JOB_POSTOFFICE      1009
+#define JOB_IPB2            1010
+#define JOB_MD5USERMD5PASSSALT 1011
+#define JOB_RVARY           1012
+#define JOB_SHA512RAWPASSSALT 1013
+#define JOB_EPISERVERSID    1014
+#define JOB_ORACLE11        1015
+#define JOB_SAPCODVNH256    1016
+#define JOB_SAPCODVNH384    1017
+#define JOB_MONGODB         1018
+#define JOB_H3C             1019
+#define JOB_ARGON2MD5       1020
+#define JOB_DRAGONFLY3_32    1021
+#define JOB_DRAGONFLY3_64    1022
+#define JOB_DRAGONFLY4_32    1023
+#define JOB_DRAGONFLY4_64    1024
+#define JOB_GOST12256CRYPT   1025
+#define JOB_GOST94CRYPT      1026
+#define JOB_SUNMD5           1027
 
 #define JOB_DONE 2000
 
@@ -8559,6 +8818,31 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [1000] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* 7ZIP */
     [1001] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CMIYC */
     [1002] = TYPEOPT_NEEDSF,  /* RMD256 */
+    [1003] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD4SALTPASS */
+    [1004] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD4PASSSALT */
+    [1005] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER,  /* SHA1UCUSERPASS */
+    [1006] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER,  /* SHA1USERCOLONPASS */
+    [1007] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5PASSSALTMD5PASSSALT */
+    [1008] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* QAS-VASAUTH */
+    [1009] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* POSTOFFICE */
+    [1010] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* IPB2 */
+    [1011] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5USERMD5PASSSALT */
+    [1012] = TYPEOPT_NEEDSF,  /* RVARY */
+    [1013] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* SHA512RAWPASSSALT */
+    [1014] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* EPISERVER-SID */
+    [1015] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* ORACLE11 */
+    [1016] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* SAPCODVNH256 */
+    [1017] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* SAPCODVNH384 */
+    [1018] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* MONGODB */
+    [1019] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* H3C */
+    [1020] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* ARGON2MD5 */
+    [1021] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* DRAGONFLY3-32 */
+    [1022] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* DRAGONFLY3-64 */
+    [1023] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* DRAGONFLY4-32 */
+    [1024] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* DRAGONFLY4-64 */
+    [1025] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* GOST12256CRYPT */
+    [1026] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* GOST94CRYPT */
+    [1027] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* SUNMD5 */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -9383,6 +9667,25 @@ char any=0;
 }
 static const struct { int job; const char *salt; } default_salts[] = {
   { JOB_POMELO, "administrator" },
+  { JOB_MD4SALTPASS, "administrator" },
+  { JOB_MD4PASSSALT, "administrator" },
+  { JOB_MD5PASSSALTMD5PASSSALT, "aaaSXB" },
+  { JOB_QASVASAUTH, "C34208EA-8C33-473D-A9B4-53FB40347EA0" },
+  { JOB_POSTOFFICE, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  { JOB_IPB2, "2e75504633" },
+  { JOB_MD5USERMD5PASSSALT, "aaaSXB:administrator" },
+  { JOB_SHA512RAWPASSSALT, "DB1C19C0" },
+  { JOB_EPISERVERSID, "5F1D84A6DE97E2BEFB637A3CB5318AFEF0750B856CF1836BD1D4470175BE" },
+  { JOB_ORACLE11, "903603F2C52ED1B4D642" },
+  { JOB_SAPCODVNH256, "3000:7a39316866346931" },
+  { JOB_SAPCODVNH384, "5000:4f387862564b5943" },
+  { JOB_MONGODB, "sa" },
+  { JOB_H3C, "4tWqOiqovcWddOKv" },
+  { JOB_ARGON2MD5, "2:19:65536:3:1:16:526e6453613174526e64536131743031:32" },
+  { JOB_DRAGONFLY3_32, "z" },
+  { JOB_DRAGONFLY3_64, "z" },
+  { JOB_DRAGONFLY4_32, "7E48ul" },
+  { JOB_DRAGONFLY4_64, "7E48ul" },
   { JOB_SHA512SALTPASS, "administrator" },
   { JOB_SHA512PASSSALT, "administrator" },
   { JOB_SHA1_SALT_UTF16_PEPPER, "f5g= of8=" },
@@ -9486,7 +9789,7 @@ static const struct { int job; const char *salt; } default_salts[] = {
   { JOB_SSHA1BASE64,   "33373630333536" },
   { JOB_SSHA256BASE64, "33373630333536" },
   { JOB_SSHA512BASE64, "3132343538393930" },
-  { JOB_PHPBB3MD5,     "$H$9saltstring" },
+  { JOB_PHPBB3MD5,     "$H$9RndSa1t0" },
   { JOB_PHPS,          "salt" },
   { JOB_JUNIPERIVE,    "$1$saltsalt$" },
   { JOB_ARUBAOS,       "5387280701" },
@@ -9583,13 +9886,16 @@ static const struct { int job; const char *salt; } default_salts[] = {
   { JOB_SAPCODVNH512, "15000:363835343830363537343634" },
   { JOB_SM3CRYPT, "" },  /* SM3CRYPT uses Typesalt in $sm3$salt$ format, default inserted in bootstrap */
   { JOB_AS400SSHA1, "QTEST1" },
-  { JOB_ARGON2, "2:19:65536:3:1:16:00000000000000000000000000000000:32" },
+  { JOB_ARGON2, "2:19:65536:3:1:16:526e6453613174526e64536131743031:32" },
   { JOB_BCRYPTHMACSHA256, "$2b$05$RndSa1tRndSa1tRndSa1tu" },
   { JOB_WPA_PMK, "1:686173686361742d6573736964:aabbccddeeff:112233445566" },
   { JOB_MD5SALT1SALT2, "salt1:salt2" },
   { JOB_SYMFONY256, "salt1234salt5678" },
   { JOB_WPBCRYPT, "$2b$05$RndSa1tRndSa1tRndSa1tu" },
   { JOB_GOST12512CRYPT, "$gost12512hash$defaultS$" },
+  { JOB_GOST12256CRYPT, "$gost12256hash$defaultS$" },
+  { JOB_GOST94CRYPT, "$gost94hash$defaultS$" },
+  { JOB_SUNMD5, "$md5$rounds=904$defaultSalt$" },
   { JOB_YESCRYPT, "$y$j9T$oJqQoBLMgF5$" },
   /* verified against libxcrypt 4.4.27 gost-yescrypt 2026-08-07 */
   { JOB_GOSTYESCRYPT, "$gy$j9T$2WmURad1wKLkIzjayhv/41$" },
@@ -9608,6 +9914,8 @@ static const struct { int job; const char *user; } default_users[] = {
   { JOB_SHA1USERSQL3, "admin" },
   { JOB_SHA512SHA512RAWUSER, "admin" },
   { JOB_JUNIPERSSG, "netscreen" },
+  { JOB_SHA1UCUSERPASS, "administrator" },
+  { JOB_SHA1USERCOLONPASS, "administrator" },
   { 0, NULL }
 };
 static void init_default_salts(void) {
@@ -12003,8 +12311,9 @@ while (1) {
   if ((job->op == JOB_SHA1HESK || job->op == JOB_MD5HESK) && !TestVec) {
     TestVec = malloc_lock(MAXVECSIZE + 10,memreason);
   }
-  if (job->op == JOB_ARGON2 && !argon2_ws) {
+  if ((job->op == JOB_ARGON2 || job->op == JOB_ARGON2MD5) && !argon2_ws) {
     argon2_ws = malloc_lock(Argon2_maxmem + 16, memreason);
+    Argon2_ws_bytes = Argon2_maxmem;
   }
   switch (job->op) {
     case JOB_GOSTHEXSALT:
@@ -13909,10 +14218,33 @@ do {
                 if (hlen > 0 && !(hlen & 1) &&
                     hlen <= (int)sizeof(curin.h) * 2) {
                   get32((char *)r.data, curin.h, hlen);
-                  if (uses_salt)
-                    checkhashsalt(&curin, hlen, (char *)ssalt, slen, x, job);
-                  else
-                    checkhash(&curin, hlen, x, job);
+                  /*
+                   * A declared stored form OVERRIDES the default reporting shape. The
+                   * defaults below (hash:salt:plain via checkhashsalt, hash:plain via
+                   * checkhash) are right when the stored field is just the digest, but a
+                   * form means the field carries the salt too -- reporting hash:salt:plain
+                   * there would both duplicate the salt and emit a line that this loader
+                   * would not read back.
+                   */
+                  {
+                    struct userdef_type *_ft = userdef_get(job->op);
+                    char _fb[MAXLINE];
+                    int _fl = -1;
+                    if (_ft && _ft->form.npieces)
+                      _fl = userdef_form_build(&_ft->form, (const char *)r.data, hlen,
+                                               ssalt, slen, "", 0, _fb, sizeof(_fb));
+                    if (_fl > 0) {
+                      Word_t *_FV;
+                      JSLG(_FV, JUDYJ(job->op), (unsigned char *)_fb);
+                      if (Printall || (_FV && *_FV == 0)) {
+                        if (!Printall) *_FV = 1;
+                        prfound(job, _fb);
+                      }
+                    } else if (uses_salt)
+                      checkhashsalt(&curin, hlen, (char *)ssalt, slen, x, job);
+                    else
+                      checkhash(&curin, hlen, x, job);
+                  }
                   last_hlen = hlen;
                   last_hex  = (const char *)r.data;
                 }
@@ -13941,8 +14273,19 @@ do {
       case JOB_PROGRESSENCODE:
         if (len > MAXLINE) break;
         hashcnt++;
-        memset(cur + len, 0, len % 16);
+        /* Pad the candidate up to a 16-byte boundary.  This zeroed len%%16
+         * bytes, which is the wrong count: for a 3-byte candidate it cleared
+         * 3 bytes where 13 were needed, so myprogress consumed stale buffer
+         * content past the padding and the digest depended on whatever a
+         * previous job had left there. */
+        memset(cur + len, 0, (16 - (len % 16)) % 16);
         myprogress(cur, len, linebuf);
+        /* myprogress writes sixteen characters and does not terminate them,
+         * so whatever linebuf already held was emitted after the value.  In
+         * a long run that is stale data from an earlier job, which is why
+         * the line looked clean when the type was run alone and carried a
+         * fixed 36-character tail in a full pass. */
+        linebuf[16] = 0;
         JSLG(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)linebuf);
         if (Printall || (PV && *PV == 0)) {
 	  if (!Printall) *PV = 1;
@@ -14080,8 +14423,11 @@ do {
 		while (*s && *s != '$' && *s != ':') s++;
 		saltlen = s - s1;
 		if (sep == ':') {
-		  b64_decode(s1, newbuf, &cryptlen);
-		  s1 = newbuf; saltlen = mystrlen(newbuf);
+		  /* Take the decoded length from the return value.  mystrlen stopped
+		   * at the first NUL, so a salt whose bytes contain one was hashed
+		   * shorter than the salt reported on the emitted line. */
+		  saltlen = b64_decode(s1, newbuf, &cryptlen);
+		  s1 = newbuf;
 		}
 		hashcnt++;
 		pbkdf2_md5(cur, len, (unsigned char *)s1, saltlen, j, (char *)curin.h, 32);
@@ -14132,8 +14478,11 @@ do {
 		while (*s && *s != '$' && *s != ':') s++;
 		saltlen = s - s1;
 		if (sep == ':') {
-		  b64_decode(s1, newbuf, &cryptlen);
-		  s1 = newbuf; saltlen = mystrlen(newbuf);
+		  /* Take the decoded length from the return value.  mystrlen stopped
+		   * at the first NUL, so a salt whose bytes contain one was hashed
+		   * shorter than the salt reported on the emitted line. */
+		  saltlen = b64_decode(s1, newbuf, &cryptlen);
+		  s1 = newbuf;
 		}
 		hashcnt++;
 		pbkdf2_sha1(cur, len, (unsigned char *)s1, saltlen, j, (char *)curin.h, 20);
@@ -14190,8 +14539,11 @@ do {
 		saltlen = s - s1;
 		if (sep == ':') {
 		  /* sha512: format: b64 salt, b64 hash */
-		  b64_decode(s1, newbuf, &cryptlen);
-		  s1 = newbuf; saltlen = mystrlen(newbuf);
+		  /* Take the decoded length from the return value.  mystrlen stopped
+		   * at the first NUL, so a salt whose bytes contain one was hashed
+		   * shorter than the salt reported on the emitted line. */
+		  saltlen = b64_decode(s1, newbuf, &cryptlen);
+		  s1 = newbuf;
 		  i = 64;
 		} else {
 		  /* $ml$ format: hex salt, hex hash */
@@ -14256,8 +14608,11 @@ do {
 		while (*s && *s != '$' && *s != ':') s++;
 		saltlen = s - s1;
 		if (sep == ':') {
-		  b64_decode(s1, newbuf, &cryptlen);
-		  s1 = newbuf; saltlen = mystrlen(newbuf);
+		  /* Take the decoded length from the return value.  mystrlen stopped
+		   * at the first NUL, so a salt whose bytes contain one was hashed
+		   * shorter than the salt reported on the emitted line. */
+		  saltlen = b64_decode(s1, newbuf, &cryptlen);
+		  s1 = newbuf;
 		}
 		hashcnt++;
 		pbkdf2_sha256(cur, len, (unsigned char *)s1, saltlen, j, (char *)curin.h, 32);
@@ -14645,6 +15000,122 @@ do {
 	cryptlen = 64;
 	crypt_prefix_len = 3; /* $6$ */
 	cryptctx = &sha512ctx;
+	goto crypt_round;
+
+      case JOB_SUNMD5:
+	/* SunMD5 (Solaris): digest = md5(pass . salt), then 4096+N rounds of
+	 * md5(digest [. 1517-byte phrase if the coin flips] . ascii(round)).
+	 * The salt is everything before the LAST '$', which handles both the
+	 * plain and the trailing-'$' stored forms without a special case.
+	 * Max round message is 16 + 1517 + 8 bytes, so one buffer suffices. */
+	if (TYPEDONE(job->op)) break;
+	if (len > MAXLINE - 64) break;
+	if (!snap_valid) {
+	  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+	                  TYPESALT(job->op), tsalt, Printall);
+	  snap_valid = 1;
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+	}
+	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+	{ int si;
+	for (si = 0; si < nsalts_job; si++) {
+	  const char *ts = saltsnap[si].salt;
+	  int sl = saltsnap[si].saltlen;
+	  int sm_rounds = 0, sm_max, sm_r, sm_rl, sm_t, sm_pos = 0, sm_sl = 0;
+	  char sm_ra[16], sm_enc[24];
+	  const char *sm_rp;
+	  static const int sm_trip[5][3] = {{0,6,12},{1,7,13},{2,8,14},{3,9,15},{4,10,5}};
+	  if (sl < 5 || sl > 200) continue;
+	  if (strncmp(ts, "$md5", 4) != 0) continue;
+	  /* Typesalt holds the whole stored line; the salt is everything before
+	   * the LAST '$'. That also yields the trailing '$' of the "$$" variant. */
+	  { int sm_k; for (sm_k = sl - 1; sm_k > 3; sm_k--) if (ts[sm_k] == '$') break;
+	    if (sm_k <= 3) continue;
+	    sm_sl = sm_k; }
+	  sm_rp = strstr(ts, "rounds=");
+	  if (sm_rp) {
+	    sm_rounds = atoi(sm_rp + 7);
+	    if (sm_rounds < 0 || sm_rounds > 999999999) continue;
+	  }
+	  sm_max = 4096 + sm_rounds;
+	  s = linebuf + MAXLINE;
+	  fastcopy(s, cur, len);
+	  fastcopy(s + len, (char *)ts, sm_sl);
+	  mymd5(s, len + sm_sl, curin.h);
+	  sm_ra[0] = '0'; sm_ra[1] = 0; sm_rl = 1;
+	  for (sm_r = 0; sm_r < sm_max; sm_r++) {
+	    int n2 = 0;
+	    memcpy(s, curin.h, 16); n2 = 16;
+	    if (sunmd5_flip(curin.h, sm_r)) {
+	      memcpy(s + n2, sunmd5_phrase, sizeof(sunmd5_phrase));
+	      n2 += (int)sizeof(sunmd5_phrase);
+	    }
+	    memcpy(s + n2, sm_ra, sm_rl); n2 += sm_rl;
+	    mymd5(s, n2, curin.h);
+	    { int k = sm_rl - 1;
+	      while (k >= 0) {
+	        if (sm_ra[k] != '9') { sm_ra[k]++; break; }
+	        sm_ra[k--] = '0';
+	      }
+	      if (k < 0) {
+	        memmove(sm_ra + 1, sm_ra, sm_rl);
+	        sm_ra[0] = '1';
+	        sm_ra[++sm_rl] = 0;
+	      }
+	    }
+	  }
+	  hashcnt += sm_max;
+	  for (sm_t = 0; sm_t < 5; sm_t++) {
+	    unsigned int v = ((unsigned int)curin.h[sm_trip[sm_t][0]] << 16) |
+	                     ((unsigned int)curin.h[sm_trip[sm_t][1]] << 8) |
+	                      (unsigned int)curin.h[sm_trip[sm_t][2]];
+	    sm_enc[sm_pos++] = phpitoa64[v & 0x3f]; v >>= 6;
+	    sm_enc[sm_pos++] = phpitoa64[v & 0x3f]; v >>= 6;
+	    sm_enc[sm_pos++] = phpitoa64[v & 0x3f]; v >>= 6;
+	    sm_enc[sm_pos++] = phpitoa64[v & 0x3f];
+	  }
+	  { unsigned int v = (unsigned int)curin.h[11];
+	    sm_enc[sm_pos++] = phpitoa64[v & 0x3f]; v >>= 6;
+	    sm_enc[sm_pos++] = phpitoa64[v & 0x3f];
+	  }
+	  sm_enc[sm_pos] = 0;
+	  snprintf(linebuf2, MAXLINE*3, "%.*s$%.*s", sm_sl, ts, sm_pos, sm_enc);
+	  if (Printall || (sl == sm_sl + 23 &&
+	                   memcmp(sm_enc, ts + sm_sl + 1, 22) == 0)) {
+	    if (!Printall) {
+	      PV_DEC(saltsnap[si].PV);
+	      if (*saltsnap[si].PV == 0) { saltsnap[si] = saltsnap[--nsalts_job]; si--; }
+	    }
+	    prfound(job, linebuf2);
+	  }
+	}
+	if (!nsalts_job) TYPEDONE(job->op) = 1;
+	}
+	break;
+      case JOB_GOST12256CRYPT:
+	if (TYPEDONE(job->op)) break;
+	if (len > MAXLINE) break;
+	if (!TYPESALT(job->op)) break;
+	hashfunc = gost2012_32_std;
+	hashinit = streebog256_init_wrap;
+	hashop = streebog256_update_wrap;
+	hashfin = streebog256_final_wrap;
+	cryptlen = 32;
+	crypt_prefix_len = 15; /* $gost12256hash$ */
+	cryptctx = linebuf2;
+	goto crypt_round;
+
+      case JOB_GOST94CRYPT:
+	if (TYPEDONE(job->op)) break;
+	if (len > MAXLINE) break;
+	if (!TYPESALT(job->op)) break;
+	hashfunc = gosthash;
+	hashinit = gost94_init_wrap;
+	hashop = gost94_update_wrap;
+	hashfin = gost94_final_wrap;
+	cryptlen = 32;
+	crypt_prefix_len = 12; /* $gost94hash$ */
+	cryptctx = linebuf2;
 	goto crypt_round;
 
       case JOB_GOST12512CRYPT:
@@ -16280,6 +16751,19 @@ nextbb:
                 while (PV) {
 		  MHASH td;
 		  char lmac[64],hmac_buf[64];
+                  /* $2k$ ONLY.  For any other salt form the else branch below
+                   * computes e989 BCRYPTHMACSHA256's construction and emitted it
+                   * under the BCRYPT256 label -- not what hx.8 documents for this
+                   * type, which is bcrypt(sha256(pass), salt, 12).  The ordinary
+                   * $2a$/$2b$/$2y$ form is produced by the BC_Start fall-through
+                   * after this loop, so a non-$2k$ salt emitted a SECOND and wrong
+                   * hash beside the right one.  The note after the loop already
+                   * asserted that everything here fires only for $2k$; this makes
+                   * that true instead of merely intended. */
+                  if (linebuf[2] != 'k') {
+                    JSLN(PV, TYPESALT(job->op), (unsigned char *)linebuf);
+                    continue;
+                  }
                   if (Printall || *PV > 0) {
 		    if (linebuf[2] == 'k') {
 			char *extrasalt = ".euO";
@@ -16287,15 +16771,41 @@ nextbb:
 			linebuf2[MAXLINE+2] = 'b';
 			for (x=0; x<4; x++) {
 			    linebuf2[MAXLINE+7+21] = extrasalt[x];
+			    /* strncpy copied exactly 28 bytes and does not NUL-pad
+			     * when the source is that long, and index 28 is the
+			     * extrasalt char, so nothing ever terminated this
+			     * string.  The HMAC key below is passed with an
+			     * explicit length of 22 and was fine, but crypt_rn
+			     * takes the salt as a C string and read past the end. */
+			    linebuf2[MAXLINE+7+21+1] = 0;
 			    td = mhash_hmac_init(MHASH_SHA256, &linebuf2[MAXLINE+7],22, mhash_get_hash_pblock(hmac_type));
 			    mhash(td,cur,len);
 			    mhash_hmac_deinit(td, hmac_buf);
 			    b64_encode(hmac_buf,lmac,32);
 			    hashcnt++;
 			    crypt_rn(lmac, linebuf2+MAXLINE, linebuf2, BCRYPT_HASHSIZE);
+			    /* crypt_rn returns the ordinary 60-character $2b$ form:
+			     * 7 prefix + 22 salt + 31 checksum.  The stored $2k$
+			     * form is 59 characters -- prefix 'k', and only 21 of
+			     * the 22 salt characters, the 22nd being the value
+			     * enumerated above.  Looking up and emitting the $2b$
+			     * form meant a real $2k$ hash could never be found (the
+			     * loader files the $2k$ line) and that -z output did not
+			     * round-trip.  Rebuild the $2k$ form and use it for both.
+			     * Built at linebuf2 + MAXLINE*2: linebuf2 is MAXLINE*3
+			     * and only [0..60) and [MAXLINE..MAXLINE+30) are in use. */
+			    if (linebuf2[0] == '$') {
+			      char *k2form = linebuf2 + MAXLINE*2;
+			      memcpy(k2form, linebuf2, 28);
+			      k2form[2] = 'k';
+			      memcpy(k2form+28, linebuf2+29, 31);
+			      k2form[59] = 0;
+			    } else {
+			      linebuf2[MAXLINE*2] = 0;
+			    }
 			    /* look up computed hash in JudyJ[JOB_BCRYPT] Judy */
 			    { Word_t *PV2;
-			      JSLG(PV2, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
+			      JSLG(PV2, JUDYJ(JOB_BCRYPT),(unsigned char *)(linebuf2+MAXLINE*2));
 			      if (Printall || (PV2 && *PV2 == 0)) {
 				if (!Printall) {
 				  *PV2 = 1;
@@ -16320,15 +16830,30 @@ nextbb:
 				    }
 				  }
 				  if (dohex) {
-				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
+				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2+MAXLINE*2);
 				    prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
 				    job->outlen += job->clen*2;
 				    job->outbuf[job->outlen++] = ']';
 				    job->outbuf[job->outlen++] = '\n';
 				  } else
-				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
+				    job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2+MAXLINE*2, job->pass);
 				}
-				break;
+				/* The 22nd salt character is not stored, so all four
+				 * candidates are equally valid hashes for this salt.
+				 * Emit every one under -z, as other multi-emit families
+				 * do (hx.8 Note [24]); stopping at the first meant -z
+				 * could not reproduce a stored hash whose character was
+				 * not the one tried first.  When cracking, one match is
+				 * the answer, so still stop. */
+				/* Stop only when this salt has no hashes left. PV is the
+				 * salt refcount and PV_DEC above just decremented it, so
+				 * a plain break abandoned any OTHER stored hash sharing
+				 * this 21-character prefix but carrying a different 22nd
+				 * character. Real salts never collide, but -z has a single
+				 * default salt and produced exactly that case. Costs
+				 * nothing normally: one hash per salt drops PV to 0 on the
+				 * first match and breaks as before. */
+				if (!Printall && *PV == 0) break;
 			      }
 			    }
 			}
@@ -16503,6 +17028,15 @@ BC_Start:
                 cur[len] = 0;
                 JSLF(PV, TYPESALT(job->op), (unsigned char *)linebuf);
                 while (PV) {
+                      /* crypt_rn does not know the $2k$ prefix -- it returns its
+                       * error marker "*0", which was then emitted as though it were
+                       * a hash.  $2k$ salts are the HMAC-SHA256 variant and are
+                       * produced by the loop above; skip them here so each salt
+                       * form is generated by exactly one path. */
+                      if (linebuf[2] == 'k') {
+                        JSLN(PV, TYPESALT(job->op), (unsigned char *)linebuf);
+                        continue;
+                      }
                   if (Printall || *PV > 0) {
                     hashcnt++;
                     crypt_rn(cur, linebuf, linebuf2, BCRYPT_HASHSIZE);
@@ -17314,8 +17848,12 @@ sha1saltpass:
 			  }
 			}
 			if (x < Maxiter) {
-			  prmd5(curin.h, newbuf, 40);
-			  mysha1((char *)newbuf, 40, curin.h);
+			  /* Iterate through mdbuf, not newbuf.  newbuf still holds the
+			   * capped hex and the salt the next cap position needs, and
+			   * prmd5 NUL-terminates at out[40], which landed on the
+			   * salt's first byte. */
+			  prmd5(curin.h, mdbuf, 40);
+			  mysha1((char *)mdbuf, 40, curin.h);
 			}
 		      }
 		      newbuf[y] = tolower(newbuf[y]);
@@ -17605,16 +18143,20 @@ sha1saltpass:
 		  MD4((char *) wline, ic_outleft, md5buf.h);
 		}
 
-                if (len > 14)
-                  job->clen = job->len = len = 14;
-                for (x = 0; x < len; x++) {
+                /* The 14-byte limit belongs to the LM half only.  Writing it back into
+                 * job->clen and job->len truncated the candidate that gets REPORTED,
+                 * while the NTLM half above had already consumed the full length, so
+                 * the emitted line showed a password that does not produce its hash. */
+                { int lmlen = len > 14 ? 14 : len;
+                for (x = 0; x < lmlen; x++) {
                   if (islower(cur[x]))
                     linebuf[x] = toupper(cur[x]);
                   else
                     linebuf[x] = cur[x];
                 }
-                linebuf[len] = 0;
-                (void)auth_LMhash(curin.h, linebuf, len);
+                linebuf[lmlen] = 0;
+                (void)auth_LMhash(curin.h, linebuf, lmlen);
+                }
                 cur = prmd5(curin.h, newbuf, 32);
                 prmd5(md5buf.h, newbuf + 32, 32);
                 len = 64;
@@ -17981,14 +18523,20 @@ md4utf16:
                   len = 40;
                   saltlen = sprintf(newbuf, "%d", i);
                   hashcnt += Maxiter;
+		  { char *xc = cur; int xl = len;
 		  for (x=1; x <= Maxiter; x++) {
-		    to_utf16le(cur, (char *)wline, len);
-		    MD4((char *) wline, len*2, curin.h);
+		    to_utf16le(xc, (char *)wline, xl);
+		    MD4((char *) wline, xl*2, curin.h);
 		    checkhashsalt(&curin, 32, newbuf, saltlen, x, job);
 		    if (x < Maxiter) {
-		      len = 32;
-		      prmd5(curin.h, cur, 32);
+		      /* Iterate through linebuf.  Writing the digest back into
+		       * cur clobbered mdbuf, which still holds the chain state
+		       * the next round hashes, and setting len here changed the
+		       * width that round hashed as well. */
+		      prmd5(curin.h, linebuf, 32);
+		      xc = linebuf; xl = 32;
 		    }
+		  }
 		  }
 		}
 	        break;
@@ -18000,13 +18548,20 @@ md4utf16:
                   len = 32;
                   saltlen = sprintf(newbuf, "%d", i);
                   hashcnt += Maxiter;
+		  { char *xc = cur; int xl = len;
 		  for (x=1; x <= Maxiter; x++) {
-		    to_utf16le(cur, (char *)wline, len);
-		    MD4((char *) wline, len*2, curin.h);
+		    to_utf16le(xc, (char *)wline, xl);
+		    MD4((char *) wline, xl*2, curin.h);
 		    checkhashsalt(&curin, 32, newbuf, saltlen, x, job);
 		    if (x < Maxiter) {
-		      prmd5(curin.h, cur, 32);
+		      /* Iterate through linebuf.  Writing the digest back into
+		       * cur clobbered mdbuf, which still holds the chain state
+		       * the next round hashes, and setting len here changed the
+		       * width that round hashed as well. */
+		      prmd5(curin.h, linebuf, 32);
+		      xc = linebuf; xl = 32;
 		    }
+		  }
 		  }
 		}
 		break;
@@ -18018,14 +18573,20 @@ md4utf16:
                   len = 64;
                   saltlen = sprintf(newbuf, "%d", i);
                   hashcnt += Maxiter;
+		  { char *xc = cur; int xl = len;
 		  for (x=1; x <= Maxiter; x++) {
-		    to_utf16le(cur, (char *)wline, len);
-		    MD4((char *) wline, len*2, curin.h);
+		    to_utf16le(xc, (char *)wline, xl);
+		    MD4((char *) wline, xl*2, curin.h);
 		    checkhashsalt(&curin, 32, newbuf, saltlen, x, job);
 		    if (x < Maxiter) {
-		      prmd5(curin.h, cur, 32);
-		      len = 32;
+		      /* Iterate through linebuf.  Writing the digest back into
+		       * cur clobbered mdbuf, which still holds the chain state
+		       * the next round hashes, and setting len here changed the
+		       * width that round hashed as well. */
+		      prmd5(curin.h, linebuf, 32);
+		      xc = linebuf; xl = 32;
 		    }
+		  }
 		  }
 		}
 		break;
@@ -18600,6 +19161,543 @@ md4utf16:
                 break;
 
 
+              case JOB_MD4SALTPASS:
+              case JOB_MD4PASSSALT:
+                /* md4(salt . pass) and md4(pass . salt): John dynamic_31 and dynamic_32.
+                 * The catalogue carried 41 md4 rows and neither of the two simplest
+                 * salted forms. Cloned from JOB_MD5SALTPASS, the same shape over md5;
+                 * iteration re-feeds lowercase hex exactly as that case does. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                fastcopy(linebuf + MAXLINE, cur, len);
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  i = saltlen;
+                  s = linebuf + MAXLINE;
+                  if (job->op == JOB_MD4SALTPASS) {
+                    memmove(s - i, s1, i);
+                    MD4((char *)(s - i), len + i, md5buf.h);
+                  } else {
+                    fastcopy(s + len, s1, i);
+                    MD4((char *)s, len + i, md5buf.h);
+                  }
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(md5buf.h, newbuf, 32);
+                      MD4((char *)newbuf, 32, md5buf.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+              
+              case JOB_SHA1UCUSERPASS:
+              case JOB_SHA1USERCOLONPASS:
+                /* John dynamic_35 / dynamic_36.
+                 *   1005  sha1(upper(user) . ":" . pass)
+                 *   1006  sha1(user . ":" . pass)
+                 * NOTE: dynamic_35 is commented "(ManGOS)" in John, but is NOT
+                 * ManGOS -- e540 uppercases the PASSWORD too. Only the user is
+                 * uppercased here. See hx.8 Note [32].
+                 * Buffer: linebuf[MAXLINE] = ':', pass at [MAXLINE+1..],
+                 * user built backwards from [MAXLINE] as in JOB_MANGOS. */
+                if (len > MAXLINE)
+                  break;
+                y = len;
+                fastcopy(linebuf + MAXLINE + 1, cur, len);
+                linebuf[MAXLINE] = ':';
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
+                  int douc = (job->op == JOB_SHA1UCUSERPASS);
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  while (PV) {
+                    if (Printall || *PV > 0) {
+                      i = mystrlen(tsalt);
+                      len = y;
+                      d = linebuf + MAXLINE;
+                      s1 = tsalt;
+                      cur = d -= i;
+                      len += i;
+                      { const char *sp = tsalt;
+                        while (*sp) {
+                          if (douc && islower(*sp))
+                            *d++ = toupper(*sp);
+                          else
+                            *d++ = *sp;
+                          sp++;
+                        }
+                      }
+                      mysha1(cur, len + 1, curin.h);
+                      { int ulen = i;
+                      for (x = 1; x <= Maxiter; x++) {
+                        hashcnt++;
+                        if (checkhashsalt(&curin, 40, s1, ulen, x, job))
+                          PV_DEC(PV);
+                        if (x < Maxiter) {
+                          prmd5(curin.h, newbuf, 40);
+                          mysha1(newbuf, 40, curin.h);
+                        }
+                      }
+                      }
+                    }
+                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                  }
+                }
+                break;
+
+              case JOB_MD5PASSSALTMD5PASSSALT:
+                /* John dynamic_1505: md5(pass . salt . md5_hex(pass . salt))
+                 * Buffer layout (linebuf + MAXLINE, MAXLINE*3 total, 2x headroom):
+                 *   [0 .. len-1]                   pass
+                 *   [len .. len+saltlen-1]         salt
+                 *   [len+saltlen .. +31]           md5_hex(pass . salt), 32 chars
+                 * prmd5() NULs at [len+saltlen+32]; nothing is staged beyond it,
+                 * so there is no adjacent-slice clobber here. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                fastcopy(linebuf + MAXLINE, cur, len);
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  s = linebuf + MAXLINE;
+                  memmove(s + len, s1, saltlen);
+                  mymd5(s, len + saltlen, md5buf.h);
+                  prmd5(md5buf.h, s + len + saltlen, 32);
+                  mymd5(s, len + saltlen + 32, md5buf.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(md5buf.h, newbuf, 32);
+                      mymd5(newbuf, 32, md5buf.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_QASVASAUTH:
+                /* John dynamic_1602 (Quest QAS vas_auth):
+                 *   sha256("#" . salt . "-" . pass)
+                 * Buffer: linebuf + MAXLINE, '#' salt '-' pass laid out forwards. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  s = linebuf + MAXLINE;
+                  s[0] = '#';
+                  memmove(s + 1, s1, saltlen);
+                  s[1 + saltlen] = '-';
+                  fastcopy(s + 2 + saltlen, cur, len);
+                  mysha256(s, 2 + saltlen + len, curin.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&curin, 64, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(curin.h, newbuf, 64);
+                      mysha256(newbuf, 64, curin.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_POSTOFFICE:
+                /* John "po" (Post.Office):
+                 *   md5(salt . "Y" . pass . 0xF7 . salt)
+                 * The two constant bytes are literal; no encoding is implied.
+                 * Buffer: linebuf + MAXLINE, total saltlen*2 + len + 2. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  s = linebuf + MAXLINE;
+                  memmove(s, s1, saltlen);
+                  s[saltlen] = 'Y';
+                  fastcopy(s + saltlen + 1, cur, len);
+                  s[saltlen + 1 + len] = (char)0xf7;
+                  memmove(s + saltlen + 2 + len, s1, saltlen);
+                  mymd5(s, saltlen + saltlen + len + 2, md5buf.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(md5buf.h, newbuf, 32);
+                      mymd5(newbuf, 32, md5buf.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_IPB2:
+                /* John "ipb2" (Invision Power Board 2):
+                 *   md5(md5_hex(fromhex(salt)) . md5_hex(pass))
+                 * The stored salt is a HEX ENCODING of the raw salt bytes and must
+                 * be decoded first; using it literally yields a well-formed but
+                 * wrong digest.
+                 * Buffer layout (2x headroom everywhere):
+                 *   newbuf[0 .. saltlen/2-1]   decoded salt bytes
+                 *   linebuf[MAXLINE+0  .. +31] md5_hex(saltbin)
+                 *   linebuf[MAXLINE+32 .. +63] md5_hex(pass)
+                 * ORDER MATTERS: prmd5() NUL-terminates at out[32], so the first
+                 * digest stores a NUL at [MAXLINE+32]. It must be written BEFORE
+                 * the second, whose text then overwrites that NUL. Writing them in
+                 * the other order truncates the result.
+                 * See feedback_prmd5_nul_clobber_class. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  int hb, nb = 0;
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  for (hb = 0; hb + 1 < saltlen; hb += 2) {
+                    int hi = s1[hb], lo = s1[hb + 1];
+                    hi = (hi >= '0' && hi <= '9') ? hi - '0' :
+                         ((hi | 32) >= 'a' && (hi | 32) <= 'f') ? (hi | 32) - 'a' + 10 : 0;
+                    lo = (lo >= '0' && lo <= '9') ? lo - '0' :
+                         ((lo | 32) >= 'a' && (lo | 32) <= 'f') ? (lo | 32) - 'a' + 10 : 0;
+                    newbuf[nb++] = (unsigned char)((hi << 4) | lo);
+                  }
+                  s = linebuf + MAXLINE;
+                  mymd5(newbuf, nb, md5buf.h);
+                  prmd5(md5buf.h, s, 32);
+                  mymd5(cur, len, md5buf.h);
+                  prmd5(md5buf.h, s + 32, 32);
+                  mymd5(s, 64, md5buf.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(md5buf.h, newbuf, 32);
+                      mymd5(newbuf, 32, md5buf.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_MD5USERMD5PASSSALT:
+                /* John dynamic_15: md5(user . md5(pass) . salt)
+                 * Typesalt[] holds "salt:user" combined and is split on the FIRST
+                 * colon, the same idiom as JOB_SOCIALENGINE. The username is NOT
+                 * taken from a user judy: the -F line carries it, and results are
+                 * reported hash:salt:user:password, so input and -z output are the
+                 * same shape and round-trip.
+                 * Buffer layout (linebuf, MAXLINE*3, 2x headroom):
+                 *   [MAXLINE .. MAXLINE+31]  md5_hex(pass), computed once per word
+                 *   [0 ..]                   user . md5_hex(pass) . salt */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                if (!TYPESALT(job->op)) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                mymd5(cur, len, md5buf.h);
+                prmd5(md5buf.h, linebuf + MAXLINE, 32);
+                hashcnt++;
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  char *combined = saltsnap[si].salt;
+                  int combinedlen = saltsnap[si].saltlen;
+                  char *colon = memchr(combined, ':', combinedlen);
+                  int slen, ulen;
+                  char *uu;
+                  if (!colon) {
+                    *saltsnap[si].PV = 0;
+                    saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                    continue;
+                  }
+                  slen = colon - combined;
+                  ulen = combinedlen - slen - 1;
+                  uu = colon + 1;
+                  if (ulen + 32 + slen >= MAXLINE) continue;
+                  memmove(linebuf, uu, ulen);
+                  memmove(linebuf + ulen, linebuf + MAXLINE, 32);
+                  memmove(linebuf + ulen + 32, combined, slen);
+                  mymd5(linebuf, ulen + 32 + slen, curin.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt2(&curin, 32, combined, slen, uu, ulen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(curin.h, newbuf, 32);
+                      mymd5(newbuf, 32, curin.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_RVARY:
+                /* John "rvary" -- IBM RVARY. DES-ECB of the EBCDIC password,
+                 * keyed by the RACF key schedule derived from that same password.
+                 * Same key derivation as JOB_RACF (a2e, XOR 0x55, shift left 1,
+                 * odd parity -- precomputed in a2e_pc[]), but the PLAINTEXT is the
+                 * EBCDIC password rather than the username, and it is NOT
+                 * uppercased. John's rvary_fmt_plug.c contains no toupper; both of
+                 * its test vectors use uppercase passwords and therefore cannot
+                 * distinguish the two, so this follows the SOURCE, not the vectors.
+                 * Password is truncated to 8 and padded with EBCDIC space 0x40;
+                 * the key pads with 0x2a, which is (a2e[space] ^ 0x55) << 1. */
+                {
+                  unsigned char deskey[8], rv_pt[8];
+                  int plen = len > 8 ? 8 : len;
+                  DES_key_schedule ks;
+                  for (x = 0; x < 8; x++) {
+                    if (x < plen) {
+                      deskey[x] = a2e_pc[(unsigned char)cur[x]];
+                      rv_pt[x]  = a2e[(unsigned char)cur[x]];
+                    } else {
+                      deskey[x] = 0x2a;
+                      rv_pt[x]  = 0x40;
+                    }
+                  }
+                  DES_set_key_unchecked((DES_cblock *)deskey, &ks);
+                  DES_ecb_encrypt((DES_cblock *)rv_pt, (DES_cblock *)curin.h,
+                                  &ks, DES_ENCRYPT);
+                  hashcnt++;
+                  checkhash(&curin, 16, 1, job);
+                }
+                break;
+
+              case JOB_SHA512RAWPASSSALT:
+                /* sha512_bin(pass . salt), iterated on the RAW 64-byte digest
+                 * rather than its hex -- the same convention as e447
+                 * SHA256RAWSALTPASS. BlackBerry Enterprise Server 10 is this
+                 * type at -i 100. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                fastcopy(linebuf + MAXLINE, cur, len);
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  s = linebuf + MAXLINE;
+                  memmove(s + len, s1, saltlen);
+                  mysha512(s, len + saltlen, curin.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&curin, 128, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter)
+                      mysha512((char *)curin.h, 64, curin.h);
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_ORACLE11:
+                /* Oracle 11g -- upper(sha1(pass . fromhex(salt))), reported as the
+                 * 60-hex concatenation digest||salt that Oracle stores. Emitted with
+                 * prfound rather than checkhashsalt because the stored form is one
+                 * field, not hash:salt. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  int hb, nb = 0;
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  if (saltlen != 20) continue;
+                  s = linebuf + MAXLINE;
+                  fastcopy(s, cur, len);
+                  for (hb = 0; hb + 1 < saltlen; hb += 2) {
+                    int hi = trhex[(unsigned char)s1[hb]];
+                    int lo = trhex[(unsigned char)s1[hb + 1]];
+                    if (hi > 15 || lo > 15) { nb = -1; break; }
+                    s[len + nb] = (char)((hi << 4) | lo);
+                    nb++;
+                  }
+                  if (nb != 10) continue;
+                  mysha1(s, len + 10, curin.h);
+                  hashcnt++;
+                  prmd5UC(curin.h, mdbuf, 40);
+                  fastcopy(mdbuf + 40, s1, 20);
+                  mdbuf[60] = 0;
+                  JSLG(PV, JUDYJ(JOB_ORACLE11), (unsigned char *)mdbuf);
+                  if (Printall || (PV && *PV == 0)) {
+                    if (!Printall) {
+                      *PV = 1;
+                      PV_DEC(saltsnap[si].PV);
+                      if (*saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    prfound(job, mdbuf);
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_EPISERVERSID:
+                /* John "EPI" -- EPiServer tblSID. sha1(salt29 . pass . NUL).
+                 * TWO off-by-ones from the original software, both deliberate here:
+                 *   1. the salt decodes to 30 bytes but only SALT_LENGTH-1 = 29
+                 *      are hashed;
+                 *   2. John's key_len is strnzcpyn(...)+1, so the password is
+                 *      hashed WITH its terminating NUL.
+                 * Distinct from e859 EPISERVER base64(sha1_bin(salt . pass)),
+                 * which is a different EPiServer storage format. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE)
+                  break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  int hb, nb = 0;
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  s = linebuf + MAXLINE;
+                  for (hb = 0; hb + 1 < saltlen && nb < 29; hb += 2) {
+                    int hi = s1[hb], lo = s1[hb + 1];
+                    hi = (hi >= '0' && hi <= '9') ? hi - '0' :
+                         ((hi | 32) >= 'a' && (hi | 32) <= 'f') ? (hi | 32) - 'a' + 10 : 0;
+                    lo = (lo >= '0' && lo <= '9') ? lo - '0' :
+                         ((lo | 32) >= 'a' && (lo | 32) <= 'f') ? (lo | 32) - 'a' + 10 : 0;
+                    s[nb++] = (char)((hi << 4) | lo);
+                  }
+                  if (nb < 29) continue;
+                  fastcopy(s + 29, cur, len);
+                  s[29 + len] = 0;
+                  mysha1(s, 29 + len + 1, curin.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&curin, 40, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(curin.h, newbuf, 40);
+                      mysha1(newbuf, 40, curin.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
               case JOB_MD5_MD5puSHA1MD5pup:
                 if (len > MAXLINE)
                   break;
@@ -18882,10 +19980,25 @@ md4utf16:
                   hashcnt += 5;
                   for (x = 1; x <= Maxiter; x++) {
                     hashcnt++;
-                    if (checkhashsalt(&mdcur[0], 40, s1, saltlen, x, job) ||
-                        checkhashsalt(&mdcur[1], 40, s1, saltlen, x, job) ||
-                        checkhashsalt(&mdcur[2], 40, s1, saltlen, x, job) ||
-                        checkhashsalt(&mdcur[3], 40, s1, saltlen, x, job)) {
+                    if (checkhashsalt(&mdcur[0], 40, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+		    if (checkhashsalt(&mdcur[1], 40, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+		    if (checkhashsalt(&mdcur[2], 40, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+		    if (checkhashsalt(&mdcur[3], 40, s1, saltlen, x, job)) {
                       PV_DEC(saltsnap[si].PV);
                       if (!Printall && *saltsnap[si].PV == 0) {
                         saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -19165,8 +20278,13 @@ sha1md51cap_done: ;
 		    hashcnt += 2;
 		    for (x = 1; x <= Maxiter; x++) {
 		      hashcnt +=2;
-		      if (checkhashsalt(&mdcur[0], 40, tsalt, tsaltlen+saltlen, x, job) ||
-		          checkhashsalt(&mdcur[1], 40, tsalt, tsaltlen+saltlen, x, job)) {
+		      if (checkhashsalt(&mdcur[0], 40, tsalt, tsaltlen+saltlen, x, job)) {
+			PV_DEC(saltsnap[si].PV);
+			if (!Printall && *saltsnap[si].PV == 0) {
+			  saltsnap[si] = saltsnap[--nsalts_job]; si--;
+			}
+		      }
+		      if (checkhashsalt(&mdcur[1], 40, tsalt, tsaltlen+saltlen, x, job)) {
 			PV_DEC(saltsnap[si].PV);
 			if (!Printall && *saltsnap[si].PV == 0) {
 			  saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -19218,8 +20336,13 @@ sha1md51cap_done: ;
 		    hashcnt += 2;
 		    for (x = 1; x <= Maxiter; x++) {
 		      hashcnt += 2;
-		      if (checkhashsalt(&mdcur[0], 40, tsalt, tsaltlen+saltlen, x, job) ||
-		          checkhashsalt(&mdcur[1], 40, tsalt, tsaltlen+saltlen, x, job)) {
+		      if (checkhashsalt(&mdcur[0], 40, tsalt, tsaltlen+saltlen, x, job)) {
+			PV_DEC(saltsnap[si].PV);
+			if (!Printall && *saltsnap[si].PV == 0) {
+			  saltsnap[si] = saltsnap[--nsalts_job]; si--;
+			}
+		      }
+		      if (checkhashsalt(&mdcur[1], 40, tsalt, tsaltlen+saltlen, x, job)) {
 			PV_DEC(saltsnap[si].PV);
 			if (!Printall && *saltsnap[si].PV == 0) {
 			  saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -19265,7 +20388,10 @@ sha1_truncsalt:
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  prmd5(curin.h, linebuf, len);
+		  if (job->op == JOB_SHA1WRLUCTRUNCSALT)
+		    prmd5UC(curin.h, linebuf, len);
+		  else
+		    prmd5(curin.h, linebuf, len);
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   i = saltlen;
@@ -20490,6 +21616,8 @@ sha11saltmd5:
                           break;
                         case JOB_SHA1MD51SALTMD5:
                         case JOB_SHA11SALTMD5:
+                        case JOB_SHA11SALTMD5SHA256:
+                        case JOB_SHA11SALTMD5UC:
                           mysha1(newbuf, hashlen, mdcur[i].h);
                           break;
                       }
@@ -20499,8 +21627,8 @@ sha11saltmd5:
                 break;
 
 
-              case JOB_MD5USERIDMD5MD5:
-                mymd5(cur, len, curin.h);
+	      case JOB_MD5USERIDMD5MD5:
+		mymd5(cur, len, curin.h);
                 cur = prmd5(curin.h, mdbuf, 32);
                 len = 32;
 
@@ -21210,7 +22338,11 @@ sha11saltmd5:
               case JOB_ISCSI_CHAP:
                 if (TYPEDONE(job->op)) break;
                 /* iSCSI CHAP (4800): MD5(id_byte || password || challenge_bytes) */
-                if (len > MAXLINE) break;
+                /* mdbuf is MAXLINE+16, and this builds id_byte + password +
+                 * challenge into it, so the password alone cannot use the whole
+                 * of MAXLINE.  Leave room for the id byte and a 255 byte
+                 * challenge (chall_hexlen is capped at 510 below). */
+                if (len > (MAXLINE-1024)) break;
                   if (!snap_valid) {
                     nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                     TYPESALT(job->op), tsalt, Printall);
@@ -25151,9 +26283,20 @@ sha1md5salt:
                     }
                     hashcnt += Maxiter;
                     for (x = 2; x <= Maxiter; x++) {
+		      int tsaltlen = saltlen;
+		      switch (job->op) {
+			case JOB_SHA1_MD5PEPPER_MD5MD5SALT:
+			case JOB_SHA1_MD5CAPPEPPER_MD5SALT:
+			case JOB_SHA1_MD5PEPPER_MD5SALT:
+			case JOB_SHA1_PEPPER_MD5SALT:
+			  tsaltlen = saltlen + 1 +peplen;
+			  break;
+		 	default:
+			  break;
+		      }
                       prmd5(curin.h, newbuf, 40);
                       mysha1(newbuf, 40, curin.h);
-                      if (checkhashsalt(&curin, 40, s1, saltlen, x, job)) {
+                      if (checkhashsalt(&curin, 40, s1, tsaltlen, x, job)) {
                         PV_DEC(saltsnap[si].PV);
                         if (!Printall && *saltsnap[si].PV == 0) {
                           saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -25203,7 +26346,11 @@ sha1md5salt:
 		        }
 		      }
 		      if (x < Maxiter) {
-			prmd5(curin.h,newbuf,y);
+			/* Width was `y`, which this case never assigns: it held whatever
+			 * a previous job left in it, so the emitted depths depended on
+			 * unrelated thread state.  A sha1 digest is 40 hex characters,
+			 * which is what the next line hashes. */
+			prmd5(curin.h,newbuf,40);
 			mysha1(newbuf,40,curin.h);
 		      }
 		    }
@@ -26001,7 +27148,7 @@ nextsalt1:
                             if (x == 1)
                               checkhashkey(&curin, 32, tsalt, job);
                             else
-                              checkhashsalt(&curin, 32, tsalt, saltlen, x, job);
+                              checkhashsalt(&curin, 32, tsalt, mystrlen(tsalt), x, job);
                             if (x < Maxiter) {
                               prmd5(curin.h, newbuf, 32);
                               s = newbuf;
@@ -26034,7 +27181,7 @@ nextsalt1:
                                 PV_DEC(saltsnap[si_outer].PV);
                               }
                             } else {
-                              if (checkhashsalt(&curin, 32, tsalt, saltlen, x, job)) {
+                              if (checkhashsalt(&curin, 32, tsalt, mystrlen(tsalt), x, job)) {
                                 PV_DEC(saltsnap[si_outer].PV);
                               }
                             }
@@ -26140,9 +27287,7 @@ nextsalt1:
                           mysha256(newbuf, y, mdcur[i].h);
                           break;
                         case JOB_GOSTHEXSALT:
-			  RHASH_RESET(rhash_con);
-                          rhash_update(rhash_con, newbuf, y);
-                          rhash_final(rhash_con, mdcur[i].h);
+                          gosthash(newbuf, y, mdcur[i].h);
                           break;
                         case JOB_HAV128HEXSALT:
                           sph_haval128_3_init(&haval);
@@ -27782,13 +28927,25 @@ md5sha256:
                 cur = (char *) curin.h;
                 len = 16;
               case JOB_MD5RAW:
+                /* Base does ONE binary feed -- md5(md5_bin(pass)) -- after which iteration
+                 * follows the STANDARD hex convention. Restores the pre-1.290
+                 * behaviour: 1.290 replaced a `goto MDstart` handoff to the plain
+                 * handler with a self-contained loop that reported md5(pass) as x01
+                 * (one round early) and re-fed the RAW digest every round. That was
+                 * collateral to a genuine buffer-aliasing fix, which is kept here by
+                 * hashing into newbuf and back. Confirmed against the gp corpus:
+                 * 32_hex.MD5RAWx0{1,2,3} decode as one raw feed then hex, hex.
+                 * Post-1.290 this type was numerically identical to its plain
+                 * sibling at x01, which defeated the purpose of the RAW family. */
+                mymd5(cur, len, (unsigned char *)newbuf);
+                mymd5(newbuf, 16, curin.h);
                 hashcnt += Maxiter;
                 for (x = 1; x <= Maxiter; x++) {
-                  mymd5(cur, len, md5buf.h);
-                  cur = (char *) curin.h;
-                  len = 16;
-		  memcpy(cur,md5buf.h,len);
-                  checkhash((union HashU *)md5buf.h, 32, x, job);
+                  checkhash(&curin, 32, x, job);
+                  if (x < Maxiter) {
+                    prmd5(curin.h, newbuf, 32);
+                    mymd5(newbuf, 32, curin.h);
+                  }
                 }
                 break;
 
@@ -27892,8 +29049,8 @@ md5sha256:
                   actlen[x] = user_len + 2;
                   strncpy(d, amuser, user_len);
                 }
-                strncpy(ljob[0].pass, cur, len);
-                strncpy(ljob[1].pass, cur, len);
+                memcpy(ljob[0].pass, cur, len);
+                memcpy(ljob[1].pass, cur, len);
                 ljobi = 2;
 #ifndef NOTINTEL
                 SSEBUF[15]=_mm_setzero_si128();
@@ -28913,7 +30070,7 @@ md5sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto MD4_start;
@@ -28955,7 +30112,7 @@ md5sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto MD2_start;
@@ -29008,7 +30165,7 @@ md5sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV128_start;
@@ -29054,7 +30211,7 @@ md5sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto RMD128_start;
@@ -29120,7 +30277,7 @@ md5sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto RMD160_start;
@@ -29518,7 +30675,7 @@ md5sha256:
               case JOB_SHA1PASSSHA1:
                 if (len > MAXLINE)
                   break;
-                strncpy(linebuf, cur, len);
+                memcpy(linebuf, cur, len);
                 mysha1(cur, len, curin.h);
                 prmd5(curin.h, &linebuf[len], 40);
                 cur = linebuf;
@@ -29531,7 +30688,7 @@ md5sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 x = 1;
@@ -29728,14 +30885,17 @@ SHA3MD_start:
 		    }
 		  }
 		  for (j= 'a'; j <= 'f'; j++) {
+		    /* Build the letter-class variant in linebuf.  Capitalising in
+		     * mdbuf left that buffer modified, and the next round's md5
+		     * reads the same buffer, so the chain stopped being md5 of
+		     * the previous round's hex. */
 		    for (y =0; y < 32; y++) {
-		      if (isupper(mdbuf[y]))
-			mdbuf[y] = tolower(mdbuf[y]);
-		      if (mdbuf[y] == j) {
-			mdbuf[y] = toupper(mdbuf[y]);
-		      }
+		      if (mdbuf[y] == j)
+			linebuf[y] = toupper(mdbuf[y]);
+		      else
+			linebuf[y] = mdbuf[y];
 		    }
-		    mysha1(mdbuf, 32, curin.h);
+		    mysha1(linebuf, 32, curin.h);
 		    hashcnt += Maxiter;
 		    for (x=1; x<= Maxiter; x++) {
                       checkhash(&curin, 40, x, job);
@@ -29744,18 +30904,16 @@ SHA3MD_start:
 			mysha1(newbuf, 40, curin.h);
 		      }
 		    }
-		    mdbuf[y] = tolower(mdbuf[y]);
 		  }
 		}
 		for (j= 'a'; j <= 'f'; j++) {
 		  for (y =0; y < 32; y++) {
-		    if (isupper(mdbuf[y]))
-		      mdbuf[y] = tolower(mdbuf[y]);
-		    if (mdbuf[y] == j) {
-		      mdbuf[y] = toupper(mdbuf[y]);
-		    }
+		    if (mdbuf[y] == j)
+		      linebuf[y] = toupper(mdbuf[y]);
+		    else
+		      linebuf[y] = mdbuf[y];
 		  }
-		  mysha1(mdbuf, 32, curin.h);
+		  mysha1(linebuf, 32, curin.h);
 		  for (x=1; x<= Maxiter; x++) {
 		    checkhash(&curin, 40, x, job);
 		    if (x < Maxiter) {
@@ -29886,13 +31044,25 @@ sha1md5md5uc:
                 len = 32;
 
               case JOB_SHA1RAW:
+                /* Base does ONE binary feed -- sha1(sha1_bin(pass)) -- after which iteration
+                 * follows the STANDARD hex convention. Restores the pre-1.290
+                 * behaviour: 1.290 replaced a `goto SHA1start` handoff to the plain
+                 * handler with a self-contained loop that reported sha1(pass) as x01
+                 * (one round early) and re-fed the RAW digest every round. That was
+                 * collateral to a genuine buffer-aliasing fix, which is kept here by
+                 * hashing into newbuf and back. Confirmed against the gp corpus:
+                 * 32_hex.MD5RAWx0{1,2,3} decode as one raw feed then hex, hex.
+                 * Post-1.290 this type was numerically identical to its plain
+                 * sibling at x01, which defeated the purpose of the RAW family. */
+                mysha1(cur, len, (unsigned char *)newbuf);
+                mysha1(newbuf, 20, curin.h);
                 hashcnt += Maxiter;
                 for (x = 1; x <= Maxiter; x++) {
-                  mysha1(cur, len, md5buf.h);
-                  cur = (char *) curin.h;
-                  len = 20;
-                  memcpy(cur, md5buf.h, len);
-                  checkhash((union HashU *)md5buf.h, 40, x, job);
+                  checkhash(&curin, 40, x, job);
+                  if (x < Maxiter) {
+                    prmd5(curin.h, newbuf, 40);
+                    mysha1(newbuf, 40, curin.h);
+                  }
                 }
                 break;
 
@@ -30088,10 +31258,10 @@ sha1trunc:
                     checkhashsalt(&mdcur[0], 40, newbuf, saltlen, x, job);
                     checkhashsalt(&mdcur[1], 40, newbuf, saltlen, x, job);
 		    if (x < Maxiter) {
-		      prmd5(mdcur[0].h, newbuf, 40);
-		      mysha1(newbuf, 40, mdcur[0].h);
-		      prmd5(mdcur[1].h, newbuf, 40);
-		      mysha1(newbuf, 40, mdcur[1].h);
+		      prmd5(mdcur[0].h, linebuf2, 40);
+		      mysha1(linebuf2, 40, mdcur[0].h);
+		      prmd5(mdcur[1].h, linebuf2, 40);
+		      mysha1(linebuf2, 40, mdcur[1].h);
 		    }
 		  }
 		}
@@ -30117,8 +31287,8 @@ sha1trunc:
 		  for (x=1; x <= Maxiter; x++) {
                     checkhashsalt(&curin, 40, newbuf, saltlen, x, job);
 		    if (x < Maxiter) {
-		      prmd5(curin.h, newbuf, 40);
-		      mysha1(newbuf, 40, curin.h);
+		      prmd5(curin.h, linebuf, 40);
+		      mysha1(linebuf, 40, curin.h);
 		    }
 		  }
 		}
@@ -30208,6 +31378,13 @@ SHA1TRUNC64:
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   i = saltlen;
+                  /* Restore the pristine hex before each salt.  The
+                   * truncation loop below copies the salt into linebuf at
+                   * offsets 63 down to 21 and never undoes it, so every
+                   * salt after the first used to truncate its predecessor
+                   * salt bytes instead of the hex.  linebuf2[0..63] holds
+                   * the same hex and is only ever written from offset 64. */
+                  memmove(linebuf, linebuf2, 64);
                   s = linebuf2+64;
                   memmove(s, s1, saltlen);
 		  memmove(newbuf,s1,saltlen);
@@ -30915,7 +32092,7 @@ sha1sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV256_start;
@@ -30943,7 +32120,7 @@ sha1sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto SHA256_start;
@@ -30974,13 +32151,25 @@ sha1sha256:
                 goto SHA256_start;
 
               case JOB_SHA256RAW:
+                /* Base does ONE binary feed -- sha256(sha256_bin(pass)) -- after which iteration
+                 * follows the STANDARD hex convention. Restores the pre-1.290
+                 * behaviour: 1.290 replaced a `goto SHA256start` handoff to the plain
+                 * handler with a self-contained loop that reported sha256(pass) as x01
+                 * (one round early) and re-fed the RAW digest every round. That was
+                 * collateral to a genuine buffer-aliasing fix, which is kept here by
+                 * hashing into newbuf and back. Confirmed against the gp corpus:
+                 * 32_hex.MD5RAWx0{1,2,3} decode as one raw feed then hex, hex.
+                 * Post-1.290 this type was numerically identical to its plain
+                 * sibling at x01, which defeated the purpose of the RAW family. */
+                mysha256(cur, len, (unsigned char *)newbuf);
+                mysha256(newbuf, 32, curin.h);
                 hashcnt += Maxiter;
                 for (x = 1; x <= Maxiter; x++) {
-                  mysha256(cur, len, md5buf.h);
-                  cur = (char *) curin.h;
-                  len = 32;
-                  memcpy(cur, md5buf.h, len);
                   checkhash(&curin, 64, x, job);
+                  if (x < Maxiter) {
+                    prmd5(curin.h, newbuf, 64);
+                    mysha256(newbuf, 64, curin.h);
+                  }
                 }
                 break;
 
@@ -31131,7 +32320,7 @@ sha1sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto SHA512_start;
@@ -31143,13 +32332,25 @@ sha1sha256:
                 goto SHA512_start;
 
               case JOB_SHA512RAW:
+                /* Base does ONE binary feed -- sha512(sha512_bin(pass)) -- after which iteration
+                 * follows the STANDARD hex convention. Restores the pre-1.290
+                 * behaviour: 1.290 replaced a `goto SHA512start` handoff to the plain
+                 * handler with a self-contained loop that reported sha512(pass) as x01
+                 * (one round early) and re-fed the RAW digest every round. That was
+                 * collateral to a genuine buffer-aliasing fix, which is kept here by
+                 * hashing into newbuf and back. Confirmed against the gp corpus:
+                 * 32_hex.MD5RAWx0{1,2,3} decode as one raw feed then hex, hex.
+                 * Post-1.290 this type was numerically identical to its plain
+                 * sibling at x01, which defeated the purpose of the RAW family. */
+                mysha512(cur, len, (unsigned char *)newbuf);
+                mysha512(newbuf, 64, curin.h);
                 hashcnt += Maxiter;
                 for (x = 1; x <= Maxiter; x++) {
-                  mysha512(cur, len, md5buf.h);
-                  cur = (char *) curin.h;
-                  len = 64;
-                  memcpy(cur, md5buf.h, len);
                   checkhash(&curin, 128, x, job);
+                  if (x < Maxiter) {
+                    prmd5(curin.h, newbuf, 128);
+                    mysha512(newbuf, 128, curin.h);
+                  }
                 }
                 break;
 
@@ -31169,7 +32370,7 @@ sha1sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto GOST_start;
@@ -31230,7 +32431,7 @@ sha1sha256:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto SHA224_start;
@@ -31248,15 +32449,24 @@ sha1sha256:
                 goto SHA224_start;
 
               case JOB_SHA224RAW:
+                /* Base does ONE binary feed -- sha224(sha224_bin(pass)) -- then STANDARD hex
+                 * iteration. Restores pre-1.290 behaviour; see JOB_MD5RAW above.
+                 * Post-1.290 this reported sha224(pass) as x01, one round early. */
+                sph_sha224_init(&sha256ctx);
+                sph_sha224(&sha256ctx, cur, len);
+                sph_sha224_close(&sha256ctx, (unsigned char *)newbuf);
+                sph_sha224_init(&sha256ctx);
+                sph_sha224(&sha256ctx, newbuf, 28);
+                sph_sha224_close(&sha256ctx, curin.h);
                 hashcnt += Maxiter;
                 for (x = 1; x <= Maxiter; x++) {
-                  sph_sha224_init(&sha256ctx);
-                  sph_sha224(&sha256ctx, cur, len);
-                  sph_sha224_close(&sha256ctx, md5buf.h);
-                  cur = (char *) curin.h;
-                  len = 28;
-                  memcpy(cur, md5buf.h, len);
                   checkhash(&curin, 56, x, job);
+                  if (x < Maxiter) {
+                    prmd5(curin.h, newbuf, 56);
+                    sph_sha224_init(&sha256ctx);
+                    sph_sha224(&sha256ctx, newbuf, 56);
+                    sph_sha224_close(&sha256ctx, curin.h);
+                  }
                 }
                 break;
 
@@ -31296,7 +32506,7 @@ SHA224_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto SHA384_start;
@@ -31308,15 +32518,24 @@ SHA224_start:
                 goto SHA384_start;
 
               case JOB_SHA384RAW:
+                /* Base does ONE binary feed -- sha384(sha384_bin(pass)) -- then STANDARD hex
+                 * iteration. Restores pre-1.290 behaviour; see JOB_MD5RAW above.
+                 * Post-1.290 this reported sha384(pass) as x01, one round early. */
+                sph_sha384_init(&sha512ctx);
+                sph_sha384(&sha512ctx, cur, len);
+                sph_sha384_close(&sha512ctx, (unsigned char *)newbuf);
+                sph_sha384_init(&sha512ctx);
+                sph_sha384(&sha512ctx, newbuf, 48);
+                sph_sha384_close(&sha512ctx, curin.h);
                 hashcnt += Maxiter;
                 for (x = 1; x <= Maxiter; x++) {
-                  sph_sha384_init(&sha512ctx);
-                  sph_sha384(&sha512ctx, cur, len);
-                  sph_sha384_close(&sha512ctx, md5buf.h);
-                  cur = (char *) curin.h;
-                  len = 48;
-                  memcpy(cur, md5buf.h, len);
                   checkhash(&curin, 96, x, job);
+                  if (x < Maxiter) {
+                    prmd5(curin.h, newbuf, 96);
+                    sph_sha384_init(&sha512ctx);
+                    sph_sha384(&sha512ctx, newbuf, 96);
+                    sph_sha384_close(&sha512ctx, curin.h);
+                  }
                 }
                 break;
 
@@ -31350,7 +32569,7 @@ SHA384_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto SNE256_start;
@@ -31378,7 +32597,7 @@ SNE256_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto SNE128_start;
@@ -31466,7 +32685,7 @@ SNE128_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto TIGER_start;
@@ -31496,7 +32715,7 @@ TIGER_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto WRL_start;
@@ -31555,7 +32774,7 @@ TIGER_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV128_4_start;
@@ -31583,7 +32802,7 @@ HAV128_4_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV128_5_start;
@@ -31611,7 +32830,7 @@ HAV128_4_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV160_3_start;
@@ -31639,7 +32858,7 @@ HAV160_3_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV160_4_start;
@@ -31667,7 +32886,7 @@ HAV160_4_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV160_5_start;
@@ -31695,7 +32914,7 @@ HAV160_5_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV192_3_start;
@@ -31723,7 +32942,7 @@ HAV192_3_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV192_4_start;
@@ -31751,7 +32970,7 @@ HAV192_4_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV192_5_start;
@@ -31779,7 +32998,7 @@ HAV192_5_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV224_3_start;
@@ -31807,7 +33026,7 @@ HAV224_3_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV224_4_start;
@@ -31835,7 +33054,7 @@ HAV224_4_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV224_5_start;
@@ -31863,7 +33082,7 @@ HAV224_5_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV256_4_start;
@@ -31891,7 +33110,7 @@ HAV256_4_start:
                   break;
                 mymd5(cur, len, curin.h);
                 prmd5(curin.h, linebuf, 32);
-                strncpy(&linebuf[32], cur, len);
+                memcpy(&linebuf[32], cur, len);
                 cur = linebuf;
                 len += 32;
                 goto HAV256_5_start;
@@ -38864,6 +40083,292 @@ HAV256_5_start:
                 }
                 break;
 
+              case JOB_MONGODB:
+                /* MongoDB system credential: md5(user . ":mongo:" . pass).
+                 * Reported in the stored form $mongodb$0$user$hash. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE - 300) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  const char *ts = saltsnap[si].salt;
+                  int ul = saltsnap[si].saltlen;
+                  if (ul < 1) continue;
+                  s = linebuf + MAXLINE;
+                  fastcopy(s, (char *)ts, ul);
+                  fastcopy(s + ul, ":mongo:", 7);
+                  fastcopy(s + ul + 7, cur, len);
+                  mymd5(s, ul + 7 + len, curin.h);
+                  hashcnt++;
+                  prmd5(curin.h, mdbuf, 32);
+                  mdbuf[32] = 0;
+                  snprintf(linebuf2, MAXLINE*3, "$mongodb$0$%.*s$%s", ul, ts, mdbuf);
+                  Word_t *PV2;
+                  JSLG(PV2, JUDYJ(JOB_MONGODB), (unsigned char *)linebuf2);
+                  if (Printall || (PV2 && *PV2 == 0)) {
+                    if (!Printall) {
+                      *PV2 = 1;
+                      PV_DEC(saltsnap[si].PV);
+                      if (*saltsnap[si].PV == 0) { saltsnap[si] = saltsnap[--nsalts_job]; si--; }
+                    }
+                    prfound(job, linebuf2);
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_H3C:
+                /* H3C/HPE/Huawei: base64(sha512(pass . NUL . salt . pass . NUL)).
+                 * The password is hashed INCLUDING its terminating NUL, twice. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE - 600) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  const char *ts = saltsnap[si].salt;
+                  int sl = saltsnap[si].saltlen, n2 = 0;
+                  if (sl < 1) continue;
+                  s = linebuf + MAXLINE;
+                  fastcopy(s, cur, len);            n2 = len; s[n2++] = 0;
+                  fastcopy(s + n2, (char *)ts, sl); n2 += sl;
+                  fastcopy(s + n2, cur, len);       n2 += len; s[n2++] = 0;
+                  mysha512(s, n2, curin.h);
+                  hashcnt++;
+                  { char h3b[200];
+                    int h3l = b64_encode((char *)curin.h, h3b, 64);
+                    snprintf(linebuf2, MAXLINE*3, "$h$6$%.*s$%.*s", sl, ts, h3l, h3b); }
+                  Word_t *PV2;
+                  JSLG(PV2, JUDYJ(JOB_H3C), (unsigned char *)linebuf2);
+                  if (Printall || (PV2 && *PV2 == 0)) {
+                    if (!Printall) {
+                      *PV2 = 1;
+                      PV_DEC(saltsnap[si].PV);
+                      if (*saltsnap[si].PV == 0) { saltsnap[si] = saltsnap[--nsalts_job]; si--; }
+                    }
+                    prfound(job, linebuf2);
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+                case JOB_DRAGONFLY3_32:
+                case JOB_DRAGONFLY3_64:
+                case JOB_DRAGONFLY4_32:
+                case JOB_DRAGONFLY4_64:
+                  /* DragonFly BSD $3$/$4$: a SINGLE sha256/sha512 of
+                   * pass . magic . salt -- there is no round loop. The magic
+                   * is the format tag INCLUDING its NUL; the 64-bit variants
+                   * read 8 magic bytes instead of 4 and pick up four adjacent
+                   * rodata bytes ("sha5" for $3$, "/etc" for $4$), which is
+                   * the bug the variant names refer to. Output uses the
+                   * sha256crypt/sha512crypt transposition; $4$ encodes only
+                   * 62 of the 64 digest bytes, so bytes 62 and 63 never
+                   * appear in the stored form. */
+                  if (TYPEDONE(job->op)) break;
+                  if (len > MAXLINE - 64) break;
+                  if (!snap_valid) {
+                    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                    TYPESALT(job->op), tsalt, Printall);
+                    snap_valid = 1;
+                    if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  }
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                  { int si;
+                    int df512 = (job->op == JOB_DRAGONFLY4_32 ||
+                                 job->op == JOB_DRAGONFLY4_64);
+                    int df64  = (job->op == JOB_DRAGONFLY3_64 ||
+                                 job->op == JOB_DRAGONFLY4_64);
+                    const char *dfm = df512 ? (df64 ? "$4$\0/etc" : "$4$\0")
+                                            : (df64 ? "$3$\0sha5" : "$3$\0");
+                    int dfml = df64 ? 8 : 4;
+                    int dfng = df512 ? 20 : 10;
+                    int dfo2 = df512 ? 21 : 11;
+                    int dfo3 = df512 ? 42 : 21;
+                    int dft1 = df512 ? 20 : 10;
+                    int dft2 = df512 ? 41 : 31;
+                  for (si = 0; si < nsalts_job; si++) {
+                    const char *ts = saltsnap[si].salt;
+                    int sl = saltsnap[si].saltlen, n2 = 0, di, dj = 0;
+                    char dfb[96];
+                    if (sl < 1 || sl > 8) continue;
+                    s = linebuf + MAXLINE;
+                    fastcopy(s, cur, len);              n2 = len;
+                    memcpy(s + n2, dfm, dfml);          n2 += dfml;
+                    fastcopy(s + n2, (char *)ts, sl);   n2 += sl;
+                    if (df512) mysha512(s, n2, curin.h);
+                    else       mysha256(s, n2, curin.h);
+                    hashcnt++;
+                    for (di = 0; di < dfng; di++) {
+                      unsigned int v = ((unsigned int)curin.h[di] << 16) |
+                                       ((unsigned int)curin.h[di + dfo2] << 8) |
+                                        (unsigned int)curin.h[di + dfo3];
+                      dfb[dj++] = phpitoa64[v & 0x3f];
+                      dfb[dj++] = phpitoa64[(v >> 6) & 0x3f];
+                      dfb[dj++] = phpitoa64[(v >> 12) & 0x3f];
+                      dfb[dj++] = phpitoa64[(v >> 18) & 0x3f];
+                    }
+                    { unsigned int v = ((unsigned int)curin.h[dft1] << 16) |
+                                       ((unsigned int)curin.h[dft2] << 8);
+                      dfb[dj++] = phpitoa64[v & 0x3f];
+                      dfb[dj++] = phpitoa64[(v >> 6) & 0x3f];
+                      dfb[dj++] = phpitoa64[(v >> 12) & 0x3f];
+                      dfb[dj++] = phpitoa64[(v >> 18) & 0x3f];
+                    }
+                    dfb[dj] = 0;
+                    snprintf(linebuf2, MAXLINE*3, "$%c$%.*s$%.*s",
+                             df512 ? '4' : '3', sl, ts, dj, dfb);
+                    Word_t *PV2;
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)linebuf2);
+                    if (Printall || (PV2 && *PV2 == 0)) {
+                      if (!Printall) {
+                        *PV2 = 1;
+                        PV_DEC(saltsnap[si].PV);
+                        if (*saltsnap[si].PV == 0) { saltsnap[si] = saltsnap[--nsalts_job]; si--; }
+                      }
+                      prfound(job, linebuf2);
+                    }
+                  }
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
+                  }
+                  break;
+              case JOB_SAPCODVNH256:
+                /* SAP CODVN H SHA256: SHA256(pass+salt) then SHA256(pass+h), ITER rounds.
+                 * Mirrors JOB_SAPCODVNH512 with a 32-byte digest. Password is
+                 * truncated at 40 bytes, as SAP does. */
+                if (TYPEDONE(job->op)) break;
+                if (len > 40) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                {
+                  int si;
+                  for (si = 0; si < nsalts_job; si++) {
+                    const char *ts = saltsnap[si].salt;
+                    const char *colon = strchr(ts, ':');
+                    if (!colon) continue;
+                    int sh_iter = atoi(ts);
+                    if (sh_iter < 1) continue;
+                    int sh_hexlen = saltsnap[si].saltlen - (int)(colon + 1 - ts);
+                    int sh_saltlen = sh_hexlen / 2;
+                    if (sh_saltlen < 1 || sh_saltlen > 256) continue;
+                    const char *hp = colon + 1;
+                    for (x = 0; x < sh_saltlen; x++)
+                      tsalt[x] = (trhex[(unsigned char)hp[x*2]] << 4) | trhex[(unsigned char)hp[x*2+1]];
+                    memcpy(linebuf, cur, len);
+                    memcpy(linebuf + len, tsalt, sh_saltlen);
+                    mysha256(linebuf, len + sh_saltlen, curin.h);
+                    for (x = 1; x < sh_iter; x++) {
+                      memcpy(linebuf + len, curin.h, 32);
+                      mysha256(linebuf, len + 32, curin.h);
+                    }
+                    hashcnt += sh_iter;
+                    prmd5(curin.h, mdbuf, 64);
+                    mdbuf[64] = 0;
+                    Word_t *PV2;
+                    JSLG(PV2, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)mdbuf);
+                    if (Printall || (PV2 && *PV2 == 0)) {
+                      unsigned char sh_raw[400];
+                      memcpy(sh_raw, curin.h, 32);
+                      memcpy(sh_raw + 32, tsalt, sh_saltlen);
+                      char sh_b64[600];
+                      int sh_b64len = b64_encode((char *)sh_raw, sh_b64, 32 + sh_saltlen);
+                      snprintf(linebuf2, MAXLINE*3, "{x-isSHA256, %d}%.*s", sh_iter, sh_b64len, sh_b64);
+                      if (!Printall) {
+                        *PV2 = 1;
+                        PV_DEC(saltsnap[si].PV);
+                        if (*saltsnap[si].PV == 0) {
+                          saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                        }
+                      }
+                      prfound(job, linebuf2);
+                    }
+                  }
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_SAPCODVNH384:
+                /* SAP CODVN H SHA384: SHA384(pass+salt) then SHA384(pass+h), ITER rounds.
+                 * Mirrors JOB_SAPCODVNH512 with a 48-byte digest. Password is
+                 * truncated at 40 bytes, as SAP does. */
+                if (TYPEDONE(job->op)) break;
+                if (len > 40) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                {
+                  int si;
+                  for (si = 0; si < nsalts_job; si++) {
+                    const char *ts = saltsnap[si].salt;
+                    const char *colon = strchr(ts, ':');
+                    if (!colon) continue;
+                    int sh_iter = atoi(ts);
+                    if (sh_iter < 1) continue;
+                    int sh_hexlen = saltsnap[si].saltlen - (int)(colon + 1 - ts);
+                    int sh_saltlen = sh_hexlen / 2;
+                    if (sh_saltlen < 1 || sh_saltlen > 256) continue;
+                    const char *hp = colon + 1;
+                    for (x = 0; x < sh_saltlen; x++)
+                      tsalt[x] = (trhex[(unsigned char)hp[x*2]] << 4) | trhex[(unsigned char)hp[x*2+1]];
+                    memcpy(linebuf, cur, len);
+                    memcpy(linebuf + len, tsalt, sh_saltlen);
+                    sph_sha384_init(&sha512ctx);
+                    sph_sha384(&sha512ctx, linebuf, len + sh_saltlen);
+                    sph_sha384_close(&sha512ctx, curin.h);
+                    for (x = 1; x < sh_iter; x++) {
+                      memcpy(linebuf + len, curin.h, 48);
+                      sph_sha384_init(&sha512ctx);
+                      sph_sha384(&sha512ctx, linebuf, len + 48);
+                      sph_sha384_close(&sha512ctx, curin.h);
+                    }
+                    hashcnt += sh_iter;
+                    prmd5(curin.h, mdbuf, 96);
+                    mdbuf[96] = 0;
+                    Word_t *PV2;
+                    JSLG(PV2, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)mdbuf);
+                    if (Printall || (PV2 && *PV2 == 0)) {
+                      unsigned char sh_raw[400];
+                      memcpy(sh_raw, curin.h, 48);
+                      memcpy(sh_raw + 48, tsalt, sh_saltlen);
+                      char sh_b64[600];
+                      int sh_b64len = b64_encode((char *)sh_raw, sh_b64, 48 + sh_saltlen);
+                      snprintf(linebuf2, MAXLINE*3, "{x-isSHA384, %d}%.*s", sh_iter, sh_b64len, sh_b64);
+                      if (!Printall) {
+                        *PV2 = 1;
+                        PV_DEC(saltsnap[si].PV);
+                        if (*saltsnap[si].PV == 0) {
+                          saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                        }
+                      }
+                      prfound(job, linebuf2);
+                    }
+                  }
+                  if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
               case JOB_SAPCODVNH512:
                 /* SAP CODVN H SHA512 (35000): SHA512(pass+salt) iterated
                  * Same as SAPCODVNH but SHA512 (64-byte digest)
@@ -39165,6 +40670,7 @@ HAV256_5_start:
                 break;
 
               case JOB_ARGON2:
+              case JOB_ARGON2MD5:
                 /* Argon2 (34000): argon2{d|i|id}(pass, salt, t_cost, m_cost, p, hashlen)
                  * Typesalt = "type:ver:m:t:p:saltlen:salthex:hashlen"
                  * JudyJ key = full $argon2... format string (lowercase)
@@ -39202,8 +40708,20 @@ HAV256_5_start:
                     memset(&ctx, 0, sizeof(ctx));
                     ctx.out = curin.h;
                     ctx.outlen = a2hashlen;
-                    ctx.pwd = (uint8_t *)cur;
-                    ctx.pwdlen = len;
+                    /* ARGON2MD5 (vBulletin 6) feeds Argon2 the MD5 HEX of the
+                     * password rather than the password, exactly as e451 BCRYPTMD5
+                     * does for vBulletin 5. Everything else is identical, so the two
+                     * types share this case. */
+                    if (job->op == JOB_ARGON2MD5) {
+                      mymd5(cur, len, curin.h);
+                      prmd5(curin.h, mdbuf, 32);
+                      mdbuf[32] = 0;
+                      ctx.pwd = (uint8_t *)mdbuf;
+                      ctx.pwdlen = 32;
+                    } else {
+                      ctx.pwd = (uint8_t *)cur;
+                      ctx.pwdlen = len;
+                    }
                     ctx.salt = a2salt;
                     ctx.saltlen = a2saltlen;
                     ctx.t_cost = a2t;
@@ -39233,7 +40751,7 @@ HAV256_5_start:
                     snprintf(mdbuf, MAXLINE, "%sv=%d$m=%d,t=%d,p=%d$%s$%s",
                              a2sig, a2ver, a2m, a2t, a2p, b64salt, b64hash);
                     Word_t *PV2;
-                    JSLG(PV2, JUDYJ(JOB_ARGON2), (unsigned char *)mdbuf);
+                    JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
                     if (Printall || (PV2 && *PV2 == 0)) {
                       if (!Printall) {
                         *PV2 = 1;
@@ -39252,9 +40770,16 @@ HAV256_5_start:
                         prmd5(curin.h, mghex, a2hashlen * 2);
                         mghex[a2hashlen * 2] = 0;
                         int mgsl = a2saltlen > 16 ? 16 : a2saltlen;
-                        snprintf(mdbuf, MAXLINE, "%s:%.*s:2",
-                                 mghex, mgsl, (char *)a2salt);
-                        prfound(job, mdbuf);
+                        /* The bare ":2" shape is Magento hash version 2,
+                         * whose Argon2 parameters are fixed: 32-byte output,
+                         * t=2, m=65536 KiB.  It cannot express anything else,
+                         * so emitting it for a hash computed with different
+                         * parameters produces a line that can never verify. */
+                        if (a2hashlen == 32 && a2t == 2 && a2m == 65536) {
+                          snprintf(mdbuf, MAXLINE, "%s:%.*s:2",
+                                   mghex, mgsl, (char *)a2salt);
+                          prfound(job, mdbuf);
+                        }
                         snprintf(mdbuf, MAXLINE, "%s:%.*s:3_%d_%d_%lld",
                                  mghex, mgsl, (char *)a2salt,
                                  a2hashlen, a2t, (long long)a2m * 1024);
@@ -44067,6 +45592,99 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       }
     }
     /* JudyJ[JOB_WBB3] (8400) in -J: 40hex:40hex = 81 chars — must be before IPMI2_SHA1 */
+    /*
+     * User-defined types. The format parser offers each SELECTED user type the
+     * line in turn and the first whose layout matches claims it. A type that was
+     * NOT selected never sees the line: an unselected type must not quietly absorb
+     * input meant for something else.
+     *
+     * Layout comes from the type's "form =" declaration when it has one. Without
+     * one the default shapes apply, chosen by which slots the expression uses:
+     *   no slots      digest
+     *   salt          digest:salt
+     *   user          digest:user
+     *   salt + user   digest:salt:user
+     */
+    {
+      int _uc = userdef_count(), _ui, _claimed = 0;
+      for (_ui = 0; _ui < _uc && !_claimed; _ui++) {
+        int _uop = (int)user_id_op(_ui);
+        struct userdef_type *_ut;
+        const char *_dg = NULL, *_sl = NULL, *_us = NULL;
+        int _dgl = 0, _sll = 0, _usl = 0;
+
+        if (_uop >= JOB_DONE || !lf[_uop]) continue;   /* not selected: ignore */
+        _ut = userdef_get(_uop);
+        if (!_ut) continue;
+
+        if (_ut->form.npieces) {
+          if (!userdef_form_split(&_ut->form, line, len,
+                                  &_dg, &_dgl, &_sl, &_sll, &_us, &_usl))
+            continue;                                  /* line is not this form */
+        } else {
+          char *_c1 = strchr(line, ':');
+          char *_c2 = _c1 ? strchr(_c1 + 1, ':') : NULL;
+          int _wants_salt = (_ut->slot_mask & USERDEF_SLOT_SALT) != 0;
+          int _wants_user = (_ut->slot_mask & USERDEF_SLOT_USER) != 0;
+          _dg = line;
+          if (!_wants_salt && !_wants_user) {
+            if (_c1) continue;
+            _dgl = len;
+          } else if (_wants_salt && _wants_user) {
+            if (!_c1 || !_c2) continue;
+            _dgl = (int)(_c1 - line);
+            _sl = _c1 + 1; _sll = (int)(_c2 - _c1 - 1);
+            _us = _c2 + 1; _usl = len - (int)(_c2 + 1 - line);
+          } else {
+            if (!_c1 || _c2) continue;
+            _dgl = (int)(_c1 - line);
+            if (_wants_salt) { _sl = _c1 + 1; _sll = len - _dgl - 1; }
+            else             { _us = _c1 + 1; _usl = len - _dgl - 1; }
+          }
+        }
+        if (_dgl != _ut->diglen_hex) continue;
+
+        JSLI(PV, JUDYJ(_uop), (unsigned char *)line);
+        if (_sl && _sll > 0)
+          Saltloaded[_uop] += store_typesalt(_uop, (char *)_sl, _sll);
+        if (_us && _usl > 0) {
+          Word_t *_UV;
+          memcpy(salttmp, _us, (size_t)_usl); salttmp[_usl] = 0;
+          JSLI(_UV, TYPEUSER(_uop), (unsigned char *)salttmp);
+          if (_UV) { if ((*_UV)++ == 0) Userloaded[_uop]++; }
+        }
+        Foundcnt[_uop]++;
+        _claimed = 1;
+      }
+      if (_claimed) continue;
+    }
+
+    /* ORACLE11: Oracle 11g stored form -- a 40-hex SHA1 digest followed by a
+     * 20-hex salt, concatenated into ONE 60-character field. No other type in
+     * the catalogue has a 30-byte digest, so the width identifies the format on
+     * its own and no wrapper is needed to disambiguate it.
+     *
+     * The construction is the same digest e834 SHA1PASSHEXSALT computes, but
+     * e834 takes hash and salt as separate fields. This type owns Oracle's
+     * stored form: it parses the concatenation on input and reproduces it on
+     * output, so a found line can be fed straight back to Oracle or to us.
+     * Oracle stores uppercase, and so does the JudyJ key built here, matching
+     * what procjob assembles with prmd5UC. */
+    if (lf[JOB_ORACLE11] && len == 60 && !strchr(line, ':')) {
+      int ook = 1;
+      for (y = 0; y < 60; y++) {
+        if (trhex[(unsigned char)line[y]] > 15) { ook = 0; break; }
+      }
+      if (ook) {
+        for (y = 0; y < 60; y++)
+          salttmp[y] = toupper((unsigned char)line[y]);
+        salttmp[60] = 0;
+        JSLI(PV, JUDYJ(JOB_ORACLE11), (unsigned char *)salttmp);
+        Saltloaded[JOB_ORACLE11] += store_typesalt(JOB_ORACLE11, salttmp + 40, 20);
+        Foundcnt[JOB_ORACLE11]++;
+        continue;
+      }
+    }
     if (lf[JOB_WBB3] && len == 81 && line[40] == ':') {
       int wok = 1;
       for (y = 0; y < 40; y++) {
@@ -46333,6 +47951,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         memcpy(msalt_hex, line + 6, 8);
         msalt_hex[8] = 0;
         JSLI(PV, JUDYJ(JOB_MSSQL2000), (unsigned char *)msalt_hex);
+        if (PV) (*PV)++;
         if (inhashbuf) {
           int hlen;
           if (x == 94) {
@@ -47108,6 +48727,126 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* SAP CODVN H SHA512 (35000): {x-isSHA512, ITER}BASE64(hash64+salt)
      * Algorithm: SHA512(pass+salt) iterated, same as SAPCODVNH but SHA512
      * JudyJ key = 128-hex SHA512, Typesalt = "iter:hexsalt" */
+    /* MONGODB (John "MongoDB" type 0): $mongodb$0$<user>$<32hex>
+     * digest = md5(user . ":mongo:" . pass). JudyJ key is the whole stored form,
+     * Typesalt the username. Type 1 is a sniffed challenge/response and is not
+     * loaded here. */
+    if (lf[JOB_MONGODB] && len > 14 && memcmp(line, "$mongodb$0$", 11) == 0) {
+      char *mg_d = strchr(line + 11, '$');
+      if (mg_d && (len - (int)(mg_d + 1 - line)) == 32) {
+        int mg_ul = (int)(mg_d - line - 11);
+        if (mg_ul > 0 && mg_ul < 200) {
+          JSLI(PV, JUDYJ(JOB_MONGODB), (unsigned char *)line);
+          Saltloaded[JOB_MONGODB] += store_typesalt(JOB_MONGODB, line + 11, mg_ul);
+          Foundcnt[JOB_MONGODB]++;
+          continue;
+        }
+      }
+    }
+    /* H3C: $h$6$<salt>$<base64 of 64-byte sha512>
+     * digest = sha512(pass . NUL . salt . pass . NUL). */
+    if (lf[JOB_H3C] && len > 10 && memcmp(line, "$h$6$", 5) == 0) {
+      char *h3_d = strchr(line + 5, '$');
+      if (h3_d) {
+        int h3_sl = (int)(h3_d - line - 5);
+        if (h3_sl > 0 && h3_sl < 200 && (len - h3_sl - 6) >= 40) {
+          JSLI(PV, JUDYJ(JOB_H3C), (unsigned char *)line);
+          Saltloaded[JOB_H3C] += store_typesalt(JOB_H3C, line + 5, h3_sl);
+          Foundcnt[JOB_H3C]++;
+          continue;
+        }
+      }
+    }
+
+      /* DragonFly BSD $3$/$4$: <tag><salt>$<crypt-b64 digest>.
+       * digest = sha256/sha512(pass . magic . salt); magic is the tag plus
+       * its NUL, and the 64-bit variants read 8 magic bytes rather than 4,
+       * picking up four adjacent rodata bytes. The stored forms of the 32-
+       * and 64-bit variants are IDENTICAL, so a line is loaded into both
+       * types and each is tried separately. */
+      if (line[0] == '$' && (line[1] == '3' || line[1] == '4') && line[2] == '$') {
+        char *df_d = strchr(line + 3, '$');
+        if (df_d) {
+          int df_sl = (int)(df_d - line - 3);
+          int df_hl = len - df_sl - 4;
+          if (df_sl > 0 && df_sl <= 8 &&
+              df_hl == ((line[1] == '3') ? 44 : 84)) {
+            int df_a = (line[1] == '3') ? JOB_DRAGONFLY3_32 : JOB_DRAGONFLY4_32;
+            int df_i, df_hit = 0;
+            for (df_i = df_a; df_i <= df_a + 1; df_i++) {
+              if (!lf[df_i]) continue;
+              JSLI(PV, JUDYJ(df_i), (unsigned char *)line);
+              Saltloaded[df_i] += store_typesalt(df_i, line + 3, df_sl);
+              Foundcnt[df_i]++;
+              df_hit = 1;
+            }
+            if (df_hit) continue;
+          }
+        }
+      }
+
+    /* SAP CODVN H SHA256: {x-isSHA256, ITER}BASE64(digest || salt).
+     * Same shape as SAPCODVNH512, 32-byte digest. JudyJ key = 64-hex digest,
+     * Typesalt = "iter:hexsalt". */
+    if (lf[JOB_SAPCODVNH256] && len > 20 && memcmp(line, "{x-isSHA256, ", 13) == 0) {
+      char *brace = strchr(line + 13, '}');
+      if (brace) {
+        int sh_iter = atoi(line + 13);
+        if (sh_iter >= 1) {
+          unsigned char sh_dec[400];
+          int incount;
+          int sh_dlen = b64_decode(brace + 1, (char *)sh_dec, &incount);
+          if (sh_dlen >= 32+1) {
+            char sh_jkey[64+1];
+            prmd5(sh_dec, sh_jkey, 64);
+            sh_jkey[64] = 0;
+            JSLI(PV, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)sh_jkey);
+            int sh_saltlen = sh_dlen - 32;
+            char sh_ts[600];
+            int sh_tsoff = snprintf(sh_ts, 20, "%d:", sh_iter);
+            for (y = 0; y < sh_saltlen && sh_tsoff + 2 < (int)sizeof(sh_ts); y++) {
+              sh_ts[sh_tsoff++] = hextab[sh_dec[32+y] >> 4];
+              sh_ts[sh_tsoff++] = hextab[sh_dec[32+y] & 0xf];
+            }
+            sh_ts[sh_tsoff] = 0;
+            Saltloaded[JOB_SAPCODVNH256] += store_typesalt(JOB_SAPCODVNH256, sh_ts, sh_tsoff);
+            Foundcnt[JOB_SAPCODVNH256]++;
+            continue;
+          }
+        }
+      }
+    }
+    /* SAP CODVN H SHA384: {x-isSHA384, ITER}BASE64(digest || salt).
+     * Same shape as SAPCODVNH512, 48-byte digest. JudyJ key = 96-hex digest,
+     * Typesalt = "iter:hexsalt". */
+    if (lf[JOB_SAPCODVNH384] && len > 20 && memcmp(line, "{x-isSHA384, ", 13) == 0) {
+      char *brace = strchr(line + 13, '}');
+      if (brace) {
+        int sh_iter = atoi(line + 13);
+        if (sh_iter >= 1) {
+          unsigned char sh_dec[400];
+          int incount;
+          int sh_dlen = b64_decode(brace + 1, (char *)sh_dec, &incount);
+          if (sh_dlen >= 48+1) {
+            char sh_jkey[96+1];
+            prmd5(sh_dec, sh_jkey, 96);
+            sh_jkey[96] = 0;
+            JSLI(PV, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)sh_jkey);
+            int sh_saltlen = sh_dlen - 48;
+            char sh_ts[600];
+            int sh_tsoff = snprintf(sh_ts, 20, "%d:", sh_iter);
+            for (y = 0; y < sh_saltlen && sh_tsoff + 2 < (int)sizeof(sh_ts); y++) {
+              sh_ts[sh_tsoff++] = hextab[sh_dec[48+y] >> 4];
+              sh_ts[sh_tsoff++] = hextab[sh_dec[48+y] & 0xf];
+            }
+            sh_ts[sh_tsoff] = 0;
+            Saltloaded[JOB_SAPCODVNH384] += store_typesalt(JOB_SAPCODVNH384, sh_ts, sh_tsoff);
+            Foundcnt[JOB_SAPCODVNH384]++;
+            continue;
+          }
+        }
+      }
+    }
     if (lf[JOB_SAPCODVNH512] && len > 20 && memcmp(line, "{x-isSHA512, ", 13) == 0) {
       char *brace = strchr(line + 13, '}');
       if (brace) {
@@ -47168,7 +48907,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     /* ARGON2 (34000): $argon2{d|i|id}$v=VER$m=MEM,t=ITER,p=PARA$B64SALT$B64HASH
      * JudyJ key = full format string (lowercase)
      * Typesalt = "type:ver:m:t:p:saltlen:salthex:hashlen" */
-    if (lf[JOB_ARGON2] && strncmp(line, "$argon2", 7) == 0 && inhashbuf) {
+    if ((lf[JOB_ARGON2] || lf[JOB_ARGON2MD5]) && strncmp(line, "$argon2", 7) == 0 && inhashbuf) {
       int a2type = -1;
       char *p = line + 7;
       if (*p == 'd' && p[1] == '$') { a2type = 0; p += 2; }
@@ -47205,7 +48944,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                       char judykey[MAXLINE];
                       memcpy(judykey, line, len);
                       judykey[len] = 0;
-                      JSLI(PV, JUDYJ(JOB_ARGON2), (unsigned char *)judykey);
+                      /* The wrapper does not say whether the password was pre-hashed,
+                       * so a selected ARGON2MD5 gets its own copy of the same line. */
+                      if (lf[JOB_ARGON2])    JSLI(PV, JUDYJ(JOB_ARGON2),    (unsigned char *)judykey);
+                      if (lf[JOB_ARGON2MD5]) JSLI(PV, JUDYJ(JOB_ARGON2MD5), (unsigned char *)judykey);
                       /* Build Typesalt: type:ver:m:t:p:saltlen:salthex:hashlen */
                       char salthex[512];
                       prmd5(saltbin, salthex, saltbinlen * 2);
@@ -47215,9 +48957,20 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
                       snprintf(tskey, MAXLINE, "%d:%d:%d:%d:%d:%d:%s:%d",
                                a2type, ver, m_cost, t_cost, parallelism,
                                saltbinlen, salthex, hashbinlen);
-                      JSLI(PV, TYPESALT(JOB_ARGON2), (unsigned char *)tskey);
-                      if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ARGON2]++; }
-                      Foundcnt[JOB_ARGON2]++;
+                      /* Both types read the same wrapper, so whichever is
+                       * selected needs its own salt entry; keying only ARGON2
+                       * left a selected ARGON2MD5 with an empty snapshot and it
+                       * computed nothing at all. */
+                      if (lf[JOB_ARGON2]) {
+                        JSLI(PV, TYPESALT(JOB_ARGON2), (unsigned char *)tskey);
+                        if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ARGON2]++; }
+                        Foundcnt[JOB_ARGON2]++;
+                      }
+                      if (lf[JOB_ARGON2MD5]) {
+                        JSLI(PV, TYPESALT(JOB_ARGON2MD5), (unsigned char *)tskey);
+                        if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_ARGON2MD5]++; }
+                        Foundcnt[JOB_ARGON2MD5]++;
+                      }
                       /* Track max workspace needed */
                       { size_t needed = (size_t)m_cost * 1024;
                         if (needed > Argon2_maxmem) Argon2_maxmem = needed;
@@ -47355,6 +49108,48 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
         JSLI(PV, TYPESALT(JOB_WPBCRYPT), (unsigned char *)tskey);
         if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_WPBCRYPT]++; }
         Foundcnt[JOB_WPBCRYPT]++;
+        continue;
+      }
+    }
+    /* SUNMD5: $md5$[rounds=N$]SALT$HASH22 (salt = up to the LAST $) */
+    if (lf[JOB_SUNMD5] && strncmp(line, "$md5", 4) == 0 && len > 26 && inhashbuf) {
+      char *lastsep = NULL;
+      for (x = len - 1; x > 3; x--) {
+        if (line[x] == '$') { lastsep = line + x; break; }
+      }
+      if (lastsep && (len - (int)(lastsep + 1 - line)) == 22) {
+        char judykey[512];
+        snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
+        JSLI(PV, JUDYJ(JOB_SUNMD5), (unsigned char *)judykey);
+        Foundcnt[JOB_SUNMD5]++;
+        continue;
+      }
+    }
+    /* GOST12256CRYPT: $gost12256hash$[rounds=N$]SALT$HASH43 */
+    if (lf[JOB_GOST12256CRYPT] && strncmp(line, "$gost12256hash$", 15) == 0 && inhashbuf) {
+      char *lastsep = NULL;
+      for (x = len - 1; x > 14; x--) {
+        if (line[x] == '$') { lastsep = line + x; break; }
+      }
+      if (lastsep && (len - (int)(lastsep + 1 - line)) == 43) {
+        char judykey[512];
+        snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
+        JSLI(PV, JUDYJ(JOB_GOST12256CRYPT), (unsigned char *)judykey);
+        Foundcnt[JOB_GOST12256CRYPT]++;
+        continue;
+      }
+    }
+    /* GOST94CRYPT: $gost94hash$[rounds=N$]SALT$HASH43 */
+    if (lf[JOB_GOST94CRYPT] && strncmp(line, "$gost94hash$", 12) == 0 && inhashbuf) {
+      char *lastsep = NULL;
+      for (x = len - 1; x > 11; x--) {
+        if (line[x] == '$') { lastsep = line + x; break; }
+      }
+      if (lastsep && (len - (int)(lastsep + 1 - line)) == 43) {
+        char judykey[512];
+        snprintf(judykey, sizeof(judykey), "%.*s", (int)len, line);
+        JSLI(PV, JUDYJ(JOB_GOST94CRYPT), (unsigned char *)judykey);
+        Foundcnt[JOB_GOST94CRYPT]++;
         continue;
       }
     }
@@ -48932,7 +50727,13 @@ union HashU curin;
       struct userdef_type *_ut = userdef_get(_uop);
       unsigned short _opts;
       if (_uop >= JOB_DONE || !_ut) continue;
-      _opts = TYPEOPT_NEEDSF;
+      /*
+       * User-defined types load through the STRUCTURED channel (-M/-F), not the
+       * plain-hex fast path. Their stored form may carry a salt, a user, literals
+       * or separators inside the field, none of which the hex loader can see -- it
+       * would take the whole field as the digest.
+       */
+      _opts = TYPEOPT_NEEDSJ;
       if (_ut->slot_mask & USERDEF_SLOT_SALT)
         _opts |= TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY;
       if (_ut->slot_mask & USERDEF_SLOT_USER)
@@ -50875,9 +52676,38 @@ usage:
       /* -z mode: generate a default bcrypt salt so all bcrypt variants can produce output */
       char bcrypt_defsalt[] = "$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
       JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)bcrypt_defsalt);
-      if (!TYPESALT(job->op)) {
-        JSLI(PV, TYPESALT(job->op), (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
-        if (PV) (*PV)++;
+      /* Typesalt[JOB_BCRYPT], NOT Typesalt[job->op].  This is main(), where job
+       * is the last struct off the free-list build loop and job->op is still 0,
+       * so the default salt was seeded into type 0 and BCRYPT's own salt table
+       * stayed empty.  procjob then walks TYPESALT(job->op) with op == JOB_BCRYPT,
+       * found nothing, and -z produced no output at all for e450/e451/e452. */
+      /* Seed Typesalt for EVERY selected bcrypt variant, mirroring the loader.
+       * Two separate bugs lived here.  First, this is main(), where job is the
+       * last struct off the free-list build loop and job->op is still 0, so
+       * TYPESALT(job->op) seeded type 0 and BCRYPT's own table stayed empty.
+       * Second, the compound variants walk their OWN TYPESALT(job->op) in
+       * procjob, so seeding only JOB_BCRYPT left e451/e452/e453 with nothing
+       * to iterate.  Between them, -z produced no output for any bcrypt type. */
+      { static const int bc_z[] = { JOB_BCRYPT, JOB_BCRYPT256, JOB_BCRYPTMD5,
+                                    JOB_BCRYPTSHA1, JOB_BCRYPTSHA512, -1 };
+        int bz;
+        for (bz = 0; bc_z[bz] >= 0; bz++) {
+          J1T(RC, Dohash, bc_z[bz]);
+          if (!RC) continue;
+          JSLI(PV, TYPESALT(bc_z[bz]), (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
+          if (PV) (*PV)++;
+          /* BCRYPT256 carries a SECOND construction selected by the salt form:
+           * a $2k$ salt means passlib bcrypt_sha256, which is what the CMIYC
+           * 2024 $2k$ hashes are.  With only a $2a$ default salt, bare -z could
+           * never exercise that path.  A $2k$ salt is 28 characters -- the
+           * 7-character prefix plus 21 of the 22 salt characters, the 22nd
+           * being enumerated at generate time. */
+          if (bc_z[bz] == JOB_BCRYPT256) {
+            JSLI(PV, TYPESALT(JOB_BCRYPT256),
+                 (unsigned char *)"$2k$05$RndSa1tRndSa1tRndSa1t");
+            if (PV) (*PV)++;
+          }
+        }
       }
       Bcryptcnt = 1;
     } else {
@@ -50972,7 +52802,7 @@ usage:
           J1T(RC, Dohash, mssql_types[dt]);
           if (RC) {
             JSLI(SPV, TYPESALT(mssql_types[dt]), (unsigned char *)line);
-            if (SPV && *SPV == 0) *SPV = 1;
+            if (SPV && *SPV == 0) *SPV = *PV ? *PV : 1;
           }
         }
         JSLN(PV, JUDYJ(JOB_MSSQL2000), (unsigned char *)line);
@@ -52900,6 +54730,118 @@ usage:
         } else { J1U(RC, Dohash, JOB_WBB4); }
       }
     }
+    /* MONGODB: count entries or disable */
+    { long cnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_MONGODB), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_MONGODB), (unsigned char *)line); }
+      if (cnt) {
+        fprintf(stderr, "Searching through %ld unique MONGODB hashes\n", cnt);
+      } else {
+        J1T(RC, Dohash, JOB_MONGODB);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_MONGODB), (unsigned char *)"placeholder-MONGODB");
+        } else { J1U(RC, Dohash, JOB_MONGODB); }
+      }
+    }
+    /* H3C: count entries or disable */
+    { long cnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_H3C), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_H3C), (unsigned char *)line); }
+      if (cnt) {
+        fprintf(stderr, "Searching through %ld unique H3C hashes\n", cnt);
+      } else {
+        J1T(RC, Dohash, JOB_H3C);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_H3C), (unsigned char *)"placeholder-H3C");
+        } else { J1U(RC, Dohash, JOB_H3C); }
+      }
+    }
+      /* DRAGONFLY3-32: count entries or disable */
+      { long cnt = 0;
+        line[0] = 0;
+        JSLF(PV, JUDYJ(JOB_DRAGONFLY3_32), (unsigned char *)line);
+        while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DRAGONFLY3_32), (unsigned char *)line); }
+        if (cnt) {
+          fprintf(stderr, "Searching through %ld unique DRAGONFLY3-32 hashes\n", cnt);
+        } else {
+          J1T(RC, Dohash, JOB_DRAGONFLY3_32);
+          if (RC && Printall) {
+            JSLI(PV, JUDYJ(JOB_DRAGONFLY3_32), (unsigned char *)"placeholder-DRAGONFLY3-32");
+          } else { J1U(RC, Dohash, JOB_DRAGONFLY3_32); }
+        }
+      }
+      /* DRAGONFLY3-64: count entries or disable */
+      { long cnt = 0;
+        line[0] = 0;
+        JSLF(PV, JUDYJ(JOB_DRAGONFLY3_64), (unsigned char *)line);
+        while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DRAGONFLY3_64), (unsigned char *)line); }
+        if (cnt) {
+          fprintf(stderr, "Searching through %ld unique DRAGONFLY3-64 hashes\n", cnt);
+        } else {
+          J1T(RC, Dohash, JOB_DRAGONFLY3_64);
+          if (RC && Printall) {
+            JSLI(PV, JUDYJ(JOB_DRAGONFLY3_64), (unsigned char *)"placeholder-DRAGONFLY3-64");
+          } else { J1U(RC, Dohash, JOB_DRAGONFLY3_64); }
+        }
+      }
+      /* DRAGONFLY4-32: count entries or disable */
+      { long cnt = 0;
+        line[0] = 0;
+        JSLF(PV, JUDYJ(JOB_DRAGONFLY4_32), (unsigned char *)line);
+        while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DRAGONFLY4_32), (unsigned char *)line); }
+        if (cnt) {
+          fprintf(stderr, "Searching through %ld unique DRAGONFLY4-32 hashes\n", cnt);
+        } else {
+          J1T(RC, Dohash, JOB_DRAGONFLY4_32);
+          if (RC && Printall) {
+            JSLI(PV, JUDYJ(JOB_DRAGONFLY4_32), (unsigned char *)"placeholder-DRAGONFLY4-32");
+          } else { J1U(RC, Dohash, JOB_DRAGONFLY4_32); }
+        }
+      }
+      /* DRAGONFLY4-64: count entries or disable */
+      { long cnt = 0;
+        line[0] = 0;
+        JSLF(PV, JUDYJ(JOB_DRAGONFLY4_64), (unsigned char *)line);
+        while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_DRAGONFLY4_64), (unsigned char *)line); }
+        if (cnt) {
+          fprintf(stderr, "Searching through %ld unique DRAGONFLY4-64 hashes\n", cnt);
+        } else {
+          J1T(RC, Dohash, JOB_DRAGONFLY4_64);
+          if (RC && Printall) {
+            JSLI(PV, JUDYJ(JOB_DRAGONFLY4_64), (unsigned char *)"placeholder-DRAGONFLY4-64");
+          } else { J1U(RC, Dohash, JOB_DRAGONFLY4_64); }
+        }
+      }
+    /* SAPCODVNH256: count entries or disable */
+    { long cnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)line); }
+      if (cnt) {
+        fprintf(stderr, "Searching through %ld unique SAPCODVNH256 hashes\n", cnt);
+      } else {
+        J1T(RC, Dohash, JOB_SAPCODVNH256);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
+        } else { J1U(RC, Dohash, JOB_SAPCODVNH256); }
+      }
+    }
+    /* SAPCODVNH384: count entries or disable */
+    { long cnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)line); }
+      if (cnt) {
+        fprintf(stderr, "Searching through %ld unique SAPCODVNH384 hashes\n", cnt);
+      } else {
+        J1T(RC, Dohash, JOB_SAPCODVNH384);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)"000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        } else { J1U(RC, Dohash, JOB_SAPCODVNH384); }
+      }
+    }
     /* SAPCODVNH512: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
@@ -52973,6 +54915,13 @@ usage:
             Argon2_maxmem = 65536 * 1024;
         } else { J1U(RC, Dohash, JOB_ARGON2); }
       }
+      /* ARGON2MD5 shares this workspace and the same default cost, but the floor
+       * above sits inside the ARGON2 arm and is gated on ARGON2 itself being
+       * selected.  Selecting ARGON2MD5 ALONE therefore left Argon2_maxmem at 0,
+       * the workspace was malloc'd at 16 bytes, and argon2 wrote 64 MB into it. */
+      J1T(RC, Dohash, JOB_ARGON2MD5);
+      if (RC && Printall && Argon2_maxmem < 65536 * 1024)
+        Argon2_maxmem = 65536 * 1024;
     }
     /* BCRYPTHMACSHA256: count entries or disable */
     { long cnt = 0;
@@ -52989,9 +54938,27 @@ usage:
           /* Ensure shared bcrypt infrastructure has a salt too */
           if (Bcryptcnt == 0) {
             JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-            if (!TYPESALT(job->op)) {
-              JSLI(PV, TYPESALT(job->op), (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
-              if (PV) (*PV)++;
+            /* Typesalt[JOB_BCRYPT], NOT Typesalt[job->op].  This is main(), where job
+             * is the last struct off the free-list build loop and job->op is still 0,
+             * so the default salt was seeded into type 0 and BCRYPT's own salt table
+             * stayed empty.  procjob then walks TYPESALT(job->op) with op == JOB_BCRYPT,
+             * found nothing, and -z produced no output at all for e450/e451/e452. */
+            /* Seed Typesalt for EVERY selected bcrypt variant, mirroring the loader.
+             * Two separate bugs lived here.  First, this is main(), where job is the
+             * last struct off the free-list build loop and job->op is still 0, so
+             * TYPESALT(job->op) seeded type 0 and BCRYPT's own table stayed empty.
+             * Second, the compound variants walk their OWN TYPESALT(job->op) in
+             * procjob, so seeding only JOB_BCRYPT left e451/e452/e453 with nothing
+             * to iterate.  Between them, -z produced no output for any bcrypt type. */
+            { static const int bc_z[] = { JOB_BCRYPT, JOB_BCRYPT256, JOB_BCRYPTMD5,
+                                          JOB_BCRYPTSHA1, JOB_BCRYPTSHA512, -1 };
+              int bz;
+              for (bz = 0; bc_z[bz] >= 0; bz++) {
+                J1T(RC, Dohash, bc_z[bz]);
+                if (!RC) continue;
+                JSLI(PV, TYPESALT(bc_z[bz]), (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tu");
+                if (PV) (*PV)++;
+              }
             }
             Bcryptcnt = 1;
           }
@@ -53043,6 +55010,75 @@ usage:
         } else { J1U(RC, Dohash, JOB_WPBCRYPT); }
       }
     }
+        /* SUNMD5: copy JudyJ to Typesalt, free JudyJ */
+        { long smcnt = 0;
+          line[0] = 0;
+          JSLF(PV, JUDYJ(JOB_SUNMD5), (unsigned char *)line);
+          while (PV) {
+            Word_t *SPV;
+            JSLI(SPV, TYPESALT(JOB_SUNMD5), (unsigned char *)line);
+            if (SPV && *SPV == 0) *SPV = 1;
+            smcnt++;
+            JSLN(PV, JUDYJ(JOB_SUNMD5), (unsigned char *)line);
+          }
+          JSLFA(RC, JUDYJ(JOB_SUNMD5));
+          if (smcnt) {
+            Numsalts += smcnt;
+            fprintf(stderr, "Searching through %ld unique SUNMD5 hashes\n", smcnt);
+          } else {
+            J1T(RC, Dohash, JOB_SUNMD5);
+            if (RC && Printall) {
+              JSLI(PV, TYPESALT(JOB_SUNMD5), (unsigned char *)"$md5$rounds=904$defaultSalt$");
+              if (PV && *PV == 0) *PV = 1;
+            } else { J1U(RC, Dohash, JOB_SUNMD5); }
+          }
+        }
+        /* GOST12256CRYPT: copy JudyJ to Typesalt, free JudyJ (like GOST12512CRYPT) */
+        { long gcnt = 0;
+          line[0] = 0;
+          JSLF(PV, JUDYJ(JOB_GOST12256CRYPT), (unsigned char *)line);
+          while (PV) {
+            Word_t *SPV;
+            JSLI(SPV, TYPESALT(JOB_GOST12256CRYPT), (unsigned char *)line);
+            if (SPV && *SPV == 0) *SPV = 1;
+            gcnt++;
+            JSLN(PV, JUDYJ(JOB_GOST12256CRYPT), (unsigned char *)line);
+          }
+          JSLFA(RC, JUDYJ(JOB_GOST12256CRYPT));
+          if (gcnt) {
+            Numsalts += gcnt;
+            fprintf(stderr, "Searching through %ld unique GOST12256CRYPT hashes\n", gcnt);
+          } else {
+            J1T(RC, Dohash, JOB_GOST12256CRYPT);
+            if (RC && Printall) {
+              JSLI(PV, TYPESALT(JOB_GOST12256CRYPT), (unsigned char *)"$gost12256hash$defaultS$");
+              if (PV && *PV == 0) *PV = 1;
+            } else { J1U(RC, Dohash, JOB_GOST12256CRYPT); }
+          }
+        }
+        /* GOST94CRYPT: copy JudyJ to Typesalt, free JudyJ (like GOST12512CRYPT) */
+        { long gcnt = 0;
+          line[0] = 0;
+          JSLF(PV, JUDYJ(JOB_GOST94CRYPT), (unsigned char *)line);
+          while (PV) {
+            Word_t *SPV;
+            JSLI(SPV, TYPESALT(JOB_GOST94CRYPT), (unsigned char *)line);
+            if (SPV && *SPV == 0) *SPV = 1;
+            gcnt++;
+            JSLN(PV, JUDYJ(JOB_GOST94CRYPT), (unsigned char *)line);
+          }
+          JSLFA(RC, JUDYJ(JOB_GOST94CRYPT));
+          if (gcnt) {
+            Numsalts += gcnt;
+            fprintf(stderr, "Searching through %ld unique GOST94CRYPT hashes\n", gcnt);
+          } else {
+            J1T(RC, Dohash, JOB_GOST94CRYPT);
+            if (RC && Printall) {
+              JSLI(PV, TYPESALT(JOB_GOST94CRYPT), (unsigned char *)"$gost94hash$defaultS$");
+              if (PV && *PV == 0) *PV = 1;
+            } else { J1U(RC, Dohash, JOB_GOST94CRYPT); }
+          }
+        }
     /* GOST12512CRYPT: copy JudyJ → Typesalt, free JudyJ (like SHA512CRYPT) */
     { long gost12cnt = 0;
       line[0] = 0;

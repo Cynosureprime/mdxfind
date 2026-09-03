@@ -534,6 +534,28 @@ static id<MTLBuffer> buf_overflow_hashes  = nil;
 static id<MTLBuffer> buf_overflow_offsets = nil;
 static id<MTLBuffer> buf_hashes_shown     = nil;   /* on-GPU dedup (lazy) */
 
+/* 2026-08-30 emission audit (mdx-gpu): the shared legacy carrier dedups
+ * hits on-GPU by setting bit (iter & 31) of hashes_shown[matched_idx]
+ * BEFORE claiming a hit slot. A record that is claimed but never
+ * delivered to the host suppresses that crack permanently, because no
+ * other thread will re-emit it. That failure is invisible in normal
+ * output. These two statics make it detectable.
+ *
+ *   mtl_audit_hits_delivered -- running total of hit-slot reservations
+ *       handed back to the host across every batch of the run.
+ *   mtl_audit_shown_bytes    -- size of the one-time hashes_shown
+ *       allocation, so shutdown can popcount exactly that many bytes;
+ *       it doubles as the bound for the under-size guard at the
+ *       dispatch site.
+ *
+ * At shutdown, popcount(hashes_shown) counts the claims that were NOT
+ * rolled back by the overflow arm, and must equal
+ * mtl_audit_hits_delivered. A shortfall means a claimed (hash, iter)
+ * never reached the host. Reported loudly when they disagree, per
+ * feedback_external_failures_are_fatal.md (never silently under-report). */
+static uint64_t mtl_audit_hits_delivered = 0ull;
+static size_t   mtl_audit_shown_bytes    = 0;
+
 /* Phase 2a row 6: rule_program + rule_offset MTLBuffers. Uploaded lazily
  * on first rules dispatch from the gpu_rule_program / gpu_rule_offsets
  * externs (mdxfind.c populates those at session start). Reused across
@@ -1967,6 +1989,33 @@ void gpu_metal_shutdown(void)
     buf_overflow_keys    = nil;
     buf_overflow_hashes  = nil;
     buf_overflow_offsets = nil;
+    /* 2026-08-30 emission audit (mdx-gpu). Compare the number of dedup
+     * bits still set in hashes_shown against the number of hit records
+     * the host actually received. The carrier claims the bit BEFORE it
+     * reserves a hit slot, and only the overflow arm rolls the bit back,
+     * so at shutdown popcount(hashes_shown) MUST equal the delivered
+     * record total. A shortfall means a claimed (hash, iter) never
+     * reached the host and that crack was silently suppressed -- exactly
+     * the failure class this audit exists to make loud. */
+    if (buf_hashes_shown != nil && mtl_audit_shown_bytes > 0) {
+        const uint32_t *hs = (const uint32_t *)[buf_hashes_shown contents];
+        size_t nwords = mtl_audit_shown_bytes / sizeof(uint32_t);
+        uint64_t bits = 0ull;
+        for (size_t i = 0; i < nwords; i++) bits += (uint64_t)__builtin_popcount(hs[i]);
+        if (bits != mtl_audit_hits_delivered
+            || getenv("MDXFIND_METAL_EMIT_AUDIT") != NULL) {
+            fprintf(stderr,
+                "mdxfind: Metal legacy carrier emission audit: "
+                "dedup claims=%llu delivered records=%llu%s\n",
+                (unsigned long long)bits,
+                (unsigned long long)mtl_audit_hits_delivered,
+                (bits != mtl_audit_hits_delivered)
+                    ? "  *** MISMATCH: claimed hits were NOT delivered;"
+                      " cracks were silently lost ***" : "");
+        }
+    }
+    mtl_audit_hits_delivered = 0ull;
+    mtl_audit_shown_bytes    = 0;
     buf_hashes_shown     = nil;
     buf_rule_program     = nil;
     buf_rule_offset      = nil;
@@ -2602,6 +2651,54 @@ static struct gpu_metal_family metal_family_md5 = {
     .base_macros        = NULL,   /* populated in metal_register_builtin_families */
     .dispatch_tg_size   = 0,
     .fam_idx            = -1,     /* populated by metal_assign_fam_indices */
+};
+
+/* MD5UC alias family (op=JOB_MD5UC, e2) -- 2026-08-30.
+ *
+ * JOB_MD5UC is the uppercase-hex-feedback variant of JOB_MD5: between -i
+ * iterations the digest is re-fed as UPPERCASE hex instead of lowercase.
+ * Iteration 1 is byte-exact with MD5, so the UC branch only fires BETWEEN
+ * iterations -- mirroring the CPU arm at mdxfind.c case JOB_MD5UC, which
+ * computes the iter-1 digest and then jumps into MDstart with x = 2.
+ *
+ * No kernel of its own. The shared MD5 template PSO already carries the
+ * branch: metal_md5_core.metal rev 1.3 defines GPU_TEMPLATE_ITERATE_HAS_-
+ * ALGO_MODE and its template_iterate selects md5_to_hex_uc vs md5_to_hex_lc
+ * from params.algo_mode; metal_template.metal rev 1.8 threads algo_mode
+ * into that call. algo_mode is host-set per dispatch, so ONE compiled PSO
+ * serves both ops -- the same aliasing pattern sha512cryptmd5 uses against
+ * sha512crypt below. metal_family_md5uc's own slots in metal_family_libs[][]
+ * / metal_family_psos[][] stay NULL for the process lifetime;
+ * metal_family_md5.fam_idx stays canonical.
+ *
+ * OpenCL twin: gpu/gpu_opencl.c has BOTH halves already -- the template
+ * resolver arm (case JOB_MD5UC, B7.7a) and the algo_mode setter (B7.7a) --
+ * plus the dispatch-side admit list (B7.9). The Metal host side was never
+ * wired, so gpu_metal_lookup_family(JOB_MD5UC) returned NULL, gpu_metal_-
+ * dispatch_md5_rules bailed at its `fam == NULL` gate, and every MD5UC
+ * batch reported 0 hits with NO CPU fallback (silent zero-crack). */
+static void *md5uc_pso_for_variant_v2(struct gpu_metal_family *fam,
+                                      uint8_t variant_bits)
+{
+    (void)fam;
+    return md5_pso_for_variant_v2(&metal_family_md5, variant_bits);
+}
+
+static struct gpu_metal_family metal_family_md5uc = {
+    .op                 = JOB_MD5UC,
+    .name               = "md5uc",
+    .op_category        = GPU_CAT_UNSALTED,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,  /* alias family; v2 wrapper canonical */
+    .pso_for_variant_v2 = md5uc_pso_for_variant_v2,
+    .core_str           = NULL,  /* aliases metal_family_md5's library */
+    .base_macros        = NULL,  /* aliases metal_family_md5's macros */
+    .dispatch_tg_size   = 0,
+    .fam_idx            = -1,    /* populated by metal_assign_fam_indices */
 };
 
 static struct gpu_metal_family metal_family_md5salt = {
@@ -3785,6 +3882,7 @@ static void metal_register_builtin_families(void)
     });
 
     gpu_metal_register_family(&metal_family_md5);
+    gpu_metal_register_family(&metal_family_md5uc);  /* 2026-08-30: e2 alias of md5 */
     gpu_metal_register_family(&metal_family_md5salt);
     gpu_metal_register_family(&metal_family_md4);
     gpu_metal_register_family(&metal_family_md4utf16);
@@ -7933,7 +8031,16 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * gates on `if (algo_mode >= 5u)` (or `== 5u` for blake2s); host
          * must set this correctly or the HMAC body silently never fires
          * (defensive fallback runs, producing wrong digest). */
-        if      (op == JOB_HMAC_BLAKE2S)           params->algo_mode = 5u;
+        /* 2026-08-30: JOB_MD5UC (e2) rides the shared MD5 template
+         * kernel with algo_mode=1u, which makes template_iterate emit
+         * UPPERCASE hex between -i iterations (metal_md5_core.metal rev
+         * 1.3). Mirrors the OpenCL twin's setter in gpu/gpu_opencl.c
+         * (`if (op == JOB_MD5UCSALT || op == JOB_MD5UC) ... = 1u`).
+         * JOB_MD5UCSALT is deliberately NOT listed here: no Metal
+         * md5ucsalt family is registered, so it never reaches this
+         * setter. */
+        if      (op == JOB_MD5UC)                  params->algo_mode = 1u;
+        else if (op == JOB_HMAC_BLAKE2S)           params->algo_mode = 5u;
         else if (op == JOB_HMAC_STREEBOG256_KSALT) params->algo_mode = 5u;
         else if (op == JOB_HMAC_STREEBOG256_KPASS) params->algo_mode = 6u;
         else if (op == JOB_HMAC_STREEBOG512_KSALT) params->algo_mode = 5u;
@@ -7987,6 +8094,30 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                           hs_bytes, op, need_slots);
             }
             memset([buf_hashes_shown contents], 0, hs_bytes);
+            /* 2026-08-30: remember what was actually allocated. This
+             * buffer is allocated ONCE and deliberately never resized --
+             * it carries dedup state across every batch of the run, so
+             * reallocating it would silently re-report already-emitted
+             * cracks. The codegen sibling at the top of this file does
+             * grow its copy, because there the buffer is re-zeroed per
+             * dispatch anyway. */
+            mtl_audit_shown_bytes = hs_bytes;
+        }
+        /* If a later dispatch needs more dedup slots than the one-time
+         * allocation holds, the kernel would index hashes_shown[] past
+         * the end of the buffer: an out-of-bounds atomic_fetch_or into
+         * whatever follows it in the Metal heap. Nothing downstream can
+         * detect that, and the visible symptom would be corrupted or
+         * missing cracks -- the exact failure class this dispatch path
+         * was just audited for. Refuse to run it. */
+        if (hs_bytes > mtl_audit_shown_bytes) {
+            GPU_FATAL("Metal: hashes_shown buffer too small for this dispatch "
+                      "(allocated %zu bytes, need %zu; op=%d need_slots=%zu "
+                      "hash_data_count=%d overflow_count=%d). The legacy "
+                      "carrier sizes this dedup buffer once per GPU session "
+                      "and cannot grow it without discarding dedup state.",
+                      mtl_audit_shown_bytes, hs_bytes, op, need_slots,
+                      cache_hash_data_count, cache_overflow_count);
         }
 
         /* Hits output buffer (GPU side). HIT_STRIDE uint32 per hit. */
@@ -8112,11 +8243,15 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
 #define METAL_RULE_CHUNK_SIZE 8192u
 #endif
         uint32_t rule_chunk_size = METAL_RULE_CHUNK_SIZE;
+        int rule_chunk_from_env = 0;
         {
             const char *env_chunk = getenv("MDXFIND_METAL_RULE_CHUNK");
             if (env_chunk != NULL) {
                 long v = strtol(env_chunk, NULL, 10);
-                if (v >= 1 && v <= 1000000) rule_chunk_size = (uint32_t)v;
+                if (v >= 1 && v <= 1000000) {
+                    rule_chunk_size = (uint32_t)v;
+                    rule_chunk_from_env = 1;
+                }
             }
         }
         if (!use_rules) rule_chunk_size = 1u;  /* one-shot for non-rules */
@@ -8159,6 +8294,64 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
             if (scaled < 256u) scaled = 256u;
             if (rule_chunk_size > scaled) rule_chunk_size = scaled;
             if (rule_chunk_size > total_rules) rule_chunk_size = total_rules;
+        }
+
+        /* ITER-AXIS scale-down (2026-08-30, mdx-gpu).
+         *
+         * The per-dispatch work budget is
+         *     words x rule_chunk x mask_size x salt_chunk x max_iter
+         * because the carrier's probe loop in metal_template.metal runs
+         * max_iter times per (word, rule, mask, salt) candidate. The two
+         * scale-downs above only ever looked at the salt axis, so a
+         * `-i N` run multiplied the command-buffer budget by N with no
+         * compensation at all.
+         *
+         * That is what made (Metal legacy carrier, iter>1, large rule
+         * count) look like nondeterministic silent hit loss: on an M1,
+         * ~15.7K words x 8192 rules x 10 iters is ~1.3e9 probe steps in
+         * one command buffer, which sits right on Apple's ~2 s
+         * kIOGPUCommandBufferCallbackErrorImpactingInteractivity
+         * watchdog. It tripped intermittently (measured 1 run in 5 with
+         * dive.rule -i 10 on dev1, 2026-08-30), the dispatch loop took
+         * the FATAL arm partway through the run, and an operator reading
+         * only the crack tally saw an under-count. Before
+         * metal_template.metal 1.8 the iterate step was never taken, so
+         * -i N cost nothing on this path and the omission was unreachable.
+         *
+         * Divide the rule chunk by max_iter so an iterated dispatch
+         * carries the same budget as the validated non-iterated one.
+         * Floor at 64 rules so the chunk-loop overhead stays bounded for
+         * very large -i. An explicit MDXFIND_METAL_RULE_CHUNK wins over
+         * this, so the operator keeps a way to say exactly what they
+         * mean. Ops that force max_iter=1 (SHA1DRU, the HMAC
+         * family, PHPBB3, MD5CRYPT, the SHACRYPT triple, DESCRYPT,
+         * BCRYPT) are unaffected -- their internal round count is
+         * accounted for separately at the salt-chunk tier. */
+        {
+            uint32_t iter_axis = (params->max_iter < 1u) ? 1u : params->max_iter;
+            if (!rule_chunk_from_env
+                && use_rules && iter_axis > 1u && rule_chunk_size > 64u) {
+                uint32_t scaled = rule_chunk_size / iter_axis;
+                if (scaled < 64u) scaled = 64u;
+                if (scaled < rule_chunk_size) rule_chunk_size = scaled;
+                if (rule_chunk_size > total_rules) rule_chunk_size = total_rules;
+                /* One-shot, unconditional. This changes dispatch
+                 * granularity in a way the operator can feel, and the
+                 * absence of the line is how you tell that an -i N run
+                 * is still carrying the un-divided budget. Sibling of
+                 * the "Metal: rule engine" advisory. */
+                static int iter_scaledown_logged = 0;
+                if (!iter_scaledown_logged) {
+                    iter_scaledown_logged = 1;
+                    fprintf(stderr,
+                        "Metal: iter-axis scale-down: max_iter=%u -> "
+                        "rule_chunk=%u rules/dispatch (total_rules=%u); "
+                        "keeps the per-command-buffer budget under Apple's "
+                        "interactivity watchdog\n",
+                        (unsigned)iter_axis, (unsigned)rule_chunk_size,
+                        (unsigned)total_rules);
+                }
+            }
         }
 
         /* Phase 2e.1 first-dispatch marker extension. One-shot stderr
@@ -8313,11 +8506,27 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                  * Phase 2d.5 dev3 PSO silent-data-loss bug. Never silently
                  * fall back; operator sees the error at first occurrence
                  * with full context. */
+                /* 2026-08-30: name the watchdog explicitly. The most
+                 * common cb.error on Apple silicon here is
+                 * kIOGPUCommandBufferCallbackErrorImpactingInteractivity
+                 * -- the ~2 s per-command-buffer watchdog -- and the
+                 * operator's lever is the per-dispatch work budget, not
+                 * anything about the hash list. Print the full budget
+                 * shape and the knob so the failure is actionable
+                 * instead of merely loud. */
                 MTL_FATAL_NSERR(cb.error,
                     "Metal dispatch error op=%d salt_base=%u salt_count=%u "
-                    "rule_base=%u rule_count=%u total_rules=%u",
+                    "rule_base=%u rule_count=%u total_rules=%u "
+                    "words=%u max_iter=%u mask_size=%u "
+                    "(per-dispatch budget = words x rule_count x mask_size "
+                    "x salt_count x max_iter; if this is Apple's "
+                    "ImpactingInteractivity watchdog, lower it with "
+                    "MDXFIND_METAL_RULE_CHUNK=<rules-per-dispatch>, "
+                    "currently %u)",
                     op, salt_base, this_salt_chunk,
-                    rule_base, this_chunk, total_rules);
+                    rule_base, this_chunk, total_rules,
+                    (unsigned)num_words, (unsigned)params->max_iter,
+                    (unsigned)mask_size_for_pack, (unsigned)rule_chunk_size);
             }
 
             /* Phase 2e.1 Path 1b post-process: rewrite this dispatch's
@@ -8392,6 +8601,18 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         uint32_t raw_nhits = 0;
         memcpy(&raw_nhits, p + 128, sizeof(raw_nhits));
         uint32_t emitted = raw_nhits > GPU_MAX_HITS ? GPU_MAX_HITS : raw_nhits;
+        /* 2026-08-30 emission audit: raw_nhits (not the clamped value) is
+         * the number of dedup claims this batch turned into hit-slot
+         * reservations. Clamping loss is separately loud below. */
+        mtl_audit_hits_delivered += (uint64_t)raw_nhits;
+        if (raw_nhits > (uint32_t)GPU_MAX_HITS) {
+            fprintf(stderr,
+                "mdxfind: WARNING %s:%d Metal legacy carrier: hit buffer "
+                "overflow -- %u records produced, GPU_MAX_HITS=%d "
+                "delivered; %u cracks LOST for this batch (op=%d)\n",
+                __FILE__, __LINE__, (unsigned)raw_nhits, GPU_MAX_HITS,
+                (unsigned)(raw_nhits - (uint32_t)GPU_MAX_HITS), op);
+        }
 
         if (emitted > 0) {
             size_t bytes = (size_t)emitted * GPU_HIT_STRIDE * sizeof(uint32_t);

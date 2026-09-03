@@ -1,3 +1,272 @@
+# mdxfind v1.576 — mdxfind emitted hashes that its own reported password would not reproduce
+
+Source: mdxfind.c rev 1.545 → 1.576. Companion release: hashpipe v1.189.
+
+**Roughly a dozen types now emit different digests than v1.545 did. In every case the
+old value was wrong — computed over different input than the line reported, or dependent
+on unrelated state — but if you hold stored results for these types, or diff against
+older output, you will see the change.** The affected types are listed under *Changed
+output* below.
+
+A full regression pass now verifies every emitted line: 7,234,771 lines across 1,020
+types, 0 unresolved. Before this work the same pass left 13,092 lines that hashpipe
+could not reproduce.
+
+## Changed output
+
+These types produce different digests than v1.545. Regenerate anything you have stored.
+
+    SHA1SHA256TRUNCSALT      SHA1SHA256TRUNCMD5SALT   SHA1SHA1CAPSALT
+    MD4UTF16SHA1x            MD4UTF16MD5x             MD4UTF16SHA256x
+    SHA1-MD5sub8-24SALT      MD5DSALT                 MD5-LMNTLM
+    PROGRESSENCODE           ARGON2                   ARGON2MD5
+    PHPBB3MD5                PBKDF2-MD5               PBKDF2-SHA1
+    PBKDF2-SHA256            PBKDF2-SHA512
+
+plus 18 types in the PASS family (`*MD5PASS`, `*PASSMD5`) — but only for candidates
+whose bytes contain a NUL. ASCII candidates are unaffected there.
+
+## A digest that depended on the rest of the run
+
+`SHA1SHA256TRUNCSALT` and `SHA1SHA256TRUNCMD5SALT` wrote the 64-character hex into a
+working buffer once, above the salt loop. The truncation loop then copied each salt into
+that same buffer at descending offsets 63 down to 21 and never restored it, so the second
+and every later salt truncated its predecessor's salt bytes rather than the hex.
+
+The consequence is worth stating plainly: the digest encoded **which other salts were in
+the run**. The same password, salt and truncation length produced a different hash when a
+longer salt appeared elsewhere in the list, and the salt that came out correct was the one
+that sorted first, not the one listed first.
+
+    salt list          reported for salt "Kp", N=32
+    Kp alone           993a12707f5ce3330bab5b3bac98b9de77cd108b   correct
+    Kp + a longer salt 00a18043132c559e5777910ee1864fccec6f7c37   wrong
+
+`e678` shows nothing because its published vectors use a single salt.
+
+## A candidate truncated at its first NUL
+
+Thirty-two sites built the input for a PASS-family type by copying the candidate after the
+hex of a preceding digest with `strncpy`, which stops at a NUL in the source. A candidate
+containing a NUL was cut there and the remainder never hashed, so the digest belonged to a
+different input than the one printed beside it. Eighteen types were affected.
+
+`strncpy` only pads when the source is shorter than the count, and the count here is the
+true length, so for NUL-free candidates `memcpy` is byte-identical — verified by
+regenerating the NUL-free vectors unchanged.
+
+The same class appeared twice more. All four PBKDF2 types measured their base64-decoded
+salt with `mystrlen`: one of the ten salts in the shipped def files decodes with a trailing
+NUL, so the line said twelve bytes and the digest used eleven. And `MD5-LMNTLM` wrote the
+LM half's fourteen-character limit back into the reported candidate while the NTLM half had
+already consumed the full one — feeding that printed password back to mdxfind produced a
+different hash.
+
+## A width taken from an unset variable
+
+`SHA1-MD5sub8-24SALT` set the width of its iterated digest from a variable its case never
+assigns, so it used whatever a previous job had left in that thread. The emitted depths
+therefore depended on unrelated state. A sha1 digest is 40 hex characters, which is what
+the following line hashes, so the width is now written out.
+
+## Stale bytes past the value
+
+`PROGRESSENCODE` had two faults stacked. `myprogress` writes sixteen characters and does
+not terminate them, so the value was emitted followed by whatever the buffer already held —
+nothing when the type ran alone, a fixed thirty-six character tail in a full pass. And the
+candidate padding zeroed `len % 16` bytes, the complement of what padding to a sixteen-byte
+boundary requires: a three-byte candidate had three bytes cleared where thirteen were
+needed, so the hash function consumed stale buffer content past the padding. Candidates
+whose length left no gap were unaffected, which is why the type looked intermittent.
+
+## Default salts that could not produce a valid line
+
+`-z` generation depends on a built-in default salt for types that take one, and two were
+unusable:
+
+- **ARGON2 / ARGON2MD5** — the default was sixteen NUL bytes. The Magento forms print the
+  salt with `%.*s`, which stops at the first NUL, so the field rendered empty and every
+  generated line carried no salt at all. The default is now printable ASCII. Separately,
+  the bare `:2` Magento shape is hash version 2, whose Argon2 parameters are fixed at a
+  32-byte digest, t=2 and m=65536 KiB; it was emitted unconditionally, so a hash computed
+  at any other cost produced a line that could never verify. It is now emitted only when
+  those parameters hold.
+- **PHPBB3MD5** — PHPass salts are exactly eight characters and the default carried ten,
+  so every default-path line was malformed.
+
+## Two salts reported as one
+
+`MD5DSALT` computes `md5(md5(md5(pass) . salt) . salt2)` and reports the two salts
+concatenated with no separator. Its iterated lines passed only the first salt's length, so
+every line below the base depth dropped salt2 entirely — three distinct digests came out
+labelled with the same salt, and none could be verified. The full key is now reported,
+matching what the base depth already did.
+
+Note for anyone consuming this type: the split point is still not recoverable from the
+line, so a reader has to try each position. Each salt is bounded at three characters, so
+at most three splits need testing. This is now hx.8 Note [50].
+
+## Chain state written over its own input
+
+Three types kept their chain state in a buffer that the inner iteration then wrote back
+into, so the chain was not what the type's expression describes.
+
+- **MD4UTF16SHA1x, MD4UTF16MD5x, MD4UTF16SHA256x** — the inner loop wrote the running
+  digest into the chain buffer and reassigned its width, so each outer round hashed the
+  previous round's inner result at the wrong width instead of its own chain value. Only the
+  first round ever matched.
+- **SHA1SHA1CAPSALT** — the iteration wrote through the buffer still holding the capped hex
+  and the salt, and `prmd5` also NUL-terminates at `out[40]`, which landed on the salt's
+  first byte. From the second cap position both the capping and the hashing ran over
+  corrupted data.
+
+## Documentation
+
+`hx.8` corrected eight rows and gained two notes. Four of the corrected rows — `SHA1MD5USER`,
+`MD5CAPMD5USER`, `MD5CAPMD5MD5USER` and `MD5MD5MD5USER` — described the algorithm as hashing
+the username alone, with no password term at all. Anyone implementing from those rows would
+have got the type wrong.
+
+Note [50] records MD5DSALT's concatenated salt. Note [51] records that mdxfind converts a
+password to UTF-16LE two different ways — a Latin-1 byte expansion for DCC2, AZURESYNC,
+KRB5PA23 and KRB5TGS23, and a real UTF-8 conversion through iconv for MSONLINE and plain
+NTLM — which is not visible from the expressions and silently produces wrong results for
+non-ASCII candidates if you pick one convention for all of them.
+
+## Verification
+
+Every emitted line of a regenerated corpus now verifies: 7,234,771 lines, 1,020 types,
+0 unresolved, at `-i 5 -q 5`. Built and confirmed on three platforms:
+
+    Darwin x86_64   INTEL/SSE    full corpus, 0 unresolved
+    Linux x86-64    INTEL/SSE    self-test 1026/0, changed types at full coverage
+    Darwin arm64    NOTINTEL     self-test 1026/0, changed types at full coverage
+
+The arm64 build matters here because `MD5DSALT` carries a separate implementation behind
+`#ifdef NOTINTEL` that the x86 builds never compile.
+
+Four types are no longer generated into the regression corpus, each for a stated reason:
+`7ZIP` (no verifier exists for the container format), `NULL` (a passthrough diagnostic whose
+reported value embeds undecoded input), and `MD5AM` / `MD5AM2` (custom to a single hash
+list). They remain fully available for cracking; only corpus generation skips them.
+
+## Also in this release: changes from 1.546 through 1.565
+
+These revisions were checked in after v1.545 but never released, so they ship here.
+
+### Twenty-five new hash types, e1003 through e1027
+
+All sourced from John the Ripper and verified against John's own published vectors —
+never against vectors produced by the code under test, which would prove nothing. For
+SAPCODVNH, DragonFly, MONGODB and H3C the construction was first reproduced by an
+independent implementation, so the check is not circular.
+
+    e1003 MD4SALTPASS         e1004 MD4PASSSALT         e1005 SHA1UCUSERPASS
+    e1006 SHA1USERCOLONPASS   e1007 MD5PASSSALTMD5PASSSALT  e1008 QAS-VASAUTH
+    e1009 POSTOFFICE          e1010 IPB2                e1011 MD5USERMD5PASSSALT
+    e1012 RVARY               e1013 SHA512RAWPASSSALT   e1014 EPISERVER-SID
+    e1015 ORACLE11            e1016 SAPCODVNH256        e1017 SAPCODVNH384
+    e1018 MONGODB             e1019 H3C                 e1020 ARGON2MD5
+    e1021-e1024 DRAGONFLY3/4-32/64                      e1025 GOST12256CRYPT
+    e1026 GOST94CRYPT         e1027 SUNMD5
+
+Three are worth calling out. **ORACLE11** owns Oracle 11g's stored 60-character form —
+a 40-hex digest immediately followed by a 20-hex salt in one field. The value equals what
+`e834 SHA1PASSHEXSALT` computes, but e834 needs the two as separate fields; this type reads
+and reproduces Oracle's own shape. It recovered a real harvest class: 3,622 lines of a
+1,003,754-line intake were correct Oracle 11g cracks that no type could read.
+
+**The DragonFly pairs reproduce a bug in the original.** The magic is the format tag
+including its NUL terminator, and on 64-bit builds its length was taken as 8 rather than 4,
+so four adjacent rodata bytes ride along after the NUL. Both variants are in the wild. The
+32- and 64-bit stored forms are identical, so a line loads into both types of its pair and
+only the correct one verifies.
+
+**SUNMD5** hashes 1,516 characters of *Hamlet* plus its terminating NUL, because Sun passed
+`sizeof()`. Dropping the NUL yields a plausible but wrong digest for every candidate.
+
+### The entire bcrypt family generated nothing under -z
+
+Not a regression — a 1.553 binary is equally empty, so it had been broken for some time. It
+surfaced only because a post-deploy smoke test across twelve types came back 11 of 12. The
+type was never disabled, so a run printed `Working on hash types: BCRYPT` and then emitted
+nothing: an honest-looking empty result rather than an error.
+
+Two bugs were stacked in the same bootstrap. The Printall branch seeded the default salt
+with `TYPESALT(job->op)`, but that code is in `main()`, not `procjob`, where `job` is the
+last struct off the free-list build loop and `job->op` is still 0 from its initialiser — so
+the salt went into type 0 and bcrypt's own table stayed empty. Correcting that exposed the
+second: only `JOB_BCRYPT` was seeded, while each compound variant walks its own table.
+
+`BCRYPT256` needed two further rounds. Its `-z` emitted two hashes and the first was wrong:
+a loop documented as firing only for `$2k$` salts had an `else` arm that computed
+`e989 BCRYPTHMACSHA256`'s construction and emitted it under the BCRYPT256 label. And the
+`$2k$` arm built its salt with `strncpy` of exactly 28 bytes — which does not NUL-pad at that
+length — then wrote a character at index 28 and never terminated, so `crypt_rn` read past
+the end.
+
+The `$2k$` form is now generated and solved. Real samples finally exist (5,179 in the 2024
+contest archive) and KoreLogic's write-up names it: passlib's `bcrypt_sha256`. The stored
+form is 59 characters, holding 21 of the 22 salt characters; the 22nd carries only two
+significant bits and is recovered by trying `.euO`. Bare `-z` now emits five hashes per
+password — one `$2a$` and four `$2k$` — and all five crack back. Validated against vectors
+generated independently with Python's `bcrypt` and `hmac` modules.
+
+### A four-month regression in the RAW family, restored
+
+Revision 1.290 (2026-04-09) replaced a `goto` handoff with a self-contained loop, as
+collateral to a genuine buffer-aliasing fix. That silently changed two things: the base was
+reported one round early, and iteration re-fed the raw digest instead of the hex. Every RAW
+type became numerically identical to its plain sibling at x01 — `MD5RAW` duplicated `MD5`,
+`SHA1RAW` duplicated `SHA1`, losing SHA1RAW's identity as MySQL 4.1. Affects `MD5RAW`,
+`SHA1RAW`, `SHA224RAW`, `SHA256RAW`, `SHA384RAW`, `SHA512RAW` and `MD5RAWMD5RAW`.
+
+No crack file has been written for this family since 2026-01-06, three months before the
+regression, so no filed result carries the wrong semantics.
+
+### Heap corruption when ARGON2MD5 was selected alone
+
+Reported as a yarn `pthread error 22`, reproducing 15-19 times in 20. The yarn message was a
+symptom. `Argon2_maxmem` has a 64 MB floor for `-z`, but that floor sat inside the ARGON2 arm
+and was gated on ARGON2 itself being selected — so choosing ARGON2MD5 alone left it at zero,
+the workspace was 16 bytes, and argon2 wrote its full 64 MB `m_cost` into it. Selecting both
+types together masked it, which is why it looked intermittent and why it was missed when the
+type was added in 1.556.
+
+Beyond the cause, the class: `argon2_prealloc_cb` now records the bytes actually allocated
+and refuses an oversized request instead of returning a buffer that cannot hold it, turning
+any recurrence into a clean failure rather than corruption surfacing far away.
+
+### A salt retired after its first hash
+
+`MSSQL`'s loader inserted the 8-hex salt into JudyJ without incrementing its counter, and the
+bootstrap hardcoded the refcount to 1 regardless of how many hashes shared that salt. Since
+that refcount is what `PV_DEC` decrements, the salt was retired after the first match and
+every other hash carrying it was silently never tried — cracks for some, silence for the
+rest, so a run looks partially successful rather than broken.
+
+Audited as a class: twelve other bootstraps use the same hardcoded idiom, but every one keys
+`Typesalt` on the whole stored line, so a count of 1 is correct by construction there. MSSQL
+was the only type keying on a bare shared salt.
+
+Also in 1.560, iSCSI CHAP's length guard admitted a password of up to `MAXLINE` while the
+case builds id byte, password and challenge into a `MAXLINE+16` buffer; the guard now
+reserves 1024 bytes.
+
+### Smaller items
+
+- **1.552** — user-defined types now load through the structured `-M`/`-F` channel and honour
+  a declared stored form on input and output. Their field may carry a salt, user, literals or
+  separators, none of which the hex loader can see, which is why a salted user type could not
+  read its own hashes. Known gap, pre-existing: `-z` still cannot generate for a *salted* user
+  type.
+- **1.564** — `SHA1WRLUCTRUNCSALT` (e672) shared the lowercase path with e683/e739 and emitted
+  lowercase despite its UC name and hx.8 definition. Now 108/108.
+- **1.550, 1.553** — forced revisions so `-V` reflects shared-source changes: a Metal
+  dispatch-budget fix for Apple's ~2s command-buffer watchdog, and a `userdef.c` change that
+  stopped counting an unknown key as a fatal error (an older binary meeting a newer key
+  refused to run and processed nothing).
+
 # mdxfind v1.545 — `-X '$HEX[...]'` used the wrong key, and the usage text now lists every option
 
 Source: mdxfind.c rev 1.543 → 1.545. Companion release: hashpipe v1.116.

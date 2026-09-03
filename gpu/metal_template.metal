@@ -681,8 +681,29 @@ kernel void template_phase0(
                                                       hashes_shown, matched_idx, mask,
                                                       ovr_set, ovr_gid, gid);
                     }
-                    /* Phase 1: template_iterate() is intentionally NOT called.
-                     * Phase 2 re-adds it inside `if (iter < max_iter) { ... }`. */
+                    /* Advance to the next -i iteration. Mirrors
+                     * gpu_template.cl lines 666-677 exactly: the step is
+                     * taken only BETWEEN probes, never after the last one.
+                     *
+                     * This call was stubbed out in Phase 1 (max_iter==1
+                     * only) and the "Phase 2 re-adds it" note was never
+                     * acted on, so every family served by this legacy
+                     * carrier probed the SAME digest max_iter times and
+                     * could only ever report x01. Codegen-eligible ops
+                     * hid the defect because gpu/codegen_auto_dispatch.c
+                     * routes (Metal, iter>1, rules>0) away from here.
+                     *
+                     * B7.7a algo_mode threading: only metal_md5_core.metal
+                     * defines GPU_TEMPLATE_ITERATE_HAS_ALGO_MODE (uppercase
+                     * hex for JOB_MD5UC); every other core keeps the legacy
+                     * one-argument shape. */
+                    if (iter < max_iter) {
+#ifdef GPU_TEMPLATE_ITERATE_HAS_ALGO_MODE
+                        template_iterate(st, params.algo_mode);
+#else
+                        template_iterate(st);
+#endif
+                    }
                 }
                 } /* salt_local (inner tile) */
             } /* salt_base (SALT_BATCH-stride outer) */

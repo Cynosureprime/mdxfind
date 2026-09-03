@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.2 $
+ * $Revision: 1.3 $
  * $Log: gpu_md5raw_core.cl,v $
+ * Revision 1.3  2026/08/30 14:35:34  dlr
+ * Restore the RAW-family iteration rule in the GPU kernels to match mdxfind.c 1.549. These kernels were written against the post-1.290 CPU regression and validated byte-exact against it, which is why CPU-vs-GPU conformance testing never caught the error: both sides agreed on the wrong answer. The correct rule is ONE binary feed at the base, giving X(X_bin(pass)), followed by STANDARD hex iteration. The former template_iterate already implemented exactly that binary absorb, so it is renamed template_raw_refeed, moved ahead of template_finalize and called once at the end of it; template_iterate is replaced by the plain siblings hex step. For the Metal MD5 variant the algo_mode parameter is dropped since RAW has no uppercase form and the call site uses the legacy single-argument shape. Validated on fpga.local GTX 1080 via OpenCL: 15 of 15 lines identical between CPU and GPU across five types and three depths, with a bogus-hash negative control returning zero. On dev1.local Apple M1 via Metal the base is correct and matches CPU at x01 for all five types, but iterations beyond x01 are not returned; that is a coverage gap and not a wrong answer, confirmed by comm showing zero Metal lines absent from the CPU set.
+ *
  * Revision 1.2  2026/05/11 05:22:01  dlr
  * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.
  *
@@ -84,7 +87,32 @@ static inline void template_transform(template_state *st,
     md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
 }
 
-/* template_finalize: byte-identical to gpu_md5_core.cl. */
+/* template_raw_refeed: absorb the 16-byte BINARY digest as a fresh message.
+ * This is the ONE binary feed that defines the RAW family: the base digest is
+ * md5(md5_bin(pass)). It is NOT the -i iteration step -- see template_iterate.
+ *
+ * Layout: M[0..3] = 16 LE digest bytes; M[4] = 0x80 pad; M[14] = 128 bits.
+ * 16 + 1 + 8 = 25 < 56, single block.
+ */
+static inline void template_raw_refeed(template_state *st)
+{
+    uint M[16];
+    M[0] = st->h[0];
+    M[1] = st->h[1];
+    M[2] = st->h[2];
+    M[3] = st->h[3];
+    M[4] = 0x80u;
+    for (int j = 5; j < 14; j++) M[j] = 0u;
+    M[14] = 16u * 8u;
+    M[15] = 0u;
+    st->h[0] = 0x67452301u;
+    st->h[1] = 0xEFCDAB89u;
+    st->h[2] = 0x98BADCFEu;
+    st->h[3] = 0x10325476u;
+    md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
+}
+
+/* template_finalize: plain MD5 finalize, then ONE binary re-feed. */
 static inline void template_finalize(template_state *st,
                                      const uchar *data, int len)
 {
@@ -124,41 +152,30 @@ static inline void template_finalize(template_state *st,
         M[15] = 0;
         md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
     }
+    /* the one binary feed that makes this MD5RAW rather than MD5 */
+    template_raw_refeed(st);
+
 }
 
-/* template_iterate: MD5RAW iter — re-feed the 16-byte BINARY digest
- * (not hex-encoded) into the compression. CPU reference at mdxfind.c
- * line 24237:
+/* template_iterate: -i loop step. MD5RAW iterates on the 32-byte lowercase
+ * HEX encoding of the digest, exactly as plain MD5 does -- the binary feed
+ * belongs to the BASE (template_raw_refeed), not to iteration.
  *
- *   memcpy(cur, md5buf.h, 16);
- *   mymd5(cur, 16, md5buf.h);
- *
- * State after template_finalize: st->h[0..3] hold the 4 LE uint32 digest
- * words. They are exactly the LE-packed M[0..3] of an md5_block call
- * given the 16-byte digest as input (since md5 reads message words LE).
- *
- * Layout:
- *   M[0..3]  = st->h[0..3] (16 LE digest bytes; native md5 word order)
- *   M[4]     = 0x80u    (0x80 padding marker at byte 16, LE)
- *   M[5..13] = 0
- *   M[14]    = 16 * 8 = 128 (length in bits, LE)
- *   M[15]    = 0
- *
- * Single block (16 + 1 + 8 = 25 < 56). After absorption, h[] holds the
- * fresh digest in native MD5 LE form.
+ * Corrected 2026-08-30 alongside mdxfind.c 1.549. Between mdxfind.c 1.290 and
+ * 1.548 the CPU reported md5(pass) as x01 and re-fed the RAW digest each
+ * round; this kernel was written against that regressed reference and matched
+ * it byte-exact, which is why CPU-vs-GPU validation never caught it. The rule
+ * confirmed by the gp crack corpus is: one binary feed at the base, then
+ * standard hex iteration.
  */
 static inline void template_iterate(template_state *st)
 {
     uint M[16];
-    M[0] = st->h[0];
-    M[1] = st->h[1];
-    M[2] = st->h[2];
-    M[3] = st->h[3];
-    M[4] = 0x80u;
-    for (int j = 5; j < 14; j++) M[j] = 0u;
-    M[14] = 16u * 8u;
+    md5_to_hex_lc(st->h[0], st->h[1], st->h[2], st->h[3], M);
+    M[8] = 0x80u;
+    for (int j = 9; j < 14; j++) M[j] = 0u;
+    M[14] = 32u * 8u;     /* 32 hex chars = 256 bits */
     M[15] = 0u;
-    /* Reset state to MD5 IV; absorb the prepared block. */
     st->h[0] = 0x67452301u;
     st->h[1] = 0xEFCDAB89u;
     st->h[2] = 0x98BADCFEu;
