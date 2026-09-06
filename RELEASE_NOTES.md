@@ -1,3 +1,53 @@
+# mdxfind v1.579 — PHPBB3MD5 found one hash per salt and silently skipped the rest
+
+Source: mdxfind.c rev 1.578 -> 1.579.
+
+If you hold PHPBB3MD5 (e537) results from an earlier version, re-run them. Any list
+with more than one hash per salt was under-reported, and the shortfall is invisible in
+the output: the run completes, reports cracks, and simply stops at the first hash for
+each salt.
+
+    121 hashes, 11 salts, 11 passwords     before: 11 found     now: 121 found
+
+Plain PHPBB3 (e455) was never affected, and no other type is.
+
+## What was wrong
+
+The loader files the phpBB3 wrapper's salt under a 12-character key -- `$H$`, the cost
+character and the 8-character salt -- so every hash sharing a salt maps to one Typesalt
+entry, and `store_typesalt()` counts them as it inserts. PHPBB3MD5 did not get that
+count. The bootstrap copied PHPBB3's salt keys across and stamped each one with a
+hardcoded 1. That count is what the per-job salt snapshot decrements, so the salt was
+retired the moment the first hash matched and every other hash carrying it was never
+tried.
+
+This is the same failure that was fixed for MSSQL in v1.560. The audit that accompanied
+that fix cleared twelve other bootstraps on the grounds that each keys Typesalt on the
+whole stored line, so one entry maps to one hash. That is true for eleven of them and
+untrue for phpBB3, whose key is the salt.
+
+## What changed
+
+The phpBB3 family is now a table:
+
+    static const int Phpbb3Family[] = { JOB_PHPBB3, JOB_PHPBB3MD5 };
+
+The loader files each selected member's salts into that member's own Typesalt, counted
+by the same call that inserts them. There is no copy step and no count produced anywhere
+that does not know the answer. A future member of the family -- a PHPBB3SHA1, say -- is
+one entry in that table plus its compute arm.
+
+Three consequences worth knowing:
+
+  * `-M e537` alone no longer populates the salt array of e455, a type that was not
+    selected. The startup line names the type it actually loaded.
+
+  * `-M e455 -F one.txt -M e537 -F two.txt` loads two different files into two
+    different salt arrays, and the salt total is their sum.
+
+  * That startup line now says `salts` rather than `hashes`, because the number it
+    prints has always been the count of distinct salts.
+
 # mdxfind v1.578 — two ways a `-F` run found nothing and said nothing
 
 Source: mdxfind.c rev 1.576 → 1.578 (1.577 was wording in the revision notes).

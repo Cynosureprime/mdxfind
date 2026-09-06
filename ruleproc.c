@@ -41,9 +41,14 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.31 2026/05/18 05:22:32 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.32 2026/09/06 15:05:48 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.32  2026/09/06 15:05:48  dlr
+ * Move the 61 RULE_OP_* opcode defines into rule_ops.h and include it.
+ *
+ * The byte engine and the UTF-32 engine both need the opcode numbering, and a second copy of 61 defines is a second place for them to drift. rule_ops.h is the single definition; ruleproc.c now includes it. No functional change: the defines are identical and the file is otherwise untouched.
+ *
  * Revision 1.31  2026/05/18 05:22:32  dlr
  * ruleproc.c: remove unused includes (limits.h, wctype.h, errno.h) flagged by clangd; verified zero references in file.
  *
