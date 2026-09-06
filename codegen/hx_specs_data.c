@@ -29135,19 +29135,19 @@ static const hx_program _hx_program_854 = {
     .has_emit  = 0,
 };
 
-/* eidx=855 e858 PEOPLESOFT : `sha1(utf16be(upper(pass)))` (hx.8 line 884) */
+/* eidx=855 e858 PEOPLESOFT : `base64(sha1_bin(utf16le(pass)))` (hx.8 line 884) */
 static const char *_hx_callnames_855[] = {
     [0] = NULL,
-    [1] = "upper",
-    [2] = "utf16be",
-    [3] = "sha1",
+    [1] = "utf16le",
+    [2] = "sha1",
+    [3] = "base64",
     [4] = NULL,
 };
 static const hx_inst _hx_code_855[5] = {
     [0] = { .op = 0, .u.slot = 0 },
-    [1] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="upper" */ },
-    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="utf16be" */ },
-    [3] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="sha1" */ },
+    [1] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="utf16le" */ },
+    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 1 } /* fn="sha1" */ },
+    [3] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="base64" */ },
     [4] = { .op = 6 },
 };
 static const char *_hx_varnames_855[5] = {
@@ -34862,7 +34862,7 @@ const struct hx_spec_entry hx_specs_data[] = {
     { .job_enum = 855, .name = "POSTGRESQL", .expression = "md5(pass . user)", .hx8_line = 881, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_852, .call_names = _hx_callnames_852, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 856, .name = "JUNIPERSSG", .expression = "juniper_encode(md5_bin(user . \":Administration Tools:\" . pass))", .hx8_line = 882, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_853, .call_names = _hx_callnames_853, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 857, .name = "SKYPE", .expression = "md5(user . fromhex(\"0a\") . \"skyper\" . fromhex(\"0a\") . pass)", .hx8_line = 883, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_854, .call_names = _hx_callnames_854, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 858, .name = "PEOPLESOFT", .expression = "sha1(utf16be(upper(pass)))", .hx8_line = 884, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_855, .call_names = _hx_callnames_855, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 858, .name = "PEOPLESOFT", .expression = "base64(sha1_bin(utf16le(pass)))", .hx8_line = 884, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_855, .call_names = _hx_callnames_855, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 859, .name = "EPISERVER", .expression = "base64(sha1_bin(salt . pass))", .hx8_line = 885, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_856, .call_names = _hx_callnames_856, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 860, .name = "HMAILSERVER", .expression = "sha256(salt . pass)", .hx8_line = 886, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_857, .call_names = _hx_callnames_857, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 861, .name = "CISCOPIX", .expression = "cisco_pix_encode(md5_bin(pad(pass, 16)))", .hx8_line = 887, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_858, .call_names = _hx_callnames_858, .emit_class = 0, .note_ref = 0 },

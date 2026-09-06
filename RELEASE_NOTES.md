@@ -1,3 +1,63 @@
+# mdxfind v1.578 — two ways a `-F` run found nothing and said nothing
+
+Source: mdxfind.c rev 1.576 → 1.578 (1.577 was wording in the revision notes).
+
+Reported by kpd, who lost an evening to a salted list that would not crack until he
+tried `-F` instead of `-f`. Nothing about which types need which option had changed —
+but nothing in the output said so either, and both of the ways to get it wrong ended
+in the same place: a run that printed a plausible `Working on hash types:` line,
+found nothing, and exited 0.
+
+## `-F` before `-m`/`-M` is now refused
+
+`-F` and `-J` parse their file at the moment `getopt` reaches them, against whatever
+selection exists *then*. A selection that appears later on the command line cannot
+reach that file:
+
+    mdxfind -F hashes.txt -M e373 words.txt      # loaded nothing, found nothing, exit 0
+    mdxfind -M e373 -F hashes.txt words.txt      # correct
+
+The first form is now fatal and names both the file and the option that read it.
+`-F` with no selection at all is unchanged: it still loads against the default MD5
+type, which is a working configuration.
+
+Note that it is the *selection* that must come first, not `-M` specifically — `-m e373
+-F file` works. `-M` additionally restricts which of the selected types the file loads
+into. The man page said `-M` was required; that has been corrected.
+
+## Every hash file now reports what it contributed
+
+The per-type lines only ever printed what was found, so a file that yielded nothing
+printed nothing at all, and the plain-hex fast path returned before printing even
+those. Each file now reports on stderr:
+
+    hashes.txt: 4213 hashes, 4213 salts, 0 users loaded
+
+and a file that contributed nothing says so, and says what to check. This is what
+makes kpd's original case visible: a `hash:salt` file read with `-f` keeps the hex
+digest and discards the salt, so a salted type now reports `0 salts` where before it
+reported nothing.
+
+## `-h` names the option you actually type
+
+The Options column of the `mdxfind -h` type listing showed `J`, the internal flag
+letter, for the structured channel. The option a user types for it is `-F`, which
+therefore appeared nowhere in the table. It now reads `F`, with a legend:
+
+    e451      F        BCRYPTMD5                     25600
+    e455      f,F,s    PHPBB3                        400
+
+      f   plain hex, read with -f (or on stdin)
+      F   wrapped or structured hash, read with -F
+      s   takes a salt: use -F with hash:salt lines, or -s <saltfile>
+      u   takes a username     j   takes a pepper
+
+with the ordering rule stated under it, and a footer recording that a type marked `F`
+does not load from `-f` at all, while a type marked `s` does but loses its salt.
+
+No hash computation changed. 37 types spanning every channel class produce
+byte-identical regression results against v1.576.
+
 # mdxfind v1.576 — mdxfind emitted hashes that its own reported password would not reproduce
 
 Source: mdxfind.c rev 1.545 → 1.576. Companion release: hashpipe v1.189.

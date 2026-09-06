@@ -270,10 +270,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.576 2026/09/02 22:11:25 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.578 2026/09/06 02:57:49 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.576 2026/09/02 22:11:25 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.578 2026/09/06 02:57:49 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -291,6 +291,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.578  2026/09/06 02:57:49  dlr
+ * Make the two silent failures around -F visible, reported by kpd 2026-09-05 after losing an evening to the second one. First: -F and -J parse their file at the moment getopt reaches them, so a -m, -M or -h that appears LATER on the command line cannot reach it, and the run completed with 0 found and exit 0 while still printing a plausible Working on hash types line. That is now fatal, naming the file and the option that read it. -F with no selection at all is unchanged and still works against the MD5 default, which was measured before wiring the check, since that path does crack. Second: load_hash_file reported only what it found, so a file that yielded nothing said nothing at all, and its plain-hex fast path returned before even that. Every file now reports what it contributed on stderr, on every path including the fast one, and a file that contributed nothing says so and says what to check: the fast-path return becomes a goto to the shared receipt, and commit_compact counts the hashes it commits. kpd hit the channel half of this, a hash colon salt file read with -f, which keeps the hex and discards the salt: that run now reads 2 hashes, 0 salts, 0 users loaded against a salted type, where before it printed nothing at all. Third, the -h type listing: the Options column showed the internal flag letter J for the structured channel, so the option the user actually types, -F, appeared nowhere in the table. It is F now, with a legend naming each channel and the ordering rule, and a footer stating that a type marked F does not load from -f while a type marked s does but loses its salt. Measured: 37 types spanning every channel class run through regress.sh against the unmodified 1.577 binary and this one produce byte-identical results, 20 pass and 11 fail in both, so no behavioural change. The 11 failures are pre-existing and mostly salted types finding 0, worth a separate look. Hand checks: the ordering case is now refused where it silently found nothing, selection-first runs are unchanged and still crack, and -F with the default MD5 type still cracks.
+ *
+ * Revision 1.577  2026/09/04 17:16:44  dlr
+ * Wording in the revision notes.
+ *
  * Revision 1.576  2026/09/02 22:11:25  dlr
  * Pad the PROGRESSENCODE candidate by the right amount. The code zeroed len modulo 16 bytes after the candidate, which is the complement of what padding to a 16-byte boundary needs: for a three-byte candidate it cleared three bytes where thirteen were required, so myprogress consumed stale buffer content past the padding and the digest depended on what an earlier job had left there. Candidates whose length left no gap, such as eleven bytes, were unaffected, which is why only some failed and why the type looked intermittent. With the count corrected the type verifies 11 of 11, closing the last outstanding family.
  *
@@ -325,22 +331,22 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
  * Fix salt-list contamination in SHA1SHA256TRUNCSALT and SHA1SHA256TRUNCMD5SALT. The 64-character hex was written into linebuf once, above the salt loop, but the truncation loop copies the salt into that same buffer at descending offsets 63 through 21 and never restores it. The first salt was unaffected, because each read covers only offsets below the current N and every write so far sat at or above it, but the buffer it left behind was wrecked from offset 21 up. Every later salt then truncated its predecessor salt bytes in place of the hex, so the emitted digest for the left-truncated shape depended on the whole salt list, its content and which salt sorted first. Same password, same salt and same N gave a different hash when a longer salt appeared elsewhere in the run. Restoring the hex from linebuf2, which holds the same value and is only ever written from offset 64, costs one 64-byte copy per salt. The right-truncated shape was always correct and is unchanged. Verified: identical output across three different salt-list contexts; e678 regenerates its published vectors byte for byte; e679 changes exactly the 9230 contaminated lines of 23650 and hashpipe now verifies all 23650.
  *
  * Revision 1.565  2026/09/01 20:43:05  dlr
- * Generate and solve the $2k$ form of BCRYPT256. Real samples exist at last - 5179 of them in contest/history/2024 - and KoreLogic own write-up names the algorithm: "$2k$: Hashes generated using Python passlib.hash.bcrypt_sha256". The stored form is 59 characters, being the 7-character prefix, 21 of the 22 salt characters and a 31-character checksum; the 22nd salt character holds only 2 significant bits and is recovered by trying the four canonical values ".euO", which this code already enumerated. Three changes. First, crypt_rn returns the ordinary 60-character $2b$ form, and that was used both for the JudyJ lookup and for the emitted hash. The loader files the $2k$ line, so the lookup could never hit and a real $2k$ hash was unsolvable, while -z output did not round-trip. The $2k$ form is now rebuilt after crypt_rn - prefix k, 21 salt characters, then the checksum - and used for both. It is built at linebuf2 + MAXLINE*2, which is free: linebuf2 is MAXLINE*3 and only [0,60) and [MAXLINE,MAXLINE+30) are in use. Second, -z stopped after the first candidate, so it emitted the ".": variant for every salt and could not reproduce a stored hash whose character was one of the other three. Under Printall it now emits all four, as other multi-emit families do. Third, a $2k$ default salt is seeded alongside the $2a$ one for JOB_BCRYPT256, so bare -z exercises the construction at all; with only a $2a$ default it could reach the bcrypt(sha256(pass)) path and nothing else. Also corrected while there: the break after a successful crack abandoned any OTHER stored hash sharing the same 21-character prefix with a different 22nd character. It is now gated on the salt refcount, which PV_DEC has just decremented, so it still breaks immediately in the normal one-hash-per-salt case and costs nothing. Real 126-bit salts never collide, but -z has a single default salt and produced exactly that case. Result: bare -z now emits FIVE hashes per password as Dave specified - one $2a$ bcrypt(sha256(pass)) and four $2k$ - and all five crack back through -M and -F. Validated against vectors generated INDEPENDENTLY with the python bcrypt and hmac modules rather than by either tool: 4 of 4 solve, a cost-12 vector matching the contest cost solves, and mdxfind own -z output for a loaded $2k$ salt is byte-identical to the python round-trip, which is the first confirmation the algorithm itself is right. hashpipe verifies all five generated hashes both under -m e577 and under bare auto-detect. No collateral: BCRYPT, BCRYPTMD5, BCRYPTSHA1, BCRYPTSHA512, BCRYPTHMACSHA256 and WPBCRYPT all still generate under -z and all still crack back; 0 false positives on the five generated hashes fed a wrong password, in both tools; hashpipe self-test 1026 passed 0 failed.
+ * Generate and solve the $2k$ form of BCRYPT256. Real samples exist at last - 5179 of them in contest/history/2024 - and KoreLogic own write-up names the algorithm: "$2k$: Hashes generated using Python passlib.hash.bcrypt_sha256". The stored form is 59 characters, being the 7-character prefix, 21 of the 22 salt characters and a 31-character checksum; the 22nd salt character holds only 2 significant bits and is recovered by trying the four canonical values ".euO", which this code already enumerated. Three changes. First, crypt_rn returns the ordinary 60-character $2b$ form, and that was used both for the JudyJ lookup and for the emitted hash. The loader files the $2k$ line, so the lookup could never hit and a real $2k$ hash was unsolvable, while -z output did not round-trip. The $2k$ form is now rebuilt after crypt_rn - prefix k, 21 salt characters, then the checksum - and used for both. It is built at linebuf2 + MAXLINE*2, which is free: linebuf2 is MAXLINE*3 and only [0,60) and [MAXLINE,MAXLINE+30) are in use. Second, -z stopped after the first candidate, so it emitted the ".": variant for every salt and could not reproduce a stored hash whose character was one of the other three. Under Printall it now emits all four, as other multi-emit families do. Third, a $2k$ default salt is seeded alongside the $2a$ one for JOB_BCRYPT256, so bare -z exercises the construction at all; with only a $2a$ default it could reach the bcrypt(sha256(pass)) path and nothing else. Also corrected while there: the break after a successful crack abandoned any OTHER stored hash sharing the same 21-character prefix with a different 22nd character. It is now gated on the salt refcount, which PV_DEC has just decremented, so it still breaks immediately in the normal one-hash-per-salt case and costs nothing. Real 126-bit salts never collide, but -z has a single default salt and produced exactly that case. Result: bare -z now emits FIVE hashes per password as Waffle specified - one $2a$ bcrypt(sha256(pass)) and four $2k$ - and all five crack back through -M and -F. Validated against vectors generated INDEPENDENTLY with the python bcrypt and hmac modules rather than by either tool: 4 of 4 solve, a cost-12 vector matching the contest cost solves, and mdxfind own -z output for a loaded $2k$ salt is byte-identical to the python round-trip, which is the first confirmation the algorithm itself is right. hashpipe verifies all five generated hashes both under -m e577 and under bare auto-detect. No collateral: BCRYPT, BCRYPTMD5, BCRYPTSHA1, BCRYPTSHA512, BCRYPTHMACSHA256 and WPBCRYPT all still generate under -z and all still crack back; 0 false positives on the five generated hashes fed a wrong password, in both tools; hashpipe self-test 1026 passed 0 failed.
  *
  * Revision 1.564  2026/09/01 14:08:46  dlr
  * Fix SHA1WRLUCTRUNCSALT (e672) to uppercase the whirlpool hex digest. It shared the lowercase sha1_truncsalt path with e683/e739, so despite its UC name and hx.8 definition it emitted lowercase. Verified 108/108 against sha1(cut(upper(wrl(pass)),0,N).salt). Also carries the GOSTHEXSALT rhash-to-gosthash correction.
  *
  * Revision 1.563  2026/09/01 04:12:55  dlr
- * Fix heap corruption when ARGON2MD5 is selected on its own. Reported by Dave as yarn internal pthread error 22 while aborting on -h argon2md5 -f /dev/null -z, reproducing 15 to 19 times in 20 across every invocation shape and at every thread count including -t 1. The yarn message was a symptom, not the fault. A crash report caught the other face of it: abort inside malloc_report, called from yarn ignition, which is heap corruption detected on a later allocation. Cause: Argon2_maxmem is the size the argon2 workspace is allocated from. It is computed in the loader from the loaded hashes, and for -z there is a floor of 64 MB in the bootstrap. That floor sits INSIDE the ARGON2 arm and is gated on ARGON2 itself being selected, so choosing ARGON2MD5 alone left Argon2_maxmem at zero, argon2_ws was malloc_lock of 0 plus 16 bytes, and argon2 then wrote its full 64 MB m_cost into a 16-byte allocation. Selecting both types together masks it, which is what made it look intermittent and is also why it was missed when the type was added. The bug is mine, from the ARGON2MD5 addition in 1.556. Two changes. First the cause: the bootstrap now sets the same floor when ARGON2MD5 is selected, whether or not ARGON2 is. Second the class: argon2_prealloc_cb now records the bytes actually allocated and REFUSES a request larger than the workspace instead of handing back a buffer that cannot hold it. That converts any future recurrence from silent corruption surfacing far away into a clean argon2_ctx failure and a skipped candidate. The callback previously checked only for a NULL workspace and never for size. Verified: the reported command now completes 20 times out of 20 and its output cracks back, with hashpipe independently verifying the generated hash as ARGON2MD5; e987 ARGON2 is unaffected at 0 failures in 10 and still round-trips; the registered ARGON2 and ARGON2MD5 vectors still crack through the ordinary loader path where Argon2_maxmem comes from the hashes; 22 assorted types complete -z without error; all six bcrypt types still emit exactly one validating line; and the MSSQL shared-salt and iSCSI long-password fixes both still hold.
+ * Fix heap corruption when ARGON2MD5 is selected on its own. Reported by Waffle as yarn internal pthread error 22 while aborting on -h argon2md5 -f /dev/null -z, reproducing 15 to 19 times in 20 across every invocation shape and at every thread count including -t 1. The yarn message was a symptom, not the fault. A crash report caught the other face of it: abort inside malloc_report, called from yarn ignition, which is heap corruption detected on a later allocation. Cause: Argon2_maxmem is the size the argon2 workspace is allocated from. It is computed in the loader from the loaded hashes, and for -z there is a floor of 64 MB in the bootstrap. That floor sits INSIDE the ARGON2 arm and is gated on ARGON2 itself being selected, so choosing ARGON2MD5 alone left Argon2_maxmem at zero, argon2_ws was malloc_lock of 0 plus 16 bytes, and argon2 then wrote its full 64 MB m_cost into a 16-byte allocation. Selecting both types together masks it, which is what made it look intermittent and is also why it was missed when the type was added. The bug is mine, from the ARGON2MD5 addition in 1.556. Two changes. First the cause: the bootstrap now sets the same floor when ARGON2MD5 is selected, whether or not ARGON2 is. Second the class: argon2_prealloc_cb now records the bytes actually allocated and REFUSES a request larger than the workspace instead of handing back a buffer that cannot hold it. That converts any future recurrence from silent corruption surfacing far away into a clean argon2_ctx failure and a skipped candidate. The callback previously checked only for a NULL workspace and never for size. Verified: the reported command now completes 20 times out of 20 and its output cracks back, with hashpipe independently verifying the generated hash as ARGON2MD5; e987 ARGON2 is unaffected at 0 failures in 10 and still round-trips; the registered ARGON2 and ARGON2MD5 vectors still crack through the ordinary loader path where Argon2_maxmem comes from the hashes; 22 assorted types complete -z without error; all six bcrypt types still emit exactly one validating line; and the MSSQL shared-salt and iSCSI long-password fixes both still hold.
  *
  * Revision 1.562  2026/09/01 03:43:31  dlr
- * BCRYPT256 -z emitted two hashes and the first was wrong. The type has two code paths: a loop over the salt table that handles the dollar 2k form, and a fall-through to BC_Start that computes the ordinary form, bcrypt of the lowercase hex of sha256 of the password, which is what hx.8 documents and what hashcat 30600 does. A note directly under the loop asserts that everything in it fires only for a dollar 2k salt. That was not true: the loop had an else arm which, for any OTHER salt form, computed e989 BCRYPTHMACSHA256 construction and emitted it under the BCRYPT256 label. So a dollar 2a salt produced the HMAC shape AND then the correct shape, two lines, and only the second verified. The loop now skips any salt that is not dollar 2k, which makes the note true rather than merely intended. Also fixed, found while testing the above: the dollar 2k arm built its salt with strncpy of exactly 28 bytes, which does not NUL-pad at that length, then wrote the extra salt character at index 28 and never terminated the string. The HMAC key below it is passed with an explicit length of 22 and was unaffected, but crypt_rn takes the salt as a C string and was reading past the end. And BC_Start now skips dollar 2k salts, because crypt_rn does not know that prefix and returns its error marker star zero, which was being emitted as though it were a hash. NOT done, deliberately: -z does not generate the dollar 2k variant. It can be generated, but the result is unverifiable in both directions, and this is pre-existing rather than anything introduced here. Generation produces the internal dollar 2b rewrite, 7 char prefix plus a 22 char salt plus the hash, 60 characters. A stored dollar 2k line is 59, a 7 char prefix plus a 21 char salt plus the hash, because the extra salt character the loop appends is not part of the stored form. The loop compares its 60 character crypt output against the stored 59 character lines, so they can never be equal: a correctly reconstructed dollar 2k line loads and then fails to crack under its own password, which was measured. Making the two sides agree without a real vector would only make them consistently wrong while LOOKING validated, which is the trap that let SAP-BCODE report Pass for months on self-generated vectors. Dave has no legitimate dollar 2k sample and agrees to leave it ungenerated until one turns up. Verified: all six bcrypt types now emit exactly one -z line each and every one validates in BOTH mdxfind and hashpipe; the registered e450, e577 and e989 vectors still crack; 11 of 11 sampled non-bcrypt types still produce -z output; the MSSQL shared-salt and iSCSI long-password fixes from 1.560 both still hold; hashpipe self-test 1026 passed 0 failed.
+ * BCRYPT256 -z emitted two hashes and the first was wrong. The type has two code paths: a loop over the salt table that handles the dollar 2k form, and a fall-through to BC_Start that computes the ordinary form, bcrypt of the lowercase hex of sha256 of the password, which is what hx.8 documents and what hashcat 30600 does. A note directly under the loop asserts that everything in it fires only for a dollar 2k salt. That was not true: the loop had an else arm which, for any OTHER salt form, computed e989 BCRYPTHMACSHA256 construction and emitted it under the BCRYPT256 label. So a dollar 2a salt produced the HMAC shape AND then the correct shape, two lines, and only the second verified. The loop now skips any salt that is not dollar 2k, which makes the note true rather than merely intended. Also fixed, found while testing the above: the dollar 2k arm built its salt with strncpy of exactly 28 bytes, which does not NUL-pad at that length, then wrote the extra salt character at index 28 and never terminated the string. The HMAC key below it is passed with an explicit length of 22 and was unaffected, but crypt_rn takes the salt as a C string and was reading past the end. And BC_Start now skips dollar 2k salts, because crypt_rn does not know that prefix and returns its error marker star zero, which was being emitted as though it were a hash. NOT done, deliberately: -z does not generate the dollar 2k variant. It can be generated, but the result is unverifiable in both directions, and this is pre-existing rather than anything introduced here. Generation produces the internal dollar 2b rewrite, 7 char prefix plus a 22 char salt plus the hash, 60 characters. A stored dollar 2k line is 59, a 7 char prefix plus a 21 char salt plus the hash, because the extra salt character the loop appends is not part of the stored form. The loop compares its 60 character crypt output against the stored 59 character lines, so they can never be equal: a correctly reconstructed dollar 2k line loads and then fails to crack under its own password, which was measured. Making the two sides agree without a real vector would only make them consistently wrong while LOOKING validated, which is the trap that let SAP-BCODE report Pass for months on self-generated vectors. Waffle has no legitimate dollar 2k sample and agrees to leave it ungenerated until one turns up. Verified: all six bcrypt types now emit exactly one -z line each and every one validates in BOTH mdxfind and hashpipe; the registered e450, e577 and e989 vectors still crack; 11 of 11 sampled non-bcrypt types still produce -z output; the MSSQL shared-salt and iSCSI long-password fixes from 1.560 both still hold; hashpipe self-test 1026 passed 0 failed.
  *
  * Revision 1.561  2026/09/01 02:07:25  dlr
  * Fix -z producing no output at all for the entire bcrypt family. Two independent bugs stacked in the same bootstrap, and the type was not disabled, so the run printed Working on hash types BCRYPT and then emitted nothing - an honest-looking empty result rather than an error. First bug: the Printall branch seeded the default salt with TYPESALT(job->op). That code is in main(), not procjob, where job is the last struct off the free-list build loop and job->op is still 0 from its initialiser, so the salt went into type 0 and BCRYPT own salt table stayed empty. procjob then walks TYPESALT(job->op) with op equal to JOB_BCRYPT, found an empty Judy, and returned without computing anything. Second bug: even with that corrected, only JOB_BCRYPT was seeded, but the compound variants each walk their OWN TYPESALT(job->op), so e451 BCRYPTMD5 and e452 BCRYPTSHA1 still had nothing to iterate. The bootstrap now mirrors what the loader already does for real input and seeds Typesalt for every SELECTED bcrypt variant, gated on Dohash, across JOB_BCRYPT, BCRYPT256, BCRYPTMD5, BCRYPTSHA1 and BCRYPTSHA512. Both Printall sites carried both bugs and both are fixed. This is pre-existing and not a regression from 1.560: a 1.553 binary on gp2 is equally empty, so it has been broken for some time and was found only because a post-deploy smoke test across twelve assorted types came back 11 of 12. All six bcrypt types now generate under -z and every one CRACKS BACK through -M and -F, which is the check that matters since a wrong generator would still print something; hashpipe independently verifies five of the six generated hashes, BCRYPT256 being the exception and noted separately rather than fixed here. No collateral: a real registered bcrypt vector still cracks normally, 11 of 11 sampled non-bcrypt types still produce -z output, and the MSSQL shared-salt and iSCSI long-password fixes from 1.560 both still hold. hashpipe self-test 1026 passed 0 failed.
  *
  * Revision 1.560  2026/09/01 01:15:40  dlr
- * Two bug fixes, authored and validated by Dave in a separate session. iSCSI CHAP: the length guard admitted a password of up to MAXLINE, but the case builds id_byte then password then challenge into mdbuf, which is only MAXLINE+16, so a maximum-length password overran it before the challenge was even appended. The guard now reserves 1024 bytes, enough for the id byte and the 255-byte challenge that the chall_hexlen cap of 510 allows. MSSQL salt accounting: the loader inserted the 8-hex salt into JudyJ without ever incrementing its counter, and the bootstrap then hardcoded the Typesalt refcount to 1 regardless of how many hashes actually shared that salt. Because that refcount is what PV_DEC decrements in the per-job salt snapshot, the salt was retired after the FIRST hash matched and every other hash carrying it was silently never tried. The loader now increments on insert and the bootstrap propagates the real count. The failure mode is worth recording: it yields cracks for some hashes and silence for the rest sharing a salt, so a run looks partially successful rather than broken. Audited as a class before check-in. Twelve other bootstraps use the same hardcoded refcount idiom - AIXMD5, SM3CRYPT, SUNMD5, GOST12256CRYPT, GOST94CRYPT, GOST12512CRYPT, PHPBB3MD5, APR1, JUNIPERIVE, SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5 - but every one of them keys Typesalt on the WHOLE stored line, so each entry maps to exactly one hash and a count of 1 is correct by construction. MSSQL was the only type keying on a bare shared salt, so no companion fixes are needed. hashpipe needs no mirror of either fix: its verify_iscsi_chap already builds into the WS workspace with an explicit bound rather than a fixed buffer, and it verifies one pair per line so it has no salt snapshot to count.
+ * Two bug fixes, authored and validated by Waffle in a separate session. iSCSI CHAP: the length guard admitted a password of up to MAXLINE, but the case builds id_byte then password then challenge into mdbuf, which is only MAXLINE+16, so a maximum-length password overran it before the challenge was even appended. The guard now reserves 1024 bytes, enough for the id byte and the 255-byte challenge that the chall_hexlen cap of 510 allows. MSSQL salt accounting: the loader inserted the 8-hex salt into JudyJ without ever incrementing its counter, and the bootstrap then hardcoded the Typesalt refcount to 1 regardless of how many hashes actually shared that salt. Because that refcount is what PV_DEC decrements in the per-job salt snapshot, the salt was retired after the FIRST hash matched and every other hash carrying it was silently never tried. The loader now increments on insert and the bootstrap propagates the real count. The failure mode is worth recording: it yields cracks for some hashes and silence for the rest sharing a salt, so a run looks partially successful rather than broken. Audited as a class before check-in. Twelve other bootstraps use the same hardcoded refcount idiom - AIXMD5, SM3CRYPT, SUNMD5, GOST12256CRYPT, GOST94CRYPT, GOST12512CRYPT, PHPBB3MD5, APR1, JUNIPERIVE, SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5 - but every one of them keys Typesalt on the WHOLE stored line, so each entry maps to exactly one hash and a count of 1 is correct by construction. MSSQL was the only type keying on a bare shared salt, so no companion fixes are needed. hashpipe needs no mirror of either fix: its verify_iscsi_chap already builds into the WS workspace with an explicit bound rather than a fixed buffer, and it verifies one pair per line so it has no salt snapshot to count.
  *
  * Revision 1.559  2026/08/31 16:44:31  dlr
  * Add e1027 SUNMD5, the Solaris crypt, completing the crypt(3) group sourced from John the Ripper. The initial digest is md5 of pass then salt; thereafter 4096 plus the rounds= value are run, each computing md5 of the previous digest, optionally a fixed 1517-byte phrase, and the decimal round number in ASCII. Whether the phrase is included is decided per round by a coin flip derived from bits of the previous digest: two seven-bit indices are assembled from digest bytes and the XOR of the bits they address gives the flip, so roughly half the rounds hash an extra 1517 bytes and the cost is data dependent rather than fixed by rounds= alone. The phrase is 1516 characters of Hamlet PLUS its terminating NUL, because Sun passed sizeof() - dropping the NUL yields a plausible but wrong digest for every candidate. The salt is everything before the LAST dollar sign, which also covers the variant whose salt itself ends in a dollar sign, with no special case. Digest is emitted with the md5crypt transposition, 22 characters. All 8 of John vectors verify in hashpipe and crack in mdxfind, including its 120-character password and the two vectors that share a salt, and mdxfind -z output cracks back in both tools. Two mdxfind-side traps worth recording: Typesalt for these structured types holds the WHOLE stored line, not the salt, so the salt must be re-derived inside the compute case; and the bootstrap FREES JudyJ after copying it into Typesalt, so a JSLG lookup there can never hit - compare the computed encoding against the stored line, as GOST12512CRYPT does. Both mistakes presented identically as a clean 0 of 8 with the hashes correctly loaded. New hx.8 row plus Note [46]; notes contiguous 1 through 46. Types[] APPENDED and verified identical between mdxfind.c and hashpipe.c. Self-test 1026 passed 0 failed; genbad 103 of 103; John corpus sweep shows the new types matching only their own vectors; bench rate measured on dev1.
@@ -476,7 +482,7 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
  * and pepper. prmd5 NUL-terminates at out[32] and the pepper copy immediately
  * overwrites that byte, so the ordering is right.
  *
- * Dave identified the sha1 call as the fault. It is one of the three
+ * Waffle identified the sha1 call as the fault. It is one of the three
  * inconsistent lines and the place the damage shows, but it and the pepper copy
  * are already correct for a digest anchored at linebuf; the misplaced write is
  * the prmd5 destination. Both repairs produce identical output, this one is a
@@ -45223,7 +45229,12 @@ int strlccmp(char *line, char *match) {
 /* Write length header for hash already at inhashbuf+2, advance pointer,
  * and flush to worker thread if buffer is near full.
  * Caller must write hash data to inhashbuf+2 before calling. */
+/* Hashes committed to the input set by the load in progress. Reset per file
+ * by load_hash_file(), which reports it: a file that contributed nothing
+ * has to say so out loud. */
+static unsigned long HashesThisFile = 0;
 static void commit_compact(int hlen) {
+    HashesThisFile++;
 #ifdef SPARC
     *inhashbuf++ = (hlen & 0xff); *inhashbuf++ = (hlen >> 8);
     inhashbuf += hlen;
@@ -45322,6 +45333,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
   unsigned long Saltloaded[JOB_DONE], Userloaded[JOB_DONE];
   Word_t ti;
 
+  HashesThisFile = 0;
   memset(Foundcnt, 0, sizeof(Foundcnt));
   memset(lf, 0, sizeof(lf));
   memset(Saltloaded, 0, sizeof(Saltloaded));
@@ -45402,7 +45414,10 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
           }
         }
       }
-      return;
+      /* Not `return`: the receipt below has to fire on THIS path above all --
+       * it is the plain-hex fast path, the one a salted hash fed to -f takes,
+       * and it used to leave without a word. */
+      goto load_done;
     }
   }
 
@@ -50363,6 +50378,34 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       fprintf(stderr, "%s: found %lu unique users for %s\n",
               filename, Userloaded[x], TYPENAME(x));
   }
+
+  /* A receipt for EVERY file, including the empty one. The per-type lines
+   * above print only what was found, so a file that yielded nothing said
+   * nothing at all, and a run that loaded no hashes looked exactly like a run
+   * that loaded them and cracked none. Both halves of the trap kpd hit on
+   * 2026-09-05 -- salted hashes fed to -f, and -F placed ahead of -m -- end in
+   * that same silence. */
+ load_done:
+  { unsigned long ts = 0, tu = 0, tf = 0, th;
+    int nt = 0;
+    for (x = 0; x < JOB_DONE; x++) {
+      if (Foundcnt[x]) { tf += (unsigned long)Foundcnt[x]; nt++; }
+      ts += Saltloaded[x];
+      tu += Userloaded[x];
+    }
+    /* A structured format is recognised per type (Foundcnt) and a plain hex
+     * line is committed straight to the input set (HashesThisFile); a line
+     * counted both ways is one hash, so take the larger rather than the sum. */
+    th = HashesThisFile > tf ? HashesThisFile : tf;
+    (void)nt;
+    fprintf(stderr, "%s: %lu hashes, %lu salts, %lu users loaded\n",
+            filename, th, ts, tu);
+    if (th == 0)
+      fprintf(stderr,
+        "%s: NOTHING was loaded from this file. Check that the -m/-M selection\n"
+        "  names the type these hashes are, that it comes BEFORE -F/-J, and that\n"
+        "  hash:salt input is read with -F rather than -f.\n", filename);
+  }
 }
 void *Stack;
 
@@ -50424,6 +50467,12 @@ unsigned int val, maxtype;
   int len, x, y, z, ch, Printsource, maxt;
   char *tok, *s, *d;
   int doneprint, donedashh, Addlf, Dodigits, Dighex;
+  /* A structured hash file read BEFORE any -m/-M/-h: -F and -J parse
+   * their file at the moment getopt reaches them, so a selection that
+   * arrives later cannot reach it. Remembered here so that selection can
+   * refuse, rather than run to completion against nothing. */
+  int structfile_preselect = 0;
+  const char *structfile_preselect_name = NULL, *structfile_preselect_opt = NULL;
 int HashesLoaded = 0;
 unsigned int Doip;
   FILE *fi;
@@ -50617,11 +50666,24 @@ union HashU curin;
           if (y > ch) ch = y;
         }
         printf("%-*s  %-7s  %-*s  %s\n", ch, "Internal", "Options", z, "Hash name", "hashcat -m");
+        printf("\n  Options -- how a hash of this type is fed to mdxfind:\n"
+               "    f   plain hex, read with -f (or on stdin)\n"
+               "    F   wrapped or structured hash, read with -F\n"
+               "        (-J offers the file to every selected type instead of the -M set)\n"
+               "    s   takes a salt: use -F with hash:salt lines, or -s <saltfile>\n"
+               "    u   takes a username: -F with hash:user lines, or -u <userfile>\n"
+               "    j   takes a pepper: -j <file>, or -P <file> after -M\n"
+               "  The -m/-M selection MUST come BEFORE -F/-J on the command line;\n"
+               "  -f and -s may appear anywhere.\n\n");
         for (x = 1; Types[x]; x++) {
           char optbuf[16];
           int oi = 0;
           if (TYPEOPTS(x) & TYPEOPT_NEEDSF) optbuf[oi++] = 'f';
-          if (TYPEOPTS(x) & TYPEOPT_NEEDSJ) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'J'; }
+          /* 'F', not 'J': this is the channel the user TYPES, and -F is the
+           * option they reach for. The letter used to be J, the internal flag
+           * name, so the one option that had to appear never did -- kpd asked
+           * for the capital F on 2026-09-05 after losing an evening to it. */
+          if (TYPEOPTS(x) & TYPEOPT_NEEDSJ) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'F'; }
           if (TYPEOPTS(x) & TYPEOPT_NEEDSALT) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 's'; }
           if (TYPEOPTS(x) & TYPEOPT_NEEDUSER) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'u'; }
           if (TYPEOPTS(x) & TYPEOPT_NEEDPEPPER) { if (oi) optbuf[oi++] = ','; optbuf[oi++] = 'j'; }
@@ -50652,6 +50714,9 @@ union HashU curin;
             }
           }
         }
+	printf("\nA type marked F does not load from -f at all. A type marked s does, but\n"
+               "-f keeps only the hex hash and discards the salt after the first colon, so\n"
+               "the run finds nothing and still exits 0. Use -F for hash:salt input.\n");
 	printf("For full usage, use -?, or supply no arguments\n");
         exit(1);
   }
@@ -50771,6 +50836,22 @@ union HashU curin;
         break;
 
       case 'm':
+        /* FATAL: the file is already gone. -F and -J parse at the moment
+         * getopt reaches them, against whatever selection exists THEN, so a
+         * selection appearing later reads its file into nothing and the run
+         * completes with 0 found and exit 0 -- indistinguishable from a genuine
+         * negative. Reported by kpd 2026-09-05, who lost an evening to the
+         * -f/-F half of the same trap. Every other input option (-f, -s) is
+         * position-free, which is exactly why this one surprises. */
+        if (structfile_preselect) {
+          fprintf(stderr,
+            "FATAL: %s %s was read BEFORE any -m/-M/-h type selection, so it was\n"
+            "       parsed with no types to load into and nothing was kept. Put the\n"
+            "       -m/-M selection BEFORE %s on the command line.\n",
+            structfile_preselect_opt, structfile_preselect_name,
+            structfile_preselect_opt);
+          exit(1);
+        }
         if (donedashh == 0) {
           J1FA(RC, Dohash);
           donedashh = 1;
@@ -51145,6 +51226,11 @@ badrule:
           }
           gzbuffer(gf,128*1024);
 	  HashesLoaded++;
+          if (donedashh == 0) {
+            structfile_preselect = 1;
+            structfile_preselect_name = optarg;
+            structfile_preselect_opt = "-F";
+          }
           load_hash_file(gf, optarg, &Doload);
           if (strcmp(optarg, "stdin") != 0)
             gzclose(gf);
@@ -51164,6 +51250,11 @@ badrule:
           }
           gzbuffer(gj,128*1024);
 	  HashesLoaded++;
+          if (donedashh == 0) {
+            structfile_preselect = 1;
+            structfile_preselect_name = optarg;
+            structfile_preselect_opt = "-J";
+          }
           load_hash_file(gj, optarg, NULL);
           if (strcmp(optarg, "stdin") != 0)
             gzclose(gj);
@@ -51331,6 +51422,22 @@ badrule:
         break;
 
       case 'h':
+        /* FATAL: the file is already gone. -F and -J parse at the moment
+         * getopt reaches them, against whatever selection exists THEN, so a
+         * selection appearing later reads its file into nothing and the run
+         * completes with 0 found and exit 0 -- indistinguishable from a genuine
+         * negative. Reported by kpd 2026-09-05, who lost an evening to the
+         * -f/-F half of the same trap. Every other input option (-f, -s) is
+         * position-free, which is exactly why this one surprises. */
+        if (structfile_preselect) {
+          fprintf(stderr,
+            "FATAL: %s %s was read BEFORE any -m/-M/-h type selection, so it was\n"
+            "       parsed with no types to load into and nothing was kept. Put the\n"
+            "       -m/-M selection BEFORE %s on the command line.\n",
+            structfile_preselect_opt, structfile_preselect_name,
+            structfile_preselect_opt);
+          exit(1);
+        }
         if (donedashh == 0) {
           J1FA(RC, Dohash);
           donedashh = 1;
@@ -51401,6 +51508,22 @@ badrule:
         exit(1);
 
       case 'M':
+        /* FATAL: the file is already gone. -F and -J parse at the moment
+         * getopt reaches them, against whatever selection exists THEN, so a
+         * selection appearing later reads its file into nothing and the run
+         * completes with 0 found and exit 0 -- indistinguishable from a genuine
+         * negative. Reported by kpd 2026-09-05, who lost an evening to the
+         * -f/-F half of the same trap. Every other input option (-f, -s) is
+         * position-free, which is exactly why this one surprises. */
+        if (structfile_preselect) {
+          fprintf(stderr,
+            "FATAL: %s %s was read BEFORE any -m/-M/-h type selection, so it was\n"
+            "       parsed with no types to load into and nothing was kept. Put the\n"
+            "       -m/-M selection BEFORE %s on the command line.\n",
+            structfile_preselect_opt, structfile_preselect_name,
+            structfile_preselect_opt);
+          exit(1);
+        }
         /* -M: select target types for subsequent -S/-U/-P loading */
         if (donedashh == 0) {
           J1FA(RC, Dohash);

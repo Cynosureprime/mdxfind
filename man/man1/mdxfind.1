@@ -1,8 +1,18 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.3 $
+.\" $Revision: 1.5 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.5  2026/09/06 02:58:03  dlr
+.\" Document the 1.578 changes to the -F channel. The OPTION ORDER MATTERS section said the -F before -M case fails silently; it is now refused, so the entry states that and keeps the old behaviour as history. The -F entry claimed types are chosen with -M which must appear first: measured, -m e373 -F loads and cracks, so what must come first is the SELECTION, with -M additionally restricting which selected types the file loads into. The -f entry now says the channel keeps the hex digest and discards everything after the first colon, which is how a salted hash read with -f finds nothing while exiting 0. New paragraph for the per-file load receipt, including that a file contributing nothing now says so. The -h entry documents the bare form, which prints the type table rather than selecting anything, and names the Options letters f, F, s, u and j against the options they mean. TH bumped to 1.578.
+.\"
+.\" Revision 1.4  2026/08/29 18:06:35  dlr
+.\" Document -X, the last undocumented mdxfind option; page now covers 40 of 40. Traced XOR_key from case X at 48902 to its only point of use in checkhash at 10137: it XORs the COMPUTED digest, byte by byte with the key repeating, immediately before the hash-table lookup and before any -g rotation. The candidate, salt and stored hash are untouched. Records that a HEX[] value decoding to zero bytes silently disables the option, verified with HEX[] and HEX[zz] both reproducing the un-XORed baseline. Bumps TH to 1.544.
+.\"
+.\" Also records a defect found while verifying: the $HEX[ spelling is accepted and produces silently wrong results. The $ is skipped by advancing s, but get32 then writes the decoded bytes to s while the XOR loop reads from XOR_key one byte earlier, so key byte 0 is the literal $ left by the strncpy and the last decoded byte is never read. Confirmed by prediction and measurement on md5 of alpha: -X HEX[ff] gives the correct d3e8bc..., -X $HEX[ff] gives 08e8..., which is XOR with 0x24 not 0xff; the two-byte case -X $HEX[ffee] matches a predicted key of 24,ff exactly. The HEX[] spelling without the dollar sign is correct and is what the page tells the reader to use.
+.\"
+.\" Per Waffle, the shared letter with hashpipe -X is written as rationale rather than as a caution: mdxfind uses hx as a type-definition mechanism only, compiling userdef.txt stanzas at start-up via userdef.c 557, with no hx_compile_expr reachable from any command-line option, so no single-expression evaluator exists to want the letter. Verified hx_vm_run appears in mdxfind.c only at 13835 and 13861, inside the userdef dispatch arm. The entry states the condition so a future reader knows what has to be re-decided if mdxfind ever gains a single-expression mode.
+.\"
 .\" Revision 1.3  2026/08/29 17:35:32  dlr
 .\" OUTPUT FORMAT: show the $HEX[] wrapper instead of only naming it. Adds two real output lines, for a password containing a colon and for one containing a high-bit byte, and states that the wrapper is what keeps the colon-delimited format parseable. Records that the form is accepted on input wherever a candidate or key is read, verified by running: $HEX[706173733a776f7264] and pass:word as wordlist candidates produce the identical digest. Cross-references rehex(1).
 .\"
@@ -12,7 +22,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-08-29" "mdxfind 1.543" "Password Recovery"
+.TH MDXFIND 1 "2026-09-05" "mdxfind 1.578" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS
@@ -86,10 +96,21 @@ has no effect on that file, which is then parsed against whatever
 .B \-m
 or
 .B \-h
-had selected so far \(em or against the MD5 default if nothing had.  The run
-still prints a plausible
+had selected so far \(em or against the MD5 default if nothing had.
+.IP
+Since 1.578 this is refused rather than tolerated: a
+.BR \-m ,
+.B \-M
+or
+.B \-h
+that follows a
+.B \-F
+or
+.B \-J
+is fatal, and names both the file and the option that read it.  Earlier
+versions ran to completion, printing a plausible
 .RB \(lq "Working on hash types:" \(rq
-line and simply finds nothing.  This failure is silent.
+line and finding nothing, which is indistinguishable from a genuine negative.
 .TP
 .B \-M must precede \-S, \-U and \-P
 Those three load per-type salts, userids and peppers for the types
@@ -170,6 +191,33 @@ It is a regex, and an unanchored pattern matches far more than intended \(em
 selects every type with MD5 anywhere in its name, which is dozens.  Help is
 .B \-?
 or no arguments at all.
+.IP
+Given
+.I no other arguments,
+.B \-h
+selects nothing and instead prints the type table: internal index, an Options
+column, the type name, and the
+.BR hashcat (1)
+mode.  The Options letters name the channel a hash of that type is fed
+through \(em
+.B f
+plain hex with
+.BR \-f ,
+.B F
+wrapped or structured with
+.B \-F
+(or
+.BR \-J ),
+.B s
+takes a salt,
+.B u
+takes a userid,
+.B j
+takes a pepper.  A type marked
+.B F
+does not load from
+.B \-f
+at all.
 .TP
 .BI \-M " spec"
 Select types
@@ -202,6 +250,18 @@ Suited to plain hex digests: when only hex-input types are selected this
 channel takes a vectorised fast path that bypasses the format recognisers
 entirely.  Types are chosen with
 .BR \-m .
+.IP
+This channel keeps the hex digest and discards anything after the first colon.
+A
+.BI hash : salt
+line read with
+.B \-f
+therefore loses its salt, and a salted type then matches nothing while the run
+still exits 0.  Read salted input with
+.B \-F
+instead, or supply the salts separately with
+.BR \-s .
+The load receipt below makes the loss visible: the file reports 0 salts.
 .TP
 .BI \-F " file"
 Read the hash list from
@@ -214,10 +274,15 @@ crypt forms, base64 digests,
 pairs,
 .BI {ssha1} NN$salt$hash
 and the rest.  Types are chosen with
-.BR \-M ,
-which
+.B \-m
+or
+.BR \-M ;
+.B \-M
+additionally restricts which of the selected types this file loads into.
+Either way the selection
 .I must
-appear first.  The filename
+appear before
+.BR \-F .  The filename
 .B stdin
 reads from standard input.
 .TP
@@ -235,6 +300,20 @@ and
 .B \-J
 may be combined; each contributes to the same hash table.  If none is given,
 the hash list is read from standard input.
+.PP
+Every hash file reports what it contributed, on standard error:
+.PP
+.RS
+.nf
+hashes.txt: 4213 hashes, 4213 salts, 0 users loaded
+.fi
+.RE
+.PP
+A file that contributed nothing says so, and says what to check.  The per-type
+.RB \(lq "found N unique salts for TYPE" \(rq
+lines print only what was found, so before 1.578 a file that yielded nothing
+printed nothing at all, and a run that loaded no hashes looked exactly like a
+run that loaded them and cracked none.
 .SH "SALTS, USERIDS, PEPPERS AND KEYS"
 .TP
 .BI \-s " file"
@@ -404,6 +483,72 @@ characters when comparing, to catch hashes that were stored rotated.
 Matches are reported with a
 .BI rot NN _
 prefix on the type name.
+.TP
+.BI \-X " key"
+XOR every computed digest with
+.I key
+before comparing it against the hash list.  The key repeats as often as
+needed to cover the digest, so a one-byte key XORs every byte alike and a
+four-byte key cycles.
+.IP
+This recovers hashes that were stored obfuscated rather than plain: an
+application writing
+.I "md5(pass) XOR constant"
+is cracked by handing
+.B mdxfind
+the same constant.  Nothing else is altered \(em not the candidate, not the
+salt, not the stored hash.  Only the digest
+.B mdxfind
+computes is transformed, immediately before the lookup and before any
+.B \-g
+rotation.
+.IP
+.I key
+may be given literally, or as
+.BI HEX[ ... ]
+for bytes that cannot be typed.  The key in effect is echoed to standard
+error on every run.
+.IP
+A
+.B HEX[]
+value that decodes to zero bytes \(em empty, or containing no hex digits \(em
+.I silently
+disables the option.  The run proceeds with no XOR whatever, and the only
+trace is the echoed key.
+.IP
+.B "Do not use the \fB$HEX[\fP\fB...\fP\fB]\fP spelling with \-X."
+It is accepted and it is wrong.  The
+.B $
+is skipped by advancing a pointer, but the decoded bytes are then written
+one byte later than the XOR reads from, so the first key byte is the literal
+.B $
+left over from the argument and the last decoded byte is never used.
+.B "\-X '$HEX[ff]'"
+XORs with
+.BR 0x24 ,
+not
+.BR 0xff ,
+and reports nothing wrong.  The
+.B HEX[]
+spelling without the dollar sign decodes correctly; use that.
+.IP
+This
+.B \-X
+is unrelated to
+.BR hashpipe (1)
+.BR \-X ,
+which evaluates an
+.BR hx (1)
+expression.  The letter is free here because
+.B mdxfind
+has no single-expression hx evaluator: it uses hx as a
+.I type definition
+mechanism only, compiling the expressions in
+.B userdef.txt
+once at start-up, with no way to supply one on the command line.  Should
+.B mdxfind
+ever gain a single-expression mode, the letter is already spoken for and one
+of the two has to move.
 .TP
 .B \-e
 Extended match: accept truncated hashes, matching on a prefix rather than
