@@ -338,6 +338,16 @@ int gpu_metal_template_pso_lazy_md5_salt_rules_presalt(void);
 #define V_R     (1u << 0)
 #define V_M     (1u << 1)
 #define V_S     (1u << 2)
+/* V_U -- the UTF-32 rule walker.  Implies V_R: the UTF-32 path is a per-lane
+ * CHOICE between the UTF-32 walker and the byte one, so a variant with V_U and
+ * not V_R would be a kernel with no byte arm to fall back to, which
+ * u32_pick_engine assumes exists.  The loader asserts it rather than trusting
+ * every future call site.
+ *
+ * Widening to four bits takes the per-family PSO cache from [8] to [16]; the
+ * bound checks move with it. */
+#define V_U     (1u << 3)
+#define V_BITS_MAX 16u
 
 /* Family registration. The Objective-C MTLComputePipelineState type is
  * intentionally not in the struct signature exposed via the header — the
@@ -460,8 +470,9 @@ int gpu_metal_kernel_a_proto_enabled(void);
  * pointer on dispatch fire, NULL when env-gate unset / not-ready.
  * *nhits_out is always 0 in this sub-phase (no hit-replay surface).
  *
- * Gated on (getenv("MDXFIND_KERNEL_B_PROTO") || gpu_metal_kernel_a_proto_-
- * enabled()) and op == JOB_MD5MD5SALT, matching OpenCL twin. */
+ * Gated on gpu_metal_kernel_a_proto_enabled() and op == JOB_MD5MD5SALT,
+ * matching the OpenCL twin.  The MDXFIND_KERNEL_B_PROTO half of the old
+ * union was removed 2026-09-16. */
 uint32_t *gpu_metal_kernelA_dispatch_proto(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,

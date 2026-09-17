@@ -1,8 +1,23 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.5 $
+.\" $Revision: 1.10 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.10  2026/09/17 11:55:59  dlr
+.\" Bump to mdxfind 1.590; the ENVIRONMENT rewrite documents the removal that shipped in 1.590, and the .TH still said 1.589 from the -f fix.
+.\"
+.\" Revision 1.9  2026/09/17 05:24:30  dlr
+.\" mdxfind 1.590 ENVIRONMENT section: MDXFIND_CACHE is now the only variable mdxfind reads. Drops the MDXFIND_GPU_BACKEND and MDXFIND_GPU_MAX_GLOBAL entries and the paragraph promising a family of further tracing and kernel-selection variables; all of them are gone. States plainly that backend choice, sizing, warm-up, kernel selection and tracing are decided by the program, and why: a knob that only production leaves unset is a knob nothing tests.
+.\"
+.\" Revision 1.8  2026/09/17 03:53:01  dlr
+.\" mdxfind 1.589. Document the -n/-N digit-count desugar to mask syntax, drop the -n i IPv4 mode entirely (removed from the code; generating address ranges externally is trivial), and record that -f loads bare hex only, terminating the hash at the first non-hex character and discarding the rest of the line, while -F and -J load structured hashes with salts and userids.
+.\"
+.\" Revision 1.7  2026/09/12 12:27:16  dlr
+.\" Document the rule-engine parity block where it changes what a run produces. Three additions. The -r entry now says nine verbs accept a character class in place of a literal character in two syntaxes, inline ?C for the John table and a ~ prefix for the hashcat one, and that ?? is the literal-? escape in both, so a rule purging a literal question mark must be written @?? and not @?, with the operational consequence stated: eight lines across the rule files shipped with mdxfind stop loading for that reason and John rejects all eight as well, so the migration costs no coverage. The class tables themselves are left to procrule(1) rather than duplicated. GPU CONTROL gains the GPU-CPU rule split, which had no home anywhere in this page: mangling rules run on the GPU, a word longer than 1024 bytes is handled on the CPU instead, the GPU walker output ceiling is 2033 bytes against MAXLINE on the CPU, and a rule generating more than that produces different candidates on the two paths. That is given as designed behaviour with its reason, that rule output cannot be bounded in principle so a limit is set and a rule reaching it does what it can and stops with no diagnostic, together with the three facts a reader needs to act on: there is no retry to the CPU, -G none is the way to get CPU-exact output, and both limits are compile-time with no environment variable that changes either. All rule verbs but S, vNC and Control-B are implemented in the GPU kernels, three and not the four the brief named, since # never reaches the bytecode at all: packrules stops at the first # in a line, so c#$1 compiles to c, verified with procrule. CAVEATS gains two bullets, one for the ?? escape breaking pre-existing rule files at load and one for the 2033-byte divergence, each pointing at the section that explains it, because both are cases where a run completes and looks clean while producing something other than what the rule file says. TH bumped to 1.583 and 2026-09-12, which is what mdxfind -V now reports. Clean under groff -man -ww and mandoc -T lint, rendered text read rather than the warning count trusted.
+.\"
+.\" Revision 1.6  2026/09/09 18:54:04  dlr
+.\" Document how user-defined types are listed and labelled. Two additions. The -h entry now says the listing ends with a User-defined types section printed after the built-ins, new in 1.581, and states that those rows are keyed on the id the stanza declared and shown as u<id> - the form -m accepts - never on an internal index. The reason is given rather than left implicit: the internal op of a user type is derived from the number of built-ins at start-up and shifts whenever built-ins are added, so it is not a stable handle and is deliberately not published, while the declared id is. The option letters are explained as derived from the expression slot mask: f always since every user type reads plain hex, F if the stanza declared a stored form, s if the expression uses salt, u if it uses user. Also that the section is absent with no user types loaded and that MDXFIND_CACHE must be set for userdef.txt to be read at all, which is the condition under which the whole feature silently does nothing. Second, OUTPUT FORMAT now carries the label rule, which had no home anywhere: a user type is always labelled USER_<name>, the prefix being part of the public label per Waffle 2026-09-09, so stanza [BWTDT] emits USER_BWTDT and the bare name matches only internally through the -h regex. And that a user type evaluates its expression once, has no iteration ladder, and therefore carries NO xNN suffix - the label is USER_BWTDT and never USER_BWTDTx01. That paragraph names hashpipe as emitting the identical label and mdsplit as filing both into the same ledger, because the failure it documents was the two tools disagreeing and splitting the ledger. TH date and version bumped to 2026-09-09 and 1.581. Renders with zero groff warnings; the paragraph break the OUTPUT FORMAT insert initially swallowed was restored after checking the rendered text rather than the source.
+.\"
 .\" Revision 1.5  2026/09/06 02:58:03  dlr
 .\" Document the 1.578 changes to the -F channel. The OPTION ORDER MATTERS section said the -F before -M case fails silently; it is now refused, so the entry states that and keeps the old behaviour as history. The -F entry claimed types are chosen with -M which must appear first: measured, -m e373 -F loads and cracks, so what must come first is the SELECTION, with -M additionally restricting which selected types the file loads into. The -f entry now says the channel keeps the hex digest and discards everything after the first colon, which is how a salted hash read with -f finds nothing while exiting 0. New paragraph for the per-file load receipt, including that a file contributing nothing now says so. The -h entry documents the bare form, which prints the type table rather than selecting anything, and names the Options letters f, F, s, u and j against the options they mean. TH bumped to 1.578.
 .\"
@@ -22,7 +37,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-09-05" "mdxfind 1.578" "Password Recovery"
+.TH MDXFIND 1 "2026-09-17" "mdxfind 1.590" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS
@@ -218,6 +233,36 @@ takes a pepper.  A type marked
 does not load from
 .B \-f
 at all.
+.IP
+Since 1.581 the listing ends with a
+.B "User-defined types"
+section, printed after the built-ins, covering the types loaded from
+.BR userdef.txt .
+Those rows are keyed on the id the stanza declared and shown as
+.BI u id
+\(em the form
+.B \-m
+accepts \(em never on an internal index.  That is deliberate: the internal op
+of a user type is derived from the number of built-ins at start-up and shifts
+whenever built-ins are added, so it is not a stable handle and is not
+published.  The declared id is.  Option letters carry the same meaning as for a
+built-in, and are derived from which slots the expression references:
+.B f
+always, since every user type reads plain hex;
+.B F
+if the stanza declared a stored
+.BR form ;
+.B s
+if the expression uses
+.BR salt ;
+.B u
+if it uses
+.BR user .
+The section is absent when no user types are loaded, and
+.B MDXFIND_CACHE
+must be set for
+.B userdef.txt
+to be read at all.
 .TP
 .BI \-M " spec"
 Select types
@@ -395,6 +440,26 @@ options concatenate their rule sets.  Each rule is validated at load time
 against the probe word
 .RB \(lq Password \(rq;
 a rule that fails validation is reported with its line number and dropped.
+.IP
+Nine verbs accept a
+.I character class
+in place of a literal character, in two syntaxes: inline
+.BI ? C
+uses John's table, and a
+.B ~
+prefix selects hashcat's.
+.B ??
+is the literal-\c
+.B ?
+escape in both, so a rule that purges a literal question mark must be
+written
+.B @??
+and not
+.BR @? .
+Eight lines across the rule files shipped with mdxfind stop loading for that
+reason; John rejects all eight as well.  See
+.BR procrule (1)
+for the class tables and the full verb list.
 .TP
 .BI \-R " file"
 As
@@ -406,6 +471,90 @@ concatenated with every new one.  Two 100-rule files loaded with
 .B \-R
 yield 10,000 rules.
 .TP
+.B \-8
+Interpret mangling rules in UTF\-32 as well as over bytes.  A candidate is
+taken as UTF\-8 and decoded to codepoints, the rule is interpreted against
+codepoints and grapheme clusters, and the result is encoded back.  Positions
+and lengths count clusters, an operand may be a codepoint or a quoted string,
+arithmetic and shift verbs are 32\-bit, and case mapping covers 23 script
+blocks rather than ASCII.
+.IP
+.B \-8
+adds an engine; it removes nothing.  Without it the byte engine runs alone and
+the candidate stream is the byte engine's exactly.  With it, which engine runs
+is decided per
+.RI ( word ", " rule )
+pair \(em see
+.B "THE TWO RULE ENGINES"
+below, because an all\-ASCII word is run by the byte engine either way.
+.IP
+The UTF\-32 switch is
+.BR \-8 ,
+not
+.BR \-u .
+.B \-u
+loads a userid file, which is why
+.BR procrule (1)
+spells the same option
+.B \-8
+as well: it is the one letter that can carry this meaning in both tools.
+See
+.B \-L
+below to pin the locale of an ambiguous case mapping.
+.IP
+The rule language itself is unchanged, and a rule file needs no edits.
+.TP
+.BI \-L " locale"
+Pin the locale of an ambiguous case mapping.  Implies
+.BR \-8 ,
+because a locale means nothing to the byte engine and silently doing nothing
+would look exactly like an honest result.
+.RS
+.TP 12
+.BR tr ", " az
+Turkish and Azeri: uppercase
+.B i
+to U+0130 and lowercase
+.B I
+to U+0131.
+.BR turkish " and " azeri
+are accepted as well.
+.TP
+.BR c ", " root
+The mapping every other locale uses: plain
+.B I
+and
+.BR i .
+.BR posix " and " none
+are accepted as well.
+.RE
+.IP
+Omitting
+.B \-L
+tries the default mapping and counts the pairs where another answer existed;
+see THE TWO RULE ENGINES.  Pinning it silences that counter, because the choice
+was then made deliberately.
+.IP
+.B "\-L tr"
+disables the GPU for the run, and says so.  The device UTF\-32 walker
+implements the default mapping only, so leaving the GPU on would compute the
+Turkish mapping on the CPU and the default one on the GPU, and the GPU's
+batches are not recomputed on the CPU.
+.B "\-L c"
+is the mapping the device already implements and costs nothing.
+.IP
+.BR procrule (1)
+spells this option the same way, with one difference that matters: its default
+emits EVERY variant and so cannot miss a candidate, while these walkers advance
+once per rule and can only ever try one.  In
+.B mdxfind
+.B \-L
+therefore CHOOSES which variant is tried, rather than narrowing a set.  Where
+the two engines deliberately differ is documented in
+.BR rules32 (7),
+with the verb and class tables in
+.BR procrule (1).
+.TP
 .BI \-n " spec"
 Append generated text to each candidate.
 .I spec
@@ -413,13 +562,28 @@ is either a mask (see
 .BR "MASK SYNTAX" ),
 a digit count such as
 .B 2
-for 00\(en99, a digit count with
+for 00\(en99, or a digit count with
 .B x
 or
 .B X
-for lowercase or uppercase hexadecimal, or
-.B i
-for the full IPv4 space.
+for lowercase or uppercase hexadecimal.
+A digit count is simply a shorthand for the mask it names \(em
+.B \-n 2
+is
+.BR ?d?d ,
+.B \-n 2x
+is
+.BR ?h?h ,
+.B \-n 2X
+is
+.B ?H?H
+\(em and both spellings generate the same candidates in the same order.
+The form is checked strictly: digits, then an optional single
+.B x
+or
+.BR X ,
+and nothing else.  Trailing characters are an error rather than being
+ignored.
 .TP
 .BI \-N " spec"
 As
@@ -458,6 +622,135 @@ lines of the first wordlist.
 .TP
 .B \-y
 Recurse into directories named as wordlists.
+.SH "THE TWO RULE ENGINES"
+Under
+.B \-8
+.B mdxfind
+carries two rule engines: the
+.I byte
+engine, which interprets a rule over the bytes of a candidate, and the
+.I "UTF\-32"
+engine, which interprets it over codepoints and grapheme clusters.  The choice
+between them is made per
+.RI ( word ", " rule )
+pair, not once per run.
+.PP
+.BR "An all-ASCII word runs on the byte engine even under \-8" .
+The two engines agree on such a word and the byte engine is faster, so no
+UTF\-32 semantics can change the result for it.  An ASCII test case therefore
+proves nothing about
+.B \-8
+in either direction, and looks exactly like the option doing nothing.  Test
+with a word that carries a non\-ASCII character.
+.PP
+Each word is classified as the wordlist is read,
+.I after
+the
+.B $HEX[]
+unwrap and never before.  The wrapper text is pure ASCII, so classifying the
+raw line calls every wrapped non\-ASCII word ASCII and routes it to the wrong
+engine: on one 53,976\-line test wordlist, 8,819 lines are ASCII raw and
+non\-ASCII once decoded.
+.PP
+Each rule carries two capability bits, established as the rule file is read:
+whether the byte compiler accepts it, and whether the UTF\-32 compiler accepts
+it.  Neither implies the other.  An operand wider than one byte, or a quoted
+operand, is accepted only by the UTF\-32 compiler.  A rule whose
+.I own text
+is not well\-formed UTF\-8 is accepted only by the byte compiler \(em 31 rules
+of
+.B HashMob.100k.rule
+are, and under
+.B \-8
+they still run, on the byte engine.
+.PP
+The word states a preference and the compilers decide what is possible:
+.IP \(bu 3
+word entirely ASCII \(em byte engine;
+.IP \(bu 3
+word carries non\-ASCII, decodes as UTF\-8, and the UTF\-32 compiler accepts
+the rule \(em UTF\-32 engine;
+.IP \(bu 3
+rule accepted only by the UTF\-32 compiler and the word does not decode \(em
+neither engine can run the pair.  It is skipped, and counted;
+.IP \(bu 3
+otherwise \(em byte engine.
+.PP
+Only the genuinely impossible combination is refused, and the refusal is
+counted rather than silent.
+.PP
+.B "What the run reports."
+The rule load states how the rule set divides.  On
+.B HashMob.100k.rule
+under
+.BR \-8 :
+.PP
+.nf
+99995 total rules in use
+  \-8: 99964 rule(s) run on either engine, 0 UTF\-32 only, 31 byte only
+  \-8: 0 rule(s) the byte engine refuses were ADMITTED for the UTF\-32
+      engine, 4 bad in both and refused
+.fi
+.PP
+The second line reports the rules the
+byte engine refuses that were
+.B ADMITTED
+for the UTF\-32 engine, and the rules
+.RB \(lq "bad in both" \(rq
+and so refused outright.  The four bad in both above are the
+\fB@?\fP lines described under
+.BR "RULES AND CANDIDATE MUTATION" ,
+refused for an unrelated reason.
+.PP
+Read the
+.B "byte only"
+count as rules that ran, not rules that were lost.  Only
+.RB \(lq "bad in both" \(rq
+never runs.
+.PP
+Two further counters are printed at the end of a run when they are non\-zero:
+.PP
+.nf
+1 (word,rule) pairs skipped: rule needs UTF\-32 and the word is
+  not valid UTF\-8
+1 (word,rule) pairs had more than one UTF\-32 locale variant; only
+  the first was tried (use \-L to pin one)
+.fi
+.PP
+Each is a real loss of coverage, and a silent one would read as \(lqthe
+wordlist did not contain it\(rq.
+.PP
+.B "Locale variants."
+The dotted and dotless I is the only case mapping in the covered ranges with
+more than one right answer: Turkish and Azeri uppercase
+.B i
+to U+0130 and lowercase
+.B I
+to U+0131, every other locale gives
+.B I
+and
+.BR i ,
+and nothing in a candidate says which system stored the password.
+.B mdxfind
+tries the first variant only \(em its rule walkers advance once per rule \(em
+and the counter above says how often that mattered.
+.B \-L
+pins the mapping, and the counter then stays silent because the choice was
+made deliberately rather than behind the operator's back.
+.PP
+The residue is small and has been measured: on a UTF\-8 fixture of 16,223 MD5
+targets,
+.B \-8
+recovers 15,950 where the byte engine alone recovers 2, and the 273\-target
+remainder is exactly the pairs lost to this limitation.
+.PP
+.B "GPU."
+The UTF\-32 rule path is GPU\-accelerated on both the OpenCL and the Metal
+backends, across the GPU\-eligible hash types, and is byte\-exact against the
+CPU.  The engine is chosen once at start\-up, so a run without
+.B \-8
+builds and executes the same device program it would build if the option did
+not exist and pays nothing for its presence.
 .SH "SEARCH DEPTH AND MATCHING"
 .TP
 .BI \-i " count"
@@ -635,6 +928,22 @@ or
 On a build with no GPU support,
 .B \-G
 with a device list is a fatal error.
+.IP
+Mangling rules run on the GPU as well.  A word longer than 1024 bytes is
+handled on the CPU instead, and the GPU rule walker's output ceiling is 2033
+bytes against MAXLINE on the CPU, so a rule that generates more than that
+produces different candidates on the two paths.  That is designed
+behaviour: rule output cannot be bounded in principle, so a limit is set and
+a rule reaching it does what it can and stops, with no diagnostic.  There is
+no retry to the CPU.  Use
+.B "\-G none"
+when CPU-exact output is required.  Both limits are compile-time; no
+environment variable changes either.  All rule verbs but
+.BR S ,
+.B vNC
+and Control-B are implemented in the GPU kernels; a rule using one of those
+three routes to the CPU while the rest of the set still runs on the GPU, and
+the reported hit set is the union of the two.
 .TP
 .BI \-t " count"
 Worker thread count.  Defaults to the number of online processors.  Valid
@@ -716,6 +1025,34 @@ is the zero-padded iteration depth at which the match occurred, so
 .B MD5x03
 means
 .BR md5(md5(md5(pass))) .
+.PP
+A user-defined type is always labelled
+.BI USER_ name
+on output \(em the
+.B USER_
+prefix is part of the public label, so a type whose stanza header is
+.B [BWTDT]
+emits
+.BR USER_BWTDT .
+The bare stanza name is matched only internally, by
+.BR \-h 's
+regex.  A user type evaluates its
+.BR hx (7)
+expression once and has no iteration ladder, so there is no depth to report and
+.B no
+.BI x NN
+.B suffix is written:
+the label is
+.B USER_BWTDT
+and never
+.BR USER_BWTDTx01 .
+.BR hashpipe (1)
+emits the identical label, and
+.BR mdsplit (1)
+therefore files both tools' output into the same
+.BI name .USER_ type
+ledger.
+.PP
 A password containing bytes that do not survive a line-oriented format \(em
 a colon, a control character, a high-bit byte \(em is emitted wrapped in
 .BI $HEX[ ... ]\fR,
@@ -761,20 +1098,17 @@ directory separator, the current directory is used.  With
 .B MDXFIND_CACHE
 unset, no user-defined types are loaded and the GPU kernel cache is
 disabled with a warning.
-.TP
-.B MDXFIND_GPU_BACKEND
-Select the GPU backend explicitly on a build that has more than one.
-.TP
-.B MDXFIND_GPU_MAX_GLOBAL
-Ceiling on the one-dimensional global work size.  Lower this if a device
-rejects a dispatch with
-.BR CL_INVALID_GLOBAL_WORK_SIZE .
 .PP
-A number of further
+.B MDXFIND_CACHE
+is the only environment variable
+.B mdxfind
+reads.  Nothing else about a run is settable from the environment: the GPU
+backend, work-group and page sizing, warm-up, kernel selection and every
+tracing channel are decided by the program from the work in front of it.
+Earlier versions carried some forty
 .BR MDXFIND_ *
-variables exist for tracing and kernel selection.  They are development
-diagnostics, are not part of the stable interface, and may change or vanish
-between releases.
+variables for tracing and kernel selection; they were removed in 1.590
+because a knob that only production leaves unset is a knob nothing tests.
 .SH FILES
 .TP
 .B userdef.txt
@@ -867,17 +1201,53 @@ The
 .B r
 mangling rule reverses
 .IR bytes ,
-not code points, and will produce mojibake on non-ASCII input.  Generate
-reversals externally if the wordlist is not ASCII.
+not code points, and will produce mojibake on non-ASCII input.  Under
+.B \-8
+it reverses grapheme clusters instead, which is the fix; without
+.B \-8
+generate reversals externally if the wordlist is not ASCII.
 .IP \(bu 3
 .B \-f
 pointed at an empty file, without
 .BR \-z ,
 is a guaranteed no-op that will still consume the entire wordlist.
+.IP \(bu 3
+.B ??
+is now the literal-\c
+.B ?
+escape in a mangling rule.  A rule file written before this change that
+purges or substitutes a literal question mark will have those lines refused
+at load.  See
+.BR "RULES AND CANDIDATE MUTATION" .
+.IP \(bu 3
+.B \-8
+is the UTF\-32 rule switch.
+.B \-u
+is a userid file, which is why the UTF\-32 switch is
+.B \-8
+in both tools.
+See
+.BR "THE TWO RULE ENGINES" .
+.IP \(bu 3
+Under
+.B \-8
+an all\-ASCII word is still run by the byte engine, so an ASCII test case
+cannot show the option working or failing.  See
+.BR "THE TWO RULE ENGINES" .
+.IP \(bu 3
+The GPU and CPU rule engines truncate rule output at different lengths, so a
+rule generating more than 2033 bytes yields different candidates on each, and
+under
+.B \-8
+that limit counts codepoints rather than bytes.
+.B \-G none
+is the only way to guarantee CPU-exact output.  See
+.BR "GPU CONTROL" .
 .SH "SEE ALSO"
 .BR hashpipe (1),
 .BR mdsplit (1),
 .BR procrule (1),
+.BR rules32 (7),
 .BR rling (1),
 .BR getpass (1),
 .BR hx (1)

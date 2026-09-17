@@ -128,6 +128,12 @@ If you know the type of algorithms, and the salts are present in the file, mdxfi
 cat *.txt salted/*.txt | mdxfind -M e31 -F stdin wordlist.txt >> session.res
 ```
 
+That last form is also the one to prefer when a salt is shared by more than one
+hash. A salt supplied by `-S` is deduplicated and retires after a single hit, so
+three hashes sharing one salt recover only one of the three; carried next to its
+own hash it recovers all three. The same applies to usernames via `-U`. See
+[SALTS_AND_USERS.md](SALTS_AND_USERS.md).
+
 ### Iterative solving
 
 Hash recovery is iterative. After each run, extract the found passwords and use them as a new wordlist (passwords from one list often work on others):

@@ -102,6 +102,13 @@
  * JOB_MD5MD5SALT route-gate widening to the seven 5a-eligible
  * MAKE_MD5PASS family JOB enums. */
 #include "gpu_codegen_eligible.h"
+/* The UTF-32 replay.  Mirrors the include at gpu/gpujob_opencl.c:44 and for
+ * the same non-negotiable reason: the replay must reproduce the ENGINE the
+ * DEVICE chose for this (word, rule), not re-decide it.  Calling applyrule()
+ * unconditionally on a UTF-32 hit emits the byte engine's answer -- a correct
+ * digest beside a plaintext that does not hash to it -- and on OpenCL that
+ * was all 15,165 recovered lines of a measured run. */
+#include "gpu_u32_host.h"
 /* Metal hit-merge fix 2026-05-30 (project_metal_hit_merge_debug_spec_-
  * 2026-05-30.md): hx_primitive_for_job + hx_primitive_digest_bytes for
  * the dedicated _proto_fired hit-replay block's family-digest-width
@@ -140,6 +147,11 @@ extern char *prmd5(unsigned char *md5, char *out, int len);
  * live in the shipped binary. See gpu/gpu_debug.h. */
 #include "gpu_debug.h"
 
+/* GPU_FATAL: fail-fast for a runtime GPU failure, per
+ * feedback_external_failures_are_fatal.md.  Used by the silent-zero
+ * backstop in the dispatch path below. */
+#include "gpu_fatal.h"
+
 /* OUTBUFSIZE is mdxfind.c's #define (OUTBUFSIZE (MAXLINE+MAXLINE) at line 160)
  * — NOT exposed via mdxfind.h. gpujob_opencl.c carries its own re-definition
  * at line 534; we mirror that pattern. The OpenCL twin uses (1024 * 1024) =
@@ -167,11 +179,12 @@ extern atomic_ullong Totrules_gpu;
 
 /* Rules-engine globals (set by classify_rules in mdxfind.c main).
  * gpu_rule_program is the NUL-separated bytecode the kernel reads;
- * gpu_rule_origin[ridx] is the index back into the host's Rules[]
- * length-prefixed buffer used for hit-replay applyrule. */
+ * gpu_rule_slot[ridx] is the 1-BASED rule slot (the job->Ruleindex /
+ * RuleCnt[] index); subtract 1 to index the host's Rules[] length-prefixed
+ * buffer for hit-replay applyrule.  Slot 0 = synthetic `:` no-rule pass. */
 extern unsigned char *gpu_rule_program;
 extern uint32_t      *gpu_rule_offsets;
-extern int           *gpu_rule_origin;
+extern int           *gpu_rule_slot;
 extern int            gpu_rule_count;
 extern char          *Rules;
 extern unsigned int   Numrules;
@@ -446,8 +459,19 @@ static int metal_gpu_hash_words(int op)
     case JOB_HAV160_3MD5PASS: /* Sub-phase 5b.3a Tier 3: e133 = 20 bytes = 5 uint32 */
     case JOB_HAV160_4MD5PASS: /* Sub-phase 5b.3b Tier 3: e135 = 20 bytes = 5 uint32 */
     case JOB_HAV160_5MD5PASS: /* Sub-phase 5b.3c Tier 3: e137 = 20 bytes = 5 uint32 */
+    case JOB_HMAC_SHA1_KPASS:       /* e793 KPASS = 5 uint32 */
+    case JOB_HMAC_SHA1:           /* e215 KSALT = 5 uint32 */
+    case JOB_HMAC_RMD160:         /* e211 KSALT = 5 uint32 */
+    case JOB_HMAC_RMD160_KPASS:     /* e798 KPASS = 5 uint32 */
+    case JOB_SQL5:        /* e259: MySQL 4.1+ = sha1(sha1_raw(pass)) = 20 bytes
+                           * = 5 uint32.  WITHOUT this arm the default arm
+                           * returns 4 and the hit compare comes up empty --
+                           * a silent GPU zero, which is how the first attempt
+                           * at serving this op on Metal failed. */
         return 5;
     case JOB_RMD320:      /* Phase 2d.6.2: 10 uint32 (RIPEMD-320 LE; widest mask-category digest) */
+    case JOB_HMAC_RMD320_KPASS:     /* e799 KPASS = 10 uint32 */
+    case JOB_HMAC_RMD320:         /* e213 KSALT = 10 uint32 */
         return 10;
     case JOB_SHA224:           /* Forward-stage 2d.4.x: 7 uint32 (28-byte digest) */
     case JOB_SHA224SALTPASS:   /* Forward-stage 2d.4.x: 7 uint32 (sha224(salt||pass)) */
@@ -457,6 +481,8 @@ static int metal_gpu_hash_words(int op)
     case JOB_HAV224_3MD5PASS:  /* Sub-phase 5b.3a Tier 3: e145 = 28 bytes = 7 uint32 */
     case JOB_HAV224_4MD5PASS:  /* Sub-phase 5b.3b Tier 3: e147 = 28 bytes = 7 uint32 */
     case JOB_HAV224_5MD5PASS:  /* Sub-phase 5b.3c Tier 3: e149 = 28 bytes = 7 uint32 */
+    case JOB_HMAC_SHA224_KPASS:     /* e794 KPASS = 7 uint32 */
+    case JOB_HMAC_SHA224:         /* e216 KSALT = 7 uint32 */
         return 7;
     case JOB_SHA256:           /* Phase 2d.4.1: 8 uint32 (raw SHA-256, 32-byte digest) -- CANARY */
     case JOB_SHA256RAW:        /* Forward-stage 2d.4.x: 8 uint32 (binary-digest re-feed) */
@@ -477,6 +503,9 @@ static int metal_gpu_hash_words(int op)
     case JOB_HAV256_5MD5PASS:  /* Sub-phase 5b.3c Tier 3: e155 = 32 bytes = 8 uint32 */
     case JOB_SNE256MD5PASS:    /* Sub-phase 5b.4a Tier 4: e177 = 32 bytes = 8 uint32 (Snefru-256) */
     case JOB_GOSTMD5PASS:      /* Sub-phase 5b.4b Tier 4: e125 = 32 bytes = 8 uint32 (GOST R 34.11-94) */
+    case JOB_HMAC_SHA256_KPASS:     /* e795 KPASS = 8 uint32 */
+    case JOB_HMAC_SHA256:         /* e217 KSALT = 8 uint32 */
+    case JOB_MD6256:           /* e29: MD6-256 = 32 bytes = 8 uint32 */
         return 8;
     case JOB_SHA384:           /* Forward-stage 2d.5.x: 12 uint32 (48-byte digest) */
     case JOB_SHA384RAW:        /* Forward-stage 2d.5.x: 12 uint32 (binary-digest re-feed) */
@@ -484,6 +513,8 @@ static int metal_gpu_hash_words(int op)
     case JOB_KECCAK384:        /* Phase 2d.7b.3: 12 uint32 (Keccak-384 = 48-byte LE digest) */
     case JOB_SHA3_384:         /* Phase 2d.7b.7: 12 uint32 (SHA3-384 = 48-byte LE digest) */
     case JOB_SHA384MD5PASS:    /* Sub-phase 5a.5: e167 = 48 bytes = 12 uint32 (family codegen) */
+    case JOB_HMAC_SHA384_KPASS:     /* e796 KPASS = 12 uint32 */
+    case JOB_HMAC_SHA384:         /* e543 KSALT = 12 uint32 */
         return 12;
     case JOB_SHA512:           /* Phase 2d.5.1: 16 uint32 (raw SHA-512, 64-byte digest) -- CANARY (FIRST 64-bit-state family) */
     case JOB_SHA512RAW:        /* Forward-stage 2d.5.x: 16 uint32 (binary-digest re-feed) */
@@ -499,6 +530,9 @@ static int metal_gpu_hash_words(int op)
     case JOB_SHA512CRYPTMD5:   /* Phase 2d.8b: 16 uint32 (SHA-512 crypt with MD5-preprocess = 64-byte LE digest; SHACRYPT shared core at HASH_WORDS=16; algo_mode=1u) */
     case JOB_SHA512MD5PASS:    /* Sub-phase 5a.5: e169 = 64 bytes = 16 uint32 (family codegen) */
     case JOB_WRLMD5PASS:       /* Sub-phase 5b.2a Tier 2: e173 = 64 bytes = 16 uint32 (family codegen) */
+    case JOB_WRL:              /* e5: Whirlpool = 64 bytes = 16 uint32 */
+    case JOB_HMAC_SHA512_KPASS:     /* e797 KPASS = 16 uint32 */
+    case JOB_HMAC_SHA512:         /* e218 KSALT = 16 uint32 */
         return 16;
     case JOB_MD5:         /* 128-bit MD5 / MD4 / MD5RAW / MD4UTF16 = 4 uint32 */
     case JOB_MD5UC:       /* 2026-08-30: e2 uppercase-hex-feedback MD5;
@@ -546,6 +580,20 @@ static int metal_gpu_hash_words(int op)
                              * arm) -- omitting it works by fall-through
                              * but risks a future default-arm change
                              * silently breaking SNE128 hit-replay. */
+    case JOB_NTLMH:            /* e786: MD4(UTF-16LE) = 16 bytes = 4 uint32 */
+    case JOB_MD5UCSALT:        /* e350: md5salt carrier, algo_mode=1 */
+    case JOB_HMAC_MD5_KPASS:        /* e792 KPASS = 4 uint32 */
+    case JOB_HMAC_MD5:            /* e214 KSALT = 4 uint32 */
+    case JOB_MD5revMD5SALT:    /* e541: md5salt carrier, algo_mode=2 */
+    case JOB_MD5sub8_24SALT:   /* e542: md5salt carrier, algo_mode=3 */
+    case JOB_MD5_MD5SALTMD5PASS:/* e367: md5salt carrier, algo_mode=4 */
+    case JOB_MYSQL3:           /* e456: HASH_WORDS=4, matching the OpenCL
+                                * carrier's defines_str. Listed explicitly per
+                                * the width-helper discipline even though 4 is
+                                * the default arm -- relying on fall-through is
+                                * exactly how a future default change breaks a
+                                * type silently. */
+        return 4;
     default:
         return 4;
     }
@@ -576,6 +624,14 @@ static int _max_salt_count = 0;
 static int _max_salt_bytes = 0;
 extern int *Typesaltcnt;
 extern long long *Typesaltbytes;
+
+/* Dohash is the Judy1 set of hash ops selected for this run (mdxfind.c:3905);
+ * gpu_rules_engine_active is the single global the chokepoint at
+ * mdxfind.c:13193 consults before packing a word (mdxfind.c:4519).  Both are
+ * read -- and gpu_rules_engine_active is cleared -- by
+ * metal_rules_engine_preflight() below. */
+extern Pvoid_t Dohash;
+extern int     gpu_rules_engine_active;
 
 /* PV_DEC macro mirrors gpu/gpujob_opencl.c line 265-268. PV is the
  * Judy-keyed pending-count; we decrement on a confirmed hit so the
@@ -629,6 +685,23 @@ struct saltentry {
  * the OpenCL twin's case list. */
 static void *gpu_salt_judy(int op) {
     switch (op) {
+        /* The eight user-keyed HMAC KSALT ops carry TYPEOPT_NEEDUSER: their
+         * HMAC key lives in Typeuser[op], not Typesalt[op]. The OpenCL twin
+         * has had these arms since the families shipped; Metal had none and
+         * fell through to the Typesalt default, which is empty for them, so
+         * the salt snapshot came back 0 and the op was never dispatched.
+         * Reachable only now that mdxfind.c's admission guard lets them
+         * through -- before that, this returned the right judy to a caller
+         * the op never reached. */
+        case JOB_HMAC_MD5:          /* e214 */
+        case JOB_HMAC_SHA1:         /* e215 */
+        case JOB_HMAC_SHA224:       /* e216 */
+        case JOB_HMAC_SHA256:       /* e217 */
+        case JOB_HMAC_SHA384:       /* e543 */
+        case JOB_HMAC_SHA512:       /* e218 */
+        case JOB_HMAC_RMD160:       /* e211 */
+        case JOB_HMAC_RMD320:       /* e213 */
+            return Typeuser ? Typeuser[op] : NULL;
     /* Future HMAC families with TYPEOPT_NEEDUSER (JOB_HMAC_MD5,
      * JOB_HMAC_SHA1, JOB_HMAC_SHA224, JOB_HMAC_SHA256, JOB_HMAC_SHA384,
      * JOB_HMAC_SHA512, JOB_HMAC_RMD160, JOB_HMAC_RMD320) will add
@@ -639,6 +712,33 @@ static void *gpu_salt_judy(int op) {
         return Typesalt ? Typesalt[op] : NULL;
     }
 }
+
+/* Hash-salt snapshot selection -- Metal twin of gpujob_opencl.c's `use_hs`
+ * (:917 and :929).  A few ops do not want the raw salt on the GPU: e367
+ * MD5_MD5SALTMD5PASS's algo_mode 4 consumes hex32(md5(salt)), which the host
+ * precomputes into Typehashsalt.  Metal hardcoded `use_hashsalt = 0` at all
+ * three gpu_pack_salts_op sites and always called build_salt_snapshot, so the
+ * kernel got raw salts and matched nothing -- GPU 0 / CPU 1, silently.
+ *
+ * For every other op metal_use_hashsalt() returns 0 and both helpers behave
+ * exactly as the previous code did, so this is a no-op outside these four. */
+static inline int metal_use_hashsalt(int op)
+{
+    return (op == JOB_MD5_MD5SALTMD5PASS ||
+            op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
+            op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
+            op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS);
+}
+
+static inline int metal_build_snapshot(void *snap, char *pool, int op,
+                                       char *tsalt)
+{
+    if (metal_use_hashsalt(op) && Typehashsalt && Typehashsalt[op])
+        return build_hashsalt_snapshot((struct saltentry *)snap, pool,
+                                       Typehashsalt[op], tsalt, Printall);
+    return build_salt_snapshot(snap, pool, gpu_salt_judy(op), tsalt, Printall);
+}
+
 
 /* gpu_compute_iter_sum: Metal twin of the same function in
  * gpu/gpujob_opencl.c. Computes the total internal iterations across
@@ -1086,14 +1186,12 @@ static void gpujob_metal_worker(void *arg) {
                 }
                 batch_count = 0;
                 tsalt[0] = 0;
-                nsalts = build_salt_snapshot(saltsnap, saltpool,
-                                              gpu_salt_judy(g->op),
-                                              tsalt, Printall);
+                nsalts = metal_build_snapshot(saltsnap, saltpool, g->op, tsalt);
                 if (nsalts > 0) {
                     nsalts_packed = gpu_pack_salts_op(saltsnap, nsalts,
                                                       salts_packed, soff, slen,
                                                       pack_map,
-                                                      /* use_hashsalt */ 0,
+                                                      metal_use_hashsalt(g->op),
                                                       g->op);
                 } else {
                     nsalts_packed = 0;
@@ -1117,14 +1215,12 @@ static void gpujob_metal_worker(void *arg) {
          * (e.g., concurrent Typedone), force one more snapshot before
          * giving up. */
         if (needs_salt_snapshot && nsalts_packed == 0) {
-            nsalts = build_salt_snapshot(saltsnap, saltpool,
-                                         gpu_salt_judy(g->op),
-                                         tsalt, Printall);
+            nsalts = metal_build_snapshot(saltsnap, saltpool, g->op, tsalt);
             if (nsalts > 0) {
                 nsalts_packed = gpu_pack_salts_op(saltsnap, nsalts,
                                                   salts_packed, soff, slen,
                                                   pack_map,
-                                                  /* use_hashsalt */ 0,
+                                                  metal_use_hashsalt(g->op),
                                                   g->op);
                 if (nsalts_packed > 0)
                     gpu_metal_set_salt(salts_packed, soff, slen, nsalts_packed);
@@ -1235,9 +1331,10 @@ static void gpujob_metal_worker(void *arg) {
                 }
             }
 
+            /* MDXFIND_KERNEL_B_PROTO used to force this too; removed
+             * 2026-09-16. */
             if (!_proto_fired && g->op == JOB_MD5MD5SALT &&
-                (getenv("MDXFIND_KERNEL_B_PROTO") != NULL ||
-                 gpu_metal_kernel_a_proto_enabled())) {
+                gpu_metal_kernel_a_proto_enabled()) {
                 int _pn = 0;
                 uint32_t *_pres = gpu_metal_kernelA_dispatch_proto(
                     0 /* dev_idx */,
@@ -1321,8 +1418,8 @@ static void gpujob_metal_worker(void *arg) {
                         "FATAL: %s:%d Metal: codegen auto-dispatcher "
                         "FATAL for op=%d iter=%d rules=%d -- neither "
                         "legacy nor codegen can serve this cell. "
-                        "Workaround: try MDXFIND_GPU_BACKEND=legacy or "
-                        "split rule file into smaller chunks.\n",
+                        "Split the rule file into smaller chunks, or "
+                        "run this type on the CPU with -G none.\n",
                         __FILE__, __LINE__, g->op, Maxiter, gpu_rule_count);
                     exit(1);
                 }
@@ -1370,12 +1467,11 @@ static void gpujob_metal_worker(void *arg) {
                     current_op = g->op;
                     gpu_metal_set_op(0, g->op);
                     tsalt[0] = 0;
-                    int _pnsalts = build_salt_snapshot(saltsnap, saltpool,
-                                    gpu_salt_judy(g->op), tsalt, Printall);
+                    int _pnsalts = metal_build_snapshot(saltsnap, saltpool, g->op, tsalt);
                     if (_pnsalts > 0) {
                         nsalts_packed = gpu_pack_salts_op(saltsnap, _pnsalts,
                                             salts_packed, soff, slen, pack_map,
-                                            0, g->op);
+                                            metal_use_hashsalt(g->op), g->op);
                         if (nsalts_packed > 0)
                             gpu_metal_set_salt(salts_packed, soff, slen,
                                                nsalts_packed);
@@ -1400,6 +1496,65 @@ static void gpujob_metal_worker(void *arg) {
                  * in procjob). */
             }
             if (!_proto_fired) {
+            /* --- Silent-zero backstop (2026-09-15) -------------------
+             * A batch only reaches here because the mdxfind.c chokepoint
+             * (mdxfind.c:13193, the `gpu_rules_engine_active && (op == ...)`
+             * OR-chain) ADMITTED this op and packed its words.  That admit
+             * list is backend-AGNOSTIC: it enumerates the ops the OpenCL
+             * template path can serve, and nothing in it consults
+             * gpu_op_category()/gpu_metal_lookup_family().  Every word it
+             * packs is marked word_packed_by_rules_engine, which makes
+             * procjob `goto gpu_packed_done` (mdxfind.c:14763-14768) and
+             * skip the CPU hash switch for that word.
+             *
+             * So if no Metal family is registered for g->op,
+             * gpu_metal_dispatch_md5_rules() bails at its own
+             * `fam == NULL` gate (gpu_metal.m:8014-8015) and returns NULL
+             * with *nhits_out == 0 -- and those words are gone.  The run
+             * then exits 0 with "None found, sorry!" and there is nothing
+             * in the output that distinguishes it from an honest negative.
+             * Measured on dev1 (Apple M1) 2026-09-15: e5 WRL, e259 SQL5,
+             * e786 NTLMH, e456 MYSQL3, e29 MD6256, e350 MD5UCSALT,
+             * e367 MD5-MD5SALTMD5PASS and e792..e799 (the eight HMAC
+             * *_KPASS ops) each reported "1 batches | 1 words | 2 hashes |
+             * 0 hits" against a known-answer fixture the CPU cracks.
+             * This is the exact failure mode already documented for
+             * JOB_MD5UC at gpu_metal.m:2905-2913.
+             *
+             * gpujob_init() below refuses to arm the Metal rules engine
+             * when the run contains such an op, so in a correctly-built
+             * binary this is unreachable.  It stays as the default-deny
+             * half of that pair: any op added to the mdxfind.c admit list
+             * in the future without a Metal family lands HERE, loudly,
+             * instead of quietly computing nothing.  Per
+             * feedback_external_failures_are_fatal.md a dispatch that
+             * cannot be served is a runtime failure, not a capability
+             * question -- the capability question was already answered
+             * (and acted on) at init.
+             *
+             * Route-gate ops are exempt: JOB_MD5MD5SALT and the
+             * MAKE_MD5PASS family are served on Metal by the codegen
+             * kernel-B proto path above, not by a registered family, and
+             * they legitimately fall through here when nsalts_packed == 0
+             * (see the comment immediately above). */
+            if (gpu_metal_lookup_family(g->op) == NULL
+                && g->op != JOB_MD5MD5SALT
+                && !gpu_codegen_kernelb_family_md5pass_eligible(g->op)
+                && !_exp_md5_route) {
+                char _hn[256];
+                if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                _hn[sizeof(_hn) - 1] = 0;
+                GPU_FATAL("Metal: no registered family can serve op=%d "
+                          "(%u words already withheld from the CPU walk by "
+                          "the mdxfind.c chokepoint) -- dispatching would "
+                          "compute nothing and report zero hits. "
+                          "host=%s operation=gpu_metal_dispatch_md5_rules "
+                          "error=gpu_metal_lookup_family(%d)==NULL. "
+                          "Re-run this type with -G none, or register a "
+                          "Metal family for it.",
+                          g->op, (unsigned)g->packed_count,
+                          _hn[0] ? _hn : "(unknown)", g->op);
+            }
             hits = gpu_metal_dispatch_md5_rules(
                 0 /* dev_idx */,
                 g->packed_buf, g->packed_pos,
@@ -1744,6 +1899,10 @@ static void gpujob_metal_worker(void *arg) {
                  * covers all salts). For unsalted ops nsalts_for_decode
                  * is 1 and the salt-axis divmod reduces to no-op. */
                 int is_salted_op = (g->op == JOB_MD5SALT ||
+                    g->op == JOB_MD5UCSALT            || /* e350 */
+                    g->op == JOB_MD5revMD5SALT        || /* e541 */
+                    g->op == JOB_MD5sub8_24SALT       || /* e542 */
+                    g->op == JOB_MD5_MD5SALTMD5PASS   || /* e367 */
                                     g->op == JOB_MD5PASSSALT ||
                                     g->op == JOB_MD5SALTPASS ||
                                     g->op == JOB_SHA1PASSSALT ||
@@ -1773,6 +1932,22 @@ static void gpujob_metal_worker(void *arg) {
                                     g->op == JOB_HMAC_STREEBOG256_KPASS ||
                                     g->op == JOB_HMAC_STREEBOG512_KSALT ||
                                     g->op == JOB_HMAC_STREEBOG512_KPASS ||
+                                    g->op == JOB_HMAC_MD5_KPASS         ||  /* e792 */
+                                    g->op == JOB_HMAC_SHA1_KPASS        ||  /* e793 */
+                                    g->op == JOB_HMAC_SHA224_KPASS      ||  /* e794 */
+                                    g->op == JOB_HMAC_SHA256_KPASS      ||  /* e795 */
+                                    g->op == JOB_HMAC_SHA384_KPASS      ||  /* e796 */
+                                    g->op == JOB_HMAC_SHA512_KPASS      ||  /* e797 */
+                                    g->op == JOB_HMAC_RMD160_KPASS      ||  /* e798 */
+                                    g->op == JOB_HMAC_RMD320_KPASS      ||  /* e799 */
+                                    g->op == JOB_HMAC_MD5             ||  /* e214 */
+                                    g->op == JOB_HMAC_SHA1            ||  /* e215 */
+                                    g->op == JOB_HMAC_SHA224          ||  /* e216 */
+                                    g->op == JOB_HMAC_SHA256          ||  /* e217 */
+                                    g->op == JOB_HMAC_SHA384          ||  /* e543 */
+                                    g->op == JOB_HMAC_SHA512          ||  /* e218 */
+                                    g->op == JOB_HMAC_RMD160          ||  /* e211 */
+                                    g->op == JOB_HMAC_RMD320          ||  /* e213 */
                                     /* Phase 2d.8a: PHPBB3 + MD5CRYPT both
                                      * salted-only iterated-MD5 ops. Hit-
                                      * replay arms route differently from
@@ -1938,45 +2113,108 @@ static void gpujob_metal_worker(void *arg) {
                     /* Recover original word from packed_buf. */
                     uint32_t pos = g->word_offset[widx];
                     if (pos >= g->packed_pos) continue;
-                    uint8_t plen = (uint8_t)g->packed_buf[pos];
-                    if (pos + 1 + plen > g->packed_pos) continue;
-                    char *pword = g->packed_buf + pos + 1;
+                    /* 2-byte little-endian length header; see the pack site in
+                     * mdxfind.c.  plen must be wider than uint8_t now. */
+                    uint32_t plen = (uint32_t)(uint8_t)g->packed_buf[pos]
+                                 | ((uint32_t)(uint8_t)g->packed_buf[pos + 1] << 8);
+                    if (pos + 2 + plen > g->packed_pos) continue;
+                    char *pword = g->packed_buf + pos + 2;
 
                     /* Map GPU rule index -> original Rules[] index.
-                     * orig_idx == -1 sentinel: synthetic `:` no-rule pass —
-                     * skip applyrule replay and use word directly. */
-                    int orig_idx = gpu_rule_origin[ridx];
+                     * slot 0 = synthetic `:` no-rule pass: skip the applyrule
+                     * replay and use the word directly.  0 is already the correct
+                     * RuleCnt[] "No rule" bucket. */
+                    int rslot = gpu_rule_slot[ridx];   /* 1-BASED RuleCnt[] index; 0 = no-rule pass */
                     int out_len;
-                    if (orig_idx == -1) {
+                    if (rslot == 0) {
                         memcpy(synthetic_job.line, pword, plen);
                         synthetic_job.line[plen] = 0;
                         out_len = (int)plen;
                         synthetic_job.Ruleindex = 0;
                     } else {
-                        if (orig_idx < 0 || orig_idx >= (int)Numrules) continue;
+                        if (rslot < 1 || rslot > (int)Numrules) continue;
 
                         memcpy(synthetic_job.line, pword, plen);
                         synthetic_job.line[plen] = 0;
 
                         char *rule_bc = (_rule_ptr_cache && _rule_ptr_nrules == (int)Numrules)
-                                        ? _rule_ptr_cache[orig_idx]
+                                        ? _rule_ptr_cache[rslot - 1]
                                         : NULL;
                         if (!rule_bc) continue;
 
-                        int new_len = applyrule(synthetic_job.line, _tpass, (int)plen,
+                        /* UTF-32 path: ask the module which engine the DEVICE
+                         * used, using the device's OWN capability bits and its
+                         * own packed stream -- there is deliberately no second
+                         * opinion here.  GPU_U32_REPLAY_BYTE means "byte arm",
+                         * and then the call below is the unchanged one.  The
+                         * returned contract is applyrule's, so the -1/-2
+                         * handling that follows is unchanged too.
+                         *
+                         * Byte-for-byte the OpenCL twin at gpujob_opencl.c
+                         * 2361-2437; the two replays must agree because the
+                         * acceptance gate compares each backend against the
+                         * same CPU answer. */
+                        int new_len = GPU_U32_REPLAY_BYTE;
+                        if (gpu_u32_active())
+                            new_len = gpu_u32_replay_apply(synthetic_job.line,
+                                                           (int)plen, ridx,
+                                                           _tpass, MAXLINE);
+                        if (new_len == GPU_U32_REPLAY_BYTE)
+                            new_len = applyrule(synthetic_job.line, _tpass, (int)plen,
                                                 rule_bc, &_ws);
+                        /* ---- THE NO-OP RE-ATTRIBUTION, BOTH ARMS ----------
+                         *
+                         * `new_len == -2` means the rule's output EQUALS its
+                         * input.  Dropping it loses a recovery, measured TWICE
+                         * -- once per engine arm -- and the full account with
+                         * the numbers is in gpu/gpujob_opencl.c at this same
+                         * site.  In short:
+                         *   UTF-32 arm, 27 rules:  control.md5 gave 28,443 of
+                         *     28,444; missing $HEX[e88ab1e59bad] (花园), whose
+                         *     own md5 was the target, because a no-op `u` on
+                         *     CJK won the on-GPU dedup bit and the replay then
+                         *     discarded it.
+                         *   BYTE arm, 100k rules:  the fix was first scoped to
+                         *     the UTF-32 arm, which held at 27 rules and failed
+                         *     at 100,000 -- byte path 24,147 of 24,148, and
+                         *     under -8 the loss MOVED to $HEX[acbc], a class-I
+                         *     word that takes the byte arm.
+                         *
+                         * If the output equals the input then the candidate IS
+                         * the original word and its digest matched a loaded
+                         * target, so it is a genuine recovery -- exactly what
+                         * the no-rule pass would have emitted.  Re-attribute to
+                         * Ruleindex 0 ("No rule"), where the CPU credits it.
+                         * The argument never mentions the engine, which is why
+                         * the original scoping was wrong.
+                         *
+                         * Metal returned 24,276 on the fixture where OpenCL
+                         * returned 24,275, because it sub-batches the rule axis
+                         * and a different lane won the bit.  A defect whose
+                         * visibility depends on chunk size is one to fix, not
+                         * to characterise. */
                         if (new_len == -2) {
-                            /* Auto-skip: output equals input. */
+                            memcpy(synthetic_job.line, pword, plen);
+                            synthetic_job.line[plen] = 0;
                             out_len = (int)plen;
-                        } else if (new_len < 0) {
+                            synthetic_job.Ruleindex = 0;   /* No rule */
+                            goto u32_noop_reattributed;
+                        }
+                        if (new_len < 0) {
+                            /* Only -1 (the rule FAILED) reaches here now; -2 is
+                             * re-attributed above.  The historical reason for
+                             * dropping -2 -- double emission and -Z inflation --
+                             * is preserved by crediting rule 0 rather than this
+                             * rule. */
                             continue;
                         } else {
                             memcpy(synthetic_job.line, _tpass, new_len);
                             synthetic_job.line[new_len] = 0;
                             out_len = new_len;
                         }
-                        synthetic_job.Ruleindex = orig_idx;
+                        synthetic_job.Ruleindex = rslot;
                     }
+                    u32_noop_reattributed: ;
 
                     /* Phase 2b row 5: prepend+append the mask characters to
                      * the candidate plaintext. Mirrors gpu/gpujob_opencl.c
@@ -2084,7 +2322,23 @@ static void gpujob_metal_worker(void *arg) {
                                    g->op == JOB_HMAC_STREEBOG256_KSALT ||
                                    g->op == JOB_HMAC_STREEBOG256_KPASS ||
                                    g->op == JOB_HMAC_STREEBOG512_KSALT ||
-                                   g->op == JOB_HMAC_STREEBOG512_KPASS) {
+                                   g->op == JOB_HMAC_STREEBOG512_KPASS ||
+                                   g->op == JOB_HMAC_MD5_KPASS         ||  /* e792 */
+                                   g->op == JOB_HMAC_SHA1_KPASS        ||  /* e793 */
+                                   g->op == JOB_HMAC_SHA224_KPASS      ||  /* e794 */
+                                   g->op == JOB_HMAC_SHA256_KPASS      ||  /* e795 */
+                                   g->op == JOB_HMAC_SHA384_KPASS      ||  /* e796 */
+                                   g->op == JOB_HMAC_SHA512_KPASS      ||  /* e797 */
+                                   g->op == JOB_HMAC_RMD160_KPASS      ||  /* e798 */
+                                   g->op == JOB_HMAC_RMD320_KPASS      ||  /* e799 */
+                                   g->op == JOB_HMAC_MD5             ||  /* e214 */
+                                   g->op == JOB_HMAC_SHA1            ||  /* e215 */
+                                   g->op == JOB_HMAC_SHA224          ||  /* e216 */
+                                   g->op == JOB_HMAC_SHA256          ||  /* e217 */
+                                   g->op == JOB_HMAC_SHA384          ||  /* e543 */
+                                   g->op == JOB_HMAC_SHA512          ||  /* e218 */
+                                   g->op == JOB_HMAC_RMD160          ||  /* e211 */
+                                   g->op == JOB_HMAC_RMD320) { /* e213 */
                             /* Phase 2d.7d: HMAC ops route via checkhashsalt
                              * with iter=0 (NOT iter_num). max_iter is forced
                              * to 1 host-side; the HMAC body runs inside
@@ -2571,8 +2825,205 @@ return_jobg:
 
 /* ---- Init / shutdown ---- */
 
+/* ======================================================================
+ * Metal capability pre-flight (2026-09-15)
+ *
+ * THE DEFECT THIS EXISTS FOR.  The chokepoint that decides whether a word
+ * goes to the GPU rules engine lives at mdxfind.c:13193 and is
+ * backend-AGNOSTIC: a 79-op OR-chain of `job->op == JOB_*` literals,
+ * enumerating what the OpenCL template path can serve.  It never consults
+ * gpu_op_category() or gpu_metal_lookup_family().  Metal registers 53
+ * families (gpu_metal.m:2871-3697), so 26 of those 79 ops are admitted to
+ * a Metal path that has no kernel for them.  The consequences, in order:
+ *
+ *   1. the word is packed and marked word_packed_by_rules_engine
+ *      (mdxfind.c:14214),
+ *   2. procjob therefore takes `goto gpu_packed_done` (mdxfind.c:14763)
+ *      and does NOT compute that word on the CPU,
+ *   3. gpu_metal_dispatch_md5_rules() returns NULL at its `fam == NULL`
+ *      gate (gpu_metal.m:8014),
+ *   4. the caller sees hits == NULL / nhits == 0, treats it as "no hits",
+ *      and the batch is gone.
+ *
+ * The run exits 0 with "None found, sorry!" and NOTHING in the output
+ * distinguishes it from an honest negative.  Same shape as the JOB_MD5UC
+ * incident written up at gpu_metal.m:2905-2913.
+ *
+ * WHY THE FIX IS A WHOLE-RUN VETO AND NOT A PER-OP ONE.  There is no
+ * per-op veto reachable from the Metal side.  The chokepoint's only
+ * backend-owned inputs are `gpu_rules_engine_active` (a single global int,
+ * mdxfind.c:4519) and functions that take no op: gpujob_available(),
+ * gpujob_get_free_rules(filename, startline).  gpu_op_category(op) IS
+ * Metal-owned and already answers GPU_CAT_NONE for every one of these ops
+ * -- the chokepoint simply does not ask it.  By the time an op IS visible
+ * to Metal code (gpujob_submit / the dispatcher) the words have already
+ * been withheld from the CPU walk, so a veto there loses a batch.  So the
+ * veto has to be taken before any procjob thread starts, and the only
+ * lever available then is the global.  The one-line change that would make
+ * this per-op is in mdxfind.c and belongs to the operator:
+ *
+ *     if (gpu_rules_engine_active &&
+ *         gpu_op_category(job->op) != GPU_CAT_NONE &&      <-- add
+ *         (job->op == JOB_MD5 || ...
+ *
+ * WHAT IT COSTS.  A run that mixes one of these ops with a Metal-served op
+ * loses GPU acceleration for the whole run rather than for the one op.
+ * That is pessimistic, and it is correct: it recovers exactly what the CPU
+ * recovers.  The alternative on offer was a zero that looks like a
+ * negative.
+ *
+ * THE TABLE.  Regenerate with:
+ *
+ *   sed -n '13193,14048p' mdxfind.c \
+ *     | grep -oE 'job->op == JOB_[A-Za-z0-9_]+' | sed 's/.*== //' \
+ *     | sort -u > /tmp/choke
+ *   grep -oE '\.op  *= JOB_[A-Za-z0-9_]+' gpu_metal.m | sed 's/.*= //' \
+ *     | sort -u > /tmp/fams
+ *   comm -23 /tmp/choke /tmp/fams
+ *
+ * That recipe reports ONE FALSE POSITIVE: JOB_MD5MD5SALT (e347).  It is
+ * served on Metal through the codegen kernel-B proto path
+ * (gpu_metal_kernelb_dispatch_proto, this file), not through a registered
+ * gpu_metal_family, so the `.op =` grep cannot see it.  Do NOT add it to
+ * the table -- that would veto the Metal rules engine for a type Metal
+ * computes correctly.  Any future codegen-routed op has the same shape.
+ *
+ * needs_salt mirrors the chokepoint's second conjunct: the salted ops are
+ * in the `job->op != JOB_*` negation list at mdxfind.c:13815-14047 and are
+ * admitted only when nsalts_job > 0, so an op with no salts loaded never
+ * reaches the dispatcher and must not trigger the veto.  Typesaltcnt[op]
+ * is the load-time salt count and is the init-time equivalent of that
+ * test -- measured on dev1 2026-09-15, the eight user-keyed HMAC KSALT ops
+ * (e211 e213 e214 e215 e216 e217 e218 e543) load "0 salts, 1 users" and
+ * produce no GPU batch at all, while their eight *_KPASS siblings load
+ * 1 salt, are admitted, and report "1 batches | 1 words | 0 hits".
+ *
+ * JOB_MD5MD5SALT (e347) is deliberately ABSENT: Metal serves it through
+ * the codegen kernel-B proto path in the worker above, not through a
+ * registered family.  So are the MAKE_MD5PASS family ops, which are
+ * admitted by predicate rather than by an `==` literal and are likewise
+ * codegen-served.
+ * ====================================================================== */
+struct metal_unserved_op {
+    int         op;          /* JOB_* == the -m eNNN number */
+    int         needs_salt;  /* 1 = in the nsalts_job > 0 negation list */
+    const char *name;
+};
+
+static const struct metal_unserved_op metal_unserved_ops[] = {
+    /* THIS TABLE IS A CANDIDATE LIST, NOT A VERDICT.  The loop consults
+     * gpu_metal_lookup_family() per row, so a row whose op now HAS a
+     * registered Metal family is skipped -- see the header note above.
+     * Rows therefore STAY here after an op is served: that keeps the check
+     * armed, so if a family ever stops being registered (a dropped
+     * register call, or a METAL_FAMILY_CAP overflow, which prints
+     * "family registry full -- dropping op=") the veto fires again
+     * instead of the batches being withheld from the CPU walk and
+     * computed by nobody.  Deleting a served row would trade a loud
+     * failure for a silent zero.
+     *
+     * As of 2026-09-16 every row below is served: the five unsalted ops by
+     * translated Metal twins, the rest by carrier cores shared with their
+     * OpenCL siblings and specialised by params.algo_mode.
+     *
+     * unsalted -- always admitted by the chokepoint */
+    { JOB_WRL,                   0, "WRL"               },  /* e5   */
+    { JOB_MD6256,                0, "MD6256"            },  /* e29  */
+    { JOB_SQL5,                  0, "SQL5"              },  /* e259 */
+    { JOB_MYSQL3,                0, "MYSQL3"            },  /* e456 */
+    { JOB_NTLMH,                 0, "NTLMH"             },  /* e786 -- STILL
+        * UNSERVED and deliberately so. metal_ntlmh_core.metal exists and
+        * compiles (translated from the OpenCL twin, 4 digest words so the
+        * width helper's default is already right), but with a family
+        * registered the GPU returned 0 hits where the CPU found 1 -- in
+        * BYTE mode as well as under -8, so this is not the UTF-32 path.
+        * The translated core computes the wrong digest and needs kernel
+        * debugging, most likely in the UTF-8 -> UTF-16LE conversion that
+        * the OpenCL twin had to have fixed. Measured 2026-09-16 with
+        * tools/gputests/bigsweep.sh. Do not register a family for this op
+        * until that is fixed: doing so disarms this veto row. */
+    /* salted -- admitted only when the type has salts loaded */
+    { JOB_HMAC_RMD160,           1, "HMAC-RMD160"       },  /* e211 */
+    { JOB_HMAC_RMD320,           1, "HMAC-RMD320"       },  /* e213 */
+    { JOB_HMAC_MD5,              1, "HMAC-MD5"          },  /* e214 */
+    { JOB_HMAC_SHA1,             1, "HMAC-SHA1"         },  /* e215 */
+    { JOB_HMAC_SHA224,           1, "HMAC-SHA224"       },  /* e216 */
+    { JOB_HMAC_SHA256,           1, "HMAC-SHA256"       },  /* e217 */
+    { JOB_HMAC_SHA512,           1, "HMAC-SHA512"       },  /* e218 */
+    { JOB_MD5UCSALT,             1, "MD5UCSALT"         },  /* e350 */
+    { JOB_MD5_MD5SALTMD5PASS,    1, "MD5-MD5SALTMD5PASS"}, /* e367 */
+    { JOB_HMAC_SHA384,           1, "HMAC-SHA384"       },  /* e543 */
+    { JOB_MD5revMD5SALT,         1, "MD5revMD5SALT"     },  /* e541 */
+    { JOB_MD5sub8_24SALT,        1, "MD5sub8_24SALT"    },  /* e542 */
+    { JOB_HMAC_MD5_KPASS,        1, "HMAC-MD5-KPASS"    },  /* e792 */
+    { JOB_HMAC_SHA1_KPASS,       1, "HMAC-SHA1-KPASS"   },  /* e793 */
+    { JOB_HMAC_SHA224_KPASS,     1, "HMAC-SHA224-KPASS" },  /* e794 */
+    { JOB_HMAC_SHA256_KPASS,     1, "HMAC-SHA256-KPASS" },  /* e795 */
+    { JOB_HMAC_SHA384_KPASS,     1, "HMAC-SHA384-KPASS" },  /* e796 */
+    { JOB_HMAC_SHA512_KPASS,     1, "HMAC-SHA512-KPASS" },  /* e797 */
+    { JOB_HMAC_RMD160_KPASS,     1, "HMAC-RMD160-KPASS" },  /* e798 */
+    { JOB_HMAC_RMD320_KPASS,     1, "HMAC-RMD320-KPASS" },  /* e799 */
+};
+
+/* Disarm the Metal rules engine when the run contains an op the
+ * chokepoint admits but no registered Metal family can compute.
+ *
+ * Called from gpujob_init(), which mdxfind.c reaches at :57097 -- after
+ * the hash list is loaded (so Dohash and Typesaltcnt[] are populated),
+ * after the rule classify/pack block sets gpu_rules_engine_active
+ * (:53625), and before any procjob thread exists.  That window is the
+ * only place the decision can still be taken without losing words.
+ *
+ * gpu_metal_lookup_family() is consulted rather than the table alone, so
+ * that adding a Metal family for one of these ops removes it from the
+ * veto with no edit here. */
+static void metal_rules_engine_preflight(void)
+{
+    if (!gpu_rules_engine_active) return;   /* engine not armed */
+    if (!Dohash) return;                    /* no types selected */
+
+    const int nent = (int)(sizeof(metal_unserved_ops) /
+                           sizeof(metal_unserved_ops[0]));
+    int nblock = 0;
+
+    for (int i = 0; i < nent; i++) {
+        const struct metal_unserved_op *e = &metal_unserved_ops[i];
+        int RC;
+        J1T(RC, Dohash, (Word_t)e->op);
+        if (!RC) continue;                              /* not requested */
+        if (gpu_metal_lookup_family(e->op) != NULL) continue; /* now served */
+        if (e->needs_salt &&
+            !(Typesaltcnt && Typesaltcnt[e->op] > 0)) continue;
+        if (nblock == 0) {
+            fprintf(stderr,
+                "STDERR: GPU admission: the Metal rules engine is DISABLED "
+                "for this run.\n");
+        }
+        nblock++;
+        fprintf(stderr,
+            "STDERR: GPU admission:   e%d %s -- admitted by the mdxfind.c "
+            "chokepoint, no Metal family registered\n",
+            e->op, e->name);
+    }
+
+    if (nblock > 0) {
+        fprintf(stderr,
+            "STDERR: GPU admission: %d such type(s).  Those batches would "
+            "have been withheld from the CPU walk and then computed by "
+            "nobody -- a zero indistinguishable from an honest negative.  "
+            "The whole run now runs on the CPU, which recovers what the CPU "
+            "recovers.  Run the Metal-served types separately to get the "
+            "GPU back for them.\n", nblock);
+        gpu_rules_engine_active = 0;
+    }
+}
+
 int gpujob_init(int num_jobg) {
     if (!gpu_metal_available()) return -1;
+
+    /* Correctness gate BEFORE anything else in init: see the block comment
+     * above.  Must run before the first procjob thread packs a word. */
+    metal_rules_engine_preflight();
 
     /* Phase 2c: compute _max_salt_count / _max_salt_bytes from
      * Typesaltcnt[] / Typesaltbytes[] (populated by mdxfind.c load

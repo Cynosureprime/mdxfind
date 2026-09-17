@@ -38,6 +38,10 @@
  * JOB_MD5MD5SALT route-gate widening to the seven 5a-eligible
  * MAKE_MD5PASS family JOB enums. */
 #include "gpu_codegen_eligible.h"
+/* UTF-32 rule path: the hit replay must apply the same engine the DEVICE
+ * applied for each (word, rule).  Header-only; the publish pointers it reads
+ * have external linkage and their storage lives in gpu_opencl.c. */
+#include "gpu_u32_host.h"
 #include "../codegen/hx_emit_primitives.h"  /* sub-phase 5b.3a.0.3 D17.4.b: hx_primitive_for_job + hx_primitive_digest_bytes */
 /* Auto-dispatcher: capability+perf matrix that picks codegen vs legacy
  * backend per (op, iter, rules, mask, bf). Replaces the user-visible
@@ -224,7 +228,7 @@ static inline void sha512crypt_b64encode(const unsigned char *in, char *out) {
  * Used by rules_engine dispatch path to recover word->rule->hash triples. */
 extern unsigned char *gpu_rule_program;   /* packed bytecodes, NUL-separated */
 extern uint32_t      *gpu_rule_offsets;   /* byte offset of each GPU rule in program */
-extern int           *gpu_rule_origin;    /* gpu_rule_origin[i] = original Rules[] index */
+extern int           *gpu_rule_slot;    /* 1-BASED RuleCnt[]/Ruleindex slot; 0 = no-rule */
 extern int            gpu_rule_count;     /* number of GPU-eligible rules uploaded */
 extern char          *Rules;              /* length-prefixed rule buffer (mdxfind.c) */
 extern unsigned int   Numrules;           /* total rules loaded */
@@ -448,23 +452,17 @@ static uint64_t gpu_now_us(void);              /* fwd-decl, defined below */
 static int gpu_pipe_trace_enabled = -1;        /* -1 = uninit, 0/1 = resolved */
 static void gpu_pipe_trace_init(void) {
     if (gpu_pipe_trace_enabled >= 0) return;
-    const char *e = getenv("MDXFIND_PIPE_TRACE");
-    gpu_pipe_trace_enabled = (e && *e && *e != '0') ? 1 : 0;
+    /* was MDXFIND_PIPE_TRACE */
+    gpu_pipe_trace_enabled = 0;
 }
 
 static void gpu_dispatch_trace_init(void) {
     if (gpu_dispatch_trace_enabled >= 0) return;
-    const char *e = getenv("MDXFIND_DISPATCH_TRACE");
-    gpu_dispatch_trace_enabled = (e && *e && *e != '0') ? 1 : 0;
+    /* was MDXFIND_DISPATCH_TRACE; MDXFIND_DISPATCH_TRACE_FILE went with it */
+    gpu_dispatch_trace_enabled = 0;
     if (gpu_dispatch_trace_enabled) {
-        const char *path = getenv("MDXFIND_DISPATCH_TRACE_FILE");
-        if (path && *path) {
-            gpu_dispatch_trace_fp = fopen(path, "a");
-            if (!gpu_dispatch_trace_fp) {
-                fprintf(stderr, "WARN: MDXFIND_DISPATCH_TRACE_FILE='%s' open failed; falling back to stderr\n", path);
-                gpu_dispatch_trace_fp = stderr;
-            }
-        } else {
+        /* Always stderr.  MDXFIND_DISPATCH_TRACE_FILE used to redirect it. */
+        {
             gpu_dispatch_trace_fp = stderr;
         }
         gpu_dispatch_trace_lock = new_lock(0);
@@ -1230,8 +1228,8 @@ void gpujob(void *arg) {
                             "FATAL: %s:%d OpenCL: codegen auto-dispatcher "
                             "FATAL for op=%d iter=%d rules=%d -- neither "
                             "legacy nor codegen can serve this cell. "
-                            "Workaround: try MDXFIND_GPU_BACKEND=legacy or "
-                            "split rule file into smaller chunks.\n",
+                            "Split the rule file into smaller chunks, or "
+                            "run this type on the CPU with -G none.\n",
                             __FILE__, __LINE__, g->op, Maxiter, gpu_rule_count);
                         exit(1);
                     }
@@ -1825,7 +1823,7 @@ void gpujob(void *arg) {
                     /* Precompute a table of rule-bytecode pointers the first time
                      * this thread enters the rules_engine path.  Each entry in
                      * the Rules buffer is: uint16_t length | bytecode[length].
-                     * We index by orig_idx (0..Numrules-1). */
+                     * We index by (rslot - 1), i.e. 0..Numrules-1. */
                     static __thread char  **_rule_ptr_cache  = NULL;
                     static __thread int     _rule_ptr_nrules = 0;
                     if (_rule_ptr_cache == NULL || _rule_ptr_nrules != (int)Numrules) {
@@ -2309,51 +2307,156 @@ void gpujob(void *arg) {
                         /* Recover original word from packed_buf. */
                         uint32_t pos = g->word_offset[widx];
                         if (pos >= g->packed_pos) continue;
-                        uint8_t plen = (uint8_t)g->packed_buf[pos];
-                        if (pos + 1 + plen > g->packed_pos) continue;
-                        char *pword = g->packed_buf + pos + 1;
+                        /* 2-byte little-endian length header; see the pack site in
+                         * mdxfind.c.  plen must be wider than uint8_t now. */
+                        uint32_t plen = (uint32_t)(uint8_t)g->packed_buf[pos]
+                                     | ((uint32_t)(uint8_t)g->packed_buf[pos + 1] << 8);
+                        if (pos + 2 + plen > g->packed_pos) continue;
+                        char *pword = g->packed_buf + pos + 2;
 
                         /* Map GPU rule index -> original Rules[] index.
-                         * Sentinel orig_idx == -1 means this hit came from the
-                         * synthetic `:` no-rule pass (auto-injected at session
-                         * start so the GPU produces md5(word) for free); skip
-                         * applyrule replay and use the original word directly. */
-                        int orig_idx = gpu_rule_origin[ridx];
+                         * gpu_rule_slot[] is 1-BASED: it is the job->Ruleindex /
+                         * RuleCnt[] index, matching the CPU walker (mdxfind.c:13963).
+                         * Slot 0 is the synthetic `:` no-rule pass (auto-injected at
+                         * session start so the GPU produces md5(word) for free), and
+                         * 0 is already the correct "No rule" bucket, so the sentinel
+                         * needs no special attribution -- only a replay skip. */
+                        int rslot = gpu_rule_slot[ridx];   /* 1-BASED RuleCnt[] index; 0 = no-rule pass */
                         int out_len;
-                        if (orig_idx == -1) {
+                        if (rslot == 0) {
                             /* Synthetic `:` — plaintext IS the original word. */
                             memcpy(synthetic_job.line, pword, plen);
                             synthetic_job.line[plen] = 0;
                             out_len = (int)plen;
                             synthetic_job.Ruleindex = 0;  /* no rule applied */
                         } else {
-                            if (orig_idx < 0 || orig_idx >= (int)Numrules) continue;
+                            if (rslot < 1 || rslot > (int)Numrules) continue;
 
                             /* Replay applyrule() to reconstruct the transformed plaintext. */
                             memcpy(synthetic_job.line, pword, plen);
                             synthetic_job.line[plen] = 0;
 
                             char *rule_bc = (_rule_ptr_cache && _rule_ptr_nrules == (int)Numrules)
-                                            ? _rule_ptr_cache[orig_idx]
+                                            ? _rule_ptr_cache[rslot - 1]
                                             : NULL;
                             if (!rule_bc) continue;
 
-                            int new_len = applyrule(synthetic_job.line, _tpass, (int)plen,
-                                                    rule_bc, &_ws);
+                            /* UTF-32 path: the replay MUST use the engine the
+                             * DEVICE used for this (word, rule).  Calling
+                             * applyrule() unconditionally emitted the byte
+                             * engine's answer for every UTF-32 hit -- a correct
+                             * digest with a plaintext that does not hash to it,
+                             * on all 15,165 recovered lines of a measured run.
+                             * gpu_u32_replay_apply reads the device's own
+                             * capability bits and walks the device's own packed
+                             * stream, so there is no second opinion about which
+                             * engine ran.  Contract is applyrule's, so the
+                             * -1/-2 handling below is unchanged. */
+                            int new_len = GPU_U32_REPLAY_BYTE;
+                            if (gpu_u32_active())
+                                new_len = gpu_u32_replay_apply(synthetic_job.line,
+                                                               (int)plen, ridx,
+                                                               _tpass, MAXLINE);
+                            if (new_len == GPU_U32_REPLAY_BYTE)
+                                new_len = applyrule(synthetic_job.line, _tpass,
+                                                    (int)plen, rule_bc, &_ws);
+                            /* The dropped-hit PROBE that found the no-rule
+                             * dedup bug lived here and is REMOVED: it read
+                             * MDXFIND_GPU_U32_PROBE, and MDXFIND_CACHE is the
+                             * only environment input mdxfind takes.  It earned
+                             * its keep -- it printed
+                             * `DROPPED hit widx=1345 ridx=0 rslot=1 new_len=-2`
+                             * and named the rule -- and a bounded stderr probe
+                             * belongs in the test harness, not in a shipped
+                             * binary's environment. */
+                            /* ---- THE NO-OP RE-ATTRIBUTION, BOTH ARMS ------
+                             *
+                             * `new_len == -2` means the rule's output EQUALS
+                             * its input.  Dropping it loses a recovery, and
+                             * this was measured TWICE -- once per arm.
+                             *
+                             * UTF-32 arm, 27 rules: `-8` over control.md5
+                             * returned 28,443 of 28,444 and the missing line
+                             * was
+                             *   MD5x01 1653a3b0...:$HEX[e88ab1e59bad]   (花园)
+                             * with `md5(word)` ITSELF the target.  The device
+                             * reported a hit for (花园, rule `u`) -- `u` is a
+                             * no-op on CJK -- that hit won the on-GPU dedup bit
+                             * for the digest, the replay then said -2 and
+                             * discarded it, and the genuine no-rule lane for the
+                             * same word was already suppressed by that bit.
+                             *
+                             * BYTE arm, 100k rules: the fix above was scoped to
+                             * the UTF-32 arm on the argument that "the byte
+                             * path's -2 drop is unchanged and control.md5 is
+                             * byte-exact on it".  That was true AT 27 RULES and
+                             * false at 100,000, where a no-op rule is far more
+                             * likely to reach a digest first.  Measured on
+                             * control.md5 x HashMob.100k.rule, GTX 1080:
+                             *   byte path (no -8)  GPU 24,147  CPU 24,148
+                             *                      missing $HEX[e88ab1e59bad]
+                             *   `-8`               GPU 24,275  CPU 24,276
+                             *                      missing $HEX[acbc]
+                             * -- the same defect, once per engine.  Under `-8`
+                             * the loss MOVED to a class-I word (0xac 0xbc is not
+                             * valid UTF-8), because a class-I word takes the
+                             * byte arm and the scoped fix did not cover it.
+                             * Metal happened to return 24,276 on the same
+                             * fixture: it sub-batches the rule axis, so a
+                             * different lane won the bit.  A defect whose
+                             * visibility depends on chunk size is one to fix,
+                             * not to characterise.
+                             *
+                             * The fix is not to drop.  If the output equals the
+                             * input then the CANDIDATE IS THE ORIGINAL WORD, and
+                             * the digest matched a loaded target, so the word is
+                             * a genuine recovery -- exactly what the no-rule pass
+                             * would have emitted.  Re-attribute it to Ruleindex 0
+                             * ("No rule"), which is where the CPU credits it, and
+                             * emit.  That argument does not mention the engine,
+                             * which is why the scoping was wrong.
+                             *
+                             * It cannot lose a recovery and it cannot emit a
+                             * wrong plaintext: the emitted plaintext is the input
+                             * word, whose digest is the one that matched.  It
+                             * cannot double-emit either -- the dedup bit that
+                             * caused this admits exactly one lane per digest.
+                             * And it cannot inflate a rule's -Z count, because
+                             * the credit goes to rule 0, not to the no-op rule.
+                             *
+                             * With a mask active the emitted plaintext is still
+                             * right: this writes the WORD and the mask block
+                             * below prepends/appends to it, exactly as the
+                             * non-re-attributed path does. */
                             if (new_len == -2) {
-                                /* Auto-skip: output equals input. */
+                                memcpy(synthetic_job.line, pword, plen);
+                                synthetic_job.line[plen] = 0;
                                 out_len = (int)plen;
-                                /* synthetic_job.line already holds the original word. */
-                            } else if (new_len < 0) {
-                                /* Rule errored — skip this hit. */
+                                synthetic_job.Ruleindex = 0;   /* No rule */
+                                goto u32_noop_reattributed;
+                            }
+                            if (new_len < 0) {
+                                /* Only -1 (the rule FAILED) reaches here now; -2
+                                 * is re-attributed above.  Skipping a failed rule
+                                 * matches the CPU.
+                                 *
+                                 * The historical reason for dropping -2 as well
+                                 * was real and is preserved by the
+                                 * re-attribution: emitting it under the RULE's
+                                 * index printed the plaintext twice and inflated
+                                 * that rule's -Z count by exactly its
+                                 * output-equals-input count.  Crediting rule 0
+                                 * keeps that fixed while not losing the
+                                 * recovery. */
                                 continue;
                             } else {
                                 memcpy(synthetic_job.line, _tpass, new_len);
                                 synthetic_job.line[new_len] = 0;
                                 out_len = new_len;
                             }
-                            synthetic_job.Ruleindex = orig_idx;
+                            synthetic_job.Ruleindex = rslot;
                         }
+                        u32_noop_reattributed: ;
 
                         /* B7.1-B7.5: prepend+append the mask characters to
                          * the candidate plaintext. The kernel did the same
@@ -2492,7 +2595,7 @@ void gpujob(void *arg) {
                         /* B5 sub-batch 2 debug: dump GPU output bytes when
                          * MDXFIND_GPU_DEBUG_DIGEST is set. Helps diagnose
                          * byte-exact mismatches in new template kernels. */
-                        if (getenv("MDXFIND_GPU_DEBUG_DIGEST")) {
+                        if (0) {   /* was MDXFIND_GPU_DEBUG_DIGEST */
                             static __thread int _logged = 0;
                             if (_logged < 5) {
                                 GPU_DEBUG_FPRINTF(stderr, "[gpu-dbg] op=%d hexlen=%d widx=%u ridx=%u mask_idx=%u plain=\"%.*s\" digest=",

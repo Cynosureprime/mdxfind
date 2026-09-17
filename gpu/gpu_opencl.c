@@ -293,6 +293,16 @@ struct gpu_device {
      * the kernel emits hits with (word_idx, rule_idx) for host replay. */
     cl_program prog_md5_rules;
     cl_kernel  kern_md5_rules_phase0;
+    /* UTF-32 path (2026-09-13).  Built from the SAME prog_md5_rules, which is
+     * why it costs no second program object: the three UTF-32 sources are
+     * appended to that program when the UTF-32 path is active. */
+    cl_kernel  kern_md5_rules_mixed_phase0;
+    int        u32_rules_uploaded;   /* combined program uploaded to this device */
+    cl_mem     b_u32_case_tab;       /* the two 1:1 case tables, concatenated.
+                                      * __global, not __constant: 26,048 bytes
+                                      * of constant data put the rules program
+                                      * 13 KB past NVIDIA's 64 KB bank and
+                                      * ptxas refused the build. */
     cl_kernel  kern_md5_rules_phase0_validate;  /* env-gated: MDXFIND_GPU_VALIDATOR=1
                                                    replaces the production kernel
                                                    for this dispatch with a
@@ -302,12 +312,10 @@ struct gpu_device {
                                                    rev 1.24, gated by
                                                    MDXFIND_RULE_VALIDATOR=1). */
 
-    /* Memo B B2 template path (env-gated: MDXFIND_GPU_TEMPLATE=md5).
-     * Side-by-side with md5_rules_phase0; same kernel signature so the
-     * dispatch_md5_rules call site swaps the cl_kernel handle and
-     * leaves all the kernel-arg setup unchanged. Default off; B5 flips
-     * the default once the template wins justify retiring the legacy
-     * side-by-side kernel. See project_memo_b_dispatch_template.md
+    /* Memo B B2 template path, and since B5 the only path for MD5.
+     * Same kernel signature as the legacy md5_rules_phase0 it displaced,
+     * so the dispatch_md5_rules call site just resolves a different
+     * cl_kernel handle and leaves all the kernel-arg setup unchanged. See project_memo_b_dispatch_template.md
      * §3 (template body) and §4 (rollout path).
      *
      * Cache key (R3 mitigation): built via gpu_kernel_cache_build_-
@@ -332,8 +340,8 @@ struct gpu_device {
     cl_program prog_template_md5_bf;
     cl_kernel  kern_template_phase0_md5_bf;
     /* Memo B Phase B4 (2026-05-04): SHA1 template instantiation. Parallel
-     * to prog_template / kern_template_phase0 (MD5) — selected when
-     * MDXFIND_GPU_TEMPLATE=sha1. Built lazily on first dispatch via
+     * to prog_template / kern_template_phase0 (MD5) — resolved for
+     * op == JOB_SHA1. Built lazily on first dispatch via
      * gpu_opencl_template_compile_sha1(); kernel object created lazily
      * via gpu_opencl_template_kernel_lazy_sha1(). Cache key uses
      * defines_str = "HASH_WORDS=5,HASH_BLOCK_BYTES=64" so distinct
@@ -342,14 +350,14 @@ struct gpu_device {
     cl_program prog_template_sha1;
     cl_kernel  kern_template_phase0_sha1;
     /* Memo B Phase B4 fan-out (2026-05-04): SHA256/SHA224/MD4 template
-     * instantiations. Parallel to prog_template_sha1; selected when
-     * MDXFIND_GPU_TEMPLATE=sha256/sha224/md4. Cache keys distinguish
+     * instantiations. Parallel to prog_template_sha1; resolved for
+     * op == JOB_SHA256 / JOB_SHA224 / JOB_MD4. Cache keys distinguish
      * SHA256 (HASH_WORDS=8) from SHA224 (HASH_WORDS=7) via defines_str;
      * MD4 has the same defines_str as MD5 (HASH_WORDS=4) but distinct
      * source text (gpu_md4_core_str vs gpu_md5_core_str), and the cache
      * key hashes both source text and defines so distinct keys are
-     * guaranteed. Built lazily on first dispatch; per-algo strict
-     * op-match swap at dispatch site. */
+     * guaranteed. Built lazily on first dispatch; the dispatch site
+     * resolves strictly on the op. */
     cl_program prog_template_sha256;
     cl_kernel  kern_template_phase0_sha256;
     cl_program prog_template_sha224;
@@ -487,19 +495,29 @@ struct gpu_device {
     cl_program prog_template_md6256;
     cl_kernel  kern_template_phase0_md6256;
     /* Memo B Phase B5 sub-batch 6 (2026-05-03), Tier B: NTLMH (NT password
-     * hash = MD4(UTF-16LE-zero-extend(p)). Hashcat-compatible zero-extend
-     * variant — for non-ASCII inputs the iconv variant remains on CPU
-     * (same gap as the existing slab path; documented in mdxfind.c
-     * line 583/589). defines_str matches MD4 (HASH_WORDS=4, HASH_BLOCK_BYTES=64). */
+     * hash = MD4(UTF-16LE(p)). 2026-09-15: the core computes BOTH CPU
+     * variants — the real iconv("UTF-16LE//IGNORE","UTF-8") conversion and
+     * the byte zero-extend — and probes both, via the
+     * GPU_TEMPLATE_HAS_ALT_DIGEST hook in gpu_template.cl. It previously
+     * computed the zero-extend alone, which left the iconv arm UNREACHABLE
+     * on any non-ASCII candidate (the GPU claims the batch and the CPU
+     * never redoes the work) and printed a clean "None found, sorry!".
+     * defines_str matches MD4 (HASH_WORDS=4, HASH_BLOCK_BYTES=64). */
     cl_program prog_template_ntlmh;
     cl_kernel  kern_template_phase0_ntlmh;
     /* Memo B Phase B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496).
-     * Same MD4(UTF-16LE-zero-extend(p)) algorithm as NTLMH, with a
-     * proper iter step for Maxiter > 1: each iter feeds back the lowercase
-     * hex of the prior digest (32 ASCII chars) zero-extended to UTF-16LE
-     * (64 bytes) and MD4'd. defines_str matches MD4 / NTLMH
-     * (HASH_WORDS=4, HASH_BLOCK_BYTES=64). Distinct cache entry by
-     * source-text hash. */
+     * MD4(UTF-16LE(p)) with an iter step for Maxiter > 1: each iter feeds
+     * back the lowercase hex of the prior digest (32 ASCII chars)
+     * zero-extended to UTF-16LE (64 bytes) and MD4'd.
+     * 2026-09-15: iter == 1 now uses the real iconv conversion. CPU
+     * JOB_MD4UTF16 (mdxfind.c:19070-19097) has NO zero-extend arm at all
+     * — unlike JOB_NTLMH, which has both — so the old zero-extend core
+     * computed a digest the CPU never computes, and e496 on the GPU could
+     * only ever miss on a non-ASCII candidate. The "same hashcat-compat
+     * gap as NTLMH" framing in the pre-2026-09-15 comments here and at
+     * mdxfind.c:13248 was wrong on exactly that point.
+     * defines_str matches MD4 / NTLMH (HASH_WORDS=4,
+     * HASH_BLOCK_BYTES=64). Distinct cache entry by source-text hash. */
     cl_program prog_template_md4utf16;
     cl_kernel  kern_template_phase0_md4utf16;
     /* Memo B Phase B5 sub-batch 7 (2026-05-05): MYSQL3 (-m e456).
@@ -1124,21 +1142,15 @@ static __thread int      _kb_last_stage_valid    = 0;
 
 static int _dynsize_atexit_registered = 0;
 
-static int dynsize_is_enabled(void) {
-    /* Default ON (2026-05-09 user direction). Env-var "0" is the only opt-out. */
-    const char *e = getenv("MDXFIND_DYNSIZE");
-    if (!e) return 1;
-    return atoi(e) ? 1 : 0;
-}
+/* Dynamic sizing is always on (2026-05-09 user direction) and has no opt-out;
+ * salts-per-page is never pinned; the verbose trace is gone. All three were
+ * env-driven until 2026-09-16 (MDXFIND_DYNSIZE, _SPP, _DYNSIZE_VERBOSE). They
+ * stay as functions because the invariant is worth stating at each caller. */
+static int dynsize_is_enabled(void) { return 1; }
 
-static int dynsize_spp_pinned(void) {
-    return getenv("MDXFIND_SPP") != NULL;
-}
+static int dynsize_spp_pinned(void) { return 0; }
 
-static int dynsize_verbose(void) {
-    const char *e = getenv("MDXFIND_DYNSIZE_VERBOSE");
-    return (e && atoi(e)) ? 1 : 0;
-}
+static int dynsize_verbose(void) { return 0; }
 
 /* FNV-1a 64-bit over (CL_DEVICE_NAME|CL_DRIVER_VERSION|CL_DEVICE_VENDOR).
  * 16 hex chars output. Stable identifier for per-device cache file. */
@@ -1371,11 +1383,7 @@ static uint32_t dynsize_compile_time_N(struct gpu_device *d, int dev_idx) {
             return d->dynsize_md5salt.current_N;
         }
     }
-    const char *sb = getenv("MDXFIND_SALT_BATCH");
-    if (sb && *sb) {
-        int v = atoi(sb);
-        if (v >= 1 && v <= 256) return (uint32_t)v;
-    }
+    /* 64 is the batch; MDXFIND_SALT_BATCH used to override it. */
     return 64u;
 }
 
@@ -1832,12 +1840,26 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
 #include "gpu_bcrypt_core_str.h"
 /* Phase 0/1 GPU rule expansion engine. See project_gpu_rule_engine_design.md. */
 #include "gpu_md5_rules_str.h"
+/* UTF-32 rule path (2026-09-13).  Three generated kernel sources plus the
+ * header-only host side.  gpu_u32_tables_str.h and gpu_u32_walker_str.h are
+ * generated from ../combining.h, ../latin_case.h and gpu_u32_walker.inc;
+ * gpu_md5_rules32_str.h carries the kernel bodies.  All three are appended to
+ * the rules program ONLY when the UTF-32 path is active, so a byte-mode run
+ * compiles exactly what it compiled before -- including the same cache key. */
+/* gpu_u32_tables_str.h is deliberately NOT included: the tables are inlined
+ * into gpu_u32_walker.cl by gen_u32_walker.py, so a second copy here would
+ * declare every array twice. */
+#include "gpu_u32_walker_str.h"
+/* The HOST's copy of the two case tables, uploaded as a __global kernel
+ * argument.  Generated alongside the device tables from ../latin_case.h. */
+#include "gpu_u32_case_host.h"
+#include "gpu_md5_rules32_str.h"
+#include "gpu_u32_host.h"
 /* Memo B Phase B2 (2026-05-04): generic dispatch-template skeleton +
- * MD5 algorithm core. Template kernel (template_phase0) is built
- * side-by-side with md5_rules_phase0; selected at dispatch time when
- * MDXFIND_GPU_TEMPLATE=md5 is set in the env. Default off. See
- * project_memo_b_dispatch_template.md §3 (template body) and the B2
- * row of the phase ladder. */
+ * MD5 algorithm core. Template kernel (template_phase0) is resolved at
+ * dispatch time for op == JOB_MD5, and is the only MD5 rules kernel
+ * since B5. See project_memo_b_dispatch_template.md §3 (template body)
+ * and the B2 row of the phase ladder. */
 #include "gpu_md5_core_str.h"
 /* Phase 1.9 Tranche A1 (2026-05-10): MD5 brute-force fast-path algorithm
  * core, side-by-side with gpu_md5_core_str. Same MD5 family geometry
@@ -1946,14 +1968,17 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
  * A working array. defines_str: HASH_WORDS=8,HASH_BLOCK_BYTES=64,
  * BASE_ALGO=md6. CPU reference at mdxfind.c JOB_MD6256 (lines 25836-25855). */
 #include "gpu_md6256_core_str.h"
-/* Memo B Phase B5 sub-batch 6 (2026-05-03), Tier B: NTLMH. MD4 of UTF-16LE
- * zero-extend(p) — hashcat-compatible NT password hash. CPU reference at
- * mdxfind.c JOB_NTLMH (line 15174). */
+/* Memo B Phase B5 sub-batch 6 (2026-05-03), Tier B: NTLMH. MD4 of the
+ * UTF-16LE form of p, BOTH variants the CPU computes (iconv and byte
+ * zero-extend) since 2026-09-15. CPU reference at mdxfind.c JOB_NTLMH
+ * (case body at mdxfind.c:19254-19277). */
 #include "gpu_ntlmh_core_str.h"
-/* Memo B Phase B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496). Same
- * MD4(UTF-16LE-zero-extend(p)) as NTLMH but with iter loop support
- * (Maxiter > 1 feeds back hex of prior digest as UTF-16LE-zero-extend
- * input). CPU reference at mdxfind.c JOB_MD4UTF16 (line 15040-15068). */
+/* Memo B Phase B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496).
+ * MD4(iconv(UTF-8 -> UTF-16LE)(p)) since 2026-09-15, with iter loop
+ * support (Maxiter > 1 feeds back hex of prior digest as
+ * UTF-16LE-zero-extend input — hex is ASCII so the two agree there).
+ * CPU reference at mdxfind.c JOB_MD4UTF16 (case body at
+ * mdxfind.c:19070-19097). */
 #include "gpu_md4utf16_core_str.h"
 /* Memo B Phase B5 sub-batch 7 (2026-05-05): MYSQL3 (-m e456). Legacy MySQL
  * OLD_PASSWORD() hash, 64-bit output, per-byte arithmetic accumulator.
@@ -2734,14 +2759,9 @@ static int init_device(int di, cl_device_id dev_id) {
      * (MDXFIND_INORDER_QUEUE was the diagnostic toggle that confirmed
      * the bug; flipped the polarity). */
     cl_command_queue_properties qprops = 0;  /* default: in-order */
-    {
-        const char *e = getenv("MDXFIND_OOO_QUEUE");
-        if (e && *e && *e != '0') {
-            qprops = CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE;
-            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: OOO queue enabled (MDXFIND_OOO_QUEUE=%s) — known to lose cracks on some NVIDIA drivers\n", e);
-        }
-    }
+    /* The queue is always in-order. MDXFIND_OOO_QUEUE could switch it to
+     * CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, which is known to LOSE CRACKS on
+     * some NVIDIA drivers -- its own warning said so. Removed 2026-09-16. */
     /* MDXFIND_KERNEL_TRACE=1 opts the queue into CL_QUEUE_PROFILING_ENABLE
      * so per-kernel-event start/end timestamps can be retrieved via
      * clGetEventProfilingInfo. Adds negligible host-side cost when on; OFF
@@ -2749,28 +2769,14 @@ static int init_device(int di, cl_device_id dev_id) {
      * is wall-clock around the whole dispatch call: kernel + readback +
      * applyrule replay + checkhash). One-line additive change to the
      * existing OOO-queue plumbing. */
-    {
-        const char *e = getenv("MDXFIND_KERNEL_TRACE");
-        if (e && *e && *e != '0') {
-            qprops |= CL_QUEUE_PROFILING_ENABLE;
-            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: kernel-time profiling enabled (MDXFIND_KERNEL_TRACE=%s) — emits [kern] lines on dispatch\n", e);
-        }
-    }
+    /* No kernel-time profiling on the queue; MDXFIND_KERNEL_TRACE used to enable it. */
     /* Phase 5 stage-timing (2026-05-20): MDXFIND_DISPATCH_TRACE=1 also opts the
      * queue into profiling so the kernel-B PROTO dispatcher can disaggregate
      * kernel_a_us / host_gap_us / kernel_b_us / queue_wait_a_us from the
      * per-call wall_us. Profiling enable adds negligible runtime overhead
      * (host-side timestamp read on each event), and DISPATCH_TRACE is itself
      * an opt-in diagnostic mode — no impact when env var is unset. */
-    {
-        const char *e = getenv("MDXFIND_DISPATCH_TRACE");
-        if (e && *e && *e != '0') {
-            qprops |= CL_QUEUE_PROFILING_ENABLE;
-            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: dispatch-trace profiling enabled (MDXFIND_DISPATCH_TRACE=%s) — per-stage [disp] fields emitted on proto path\n", e);
-        }
-    }
+    /* No dispatch-stage profiling on the queue; MDXFIND_DISPATCH_TRACE used to enable it. */
     /* PROFILE_VARIANT-for-A4 (2026-05-30, architect spec project_kernel_-
      * a_a4_profile_variant_spec_2026-05-30.md D5.a): the A4 standalone
      * dispatcher records kernel_a4_us via cl_event profiling, which
@@ -2780,19 +2786,8 @@ static int init_device(int di, cl_device_id dev_id) {
      * Direct check on getenv (not via the accessor) to avoid host-gate
      * recursion at queue-creation time -- queue lives across all dispatch
      * variants, doesn't matter if VARIANT != 4 at this point. */
-    {
-        const char *e = getenv("MDXFIND_KERNEL_A4_PROFILE_VARIANT");
-        if (e && *e) {
-            /* Auto-enable profiling whenever env is SET (including
-             * "0") so the operator can collect the V0 baseline using
-             * the same dispatcher path that V1..V5 use. Per spec D5.a
-             * matching gate semantics with the dispatcher-side
-             * timing accumulator. */
-            qprops |= CL_QUEUE_PROFILING_ENABLE;
-            if (di == 0) GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: A4 PROFILE_VARIANT timing enabled (MDXFIND_KERNEL_A4_PROFILE_VARIANT=%s) -- per-dispatch [ocl-kA4] line emitted from A4 dispatcher\n", e);
-        }
-    }
+        /* No queue profiling.  MDXFIND_KERNEL_A4_PROFILE_VARIANT used to
+         * add CL_QUEUE_PROFILING_ENABLE here for A4 dispatch timings. */
     d->queue = clCreateCommandQueue(d->ctx, dev_id, qprops, &err);
     if (!d->queue && qprops != 0) {
         d->queue = clCreateCommandQueue(d->ctx, dev_id, 0, &err);
@@ -4390,10 +4385,9 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
      * unchanged. Override either way via MDXFIND_SKIP_WARMUP=1.
      * MDXFIND_FORCE_WARMUP=1 overrides the AMD auto-skip (for debugging). */
     {
-        const char *force = getenv("MDXFIND_FORCE_WARMUP");
-        int force_warm = (force && *force && *force != '0');
-        if (!force_warm &&
-            (strstr(d->name, "AMD") || strstr(d->name, "Radeon") ||
+        /* The AMD auto-skip always applies; MDXFIND_FORCE_WARMUP used to
+         * override it for debugging. */
+        if ((strstr(d->name, "AMD") || strstr(d->name, "Radeon") ||
              strncmp(d->name, "gfx", 3) == 0)) {
             if (!d->fam_timed[fam]) {
                 GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: warm-probe skipped (AMD device, task #44)\n", dev_idx);
@@ -4849,13 +4843,7 @@ static void *probe_thread_body(void *vp) {
 
 void gpu_opencl_warm_probe_async(int op) {
     if (!ocl_ready) return;
-    {
-        const char *e = getenv("MDXFIND_SKIP_WARMUP");
-        if (e && *e && *e != '0') {
-            fprintf(stderr, "WARN: warm_probe_async skipped via MDXFIND_SKIP_WARMUP\n");
-            return;
-        }
-    }
+    /* The warm probe always runs; MDXFIND_SKIP_WARMUP used to skip it. */
     if (probe_thread_count > 0) {
         fprintf(stderr, "WARN: warm_probe_async early-return: probe_thread_count=%d (stale from prior session?)\n",
                 probe_thread_count);
@@ -5377,15 +5365,49 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
  * dispatch_md5_rules() and a few microseconds at first dispatch.
  */
 static int gpu_opencl_rules_compile(struct gpu_device *d, int dev_idx) {
+    /* This backend HAS the UTF-32 kernel bodies (md5_rules_mixed_phase0 in
+     * gpu_md5_rules32.cl), so it is entitled to claim capability.  A backend
+     * that carries only the generated walker must NOT -- see
+     * gpu_u32_set_backend_capable.  Claimed here rather than at device
+     * enumeration because this is the function that would fail if the sources
+     * did not compile. */
+    gpu_u32_set_backend_capable(1);
     if (d->prog_md5_rules) return 0;       /* already built */
     cl_int err = CL_SUCCESS;
-    const char *sources[2] = { gpu_common_str, gpu_md5_rules_str };
+    /* The UTF-32 sources are appended only when the UTF-32 path is active --
+     * i.e. `-8` was given and this backend can run the walker.
+     * Two reasons, and the second is the important one:
+     *   - 30 KB of constant tables and a second walker cost compile time and
+     *     constant-memory budget that a byte-mode run has no use for;
+     *   - the source list is part of the kernel-cache key, so a byte-mode run
+     *     keeps hitting the cache entries it already has.  Compiling the
+     *     bigger program unconditionally would invalidate every cached rules
+     *     binary in the fleet on the first run of this build. */
+    const char *sources[4] = { gpu_common_str, gpu_md5_rules_str,
+                               NULL, NULL };
+    cl_uint nsrc = 2;
+    if (gpu_u32_active()) {
+        /* TWO sources, not three.  gpu_u32_walker.cl is GENERATED with
+         * gpu_u32_tables.cl INLINED into it (gen_u32_walker.py concatenates
+         * them so the address-space macros are defined before the tables are
+         * declared).  Passing the tables as a separate source as well declared
+         * every array TWICE and, worse, the standalone copy was compiled before
+         * anything defined CL_CONSTANT -- the JIT echoed
+         * `CL_CONSTANT uint u32_marks[580] = {` back as a syntax error, the
+         * rules program failed to build, and mdxfind fell back to the CPU rule
+         * path for the whole run.  Loud, but the recovered COUNT was still
+         * right because the CPU did the work, so only the stderr line
+         * distinguished it from a successful GPU run. */
+        sources[2] = gpu_u32_walker_str;
+        sources[3] = gpu_md5_rules32_str;
+        nsrc = 4;
+    }
     /* gpu_kernel_cache_build_program() handles cache load/store + atomic
      * compile-with-lock when MDXFIND_CACHE is set; falls through to plain
      * source compile when the cache is disabled. Either way returns the
      * built cl_program (or NULL on failure) and the last cl_int via err. */
     d->prog_md5_rules = gpu_kernel_cache_build_program(d->ctx, d->dev,
-                                                       2, sources,
+                                                       nsrc, sources,
                                                        "-cl-std=CL1.2", &err);
     if (!d->prog_md5_rules || err != CL_SUCCESS) {
         char log[8192] = {0};
@@ -5413,16 +5435,7 @@ static int gpu_opencl_rules_compile(struct gpu_device *d, int dev_idx) {
  * this function returns 0 after one getenv() call — no measurable
  * overhead on the dispatch hot path. */
 static int gpu_validator_enabled(void) {
-    static int cached = -1;
-    if (cached == -1) {
-        cached = (getenv("MDXFIND_GPU_VALIDATOR") != NULL) ? 1 : 0;
-        if (cached) {
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_VALIDATOR=1 — md5_rules dispatch will use "
-                "validator kernel and emit VALIDATE lines on stderr\n");
-        }
-    }
-    return cached;
+    return 0;   /* was MDXFIND_GPU_VALIDATOR */
 }
 
 /* Lazily create the md5_rules_phase0_validate kernel object. Only
@@ -5441,6 +5454,35 @@ static int gpu_opencl_validate_kernel_lazy(struct gpu_device *d, int dev_idx) {
         d->kern_md5_rules_phase0_validate = NULL;
         d->device_disabled = 1;
         return -1;
+    }
+    return 0;
+}
+
+/* Lazily create md5_rules_mixed_phase0 -- the UTF-32 path's production
+ * kernel.  Same 14-argument signature and same payload layout as
+ * md5_rules_phase0, so the dispatch below swaps the handle and changes
+ * nothing else.  That is what makes the T0/T1/T2 comparison measure the
+ * kernel rather than the plumbing.
+ *
+ * A failure here is FATAL rather than a fall-back to the byte kernel.  A
+ * silent fall-back would run the byte walker while the operator believed the
+ * UTF-32 variant was being measured, and the result would look like a clean
+ * completed run -- which is precisely the failure mode this exercise exists
+ * to be able to detect. */
+static int gpu_opencl_rules32_kernel_lazy(struct gpu_device *d, int dev_idx) {
+    if (d->kern_md5_rules_mixed_phase0) return 0;
+    if (!d->prog_md5_rules) return -1;
+    cl_int err;
+    d->kern_md5_rules_mixed_phase0 =
+        clCreateKernel(d->prog_md5_rules, "md5_rules_mixed_phase0", &err);
+    if (err != CL_SUCCESS || !d->kern_md5_rules_mixed_phase0) {
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d]: md5_rules_mixed_phase0 kernel create "
+            "failed (err=%d) with -8 active. Refusing to fall "
+            "back to the byte walker: that would measure the baseline while "
+            "reporting the variant.\n",
+            __FILE__, __LINE__, dev_idx, err);
+        exit(1);
     }
     return 0;
 }
@@ -5466,137 +5508,88 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
 }
 
 /* ====================================================================
- * Memo B Phase B2: generic dispatch template (env-gated, default off).
+ * The generic dispatch template (Memo B, phases B2 through B7).
  *
- * MDXFIND_GPU_TEMPLATE=md5 (or any non-empty/non-"0") swaps the
- * production md5_rules_phase0 kernel for the template-instantiated
- * template_phase0 kernel built from gpu_template.cl + gpu_md5_core.cl.
- * Both kernels have identical signatures and identical wire formats;
- * only the cl_kernel handle changes.
+ * One kernel skeleton, gpu_template.cl, instantiated per algorithm
+ * against a gpu_<algo>_core.cl that supplies template_finalize and
+ * friends. Every instantiation has the same signature and the same wire
+ * format as the md5_rules_phase0 kernel it replaced; only the cl_kernel
+ * handle differs, which is what let the fan-out land one algorithm at a
+ * time. gpu_template_resolve_kernel() below maps a job op to its handle.
  *
- * The template path proves the structural skeleton that Phase B4-B7
- * will fan out to SHA1/SHA256/SHA512/MD4/etc. B2 itself is a
- * regression-only structural prerequisite: expected wins are 0 (per
- * the phase ladder); the byte-exact 21,289 mmt+ioblade gate is the
- * sign-off.
+ * The notes that follow each document one templated algorithm: which
+ * core file it is built from, its state width and block size, and
+ * whatever was peculiar about wiring it. They are the fan-out's record
+ * and are worth reading before adding the next one.
+ *
+ * Each note used to be attached to a GPU_TEMPLATE_<algo> id, the operand
+ * of the MDXFIND_GPU_TEMPLATE env selector. The selector is gone (see
+ * gpu_template_resolve_kernel) and so are the ids; the notes stay.
  * ==================================================================== */
-
-/* Cached env-var read for MDXFIND_GPU_TEMPLATE. Returns:
- *   GPU_TEMPLATE_OFF  (0) = template path off (default; production md5_rules_phase0)
- *   GPU_TEMPLATE_MD5  (1) = MD5 template (template_phase0 with MD5 core)
- *   GPU_TEMPLATE_SHA1 (2) = SHA1 template (template_phase0 with SHA1 core, B4)
- *
- * B4 (2026-05-04) extended the parser to recognize "sha1". The chokepoint
- * gate at mdxfind.c:10054 still restricts the rules-engine path to
- * job->op == JOB_MD5 — MDXFIND_GPU_TEMPLATE=sha1 alone does NOT route
- * real-mdxfind SHA1 work through this kernel. Production validation of
- * the SHA1 template happens via the gpu_rules_test harness
- * (--algo=sha1 --engine={legacy|template}) until a follow-up commit
- * widens the chokepoint gate. The env-var slot is wired here so the
- * harness can reuse the same compile/cache infrastructure. */
-#define GPU_TEMPLATE_OFF    0
-#define GPU_TEMPLATE_MD5    1
-#define GPU_TEMPLATE_SHA1   2
 /* Memo B Phase B4 fan-out (2026-05-04): SHA256/SHA224/MD4 instantiations.
- * Each is selected over the MD5 template at the dispatch_md5_rules
- * kernel-handle swap site when MDXFIND_GPU_TEMPLATE matches AND the
- * dispatch op == JOB_<algo>. Real-mdxfind work for these algorithms
- * does NOT reach this dispatch path until the chokepoint gate at
- * mdxfind.c:10054 widens (separate commit); the harness
- * (gpu_rules_test.c -a sha256/sha224/md4) is the validation gate. */
-#define GPU_TEMPLATE_SHA256 3
-#define GPU_TEMPLATE_SHA224 4
-#define GPU_TEMPLATE_MD4    5
+ * Each is resolved over the MD5 template at the dispatch_md5_rules
+ * kernel-handle site on dispatch op == JOB_<algo>. The B5 chokepoint
+ * widening carried real mdxfind work down this path; gpu_rules_test
+ * (-a sha256/sha224/md4) remains the per-algorithm validation gate. */
 /* Memo B Phase B5 sub-batch 1 (2026-05-04): first 64-bit-state algos
  * in the template family. SHA384 = 6 ulong = 12 uint32 (HASH_WORDS=12);
  * SHA512 = 8 ulong = 16 uint32 (HASH_WORDS=16). Both use 128-byte blocks
  * (vs MD5/SHA1/SHA2-256/MD4's 64-byte blocks). */
-#define GPU_TEMPLATE_SHA384 6
-#define GPU_TEMPLATE_SHA512 7
 /* Memo B Phase B5 sub-batch 2 (2026-05-05): RIPEMD-160 / RIPEMD-320.
  * RIPEMD-160 is the second 5-word-state algo (after SHA1); RIPEMD-320 is
  * the first 10-word-state algo (10 × uint32 LE; needed new EMIT_HIT_10
  * family in gpu_common.cl rev 1.12). Both are LE per uint32 state (match
  * MD5 / MD4 convention; UNLIKE the SHA family which is BE). */
-#define GPU_TEMPLATE_RIPEMD160 8
-#define GPU_TEMPLATE_RIPEMD320 9
 /* Memo B Phase B5 sub-batch 3 (2026-05-06): BLAKE2 family. BLAKE2S-256
  * (8 uint32 LE state), BLAKE2B-256 (8 uint32 LE = first 4-of-8 ulong),
  * BLAKE2B-512 (16 uint32 LE = full 8 ulong). New b2b_compress primitive
  * in gpu_common.cl rev 1.13 (b2s_compress was already there since the
  * original gpu_blake2s256unsalted slab kernel). */
-#define GPU_TEMPLATE_BLAKE2S256 10
-#define GPU_TEMPLATE_BLAKE2B256 11
-#define GPU_TEMPLATE_BLAKE2B512 12
 /* Memo B Phase B5 sub-batch 4 (2026-05-03): SHA3 / Keccak family. Sponge
  * construction (Keccak-f[1600] permutation; rate=200-2*output_bytes). Each
  * pair (Keccak/SHA3 of same output size) shares rate + EMIT_HIT width but
  * differs in suffix byte (0x01 plain Keccak, 0x06 SHA3 NIST FIPS 202). */
-#define GPU_TEMPLATE_KECCAK224  13
-#define GPU_TEMPLATE_KECCAK256  14
-#define GPU_TEMPLATE_KECCAK384  15
-#define GPU_TEMPLATE_KECCAK512  16
-#define GPU_TEMPLATE_SHA3_224   17
-#define GPU_TEMPLATE_SHA3_256   18
-#define GPU_TEMPLATE_SHA3_384   19
-#define GPU_TEMPLATE_SHA3_512   20
 /* B5 sub-batch 5a Tier 1 (2026-05-03): SHA384RAW + SHA512RAW. Reuse
  * SHA384/SHA512 compression; binary-digest iter step. */
-#define GPU_TEMPLATE_SHA384RAW  21
-#define GPU_TEMPLATE_SHA512RAW  22
 /* B5 sub-batch 6 Tier A (2026-05-03): MD5RAW + SHA1RAW + SHA256RAW. Reuse
  * MD5/SHA1/SHA256 compression; binary-digest iter step. */
-#define GPU_TEMPLATE_MD5RAW     23
-#define GPU_TEMPLATE_SHA1RAW    24
-#define GPU_TEMPLATE_SHA256RAW  25
 /* B5 sub-batch 6 Tier C (2026-05-03): SQL5 (MySQL 4.1+ password). Compound
  * SHA1(SHA1(p)) with UPPERCASE-hex iter feedback. Two SHA1 chains in state. */
-#define GPU_TEMPLATE_SQL5       26
 /* B5 sub-batch 6 Tier B (2026-05-03): NTLMH (NT password hash). MD4 of
- * UTF-16LE zero-extend(p). Hashcat-compatible single-variant. */
-#define GPU_TEMPLATE_NTLMH      27
-/* B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496). Same MD4(UTF-16LE-
- * zero-extend(p)) algorithm as NTLMH with iter loop support (Maxiter > 1
- * feeds back hex of prior digest as UTF-16LE-zero-extend input). */
-#define GPU_TEMPLATE_MD4UTF16   28
+ * UTF-16LE(p); since 2026-09-15 BOTH CPU variants (iconv + zero-extend). */
+/* B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496). MD4(iconv UTF-16LE(p))
+ * since 2026-09-15, with iter loop support (Maxiter > 1 feeds back hex of
+ * prior digest as UTF-16LE-zero-extend input). */
 /* B5 sub-batch 7 (2026-05-05): MYSQL3 (-m e456). Legacy MySQL
  * OLD_PASSWORD() hash. 64-bit output. Per-byte arithmetic accumulator
  * loop with hex-feedback iter step (16 ASCII chars from prior digest).
  * Probe via the default 4-word path (h[2..3] zero); host zero-pad of
  * HashDataBuf (mdxfind.c:36400-36412 rev 1.399+) makes the 4-uint32
  * compare byte-exact for the 8-byte digest. */
-#define GPU_TEMPLATE_MYSQL3     29
 /* B5 sub-batch 6.5 (2026-05-05): WRL (-m e5). Whirlpool 512-bit hash.
  * Miyaguchi-Preneel over 64-byte BE block; iter feeds back 128
  * lowercase hex chars. Diagnostic data point for RDNA4 gfx1201
  * Streebog-deferred issue (different __constant access pattern from
  * SBOG_LPS). */
-#define GPU_TEMPLATE_WRL        30
 /* B5 sub-batch 5b retry (2026-05-06): Streebog-256 + Streebog-512.
  * GOST R 34.11-2012. SBOG_LPS rewritten to shift-then-mask access pattern
  * matching WRL_OP — RDNA4 gfx1201 mitigation validated by sub-6.5 WRL ship
  * (16 KB __constant size identical, only access pattern differs). */
-#define GPU_TEMPLATE_STREEBOG256 31
-#define GPU_TEMPLATE_STREEBOG512 32
 /* B6 salt-axis (2026-05-06): first two salted variants ship together —
  * MD5SALT (hashcat -m 10, JOB_MD5SALT=31) is the double-MD5 chain
  * MD5(hex32(MD5(p)) || salt); MD5SALTPASS (hashcat -m 20, JOB_MD5SALTPASS=
  * 394) is the simple prepend MD5(salt || pass). Two distinct cache keys
  * via SALT_POSITION=APPEND_TO_HEX32 vs PREPEND in defines_str. */
-#define GPU_TEMPLATE_MD5SALT     33
-#define GPU_TEMPLATE_MD5SALTPASS 34
 /* B6.1 SHA1 fan-out (2026-05-06): SHA1SALTPASS (hashcat -m 110, JOB_-
  * SHA1SALTPASS=385) is SHA1(salt || pass). First SHA-family salted variant.
  * Distinct cache key from MD5SALTPASS via HASH_WORDS=5 + BASE_ALGO=sha1
  * tokens in defines_str. */
-#define GPU_TEMPLATE_SHA1SALTPASS 35
 /* B6.2 SHA256 fan-out (2026-05-06): SHA256SALTPASS (hashcat -m 1410, JOB_-
  * SHA256SALTPASS=412) is SHA256(salt || pass). Second SHA-family salted
  * variant. Distinct cache key from SHA1SALTPASS via HASH_WORDS=8 +
  * BASE_ALGO=sha256 tokens (both axes differ); from MD5SALTPASS via
  * HASH_WORDS=8 + BASE_ALGO=sha256 (both axes differ). 36/36 pairwise
  * distinct defines_str. */
-#define GPU_TEMPLATE_SHA256SALTPASS 36
 /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS (hashcat -m 1310, JOB_-
  * SHA224SALTPASS) is SHA224(salt || pass). Third SHA-family salted
  * variant — sha256_block compression with 7-word truncated output.
@@ -5605,20 +5598,17 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * SHA1SALTPASS via HASH_WORDS=7 + BASE_ALGO=sha256 (both axes differ).
  * From MD5SALTPASS via HASH_WORDS=7 + BASE_ALGO=sha256 (both axes
  * differ). 37/37 pairwise distinct defines_str. */
-#define GPU_TEMPLATE_SHA224SALTPASS 37
 /* B6.4 MD5PASSSALT fan-out (2026-05-06): MD5PASSSALT (hashcat -m 10,
  * JOB_MD5PASSSALT=373) is MD5(pass || salt). First APPEND-shape salted
  * variant — distinct cache key from MD5SALTPASS (PREPEND) via SALT_-
  * POSITION=APPEND in defines_str; same BASE_ALGO=md5 + HASH_WORDS=4.
  * 38/38 pairwise distinct defines_str. */
-#define GPU_TEMPLATE_MD5PASSSALT 38
 /* B6.5 SHA1PASSSALT fan-out (2026-05-06): SHA1PASSSALT (hashcat -m 100,
  * JOB_SHA1PASSSALT=405) is SHA1(pass || salt). First SHA-family APPEND-
  * shape salted variant — distinct cache key from SHA1SALTPASS (PREPEND)
  * via SALT_POSITION=APPEND in defines_str; same BASE_ALGO=sha1 +
  * HASH_WORDS=5 axes. From MD5PASSSALT via HASH_WORDS=5 + BASE_ALGO=sha1
  * (both axes differ). 39/39 pairwise distinct defines_str. */
-#define GPU_TEMPLATE_SHA1PASSSALT 39
 /* B6.7 SHA256PASSSALT fan-out (2026-05-06): SHA256PASSSALT (hashcat -m 1410,
  * JOB_SHA256PASSSALT=413) is SHA256(pass || salt). Second SHA-family APPEND-
  * shape salted variant — distinct cache key from SHA256SALTPASS (PREPEND)
@@ -5627,7 +5617,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * (both axes differ). 40/40 pairwise distinct defines_str. (Enum value 43
  * skips 40-42 — reserved for future fan-outs; the enum is a host-side cache
  * key and gaps are harmless.) */
-#define GPU_TEMPLATE_SHA256PASSSALT 43
 /* B6.9 SHA512 fan-out (2026-05-06): SHA512SALTPASS (hashcat -m 1710,
  * JOB_SHA512SALTPASS=388) is SHA512(salt || pass). FIRST 64-bit-state
  * salted variant on the codegen path — sha512_block compression with
@@ -5637,7 +5626,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * 44/44 pairwise distinct defines_str. R2 risk on gfx1201 — unsalted
  * SHA-512 reading was 42,520 B priv_mem; HARD GATE 43,024 B (3080
  * spill-region ceiling). Salted finalize delta expected ~0-50 B. */
-#define GPU_TEMPLATE_SHA512SALTPASS 44
 /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT (hashcat
  * -m 1720, JOB_SHA512PASSSALT=386) is SHA512(pass || salt). FINAL B6
  * ladder step. APPEND-shape sibling of SHA512SALTPASS (B6.9) — same
@@ -5646,7 +5634,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * differs. Cache disambiguated from SHA512SALTPASS via SALT_POSITION=
  * APPEND (vs PREPEND); same BASE_ALGO=sha512 + HASH_WORDS=16 +
  * HASH_BLOCK_BYTES=128 axes. 45/45 pairwise distinct defines_str. */
-#define GPU_TEMPLATE_SHA512PASSSALT 45
 /* Family E HMAC-SHA384 carrier (2026-05-08): SHA384SALTPASS-shaped carrier
  * for HMAC-SHA384 (e543) + HMAC-SHA384_KPASS (e796). No JOB_SHA384SALTPASS
  * algorithm in mdxfind; this enum value exists ONLY for cache-key
@@ -5654,7 +5641,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * SHA512SALTPASS (44) and SHA512PASSSALT (45) via HASH_WORDS=12 (vs 16);
  * same BASE_ALGO=sha512 + HASH_BLOCK_BYTES=128. 46/46 pairwise distinct
  * defines_str. */
-#define GPU_TEMPLATE_SHA384SALTPASS 46
 /* B6.11 SHA1DRU fan-out (2026-05-06): SHA1DRU (Drupal SHA1, hashcat -m 7900,
  * JOB_SHA1DRU=404). FIRST 1M-iteration algorithm on the unified template
  * path. Algorithm: SHA1(pass) followed by 1,000,000 iterations of
@@ -5671,7 +5657,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * Distinct from SHA1 / SHA1RAW / SQL5 by the ITER_COUNT token AND by source
  * text (the iter body lives in template_finalize). 46/46 pairwise distinct
  * defines_str. */
-#define GPU_TEMPLATE_SHA1DRU 46
 /* B7.7b MD6256 fan-out (2026-05-07): MD6256 (hashcat -m 17800,
  * JOB_MD6256=29). Final M5 closure from B9 gate-fail. MD6-256 single-block
  * leaf compression — algorithmically-largest single-compression unsalted
@@ -5686,7 +5671,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * A[1753] stack on top of RULE_BUF_MAX. Compile-only ship per user
  * 2026-05-07 OPTION A; integrated post-B7.9 validation will reveal
  * gfx1201 status. */
-#define GPU_TEMPLATE_MD6256 47
 /* Family G HMAC-RIPEMD-160 carrier (2026-05-08): RIPEMD160SALTPASS-shaped
  * carrier for HMAC-RMD160 (e211) + HMAC-RMD160_KPASS (e798). No
  * JOB_RIPEMD160SALTPASS algorithm in mdxfind; this enum value exists ONLY
@@ -5696,7 +5680,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * load-bearing differentiator (ripemd160_block has different compression
  * rounds + 2-arg call signature vs sha1_block's BE compression).
  * 48/48 pairwise distinct defines_str. */
-#define GPU_TEMPLATE_RIPEMD160SALTPASS 48
 /* Family H HMAC-RIPEMD-320 carrier (2026-05-08): RIPEMD320SALTPASS-shaped
  * carrier for HMAC-RMD320 (e213) + HMAC-RMD320_KPASS (e799). No
  * JOB_RIPEMD320SALTPASS algorithm in mdxfind; this enum value exists ONLY
@@ -5706,14 +5689,12 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * bodies + line/line' cross-mix accumulation; HASH_WORDS=10 vs 5 also
  * affects EMIT_HIT_<N> + iter-loop block geometry). 49/49 pairwise
  * distinct defines_str. */
-#define GPU_TEMPLATE_RIPEMD320SALTPASS 49
 /* Family I HMAC-BLAKE2S carrier (2026-05-08): hand-written Path A sibling
  * for HMAC-BLAKE2S (e828) with single algo_mode (5). HASH_WORDS=8,
  * HASH_BLOCK_BYTES=64, BASE_ALGO=blake2s, HAS_SALT=1, HMAC_KPASS=1. Cache
  * key disambiguated from every prior salted/unsalted template via the
  * BASE_ALGO=blake2s + HAS_SALT=1 + HMAC_KPASS=1 triple — pairwise distinct
  * across the 49 prior templates. */
-#define GPU_TEMPLATE_HMAC_BLAKE2S 50
 /* Family J HMAC-STREEBOG-256 carrier (2026-05-08): hand-written Path A
  * sibling of gpu_streebog256_core.cl for HMAC-STREEBOG256_KSALT (e838) +
  * HMAC-STREEBOG256_KPASS (e837) with two algo_modes (5/6). HASH_WORDS=8,
@@ -5722,7 +5703,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * HAS_SALT=1 + HMAC_KSALTPASS=1 axes (absent in unsalted defines_str), and
  * from every other salted/unsalted template via BASE_ALGO=streebog256
  * (unique). 50/50 pairwise distinct defines_str. */
-#define GPU_TEMPLATE_HMAC_STREEBOG256 51
 /* Family K HMAC-STREEBOG-512 carrier (2026-05-08): hand-written Path A
  * sibling of gpu_streebog512_core.cl for HMAC-STREEBOG512_KSALT (e840) +
  * HMAC-STREEBOG512_KPASS (e839) with two algo_modes (5/6). HASH_WORDS=16,
@@ -5733,7 +5713,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * (unique). 51/51 pairwise distinct defines_str. Final HMAC family
  * shipped in the ladder (HMAC LADDER COMPLETE: 19/21 algos; Family D
  * HMAC-SHA256 deferred per project_family_d_deferred.md). */
-#define GPU_TEMPLATE_HMAC_STREEBOG512 52
 /* PHPBB3 carrier (2026-05-08): hand-written Path A salted-template
  * kernel for JOB_PHPBB3 (e455). Single algo_mode; iterated MD5 chain
  * INSIDE template_finalize (mirrors SHA1DRU pattern at max_iter=1
@@ -5743,7 +5722,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * BASE_ALGO=phpbb3 axis. 52/52 pairwise distinct defines_str.
  * Templated count delta: 55 -> 56. First iterated-crypt with salt-
  * carried iter count on the unified template path. */
-#define GPU_TEMPLATE_PHPBB3 53
 /* MD5CRYPT carrier (2026-05-08): hand-written Path A salted-template
  * kernel for JOB_MD5CRYPT (e511). Single algo_mode; iterated MD5 chain
  * (1000 fixed iters per BSD $1$ md5crypt) INSIDE template_finalize
@@ -5755,7 +5733,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * defines_str. Templated count delta: 56 -> 57. Phase 1 of the Unix-
  * crypt ladder (MD5CRYPT -> SHA256CRYPT -> SHA512CRYPT ->
  * SHA512CRYPTMD5). */
-#define GPU_TEMPLATE_MD5CRYPT 54
 /* SHA256CRYPT carrier (2026-05-08): hand-written Path A salted-template
  * kernel for JOB_SHA256CRYPT (e512). Single algo_mode; SHA-256 crypt
  * chain (5 steps + variable-rounds main loop, default 5000 iters,
@@ -5768,7 +5745,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * 2 of the Unix-crypt ladder. Shares the gpu_shacrypt_core.cl source
  * with Phase 3 (SHA512CRYPT at HASH_WORDS=16) + Phase 4 (SHA512CRYPTMD5
  * at HASH_WORDS=16, algo_mode=1 for the MD5-preprocess). */
-#define GPU_TEMPLATE_SHA256CRYPT 55
 /* SHA512CRYPT carrier (2026-05-08): hand-written Path A salted-template
  * kernel for JOB_SHA512CRYPT (e513). Single algo_mode; SHA-512 crypt
  * chain (5 steps + variable-rounds main loop, default 5000 iters,
@@ -5783,7 +5759,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * Phase 2 (SHA256CRYPT at HASH_WORDS=8) + Phase 4 (SHA512CRYPTMD5 at
  * HASH_WORDS=16, algo_mode=1 for the MD5-preprocess). SHA512CRYPTMD5
  * REMAINS on the slab path for now; Phase 4 will move it. */
-#define GPU_TEMPLATE_SHA512CRYPT 56
 /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): hand-written Path A
  * salted-template kernel for JOB_DESCRYPT (e500). Single algo_mode (7);
  * bespoke kernel that will NOT share with BCRYPT. 25-iter DES Feistel
@@ -5802,7 +5777,6 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * ladder (FINAL phase; Unix-crypt slab path fully retired across all 5
  * Unix-crypt ops: MD5CRYPT, SHA256CRYPT, SHA512CRYPT, SHA512CRYPTMD5,
  * DESCRYPT). */
-#define GPU_TEMPLATE_DESCRYPT 57
 /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): hand-written Path A
  * salted-template kernel for JOB_BCRYPT (e450). Single algo_mode (8);
  * bespoke kernel that will NOT share with DESCRYPT or any other algo;
@@ -5830,540 +5804,67 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * retirement). Compound siblings BCRYPTMD5 (e451) / BCRYPTSHA1 (e452) /
  * BCRYPTSHA512 (e967) remain CPU-only via gpu_op_category default
  * fall-through; only JOB_BCRYPT singleton uses this kernel. */
-#define GPU_TEMPLATE_BCRYPT 58
 
-static int gpu_template_enabled(void) {
-    static int cached = -1;
-    if (cached == -1) {
-        const char *e = getenv("MDXFIND_GPU_TEMPLATE");
-        if (e && *e && *e != '0' && strcmp(e, "md5") == 0) {
-            cached = GPU_TEMPLATE_MD5;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md5 — md5_rules dispatch will use "
-                "template_phase0 kernel from gpu_template.cl + gpu_md5_core.cl "
-                "(B2 structural prereq; production path remains "
-                "md5_rules_phase0 by default).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha1") == 0) {
-            /* B4 first-algorithm fan-out: SHA1 template instantiation.
-             * The kernel object is built lazily on first dispatch via
-             * gpu_opencl_template_compile_sha1 / _kernel_lazy_sha1 and
-             * is selected over the MD5 template at the dispatch_md5_rules
-             * kernel-handle swap site. NOTE: this comment dates to before
-             * SHA1 was widened into the rules-engine admit list (B5). The
-             * chokepoint pack at mdxfind.c that previously fielded SHA1
-             * work was retired in B7.9 (2026-05-07); SHA1 now dispatches
-             * exclusively via dispatch_md5_rules under the template kernel. */
-            cached = GPU_TEMPLATE_SHA1;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha1 — when SHA1 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_sha1_core.cl (B4 first-algorithm "
-                "fan-out; chokepoint gate widening is a follow-up commit).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha256") == 0) {
-            /* B4 fan-out: SHA256 template instantiation. */
-            cached = GPU_TEMPLATE_SHA256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha256 — when SHA256 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_sha256_core.cl (B4 fan-out; chokepoint "
-                "gate widening is a follow-up commit).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha224") == 0) {
-            /* B4 fan-out: SHA224 template instantiation. Same compression as
-             * SHA256, different IV, output truncated to 7 of 8 state words. */
-            cached = GPU_TEMPLATE_SHA224;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha224 — when SHA224 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_sha224_core.cl (B4 fan-out; chokepoint "
-                "gate widening is a follow-up commit).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md4") == 0) {
-            /* B4 fan-out: MD4 template instantiation. Same digest geometry
-             * as MD5 (4 LE uint32) but different compression function. */
-            cached = GPU_TEMPLATE_MD4;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md4 — when MD4 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_md4_core.cl (B4 fan-out; chokepoint "
-                "gate widening is a follow-up commit).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha384") == 0) {
-            /* B5 sub-batch 1: SHA384 template instantiation. First 64-bit
-             * state + 128-bit length encoding algorithm. Output truncates
-             * to 6 ulong = 12 uint32. */
-            cached = GPU_TEMPLATE_SHA384;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha384 — when SHA384 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_sha384_core.cl (B5 fan-out; first "
-                "64-bit-state algo).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha512") == 0) {
-            /* B5 sub-batch 1: SHA512 template instantiation. First 64-bit
-             * state + 128-bit length encoding algorithm. 8 ulong = 16 uint32. */
-            cached = GPU_TEMPLATE_SHA512;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha512 — when SHA512 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_sha512_core.cl (B5 fan-out; first "
-                "64-bit-state algo).\n");
-        } else if (e && *e && *e != '0' &&
-                   (strcmp(e, "ripemd160") == 0 || strcmp(e, "rmd160") == 0)) {
-            /* B5 sub-batch 2: RIPEMD-160 template instantiation. Second
-             * 5-word-state algo (after SHA1) but LITTLE-ENDIAN per uint32
-             * (like MD5; UNLIKE the SHA family). */
-            cached = GPU_TEMPLATE_RIPEMD160;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=%s — when RIPEMD-160 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_ripemd160_core.cl (B5 fan-out; "
-                "LE-per-uint32 state; HASH_WORDS=5).\n", e);
-        } else if (e && *e && *e != '0' &&
-                   (strcmp(e, "ripemd320") == 0 || strcmp(e, "rmd320") == 0)) {
-            /* B5 sub-batch 2: RIPEMD-320 template instantiation. First
-             * 10-word-state algo in the family — needed new EMIT_HIT_10
-             * family macros in gpu_common.cl rev 1.12. */
-            cached = GPU_TEMPLATE_RIPEMD320;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=%s — when RIPEMD-320 work reaches "
-                "dispatch_md5_rules, will use template_phase0 kernel from "
-                "gpu_template.cl + gpu_ripemd320_core.cl (B5 fan-out; "
-                "LE-per-uint32 state; HASH_WORDS=10; first 10-word state).\n", e);
-        } else if (e && *e && *e != '0' && strcmp(e, "blake2s256") == 0) {
-            /* B5 sub-batch 3: BLAKE2S-256 template instantiation. First
-             * BLAKE2 algorithm (counter + flag in state struct). 8 uint32
-             * LE digest, 64-byte block, 10-round G compression. */
-            cached = GPU_TEMPLATE_BLAKE2S256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=blake2s256 — when BLAKE2S-256 "
-                "work reaches dispatch_md5_rules, will use template_phase0 "
-                "kernel from gpu_template.cl + gpu_blake2s256_core.cl "
-                "(B5 sub-batch 3; LE-per-uint32; HASH_WORDS=8; counter+flag "
-                "in per-algo state).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "blake2b256") == 0) {
-            /* B5 sub-batch 3: BLAKE2B-256 template instantiation. 64-bit
-             * lane (8 ulong internal); HASH_WORDS=8 exposed as first 4
-             * ulong → 8 uint32 LE truncated digest. New b2b_compress in
-             * gpu_common.cl rev 1.13. */
-            cached = GPU_TEMPLATE_BLAKE2B256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=blake2b256 — when BLAKE2B-256 "
-                "work reaches dispatch_md5_rules, will use template_phase0 "
-                "kernel from gpu_template.cl + gpu_blake2b256_core.cl "
-                "(B5 sub-batch 3; 64-bit lane, 128-byte block, 12-round G; "
-                "first BLAKE2b template).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "blake2b512") == 0) {
-            /* B5 sub-batch 3: BLAKE2B-512 template instantiation. Same
-             * compression as BLAKE2B-256, full 8-ulong = 16-uint32 LE
-             * digest output. */
-            cached = GPU_TEMPLATE_BLAKE2B512;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=blake2b512 — when BLAKE2B-512 "
-                "work reaches dispatch_md5_rules, will use template_phase0 "
-                "kernel from gpu_template.cl + gpu_blake2b512_core.cl "
-                "(B5 sub-batch 3; HASH_WORDS=16; full 64-byte digest).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "keccak224") == 0) {
-            cached = GPU_TEMPLATE_KECCAK224;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=keccak224 — sponge construction; "
-                "rate=144, output=28, suffix=0x01 (B5 sub-batch 4).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "keccak256") == 0) {
-            cached = GPU_TEMPLATE_KECCAK256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=keccak256 — sponge construction; "
-                "rate=136, output=32, suffix=0x01 (B5 sub-batch 4).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "keccak384") == 0) {
-            cached = GPU_TEMPLATE_KECCAK384;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=keccak384 — sponge construction; "
-                "rate=104, output=48, suffix=0x01 (B5 sub-batch 4).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "keccak512") == 0) {
-            cached = GPU_TEMPLATE_KECCAK512;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=keccak512 — sponge construction; "
-                "rate=72, output=64, suffix=0x01 (B5 sub-batch 4).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha3_224") == 0) {
-            cached = GPU_TEMPLATE_SHA3_224;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_224 — sponge construction; "
-                "rate=144, output=28, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha3_256") == 0) {
-            cached = GPU_TEMPLATE_SHA3_256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_256 — sponge construction; "
-                "rate=136, output=32, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha3_384") == 0) {
-            cached = GPU_TEMPLATE_SHA3_384;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_384 — sponge construction; "
-                "rate=104, output=48, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha3_512") == 0) {
-            cached = GPU_TEMPLATE_SHA3_512;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha3_512 — sponge construction; "
-                "rate=72, output=64, suffix=0x06 (B5 sub-batch 4; NIST FIPS 202).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha384raw") == 0) {
-            cached = GPU_TEMPLATE_SHA384RAW;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha384raw — SHA384 compression "
-                "with binary-digest iter (48 bytes; B5 sub-batch 5a Tier 1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha512raw") == 0) {
-            cached = GPU_TEMPLATE_SHA512RAW;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha512raw — SHA512 compression "
-                "with binary-digest iter (64 bytes; B5 sub-batch 5a Tier 1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md5raw") == 0) {
-            cached = GPU_TEMPLATE_MD5RAW;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md5raw — MD5 compression with "
-                "binary-digest iter (16 bytes; B5 sub-batch 6 Tier A).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha1raw") == 0) {
-            cached = GPU_TEMPLATE_SHA1RAW;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha1raw — SHA1 compression with "
-                "binary-digest iter (20 bytes; B5 sub-batch 6 Tier A).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha256raw") == 0) {
-            cached = GPU_TEMPLATE_SHA256RAW;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha256raw — SHA256 compression "
-                "with binary-digest iter (32 bytes; B5 sub-batch 6 Tier A).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sql5") == 0) {
-            cached = GPU_TEMPLATE_SQL5;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sql5 — SHA1(SHA1(p)) with "
-                "UPPERCASE-hex iter feedback (B5 sub-batch 6 Tier C; "
-                "two SHA1 chains in template_state).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "ntlmh") == 0) {
-            cached = GPU_TEMPLATE_NTLMH;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=ntlmh — MD4(UTF-16LE-zero-extend"
-                "(p)) (B5 sub-batch 6 Tier B; hashcat-compat; iconv variant "
-                "remains on CPU for non-ASCII inputs).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md4utf16") == 0) {
-            cached = GPU_TEMPLATE_MD4UTF16;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md4utf16 — MD4(UTF-16LE-zero-"
-                "extend(p)) with iter feedback hex(prev_digest) (B5 sub-batch "
-                "8; same hashcat-compat gap as NTLMH on non-ASCII inputs).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "mysql3") == 0) {
-            cached = GPU_TEMPLATE_MYSQL3;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=mysql3 — legacy MySQL "
-                "OLD_PASSWORD() hash (B5 sub-batch 7; per-byte arithmetic "
-                "accumulator with 16-hex feedback iter step).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "wrl") == 0) {
-            cached = GPU_TEMPLATE_WRL;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=wrl — Whirlpool 512-bit hash "
-                "(B5 sub-batch 6.5; Miyaguchi-Preneel; 64-byte BE block; "
-                "256-bit BE length encoding; 128-hex feedback iter step).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "streebog256") == 0) {
-            cached = GPU_TEMPLATE_STREEBOG256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=streebog256 — GOST R 34.11-2012 "
-                "256-bit hash (B5 sub-batch 5b retry; LPS-keyed 12-round "
-                "compression; 16 KB __constant SBOB_SL64 with shift-then-mask "
-                "access pattern matching WRL_OP for RDNA4 compat).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "streebog512") == 0) {
-            cached = GPU_TEMPLATE_STREEBOG512;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=streebog512 — GOST R 34.11-2012 "
-                "512-bit hash (B5 sub-batch 5b retry; same compression as "
-                "streebog256, 64-byte digest output).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md5salt") == 0) {
-            /* B6 salt-axis (2026-05-06): MD5SALT (hashcat -m 10) =
-             * MD5(hex32(MD5(p)) || salt) — first salted variant on the
-             * unified template path. Mirrors mdxfind.c JOB_MD5SALT
-             * (lines 21943-21974). Cache disambiguated from MD5SALTPASS
-             * via SALT_POSITION=APPEND_TO_HEX32 in defines_str. */
-            cached = GPU_TEMPLATE_MD5SALT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md5salt — MD5(hex32(MD5(p)) || "
-                "salt) double-MD5 chain (B6 salt-axis prereq; first salted "
-                "variant on the template path; SALT_POSITION=APPEND_TO_HEX32).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md5saltpass") == 0) {
-            /* B6 salt-axis (2026-05-06): MD5SALTPASS (hashcat -m 20) =
-             * MD5(salt || pass) — simple prepend salt. Mirrors
-             * mdxfind.c JOB_MD5SALTPASS (lines 15776-15832). Cache
-             * disambiguated from MD5SALT via SALT_POSITION=PREPEND in
-             * defines_str. */
-            cached = GPU_TEMPLATE_MD5SALTPASS;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md5saltpass — MD5(salt || pass) "
-                "simple prepend salt (B6 salt-axis prereq; second salted "
-                "variant; SALT_POSITION=PREPEND).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha1saltpass") == 0) {
-            /* B6.1 SHA1 fan-out (2026-05-06): SHA1SALTPASS (hashcat -m 110)
-             * = SHA1(salt || pass) — simple prepend salt SHA1. Mirrors
-             * mdxfind.c JOB_SHA1SALTPASS (lines 14369-14418). Cache
-             * disambiguated from MD5SALTPASS via HASH_WORDS=5 +
-             * BASE_ALGO=sha1 in defines_str (SALT_POSITION=PREPEND
-             * matches but the per-algorithm tokens differ). */
-            cached = GPU_TEMPLATE_SHA1SALTPASS;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha1saltpass — SHA1(salt || pass) "
-                "simple prepend salt SHA1 (B6.1 SHA fan-out; first SHA-family "
-                "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=5).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha256saltpass") == 0) {
-            /* B6.2 SHA256 fan-out (2026-05-06): SHA256SALTPASS (hashcat
-             * -m 1410) = SHA256(salt || pass) — simple prepend salt
-             * SHA256. Mirrors mdxfind.c JOB_SHA256SALTPASS (lines 27603-
-             * 27651). Cache disambiguated from SHA1SALTPASS via
-             * HASH_WORDS=8 + BASE_ALGO=sha256 in defines_str (both axes
-             * differ); from MD5SALTPASS via HASH_WORDS=8 + BASE_ALGO=
-             * sha256 (both axes differ). */
-            cached = GPU_TEMPLATE_SHA256SALTPASS;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha256saltpass — SHA256(salt || pass) "
-                "simple prepend salt SHA256 (B6.2 SHA fan-out; second SHA-family "
-                "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=8).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha224saltpass") == 0) {
-            /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS (hashcat
-             * -m 1310) = SHA224(salt || pass) — simple prepend salt
-             * SHA224. Mirrors mdxfind.c JOB_SHA224SALTPASS. Cache
-             * disambiguated from SHA256SALTPASS via HASH_WORDS=7 (vs 8)
-             * — same BASE_ALGO=sha256 since the compression primitive is
-             * identical. From SHA1SALTPASS via HASH_WORDS=7 + BASE_ALGO=
-             * sha256 (both axes differ); from MD5SALTPASS via HASH_WORDS=7
-             * + BASE_ALGO=sha256 (both axes differ). */
-            cached = GPU_TEMPLATE_SHA224SALTPASS;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha224saltpass — SHA224(salt || pass) "
-                "simple prepend salt SHA224 (B6.3 SHA fan-out; third SHA-family "
-                "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=7).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md5passsalt") == 0) {
-            /* B6.4 MD5PASSSALT fan-out (2026-05-06): MD5PASSSALT (hashcat
-             * -m 10) = MD5(pass || salt) — simple APPEND salt MD5.
-             * Mirrors mdxfind.c JOB_MD5PASSSALT (lines 16627-16669).
-             * First APPEND-shape salted variant on the codegen path.
-             * Cache disambiguated from MD5SALTPASS via SALT_POSITION=
-             * APPEND (vs PREPEND); same BASE_ALGO=md5 + HASH_WORDS=4
-             * axes. Authors the finalize_append.cl.frag fragment that
-             * future SHA-family APPEND variants reuse (modulo BE/LE
-             * sibling). */
-            cached = GPU_TEMPLATE_MD5PASSSALT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md5passsalt — MD5(pass || salt) "
-                "simple append salt MD5 (B6.4 fan-out; first APPEND-shape "
-                "salted variant; SALT_POSITION=APPEND, HASH_WORDS=4).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha1passsalt") == 0) {
-            /* B6.5 SHA1PASSSALT fan-out (2026-05-06): SHA1PASSSALT (hashcat
-             * -m 100) = SHA1(pass || salt) — simple APPEND salt SHA1.
-             * Mirrors mdxfind.c JOB_SHA1PASSSALT (lines 14227-14270).
-             * First SHA-family APPEND-shape salted variant on the codegen
-             * path. Cache disambiguated from SHA1SALTPASS via SALT_-
-             * POSITION=APPEND (vs PREPEND); same BASE_ALGO=sha1 +
-             * HASH_WORDS=5 axes. Authors the finalize_append_be.cl.frag
-             * fragment that future SHA-family APPEND variants
-             * (SHA256PASSSALT) reuse without further fragment work. */
-            cached = GPU_TEMPLATE_SHA1PASSSALT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha1passsalt — SHA1(pass || salt) "
-                "simple append salt SHA1 (B6.5 fan-out; first SHA-family "
-                "APPEND-shape salted variant; SALT_POSITION=APPEND, "
-                "HASH_WORDS=5, BASE_ALGO=sha1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha256passsalt") == 0) {
-            /* B6.7 SHA256PASSSALT fan-out (2026-05-06): SHA256PASSSALT
-             * (hashcat -m 1410) = SHA256(pass || salt) — simple APPEND
-             * salt SHA256. Mirrors mdxfind.c JOB_SHA256PASSSALT
-             * (lines 27639-27677). Second SHA-family APPEND-shape salted
-             * variant — pure spec reuse (template + fragment both already
-             * shipped at B6.2 and B6.5). Cache disambiguated from
-             * SHA256SALTPASS via SALT_POSITION=APPEND (vs PREPEND); same
-             * BASE_ALGO=sha256 + HASH_WORDS=8 axes. From SHA1PASSSALT via
-             * HASH_WORDS=8 + BASE_ALGO=sha256 (both axes differ). */
-            cached = GPU_TEMPLATE_SHA256PASSSALT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha256passsalt — SHA256(pass || salt) "
-                "simple append salt SHA256 (B6.7 fan-out; second SHA-family "
-                "APPEND-shape salted variant; SALT_POSITION=APPEND, "
-                "HASH_WORDS=8, BASE_ALGO=sha256).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha512saltpass") == 0) {
-            /* B6.9 SHA512 fan-out (2026-05-06): SHA512SALTPASS (hashcat
-             * -m 1710) = SHA512(salt || pass) — simple PREPEND salt
-             * SHA-512. FIRST 64-bit-state salted variant on the codegen
-             * path. Mirrors mdxfind.c JOB_SHA512SALTPASS (lines 13981-
-             * 14023). Cache disambiguated from every other salted
-             * template via HASH_BLOCK_BYTES=128 (the 128-byte block is
-             * unique among salted variants on the codegen path) +
-             * HASH_WORDS=16 + BASE_ALGO=sha512. Authors a sibling
-             * sha512_style_salted.cl.tmpl AND a sibling
-             * finalize_prepend_be64.cl.frag — width-bearing constants
-             * (block_size, word_width, length-field-width) live in
-             * the template+fragment, not parameterized into the
-             * SHA-256 versions. R2 risk on gfx1201 — unsalted SHA-512
-             * already at 42,520 B priv_mem; HARD GATE 43,024 B. */
-            cached = GPU_TEMPLATE_SHA512SALTPASS;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha512saltpass — SHA512(salt || pass) "
-                "simple prepend salt SHA-512 (B6.9 fan-out; first 64-bit-state "
-                "salted variant; SALT_POSITION=PREPEND, HASH_WORDS=16, "
-                "HASH_BLOCK_BYTES=128, BASE_ALGO=sha512).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha512passsalt") == 0) {
-            /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT
-             * (hashcat -m 1720) = SHA512(pass || salt) — simple APPEND
-             * salt SHA-512. FINAL B6 ladder step. Second 64-bit-state
-             * salted variant on the codegen path; APPEND-shape sibling
-             * of SHA512SALTPASS (B6.9). Mirrors mdxfind.c JOB_SHA512-
-             * PASSSALT (lines 14069-14127). Cache disambiguated from
-             * SHA512SALTPASS via SALT_POSITION=APPEND (vs PREPEND);
-             * same BASE_ALGO=sha512 + HASH_WORDS=16 + HASH_BLOCK_BYTES=
-             * 128 axes — single-axis delta (mirrors SHA1PASSSALT vs
-             * SHA1SALTPASS / SHA256PASSSALT vs SHA256SALTPASS / MD5-
-             * PASSSALT vs MD5SALTPASS). Pure spec reuse on the SHA-512
-             * main template (sha512_style_salted.cl.tmpl, salt-
-             * position-agnostic), plus ONE new fragment authoring
-             * (finalize_append_be64.cl.frag). HARD GATE 43,024 B
-             * gfx1201 priv_mem; sibling SHA512SALTPASS reading was
-             * 42,032 B (992 B headroom). */
-            cached = GPU_TEMPLATE_SHA512PASSSALT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha512passsalt — SHA512(pass || salt) "
-                "simple append salt SHA-512 (B6.10 fan-out; FINAL B6 ladder step; "
-                "second 64-bit-state salted variant; SALT_POSITION=APPEND, "
-                "HASH_WORDS=16, HASH_BLOCK_BYTES=128, BASE_ALGO=sha512).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha1dru") == 0) {
-            /* B6.11 SHA1DRU fan-out (2026-05-06): SHA1DRU (Drupal SHA1,
-             * hashcat -m 7900, JOB_SHA1DRU=404). First 1M-iteration
-             * algorithm on the unified template path. SHA1(pass) + 1M
-             * iters of SHA1(hex_lc(state) || pass); ONE probe at the
-             * final state. Mirrors mdxfind.c JOB_SHA1DRU (lines 14261-
-             * 14285). 1M loop INSIDE template_finalize; max_iter=1 host-
-             * forced. */
-            cached = GPU_TEMPLATE_SHA1DRU;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha1dru — Drupal SHA1 "
-                "(B6.11 fan-out; first 1M-iteration algorithm on the unified "
-                "template path; HASH_WORDS=5, HASH_BLOCK_BYTES=64, "
-                "BASE_ALGO=sha1, ITER_COUNT=1000000).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md6256") == 0) {
-            /* B7.7b MD6256 fan-out (2026-05-07): MD6256 (hashcat -m 17800,
-             * JOB_MD6256=29). Final M5 closure from B9 gate-fail. MD6-256
-             * single-block leaf compression with 1753-ulong A working
-             * array (14 KB stack). Per-iter probe like SQL5 (vs.
-             * SHA1DRU's max_iter=1 internal loop). Mirrors mdxfind.c
-             * JOB_MD6256 (lines 25836-25855). */
-            cached = GPU_TEMPLATE_MD6256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md6256 — MD6-256 "
-                "(B7.7b fan-out; final M5 closure; algorithmically-largest "
-                "single-compression unsalted algo on the template path; "
-                "HASH_WORDS=8, HASH_BLOCK_BYTES=64, BASE_ALGO=md6).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "hmac_blake2s") == 0) {
-            /* Family I HMAC-BLAKE2S carrier (2026-05-08): Path A hand-
-             * written sibling for HMAC-BLAKE2S (e828). Single algo_mode (5);
-             * no KPASS sibling op exists in mdxfind. HMAC body branches at
-             * the top of template_finalize in gpu_hmac_blake2s_core.cl
-             * (gated on algo_mode == 5u) and returns early. The mode-0
-             * BLAKE2S(salt||pass) main body is structurally unreachable in
-             * production. */
-            cached = GPU_TEMPLATE_HMAC_BLAKE2S;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=hmac_blake2s — Family I "
-                "HMAC-BLAKE2S carrier (Path A hand-written; single algo_mode "
-                "5; HASH_WORDS=8, HASH_BLOCK_BYTES=64, BASE_ALGO=blake2s, "
-                "HAS_SALT=1, HMAC_KPASS=1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "hmac_streebog256") == 0) {
-            /* Family J HMAC-STREEBOG-256 carrier (2026-05-08): Path A
-             * hand-written sibling for HMAC-STREEBOG256_KSALT (e838) +
-             * HMAC-STREEBOG256_KPASS (e837). Two algo_modes: 5 = KSALT,
-             * 6 = KPASS. HMAC body branches at the top of template_finalize
-             * in gpu_hmac_streebog256_core.cl (gated on algo_mode >= 5u —
-             * single branch since kernel-side math is identical for KSALT
-             * and KPASS) and returns early. The mode-0 STREEBOG-256(salt||
-             * pass) main body is structurally unreachable in production. */
-            cached = GPU_TEMPLATE_HMAC_STREEBOG256;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=hmac_streebog256 — Family J "
-                "HMAC-STREEBOG-256 carrier (Path A hand-written; two algo_modes "
-                "5/6 for KSALT/KPASS; HASH_WORDS=8, HASH_BLOCK_BYTES=64, "
-                "BASE_ALGO=streebog256, HAS_SALT=1, HMAC_KSALTPASS=1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "hmac_streebog512") == 0) {
-            /* Family K HMAC-STREEBOG-512 carrier (2026-05-08): Path A
-             * hand-written sibling for HMAC-STREEBOG512_KSALT (e840) +
-             * HMAC-STREEBOG512_KPASS (e839). Two algo_modes: 5 = KSALT,
-             * 6 = KPASS. HMAC body branches at the top of template_finalize
-             * in gpu_hmac_streebog512_core.cl (gated on algo_mode >= 5u —
-             * single branch since kernel-side math is identical for KSALT
-             * and KPASS) and returns early. The mode-0 STREEBOG-512(salt||
-             * pass) main body is structurally unreachable in production.
-             * Final HMAC family in the ladder. */
-            cached = GPU_TEMPLATE_HMAC_STREEBOG512;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=hmac_streebog512 — Family K "
-                "HMAC-STREEBOG-512 carrier (Path A hand-written; two algo_modes "
-                "5/6 for KSALT/KPASS; HASH_WORDS=16, HASH_BLOCK_BYTES=64, "
-                "BASE_ALGO=streebog512, HAS_SALT=1, HMAC_KSALTPASS=1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "phpbb3") == 0) {
-            /* PHPBB3 carrier (2026-05-08): Path A hand-written
-             * salted-template kernel for JOB_PHPBB3 (e455). Iterated
-             * MD5 chain INSIDE template_finalize; iter count decoded
-             * from salt[3] via phpitoa64 reverse lookup (typical range
-             * 7..30 -> 128..2^30 iters). max_iter=1 host-forced so
-             * kernel's outer iter loop runs exactly once and only the
-             * FINAL state is probed. Mirrors mdxfind.c JOB_PHPBB3
-             * (lines 13415-13628). */
-            cached = GPU_TEMPLATE_PHPBB3;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=phpbb3 — PHPBB3 / phpass "
-                "(Path A hand-written; single algo_mode; iterated MD5 "
-                "chain in template_finalize with iter count from salt[3]; "
-                "HASH_WORDS=4, HASH_BLOCK_BYTES=64, BASE_ALGO=phpbb3, "
-                "HAS_SALT=1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "md5crypt") == 0) {
-            /* MD5CRYPT carrier (2026-05-08): Path A hand-written
-             * salted-template kernel for JOB_MD5CRYPT (e511). BSD $1$
-             * md5crypt with FIXED 1000-iteration count. Iterated MD5
-             * chain INSIDE template_finalize; max_iter=1 host-forced
-             * so kernel's outer iter loop runs exactly once and only
-             * the FINAL state is probed. Mirrors mdxfind.c JOB_MD5CRYPT
-             * (lines 13017-13117). Phase 1 of the Unix-crypt ladder. */
-            cached = GPU_TEMPLATE_MD5CRYPT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=md5crypt -- MD5CRYPT / BSD $1$ "
-                "(Path A hand-written; single algo_mode; iterated MD5 chain "
-                "in template_finalize with FIXED 1000 iters; HASH_WORDS=4, "
-                "HASH_BLOCK_BYTES=64, BASE_ALGO=md5crypt, HAS_SALT=1).\n");
-        } else if (e && *e && *e != '0' && strcmp(e, "sha256crypt") == 0) {
-            /* SHA256CRYPT carrier (2026-05-08): Path A hand-written
-             * salted-template kernel for JOB_SHA256CRYPT (e512). glibc
-             * crypt-sha256 ($5$[rounds=N$]<salt>$<43-base64>) with
-             * default 5000-iteration count (configurable via "rounds=N$"
-             * salt prefix). 5-step chain INSIDE template_finalize;
-             * max_iter=1 host-forced so kernel's outer iter loop runs
-             * exactly once and only the FINAL state is probed. Mirrors
-             * mdxfind.c JOB_SHA256CRYPT (entry at line 12121; shared
-             * crypt_round body at 12177-12290). Phase 2 of the Unix-
-             * crypt ladder. */
-            cached = GPU_TEMPLATE_SHA256CRYPT;
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=sha256crypt -- SHA256CRYPT / "
-                "glibc $5$ (Path A hand-written; single algo_mode; 5-step "
-                "chain in template_finalize with default 5000 iters via "
-                "rounds=N$ salt prefix; HASH_WORDS=8, HASH_BLOCK_BYTES=64, "
-                "BASE_ALGO=sha256crypt, HAS_SALT=1).\n");
-        } else if (e && *e && *e != '0') {
-            /* Unknown value: log once, default to off. */
-            GPU_DEBUG_FPRINTF(stderr,
-                "OpenCL: MDXFIND_GPU_TEMPLATE=\"%s\" not recognized "
-                "(supported: \"md5\", \"sha1\", \"sha256\", \"sha224\", "
-                "\"md4\", \"sha384\", \"sha512\", \"ripemd160\"/\"rmd160\", "
-                "\"ripemd320\"/\"rmd320\", \"blake2s256\", \"blake2b256\", "
-                "\"blake2b512\", \"keccak{224,256,384,512}\", "
-                "\"sha3_{224,256,384,512}\", \"sha384raw\", \"sha512raw\", "
-                "\"md5raw\", \"sha1raw\", \"sha256raw\", \"sql5\", "
-                "\"ntlmh\", \"md4utf16\", \"mysql3\", \"wrl\", "
-                "\"streebog256\", \"streebog512\", "
-                "\"md5salt\", \"md5saltpass\", \"md5passsalt\", "
-                "\"sha1saltpass\", \"sha1passsalt\", \"sha256saltpass\", "
-                "\"sha256passsalt\", \"sha224saltpass\", \"sha512saltpass\", "
-                "\"sha512passsalt\", \"sha1dru\", \"md6256\", "
-                "\"hmac_blake2s\", \"hmac_streebog256\", \"hmac_streebog512\", "
-                "\"phpbb3\", \"md5crypt\", \"sha256crypt\"); "
-                "ignoring, using production md5_rules_phase0.\n", e);
-            cached = GPU_TEMPLATE_OFF;
-        } else {
-            cached = GPU_TEMPLATE_OFF;
-        }
-    }
-    return cached;
+/* There is no template selector.  Every op below resolves to its template
+ * kernel unconditionally, which is what production has always done.
+ *
+ * This is where gpu_template_enabled() used to live: 534 lines that read
+ * MDXFIND_GPU_TEMPLATE and mapped it onto the GPU_TEMPLATE_* ids.  Leaving
+ * it unset selected the production path, so the variable could not improve
+ * a run -- it could only break one: setting it to an algorithm other than
+ * the dispatched op made the resolver return NULL, and the caller then ran
+ * the legacy MD5 kernel against non-MD5 work and emitted wrong digests.
+ * The id space had rotted too -- SHA384SALTPASS and SHA1DRU were both 46,
+ * so those two were indistinguishable, and 40-42 were unassigned.
+ * Removed 2026-09-16; mdxfind takes no environment input but MDXFIND_CACHE. */
+
+/* ----------------------------------------------------------------------
+ * Source list for EVERY template instantiation, in one place.
+ *
+ * Order is load-bearing.  gpu_common.cl defines OCLParams and the address-
+ * space macros; gpu_md5_rules.cl defines apply_rule(), which the UTF-32
+ * walker still calls for BYTE-ONLY rules; gpu_u32_walker.cl then defines
+ * apply_rule32(), u32_run_pair() and GPU_U32_WALKER_PRESENT, which is what
+ * flips gpu_template.cl to its UTF-32 arm; the per-algorithm core supplies
+ * template_init/template_finalize; gpu_template.cl is the kernel itself.
+ *
+ * The walker is appended ONLY when `-8` is active, for the same two reasons
+ * as gpu_opencl_rules_compile():
+ *   - ~30 KB of constant tables and a second walker cost compile time and
+ *     24 KB of per-lane private memory that a byte-mode run has no use for;
+ *   - the source list is part of the kernel-cache key, so a byte-mode run
+ *     keeps hitting the cache entries it already has.  Compiling the bigger
+ *     program unconditionally would invalidate every cached template binary
+ *     in the fleet on the first run of this build, 57 programs per device.
+ *
+ * `-8` is fixed at start-up, so a process never needs both shapes of a given
+ * program and one cl_program slot per algorithm remains sufficient.  Callers
+ * pass a `const char *sources[5]` and use the returned count.
+ * ---------------------------------------------------------------------- */
+/* A one-line source, prepended so its #define is visible to gpu_common.cl.
+ * Cheaper and less error-prone than threading -DGPU_COMMON_LEAN through 57
+ * per-algorithm compile helpers' option strings, and it lands in the
+ * kernel-cache key automatically because the key covers the source list. */
+static const char *gpu_common_lean_str =
+    "/* prepended by gpu_template_sources() / gpu_opencl_kernelb_build_prog() */\n"
+    "#define GPU_COMMON_LEAN 1\n";
+
+static cl_uint gpu_template_sources(const char **sources, const char *core_str)
+{
+    cl_uint n = 0;
+    /* Drop the TIGER / SNEFRU / GOST constant tables (28,672 bytes) that no
+     * template core references.  Without this the STREEBOG family is 544 bytes
+     * under NVIDIA's 64 KB constant bank in byte mode and 4,104 bytes OVER it
+     * once the UTF-32 walker's tables join the program -- ptxas refuses the
+     * build and six hash types stop working under `-8`.  See the gate comment
+     * in gpu_common.cl. */
+    sources[n++] = gpu_common_lean_str;
+    sources[n++] = gpu_common_str;
+    sources[n++] = gpu_md5_rules_str;
+    if (gpu_u32_active()) sources[n++] = gpu_u32_walker_str;
+    sources[n++] = core_str;
+    sources[n++] = gpu_template_str;
+    return n;
 }
 
 /* Build the template program for this device. Sources (in order):
@@ -6378,15 +5879,11 @@ static int gpu_template_enabled(void) {
 static int gpu_opencl_template_compile(struct gpu_device *d, int dev_idx) {
     if (d->prog_template) return 0;             /* already built */
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_md5_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5_core_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template || err != CL_SUCCESS) {
@@ -6473,18 +5970,14 @@ static int gpu_opencl_template_kernel_lazy(struct gpu_device *d, int dev_idx) {
 static int gpu_opencl_template_md5_bf_compile(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md5_bf) return 0;       /* already built */
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_md5_bf_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5_bf_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64,BF_FAST_MD5=1";
     /* build_opts: pass BF_FAST_MD5=1 as -D so the preprocessor sees it
      * during compilation (currently unused in source; reserved for
      * runtime branching in A2-A4). -cl-std=CL1.2 matches the slow path. */
     d->prog_template_md5_bf = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DBF_FAST_MD5=1",
         defines, &err);
     if (!d->prog_template_md5_bf || err != CL_SUCCESS) {
@@ -6555,15 +6048,11 @@ static int gpu_opencl_template_md5_bf_kernel_lazy(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_sha1(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha1) return 0;        /* already built */
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_sha1_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha1_core_str);
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64";
     d->prog_template_sha1 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_sha1 || err != CL_SUCCESS) {
@@ -6640,15 +6129,11 @@ static int gpu_opencl_template_kernel_lazy_sha1(struct gpu_device *d, int dev_id
 static int gpu_opencl_template_compile_sha256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_sha256_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64";
     d->prog_template_sha256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_sha256 || err != CL_SUCCESS) {
@@ -6690,15 +6175,11 @@ static int gpu_opencl_template_kernel_lazy_sha256(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_sha224(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha224) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_sha224_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha224_core_str);
     const char *defines = "HASH_WORDS=7,HASH_BLOCK_BYTES=64";
     d->prog_template_sha224 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_sha224 || err != CL_SUCCESS) {
@@ -6740,15 +6221,11 @@ static int gpu_opencl_template_kernel_lazy_sha224(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_md4(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md4) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_md4_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md4_core_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_md4 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_md4 || err != CL_SUCCESS) {
@@ -6812,15 +6289,11 @@ static int gpu_opencl_template_kernel_lazy_md4(struct gpu_device *d, int dev_idx
 static int gpu_opencl_template_compile_sha384(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha384) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_sha384_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha384_core_str);
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=128";
     d->prog_template_sha384 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_sha384 || err != CL_SUCCESS) {
@@ -6862,15 +6335,11 @@ static int gpu_opencl_template_kernel_lazy_sha384(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_sha512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha512) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_sha512_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha512_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=128";
     d->prog_template_sha512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_sha512 || err != CL_SUCCESS) {
@@ -6934,15 +6403,11 @@ static int gpu_opencl_template_kernel_lazy_sha512(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_ripemd160(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_ripemd160) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_ripemd160_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_ripemd160_core_str);
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64";
     d->prog_template_ripemd160 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_ripemd160 || err != CL_SUCCESS) {
@@ -6984,15 +6449,11 @@ static int gpu_opencl_template_kernel_lazy_ripemd160(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_ripemd320(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_ripemd320) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_ripemd320_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_ripemd320_core_str);
     const char *defines = "HASH_WORDS=10,HASH_BLOCK_BYTES=64";
     d->prog_template_ripemd320 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_ripemd320 || err != CL_SUCCESS) {
@@ -7044,15 +6505,11 @@ static int gpu_opencl_template_kernel_lazy_ripemd320(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_blake2s256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_blake2s256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_blake2s256_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_blake2s256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64";
     d->prog_template_blake2s256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_blake2s256 || err != CL_SUCCESS) {
@@ -7093,15 +6550,11 @@ static int gpu_opencl_template_kernel_lazy_blake2s256(struct gpu_device *d, int 
 static int gpu_opencl_template_compile_blake2b256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_blake2b256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_blake2b256_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_blake2b256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=128";
     d->prog_template_blake2b256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_blake2b256 || err != CL_SUCCESS) {
@@ -7142,15 +6595,11 @@ static int gpu_opencl_template_kernel_lazy_blake2b256(struct gpu_device *d, int 
 static int gpu_opencl_template_compile_blake2b512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_blake2b512) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str,
-        gpu_md5_rules_str,
-        gpu_blake2b512_core_str,
-        gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_blake2b512_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=128";
     d->prog_template_blake2b512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
     if (!d->prog_template_blake2b512 || err != CL_SUCCESS) {
@@ -7212,13 +6661,11 @@ static int gpu_opencl_template_kernel_lazy_blake2b512(struct gpu_device *d, int 
 static int gpu_opencl_template_compile_keccak224(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_keccak224) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_keccak224_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_keccak224_core_str);
     const char *defines = "HASH_WORDS=7,HASH_BLOCK_BYTES=144";
     d->prog_template_keccak224 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_keccak224 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_keccak224) {
@@ -7254,13 +6701,11 @@ static int gpu_opencl_template_kernel_lazy_keccak224(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_keccak256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_keccak256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_keccak256_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_keccak256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=136";
     d->prog_template_keccak256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_keccak256 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_keccak256) {
@@ -7296,13 +6741,11 @@ static int gpu_opencl_template_kernel_lazy_keccak256(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_keccak384(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_keccak384) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_keccak384_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_keccak384_core_str);
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=104";
     d->prog_template_keccak384 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_keccak384 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_keccak384) {
@@ -7338,13 +6781,11 @@ static int gpu_opencl_template_kernel_lazy_keccak384(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_keccak512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_keccak512) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_keccak512_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_keccak512_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=72";
     d->prog_template_keccak512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_keccak512 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_keccak512) {
@@ -7380,13 +6821,11 @@ static int gpu_opencl_template_kernel_lazy_keccak512(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_sha3_224(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha3_224) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha3_224_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha3_224_core_str);
     const char *defines = "HASH_WORDS=7,HASH_BLOCK_BYTES=144";
     d->prog_template_sha3_224 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha3_224 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha3_224) {
@@ -7422,13 +6861,11 @@ static int gpu_opencl_template_kernel_lazy_sha3_224(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_sha3_256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha3_256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha3_256_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha3_256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=136";
     d->prog_template_sha3_256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha3_256 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha3_256) {
@@ -7464,13 +6901,11 @@ static int gpu_opencl_template_kernel_lazy_sha3_256(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_sha3_384(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha3_384) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha3_384_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha3_384_core_str);
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=104";
     d->prog_template_sha3_384 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha3_384 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha3_384) {
@@ -7506,13 +6941,11 @@ static int gpu_opencl_template_kernel_lazy_sha3_384(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_sha3_512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha3_512) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha3_512_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha3_512_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=72";
     d->prog_template_sha3_512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha3_512 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha3_512) {
@@ -7562,13 +6995,11 @@ static int gpu_opencl_template_kernel_lazy_sha3_512(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_sha384raw(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha384raw) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha384raw_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha384raw_core_str);
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=128";
     d->prog_template_sha384raw = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha384raw || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha384raw) {
@@ -7605,13 +7036,11 @@ static int gpu_opencl_template_kernel_lazy_sha384raw(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_sha512raw(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha512raw) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha512raw_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha512raw_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=128";
     d->prog_template_sha512raw = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha512raw || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha512raw) {
@@ -7661,13 +7090,11 @@ static int gpu_opencl_template_kernel_lazy_sha512raw(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_md5raw(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md5raw) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md5raw_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5raw_core_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_md5raw = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_md5raw || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_md5raw) {
@@ -7704,13 +7131,11 @@ static int gpu_opencl_template_kernel_lazy_md5raw(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_sha1raw(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha1raw) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha1raw_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha1raw_core_str);
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64";
     d->prog_template_sha1raw = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha1raw || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha1raw) {
@@ -7747,13 +7172,11 @@ static int gpu_opencl_template_kernel_lazy_sha1raw(struct gpu_device *d, int dev
 static int gpu_opencl_template_compile_sha256raw(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha256raw) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha256raw_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha256raw_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64";
     d->prog_template_sha256raw = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha256raw || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha256raw) {
@@ -7800,13 +7223,11 @@ static int gpu_opencl_template_kernel_lazy_sha256raw(struct gpu_device *d, int d
 static int gpu_opencl_template_compile_sql5(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sql5) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sql5_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sql5_core_str);
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64";
     d->prog_template_sql5 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sql5 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sql5) {
@@ -7861,13 +7282,11 @@ static int gpu_opencl_template_kernel_lazy_sql5(struct gpu_device *d, int dev_id
 static int gpu_opencl_template_compile_sha1dru(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha1dru) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha1dru_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha1dru_core_str);
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64,BASE_ALGO=sha1,ITER_COUNT=1000000";
     d->prog_template_sha1dru = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_sha1dru || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_sha1dru) {
@@ -7927,13 +7346,11 @@ static int gpu_opencl_template_kernel_lazy_sha1dru(struct gpu_device *d, int dev
 static int gpu_opencl_template_compile_md6256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md6256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md6256_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md6256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64,BASE_ALGO=md6";
     d->prog_template_md6256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_md6256 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_md6256) {
@@ -7983,13 +7400,11 @@ static int gpu_opencl_template_kernel_lazy_md6256(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_ntlmh(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_ntlmh) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_ntlmh_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_ntlmh_core_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_ntlmh = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_ntlmh || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_ntlmh) {
@@ -8040,13 +7455,11 @@ static int gpu_opencl_template_kernel_lazy_ntlmh(struct gpu_device *d, int dev_i
 static int gpu_opencl_template_compile_md4utf16(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md4utf16) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md4utf16_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md4utf16_core_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_md4utf16 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_md4utf16 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_md4utf16) {
@@ -8099,13 +7512,11 @@ static int gpu_opencl_template_kernel_lazy_md4utf16(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_mysql3(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_mysql3) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_mysql3_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_mysql3_core_str);
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_mysql3 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_mysql3 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_mysql3) {
@@ -8171,13 +7582,11 @@ static int gpu_opencl_template_kernel_lazy_mysql3(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_wrl(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_wrl) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_wrl_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_wrl_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=64";
     d->prog_template_wrl = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_wrl || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_wrl) {
@@ -8219,13 +7628,11 @@ static int gpu_opencl_template_kernel_lazy_wrl(struct gpu_device *d, int dev_idx
 static int gpu_opencl_template_compile_streebog256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_streebog256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_streebog256_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_streebog256_core_str);
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64";
     d->prog_template_streebog256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_streebog256 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_streebog256) {
@@ -8264,13 +7671,11 @@ static int gpu_opencl_template_kernel_lazy_streebog256(struct gpu_device *d, int
 static int gpu_opencl_template_compile_streebog512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_streebog512) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_streebog512_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_streebog512_core_str);
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=64";
     d->prog_template_streebog512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
     if (!d->prog_template_streebog512 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_streebog512) {
@@ -8321,10 +7726,8 @@ static int gpu_opencl_template_kernel_lazy_streebog512(struct gpu_device *d, int
 static int gpu_opencl_template_compile_md5salt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md5salt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md5salt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5salt_core_str);
     /* 2026-05-09 lane-batch experiment: GPU_TEMPLATE_HAS_PRE_SALT enables
      * the inner-MD5 hoist (template_pre_salt + template_finalize_post)
      * in gpu_template.cl + gpu_md5salt_core.cl. SALT_BATCH controls the
@@ -8355,7 +7758,7 @@ static int gpu_opencl_template_compile_md5salt(struct gpu_device *d, int dev_idx
      * one in the .cl file; defines_str carries the SAME token plus the
      * SALT_POSITION discriminator for cache-key purposes. */
     d->prog_template_md5salt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         build_opts_buf,
         defines_buf, &err);
     if (!d->prog_template_md5salt || err != CL_SUCCESS) {
@@ -8397,15 +7800,13 @@ static int gpu_opencl_template_kernel_lazy_md5salt(struct gpu_device *d, int dev
 static int gpu_opencl_template_compile_md5saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md5saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md5saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5saltpass_core_str);
     const char *defines =
         "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND";
     d->prog_template_md5saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_md5saltpass || err != CL_SUCCESS) {
@@ -8450,10 +7851,8 @@ static int gpu_opencl_template_kernel_lazy_md5saltpass(struct gpu_device *d, int
 static int gpu_opencl_template_compile_sha1saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha1saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha1saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha1saltpass_core_str);
     /* HASH_WORDS=5 (5 uint32 SHA1 state, vs MD5's 4) and BASE_ALGO=sha1
      * (per-family primitive disambiguator) are the two axes that distinguish
      * this entry's cache key from MD5SALTPASS's (which has HASH_WORDS=4 +
@@ -8463,7 +7862,7 @@ static int gpu_opencl_template_compile_sha1saltpass(struct gpu_device *d, int de
         "HASH_WORDS=5,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha1";
     d->prog_template_sha1saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha1saltpass || err != CL_SUCCESS) {
@@ -8508,10 +7907,8 @@ static int gpu_opencl_template_kernel_lazy_sha1saltpass(struct gpu_device *d, in
 static int gpu_opencl_template_compile_sha256saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha256saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha256saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha256saltpass_core_str);
     /* HASH_WORDS=8 (8 uint32 SHA256 state, vs SHA1's 5 / MD5's 4) and
      * BASE_ALGO=sha256 (per-family primitive disambiguator) are the two
      * axes that distinguish this entry's cache key from both
@@ -8521,7 +7918,7 @@ static int gpu_opencl_template_compile_sha256saltpass(struct gpu_device *d, int 
         "HASH_WORDS=8,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha256";
     d->prog_template_sha256saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha256saltpass || err != CL_SUCCESS) {
@@ -8570,10 +7967,8 @@ static int gpu_opencl_template_kernel_lazy_sha256saltpass(struct gpu_device *d, 
 static int gpu_opencl_template_compile_sha224saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha224saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha224saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha224saltpass_core_str);
     /* HASH_WORDS=7 (truncated SHA224 state, vs SHA256's 8) and
      * BASE_ALGO=sha256 (compression primitive — sha256_block is the
      * shared core; SHA224 differs only by IV constants and output
@@ -8583,7 +7978,7 @@ static int gpu_opencl_template_compile_sha224saltpass(struct gpu_device *d, int 
         "HASH_WORDS=7,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha256";
     d->prog_template_sha224saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha224saltpass || err != CL_SUCCESS) {
@@ -8629,10 +8024,8 @@ static int gpu_opencl_template_kernel_lazy_sha224saltpass(struct gpu_device *d, 
 static int gpu_opencl_template_compile_md5passsalt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md5passsalt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md5passsalt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5passsalt_core_str);
     /* SALT_POSITION=APPEND is the load-bearing axis here vs MD5SALTPASS
      * (PREPEND). HASH_WORDS=4 + BASE_ALGO=md5 match MD5SALTPASS exactly;
      * the kernel-cache key disambiguates only on SALT_POSITION. */
@@ -8640,7 +8033,7 @@ static int gpu_opencl_template_compile_md5passsalt(struct gpu_device *d, int dev
         "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=APPEND,BASE_ALGO=md5";
     d->prog_template_md5passsalt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_md5passsalt || err != CL_SUCCESS) {
@@ -8686,10 +8079,8 @@ static int gpu_opencl_template_kernel_lazy_md5passsalt(struct gpu_device *d, int
 static int gpu_opencl_template_compile_sha1passsalt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha1passsalt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha1passsalt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha1passsalt_core_str);
     /* SALT_POSITION=APPEND is the load-bearing axis here vs SHA1SALTPASS
      * (PREPEND). HASH_WORDS=5 + BASE_ALGO=sha1 match SHA1SALTPASS exactly;
      * the kernel-cache key disambiguates only on SALT_POSITION. */
@@ -8697,7 +8088,7 @@ static int gpu_opencl_template_compile_sha1passsalt(struct gpu_device *d, int de
         "HASH_WORDS=5,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=APPEND,BASE_ALGO=sha1";
     d->prog_template_sha1passsalt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha1passsalt || err != CL_SUCCESS) {
@@ -8746,10 +8137,8 @@ static int gpu_opencl_template_kernel_lazy_sha1passsalt(struct gpu_device *d, in
 static int gpu_opencl_template_compile_sha256passsalt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha256passsalt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha256passsalt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha256passsalt_core_str);
     /* SALT_POSITION=APPEND is the load-bearing axis here vs SHA256SALTPASS
      * (PREPEND). HASH_WORDS=8 + BASE_ALGO=sha256 match SHA256SALTPASS
      * exactly; the kernel-cache key disambiguates only on SALT_POSITION. */
@@ -8757,7 +8146,7 @@ static int gpu_opencl_template_compile_sha256passsalt(struct gpu_device *d, int 
         "HASH_WORDS=8,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=APPEND,BASE_ALGO=sha256";
     d->prog_template_sha256passsalt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha256passsalt || err != CL_SUCCESS) {
@@ -8807,10 +8196,8 @@ static int gpu_opencl_template_kernel_lazy_sha256passsalt(struct gpu_device *d, 
 static int gpu_opencl_template_compile_sha512saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha512saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha512saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha512saltpass_core_str);
     /* HASH_WORDS=16 + HASH_BLOCK_BYTES=128 + BASE_ALGO=sha512 — three
      * load-bearing axes, all distinct from every prior salted template.
      * HASH_BLOCK_BYTES=128 alone is unique to SHA-384/512 among salted
@@ -8819,7 +8206,7 @@ static int gpu_opencl_template_compile_sha512saltpass(struct gpu_device *d, int 
         "HASH_WORDS=16,HASH_BLOCK_BYTES=128,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha512";
     d->prog_template_sha512saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha512saltpass || err != CL_SUCCESS) {
@@ -8870,10 +8257,8 @@ static int gpu_opencl_template_kernel_lazy_sha512saltpass(struct gpu_device *d, 
 static int gpu_opencl_template_compile_sha512passsalt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha512passsalt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha512passsalt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha512passsalt_core_str);
     /* HASH_WORDS=16 + HASH_BLOCK_BYTES=128 + SALT_POSITION=APPEND +
      * BASE_ALGO=sha512 — four load-bearing axes, of which only
      * SALT_POSITION differs from SHA512SALTPASS. The 128-byte block
@@ -8882,7 +8267,7 @@ static int gpu_opencl_template_compile_sha512passsalt(struct gpu_device *d, int 
         "HASH_WORDS=16,HASH_BLOCK_BYTES=128,HAS_SALT=1,"
         "SALT_POSITION=APPEND,BASE_ALGO=sha512";
     d->prog_template_sha512passsalt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha512passsalt || err != CL_SUCCESS) {
@@ -8934,10 +8319,8 @@ static int gpu_opencl_template_kernel_lazy_sha512passsalt(struct gpu_device *d, 
 static int gpu_opencl_template_compile_sha384saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha384saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_sha384saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_sha384saltpass_core_str);
     /* HASH_WORDS=12 + HASH_BLOCK_BYTES=128 + BASE_ALGO=sha512 — three
      * load-bearing axes. HASH_WORDS=12 distinguishes from SHA512SALTPASS
      * (16) and SHA512PASSSALT (16). HASH_BLOCK_BYTES=128 + BASE_ALGO=
@@ -8946,7 +8329,7 @@ static int gpu_opencl_template_compile_sha384saltpass(struct gpu_device *d, int 
         "HASH_WORDS=12,HASH_BLOCK_BYTES=128,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha512";
     d->prog_template_sha384saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha384saltpass || err != CL_SUCCESS) {
@@ -8999,10 +8382,8 @@ static int gpu_opencl_template_kernel_lazy_sha384saltpass(struct gpu_device *d, 
 static int gpu_opencl_template_compile_ripemd160saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_ripemd160saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_ripemd160saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_ripemd160saltpass_core_str);
     /* HASH_WORDS=5 + HASH_BLOCK_BYTES=64 + BASE_ALGO=rmd160 — three
      * load-bearing axes. BASE_ALGO=rmd160 distinguishes from SHA1SALTPASS
      * (BASE_ALGO=sha1; same HASH_WORDS=5 + HASH_BLOCK_BYTES=64). The
@@ -9013,7 +8394,7 @@ static int gpu_opencl_template_compile_ripemd160saltpass(struct gpu_device *d, i
         "HASH_WORDS=5,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=rmd160";
     d->prog_template_ripemd160saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_ripemd160saltpass || err != CL_SUCCESS) {
@@ -9065,10 +8446,8 @@ static int gpu_opencl_template_kernel_lazy_ripemd160saltpass(struct gpu_device *
 static int gpu_opencl_template_compile_ripemd320saltpass(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_ripemd320saltpass) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_ripemd320saltpass_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_ripemd320saltpass_core_str);
     /* HASH_WORDS=10 + HASH_BLOCK_BYTES=64 + BASE_ALGO=rmd320 — three
      * load-bearing axes. BASE_ALGO=rmd320 distinguishes from RIPEMD160-
      * SALTPASS (BASE_ALGO=rmd160; HASH_WORDS=5). The compression primitive
@@ -9079,7 +8458,7 @@ static int gpu_opencl_template_compile_ripemd320saltpass(struct gpu_device *d, i
         "HASH_WORDS=10,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=rmd320";
     d->prog_template_ripemd320saltpass = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_ripemd320saltpass || err != CL_SUCCESS) {
@@ -9129,10 +8508,8 @@ static int gpu_opencl_template_kernel_lazy_ripemd320saltpass(struct gpu_device *
 static int gpu_opencl_template_compile_hmac_blake2s(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_hmac_blake2s) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_hmac_blake2s_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_hmac_blake2s_core_str);
     /* HASH_WORDS=8 + HASH_BLOCK_BYTES=64 + BASE_ALGO=blake2s + HAS_SALT=1
      * + HMAC_KPASS=1 — five-axis cache key. BASE_ALGO=blake2s + HMAC_KPASS=1
      * pairwise-distinguishes from every prior salted template (none use
@@ -9147,7 +8524,7 @@ static int gpu_opencl_template_compile_hmac_blake2s(struct gpu_device *d, int de
         "HASH_WORDS=8,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=blake2s,HMAC_KPASS=1";
     d->prog_template_hmac_blake2s = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_hmac_blake2s || err != CL_SUCCESS) {
@@ -9201,10 +8578,8 @@ static int gpu_opencl_template_kernel_lazy_hmac_blake2s(struct gpu_device *d, in
 static int gpu_opencl_template_compile_hmac_streebog256(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_hmac_streebog256) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_hmac_streebog256_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_hmac_streebog256_core_str);
     /* HASH_WORDS=8 + HASH_BLOCK_BYTES=64 + BASE_ALGO=streebog256 + HAS_SALT=1
      * + HMAC_KSALTPASS=1 — five-axis cache key. BASE_ALGO=streebog256 +
      * HMAC_KSALTPASS=1 pairwise-distinguishes from every prior salted
@@ -9220,7 +8595,7 @@ static int gpu_opencl_template_compile_hmac_streebog256(struct gpu_device *d, in
         "HASH_WORDS=8,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=streebog256,HMAC_KSALTPASS=1";
     d->prog_template_hmac_streebog256 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_hmac_streebog256 || err != CL_SUCCESS) {
@@ -9271,10 +8646,8 @@ static int gpu_opencl_template_kernel_lazy_hmac_streebog256(struct gpu_device *d
 static int gpu_opencl_template_compile_hmac_streebog512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_hmac_streebog512) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_hmac_streebog512_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_hmac_streebog512_core_str);
     /* HASH_WORDS=16 + HASH_BLOCK_BYTES=64 + BASE_ALGO=streebog512 + HAS_SALT=1
      * + HMAC_KSALTPASS=1 — five-axis cache key. BASE_ALGO=streebog512 +
      * HMAC_KSALTPASS=1 pairwise-distinguishes from every prior salted
@@ -9290,7 +8663,7 @@ static int gpu_opencl_template_compile_hmac_streebog512(struct gpu_device *d, in
         "HASH_WORDS=16,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=streebog512,HMAC_KSALTPASS=1";
     d->prog_template_hmac_streebog512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_hmac_streebog512 || err != CL_SUCCESS) {
@@ -9341,10 +8714,8 @@ static int gpu_opencl_template_kernel_lazy_hmac_streebog512(struct gpu_device *d
 static int gpu_opencl_template_compile_phpbb3(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_phpbb3) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_phpbb3_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_phpbb3_core_str);
     /* HASH_WORDS=4 + HASH_BLOCK_BYTES=64 + BASE_ALGO=phpbb3 + HAS_SALT=1 +
      * SALT_POSITION=PREPEND -- five-axis cache key. BASE_ALGO=phpbb3
      * pairwise-distinguishes from every prior salted template (only this
@@ -9357,7 +8728,7 @@ static int gpu_opencl_template_compile_phpbb3(struct gpu_device *d, int dev_idx)
         "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=phpbb3";
     d->prog_template_phpbb3 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_phpbb3 || err != CL_SUCCESS) {
@@ -9408,10 +8779,8 @@ static int gpu_opencl_template_kernel_lazy_phpbb3(struct gpu_device *d, int dev_
 static int gpu_opencl_template_compile_md5crypt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_md5crypt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_md5crypt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5crypt_core_str);
     /* HASH_WORDS=4 + HASH_BLOCK_BYTES=64 + BASE_ALGO=md5crypt + HAS_SALT=1 +
      * SALT_POSITION=PREPEND -- five-axis cache key. BASE_ALGO=md5crypt
      * pairwise-distinguishes from every prior salted template (only this
@@ -9424,7 +8793,7 @@ static int gpu_opencl_template_compile_md5crypt(struct gpu_device *d, int dev_id
         "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=md5crypt";
     d->prog_template_md5crypt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_md5crypt || err != CL_SUCCESS) {
@@ -9476,10 +8845,8 @@ static int gpu_opencl_template_kernel_lazy_md5crypt(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_sha256crypt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha256crypt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_shacrypt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_shacrypt_core_str);
     /* HASH_WORDS=8 + HASH_BLOCK_BYTES=64 + BASE_ALGO=sha256crypt + HAS_SALT=1
      * + SALT_POSITION=PREPEND -- five-axis cache key. BASE_ALGO=sha256crypt
      * pairwise-distinguishes from every prior salted template at HASH_WORDS=8
@@ -9490,7 +8857,7 @@ static int gpu_opencl_template_compile_sha256crypt(struct gpu_device *d, int dev
         "HASH_WORDS=8,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha256crypt";
     d->prog_template_sha256crypt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_sha256crypt || err != CL_SUCCESS) {
@@ -9540,10 +8907,8 @@ static int gpu_opencl_template_kernel_lazy_sha256crypt(struct gpu_device *d, int
 static int gpu_opencl_template_compile_sha512crypt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_sha512crypt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_shacrypt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_shacrypt_core_str);
     /* HASH_WORDS=16 + HASH_BLOCK_BYTES=128 + BASE_ALGO=sha512crypt + HAS_SALT=1
      * + SALT_POSITION=PREPEND -- five-axis cache key. BASE_ALGO=sha512crypt
      * pairwise-distinguishes from every prior salted template at HASH_WORDS=16
@@ -9564,7 +8929,7 @@ static int gpu_opencl_template_compile_sha512crypt(struct gpu_device *d, int dev
         "HASH_WORDS=16,HASH_BLOCK_BYTES=128,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=sha512crypt";
     d->prog_template_sha512crypt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1 -DHASH_WORDS=16 -DHASH_BLOCK_BYTES=128",
         defines, &err);
     if (!d->prog_template_sha512crypt || err != CL_SUCCESS) {
@@ -9612,10 +8977,8 @@ static int gpu_opencl_template_kernel_lazy_sha512crypt(struct gpu_device *d, int
 static int gpu_opencl_template_compile_descrypt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_descrypt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_descrypt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_descrypt_core_str);
     /* HASH_WORDS=4 + HASH_BLOCK_BYTES=64 + BASE_ALGO=descrypt + HAS_SALT=1
      * + SALT_POSITION=PREPEND -- five-axis cache key. BASE_ALGO=descrypt
      * pairwise-distinguishes from every prior salted template at HASH_-
@@ -9630,7 +8993,7 @@ static int gpu_opencl_template_compile_descrypt(struct gpu_device *d, int dev_id
         "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
         "SALT_POSITION=PREPEND,BASE_ALGO=descrypt";
     d->prog_template_descrypt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
     if (!d->prog_template_descrypt || err != CL_SUCCESS) {
@@ -9681,10 +9044,8 @@ static int gpu_opencl_template_kernel_lazy_descrypt(struct gpu_device *d, int de
 static int gpu_opencl_template_compile_bcrypt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_bcrypt) return 0;
     cl_int err = CL_SUCCESS;
-    const char *sources[4] = {
-        gpu_common_str, gpu_md5_rules_str,
-        gpu_bcrypt_core_str, gpu_template_str
-    };
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_bcrypt_core_str);
     /* HASH_WORDS=6 + HASH_BLOCK_BYTES=64 + BASE_ALGO=bcrypt + HAS_SALT=1
      * + SALT_POSITION=PREPEND + GPU_TEMPLATE_HAS_LOCAL_BUFFER=1 +
      * GPU_TEMPLATE_LOCAL_BUFFER_PER_LANE=1024 + BCRYPT_WG_SIZE=8 -- eight-
@@ -9710,7 +9071,7 @@ static int gpu_opencl_template_compile_bcrypt(struct gpu_device *d, int dev_idx)
         "GPU_TEMPLATE_LOCAL_BUFFER_PER_LANE=1024,"
         "BCRYPT_WG_SIZE=8";
     d->prog_template_bcrypt = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, 4, sources,
+        d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1 "
         "-DGPU_TEMPLATE_HAS_LOCAL_BUFFER=1 "
         "-DGPU_TEMPLATE_LOCAL_BUFFER_PER_LANE=1024 "
@@ -9764,19 +9125,28 @@ static int gpu_opencl_template_kernel_lazy_bcrypt(struct gpu_device *d, int dev_
  * as __constant; if prog_len exceeds the device's CL_DEVICE_MAX_-
  * CONSTANT_BUFFER_SIZE (typically 64 KB), the build/dispatch will fail —
  * callers should fall back to CPU rule expansion in that case. */
-int gpu_opencl_set_rules(int dev_idx,
+/* gpu_opencl_set_rules_ex -- the real uploader.
+ *
+ * `off_entries` is the number of ENTRIES in rule_offset[], which is NOT the
+ * same as the number of rules: the UTF-32 path passes a table of 2 * n_rules
+ * (first half byte-stream offsets, second half the UTF-32 offsets plus the two
+ * capability bits) while `n_rules` keeps meaning "rules", because that is what
+ * the kernel divides gid by.  Conflating them would leave the second half
+ * unuploaded and every lane would read capability bits out of uninitialised
+ * device memory.
+ *
+ * The public gpu_opencl_set_rules() below is a thin wrapper with
+ * off_entries == n_rules, so mdxfind.c's call site is unchanged. */
+static int gpu_opencl_set_rules_ex(int dev_idx,
     const unsigned char *rule_program, uint32_t prog_len,
-    const uint32_t *rule_offset, int n_rules)
+    const uint32_t *rule_offset, int n_rules, int off_entries)
 {
     if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return -1;
     if (!rule_program || prog_len == 0 || !rule_offset || n_rules <= 0) return -1;
     struct gpu_device *d = &gpu_devs[dev_idx];
     cl_int err;
 
-    /* Don't upload rules to a disabled device. See d->device_disabled doc.
-     * Caller's n_uploaded counter will omit this device, and if zero
-     * devices upload successfully gpu_rule_count stays 0 → full CPU
-     * rule-walk fallback. */
+    /* Don't upload rules to a disabled device. See d->device_disabled doc. */
     if (d->device_disabled) {
         GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: skipping rule program upload (device disabled)\n", dev_idx);
         return -1;
@@ -9787,8 +9157,8 @@ int gpu_opencl_set_rules(int dev_idx,
     /* Phase E: time the rule-program + offset upload. */
     struct timespec _ru_t0, _ru_t1;
     clock_gettime(CLOCK_MONOTONIC, &_ru_t0);
-    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: rule program upload START (%.2fMB, %d rules)\n",
-              dev_idx, prog_len / (1024.0 * 1024), n_rules);
+    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: rule program upload START (%.2fMB, %d rules, %d offset entries)\n",
+              dev_idx, prog_len / (1024.0 * 1024), n_rules, off_entries);
 
     /* Grow / (re)create the rule_program buffer. __constant so the
      * kernel can take advantage of the device's constant cache.
@@ -9847,7 +9217,7 @@ int gpu_opencl_set_rules(int dev_idx,
      * → off_bytes=4, well below NVIDIA Windows NDRange-time minimum
      * buffer threshold. Kernel reads rule_offset[rule_idx] only when
      * rule_idx < n_rules; tail bytes unread by valid lanes. */
-    size_t off_bytes = (size_t)n_rules * sizeof(uint32_t);
+    size_t off_bytes = (size_t)off_entries * sizeof(uint32_t);
     if (!d->b_rule_offset || off_bytes > d->rule_offset_cap) {
         if (d->b_rule_offset) clReleaseMemObject(d->b_rule_offset);
         d->b_rule_offset = create_min_buf(d->ctx, d->queue,
@@ -9892,7 +9262,14 @@ int gpu_opencl_set_rules(int dev_idx,
      * never freed within a session (matches the device buffers'
      * persistence model). When the validator env var is unset the
      * pointers stay NULL and zero memory is consumed. */
-    if (gpu_validator_enabled()) {
+    /* The UTF-32 path needs this mirror too, and not for validation: the
+     * combined program is built at FIRST DISPATCH (see
+     * gpu_opencl_u32_rules_lazy for the ordering reason), by which time the
+     * byte program mdxfind handed us here is long out of scope.  The mirror is
+     * the only surviving copy.  Gating it on an env var meant to enable a
+     * DIAGNOSTIC would have made the feature silently depend on
+     * MDXFIND_GPU_VALIDATOR=1. */
+    if (gpu_validator_enabled() || gpu_u32_active()) {
         if (!d->h_rule_program || prog_len > d->h_rule_program_len) {
             free(d->h_rule_program);
             d->h_rule_program = (unsigned char *)malloc(prog_len);
@@ -9921,22 +9298,118 @@ int gpu_opencl_set_rules(int dev_idx,
     return 0;
 }
 
+/* The public entry point mdxfind.c calls.  Byte-stream program, one offset
+ * per rule. */
+int gpu_opencl_set_rules(int dev_idx,
+    const unsigned char *rule_program, uint32_t prog_len,
+    const uint32_t *rule_offset, int n_rules)
+{
+    return gpu_opencl_set_rules_ex(dev_idx, rule_program, prog_len,
+                                   rule_offset, n_rules, n_rules);
+}
+
+/* ==== UTF-32 rule program: built and uploaded at FIRST DISPATCH ========
+ *
+ * NOT at set_rules time, and the reason is an ordering fact that no host-side
+ * test could have found.  mdxfind.c assigns `gpu_rule_slot` AFTER the
+ * srl_thread_fn fan-out that calls set_rules -- launch at mdxfind.c:53462,
+ * `gpu_rule_slot = slot;` at :53471 -- so at set_rules time that pointer is
+ * still NULL and there is no way to map a device rule index back to its
+ * Rules[] entry, which is where the rule's retained SOURCE TEXT lives.  The
+ * UTF-32 stream is compiled from that source, because the byte bytecode cannot
+ * be decompiled.
+ *
+ * First dispatch happens long after, so the map is set by then.  Found by the
+ * first run on real hardware, which refused loudly rather than quietly
+ * uploading a byte-only program and measuring the baseline -- exactly what the
+ * fail-loud discipline is for.
+ *
+ * The program is built ONCE PER SESSION (identical bytes for every device,
+ * and packrule32 over a large rule file is not free) and uploaded once per
+ * device.
+ */
+static int gpu_opencl_u32_rules_lazy(struct gpu_device *d, int dev_idx)
+{
+    static pthread_mutex_t u32_lk = PTHREAD_MUTEX_INITIALIZER;
+    static const unsigned char *u32_prog_c = NULL;
+    static const uint32_t      *u32_offs_c = NULL;
+    static uint32_t             u32_len    = 0;
+    static int                  u32_nrules = 0;
+    static int                  u32_built  = 0;
+
+    if (d->u32_rules_uploaded) return 0;
+
+    pthread_mutex_lock(&u32_lk);
+    /* The pre-filter builds at rule-load time (that timing is what makes the
+     * tier-3 membership clawback effective), so by first dispatch the program
+     * normally already exists.  Ask the module for it rather than reaching into
+     * its cache: there is one copy and only the module that filled it should be
+     * able to hand it out. */
+    if (!u32_built && gpu_u32_get_program(&u32_prog_c, &u32_len,
+                                          &u32_offs_c, &u32_nrules)) {
+        u32_built = 1;
+        gpu_u32_dev_prog   = u32_prog_c;
+        gpu_u32_dev_offs   = u32_offs_c;
+        gpu_u32_dev_nrules = u32_nrules;
+        fprintf(stderr,
+            "GPU rule engine: UTF-32 path ON — %d device rules, program %u "
+            "bytes, %d offset entries, gpu_legacy_slot_unused=%d\n",
+            u32_nrules, u32_len, u32_nrules * 2, gpu_legacy_slot_unused);
+    }
+    if (!u32_built) {
+        /* The pre-filter did not run or could not build.  That is a wiring
+         * error, not a configuration: gpu_u32_active() is true, so -8 is on and
+         * the backend claimed capability, and the only caller that builds the
+         * program is mdxfind.c's rule-pack block. */
+        pthread_mutex_unlock(&u32_lk);
+        fprintf(stderr,
+            "FATAL: %s:%d the UTF-32 device path is active but no rule program "
+            "was built. gpu_u32_membership_prefilter() must be called from the "
+            "rule-pack block, after the membership fill loop.\n",
+            __FILE__, __LINE__);
+        exit(1);
+    }
+    pthread_mutex_unlock(&u32_lk);
+
+    /* The case tables, uploaded once per device.  Generated from
+     * ../latin_case.h by gen_u32_tables.py so they cannot drift from the CPU
+     * engine's table; see gpu_u32_case_host.h. */
+    if (!d->b_u32_case_tab) {
+        cl_int cerr;
+        d->b_u32_case_tab = clCreateBuffer(d->ctx,
+            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+            sizeof(gpu_u32_case_host), (void *)gpu_u32_case_host, &cerr);
+        if (cerr != CL_SUCCESS || !d->b_u32_case_tab) {
+            GPU_FATAL("b_u32_case_tab alloc failed (err=%d, %zu bytes) on dev %d",
+                      cerr, sizeof(gpu_u32_case_host), dev_idx);
+        }
+    }
+
+    if (gpu_opencl_set_rules_ex(dev_idx, u32_prog_c, u32_len, u32_offs_c,
+                                u32_nrules, u32_nrules * 2) != 0) {
+        fprintf(stderr,
+            "FATAL: %s:%d re-upload of the combined UTF-32 rule program failed "
+            "on device %d.\n", __FILE__, __LINE__, dev_idx);
+        exit(1);
+    }
+    d->u32_rules_uploaded = 1;
+    return 0;
+}
+
 /* B5 chokepoint widening (2026-05-04): single entry point that resolves
  * the appropriate per-op template kernel handle, ensuring it has been
  * compiled and instantiated lazily on this device. Replaces the 5-branch
  * if-ladder previously inlined at the dispatch_md5_rules kernel-handle
  * swap site.
  *
- * Returns the per-op template kernel when:
- *   - MDXFIND_GPU_TEMPLATE is unset (tpl == GPU_TEMPLATE_OFF) — production
- *     path for the 5 fan-out ops; OR
- *   - MDXFIND_GPU_TEMPLATE is set AND the env-var algo matches the op.
+ * Returns the per-op template kernel for every op in the switch below.
+ * There is no selector and no way to ask for a different one: the op being
+ * dispatched picks the kernel. (Until 2026-09-16 an MDXFIND_GPU_TEMPLATE
+ * env var could force a mismatch here, which returned NULL and left the
+ * caller running the legacy MD5 kernel against non-MD5 work. It is gone.)
  *
- * Returns NULL when the env-var is set but selects a different algorithm
- * than this dispatch's op (caller falls back to legacy md5_rules_phase0
- * for the MD5 case; for non-MD5 ops the caller will dispatch the legacy
- * MD5 kernel which is structurally wrong — but that combination is opt-in
- * via env-var, and the warning emitted here documents it).
+ * Returns NULL only for an op with no template kernel, and for a compile or
+ * kernel-create failure.
  *
  * Returns NULL on compile / kernel-create failure (caller falls back to
  * legacy md5_rules_phase0 for MD5; for other ops the dispatch will
@@ -9956,7 +9429,6 @@ int gpu_opencl_set_rules(int dev_idx,
  *   JOB_RMD160  -> kern_template_phase0_ripemd160 (gpu_ripemd160_core.cl + gpu_template.cl) [B5 sb2]
  *   JOB_RMD320  -> kern_template_phase0_ripemd320 (gpu_ripemd320_core.cl + gpu_template.cl) [B5 sb2] */
 static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, int op) {
-    int tpl = gpu_template_enabled();
     switch (op) {
         case JOB_MD5:
         /* B7.7a (2026-05-07): JOB_MD5UC reuses the MD5 template kernel.
@@ -9967,204 +9439,150 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * gpu_md5_core.cl template_iterate branches on algo_mode to
          * pick md5_to_hex_uc vs md5_to_hex_lc. No new kernel handle. */
         case JOB_MD5UC:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD5) {
-                if (gpu_opencl_template_compile(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy(d, dev_idx) == 0)
-                    return d->kern_template_phase0;
-            }
+            if (gpu_opencl_template_compile(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy(d, dev_idx) == 0)
+                return d->kern_template_phase0;
             break;
         case JOB_MD4:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD4) {
-                if (gpu_opencl_template_compile_md4(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md4(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md4;
-            }
+            if (gpu_opencl_template_compile_md4(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md4(d, dev_idx) == 0)
+                return d->kern_template_phase0_md4;
             break;
         case JOB_SHA1:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA1) {
-                if (gpu_opencl_template_compile_sha1(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha1(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha1;
-            }
+            if (gpu_opencl_template_compile_sha1(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha1(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha1;
             break;
         case JOB_SHA224:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA224) {
-                if (gpu_opencl_template_compile_sha224(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha224(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha224;
-            }
+            if (gpu_opencl_template_compile_sha224(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha224(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha224;
             break;
         case JOB_SHA256:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA256) {
-                if (gpu_opencl_template_compile_sha256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha256;
-            }
+            if (gpu_opencl_template_compile_sha256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha256(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha256;
             break;
         case JOB_SHA384:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA384) {
-                if (gpu_opencl_template_compile_sha384(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha384(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha384;
-            }
+            if (gpu_opencl_template_compile_sha384(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha384(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha384;
             break;
         case JOB_SHA512:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA512) {
-                if (gpu_opencl_template_compile_sha512(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha512(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha512;
-            }
+            if (gpu_opencl_template_compile_sha512(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha512(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha512;
             break;
         case JOB_RMD160:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_RIPEMD160) {
-                if (gpu_opencl_template_compile_ripemd160(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_ripemd160(d, dev_idx) == 0)
-                    return d->kern_template_phase0_ripemd160;
-            }
+            if (gpu_opencl_template_compile_ripemd160(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_ripemd160(d, dev_idx) == 0)
+                return d->kern_template_phase0_ripemd160;
             break;
         case JOB_RMD320:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_RIPEMD320) {
-                if (gpu_opencl_template_compile_ripemd320(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_ripemd320(d, dev_idx) == 0)
-                    return d->kern_template_phase0_ripemd320;
-            }
+            if (gpu_opencl_template_compile_ripemd320(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_ripemd320(d, dev_idx) == 0)
+                return d->kern_template_phase0_ripemd320;
             break;
         /* B5 sub-batch 3 (2026-05-06): BLAKE2 family. Three variants
          * wired (BLAKE2B-160 omitted — JOB_BLAKE2B160 is not defined in
          * mdxfind.c; would require new job-type plumbing beyond GPU work). */
         case JOB_BLAKE2S256:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_BLAKE2S256) {
-                if (gpu_opencl_template_compile_blake2s256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_blake2s256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_blake2s256;
-            }
+            if (gpu_opencl_template_compile_blake2s256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_blake2s256(d, dev_idx) == 0)
+                return d->kern_template_phase0_blake2s256;
             break;
         case JOB_BLAKE2B256:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_BLAKE2B256) {
-                if (gpu_opencl_template_compile_blake2b256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_blake2b256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_blake2b256;
-            }
+            if (gpu_opencl_template_compile_blake2b256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_blake2b256(d, dev_idx) == 0)
+                return d->kern_template_phase0_blake2b256;
             break;
         case JOB_BLAKE2B512:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_BLAKE2B512) {
-                if (gpu_opencl_template_compile_blake2b512(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_blake2b512(d, dev_idx) == 0)
-                    return d->kern_template_phase0_blake2b512;
-            }
+            if (gpu_opencl_template_compile_blake2b512(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_blake2b512(d, dev_idx) == 0)
+                return d->kern_template_phase0_blake2b512;
             break;
         /* B5 sub-batch 4 (2026-05-03): SHA3 / Keccak family. Eight variants;
          * sponge construction. Pairs (Keccak/SHA3 of same output size) share
          * rate + EMIT_HIT width but distinct suffix-byte literal in the core. */
         case JOB_KECCAK224:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_KECCAK224) {
-                if (gpu_opencl_template_compile_keccak224(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_keccak224(d, dev_idx) == 0)
-                    return d->kern_template_phase0_keccak224;
-            }
+            if (gpu_opencl_template_compile_keccak224(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_keccak224(d, dev_idx) == 0)
+                return d->kern_template_phase0_keccak224;
             break;
         case JOB_KECCAK256:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_KECCAK256) {
-                if (gpu_opencl_template_compile_keccak256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_keccak256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_keccak256;
-            }
+            if (gpu_opencl_template_compile_keccak256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_keccak256(d, dev_idx) == 0)
+                return d->kern_template_phase0_keccak256;
             break;
         case JOB_KECCAK384:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_KECCAK384) {
-                if (gpu_opencl_template_compile_keccak384(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_keccak384(d, dev_idx) == 0)
-                    return d->kern_template_phase0_keccak384;
-            }
+            if (gpu_opencl_template_compile_keccak384(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_keccak384(d, dev_idx) == 0)
+                return d->kern_template_phase0_keccak384;
             break;
         case JOB_KECCAK512:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_KECCAK512) {
-                if (gpu_opencl_template_compile_keccak512(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_keccak512(d, dev_idx) == 0)
-                    return d->kern_template_phase0_keccak512;
-            }
+            if (gpu_opencl_template_compile_keccak512(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_keccak512(d, dev_idx) == 0)
+                return d->kern_template_phase0_keccak512;
             break;
         case JOB_SHA3_224:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA3_224) {
-                if (gpu_opencl_template_compile_sha3_224(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha3_224(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha3_224;
-            }
+            if (gpu_opencl_template_compile_sha3_224(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha3_224(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha3_224;
             break;
         case JOB_SHA3_256:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA3_256) {
-                if (gpu_opencl_template_compile_sha3_256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha3_256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha3_256;
-            }
+            if (gpu_opencl_template_compile_sha3_256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha3_256(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha3_256;
             break;
         case JOB_SHA3_384:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA3_384) {
-                if (gpu_opencl_template_compile_sha3_384(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha3_384(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha3_384;
-            }
+            if (gpu_opencl_template_compile_sha3_384(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha3_384(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha3_384;
             break;
         case JOB_SHA3_512:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA3_512) {
-                if (gpu_opencl_template_compile_sha3_512(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha3_512(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha3_512;
-            }
+            if (gpu_opencl_template_compile_sha3_512(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha3_512(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha3_512;
             break;
         /* B5 sub-batch 5a Tier 1 (2026-05-03): SHA384RAW + SHA512RAW. */
         case JOB_SHA384RAW:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA384RAW) {
-                if (gpu_opencl_template_compile_sha384raw(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha384raw(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha384raw;
-            }
+            if (gpu_opencl_template_compile_sha384raw(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha384raw(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha384raw;
             break;
         case JOB_SHA512RAW:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA512RAW) {
-                if (gpu_opencl_template_compile_sha512raw(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha512raw(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha512raw;
-            }
+            if (gpu_opencl_template_compile_sha512raw(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha512raw(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha512raw;
             break;
         /* B5 sub-batch 6 Tier A (2026-05-03): MD5RAW + SHA1RAW + SHA256RAW. */
         case JOB_MD5RAW:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD5RAW) {
-                if (gpu_opencl_template_compile_md5raw(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md5raw(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md5raw;
-            }
+            if (gpu_opencl_template_compile_md5raw(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md5raw(d, dev_idx) == 0)
+                return d->kern_template_phase0_md5raw;
             break;
         case JOB_SHA1RAW:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA1RAW) {
-                if (gpu_opencl_template_compile_sha1raw(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha1raw(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha1raw;
-            }
+            if (gpu_opencl_template_compile_sha1raw(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha1raw(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha1raw;
             break;
         case JOB_SHA256RAW:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA256RAW) {
-                if (gpu_opencl_template_compile_sha256raw(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha256raw(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha256raw;
-            }
+            if (gpu_opencl_template_compile_sha256raw(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha256raw(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha256raw;
             break;
         /* B5 sub-batch 6 Tier C (2026-05-03): SQL5. */
         case JOB_SQL5:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SQL5) {
-                if (gpu_opencl_template_compile_sql5(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sql5(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sql5;
-            }
+            if (gpu_opencl_template_compile_sql5(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sql5(d, dev_idx) == 0)
+                return d->kern_template_phase0_sql5;
             break;
         /* B6.11 SHA1DRU (2026-05-06): Drupal SHA1; first 1M-iter algo on
          * template path. 1M loop in template_finalize; max_iter=1 forced. */
         case JOB_SHA1DRU:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA1DRU) {
-                if (gpu_opencl_template_compile_sha1dru(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha1dru(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha1dru;
-            }
+            if (gpu_opencl_template_compile_sha1dru(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha1dru(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha1dru;
             break;
         /* PHPBB3 carrier (2026-05-08): JOB_PHPBB3 (e455). Iterated MD5
          * chain INSIDE template_finalize (iter count decoded from
@@ -10172,11 +9590,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * pack site so kernel's outer iter loop runs exactly once.
          * Mirrors SHA1DRU dispatch shape. */
         case JOB_PHPBB3:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_PHPBB3) {
-                if (gpu_opencl_template_compile_phpbb3(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_phpbb3(d, dev_idx) == 0)
-                    return d->kern_template_phase0_phpbb3;
-            }
+            if (gpu_opencl_template_compile_phpbb3(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_phpbb3(d, dev_idx) == 0)
+                return d->kern_template_phase0_phpbb3;
             break;
         /* MD5CRYPT carrier (2026-05-08): JOB_MD5CRYPT (e511). Iterated
          * MD5 chain INSIDE template_finalize (FIXED 1000 iters per BSD
@@ -10185,11 +9601,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * Mirrors PHPBB3 dispatch shape. Phase 1 of the Unix-crypt
          * ladder. */
         case JOB_MD5CRYPT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD5CRYPT) {
-                if (gpu_opencl_template_compile_md5crypt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md5crypt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md5crypt;
-            }
+            if (gpu_opencl_template_compile_md5crypt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md5crypt(d, dev_idx) == 0)
+                return d->kern_template_phase0_md5crypt;
             break;
         /* SHA256CRYPT carrier (2026-05-08): JOB_SHA256CRYPT (e512). 5-step
          * SHA-crypt chain INSIDE template_finalize (default 5000 rounds,
@@ -10199,11 +9613,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * 2 of the Unix-crypt ladder. Shares gpu_shacrypt_core.cl source
          * with Phase 3 (SHA512CRYPT) and Phase 4 (SHA512CRYPTMD5). */
         case JOB_SHA256CRYPT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA256CRYPT) {
-                if (gpu_opencl_template_compile_sha256crypt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha256crypt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha256crypt;
-            }
+            if (gpu_opencl_template_compile_sha256crypt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha256crypt(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha256crypt;
             break;
         /* SHA512CRYPT carrier (2026-05-08): JOB_SHA512CRYPT (e513). 5-step
          * SHA-crypt chain INSIDE template_finalize (default 5000 rounds,
@@ -10215,11 +9627,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * (SHA512CRYPTMD5 at HASH_WORDS=16, algo_mode=1 for MD5-pre-
          * process). SHA512CRYPTMD5 REMAINS on the slab path for now. */
         case JOB_SHA512CRYPT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA512CRYPT) {
-                if (gpu_opencl_template_compile_sha512crypt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha512crypt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha512crypt;
-            }
+            if (gpu_opencl_template_compile_sha512crypt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha512crypt(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha512crypt;
             break;
         /* SHA512CRYPTMD5 carrier (2026-05-08): JOB_SHA512CRYPTMD5 (e510)
          * REUSES the same compiled program/kernel as Phase 3 SHA512CRYPT
@@ -10234,11 +9644,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * algo_mode=1 kernel-side approach would require. Phase 4 of
          * the Unix-crypt ladder (final phase). */
         case JOB_SHA512CRYPTMD5:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA512CRYPT) {
-                if (gpu_opencl_template_compile_sha512crypt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha512crypt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha512crypt;
-            }
+            if (gpu_opencl_template_compile_sha512crypt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha512crypt(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha512crypt;
             break;
         /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): JOB_DESCRYPT
          * (e500). 25-iter DES Feistel chain INSIDE template_finalize.
@@ -10249,11 +9657,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * Unix-crypt ladder (FINAL phase; Unix-crypt slab path fully
          * retired across all 5 Unix-crypt ops). */
         case JOB_DESCRYPT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_DESCRYPT) {
-                if (gpu_opencl_template_compile_descrypt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_descrypt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_descrypt;
-            }
+            if (gpu_opencl_template_compile_descrypt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_descrypt(d, dev_idx) == 0)
+                return d->kern_template_phase0_descrypt;
             break;
         /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): JOB_BCRYPT (e450).
          * 2^cost Eksblowfish chain INSIDE template_finalize; cost parsed per-
@@ -10266,67 +9672,51 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * is admitted to the rules-engine path here. Phase 6 of the slab-
          * retirement ladder (final major slab kernel). */
         case JOB_BCRYPT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_BCRYPT) {
-                if (gpu_opencl_template_compile_bcrypt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_bcrypt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_bcrypt;
-            }
+            if (gpu_opencl_template_compile_bcrypt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_bcrypt(d, dev_idx) == 0)
+                return d->kern_template_phase0_bcrypt;
             break;
         /* B7.7b MD6256 (2026-05-07): MD6-256; final M5 closure. Single-block
          * leaf compression with 14 KB A[1753] stack; per-iter probe like SQL5. */
         case JOB_MD6256:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD6256) {
-                if (gpu_opencl_template_compile_md6256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md6256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md6256;
-            }
+            if (gpu_opencl_template_compile_md6256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md6256(d, dev_idx) == 0)
+                return d->kern_template_phase0_md6256;
             break;
         /* B5 sub-batch 6 Tier B (2026-05-03): NTLMH. */
         case JOB_NTLMH:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_NTLMH) {
-                if (gpu_opencl_template_compile_ntlmh(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_ntlmh(d, dev_idx) == 0)
-                    return d->kern_template_phase0_ntlmh;
-            }
+            if (gpu_opencl_template_compile_ntlmh(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_ntlmh(d, dev_idx) == 0)
+                return d->kern_template_phase0_ntlmh;
             break;
         /* B5 sub-batch 8 (2026-05-05): MD4UTF16. */
         case JOB_MD4UTF16:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD4UTF16) {
-                if (gpu_opencl_template_compile_md4utf16(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md4utf16(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md4utf16;
-            }
+            if (gpu_opencl_template_compile_md4utf16(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md4utf16(d, dev_idx) == 0)
+                return d->kern_template_phase0_md4utf16;
             break;
         /* B5 sub-batch 7 (2026-05-05): MYSQL3. */
         case JOB_MYSQL3:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MYSQL3) {
-                if (gpu_opencl_template_compile_mysql3(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_mysql3(d, dev_idx) == 0)
-                    return d->kern_template_phase0_mysql3;
-            }
+            if (gpu_opencl_template_compile_mysql3(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_mysql3(d, dev_idx) == 0)
+                return d->kern_template_phase0_mysql3;
             break;
         /* B5 sub-batch 6.5 (2026-05-05): WRL. */
         case JOB_WRL:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_WRL) {
-                if (gpu_opencl_template_compile_wrl(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_wrl(d, dev_idx) == 0)
-                    return d->kern_template_phase0_wrl;
-            }
+            if (gpu_opencl_template_compile_wrl(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_wrl(d, dev_idx) == 0)
+                return d->kern_template_phase0_wrl;
             break;
         /* B5 sub-batch 5b retry (2026-05-06): Streebog-256 + Streebog-512. */
         case JOB_STREEBOG_32:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_STREEBOG256) {
-                if (gpu_opencl_template_compile_streebog256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_streebog256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_streebog256;
-            }
+            if (gpu_opencl_template_compile_streebog256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_streebog256(d, dev_idx) == 0)
+                return d->kern_template_phase0_streebog256;
             break;
         case JOB_STREEBOG_64:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_STREEBOG512) {
-                if (gpu_opencl_template_compile_streebog512(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_streebog512(d, dev_idx) == 0)
-                    return d->kern_template_phase0_streebog512;
-            }
+            if (gpu_opencl_template_compile_streebog512(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_streebog512(d, dev_idx) == 0)
+                return d->kern_template_phase0_streebog512;
             break;
         /* B6 salt-axis (2026-05-06): MD5SALT + MD5SALTPASS — first two
          * salted variants on the unified template path. The kernel that
@@ -10361,18 +9751,14 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * disambiguated by params.algo_mode at host pack time. */
         case JOB_HMAC_MD5:
         case JOB_HMAC_MD5_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD5SALT) {
-                if (gpu_opencl_template_compile_md5salt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md5salt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md5salt;
-            }
+            if (gpu_opencl_template_compile_md5salt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md5salt(d, dev_idx) == 0)
+                return d->kern_template_phase0_md5salt;
             break;
         case JOB_MD5SALTPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD5SALTPASS) {
-                if (gpu_opencl_template_compile_md5saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md5saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md5saltpass;
-            }
+            if (gpu_opencl_template_compile_md5saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md5saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_md5saltpass;
             break;
         /* B6.1 SHA1 fan-out (2026-05-06): SHA1SALTPASS — first SHA-family
          * salted variant. Same 19-arg kernel signature as MD5SALTPASS
@@ -10387,11 +9773,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
         case JOB_SHA1SALTPASS:
         case JOB_HMAC_SHA1:
         case JOB_HMAC_SHA1_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA1SALTPASS) {
-                if (gpu_opencl_template_compile_sha1saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha1saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha1saltpass;
-            }
+            if (gpu_opencl_template_compile_sha1saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha1saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha1saltpass;
             break;
         /* B6.2 SHA256 fan-out (2026-05-06): SHA256SALTPASS — second SHA-family
          * salted variant. Same 19-arg kernel signature; cache disambiguated
@@ -10410,11 +9794,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
         case JOB_SHA256SALTPASS:
         case JOB_HMAC_SHA256:
         case JOB_HMAC_SHA256_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA256SALTPASS) {
-                if (gpu_opencl_template_compile_sha256saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha256saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha256saltpass;
-            }
+            if (gpu_opencl_template_compile_sha256saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha256saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha256saltpass;
             break;
         /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS — third SHA-family
          * salted variant. Same 19-arg kernel signature; cache disambiguated
@@ -10430,22 +9812,18 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
         case JOB_SHA224SALTPASS:
         case JOB_HMAC_SHA224:
         case JOB_HMAC_SHA224_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA224SALTPASS) {
-                if (gpu_opencl_template_compile_sha224saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha224saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha224saltpass;
-            }
+            if (gpu_opencl_template_compile_sha224saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha224saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha224saltpass;
             break;
         /* B6.4 MD5PASSSALT fan-out (2026-05-06): MD5PASSSALT — first
          * APPEND-shape salted variant. Same 19-arg kernel signature;
          * cache disambiguated from MD5SALTPASS via SALT_POSITION=APPEND
          * (vs PREPEND) — same BASE_ALGO=md5 + HASH_WORDS=4. */
         case JOB_MD5PASSSALT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_MD5PASSSALT) {
-                if (gpu_opencl_template_compile_md5passsalt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_md5passsalt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_md5passsalt;
-            }
+            if (gpu_opencl_template_compile_md5passsalt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md5passsalt(d, dev_idx) == 0)
+                return d->kern_template_phase0_md5passsalt;
             break;
         /* B6.5 SHA1PASSSALT fan-out (2026-05-06): SHA1PASSSALT — first
          * SHA-family APPEND-shape salted variant. Same 19-arg kernel
@@ -10453,11 +9831,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * POSITION=APPEND (vs PREPEND) — same BASE_ALGO=sha1 +
          * HASH_WORDS=5. */
         case JOB_SHA1PASSSALT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA1PASSSALT) {
-                if (gpu_opencl_template_compile_sha1passsalt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha1passsalt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha1passsalt;
-            }
+            if (gpu_opencl_template_compile_sha1passsalt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha1passsalt(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha1passsalt;
             break;
         /* B6.7 SHA256PASSSALT fan-out (2026-05-06): SHA256PASSSALT — second
          * SHA-family APPEND-shape salted variant. Same 19-arg kernel
@@ -10465,11 +9841,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * SALT_POSITION=APPEND (vs PREPEND) — same BASE_ALGO=sha256 +
          * HASH_WORDS=8. */
         case JOB_SHA256PASSSALT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA256PASSSALT) {
-                if (gpu_opencl_template_compile_sha256passsalt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha256passsalt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha256passsalt;
-            }
+            if (gpu_opencl_template_compile_sha256passsalt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha256passsalt(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha256passsalt;
             break;
         /* B6.9 SHA512 fan-out (2026-05-06): SHA512SALTPASS — first 64-bit-
          * state salted variant. Same 19-arg kernel signature; cache
@@ -10487,11 +9861,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
         case JOB_SHA512SALTPASS:
         case JOB_HMAC_SHA512:
         case JOB_HMAC_SHA512_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA512SALTPASS) {
-                if (gpu_opencl_template_compile_sha512saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha512saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha512saltpass;
-            }
+            if (gpu_opencl_template_compile_sha512saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha512saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha512saltpass;
             break;
         /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT — second
          * 64-bit-state salted variant; APPEND-shape sibling of SHA512SALTPASS.
@@ -10500,11 +9872,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * (vs PREPEND); same BASE_ALGO=sha512 + HASH_WORDS=16 +
          * HASH_BLOCK_BYTES=128 axes — single-axis delta. */
         case JOB_SHA512PASSSALT:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA512PASSSALT) {
-                if (gpu_opencl_template_compile_sha512passsalt(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha512passsalt(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha512passsalt;
-            }
+            if (gpu_opencl_template_compile_sha512passsalt(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha512passsalt(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha512passsalt;
             break;
         /* Family E HMAC-SHA384 carrier (2026-05-08): JOB_HMAC_SHA384 (e543) +
          * JOB_HMAC_SHA384_KPASS (e796) resolve to the SHA384SALTPASS-shaped
@@ -10516,11 +9886,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * (vs 16) — same BASE_ALGO=sha512 + HASH_BLOCK_BYTES=128 axes. */
         case JOB_HMAC_SHA384:
         case JOB_HMAC_SHA384_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_SHA384SALTPASS) {
-                if (gpu_opencl_template_compile_sha384saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_sha384saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_sha384saltpass;
-            }
+            if (gpu_opencl_template_compile_sha384saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_sha384saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_sha384saltpass;
             break;
         /* Family G HMAC-RIPEMD-160 carrier (2026-05-08): JOB_HMAC_RMD160 (e211)
          * + JOB_HMAC_RMD160_KPASS (e798) resolve to the RIPEMD160SALTPASS-
@@ -10533,11 +9901,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * + HASH_BLOCK_BYTES=64 axes. */
         case JOB_HMAC_RMD160:
         case JOB_HMAC_RMD160_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_RIPEMD160SALTPASS) {
-                if (gpu_opencl_template_compile_ripemd160saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_ripemd160saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_ripemd160saltpass;
-            }
+            if (gpu_opencl_template_compile_ripemd160saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_ripemd160saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_ripemd160saltpass;
             break;
         /* Family H HMAC-RIPEMD-320 carrier (2026-05-08): JOB_HMAC_RMD320 (e213)
          * + JOB_HMAC_RMD320_KPASS (e799) resolve to the RIPEMD320SALTPASS-
@@ -10550,11 +9916,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * (vs rmd160). */
         case JOB_HMAC_RMD320:
         case JOB_HMAC_RMD320_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_RIPEMD320SALTPASS) {
-                if (gpu_opencl_template_compile_ripemd320saltpass(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_ripemd320saltpass(d, dev_idx) == 0)
-                    return d->kern_template_phase0_ripemd320saltpass;
-            }
+            if (gpu_opencl_template_compile_ripemd320saltpass(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_ripemd320saltpass(d, dev_idx) == 0)
+                return d->kern_template_phase0_ripemd320saltpass;
             break;
         /* Family I HMAC-BLAKE2S carrier (2026-05-08): JOB_HMAC_BLAKE2S (e828)
          * resolves to a hand-written Path A salted-template kernel. Single
@@ -10565,11 +9929,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * production. Cache key disambiguated from BLAKE2S256 unsalted via
          * HAS_SALT=1 + HMAC_KPASS=1 axes (absent in unsalted defines_str). */
         case JOB_HMAC_BLAKE2S:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_HMAC_BLAKE2S) {
-                if (gpu_opencl_template_compile_hmac_blake2s(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_hmac_blake2s(d, dev_idx) == 0)
-                    return d->kern_template_phase0_hmac_blake2s;
-            }
+            if (gpu_opencl_template_compile_hmac_blake2s(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_hmac_blake2s(d, dev_idx) == 0)
+                return d->kern_template_phase0_hmac_blake2s;
             break;
         /* Family J HMAC-STREEBOG-256 carrier (2026-05-08): JOB_HMAC_STREEBOG256_-
          * KSALT (e838) + JOB_HMAC_STREEBOG256_KPASS (e837) resolve to the
@@ -10587,11 +9949,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * defines_str). */
         case JOB_HMAC_STREEBOG256_KSALT:
         case JOB_HMAC_STREEBOG256_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_HMAC_STREEBOG256) {
-                if (gpu_opencl_template_compile_hmac_streebog256(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_hmac_streebog256(d, dev_idx) == 0)
-                    return d->kern_template_phase0_hmac_streebog256;
-            }
+            if (gpu_opencl_template_compile_hmac_streebog256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_hmac_streebog256(d, dev_idx) == 0)
+                return d->kern_template_phase0_hmac_streebog256;
             break;
         /* Family K HMAC-STREEBOG-512 carrier (2026-05-08): JOB_HMAC_STREEBOG512_-
          * KSALT (e840) + JOB_HMAC_STREEBOG512_KPASS (e839) resolve to the
@@ -10612,11 +9972,9 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * HMAC family in the ladder. */
         case JOB_HMAC_STREEBOG512_KSALT:
         case JOB_HMAC_STREEBOG512_KPASS:
-            if (tpl == GPU_TEMPLATE_OFF || tpl == GPU_TEMPLATE_HMAC_STREEBOG512) {
-                if (gpu_opencl_template_compile_hmac_streebog512(d, dev_idx) == 0 &&
-                    gpu_opencl_template_kernel_lazy_hmac_streebog512(d, dev_idx) == 0)
-                    return d->kern_template_phase0_hmac_streebog512;
-            }
+            if (gpu_opencl_template_compile_hmac_streebog512(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_hmac_streebog512(d, dev_idx) == 0)
+                return d->kern_template_phase0_hmac_streebog512;
             break;
         default:
             break;
@@ -10631,10 +9989,10 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
  * Deliverable 3: Gate 6 register-pressure probe.
  * Deliverable 4: Sibling dispatch entry point.
  *
- * ALL THREE FUNCTIONS are gated behind getenv("MDXFIND_KERNEL_B_PROTO").
- * When the env flag is not set, these functions return early without
- * touching any existing GPU state. Existing paths are bit-for-bit
- * unchanged when the flag is absent.
+ * ALL THREE FUNCTIONS were gated behind an MDXFIND_KERNEL_B_PROTO env var,
+ * which is gone as of 2026-09-16 (this file no longer reads it).  They return
+ * early without touching any existing GPU state, exactly as the unset case
+ * always did, so existing paths are bit-for-bit unchanged.
  * ====================================================================== */
 
 /* Phase 4 sub-phase 4a.3 (2026-05-22): KERNELB_PRIV_MEM_CAP + Gate 6
@@ -10688,8 +10046,12 @@ int gpu_experiment_rules_codegen_vec_write_enabled(void);
  * requires MDXFIND_GPU_BACKEND=codegen to compose." */
 static int _gpu_backend_force_codegen(void)
 {
-    const char *e = getenv("MDXFIND_GPU_BACKEND");
-    return (e && !strcmp(e, "codegen")) ? 1 : 0;
+    /* Always 0.  MDXFIND_GPU_BACKEND=codegen was a developer FORCE
+     * override that put the codegen route on the gate so the
+     * developer-only PROFILE_VARIANT and Knob G stubs could compose
+     * with it.  Removed 2026-09-16; codegen_auto_dispatch.c picks the
+     * route. */
+    return 0;
 }
 
 /* Deliverable 2: Lazy-build the kernel A1 (cand_rules_phase0) program.
@@ -10713,10 +10075,31 @@ static int gpu_opencl_kernelb_build_prog(struct gpu_device *d, int dev_idx)
 
     /* ---- Kernel A1 (rules-only) + common: cand_rules_phase0 entry point ---- */
     if (!d->prog_kernel_a) {
-        const char *sources_a[2] = {
+        /* Kernel A1's sources.  Under `-8` the shared byte walker
+         * (gpu_md5_rules.cl) and the UTF-32 walker are inserted BEFORE
+         * gpu_kernel_a_rules.cl, and the kernel file's own private copy of the
+         * opcode table / case_flip_mask / apply_rule is preprocessed out by
+         * GPU_U32_WALKER_PRESENT -- see the note above region A there.  The
+         * substitution is byte-exact: the three OpenCL copies of that span are
+         * code-identical once comments are stripped.
+         *
+         * Order is load-bearing and is why the shared copy has to come in at
+         * all: u32_run_pair() calls apply_rule(), and gpu_template.cl-style
+         * source ordering cannot put the walker between apply_rule and a
+         * kernel that live in the SAME file. */
+        const char *sources_a[5] = {
+            gpu_common_lean_str,     /* see gpu_template_sources() */
             gpu_common_str,
-            gpu_kernel_a_rules_str   /* Phase 1a A1: renamed source */
+            gpu_kernel_a_rules_str,  /* Phase 1a A1: renamed source */
+            NULL, NULL
         };
+        cl_uint nsrc_a = 3;
+        if (gpu_u32_active()) {
+            sources_a[2] = gpu_md5_rules_str;
+            sources_a[3] = gpu_u32_walker_str;
+            sources_a[4] = gpu_kernel_a_rules_str;
+            nsrc_a = 5;
+        }
         int knobg = gpu_experiment_rules_codegen_vec_write_enabled();
         int pvariant = gpu_experiment_rules_codegen_profile_variant();
         char opts_buf[320];
@@ -10749,10 +10132,17 @@ static int gpu_opencl_kernelb_build_prog(struct gpu_device *d, int dev_idx)
             snprintf(key_buf, sizeof(key_buf),
                 "KERNEL_A_VARIANT=1");
         }
+        if (gpu_u32_active()) {
+            /* The source list is part of the cache key, but make the `-8`
+             * shape explicit in the key text too: a byte-mode run and a `-8`
+             * run of the same build must never share a kernel-A binary. */
+            size_t kl = strlen(key_buf);
+            snprintf(key_buf + kl, sizeof(key_buf) - kl, ",U32=1");
+        }
         const char *opts = opts_buf;
         const char *key  = key_buf;
         d->prog_kernel_a = gpu_kernel_cache_build_program_ex(
-            d->ctx, d->dev, 2, sources_a,
+            d->ctx, d->dev, nsrc_a, sources_a,
             opts, key, &err);
         if (!d->prog_kernel_a || err != CL_SUCCESS) {
             char log[8192] = {0};
@@ -10888,45 +10278,10 @@ static int _cached_a_variant = -2;
 
 static void gpu_opencl_kernel_a_variant_compute(void)
 {
-    if (_cached_a_variant != -2) return;
-
-    const char *e_a   = getenv("MDXFIND_KERNEL_A_PROTO");
-    const char *e_var = getenv("MDXFIND_KERNEL_A_VARIANT");
-
-    if (!e_a || strcmp(e_a, "1") != 0) {
-        _cached_a_variant = 0;
-        return;
-    }
-    int variant = 1;  /* default when MDXFIND_KERNEL_A_VARIANT unset */
-    if (e_var && *e_var) {
-        variant = atoi(e_var);
-    }
-    /* Sub-phase 1a.4 (2026-05-21): variants 1, 2, 3, 4 are implemented.
-     * Variant 1 (rules-only)   -> cand_rules_phase0       (A1).
-     * Variant 2 (masks-only)   -> cand_masks_phase0       (A2).
-     * Variant 3 (rules+masks)  -> cand_rules_masks_phase0 (A3).
-     * Variant 4 (brute-force)  -> cand_bruteforce_phase0  (A4, this sub-phase).
-     * Unknown variants still emit a one-time stderr warning and gate
-     * back to 0 (fall through to existing wiring). */
-    if (variant != 1 && variant != 2 && variant != 3 && variant != 4) {
-        fprintf(stderr,
-            "OpenCL: MDXFIND_KERNEL_A_PROTO=1 with MDXFIND_KERNEL_A_VARIANT=%d "
-            "is not implemented yet (sub-phase 1a.4 ships VARIANT=1/2/3/4 "
-            "(rules/masks/rules+masks/bruteforce)); falling through to "
-            "existing wiring.\n",
-            variant);
-        _cached_a_variant = 0;
-        return;
-    }
-    fprintf(stderr,
-        "OpenCL: Phase 1a kernel A%d (%s) production path enabled "
-        "via MDXFIND_KERNEL_A_PROTO=1 (variant=%d).\n",
-        variant,
-        variant == 1 ? "rules-only" :
-        variant == 2 ? "masks-only" :
-        variant == 3 ? "rules+masks" : "bruteforce",
-        variant);
-    _cached_a_variant = variant;
+    /* Variant 0 = existing production wiring.  A1-A4 sat behind
+     * MDXFIND_KERNEL_A_PROTO / _VARIANT, removed 2026-09-16; the
+     * sources are retained but unreachable without a native flag. */
+    _cached_a_variant = 0;
 }
 
 /* gpu_opencl_kernel_a_proto_enabled — Phase 1a env-flag gate for kernel A.
@@ -10980,10 +10335,7 @@ int gpu_opencl_kernel_a_active_variant(void)
  * than the literal string "0"; returns 0 when MDXFIND_HX_CODEGEN=0. */
 int gpu_opencl_hx_codegen_enabled(void)
 {
-    const char *e = getenv("MDXFIND_HX_CODEGEN");
-    if (e == NULL) return 1;
-    if (e[0] == '0' && e[1] == '\0') return 0;
-    return 1;
+    return 1;   /* hx codegen is always on; MDXFIND_HX_CODEGEN=0 used to disable */
 }
 
 /* gpu_experiment_rules_codegen_md5_enabled REMOVED 2026-05-31 by
@@ -11044,55 +10396,7 @@ int gpu_opencl_hx_codegen_enabled(void)
  * Decision cached on first call. One-shot stderr advisory when active. */
 int gpu_experiment_rules_codegen_profile_variant(void)
 {
-    static int _cached = -2;
-    if (_cached != -2) return _cached;
-    const char *e = getenv("MDXFIND_PROFILE_VARIANT");
-    int n = 0;
-    /* Range extended 2026-05-29 from 0..5 to 0..6: V6 added for Knob G
-     * micro-benchmark (V0 baseline + Knob G vectorized write loop ON;
-     * produces VALID candidates -- kernel B runs normally). */
-    if (e && e[0] >= '0' && e[0] <= '6' && e[1] == '\0') {
-        n = e[0] - '0';
-    }
-    /* Composition: only active when developer FORCE override has put
-     * the codegen path on the route gate. Auto-dispatch (2026-05-31)
-     * retired the parent env flag; PROFILE_VARIANT now composes with
-     * MDXFIND_GPU_BACKEND=codegen explicitly (per spec §15 open-
-     * question recommendation: simpler parent semantic, preserves the
-     * developer mental model: "variant stubs are meaningful only when
-     * codegen is the active path"). */
-    if (n > 0 && !_gpu_backend_force_codegen()) {
-        fprintf(stderr,
-            "OpenCL: NOTICE -- MDXFIND_PROFILE_VARIANT=%d is set but "
-            "MDXFIND_GPU_BACKEND is not 'codegen' -- variant is a "
-            "no-op outside a force-codegen route. Set BOTH "
-            "MDXFIND_GPU_BACKEND=codegen and MDXFIND_PROFILE_VARIANT=%d "
-            "to enable profile-variant stubs.\n", n, n);
-        _cached = 0;
-        return _cached;
-    }
-    _cached = n;
-    if (_cached > 0 && _cached < 6) {
-        fprintf(stderr,
-            "OpenCL: EXPERIMENT MDXFIND_PROFILE_VARIANT=%d — kernel A1 "
-            "(cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=%d. "
-            "STUB BUILD: kernel A produces NO valid candidates; host "
-            "actual_slots=0 makes kernel B a no-op. Crack count will be "
-            "ZERO. Use for kernel_a_us timing attribution only. "
-            "MDXFIND_DISPATCH_TRACE=1 emits per-chunk kernel_a_us; the "
-            "V0-vs-VN delta is the variant's attributed share.\n",
-            _cached, _cached);
-    } else if (_cached == 6) {
-        fprintf(stderr,
-            "OpenCL: EXPERIMENT MDXFIND_PROFILE_VARIANT=6 — kernel A1 "
-            "(cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=6 "
-            "(Knob G micro-benchmark variant). REAL CANDIDATES produced "
-            "with uint4 vectorized write loop FORCED ON (regardless of "
-            "MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE). Crack output "
-            "is bit-equivalent to V0+KNOBG_VEC_WRITE=1. The V0-vs-V6 "
-            "kernel_a_us delta isolates the per-byte-write component.\n");
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_PROFILE_VARIANT */
 }
 
 /* gpu_opencl_kernel_a4_profile_variant — A4 (brute-force engine) PROFILE_-
@@ -11142,45 +10446,7 @@ int gpu_experiment_rules_codegen_profile_variant(void)
 int gpu_opencl_kernel_a4_profile_variant(void);
 int gpu_opencl_kernel_a4_profile_variant(void)
 {
-    static int _cached = -2;
-    if (_cached != -2) return _cached;
-    const char *e = getenv("MDXFIND_KERNEL_A4_PROFILE_VARIANT");
-    int n = 0;
-    if (e && e[0] >= '0' && e[0] <= '5' && e[1] == '\0') {
-        n = e[0] - '0';
-    } else if (e && e[0] != '\0') {
-        fprintf(stderr,
-            "OpenCL: NOTICE -- MDXFIND_KERNEL_A4_PROFILE_VARIANT=%s "
-            "invalid (expected 0..5; V6 was removed by the 2026-05-30 "
-            "A4 C5 default-on refactor -- uint4 stores are now the V0 "
-            "production path); falling back to 0 / production.\n",
-            e);
-        _cached = 0;
-        return _cached;
-    }
-    /* R5 host gate: PROFILE_VARIANT-for-A4 only active when
-     * KERNEL_A_VARIANT=4 is the active engine. */
-    if (n > 0 && gpu_opencl_kernel_a_active_variant() != 4) {
-        fprintf(stderr,
-            "OpenCL: NOTICE -- MDXFIND_KERNEL_A4_PROFILE_VARIANT=%d "
-            "requires MDXFIND_KERNEL_A_VARIANT=4; falling through to "
-            "baseline.\n", n);
-        _cached = 0;
-        return _cached;
-    }
-    _cached = n;
-    if (_cached >= 1 && _cached <= 5) {
-        fprintf(stderr,
-            "OpenCL: EXPERIMENT MDXFIND_KERNEL_A4_PROFILE_VARIANT=%d -- "
-            "kernel A4 (cand_bruteforce_phase0) JIT-built with "
-            "-DA4_PROFILE_VARIANT=%d. STUB BUILD: A4 produces NO valid "
-            "candidates (harness short-circuits on actual_slots=0). Use "
-            "for kernel_a4_us timing attribution only. Per-dispatch "
-            "[ocl-kA4] line emitted when active; shutdown-time AGGREGATE "
-            "dumped to stderr.\n",
-            _cached, _cached);
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_KERNEL_A4_PROFILE_VARIANT */
 }
 
 /* gpu_experiment_rules_codegen_vec_write_enabled — Knob G env-flag gate
@@ -11208,37 +10474,7 @@ int gpu_opencl_kernel_a4_profile_variant(void)
  * (b) disambiguate the JIT cache key. */
 int gpu_experiment_rules_codegen_vec_write_enabled(void)
 {
-    static int _cached = -1;
-    if (_cached != -1) return _cached;
-    const char *e = getenv("MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE");
-    int local_set = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
-    /* Composition: only active when developer FORCE override has put
-     * the codegen path on the route gate. Auto-dispatch (2026-05-31)
-     * retired the parent env flag; Knob G now composes with
-     * MDXFIND_GPU_BACKEND=codegen explicitly. */
-    _cached = (local_set && _gpu_backend_force_codegen()) ? 1 : 0;
-    if (_cached) {
-        fprintf(stderr,
-            "OpenCL: EXPERIMENT MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 "
-            "(Knob G) -- kernel A1 (cand_rules_phase0) JIT-built with "
-            "-DKNOBG_VEC_WRITE=1; per-byte candidate write loop replaced "
-            "with uint4 (16-byte) stores from a private 16-aligned staging "
-            "buffer; per-slot byte claim rounded up to a 16-byte multiple. "
-            "Crack set unchanged (consumer reads only plen bytes; pad never "
-            "accessed). Avg per-slot padding cost ~3.8 B (rockyou-1m); "
-            "bounded by per-chunk cap.\n");
-    } else if (local_set) {
-        /* User set VEC_WRITE=1 but forgot MDXFIND_GPU_BACKEND=codegen.
-         * Make this loud so they know nothing happened. */
-        fprintf(stderr,
-            "OpenCL: NOTICE -- MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 "
-            "is set but MDXFIND_GPU_BACKEND is not 'codegen' -- Knob G "
-            "is a no-op outside a force-codegen route. Set BOTH "
-            "MDXFIND_GPU_BACKEND=codegen and "
-            "MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 to enable "
-            "Knob G.\n");
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE (Knob G) */
 }
 
 /* gpu_opencl_kernel_a_trace_dump — Phase 1a A1 buffer-quadruple trace.
@@ -11263,7 +10499,7 @@ static void gpu_opencl_kernel_a_trace_dump(int dev_idx,
     const void *index_data, size_t index_bytes,
     const void *packed_data, size_t packed_bytes)
 {
-    const char *prefix = getenv("MDXFIND_KERNEL_A_TRACE");
+    const char *prefix = NULL /* was MDXFIND_KERNEL_A_TRACE */;
     if (!prefix || !*prefix) return;
 
     char path[1024];
@@ -12702,10 +11938,7 @@ uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
          * event lives across the readback; released after profiling
          * read. */
         evt_a4_for_timing = NULL;
-        {
-            const char *_a4pv_env = getenv("MDXFIND_KERNEL_A4_PROFILE_VARIANT");
-            a4pv_timing_active = (_a4pv_env && _a4pv_env[0] != '\0') ? 1 : 0;
-        }
+            a4pv_timing_active = 0;   /* was MDXFIND_KERNEL_A4_PROFILE_VARIANT */
         err = clEnqueueNDRangeKernel(d->queue, ka, 1,
                                      NULL, &gsize_a, &lsize_a,
                                      0, NULL,
@@ -13117,12 +12350,9 @@ static size_t gpu_opencl_proto_cand_cap_bytes(struct gpu_device *d, int dev_idx)
     const size_t cap_min = (size_t)GPU_RULES_CAND_CAP_MIN_MB * 1024u * 1024u;
     const size_t cap_max = (size_t)GPU_RULES_CAND_CAP_MAX_MB * 1024u * 1024u;
 
+    /* Always derived from device global memory; MDXFIND_GPU_CAND_CAP_MB used
+     * to pin it. */
     size_t cap = 0;
-    const char *e = getenv("MDXFIND_GPU_CAND_CAP_MB");
-    if (e && *e) {
-        long mb = atol(e);
-        if (mb > 0) cap = (size_t)mb * 1024u * 1024u;
-    }
     if (cap == 0) {
         cl_ulong gmem = 0;
         clGetDeviceInfo(d->dev, CL_DEVICE_GLOBAL_MEM_SIZE,
@@ -13267,6 +12497,18 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
         memcpy(staging + 128, &zero32, 4);
         memcpy(staging + 132, word_offset, payload_woff_bytes);
         memcpy(staging + 132 + payload_woff_bytes, packed_words, packed_size);
+        /* UTF-32 path: identical to the non-chunked twin -- see the long note
+         * there.  The per-chunk OCLParams re-upload below rewrites num_words /
+         * num_rules / rule_cursor_start / packed_size out of this same staging
+         * buffer, so num_masks set here survives every chunk. */
+        if (gpu_u32_active()) {
+            uint32_t *pwoff = (uint32_t *)(staging + 132);
+            const unsigned char *ppk =
+                (const unsigned char *)(staging + 132 + payload_woff_bytes);
+            uint32_t cls_counts[3];
+            gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
+            ((OCLParams *)staging)->num_masks = (uint32_t)d->gpu_n_rules;
+        }
     }
     err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
                                0, payload_size, d->h_dispatch_payload,
@@ -13453,6 +12695,12 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
                 KARGC(ka, a++, sizeof(cl_mem), &d->b_proto_packed_buf);
                 KARGC(ka, a++, sizeof(cl_mem), &d->b_proto_chunk_index);
                 KARGC(ka, a++, sizeof(cl_mem), &d->b_proto_kernelA_state);
+                /* UTF-32 path: case_tab is declared last in
+                 * cand_rules_phase0's signature under #ifdef
+                 * GPU_U32_WALKER_PRESENT, so it binds last and only when the
+                 * walker is in the source list -- the same predicate. */
+                if (gpu_u32_active())
+                    KARGC(ka, a++, sizeof(cl_mem), &d->b_u32_case_tab);
 #undef KARGC
                 size_t gsize_a = (size_t)num_words * this_count;
                 size_t lsize_a = 64;
@@ -13578,13 +12826,8 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
 
             /* Bind + enqueue kernel B (identical 16-arg signature + grid to the
              * single-dispatch path). b_hashes_shown is NOT re-zeroed here. */
-            if (!gpu_opencl_hx_codegen_enabled()) {
-                fprintf(stderr,
-                    "FATAL: %s:%d OpenCL GPU[%d] on %s: MDXFIND_HX_CODEGEN=0 "
-                    "unsupported on the chunked codegen path\n",
-                    __FILE__, __LINE__, dev_idx, hostname);
-                exit(1);
-            }
+            /* hx codegen is unconditional; the MDXFIND_HX_CODEGEN=0 opt-out and
+             * its FATAL diagnostic were removed 2026-09-16. */
             {
                 int a = 0;
 #define KBC(n, s, v) do { cl_int _e = clSetKernelArg(kb, n, s, v); \
@@ -13947,6 +13190,24 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
 
     struct gpu_device *d = &gpu_devs[dev_idx];
     if (d->device_disabled) return NULL;
+
+    /* Upload the COMBINED byte+UTF-32 rule program and the case tables before
+     * anything reads d->gpu_n_rules, because this call REPLACES it with the
+     * UTF-32 rule count -- the pre-filter admits rules the byte compiler
+     * refuses, so the two counts are not always equal and a grid sized from the
+     * byte count would walk the wrong number of rules.
+     *
+     * The template path gets this from gpu_opencl_dispatch_md5_rules; the
+     * kernel-A/B path does not go through that function at all, so without this
+     * the device still holds the BYTE-ONLY program: rule_offset has n_rules
+     * entries rather than 2*n_rules, the read of the second half is past the
+     * end, b_u32_case_tab is NULL, and every pair falls to the byte engine.
+     * Not loud -- e347 and the five MAKE_MD5PASS ops simply reported 0 hits
+     * with the pipeline visibly firing and the candidate count right. The Metal
+     * twin needs no equivalent because metal_upload_rules_lazy runs on every
+     * rules dispatch and carries the `-8` swap itself. */
+    if (gpu_u32_active()) (void)gpu_opencl_u32_rules_lazy(d, dev_idx);
+
     if (d->gpu_n_rules <= 0 || !d->prog_md5_rules) return NULL;
 
     /* Build kernel A + B programs (lazy, once per device). */
@@ -14148,6 +13409,27 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
 
         /* packed_words at offset 132 + woff_bytes. */
         memcpy(staging + 132 + payload_woff_bytes, packed_words, packed_size);
+    
+        /* UTF-32 path.  Two things the byte path does not need, both on the
+         * PAYLOAD COPY and never on the caller's array (the hit replay in
+         * gpujob_opencl.c reads g->word_offset back and masks nothing):
+         *
+         *  - the per-word CLASS in word_offset bits 30-31, which is what
+         *    routes each (word, rule) pair to an engine.  Without it every
+         *    word reads as class A and the byte engine silently answers for
+         *    class-W words -- a correct-looking run with wrong candidates.
+         *  - params.num_masks as the base of rule_offset's SECOND half.
+         *    It is 0 on every byte-mode kernel-A dispatch and unread by
+         *    cand_rules_phase0; params.num_rules cannot serve because it is
+         *    the per-CHUNK rule count under rule-axis chunking. */
+        if (gpu_u32_active()) {
+            uint32_t *pwoff = (uint32_t *)(staging + 132);
+            const unsigned char *ppk =
+                (const unsigned char *)(staging + 132 + payload_woff_bytes);
+            uint32_t cls_counts[3];
+            gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
+            ((OCLParams *)staging)->num_masks = (uint32_t)d->gpu_n_rules;
+        }
     }
 
     /* Upload payload to GPU. CL_TRUE = synchronous per hashcat pattern. */
@@ -14183,6 +13465,9 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         KARG(ka, a++, sizeof(cl_mem), &d->b_proto_packed_buf);
         KARG(ka, a++, sizeof(cl_mem), &d->b_proto_chunk_index);
         KARG(ka, a++, sizeof(cl_mem), &d->b_proto_kernelA_state);
+        /* UTF-32 path: see the chunked twin above. */
+        if (gpu_u32_active())
+            KARG(ka, a++, sizeof(cl_mem), &d->b_u32_case_tab);
 #undef KARG
         (void)e;
 
@@ -14250,7 +13535,7 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * MDXFIND_KERNEL_A_TRACE validation-dump channel (it needs every slot),
      * gated behind that env flag so the normal path never pays for it.
      * Skip if overflow or zero-slot (no hits possible). */
-    const char *_ka_trace = getenv("MDXFIND_KERNEL_A_TRACE");
+    const char *_ka_trace = NULL /* was MDXFIND_KERNEL_A_TRACE */;
     int _want_full_readback = (_ka_trace && *_ka_trace);
     {
         if (!overflow_flag && actual_slots > 0) {
@@ -14491,19 +13776,8 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * so users who set MDXFIND_HX_CODEGEN=0 (e.g. from documentation
      * snapshots dated before 2026-05-22) get a clear deprecation message
      * rather than a silent behavior change. */
-    if (!gpu_opencl_hx_codegen_enabled()) {
-        char hostname[256];
-        mdx_gethostname(hostname, sizeof(hostname));
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d] on %s: MDXFIND_HX_CODEGEN=0 "
-            "opt-out removed in Phase 4a.3 (hand-written kernel B "
-            "gpu_kernelb_md5md5salt_nocache.cl deleted from the source "
-            "tree). hx-codegen is the only OpenCL path for "
-            "JOB_MD5MD5SALT. Unset MDXFIND_HX_CODEGEN or set it to any "
-            "value other than the literal \"0\" to use the codegen path.\n",
-            __FILE__, __LINE__, dev_idx, hostname);
-        exit(1);
-    }
+    /* hx codegen is unconditional; the MDXFIND_HX_CODEGEN=0 opt-out and
+     * its FATAL diagnostic were removed 2026-09-16. */
     /* Sub-phase 5a.5 (2026-05-22): per-JOB kernel lookup. The 5a.1-era
      * shim gpu_opencl_kernelb_codegen_kernel() (which hardcoded
      * JOB_MD5MD5SALT) is retired here in favor of the per-JOB
@@ -15232,7 +14506,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
         }
         if (!d->h_rule_program || !d->h_rule_offset) {
             GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator host-side rule mirror not "
-                    "populated (set_rules called before MDXFIND_GPU_VALIDATOR was "
+                    "populated (set_rules called before the validator was "
                     "set?); cannot stringify rulebytes — bypassing validator\n",
                     dev_idx);
             goto validator_skip;
@@ -15523,27 +14797,9 @@ validator_skip:
      * full GPU_PACKED_MAX_HITS so accumulating re-issue hits up to that
      * cap works without grow. */
     uint32_t b3_max_hits_cap = GPU_PACKED_MAX_HITS;
-    {
-        static int _max_hits_cached = -1;
-        static uint32_t _max_hits_override = 0;
-        if (_max_hits_cached == -1) {
-            const char *e = getenv("MDXFIND_MAX_HITS_OVERRIDE");
-            if (e && *e) {
-                long v = strtol(e, NULL, 0);
-                if (v > 0 && v < GPU_PACKED_MAX_HITS) {
-                    _max_hits_override = (uint32_t)v;
-                    GPU_DEBUG_FPRINTF(stderr,
-                        "MDXFIND_MAX_HITS_OVERRIDE=%u: forcing GPU hit "
-                        "buffer cap to %u (default %u). Cursor-restart "
-                        "(B3) protocol exercised at this threshold.\n",
-                        _max_hits_override, _max_hits_override,
-                        (unsigned)GPU_PACKED_MAX_HITS);
-                }
-            }
-            _max_hits_cached = 1;
-        }
-        if (_max_hits_override > 0) b3_max_hits_cap = _max_hits_override;
-    }
+    /* The cap is GPU_PACKED_MAX_HITS. MDXFIND_MAX_HITS_OVERRIDE used to lower
+     * it so the B3 cursor-restart protocol could be exercised at a small
+     * threshold; that is a test fixture's job, not a shipped knob. */
 
     /* Memo B Phase B7.1-B7.5/B7.8: derive mask_size for the third
      * dispatch axis. The B7.5-eligible configuration is (n_prepend in
@@ -15951,11 +15207,8 @@ validator_skip:
          * optimum from gpu_md5salt_core.cl rev 1.5. */
         uint32_t spp_default = 8192u;
         {
-            const char *spp_env = getenv("MDXFIND_SPP");
-            if (spp_env && *spp_env) {
-                int v = atoi(spp_env);
-                if (v >= 1 && v <= 65536) spp_default = (uint32_t)v;
-            } else if (dynsize_is_enabled() &&
+            /* MDXFIND_SPP used to pin spp_default here. */
+            if (dynsize_is_enabled() &&
                        (op == JOB_MD5SALT || op == JOB_MD5UCSALT ||
                         op == JOB_MD5revMD5SALT || op == JOB_MD5sub8_24SALT)) {
                 /* Dynsize gate at salts_per_page derivation:
@@ -15997,12 +15250,11 @@ validator_skip:
          * (correctness preserved -- fewer salts per page, more pages).  Env
          * override MDXFIND_GPU_MAX_GLOBAL for devices whose real limit differs. */
         if (salts_per_page > 0u) {
-            uint64_t max_global = 0xFFF00000ULL; /* ~2^32 - 1M; headroom for the local round-up at dispatch */
-            const char *mg = getenv("MDXFIND_GPU_MAX_GLOBAL");
-            if (mg && *mg) {
-                unsigned long long v = strtoull(mg, NULL, 0);
-                if (v >= 65536ULL) max_global = (uint64_t)v;
-            }
+            /* ~2^32 - 1M; headroom for the local round-up at dispatch.
+             * MDXFIND_GPU_MAX_GLOBAL used to override this ceiling; the
+             * salts_per_page capping below -- which is the actual
+             * CL_INVALID_GLOBAL_WORK_SIZE fix -- is unconditional. */
+            const uint64_t max_global = 0xFFF00000ULL;
             uint64_t per_salt = (uint64_t)num_words
                               * (uint64_t)d->gpu_n_rules
                               * (uint64_t)effective_mask_size;
@@ -16496,6 +15748,61 @@ validator_skip:
 
         /* packed_words[] (offset 132+wo_size). */
         memcpy(p + payload_pkt_off, packed_words, packed_size);
+
+        /* ---- UTF-32 path: tag the per-word class into bits 30-31 -------
+         *
+         * DONE ON THE PAYLOAD COPY, deliberately and necessarily.  The
+         * caller's word_offset[] is the jobg slot's array: it is reused
+         * across dispatches AND it is read back by the host hit replay
+         * (gpujob_opencl.c, `uint32_t pos = g->word_offset[widx];`), which
+         * masks nothing.  Tagging it in place would corrupt the emitted
+         * plaintext of every crack while the digest stayed right -- the
+         * signature of a bug nothing downstream can detect.
+         *
+         * The class is re-derived here with classify_utf8() over the packed
+         * bytes rather than carried down from mdxfind.c's LineInfo.enc.  Same
+         * function, same bytes (the pack site writes the post-$HEX[] string
+         * that classify_utf8 already ran on), no edit to a file another agent
+         * is editing, and the two can be cross-checked against each other.
+         *
+         * Cost is one byte scan over at most GPU_RULES_MAX_WORDS_PER_BATCH
+         * words per DISPATCH, against up to 1.6 billion lanes in it. */
+        /* ONE predicate for the tag AND the kernel swap AND the replay.  They
+         * were separate tests for one revision and the mismatch was immediate:
+         * the tag went into word_offset bits 30-31 while the BYTE kernel ran,
+         * and that kernel masks NOTHING, so every word offset carried bit 30 --
+         * wild global reads and `md5_rules ovr-state read err=-5`.  Tagging an
+         * array whose reader does not mask it has bitten three times in this
+         * feature; sharing the predicate is what stops a fourth. */
+        if (gpu_u32_active()) {
+            uint32_t *pwoff = (uint32_t *)(p + 132);
+            const unsigned char *ppk = (const unsigned char *)(p + payload_pkt_off);
+            uint32_t cls_counts[3];
+            gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
+            /* The per-batch class PARTITION lived here and is GONE, not
+             * disabled.  It was measured WRONG: 14,687 recovered against the
+             * CPU's 15,950 with the two sets DISJOINT, because the partition is
+             * applied to the PAYLOAD COPY -- it has to be, the caller's array
+             * is the jobg slot's and the hit replay reads it back -- so the
+             * device's word_idx indexed the PERMUTED order while the replay
+             * resolved the UNPERMUTED array.  Every emitted plaintext belonged
+             * to a different word.  Reviving it needs either a
+             * payload-lane -> widx permutation handed to the replay, or the tag
+             * and permutation moved onto the caller's array with the replay
+             * masking bits 30-31; it is not a matter of re-enabling a flag. */
+            /* One line per session, not per dispatch: the class mix is a
+             * property of the wordlist and 1.2K dispatches of it is noise. */
+            {
+                static int said = 0;
+                if (!said) {
+                    said = 1;
+                    fprintf(stderr,
+                        "GPU rule engine: first UTF-32 batch — word classes "
+                        "A(ascii)=%u W(utf8-wide)=%u I(undecodable)=%u of %u\n",
+                        cls_counts[0], cls_counts[1], cls_counts[2], num_words);
+                }
+            }
+        }
     }
 
     /* ONE coalesced host->GPU write — synchronous (CL_TRUE) per hashcat
@@ -16520,7 +15827,7 @@ validator_skip:
     {
         static int _pipe_trace_cached = -1;
         if (_pipe_trace_cached == -1) {
-            const char *e = getenv("MDXFIND_PIPE_TRACE");
+            const char *e = NULL /* was MDXFIND_PIPE_TRACE */;
             _pipe_trace_cached = (e && *e && *e != '0') ? 1 : 0;
         }
         if (_pipe_trace_cached == 1) {
@@ -16561,7 +15868,7 @@ validator_skip:
              * reports — visible when diagnosing, not in normal output. */
             static int _ht_trace_cached = -1;
             if (_ht_trace_cached == -1) {
-                const char *_e = getenv("MDXFIND_PIN_TRACE");
+                const char *_e = NULL /* was MDXFIND_PIN_TRACE */;
                 _ht_trace_cached = (_e && *_e && *_e != '0') ? 1 : 0;
             }
             struct timespec _hs_t0, _hs_t1;
@@ -16656,26 +15963,74 @@ validator_skip:
      * everything else; b_packed_buf / b_chunk_index / b_params /
      * b_hit_count are folded INTO the payload and no longer kernel args).
      *
-     * Memo B B2: when MDXFIND_GPU_TEMPLATE=md5 is set, swap to the
-     * template_phase0 kernel from gpu_template.cl + gpu_md5_core.cl.
-     * Same signature as md5_rules_phase0; the kernel-arg setup below
-     * is unchanged. Template build/lazy is per-device and self-healing:
-     * if compile fails or kernel create fails, fall back to the
-     * legacy kernel for this dispatch (warning already emitted). */
+     * Memo B B2: MD5 resolves to the template_phase0 kernel built from
+     * gpu_template.cl + gpu_md5_core.cl. Same signature as the legacy
+     * md5_rules_phase0; the kernel-arg setup below is unchanged.
+     * Template build/lazy is per-device and self-healing: if compile or
+     * kernel create fails, this dispatch falls back to the legacy
+     * kernel (warning already emitted). */
     /* B5 chokepoint widening (2026-05-04): single resolve helper picks
      * the per-op template kernel for {MD5, MD4, SHA1, SHA224, SHA256}.
      * Production path is the template; legacy md5_rules_phase0 only
-     * survives as a fallback when:
-     *   (a) op == JOB_MD5 AND template compile/lazy failed for MD5; OR
-     *   (b) MDXFIND_GPU_TEMPLATE is set and selects an algo other than
-     *       this dispatch's op (env-var-driven cross-algorithm probe;
-     *       not a production configuration).
-     * For non-MD5 ops the legacy kernel computes MD5 digests (wrong) — but
-     * cases (b) is opt-in and case (a) for non-MD5 is structurally a
-     * hard error logged by the compile helpers (gpu_*_core build failed),
-     * not a silent miscompute. See gpu_template_resolve_kernel doc above. */
+     * survives as a fallback for exactly one case: op == JOB_MD5 with
+     * template compile or lazy-create having failed. Nothing can now ask
+     * for it on a non-MD5 op -- the cross-algorithm probe that could,
+     * MDXFIND_GPU_TEMPLATE, was removed 2026-09-16. A non-MD5 op whose
+     * template fails to build is a hard error already logged by the
+     * compile helpers, not a silent miscompute against the MD5 kernel.
+     * See gpu_template_resolve_kernel doc above. */
     cl_kernel kern = gpu_template_resolve_kernel(d, dev_idx, op);
     if (!kern) kern = d->kern_md5_rules_phase0;
+    /* UTF-32 path.  Runs AFTER the template resolver and BEFORE the BF-fast
+     * swap below, and it is op-agnostic: every template instantiation carries
+     * the UTF-32 arm (gpu_template.cl, #ifdef GPU_U32_WALKER_PRESENT), so the
+     * resolved template kernel is already the right kernel and all this block
+     * does is make sure the device has the tagged rule program and the case
+     * tables, and refuse the two kernels that cannot serve the mode.
+     *
+     * It used to be MD5-only and fatal for every other op, because the only
+     * device-side UTF-32 body was md5_rules_mixed_phase0, which computes MD5
+     * unconditionally.  That kernel remains in the tree as the T1/T2
+     * benchmark vehicle and as the MD5 fallback below, but it is no longer
+     * the production path for MD5 -- routing MD5 through the mixed kernel and
+     * the other 55 algorithms through the template would have left the
+     * template's UTF-32 arm unexercised on exactly the type we validate
+     * first. */
+    if (gpu_u32_active()) {
+        /* Uploads the combined byte+UTF-32 rule program and the case tables
+         * for this device.  Returns 0 or exits; there is no soft failure. */
+        (void)gpu_opencl_u32_rules_lazy(d, dev_idx);
+
+        if (kern == d->kern_md5_rules_phase0) {
+            /* The legacy byte kernel masks NOTHING out of word_offset, and
+             * under `-8` the host tags the word class into bits 30-31
+             * (gpu_u32_tag_word_offsets).  The first time the tag was written
+             * while that kernel ran, every word offset carried bit 30: wild
+             * global reads and `md5_rules ovr-state read err=-5`.  It also
+             * has no UTF-32 arm at all, so even a correctly masked offset
+             * would silently run the byte engine on a class-W word.
+             *
+             * We get here only when the per-op template program failed to
+             * build or its kernel failed to create -- a real but recoverable
+             * event on a cold JIT.  For MD5 there is a correct alternative;
+             * for anything else there is not, and a silent byte-engine run
+             * under `-8` is exactly the clean-looking wrong answer this
+             * codebase refuses to produce. */
+            if (op == JOB_MD5 &&
+                gpu_opencl_rules32_kernel_lazy(d, dev_idx) == 0) {
+                kern = d->kern_md5_rules_mixed_phase0;
+            } else {
+                fprintf(stderr,
+                    "FATAL: %s:%d -8 is active but the template program for "
+                    "op=%d did not build on device %d, and the legacy byte "
+                    "kernel cannot serve the UTF-32 path (it neither masks the "
+                    "word-class tag nor carries the UTF-32 walker). The "
+                    "template build error is logged above.\n",
+                    __FILE__, __LINE__, op, dev_idx);
+                exit(1);
+            }
+        }
+    }
     /* Phase 1.9 Tranche A1 (2026-05-10): BF-fast MD5 kernel swap. The
      * standard resolver picked the slow MD5 template
      * (d->kern_template_phase0) for JOB_MD5; if the dispatch is BF-fast
@@ -16853,7 +16208,15 @@ validator_skip:
      * NOTE: The legacy md5_rules_phase0 kernel does NOT take these args.
      * If we fall back to that kernel (kern == d->kern_md5_rules_phase0),
      * we MUST NOT bind a 15th/16th arg. Detect by comparing kern pointer. */
-    int kern_is_template = (kern != d->kern_md5_rules_phase0);
+    /* md5_rules_mixed_phase0 is ALSO not a template: it has the same 14 shared
+     * arguments plus ONE of its own (the case tables) and takes neither mask
+     * arg.  The test was written as "anything that is not the legacy kernel",
+     * which silently made the UTF-32 kernel a template and bound two mask
+     * buffers past the end of its signature -- CL_INVALID_ARG_INDEX (-49) at
+     * the first dispatch.  Naming both exclusions explicitly is why this is a
+     * list and not a negation. */
+    int kern_is_template = (kern != d->kern_md5_rules_phase0) &&
+                           (kern != d->kern_md5_rules_mixed_phase0);
     /* B6 salt-axis (2026-05-06; §11 row 17): parallel flag for the salted
      * variants. Compares the resolved kernel handle against the per-device
      * salted-template kernel slots. SETARG block below binds 3 extra args
@@ -17071,6 +16434,13 @@ validator_skip:
         SETARG(kern, a++, sizeof(cl_mem), &d->b_overflow_offsets);
         SETARG(kern, a++, sizeof(cl_mem), &d->b_overflow_lengths);
         SETARG(kern, a++, sizeof(cl_mem), &d->b_hashes_shown);     /* on-GPU dedup */
+        /* UTF-32 path: the 15th argument is the concatenated case tables.
+         * Bound ONLY for the mixed kernel -- md5_rules_phase0 and the
+         * templates have 14 arguments and binding a 15th to them is
+         * CL_INVALID_ARG_INDEX. */
+        if (kern == d->kern_md5_rules_mixed_phase0) {
+            SETARG(kern, a++, sizeof(cl_mem), &d->b_u32_case_tab);
+        }
         if (kern_is_template) {
             SETARG(kern, a++, sizeof(cl_mem), &d->b_template_mask_charsets); /* B7.1 */
             SETARG(kern, a++, sizeof(cl_mem), &d->b_template_mask_sizes);    /* B7.2 */
@@ -17087,6 +16457,18 @@ validator_skip:
             SETARG(kern, a++, sizeof(cl_mem), &d->b_salt_data);  /* salt_buf  */
             SETARG(kern, a++, sizeof(cl_mem), &d->b_salt_off);   /* salt_off  */
             SETARG(kern, a++, sizeof(cl_mem), &d->b_salt_len);   /* salt_lens */
+        }
+        /* UTF-32 path on a TEMPLATE kernel: case_tab is declared LAST in
+         * template_phase0's signature -- after the two mask args and after
+         * the three salt args -- under #ifdef GPU_U32_WALKER_PRESENT.  So
+         * this bind must come last too, and it must fire under exactly the
+         * condition that put the walker in the source list, which is
+         * gpu_u32_active() (see gpu_template_sources).  Binding it when the
+         * walker is absent is CL_INVALID_ARG_INDEX; NOT binding it when the
+         * walker is present leaves case_tab unbound and every case verb on
+         * the UTF-32 arm reads from nowhere. */
+        if (kern_is_template && gpu_u32_active()) {
+            SETARG(kern, a++, sizeof(cl_mem), &d->b_u32_case_tab);
         }
 #undef SETARG
     }
@@ -17110,7 +16492,7 @@ validator_skip:
     {
         static int _arg_trace_cached = -1;
         if (_arg_trace_cached == -1) {
-            const char *e = getenv("MDXFIND_ARG_TRACE");
+            const char *e = NULL /* was MDXFIND_ARG_TRACE */;
             _arg_trace_cached = (e && *e && *e != '0') ? 1 : 0;
         }
         if (_arg_trace_cached == 1) {
@@ -17531,7 +16913,7 @@ validator_skip:
          * expectations are one [kern] line per logical dispatch. */
         if (!last_dispatch_kern_us_emitted &&
             kern_event && p_clGetEventProfilingInfo) {
-            const char *_e = getenv("MDXFIND_KERNEL_TRACE");
+            const char *_e = NULL /* was MDXFIND_KERNEL_TRACE */;
             if (_e && *_e && *_e != '0') {
                 cl_ulong t_queued = 0, t_submit = 0, t_start = 0, t_end = 0;
                 cl_int _pe1 = clGetEventProfilingInfo(kern_event,

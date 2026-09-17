@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.8 2026/08/09 20:13:37 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.10 2026/09/14 19:28:43 dlr Exp dlr $
  *
  * Implementation. See gpu_kernel_cache.h for the design overview.
  */
@@ -11,6 +11,7 @@
  * uses, avoiding "undefined reference to clGetDeviceInfo" etc. */
 #include "opencl_dynload.h"
 #include "gpu_kernel_cache.h"
+#include "gpujob.h"   /* GPU_RULES_WALKER_BUF_ELEMS -- see the -D injection below */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -691,6 +692,84 @@ cl_program gpu_kernel_cache_build_program_ex(
 {
     cl_int err = CL_SUCCESS;
     cl_program prog = NULL;
+
+    /* ---- -D injection: the single OpenCL point (2026-09-11) ------------
+     *
+     * RULE_BUF_MAX -- the rule-walker scratch size -- must reach EVERY
+     * program built from these sources, not just the rules kernels: the
+     * unified template and five algorithm cores (md4, sha1dru, sha256,
+     * md6256, md5_core) all reference RULE_BUF_LIMIT, which derives from it.
+     * All 67 build sites funnel through here, so injecting once covers them
+     * and a 68th cannot forget it.  The value comes from ONE host constant,
+     * GPU_RULES_WALKER_BUF_ELEMS in gpujob.h, itself 2x the input-word gate.
+     *
+     * Folded into defines_str as well as build_opts ON PURPOSE: defines_str
+     * feeds compute_key(), so changing the constant changes the cache key and
+     * a stale cached binary built at the old size cannot be loaded.  Without
+     * that, lowering the size would silently keep running yesterday's kernel.
+     *
+     * The kernels keep #ifndef fallbacks, which are reached only by
+     * out-of-band compiles (gpu_rules_test.c, a standalone clang check).
+     * Truncation here would silently drop the -D and produce a kernel with a
+     * 40960-element buffer against a host that gates input at 1024, so it is
+     * fatal rather than clamped.  Longest build_opts in the tree is 80 bytes.
+     */
+    char _opts_inj[512];
+    char _defs_inj[512];
+    {
+        /* U32_BUF_ELEMS rides the SAME injection for the same reasons.  It
+         * is the UTF-32 walker's element count, and an element there is a
+         * uint32 -- so the same count costs 4x the private memory and it must
+         * be tunable INDEPENDENTLY of RULE_BUF_MAX.  Default is
+         * GPU_RULES_WALKER_BUF_ELEMS, which gives correctness parity with the
+         * byte walker (2x the input-word gate, so a duplication verb on a
+         * full-length word still fits).
+         *
+         * Folded into defines_str as well as build_opts, so the value is part
+         * of the kernel-cache key: a binary built at a different size cannot be
+         * silently reloaded.  That mattered when the size was a variable and it
+         * still matters across builds. */
+        /* U32_BUF_ELEMS is a COMPILE-TIME constant, not a dial.  It was
+         * briefly overridable by MDXFIND_GPU_U32_BUF_ELEMS while the size was
+         * being chosen; 2048 is the answer and the override is gone, because
+         * MDXFIND_CACHE is the only environment input mdxfind takes and this is
+         * the knob with a real consequence -- the UTF-32 walker's element is a
+         * uint32, so the same element count costs 4x the private memory, and a
+         * measured 6.0-6.5x per-thread against the byte walker.  A value that
+         * decides occupancy should not be settable from the environment.
+         *
+         * 2048 is chosen for CORRECTNESS PARITY, not for memory: the input-word
+         * gate is GPU_RULES_MAX_INPUT_LEN = 1024 BYTES, a 1024-byte UTF-8 word
+         * is at most 1024 codepoints, and the byte walker's buffer is 2x its
+         * gate so a duplication verb on a full-length word still fits.  At 1024
+         * elements it would not, and `d`/`f`/`p` on a long word would become a
+         * defined-behaviour divergence from the CPU. */
+        int u32_elems = (int)GPU_RULES_WALKER_BUF_ELEMS;
+        int n1 = snprintf(_opts_inj, sizeof _opts_inj,
+                          "%s%s-D RULE_BUF_MAX=%d -D U32_BUF_ELEMS=%d",
+                          build_opts ? build_opts : "",
+                          (build_opts && *build_opts) ? " " : "",
+                          (int)GPU_RULES_WALKER_BUF_ELEMS, u32_elems);
+        int n2 = snprintf(_defs_inj, sizeof _defs_inj,
+                          "%s%sRULE_BUF_MAX=%d,U32_BUF_ELEMS=%d",
+                          defines_str ? defines_str : "",
+                          (defines_str && *defines_str) ? "," : "",
+                          (int)GPU_RULES_WALKER_BUF_ELEMS, u32_elems);
+        if (n1 < 0 || n1 >= (int)sizeof _opts_inj ||
+            n2 < 0 || n2 >= (int)sizeof _defs_inj) {
+            fprintf(stderr,
+                "FATAL: %s:%d RULE_BUF_MAX / U32_BUF_ELEMS -D injection truncated "
+                "(build_opts=%d defines=%d, caps %zu/%zu). A dropped -D would "
+                "build the kernel at its fallback buffer size against a host "
+                "that gates input at %d.\n",
+                __FILE__, __LINE__, n1, n2,
+                sizeof _opts_inj, sizeof _defs_inj,
+                (int)GPU_RULES_MAX_INPUT_LEN);
+            exit(1);
+        }
+        build_opts  = _opts_inj;
+        defines_str = _defs_inj;
+    }
 
     /* Disabled-cache path: plain compile-from-source. Caller checks
      * *err_out and pulls the build log from `prog` on non-CL_SUCCESS. */

@@ -154,8 +154,9 @@ struct jobg {
      * (kern_template_phase0_md5_bf) instead of the generic slow MD5
      * template (kern_template_phase0). Set by the BF chunk producer in
      * mdxfind.c when (op==JOB_MD5) && (Numrules<=1) && unsalted &&
-     * (npre==0) && (napp in [1,8]) AND env MDXFIND_GPU_FAST_DISABLE is
-     * unset. The dispatch path in gpu_opencl_dispatch_md5_rules swaps
+     * (npre==0) && (napp in [1,8]).  An MDXFIND_GPU_FAST_DISABLE env
+     * var could also veto it; removed 2026-09-16.  The dispatch path
+     * in gpu_opencl_dispatch_md5_rules swaps
      * to the fast kernel after the standard kernel resolve, only if
      * the fast kernel compile/lazy succeeded; otherwise it stays on the
      * slow kernel (silent self-heal, warning already emitted by the
@@ -229,17 +230,45 @@ void gpujob_overflow_preload_all(void);
  * (64) above is reused unchanged for the floor. */
 #define GPU_RULES_METAL_CAND_CAP_FRACTION  0.15
 #define GPU_RULES_METAL_CAND_CAP_MAX_MB    1024
-/* Maximum input-word length accepted by the GPU rules-engine pack path
- * in mdxfind.c. MUST match RULE_BUF_LIMIT in gpu/gpu_md5_rules.cl
- * (currently 40959 = RULE_BUF_MAX(40960) - 1). The walker's private buf
- * is sized RULE_BUF_MAX bytes; longer inputs would overflow apply_rule's
- * per-op bounds checks. Bumping here requires bumping RULE_BUF_LIMIT
- * in gpu_md5_rules.cl in the same commit. Bumped 256→512 on 2026-05-01
- * to fix 303-byte rule-output truncation (ioblade run #76, one missed
- * crack vs canonical 21,289). Bumped 512→40959 on 2026-05-02 to track
- * CPU's MAXLINE=40*1024 in mdxfind.h:63 — eliminates GPU/CPU clamp
- * divergence on long rule outputs (e.g. p9 × 67-char input = 670 B). */
-#define GPU_RULES_MAX_INPUT_LEN 40959
+/* ---- INPUT-WORD GATE (operator ruling 2026-09-11) ----------------------
+ *
+ * The ONLY length check on the GPU rules path.  A word longer than this is
+ * not packed; procjob leaves word_packed_by_rules_engine 0, the C2.3 skip
+ * therefore does not fire, and the CPU applies every rule to that word.
+ *
+ * DELIBERATELY INDEPENDENT of the walker buffer size below.  Those were one
+ * constant, and the conflation is why discussion of it slid between "which
+ * words go to the GPU" and "how big is the scratch buffer".  Nothing is
+ * checked about what a rule can PRODUCE -- that is unbounded in principle,
+ * and exceeding the buffer is defined behaviour: the rule does what it can,
+ * stops, and whatever was generated becomes the candidate.  Both engines
+ * behave that way, at their own limits, which is why GPU and CPU results
+ * diverge above the GPU walker's limit.  `-G none` is the answer to anyone
+ * who needs CPU-exact output.
+ *
+ * History: this was 256, went to 512 on 2026-05-01 to fix a 303-byte rule
+ * OUTPUT truncation that cost one crack against the canonical 21,289, then to
+ * 40959 on 2026-05-02 to track MAXLINE.  The 40959 value also silently
+ * outran the one-byte packed-length wire field (fixed 2026-09-11, now two
+ * bytes), so words of 256..40959 were hashed as their first len mod 256
+ * bytes.  1024 is a SET limit, not a derived one.
+ */
+#define GPU_RULES_MAX_INPUT_LEN 1024
+
+/* Walker scratch size in ELEMENTS, = 2 x the input gate.  Single source of
+ * truth: injected into every GPU program as -D RULE_BUF_MAX (OpenCL: the one
+ * funnel in gpu_kernel_cache.c; Metal: metal_compile_opts in gpu_metal.m), so
+ * the kernels' #ifndef fallbacks are only for out-of-band compiles.
+ *
+ * ELEMENTS, not bytes, on purpose: the byte walker has 1 element = 1 uchar,
+ * and a future UTF-32 walker keeps the same element count at 4x the bytes,
+ * so this does not need re-deriving for that port.
+ *
+ * The usable limit is 15 BELOW the allocation (RULE_BUF_LIMIT in the
+ * kernels), covering a NUL and the n+1 boundary conditions in the per-op
+ * bounds checks.  Not MAX-1. */
+#define GPU_RULES_WALKER_BUF_ELEMS (2 * GPU_RULES_MAX_INPUT_LEN)
+#define GPU_RULES_WALKER_BUF_SLACK 15
 #define GPUBATCH_RULES_WOFF_SIZE     (GPU_RULES_MAX_WORDS_PER_BATCH * sizeof(uint32_t))
 
 /* Send JOB_DONE to GPU queue and join the gpujob thread.

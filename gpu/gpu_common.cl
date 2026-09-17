@@ -1,6 +1,36 @@
 /*
- * $Revision: 1.34 $
+ * $Revision: 1.36 $
  * $Log: gpu_common.cl,v $
+ * Revision 1.36  2026/09/15 21:32:33  dlr
+ * Gate the TIGER, SNEFRU and GOST constant tables behind GPU_COMMON_LEAN: 28,672 bytes, and without it six hash types stop building.
+ *
+ * NVIDIA's constant bank is a hard 64 KB per PROGRAM and ptxas does not spill or warn, it refuses the build: File uses too much global constant data 0x11008 bytes, 0x10000 max. This file alone carries 47,796 bytes of __constant, and with a per-algorithm core on top the STREEBOG-256, STREEBOG-512 and HMAC-STREEBOG template programs sat 544 BYTES under the ceiling, which nothing measured and nothing asserted. Adding the UTF-32 walker's 4,648 bytes of tables put them 4,104 bytes over and e430, e431, e837, e838, e839 and e840 stopped building under -8. In byte mode the same overflow would have fallen back to the legacy kernel and computed MD5 digests for STREEBOG work.
+ *
+ * Gating these three frees 28,672 bytes, so the margin is no longer a coincidence. Nothing outside this file references SNEFRU_SBOX, TIGER_SBOX, GOST_SBOX_1 through 4, snefru_block, tiger_block or gost_block, verified across every .cl, every codegen emitter and every host source; they were lifted from the CPU donor ahead of the emitter that will use them, so they are gated and not deleted, and every program that does not set the marker still compiles them. WRL_SBOX stays because gpu_wrl_core.cl needs it.
+ *
+ * The marker is set by gpu_template_sources and by the kernel-A program builder in gpu_opencl.c, as a one-line source prepended ahead of this one: the sources of an OpenCL program are one translation unit, so a leading define reaches this file, which avoids threading -DGPU_COMMON_LEAN through 57 per-algorithm option strings and lands in the kernel-cache key automatically because the key covers the source list.
+ *
+ * The GOST gate sits immediately above the table rather than beside its budget comment, because that comment opens with a block comment and then continues in line comments, closing only on its last line. An #ifndef placed in the middle of it would have been inside a comment, and the header above it nested one block comment inside another, which is the thing feedback_no_nested_block_comments_in_cl warns about. Placing the gate after the comment ends leaves the original text untouched.
+ *
+ * Checked with the preprocessor, not by reading it. With the marker undefined, cc -E -P against the 1.35 copy differs by ZERO lines. With it defined, exactly SNEFRU_SBOX, TIGER_SBOX, GOST_SBOX_1 through 4, snefru_block, tiger_block and gost_block disappear and nothing else moves. Byte-mode regression sweep on a GTX 1080 over the template ops: no type lost.
+ *
+ * Revision 1.35  2026/09/11 19:46:34  dlr
+ * Rule-engine parity block, character classes on GPU, 2-byte packed-word length, and two dispatch guards.
+ *
+ * Byte engine brought to parity with the documented john and hashcat feature sets. Character classes in both syntaxes: inline ?C uses the john table with complement-by-case-toggle, a ~ prefix selects the hashcat table. Nine verbs take a class, opcodes 0x80 to 0x89. ~e?C needs its own opcode 0x89 because hashcat class title-case is a different algorithm from the john form, not the same one with a class test substituted. The ?s class is hashcat class_sym in BOTH tables and john user classes ?0 to ?9 are not implemented, both per operator ruling. ?? is the literal-? escape, so purging a literal ? is now written @?? and 8 lines across the shipped rule files stop loading, every one of them a rule john also rejects.
+ *
+ * Other parity fixes in the same block: c C E and e act on position 0, not on the first alphabetic character, which john and hashcat agree on and mdxfind did not; x and X follow hashcat when out of range, superseding an earlier ruling for john; a candidate a rule empties is kept, following hashcat; T is bounds-checked as john does; X honours the memory offset N, which was read and then ignored so every offset gave the same answer; B is added from hashcat master. ruleproc32 refuses a class loudly rather than silently reinterpreting it, and accepts the ?? escape identically, closing a byte-versus-utf32 divergence where the same rule text produced different candidates in each engine with no diagnostic.
+ *
+ * All ten class opcodes plus =NX and %NX promoted from CPU-only to GPU-eligible and implemented in all six rules kernels, sharing one 480-byte constant-address-space membership table in gpu_common.cl and metal_common.metal so the six cannot drift. Three real rule files now have zero CPU-only rules.
+ *
+ * Packed-word length widened from one byte to two, little-endian, written and read byte by byte so it depends on neither host alignment nor host endianness. The admission gate allows GPU_RULES_MAX_INPUT_LEN 40959 while the wire field held 255, so any word of 256 to 40959 bytes was hashed as its first len mod 256 bytes: 285 as its first 29, 300 as its first 44. The emitted plaintext matched the emitted digest so nothing downstream could detect it. 11 kernel read sites across 7 files, 3 host writers, 2 host hit decoders and the buffer-full check move together.
+ *
+ * Two dispatch guards. C2.3 now tests the per-word word_packed_by_rules_engine rather than the thread-persistent my_jobg_rules, which differ whenever a word is walked but not packed. FastRule is disabled when this iteration is not the no-rule pass, making entered-at-the-rule-stream-origin a precondition rather than an assumption: the SIMD walker was re-draining the remaining rules from the first CPU-only rule output, so exactly one CPU-partition candidate survived per word.
+ *
+ * Validation: john class sweep 66 of 75 with all 9 differences the ruled empty-word policy, hashcat class sweep 21 of 21, X 22 of 22, x 16 of 16, c C E e 50 of 50 against john, rules32 conformance 165 of 165, zero silent byte-versus-utf32 divergences, wire round trip proven for all 40960 admitted lengths. Five GPU fixtures CPU equals GPU on a GTX 1080 and an M2 Max, including 113 of 113 on the fixture that measured 84 of 113 before the FastRule guard, and 126 of 126 on words from 1 to 4096 bytes. Regression on shipped rule files: Hash-IT_Crazy_Rules 6828885 rules, all_gj 208010 and T0XlC byte-identical.
+ *
+ * Also included in mdxfind.c and authored by Waffle, not by me: the AIX cmiyc challenge-3 algorithm validation comment block, recording the ppcemu emulated-oracle confirmation and the 504-hash corpus confirmation at the live parameters.
+ *
  * Revision 1.34  2026/05/28 04:44:24  dlr
  * 5b.4b.2: lift gost_block + 4KB GOST_SBOX_1..4 (TEST set, precomputed host-side from gosthash_init) into gpu_common.cl; donor gosthash/gosthash.c gosthash_compress; chi compression 8-iter U-V key schedule + GOST 28147-89 32-round Feistel + 3 LFSR product-matrix stages; noinline R6; R8 line comments; body+macros byte-identical to validated C-mirror 27 of 27 PASS; sum8 checksum carry and dual finalization carried by emit helper not block
  *
@@ -118,6 +148,73 @@ typedef struct {
 /* Universal hit entry: fixed stride 19 uint32 words.
  * [0] word_idx  [1] salt_idx  [2] iter_num  [3..18] hash[0..15] */
 #define HIT_STRIDE 19
+
+/* ---- character-class membership, shared by every rules kernel -----------
+ *
+ * One 32-byte row per class, in class-id order, indexed
+ * (class_byte & 0x7f) - 1.  Ids start at 1 so a class operand is never a NUL
+ * byte, which matters because the packed rule stream is NUL-terminated.  The
+ * complement lives in the high bit of the class byte and is applied by XOR at
+ * test time, so a complemented class costs nothing extra.
+ *
+ * Byte-identical to rule_class_bits[][] in ruleproc.c -- both are generated
+ * from the same reference definitions (john's CHARS_* macros in rules.c and
+ * hashcat's class_*() predicates in src/rp.c), and `?s` is hashcat's
+ * class_sym() in both class tables per the operator's ruling.
+ *
+ * This lives in the COMMON source, not in each kernel, because all three
+ * rules kernels per backend are compiled as { common, family_source } -- one
+ * copy cannot drift from another.  480 bytes in the constant address space:
+ * it must NOT become a function-local array, which is what put the retired
+ * memory-op attempt over the per-thread private-memory budget and FATAL'd
+ * CL_OUT_OF_HOST_MEMORY on an RTX 3080.
+ */
+
+/* Class-form opcodes.  These live HERE rather than being copied into each
+ * rules kernel: the existing 62 RULE_OP_* defines are duplicated per kernel,
+ * which is the drift hazard rule_ops.h exists to prevent on the host side, and
+ * there is no reason to extend it.  Every rules kernel is compiled as
+ * { common, family_source }, so one copy reaches all of them.
+ * Values must match rule_ops.h exactly -- they are in the packed stream. */
+#define RULE_OP_SUB_CLASS        0x80   /* s?CY  / ~s?CY */
+#define RULE_OP_PURGE_CLASS      0x81   /* @?C   / ~@?C  */
+#define RULE_OP_TITLE_CLASS      0x82   /* e?C   (john)  */
+#define RULE_OP_REJ_HAS_CLASS    0x83   /* !?C   / ~!?C  */
+#define RULE_OP_REJ_NHAS_CLASS   0x84   /* /?C   / ~/?C  */
+#define RULE_OP_REJ_FIRST_CLASS  0x85   /* (?C   / ~(?C  */
+#define RULE_OP_REJ_LAST_CLASS   0x86   /* )?C   / ~)?C  */
+#define RULE_OP_REJ_AT_CLASS     0x87   /* =N?C  / ~=N?C */
+#define RULE_OP_REJ_CNT_CLASS    0x88   /* %N?C  / ~%N?C */
+#define RULE_OP_TITLE_CLASS_HC   0x89   /* ~e?C  (hashcat, different algo) */
+/* `=NX` and `%NX` pack as their literal ASCII bytes, a historical exception
+ * to the high-bit opcode range. */
+#define RULE_OP_REJ_AT_CHR       0x3d
+#define RULE_OP_REJ_CNT_CHR      0x25
+
+__constant uchar RULE_CLASS_BITS[15][32] = {
+/* 1  LOWER  26 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 2  UPPER  26 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 3  DIGIT  10 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 4  SYM    33 members */ {0x00,0x00,0x00,0x00,0xff,0xff,0x00,0xfc,0x01,0x00,0x00,0xf8,0x01,0x00,0x00,0x78,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 5  LHEX   16 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0x00,0x00,0x00,0x00,0x7e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 6  UHEX   16 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0x7e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 7  VOWEL  10 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x22,0x82,0x20,0x00,0x22,0x82,0x20,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 8  CONS   42 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xdc,0x7d,0xdf,0x07,0xdc,0x7d,0xdf,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 9  WS      2 members */ {0x00,0x02,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 10 PUNCT   9 members */ {0x00,0x00,0x00,0x00,0x86,0x50,0x00,0x8c,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 11 ALPHA  52 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x07,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 12 ALNUM  62 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0xfe,0xff,0xff,0x07,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 13 CTRL   47 members */ {0xfe,0xfd,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x30,0xe1,0xc1,0xfd,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 14 HIGH  128 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff},
+/* 15 ALL   256 members */ {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff},
+};
+
+/* Does byte CH belong to the class named by packed class byte CB? */
+static inline int rule_class_match(uchar cb, uchar ch) {
+    uchar bit = (RULE_CLASS_BITS[(cb & 0x7f) - 1][ch >> 3] >> (ch & 7)) & 1;
+    return (int)(bit ^ ((cb >> 7) & 1));
+}
+
 
 /* Phase 6 BCRYPT (2026-05-08): workgroup-size constant for the BCRYPT
  * carrier kernel. Mirrors slab gpu_bcrypt.cl's BCRYPT_WG_SIZE=8 default
@@ -2060,6 +2157,28 @@ __attribute__((noinline)) void wrl_block(ulong *hash, ulong *p_block) {
 // per the R12 NESSIE pre-flight test (16/16 PASS against published
 // vectors on iMac 2026-05-27).
 //
+/* ---- TIGER: 8 KB of __constant, gated ----------------------------
+ *
+ * GPU_COMMON_LEAN excludes this block.  It is set for every TEMPLATE program
+ * and for kernel A -- the programs that also carry the UTF-32 walker -- because
+ * NVIDIA's constant bank is a hard 64 KB per program and ptxas refuses the
+ * build outright when it is exceeded, with no fallback:
+ *
+ *   ptxas error : File uses too much global constant data (0x11008 bytes, 0x10000 max)
+ *
+ * That is not hypothetical.  The STREEBOG-256/512 and HMAC-STREEBOG template
+ * programs sat 544 bytes under the ceiling in byte mode; adding the UTF-32
+ * walker's 4,648 bytes of tables put them 4,104 bytes over and six hash types
+ * stopped building under `-8`.  Gating this block and its two siblings frees
+ * 28,672 bytes, so the margin is no longer a coincidence.
+ *
+ * Nothing outside this file references TIGER_SBOX or tiger_block -- verified across
+ * every .cl, every codegen emitter and every host source.  They were lifted
+ * from the CPU donor ahead of the emitter that will use them, so they are
+ * gated rather than deleted, and they are still compiled into every program
+ * that does NOT set GPU_COMMON_LEAN.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_COMMON_LEAN
 // Constant memory budget: 4 * 256 * 8 = 8 KB (TIGER_SBOX). Combined
 // with WRL_SBOX (16 KB) and WRL_RC (80 B) post-Tier-2 total is ~24 KB
 // of `__constant`; Pascal GTX 1080 and Apple Silicon M2 Max both
@@ -2427,6 +2546,7 @@ __attribute__((noinline)) void tiger_block(ulong *state, ulong *M) {
     state[1] = b - state[1];
     state[2] = c + state[2];
 }
+#endif  /* !GPU_COMMON_LEAN -- TIGER */
 
 // Phase 5b Tier 3 sub-phase 5b.3a.1 (2026-05-27): lift haval3_block from
 // mhash-0.9.9.9/lib/haval.c havalTransform3 lines 113-241. Public-domain
@@ -3100,6 +3220,28 @@ __attribute__((noinline)) void haval5_block(uint *state, const uint *M) {
 // codegen.md: the emit helper byte-swaps the BE state words into the LE-uint
 // frame the compact_fp probe expects.
 //
+/* ---- SNEFRU: 16 KB of __constant, gated ----------------------------
+ *
+ * GPU_COMMON_LEAN excludes this block.  It is set for every TEMPLATE program
+ * and for kernel A -- the programs that also carry the UTF-32 walker -- because
+ * NVIDIA's constant bank is a hard 64 KB per program and ptxas refuses the
+ * build outright when it is exceeded, with no fallback:
+ *
+ *   ptxas error : File uses too much global constant data (0x11008 bytes, 0x10000 max)
+ *
+ * That is not hypothetical.  The STREEBOG-256/512 and HMAC-STREEBOG template
+ * programs sat 544 bytes under the ceiling in byte mode; adding the UTF-32
+ * walker's 4,648 bytes of tables put them 4,104 bytes over and six hash types
+ * stopped building under `-8`.  Gating this block and its two siblings frees
+ * 28,672 bytes, so the margin is no longer a coincidence.
+ *
+ * Nothing outside this file references SNEFRU_SBOX or snefru_block -- verified across
+ * every .cl, every codegen emitter and every host source.  They were lifted
+ * from the CPU donor ahead of the emitter that will use them, so they are
+ * gated rather than deleted, and they are still compiled into every program
+ * that does NOT set GPU_COMMON_LEAN.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_COMMON_LEAN
 // Constant memory budget: SNEFRU_SBOX = 4096 * 4 = 16 KB `__constant`.
 // Cumulative post-Tier-3 (~26-27 KB) + 16 KB = ~42-43 KB of the 64 KB
 // Pascal / Apple Silicon CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE budget; fits
@@ -3874,6 +4016,7 @@ __attribute__((noinline)) void snefru_block(uint *state, const uchar *block,
     }
 }
 #undef SNEFRU_BE32
+#endif  /* !GPU_COMMON_LEAN -- SNEFRU */
 
 /* ---- GOST R 34.11-94 block function (legacy, TEST S-box set) ----
 // Phase 5b Tier 4 sub-phase 5b.4b.2 (2026-05-27): lift gost_block from the
@@ -3902,6 +4045,28 @@ __attribute__((noinline)) void snefru_block(uint *state, const uchar *block,
 //
 // R6 noinline per feedback_md5_block_noinline_pascal.md (Pascal register
 // budget). R8 no nested block comments -- donor stripped, line comments. */
+/* ---- GOST: 4 KB of __constant, gated ----------------------------
+ *
+ * GPU_COMMON_LEAN excludes this block.  It is set for every TEMPLATE program
+ * and for kernel A -- the programs that also carry the UTF-32 walker -- because
+ * NVIDIA's constant bank is a hard 64 KB per program and ptxas refuses the
+ * build outright when it is exceeded, with no fallback:
+ *
+ *   ptxas error : File uses too much global constant data (0x11008 bytes, 0x10000 max)
+ *
+ * That is not hypothetical.  The STREEBOG-256/512 and HMAC-STREEBOG template
+ * programs sat 544 bytes under the ceiling in byte mode; adding the UTF-32
+ * walker's 4,648 bytes of tables put them 4,104 bytes over and six hash types
+ * stopped building under `-8`.  Gating this block and its two siblings frees
+ * 28,672 bytes, so the margin is no longer a coincidence.
+ *
+ * Nothing outside this file references GOST_SBOX_1..4 or gost_block -- verified across
+ * every .cl, every codegen emitter and every host source.  They were lifted
+ * from the CPU donor ahead of the emitter that will use them, so they are
+ * gated rather than deleted, and they are still compiled into every program
+ * that does NOT set GPU_COMMON_LEAN.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_COMMON_LEAN
 __constant uint GOST_SBOX_1[256] = {
     0x00072000u, 0x00075000u, 0x00074800u, 0x00071000u, 0x00076800u, 0x00074000u,
     0x00070000u, 0x00077000u, 0x00073000u, 0x00075800u, 0x00070800u, 0x00076000u,
@@ -4236,6 +4401,7 @@ __attribute__((noinline)) void gost_block(uint *h, const uint *m) {
 }
 #undef GOST_GE_ROUND
 #undef GOST_GE_ENCRYPT
+#endif  /* !GPU_COMMON_LEAN -- GOST */
 
 /* ---- RIPEMD-160 block function ---- */
 

@@ -24,8 +24,11 @@
 /* gpu_md4utf16_core.cl — MD4UTF16 (-m e496) algorithm extension functions
  * for the generic dispatch template (Memo B Phase B5 sub-batch 8).
  *
- * MD4UTF16 = MD4(UTF-16LE-zero-extend(input))  on iter == 1
+ * MD4UTF16 = MD4(UTF-16LE(input))  on iter == 1, where UTF-16LE is the
+ *            real iconv("UTF-16LE//IGNORE","UTF-8") conversion
  *          = MD4(UTF-16LE-zero-extend(lowercase_hex(prev_digest)))  on iter > 1
+ *            (the iter feed is 32 lowercase hex chars, so zero-extend and
+ *            iconv are the same thing there)
  *
  * This is a CLONE of gpu_ntlmh_core.cl's algorithm (zero-extend UTF-16LE
  * variant of MD4) with one structural difference: MD4UTF16 supports the
@@ -34,25 +37,31 @@
  * iter 2..Maxiter feeding back the lowercase-hex of the prior digest
  * (32 ASCII hex chars) zero-extended to UTF-16LE (64 bytes), then MD4'd.
  *
- * The hashcat-compatible "zero-extend UTF-16LE" semantic is used (each
- * input byte b -> two bytes (b, 0x00)). For ASCII inputs this is byte-
- * identical to iconv(utf-8 -> UTF-16LE) -- which is the only iconv
- * variant CPU JOB_MD4UTF16 tests (see Memo B multi-variant hook memo,
- * the SUPERSEDED notice corrects the earlier 'multi-variant' framing:
- * MD4UTF16 is in fact single-variant). For non-ASCII inputs there is a
- * documented gap with CPU iconv -- same gap as the existing slab kernel
- * md4utf16_unsalted_batch (hashcat-compatible by design).
+ * 2026-09-15 CORRECTNESS FIX.  This core used to zero-extend (input byte
+ * b -> the two bytes b, 0x00), described here and at mdxfind.c:13248 as
+ * a "documented hashcat-compat gap, same as NTLMH".  That description was
+ * wrong: JOB_NTLMH tests an iconv arm AND a zero-extend arm, but
+ * JOB_MD4UTF16 at mdxfind.c:19070-19097 tests ONLY the iconv arm.  So on
+ * any input carrying a byte >= 0x80 the GPU computed a digest the CPU
+ * never computes -- it could not match, and the CPU never redid the work,
+ * so the run printed "None found, sorry!" and exited 0.  Measured on
+ * fpga.local (GTX 1080): CPU recovered its known answer, GPU recovered
+ * nothing.  template_finalize now performs the real conversion; see
+ * md4_over_utf16le below for the equivalence proof.  ASCII inputs are
+ * byte-identical to the old code, so nothing that worked stops working.
  *
  * On the iter > 1 feedback path the input is always lowercase hex chars
- * [0-9a-f] (pure ASCII) so zero-extend == iconv and there is no gap;
- * Maxiter > 1 is byte-exact vs CPU.
+ * [0-9a-f] (pure ASCII) so zero-extend == iconv; template_iterate is
+ * UNCHANGED by the 2026-09-15 fix and stays byte-exact vs CPU (the CPU
+ * itself calls to_utf16le there, mdxfind.c:19093, not iconv).
  *
  * Block layout (template_finalize, iter == 1):
- *   Per-byte LE expansion of input[i] to (input[i], 0x00).
- *   For ASCII char c, MD4 word j (LE) covers UTF-16LE bytes
- *   [4j..4j+3] = (input[2j], 0, input[2j+1], 0).
- *   M[j] = input[2j] | (input[2j+1] << 16)
- *   Length: 2*len bytes UTF-16LE. Bit count = 16*len.
+ *   UTF-16 code unit k occupies UTF-16LE bytes 2k and 2k+1, so it lands in
+ *   MD4 word (k mod 32) >> 1 at shift 16 * (k & 1).  A block closes every
+ *   32 code units.  Bit count = 16 * (number of code units), which for an
+ *   ASCII input is 16*len exactly as before, and for a multi-byte input is
+ *   SHORTER than the old 16*len -- one of the two ways the old code was
+ *   wrong (the other being the byte values themselves).
  *
  * Block layout (template_iterate, iter > 1):
  *   Input is fixed 32 lowercase hex chars (digest of prior iter).
@@ -83,6 +92,10 @@
 
 struct template_state {
     uint h[HASH_WORDS];
+    /* 0 when the CPU would not have produced a digest at all for this
+     * candidate -- see template_finalize.  template_digest_compare then
+     * refuses to probe, which is how the kernel says "no hash here". */
+    uint live;
 };
 
 /* MD4 compression -- inlined here (renamed to md4_compress_md4utf16 to avoid
@@ -125,6 +138,7 @@ static inline void template_init(thread template_state &st)
     st.h[1] = 0xEFCDAB89u;
     st.h[2] = 0x98BADCFEu;
     st.h[3] = 0x10325476u;
+    st.live = 1u;
 }
 
 /* template_transform: stub for interface symmetry (cloned from NTLMH).
@@ -145,65 +159,161 @@ static inline void template_transform(thread template_state &st,
     md4_compress_md4utf16(st.h[0], st.h[1], st.h[2], st.h[3], M);
 }
 
-/* template_finalize: MD4UTF16 = MD4(UTF-16LE-zero-extend(input)). Build
- * M[] directly from the input bytes interleaved with zeros (the UTF-16LE
- * high-byte placeholder for ASCII chars). Cloned byte-for-byte from
- * gpu_ntlmh_core.cl template_finalize. */
+/* md4_over_utf16le: MD4 of the UTF-16LE form of a UTF-8 input, assembled
+ * one 64-byte block at a time so no UTF-16 scratch buffer is needed.
+ *
+ * h4 must already hold the MD4 IV (template_init does that).
+ *
+ * The decoder mirrors iconv_open("UTF-16LE//IGNORE", "UTF-8")
+ * (mdxfind.c:12593), which is the converter CPU JOB_MD4UTF16 uses at
+ * mdxfind.c:19074-19085, and matches glibc BYTE-FOR-BYTE including on
+ * malformed input.  Proven, not asserted: a host transliteration of this
+ * exact loop was run against glibc iconv on .205 over 18,802,400 inputs
+ * (every 1-, 2- and 3-byte string exhaustively, a structured 4-byte
+ * sweep, ASCII lengths 0..63, 2/3/4-byte characters at every block
+ * alignment, and 1.5M pseudo-random strings) with ZERO differences.
+ *
+ * Why //IGNORE falls out of the code rather than being special-cased:
+ * glibc skips the bytes it validated and resynchronises, and a
+ * continuation byte 0x80..0xBF is never a valid lead, so dropping ONE
+ * byte and re-entering the loop reaches the same resynchronisation point
+ * with the same output.  A sequence truncated by end-of-input produces no
+ * output in either implementation.
+ *
+ * Rejected as glibc rejects them: 0xC0/0xC1 and any other overlong form,
+ * the surrogate range U+D800..U+DFFF, and anything above U+10FFFF.
+ * Astral codepoints become a correct surrogate PAIR -- the old
+ * zero-extend produced four bytes there too, but the wrong four.
+ *
+ * For an ALL-ASCII input this is byte-identical to the zero-extend form
+ * it replaces, so every existing MD4UTF16 result on ASCII candidates is
+ * unchanged (host mirror part C: 0 differences).  It differs only where
+ * the old code was wrong, because CPU JOB_MD4UTF16 has NO zero-extend
+ * arm -- unlike JOB_NTLMH, which tests both.  The pre-2026-09 comments
+ * in this file, in gpu_opencl.c and at mdxfind.c:13248 describing the
+ * divergence as a "documented hashcat-compat gap, same as NTLMH" were
+ * wrong on that point: for e496 the GPU was computing a digest the CPU
+ * never computes, at any input, so it could only ever miss.
+ */
+static inline uint md4_over_utf16le(thread uint *h4, device const uchar *data, int len)
+{
+    uint M[16];
+    for (int j = 0; j < 16; j++) M[j] = 0u;
+
+    uint nunits = 0u;   /* UTF-16 code units emitted so far */
+    int  i = 0;
+
+    while (i < len) {
+        uint c = (uint)data[i];
+        uint cp;
+        int  adv;
+
+        if (c < 0x80u) {
+            cp = c; adv = 1;
+        } else if (c >= 0xC2u && c <= 0xDFu && i + 1 < len &&
+                   (data[i + 1] & 0xC0u) == 0x80u) {
+            cp  = ((c & 0x1Fu) << 6) | (uint)(data[i + 1] & 0x3Fu);
+            adv = 2;
+        } else if (c >= 0xE0u && c <= 0xEFu && i + 2 < len &&
+                   (data[i + 1] & 0xC0u) == 0x80u &&
+                   (data[i + 2] & 0xC0u) == 0x80u) {
+            cp  = ((c & 0x0Fu) << 12) |
+                  ((uint)(data[i + 1] & 0x3Fu) << 6) |
+                   (uint)(data[i + 2] & 0x3Fu);
+            adv = 3;
+            /* overlong, or a lone surrogate -- glibc rejects both */
+            if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)) { i += 1; continue; }
+        } else if (c >= 0xF0u && c <= 0xF4u && i + 3 < len &&
+                   (data[i + 1] & 0xC0u) == 0x80u &&
+                   (data[i + 2] & 0xC0u) == 0x80u &&
+                   (data[i + 3] & 0xC0u) == 0x80u) {
+            cp  = ((c & 0x07u) << 18) |
+                  ((uint)(data[i + 1] & 0x3Fu) << 12) |
+                  ((uint)(data[i + 2] & 0x3Fu) << 6) |
+                   (uint)(data[i + 3] & 0x3Fu);
+            adv = 4;
+            if (cp < 0x10000u || cp > 0x10FFFFu) { i += 1; continue; }
+        } else {
+            i += 1;      /* //IGNORE: drop one byte and resynchronise */
+            continue;
+        }
+        i += adv;
+
+        /* One BMP code unit, or a surrogate pair for an astral codepoint. */
+        uint u0, u1; int nu;
+        if (cp < 0x10000u) {
+            u0 = cp; u1 = 0u; nu = 1;
+        } else {
+            uint v = cp - 0x10000u;
+            u0 = 0xD800u + (v >> 10);
+            u1 = 0xDC00u + (v & 0x3FFu);
+            nu = 2;
+        }
+        for (int e = 0; e < nu; e++) {
+            uint u = (e == 0) ? u0 : u1;
+            /* Code unit k occupies UTF-16LE bytes 2k, 2k+1; MD4 reads M
+             * little-endian, so it lands in M[(k mod 32) >> 1] at shift
+             * 16 * (k & 1). */
+            M[(nunits & 31u) >> 1] |= u << ((nunits & 1u) * 16u);
+            nunits++;
+            if ((nunits & 31u) == 0u) {   /* 32 code units == one 64-byte block */
+                md4_compress_md4utf16(h4[0], h4[1], h4[2], h4[3], M);
+                for (int j = 0; j < 16; j++) M[j] = 0u;
+            }
+        }
+    }
+
+    /* Pad.  r code units sit in the partial block, so the 0x80 marker goes
+     * at byte 2r of it, and the bit count is 16 * nunits. */
+    uint r = nunits & 31u;
+    M[r >> 1] |= 0x80u << ((r & 1u) * 16u);
+    if (r * 2u < 56u) {
+        M[14] = nunits << 4;
+        M[15] = nunits >> 28;
+        md4_compress_md4utf16(h4[0], h4[1], h4[2], h4[3], M);
+    } else {
+        md4_compress_md4utf16(h4[0], h4[1], h4[2], h4[3], M);
+        for (int j = 0; j < 16; j++) M[j] = 0u;
+        M[14] = nunits << 4;
+        M[15] = nunits >> 28;
+        md4_compress_md4utf16(h4[0], h4[1], h4[2], h4[3], M);
+    }
+    return nunits;
+}
+
+/* template_finalize: MD4UTF16 = MD4(iconv(UTF-8 -> UTF-16LE)(input)),
+ * which is the ONLY variant CPU JOB_MD4UTF16 computes.
+ *
+ * THE EMPTY-CONVERSION CASE.  The CPU guard is
+ *
+ *     x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
+ *     if (ic_outleft == MAXLINE*2)
+ *       break;                       -- no digest AT ALL for this candidate
+ *
+ * (mdxfind.c:19076-19082).  It ignores iconv's RETURN value and tests only
+ * whether any output bytes were written, so a partially-ignored candidate
+ * IS hashed (as its surviving bytes) while a candidate that converts to
+ * nothing produces no hash and no probe.  Two inputs reach that break: the
+ * empty candidate, and a candidate made entirely of bytes //IGNORE drops
+ * (measured: 12 of 539 words in the volume fixture).
+ *
+ * Getting this wrong is not a miss, it is a FALSE POSITIVE, and a
+ * spectacularly likely one: both cases would otherwise hash to MD4 of the
+ * empty string, 31d6cfe0d16ae931b73c59d7e0c089c0, which is the empty
+ * password and is present in essentially every NTLM-family hash list.  The
+ * kernel would have reported garbage bytes as the plaintext for it.  So
+ * live = 0 suppresses the probe instead, which is exactly the CPU's break.
+ * (The pre-2026-09-15 zero-extend core had the same hazard for the empty
+ * candidate specifically -- it hashed zero bytes and probed.)
+ *
+ * live is NOT re-armed by template_iterate: the CPU's break leaves the
+ * whole case, so iterations 2..Maxiter produce nothing either. */
 static inline void template_finalize(thread template_state &st,
                                 device const uchar *data,
                                 int len)
 {
-    /* Process complete UTF-16LE blocks. Each MD4 block (64 bytes) holds
-     * 32 UTF-16LE chars = 32 input bytes. */
-    uint M[16];
-    int input_pos = 0;
-
-    while (len - input_pos >= 32) {
-        /* 32 input bytes -> 64 UTF-16LE bytes -> 16 MD4 M[] words. */
-        for (int j = 0; j < 16; j++) {
-            int k = input_pos + j * 2;
-            M[j] = (uint)data[k] | ((uint)data[k + 1] << 16);
-        }
-        md4_compress_md4utf16(st.h[0], st.h[1], st.h[2], st.h[3], M);
-        input_pos += 32;
-    }
-
-    /* Tail: remaining input bytes (rem in [0..31]) -> 2*rem UTF-16LE bytes. */
-    int rem = len - input_pos;  /* 0..31 input bytes */
-    int rem_utf16 = rem * 2;     /* 0..62 UTF-16LE bytes */
-
-    /* Zero scratch. */
-    for (int j = 0; j < 16; j++) M[j] = 0;
-
-    /* Pack input bytes into M[] LE positions, interleaved with zeros. */
-    for (int i = 0; i < rem; i++) {
-        int byte_idx = i * 2;            /* low byte of UTF-16 char */
-        int wi = byte_idx >> 2;
-        int bi = byte_idx & 3;
-        M[wi] |= ((uint)data[input_pos + i]) << (bi * 8);
-        /* High byte (byte_idx + 1) is zero; no write needed. */
-    }
-
-    /* 0x80 pad marker at UTF-16 byte position rem_utf16 = 2*rem. */
-    {
-        int wi = rem_utf16 >> 2;
-        int bi = rem_utf16 & 3;
-        M[wi] |= ((uint)0x80u) << (bi * 8);
-    }
-
-    /* MD4 LE bit-count encoding: M[14] = low 32 bits, M[15] = high 32 bits.
-     * Total UTF-16LE bytes = 2*len => bit count = 16 * len. */
-    if (rem_utf16 < 56) {
-        M[14] = (uint)((uint)len * 16u);
-        M[15] = 0;
-        md4_compress_md4utf16(st.h[0], st.h[1], st.h[2], st.h[3], M);
-    } else {
-        md4_compress_md4utf16(st.h[0], st.h[1], st.h[2], st.h[3], M);
-        for (int j = 0; j < 16; j++) M[j] = 0;
-        M[14] = (uint)((uint)len * 16u);
-        M[15] = 0;
-        md4_compress_md4utf16(st.h[0], st.h[1], st.h[2], st.h[3], M);
-    }
+    uint nunits = md4_over_utf16le(st.h, data, len);
+    st.live = (nunits != 0u) ? 1u : 0u;
 }
 
 /* template_iterate: -i loop step. CPU reference at mdxfind.c:15059-15066:
@@ -274,6 +384,7 @@ static inline int template_digest_compare(thread const template_state &st,
                                 uint overflow_count,
                                 thread uint *out_idx)
 {
+    if (!st.live) return 0;
     return probe_compact_idx(
         st.h[0], st.h[1], st.h[2], st.h[3],
         compact_fp, compact_idx,

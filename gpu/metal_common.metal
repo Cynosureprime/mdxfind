@@ -1,6 +1,98 @@
 /*
- * $Revision: 1.34 $
+ * $Revision: 1.38 $
  * $Log: metal_common.metal,v $
+ * Revision 1.38  2026/09/17 03:23:13  dlr
+ * Lift md5_block_from8 as a Metal twin of the gpu_common.cl helper. It runs MD5 compression rounds 9 to 64 from a state pre-rolled through rounds 1 to 8, which the md5salt carrier does once per word, rule and mask because M[0..7], the hex32, is salt-independent - 12.5 percent of the outer MD5 saved per word and salt. Needed because metal_md5salt_core.metal moves from a mode-0-only hand-port to the translated twin, and the translated source calls this. Its absence was one of the real OpenCL to Metal port gaps. Two deliberate differences from the OpenCL twin: static inline rather than noinline, since the noinline there is a Pascal register-pressure guard and Metal wants the opposite; and the MTL_MD5 namespaced round macros per Pattern 2. Pointer args not references, to match the translated call sites. Additive - nothing else calls it - and verified not to disturb the other 54 cores by a 77 of 77 sweep.
+ *
+ * Revision 1.37  2026/09/15 21:32:33  dlr
+ * Mirror the OpenCL GPU_COMMON_LEAN gates, with the marker deliberately unset.
+ *
+ * This file carries the identical 47,796 bytes of constant data as gpu_common.cl, with MTL_ prefixes. The OpenCL twin NEEDS the gate: NVIDIA's constant bank is a hard 64 KB per program and ptxas refused the STREEBOG template outright once the UTF-32 walker's tables joined it. Apple has no comparable ceiling and every Metal family builds with these tables present, so gpu_metal.m does not define GPU_COMMON_LEAN and all three blocks are always compiled. cc -E -P against the 1.36 copy differs by ZERO lines, so no Metal program's compiled output changes.
+ *
+ * The switch is added here anyway for two reasons: the two commons diverging structurally is how they drift, and if Apple ever tightens the budget the fix is a one-line marker rather than this surgery again.
+ *
+ * Revision 1.36  2026/09/12 12:12:51  dlr
+ * Input-word gate at 1024 bytes, walker buffer at 2048, and the memory family on GPU.
+ *
+ * The admission gate and the walker buffer size were one constant doing two jobs.
+ * They are now separate: GPU_RULES_MAX_INPUT_LEN 1024 gates the INPUT WORD only,
+ * GPU_RULES_WALKER_BUF_ELEMS is twice that, and GPU_RULES_WALKER_BUF_SLACK 15 backs
+ * the usable limit off to 2033 to cover n+1 boundary conditions such as a
+ * terminating NUL.
+ *
+ * Operator ruling that sets the policy: output length is never checked. It is not
+ * possible to bound what a rule can produce, because for any limit, on either
+ * engine, a rule that overflows it can always be written. So a limit is SET,
+ * arbitrarily, and a rule that exceeds it does what it can and stops; whatever has
+ * been generated becomes the candidate. The check is strictly and only on the input
+ * word size. A word over 1024 bytes goes to the CPU, and if the CPU engine then
+ * exceeds MAXLINE it stops the same way and the hash is computed over whatever was
+ * generated. There are no environment variable overrides, this is compile time
+ * only, and there is no retry to CPU when a rule line exceeds the GPU limit. That
+ * deliberately permits divergence between the two engines; -G none is the remedy.
+ *
+ * Memory family M 4 6 Q X promoted from CPU-only to GPU-eligible and implemented in
+ * all six rules kernels against a second RULE_BUF_MAX buffer. The earlier attempt
+ * was reverted because at 40960 bytes a second buffer doubled per-thread private
+ * memory and aborted with CL_OUT_OF_HOST_MEMORY on an RTX 3080; at 2048 the pair
+ * costs 4 KB per thread, a tenth of what ONE buffer cost before, so the resource
+ * objection is gone rather than worked around. applyrule sets memlen to 0 at the
+ * top of every call, so memory state never crosses a word-and-rule boundary and
+ * there is no cross-rule state for an independent work-item to reproduce.
+ *
+ * RULE_BUF_MAX reaches the kernels by -D through exactly one funnel per backend.
+ * OpenCL: gpu_kernel_cache.c, 67 build sites, with the define folded into
+ * defines_str so it enters compute_key and a stale cache binary built at a
+ * different size cannot load. Metal: a new metal_compile_opts helper in
+ * gpu_metal.m, 9 call sites converted. All six kernels carry a matching ifndef
+ * RULE_BUF_MAX default of 2048 so they still compile standalone. In
+ * metal_common.metal the class membership table, its helper and the class opcode
+ * defines moved OUT of the ifndef RULE_BUF_MAX block where they had been trapped:
+ * they are needed whenever the file is compiled, and with the -D live that block
+ * is skipped, which produced 20 undeclared-identifier errors.
+ *
+ * Two ruleproc.c comments corrected against their own code. The header still
+ * listed M 4 6 X Q and also = % as CPU-only after both had been promoted, and the
+ * rejection-ops comment still claimed Q stays in default-reject. Only four opcodes
+ * now sit outside the whitelist, S 0xc5, hash 0xc4, v 0xc1 and 0x02, and they are
+ * the only remaining way to build a mixed GPU and CPU partition.
+ *
+ * Validation. Seven fixtures, CPU equals GPU on a GTX 1080 and an M2 Max: classfix
+ * 232, gpufix 144, longfix 111, mixfix 145, gatefix 84 exercising the
+ * never-before-executed over-gate routing path, memfix 100, and divfix, which
+ * asserts divergence and is the functional proof the -D reached the device by
+ * finding the within-limit 19 of 30 rather than all 30. pretoday 113. A new
+ * mixguard fixture covers the FastRule precondition guard at mdxfind.c 13764, which
+ * no other fixture reaches any more now that the memory family is eligible: with
+ * the guard removed its CPU-partition recovery collapses to exactly 6 of 16, one
+ * per word. gatefix by contrast still scores 84 of 84 with the guard removed, so it
+ * never covered that guard at all.
+ *
+ * Benchmark: rockyou 14341564 lines by best64.rule, 77 rules, -m e1, 1000 hashes,
+ * median of 3 runs. fpga GTX 1080 peak VRAM 1769 MiB on the deployed 1.581 against
+ * 325 MiB here, an 81.6 percent reduction from the buffer resize, with throughput
+ * up from 0.990 to 1.047 hash Gh per second. Compiling the memory family back out
+ * saves a further 76 MiB and moves throughput by -0.57 percent, inside noise, so
+ * the family stays. mmt 72 cores with -G none: 51.13s on the deployed 1.245 against
+ * 3.14s here.
+ *
+ * Revision 1.35  2026/09/11 19:46:35  dlr
+ * Rule-engine parity block, character classes on GPU, 2-byte packed-word length, and two dispatch guards.
+ *
+ * Byte engine brought to parity with the documented john and hashcat feature sets. Character classes in both syntaxes: inline ?C uses the john table with complement-by-case-toggle, a ~ prefix selects the hashcat table. Nine verbs take a class, opcodes 0x80 to 0x89. ~e?C needs its own opcode 0x89 because hashcat class title-case is a different algorithm from the john form, not the same one with a class test substituted. The ?s class is hashcat class_sym in BOTH tables and john user classes ?0 to ?9 are not implemented, both per operator ruling. ?? is the literal-? escape, so purging a literal ? is now written @?? and 8 lines across the shipped rule files stop loading, every one of them a rule john also rejects.
+ *
+ * Other parity fixes in the same block: c C E and e act on position 0, not on the first alphabetic character, which john and hashcat agree on and mdxfind did not; x and X follow hashcat when out of range, superseding an earlier ruling for john; a candidate a rule empties is kept, following hashcat; T is bounds-checked as john does; X honours the memory offset N, which was read and then ignored so every offset gave the same answer; B is added from hashcat master. ruleproc32 refuses a class loudly rather than silently reinterpreting it, and accepts the ?? escape identically, closing a byte-versus-utf32 divergence where the same rule text produced different candidates in each engine with no diagnostic.
+ *
+ * All ten class opcodes plus =NX and %NX promoted from CPU-only to GPU-eligible and implemented in all six rules kernels, sharing one 480-byte constant-address-space membership table in gpu_common.cl and metal_common.metal so the six cannot drift. Three real rule files now have zero CPU-only rules.
+ *
+ * Packed-word length widened from one byte to two, little-endian, written and read byte by byte so it depends on neither host alignment nor host endianness. The admission gate allows GPU_RULES_MAX_INPUT_LEN 40959 while the wire field held 255, so any word of 256 to 40959 bytes was hashed as its first len mod 256 bytes: 285 as its first 29, 300 as its first 44. The emitted plaintext matched the emitted digest so nothing downstream could detect it. 11 kernel read sites across 7 files, 3 host writers, 2 host hit decoders and the buffer-full check move together.
+ *
+ * Two dispatch guards. C2.3 now tests the per-word word_packed_by_rules_engine rather than the thread-persistent my_jobg_rules, which differ whenever a word is walked but not packed. FastRule is disabled when this iteration is not the no-rule pass, making entered-at-the-rule-stream-origin a precondition rather than an assumption: the SIMD walker was re-draining the remaining rules from the first CPU-only rule output, so exactly one CPU-partition candidate survived per word.
+ *
+ * Validation: john class sweep 66 of 75 with all 9 differences the ruled empty-word policy, hashcat class sweep 21 of 21, X 22 of 22, x 16 of 16, c C E e 50 of 50 against john, rules32 conformance 165 of 165, zero silent byte-versus-utf32 divergences, wire round trip proven for all 40960 admitted lengths. Five GPU fixtures CPU equals GPU on a GTX 1080 and an M2 Max, including 113 of 113 on the fixture that measured 84 of 113 before the FastRule guard, and 126 of 126 on words from 1 to 4096 bytes. Regression on shipped rule files: Hash-IT_Crazy_Rules 6828885 rules, all_gj 208010 and T0XlC byte-identical.
+ *
+ * Also included in mdxfind.c and authored by Waffle, not by me: the AIX cmiyc challenge-3 algorithm validation comment block, recording the ppcemu emulated-oracle confirmation and the 504-hash corpus confirmation at the live parameters.
+ *
  * Revision 1.34  2026/08/30 23:47:41  dlr
  * Replace the divergent threadgroup_barrier in all eight EMIT_HIT_N_DEDUP_OR_OVERFLOW macros with a new MTL_EMIT_HIT_DEVICE_FENCE. The OpenCL twin gpu_common.cl closes each macro body with mem_fence CLK_GLOBAL_MEM_FENCE, a per-thread MEMORY fence that is legal anywhere; the Metal port translated it to threadgroup_barrier mem_flags::mem_device, which is an EXECUTION barrier that MSL requires every thread in the threadgroup to reach. It sat inside the hit-emit conditional inside the carrier iterated probe loop, the most divergent point in the kernel, so the constraint was violated on every emit - undefined behaviour inherited by all eight digest widths and therefore by every Metal family that emits a hit. The new macro expands to atomic_thread_fence mem_flags::mem_device memory_order_relaxed thread_scope_device on MSL 3.2 and above, and to nothing below, because atomic_thread_fence is undeclared under the -std=metal3.0 pin in gpu/build_metallib.sh and MSL exposes no ordering stronger than relaxed for device-scope atomics in any case. Correct either way: no thread in the kernel reads hits or hit_count, and the host reads both only after command-buffer completion, which is a full memory synchronisation point. Offline xcrun metal clean for both the metallib 3.0 path and the driver-default JIT path; emitted AIR shows air.atomic.fence and no threadgroup barrier. Companion to the same-day gpu_metal.m revision; validated on dev1 Apple M1 and dev3 Apple M2 Max.
  *
@@ -162,12 +254,80 @@ using namespace metal;
 #endif
 
 #ifndef RULE_BUF_MAX
-#define RULE_BUF_MAX 40960
+#define RULE_BUF_MAX 2048
 #endif
 
 #ifndef RULE_BUF_LIMIT
-#define RULE_BUF_LIMIT (RULE_BUF_MAX - 1)
+#define RULE_BUF_LIMIT (RULE_BUF_MAX - 15)
 #endif
+
+
+/* ---- character-class membership, shared by every rules kernel -----------
+ *
+ * One 32-byte row per class, in class-id order, indexed
+ * (class_byte & 0x7f) - 1.  Ids start at 1 so a class operand is never a NUL
+ * byte, which matters because the packed rule stream is NUL-terminated.  The
+ * complement lives in the high bit of the class byte and is applied by XOR at
+ * test time, so a complemented class costs nothing extra.
+ *
+ * Byte-identical to rule_class_bits[][] in ruleproc.c -- both are generated
+ * from the same reference definitions (john's CHARS_* macros in rules.c and
+ * hashcat's class_*() predicates in src/rp.c), and `?s` is hashcat's
+ * class_sym() in both class tables per the operator's ruling.
+ *
+ * This lives in the COMMON source, not in each kernel, because all three
+ * rules kernels per backend are compiled as { common, family_source } -- one
+ * copy cannot drift from another.  480 bytes in the constant address space:
+ * it must NOT become a function-local array, which is what put the retired
+ * memory-op attempt over the per-thread private-memory budget and FATAL'd
+ * CL_OUT_OF_HOST_MEMORY on an RTX 3080.
+ */
+
+/* Class-form opcodes.  These live HERE rather than being copied into each
+ * rules kernel: the existing 62 RULE_OP_* defines are duplicated per kernel,
+ * which is the drift hazard rule_ops.h exists to prevent on the host side, and
+ * there is no reason to extend it.  Every rules kernel is compiled as
+ * { common, family_source }, so one copy reaches all of them.
+ * Values must match rule_ops.h exactly -- they are in the packed stream. */
+#define RULE_OP_SUB_CLASS        0x80   /* s?CY  / ~s?CY */
+#define RULE_OP_PURGE_CLASS      0x81   /* @?C   / ~@?C  */
+#define RULE_OP_TITLE_CLASS      0x82   /* e?C   (john)  */
+#define RULE_OP_REJ_HAS_CLASS    0x83   /* !?C   / ~!?C  */
+#define RULE_OP_REJ_NHAS_CLASS   0x84   /* /?C   / ~/?C  */
+#define RULE_OP_REJ_FIRST_CLASS  0x85   /* (?C   / ~(?C  */
+#define RULE_OP_REJ_LAST_CLASS   0x86   /* )?C   / ~)?C  */
+#define RULE_OP_REJ_AT_CLASS     0x87   /* =N?C  / ~=N?C */
+#define RULE_OP_REJ_CNT_CLASS    0x88   /* %N?C  / ~%N?C */
+#define RULE_OP_TITLE_CLASS_HC   0x89   /* ~e?C  (hashcat, different algo) */
+/* `=NX` and `%NX` pack as their literal ASCII bytes, a historical exception
+ * to the high-bit opcode range. */
+#define RULE_OP_REJ_AT_CHR       0x3d
+#define RULE_OP_REJ_CNT_CHR      0x25
+
+constant uchar MTL_RULE_CLASS_BITS[15][32] = {
+/* 1  LOWER  26 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 2  UPPER  26 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 3  DIGIT  10 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 4  SYM    33 members */ {0x00,0x00,0x00,0x00,0xff,0xff,0x00,0xfc,0x01,0x00,0x00,0xf8,0x01,0x00,0x00,0x78,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 5  LHEX   16 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0x00,0x00,0x00,0x00,0x7e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 6  UHEX   16 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0x7e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 7  VOWEL  10 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x22,0x82,0x20,0x00,0x22,0x82,0x20,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 8  CONS   42 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xdc,0x7d,0xdf,0x07,0xdc,0x7d,0xdf,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 9  WS      2 members */ {0x00,0x02,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 10 PUNCT   9 members */ {0x00,0x00,0x00,0x00,0x86,0x50,0x00,0x8c,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 11 ALPHA  52 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xfe,0xff,0xff,0x07,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 12 ALNUM  62 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0xff,0x03,0xfe,0xff,0xff,0x07,0xfe,0xff,0xff,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 13 CTRL   47 members */ {0xfe,0xfd,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x30,0xe1,0xc1,0xfd,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+/* 14 HIGH  128 members */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff},
+/* 15 ALL   256 members */ {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff},
+};
+
+/* Does byte CH belong to the class named by packed class byte CB? */
+static inline int rule_class_match(uchar cb, uchar ch) {
+    uchar bit = (MTL_RULE_CLASS_BITS[(cb & 0x7f) - 1][ch >> 3] >> (ch & 7)) & 1;
+    return (int)(bit ^ ((cb >> 7) & 1));
+}
+
 
 /* --- MetalParams: 128-byte uniform API. BYTE-IDENTICAL to OCLParams in
  * gpu/gpu_common.cl. The layout MUST match because gpujob_opencl.c host
@@ -437,6 +597,66 @@ static inline void md5_block(thread uint &h0, thread uint &h1,
     MTL_MD5_II(c,d,a,b,M[2],15,0x2ad7d2bbu);  MTL_MD5_II(b,c,d,a,M[9],21,0xeb86d391u);
     h0 += a; h1 += b; h2 += c; h3 += d;
 }
+
+/* md5_block_from8 -- Metal twin of the gpu_common.cl helper of the same name
+ * (Phase 2h-A).  Runs MD5 compression rounds 9-64 from a state pre-rolled
+ * through rounds 1-8, which the md5salt carrier does once per (word, rule,
+ * mask) because M[0..7] (the hex32) is salt-independent: 12.5% of the outer
+ * MD5 saved per (word, salt).
+ *
+ * Lifted 2026-09-16 because metal_md5salt_core.metal is moving from a
+ * mode-0-only hand-port to the translated twin, and the translated source
+ * calls this.  Its absence from metal_common.metal was one of the two real
+ * OpenCL->Metal port gaps.
+ *
+ * Differences from the OpenCL twin, both deliberate:
+ *   - `static inline`, NOT `__attribute__((noinline))`.  The noinline there
+ *     is a Pascal register-pressure guard (see gpu_common.cl and
+ *     feedback_md5_block_noinline_pascal); Metal wants the opposite
+ *     (Pattern 3).
+ *   - round macros are the MTL_MD5_* namespaced spellings (Pattern 2).
+ * Pointer args, not references, to match the translated call sites
+ * `md5_block_from8(&st.h[0], ...)`. */
+static inline void md5_block_from8(thread uint *h0, thread uint *h1,
+                                   thread uint *h2, thread uint *h3,
+                                                uint a8, uint b8, uint c8, uint d8,
+                                                thread const uint *M) {
+    uint a = a8, b = b8, c = c8, d = d8;
+    /* Rounds 9-16 (FF, uses M[8..15]) */
+    MTL_MD5_FF(a,b,c,d,M[8],(uint)7,0x698098d8u);   MTL_MD5_FF(d,a,b,c,M[9],(uint)12,0x8b44f7afu);
+    MTL_MD5_FF(c,d,a,b,M[10],(uint)17,0xffff5bb1u); MTL_MD5_FF(b,c,d,a,M[11],(uint)22,0x895cd7beu);
+    MTL_MD5_FF(a,b,c,d,M[12],(uint)7,0x6b901122u);  MTL_MD5_FF(d,a,b,c,M[13],(uint)12,0xfd987193u);
+    MTL_MD5_FF(c,d,a,b,M[14],(uint)17,0xa679438eu); MTL_MD5_FF(b,c,d,a,M[15],(uint)22,0x49b40821u);
+    /* Rounds 17-32 (GG) */
+    MTL_MD5_GG(a,b,c,d,M[1],(uint)5,0xf61e2562u);   MTL_MD5_GG(d,a,b,c,M[6],(uint)9,0xc040b340u);
+    MTL_MD5_GG(c,d,a,b,M[11],(uint)14,0x265e5a51u); MTL_MD5_GG(b,c,d,a,M[0],(uint)20,0xe9b6c7aau);
+    MTL_MD5_GG(a,b,c,d,M[5],(uint)5,0xd62f105du);   MTL_MD5_GG(d,a,b,c,M[10],(uint)9,0x02441453u);
+    MTL_MD5_GG(c,d,a,b,M[15],(uint)14,0xd8a1e681u); MTL_MD5_GG(b,c,d,a,M[4],(uint)20,0xe7d3fbc8u);
+    MTL_MD5_GG(a,b,c,d,M[9],(uint)5,0x21e1cde6u);   MTL_MD5_GG(d,a,b,c,M[14],(uint)9,0xc33707d6u);
+    MTL_MD5_GG(c,d,a,b,M[3],(uint)14,0xf4d50d87u);  MTL_MD5_GG(b,c,d,a,M[8],(uint)20,0x455a14edu);
+    MTL_MD5_GG(a,b,c,d,M[13],(uint)5,0xa9e3e905u);  MTL_MD5_GG(d,a,b,c,M[2],(uint)9,0xfcefa3f8u);
+    MTL_MD5_GG(c,d,a,b,M[7],(uint)14,0x676f02d9u);  MTL_MD5_GG(b,c,d,a,M[12],(uint)20,0x8d2a4c8au);
+    /* Rounds 33-48 (HH) */
+    MTL_MD5_HH(a,b,c,d,M[5],(uint)4,0xfffa3942u);   MTL_MD5_HH(d,a,b,c,M[8],(uint)11,0x8771f681u);
+    MTL_MD5_HH(c,d,a,b,M[11],(uint)16,0x6d9d6122u); MTL_MD5_HH(b,c,d,a,M[14],(uint)23,0xfde5380cu);
+    MTL_MD5_HH(a,b,c,d,M[1],(uint)4,0xa4beea44u);   MTL_MD5_HH(d,a,b,c,M[4],(uint)11,0x4bdecfa9u);
+    MTL_MD5_HH(c,d,a,b,M[7],(uint)16,0xf6bb4b60u);  MTL_MD5_HH(b,c,d,a,M[10],(uint)23,0xbebfbc70u);
+    MTL_MD5_HH(a,b,c,d,M[13],(uint)4,0x289b7ec6u);  MTL_MD5_HH(d,a,b,c,M[0],(uint)11,0xeaa127fau);
+    MTL_MD5_HH(c,d,a,b,M[3],(uint)16,0xd4ef3085u);  MTL_MD5_HH(b,c,d,a,M[6],(uint)23,0x04881d05u);
+    MTL_MD5_HH(a,b,c,d,M[9],(uint)4,0xd9d4d039u);   MTL_MD5_HH(d,a,b,c,M[12],(uint)11,0xe6db99e5u);
+    MTL_MD5_HH(c,d,a,b,M[15],(uint)16,0x1fa27cf8u); MTL_MD5_HH(b,c,d,a,M[2],(uint)23,0xc4ac5665u);
+    /* Rounds 49-64 (II) */
+    MTL_MD5_II(a,b,c,d,M[0],(uint)6,0xf4292244u);   MTL_MD5_II(d,a,b,c,M[7],(uint)10,0x432aff97u);
+    MTL_MD5_II(c,d,a,b,M[14],(uint)15,0xab9423a7u); MTL_MD5_II(b,c,d,a,M[5],(uint)21,0xfc93a039u);
+    MTL_MD5_II(a,b,c,d,M[12],(uint)6,0x655b59c3u);  MTL_MD5_II(d,a,b,c,M[3],(uint)10,0x8f0ccc92u);
+    MTL_MD5_II(c,d,a,b,M[10],(uint)15,0xffeff47du); MTL_MD5_II(b,c,d,a,M[1],(uint)21,0x85845dd1u);
+    MTL_MD5_II(a,b,c,d,M[8],(uint)6,0x6fa87e4fu);   MTL_MD5_II(d,a,b,c,M[15],(uint)10,0xfe2ce6e0u);
+    MTL_MD5_II(c,d,a,b,M[6],(uint)15,0xa3014314u);  MTL_MD5_II(b,c,d,a,M[13],(uint)21,0x4e0811a1u);
+    MTL_MD5_II(a,b,c,d,M[4],(uint)6,0xf7537e82u);   MTL_MD5_II(d,a,b,c,M[11],(uint)10,0xbd3af235u);
+    MTL_MD5_II(c,d,a,b,M[2],(uint)15,0x2ad7d2bbu);  MTL_MD5_II(b,c,d,a,M[9],(uint)21,0xeb86d391u);
+    *h0 += a; *h1 += b; *h2 += c; *h3 += d;
+}
+
 
 /* --- bswap32: 32-bit byte swap (mirrors gpu_common.cl line 755).
  *
@@ -2150,6 +2370,25 @@ static inline void wrl_block(thread ulong *hash, thread const ulong *p_block) {
 // ulongs, is the 24-byte digest (Tiger output is LE, matching MD-family
 // convention; UNLIKE Whirlpool/SHA-2 which are BE).
 //
+/* ---- TIGER: 8 KB of `constant`, gated -----------------------------
+ *
+ * The OpenCL twin's gate, mirrored so the two files stay line-for-line
+ * comparable.  There, GPU_COMMON_LEAN is REQUIRED: NVIDIA's constant bank is a
+ * hard 64 KB per program and ptxas refused the STREEBOG template outright once
+ * the UTF-32 walker's tables joined it ("File uses too much global constant
+ * data (0x11008 bytes, 0x10000 max)").  Apple has no comparable ceiling and
+ * every Metal family builds with these tables present, so gpu_metal.m does NOT
+ * define GPU_COMMON_LEAN and this block is always compiled.
+ *
+ * The switch exists here anyway for two reasons: the two commons diverging
+ * structurally is how they drift, and if Apple ever tightens the budget the
+ * fix is a one-line marker rather than this surgery again.
+ *
+ * Nothing outside this file references MTL_TIGER_SBOX or tiger_block -- verified across
+ * every .metal, every codegen emitter and every host source.  Lifted from the
+ * CPU donor ahead of the emitter that will use them, so gated, never deleted.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_COMMON_LEAN
 // Constant memory budget: 4 * 256 * 8 = 8 KB (MTL_TIGER_SBOX). Combined
 // with MTL_WRL_SBOX (16 KB) post-Tier-2 total is ~24 KB of `constant`;
 // Apple Silicon constant address space comfortably above this budget.
@@ -2501,6 +2740,7 @@ static inline void tiger_block(thread ulong *state, thread const ulong *M) {
     state[1] = b - state[1];
     state[2] = c + state[2];
 }
+#endif  /* !GPU_COMMON_LEAN -- TIGER */
 
 // Phase 5b Tier 3 sub-phase 5b.3a.2 (2026-05-27): Metal twin lift
 // haval3_block from mhash-0.9.9.9/lib/haval.c havalTransform3 lines
@@ -3098,6 +3338,25 @@ static inline void haval5_block(thread uint *state, thread const uint *M) {
 // (XOR + ROTR + S-box lookup only). R8 no nested block comments. Inserted
 // after haval5_block. Diff vs OpenCL twin byte-identical modulo MTL_
 // prefix + rotl32 + signature.
+/* ---- SNEFRU: 16 KB of `constant`, gated -----------------------------
+ *
+ * The OpenCL twin's gate, mirrored so the two files stay line-for-line
+ * comparable.  There, GPU_COMMON_LEAN is REQUIRED: NVIDIA's constant bank is a
+ * hard 64 KB per program and ptxas refused the STREEBOG template outright once
+ * the UTF-32 walker's tables joined it ("File uses too much global constant
+ * data (0x11008 bytes, 0x10000 max)").  Apple has no comparable ceiling and
+ * every Metal family builds with these tables present, so gpu_metal.m does NOT
+ * define GPU_COMMON_LEAN and this block is always compiled.
+ *
+ * The switch exists here anyway for two reasons: the two commons diverging
+ * structurally is how they drift, and if Apple ever tightens the budget the
+ * fix is a one-line marker rather than this surgery again.
+ *
+ * Nothing outside this file references MTL_SNEFRU_SBOX or snefru_block -- verified across
+ * every .metal, every codegen emitter and every host source.  Lifted from the
+ * CPU donor ahead of the emitter that will use them, so gated, never deleted.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_COMMON_LEAN
 constant uint MTL_SNEFRU_SBOX[4096] = {
     0x64f9001bu, 0xfeddcdf6u, 0x7c8ff1e2u, 0x11d71514u, 0x8b8c18d3u, 0xdddf881eu,
     0x6eab5056u, 0x88ced8e1u, 0x49148959u, 0x69c56fd5u, 0xb7994f03u, 0x0fbcee3eu,
@@ -3850,6 +4109,7 @@ static inline void snefru_block(thread uint *state, thread const uchar *block,
     }
 }
 #undef MTL_SNEFRU_BE32
+#endif  /* !GPU_COMMON_LEAN -- SNEFRU */
 
 /* --- GOST R 34.11-94 block function (legacy, TEST S-box set) Metal twin.
 // Phase 5b Tier 4 sub-phase 5b.4b.2 (2026-05-27): Metal twin of the
@@ -3863,6 +4123,25 @@ static inline void snefru_block(thread uint *state, thread const uchar *block,
 // dual finalization (compress(bit-length) then compress(checksum)) are
 // carried by the emit helper, NOT here. R11 scalar bitselect NOT in play
 // (XOR + add + shift + S-box lookup only). R8 no nested block comments. */
+/* ---- GOST: 4 KB of `constant`, gated -----------------------------
+ *
+ * The OpenCL twin's gate, mirrored so the two files stay line-for-line
+ * comparable.  There, GPU_COMMON_LEAN is REQUIRED: NVIDIA's constant bank is a
+ * hard 64 KB per program and ptxas refused the STREEBOG template outright once
+ * the UTF-32 walker's tables joined it ("File uses too much global constant
+ * data (0x11008 bytes, 0x10000 max)").  Apple has no comparable ceiling and
+ * every Metal family builds with these tables present, so gpu_metal.m does NOT
+ * define GPU_COMMON_LEAN and this block is always compiled.
+ *
+ * The switch exists here anyway for two reasons: the two commons diverging
+ * structurally is how they drift, and if Apple ever tightens the budget the
+ * fix is a one-line marker rather than this surgery again.
+ *
+ * Nothing outside this file references MTL_GOST_SBOX_1..4 or gost_block -- verified across
+ * every .metal, every codegen emitter and every host source.  Lifted from the
+ * CPU donor ahead of the emitter that will use them, so gated, never deleted.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_COMMON_LEAN
 constant uint MTL_GOST_SBOX_1[256] = {
     0x00072000u, 0x00075000u, 0x00074800u, 0x00071000u, 0x00076800u, 0x00074000u,
     0x00070000u, 0x00077000u, 0x00073000u, 0x00075800u, 0x00070800u, 0x00076000u,
@@ -4196,6 +4475,7 @@ static inline void gost_block(thread uint *h, thread const uint *m) {
         (v[6] << 16) ^ (v[6] >> 16) ^ (v[7] << 16) ^ v[7];
 }
 #undef MTL_GOST_GE_ROUND
+#endif  /* !GPU_COMMON_LEAN -- GOST */
 #undef MTL_GOST_GE_ENCRYPT
 
 /* --- Hex encode helpers (mirrors gpu_common.cl lines 771-812).

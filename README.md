@@ -6,7 +6,7 @@
 
 Multi-threaded, multi-algorithm hash search engine. Searches wordlists against large hash collections across 1001 hash types simultaneously, using Judy arrays for memory-efficient hash storage and SIMD acceleration on supported platforms. Includes **mdsplit**, a companion tool that separates solved hashes by type into organized output files.
 
-See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons. See [docs/SEVENZIP.md](docs/SEVENZIP.md) for 7-Zip (`-m e1000`) archive recovery, including the silent false negatives that affect other tools.
+See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons. See [docs/SEVENZIP.md](docs/SEVENZIP.md) for 7-Zip (`-m e1000`) archive recovery, including the silent false negatives that affect other tools. See [docs/SALTS_AND_USERS.md](docs/SALTS_AND_USERS.md) for how salts and usernames reach mdxfind (`-F` alongside the hash, `-S`/`-U` per-type lists, `-s`/`-u` global pools) and how their reference counts decide whether a run silently under-reports.
 
 Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://judy.sourceforge.net/) for compressed hash lookup, and [hashpipe](https://github.com/Cynosureprime/hashpipe) for hash verification.
 
@@ -445,7 +445,9 @@ mdxfind supports hashcat-compatible password mangling rules in two modes:
 - **Concatenated rules** (`-r`): Each rule is a sequence of operations applied in order to each candidate word. One rule per line.
 - **Dot-product rules** (`-R`): Multiple rule files whose operations are combined as a cross-product, generating all combinations.
 
-The rule engine (`ruleproc.c`) supports the standard hashcat rule set including case manipulation, character insertion/deletion/replacement, rotation, duplication, truncation, and memory operations.
+The rule engine (`ruleproc.c`) supports the standard hashcat rule set including case manipulation, character insertion/deletion/replacement, rotation, duplication, truncation, memory operations, and character classes in both the John and hashcat syntaxes.
+
+Rules run on the GPU where one is available. All but three verbs — `S`, `vNC` and Control-B — are implemented in the GPU rule kernels; a rule using one of those routes to the CPU while the rest of the set still runs on the GPU, and the reported hit set is the union. Input words longer than 1024 bytes are handled on the CPU. The GPU walker's output ceiling is 2033 bytes against `MAXLINE` on the CPU, so a rule generating more than that produces different candidates on the two paths by design; `-G none` gives CPU-exact output. See [docs/RULES.md](docs/RULES.md#the-gpu-and-cpu-rule-engines).
 
 ### Hybrid Mask Attacks
 
@@ -713,6 +715,21 @@ GPU iteration and mask performance, measured with 14M MD5 hashes from `rockyou.t
 | Desktop | RTX 4070 Ti Super | MD5 `-i 100 -n '?d?d'` | ~10 Gh/s |
 
 bcrypt on the RTX 4070 Ti Super outperformed hashcat 6.2.3 on the same hardware (620 h/s vs 595 h/s) for 1000 salts at cost=12.
+
+#### Rules engine: VRAM after the walker-buffer resize
+
+Fixture: `rockyou.txt` (14,341,564 lines) × `best64.rule` (103 lines, 77 rules in use), 1,000 MD5 hashes sampled from the same wordlist, `-m e1`. 1,118,641,957 hash calculations, 1000/1000 found on every repeat. Median of 3 on an NVIDIA GTX 1080 (Pascal, 8 GB).
+
+| Build | Hash rate | Peak VRAM |
+|-------|----------:|----------:|
+| v1.581 | 0.990 Gh/s | 1769 MiB |
+| v1.583 | 1.047 Gh/s | 325 MiB |
+
+The GPU rule walker's scratch buffer dropped from 40960 bytes to 2048 in v1.583, which is where the 81% VRAM reduction comes from — the buffer is per work-item, so its size is multiplied by the occupancy the device schedules. The headroom is what made the memory verbs (`M 4 6 Q X`) affordable on the GPU in the same release: a second buffer of the same size now costs less than a tenth of what one buffer cost before. Throughput moved 5.8%, at the edge of useful resolution on this fixture.
+
+The same fixture on a 72-core Xeon E5-2697 v4 with `-G none` completes in 3.14s at 359.94 Mh/s, median of 3.
+
+See [docs/RULES.md](docs/RULES.md#the-gpu-and-cpu-rule-engines) for what the 2048-byte buffer means for output length, and why the two engines can legitimately disagree above it.
 
 GPU iteration works with all mask modes (`-n`, `-N`) and probes the compact table at every iteration depth, finding matches at any `-i` level in a single pass.
 

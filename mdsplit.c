@@ -28,9 +28,12 @@
 
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdsplit.c,v 1.30 2026/04/21 17:11:40 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdsplit.c,v 1.31 2026/09/11 01:56:37 dlr Exp dlr $";
 /*
  * $Log: mdsplit.c,v $
+ * Revision 1.31  2026/09/11 01:56:37  dlr
+ * Restore shortest-solution-wins when one hash has several type solutions. Lost in 1.26 when the hex path moved from the JudySL chain to the compact table: duplicates were kept in adjacent probe slots and match_compact returned whichever was inserted first, making the result depend on record order in the result file. Now collapsed at table build, keeping the shortest total solution INCLUDING the type tag, so encodings that differ only by tag (NTLMx01 vs MD4UTF16UCx01 over identical plaintext) resolve to the shorter tag. Ties: higher iteration count, then strcmp on type name for determinism across table sizes. Entries with a different hash length are left alone, so prefix/chopped matching is unchanged. Reports the collapse count.
+ *
  * Revision 1.30  2026/04/21 17:11:40  dlr
  * Fix partial-match false positive: reject matches where boundary char is still hex. Previously fell through to accept any best_len2 > 0 even when no entry passed the boundary check, causing 16-char prefix collisions on reversed hashes to be accepted as valid matches.
  *
@@ -209,6 +212,7 @@ static uint16_t *SolnHlen;       /* hash portion length */
 static uint16_t *SolnTotalLen;   /* total found string length */
 static struct FNInfo **SolnType; /* pointer to type info */
 static uint64_t *SolnKey;        /* decoded uint64_t key for building compact table */
+static uint32_t CompactDup;      /* duplicate solutions collapsed at table build */
 static uint32_t SolnCount, SolnCap;
 
 /* Forward declarations */
@@ -279,6 +283,32 @@ static uint32_t soln_add(const char *found, int len, int hlen, struct FNInfo *ft
     return idx;
 }
 
+/* soln_cost / soln_better: when the same hash is solved under more than one
+ * type, prefer the SHORTEST total solution, counting the type tag.
+ *
+ * This restores the rule that was lost in revision 1.26 when the hex path moved
+ * from the JudySL chain to the compact table.  The chain version deduplicated
+ * at insert time and replaced the stored entry when the new solution was
+ * shorter -- that code still exists for text hashes in the reader below
+ * ("if (len < resi2->len || ...)").  The compact rewrite kept whichever entry
+ * was inserted first, which made the choice depend on record order in the
+ * result file rather than on the solutions themselves.
+ *
+ * Counting the tag is what separates encodings whose plaintext is identical:
+ * NTLMx01 and MD4UTF16UCx01 compute the same digest, so only the tag differs.
+ * Ties fall to the higher iteration count, then to strcmp on the type name so
+ * that the outcome does not vary with table size or insertion order. */
+static inline int soln_cost(uint32_t i) {
+    return (int)strlen(SolnType[i]->type) + (int)SolnTotalLen[i];
+}
+static inline int soln_better(uint32_t a, uint32_t b) {
+    int ca = soln_cost(a), cb = soln_cost(b);
+    if (ca != cb) return ca < cb;
+    if (SolnType[a]->iter != SolnType[b]->iter)
+        return SolnType[a]->iter > SolnType[b]->iter;
+    return strcmp(SolnType[a]->type, SolnType[b]->type) < 0;
+}
+
 /* Build the compact hash table from SolnKey[]/SolnCount.
  * Called after all solutions are loaded. */
 static void build_compact(void) {
@@ -324,16 +354,21 @@ static void build_compact(void) {
                 CompactUsed++;
                 break;
             }
-            /* On collision with same fp, keep existing - we'll handle
-             * multiple entries with same key in the lookup (longest match) */
+            /* Collision with the same fingerprint.  If this slot holds the SAME
+             * hash -- same key, same length, same text -- then the two entries
+             * are competing solutions for one hash: keep the better one and do
+             * not add a second slot.  A different hlen is a different hash (a
+             * chopped or partial hash) and still gets its own entry, so prefix
+             * matching is unaffected. */
             if (CompactFP[pos] == fp) {
                 uint32_t eidx = CompactIdx[pos];
-                if (SolnKey[eidx] == key) {
-                    /* Same key - chain: store as linked via next index.
-                     * For simplicity, just keep the first one in the table.
-                     * The match function will scan all SolnCount entries
-                     * with matching key via linear probe. We allow duplicates
-                     * in adjacent probe slots. */
+                if (SolnKey[eidx] == key &&
+                    SolnHlen[eidx] == SolnHlen[i] &&
+                    memcmp(SolnBuf + SolnOff[eidx], SolnBuf + SolnOff[i],
+                           SolnHlen[i]) == 0) {
+                    if (soln_better(i, eidx)) CompactIdx[pos] = i;
+                    CompactDup++;
+                    goto next_soln;
                 }
             }
             pos = (pos + 1) & CompactMask;
@@ -354,7 +389,11 @@ static void build_compact(void) {
             CompactIdx[opos] = i;
             CompactUsed++;
         }
+next_soln: ;
     }
+    if (CompactDup)
+        fprintf(stderr, "Compact table: %u duplicate solution(s) collapsed, shortest kept\n",
+                CompactDup);
     fprintf(stderr, "Compact table: %s hex entries in %llu slots\n",
             commify(SolnCount), (unsigned long long)tsize);
 }

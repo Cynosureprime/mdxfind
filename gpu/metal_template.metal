@@ -145,8 +145,9 @@
 /* Phase 2e SALT_BATCH default. Tile size for the inner salt loop under
  * GPU_TEMPLATE_HAS_PRE_SALT. The host passes -DSALT_BATCH=N (per-tier
  * selection via metal_select_salt_batch in gpu_metal.m: 8 for M1, 16
- * for M2/M2 Max, 32 for M3+; env override MDXFIND_METAL_SALT_BATCH).
- * Default 16 (M2 Max sweet spot) when neither macro nor env is set. */
+ * for M2/M2 Max, 32 for M3+).  The device tier is the only input --
+ * MDXFIND_METAL_SALT_BATCH used to override it and was removed 2026-09-16.
+ * Default 16 (M2 Max sweet spot) when the macro is not set. */
 #ifndef SALT_BATCH
 #define SALT_BATCH 16
 #endif
@@ -165,6 +166,28 @@ kernel void template_phase0(
 #ifdef GPU_TEMPLATE_HAS_RULES
     device const uchar    *rule_program     [[buffer(10)]],
     device const uint     *rule_offset      [[buffer(11)]],
+#endif
+#ifdef GPU_TEMPLATE_HAS_RULES32
+    /* UTF-32 rule path.  Buffer 18 and 19 -- 0-9 are dense, 10/11 rules,
+     * 12/13 mask, 14 the byte scratch pool, 15/16/17 salt.
+     *
+     *   u32_case_tab  the two 1:1 case tables CONCATENATED: up at
+     *                 [0 .. U32_CASE_N-1], lo above it.  `device`, not
+     *                 `constant`, and that is not a preference: on NVIDIA the
+     *                 same 26,048 bytes in the constant bank put the OpenCL
+     *                 rules program 13 KB past a hard 64 KB limit and ptxas
+     *                 refused the build outright.  Generated from
+     *                 ../latin_case.h so it cannot drift from the CPU engine.
+     *
+     *   u32_scratch_pool  per-word working memory for the UTF-32 walker,
+     *                 U32_SLOT_BYTES per word.  In `device` space for the
+     *                 same reason buf_scratch_pool is (task #250): the
+     *                 walker's two uint buffers are ~16 KB per lane, Apple
+     *                 Metal does NOT spill, and an M2 Max PSO-create rejects
+     *                 a `thread` array that size with "Compute function
+     *                 exceeds available temporary registers". */
+    device const uint     *u32_case_tab     [[buffer(18)]],
+    device uchar          *u32_scratch_pool [[buffer(19)]],
 #endif
 #ifdef GPU_TEMPLATE_HAS_MASK
     /* Phase 2b row 1: mask charset table + per-position sizes. Layout mirrors
@@ -358,6 +381,32 @@ kernel void template_phase0(
     device uchar *buf =
         buf_scratch_pool + (ulong)word_idx * (ulong)RULE_BUF_MAX;
 
+#ifdef GPU_TEMPLATE_HAS_RULES32
+    /* The UTF-32 lane's three working regions, carved out of one slot so the
+     * host binds one buffer:
+     *
+     *   [0                        .. U32_BUF_ELEMS*4)   u32buf  (codepoints)
+     *   [U32_BUF_ELEMS*4          .. 2*U32_BUF_ELEMS*4) u32mem  (memory verbs)
+     *   [2*U32_BUF_ELEMS*4        .. + U32_OUT_BYTES)   the CANDIDATE bytes
+     *
+     * All three are 4-aligned by construction (U32_SLOT_BYTES is a multiple of
+     * 16 and an MTLBuffer base is at least 16-aligned), which the uint casts
+     * require -- MSL vector and scalar loads are undefined when misaligned.
+     *
+     * `buf` is REPOINTED at the candidate region, and that is deliberate
+     * rather than tidy: it is U32_OUT_BYTES (8192) where buf_scratch_pool's
+     * slot is RULE_BUF_MAX (2048), and the UTF-32 encode can produce up to 4
+     * bytes per codepoint.  Encoding into the 2048-byte slot would truncate
+     * where the OpenCL kernel does not, and the two backends would disagree
+     * on exactly the long-candidate cases hardest to notice.  The BYTE arm is
+     * unaffected: apply_rule bounds itself at RULE_BUF_LIMIT regardless. */
+    device uchar *u32slot =
+        u32_scratch_pool + (ulong)word_idx * (ulong)U32_SLOT_BYTES;
+    device uint  *u32buf  = (device uint *)(u32slot);
+    device uint  *u32mem  = (device uint *)(u32slot + (ulong)U32_BUF_ELEMS * 4u);
+    buf = u32slot + (ulong)U32_BUF_ELEMS * 8u;
+#endif
+
     /* Phase 2d.9b BCRYPT (2026-05-16): workgroup-shared threadgroup buffer
      * for the Eksblowfish S-boxes (4 x 256 uint = 4 KB per lane x
      * BCRYPT_WG_SIZE lanes = 32 KB per workgroup). Declared at kernel-
@@ -381,8 +430,20 @@ kernel void template_phase0(
 
     /* Cache word origin (wpos, wlen) once outside the inner loop.
      * Each rule iteration re-stages buf[0..wlen) from words[]. */
-    uint wpos = word_offset[word_idx];
-    int wlen_orig = (int)words[wpos++];
+    uint raw_woff = word_offset[word_idx];
+#ifdef GPU_TEMPLATE_HAS_RULES32
+    /* Bits 30-31 carry the per-word CLASS (0 = A ascii, 1 = W utf8-wide,
+     * 2 = I undecodable), written by the host at submit.  MASK THEM OFF before
+     * using the offset -- the byte-only variants do not, which is why the tag
+     * and the kernel that reads it must be decided by one predicate.  Failing
+     * to mask cost a `md5_rules ovr-state read err=-5` on OpenCL. */
+    uint wcls = raw_woff >> U32_TAG_SHIFT;
+    uint wpos = raw_woff & U32_OFF_MASK;
+#else
+    uint wpos = raw_woff;
+#endif
+    int wlen_orig = (int)words[wpos] | ((int)words[wpos + 1] << 8);
+    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen_orig > RULE_BUF_LIMIT) wlen_orig = RULE_BUF_LIMIT;
 
     /* Inner double-loop: rule_idx (outer) × mask_idx_local (inner). The
@@ -425,7 +486,45 @@ kernel void template_phase0(
              * being NUL means k==0 at apply_rule entry == the synthetic no-
              * rule pass. */
             int is_no_rule = (rule_program[rpos] == 0);
+#ifdef GPU_TEMPLATE_HAS_RULES32
+            /* ---- PER-LANE ENGINE CHOICE ----------------------------------
+             *
+             * The Metal twin of md5_rules_mixed_phase0.  u32_run_pair() is the
+             * SHARED body out of gpu_u32_walker.inc -- the same function the
+             * OpenCL kernel calls, not a second copy -- because its signature
+             * was already expressible in the address-space macros the walker
+             * uses.  It reproduces pick_engine() exactly: class W or a
+             * u32-only rule goes to UTF-32, class I with no byte form is
+             * skipped, everything else takes the byte walker.
+             *
+             * The candidate lands in `buf`, which points at the slot's
+             * candidate region here, so everything downstream -- mask
+             * expansion, the no-op test, template_finalize -- is unchanged.
+             *
+             * `engine` is written but not read: the arm taken is already
+             * implied by the bytes, and the host replay re-derives it from the
+             * DEVICE's own capability bits rather than trusting a flag that
+             * would have to survive the hit buffer. */
+            /* The second half of rule_offset is indexed by the TOTAL device
+             * rule count, and on Metal that is NOT rule_count: this backend
+             * sub-batches the rule axis to stay under Apple's ~2 s command
+             * buffer watchdog, so params.num_masks carries the SUB-BATCH size.
+             * OpenCL does not sub-batch here and uses num_masks as the total,
+             * so the two backends genuinely read the total from different
+             * fields -- stated rather than left to be inferred.  gpu_metal.m
+             * writes params.num_rules (offset 108, documented as "source rule
+             * count") with the total in lockstep. */
+            uint u32_total_rules = params.num_rules;
+            if (u32_total_rules == 0u) u32_total_rules = rule_count;
+            int engine = 0;
+            int new_len = u32_run_pair(words, wpos, wlen, rule_program,
+                                       rpos, rule_offset[u32_total_rules + rule_idx],
+                                       wcls, buf, u32buf, u32mem,
+                                       buf, U32_OUT_BYTES,
+                                       u32_case_tab, &engine);
+#else
             int new_len = apply_rule(rule_program + rpos, buf, wlen);
+#endif
 
             /* Rejection sentinel: apply_rule fired a `_ < > ! / ( )` op. */
             if (new_len < 0) continue;
@@ -681,6 +780,59 @@ kernel void template_phase0(
                                                       hashes_shown, matched_idx, mask,
                                                       ovr_set, ovr_gid, gid);
                     }
+#ifdef GPU_TEMPLATE_HAS_ALT_DIGEST
+                    /* SECOND DIGEST VARIANT -- Metal twin of the block in
+                     * gpu_template.cl (added there 2026-09-15, ported here
+                     * 2026-09-16).  Its absence was one of the two real
+                     * OpenCL->Metal port gaps: gpu_template.cl had this hook
+                     * and metal_template.metal had no reference to it at all.
+                     *
+                     * Some CPU algorithms compute more than one digest per
+                     * candidate and count a match on ANY of them.  JOB_NTLMH
+                     * is the one that needs it: mdxfind.c hashes the candidate
+                     * BOTH through iconv to UTF-16LE and through a byte
+                     * zero-extend, and checkhash()es each.  A single-probe
+                     * kernel covers only one, and the arm it does not cover is
+                     * UNREACHABLE rather than merely slow, because the GPU
+                     * claims the batch and the CPU never redoes the work -- so
+                     * the run exits 0 saying "None found, sorry!".  On Metal
+                     * that is exactly what happened: the core computed both
+                     * digests and only the zero-extend one was ever compared,
+                     * so a non-ASCII password (whose correct answer is the
+                     * UTF-16LE digest) missed in byte mode as well as -8.
+                     *
+                     * Only a core defining GPU_TEMPLATE_HAS_ALT_DIGEST
+                     * compiles this; today that is metal_ntlmh_core.metal
+                     * alone, so every other program's text is unchanged.
+                     *
+                     * Mutually exclusive with the salt axis, same as the
+                     * OpenCL twin: a salted alt-digest carrier would need the
+                     * three-axis combined_ridx encoding and has no caller. */
+#ifdef GPU_TEMPLATE_HAS_SALT
+#error "GPU_TEMPLATE_HAS_ALT_DIGEST is unsalted-only; no salted carrier exists"
+#endif
+                    {
+                        uint matched_idx_alt = 0u;
+                        if (template_digest_compare_alt(st,
+                                        compact_fp, compact_idx,
+                                        params.compact_mask, params.max_probe,
+                                        params.hash_data_count,
+                                        hash_data_buf, hash_data_off,
+                                        overflow_keys, overflow_hashes,
+                                        overflow_offsets, params.overflow_count,
+                                        &matched_idx_alt))
+                        {
+                            uint combined_ridx_alt =
+                                rule_idx * mask_size + mask_idx_local;
+                            uint mask_alt = 1u << (iter & 31u);
+                            template_emit_hit_alt_or_overflow(hits, hit_count,
+                                              params.max_hits,
+                                              st, word_idx, combined_ridx_alt, iter,
+                                              hashes_shown, matched_idx_alt, mask_alt,
+                                              ovr_set, ovr_gid, gid);
+                        }
+                    }
+#endif /* GPU_TEMPLATE_HAS_ALT_DIGEST */
                     /* Advance to the next -i iteration. Mirrors
                      * gpu_template.cl lines 666-677 exactly: the step is
                      * taken only BETWEEN probes, never after the last one.

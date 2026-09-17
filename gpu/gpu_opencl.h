@@ -309,6 +309,22 @@ int gpu_opencl_set_rules(int dev_idx,
     const unsigned char *rule_program, uint32_t prog_len,
     const uint32_t *rule_offset, int n_rules);
 
+/* UTF-32 rule path (2026-09-14): build the device UTF-32 rule stream EARLY and
+ * clear gpu_rule_membership[] for any rule the device walker cannot run.
+ *
+ * Call from each rule-pack block immediately after `gpu_rule_slot = slot;`.
+ * The timing is load-bearing, not cosmetic: the clawback is useless once the
+ * words have been walked, because each word consults membership at the C2.3
+ * gate and skips a member -- while the device also skips a rule with neither
+ * capability bit, so those pairs are walked by nobody.  Measured at 9,011
+ * recovered against the CPU's 13,435 when it ran at first dispatch instead.
+ *
+ * No-op unless `-8` is active and there are UTF-32 rules.  Returns the number
+ * of rules whose membership it cleared. */
+int gpu_u32_membership_prefilter(const unsigned char *byte_prog,
+                                 uint32_t byte_len,
+                                 const uint32_t *byte_offs, int n_rules);
+
 uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,

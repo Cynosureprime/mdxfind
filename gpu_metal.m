@@ -29,9 +29,10 @@
  *   - One library + one PSO (template_phase0 for JOB_MD5 unsalted).
  *   - metallib-first compile: load embedded gpu_mdxfind_metallib[] bytes
  *     via -[MTLDevice newLibraryWithData:error:].
- *   - JIT fallback when getenv("MDXFIND_METAL_JIT") == "1": concat
- *     metal_common_str + metal_md5_core_str + metal_template_str and
- *     compile via -[MTLDevice newLibraryWithSource:options:error:].
+ *   - A JIT path that concatenated metal_common_str + metal_md5_core_str +
+ *     metal_template_str and compiled via newLibraryWithSource: used to be
+ *     selectable with MDXFIND_METAL_JIT=1.  That env var is gone as of
+ *     2026-09-16; the metallib is the only path.
  *   - Lazy PSO creation on first dispatch (mirrors
  *     gpu_opencl_template_kernel_lazy_md5).
  *   - SSH-context fallback: MTLCreateSystemDefaultDevice() returns nil
@@ -152,6 +153,13 @@
 #include "gpu/metal_md5salt_core_str.h"  /* Phase 2c salt-variant core */
 #include "gpu/metal_md4_core_str.h"      /* Phase 2d.2.1b md4 core */
 #include "gpu/metal_md4utf16_core_str.h" /* Phase 2d.2.2 md4utf16 core */
+#include "gpu/metal_sql5_core_str.h" /* e259 SQL5 Metal twin */
+#include "gpu/metal_ntlmh_core_str.h" /* e786 NTLMH; needs the ALT_DIGEST template hook */
+#include "gpu/metal_ripemd160saltpass_core_str.h" /* HMAC-RMD160-KPASS carrier e798 */
+#include "gpu/metal_ripemd320saltpass_core_str.h" /* HMAC-RMD320-KPASS carrier e799 */
+#include "gpu/metal_wrl_core_str.h" /* e5 */
+#include "gpu/metal_md6256_core_str.h" /* e29 */
+#include "gpu/metal_mysql3_core_str.h" /* e456 */
 #include "gpu/metal_md5raw_core_str.h"   /* Phase 2d.2.3 md5raw core */
 #include "gpu/metal_md5passsalt_core_str.h" /* Phase 2d.2.4 md5passsalt core (4 PSO variants) */
 #include "gpu/metal_md5saltpass_core_str.h" /* Phase 2d.2.5 md5saltpass core (4 PSO variants) */
@@ -197,7 +205,25 @@
 #include "gpu/metal_descrypt_core_str.h" /* Phase 2d.9a DESCRYPT carrier (op=500; SALTED-ONLY; single algo_mode=7; 4 uint32 LE state = h[0..1] pre-FP (l,r) + h[2..3] zero-pad; 25-iter DES Feistel INSIDE template_finalize; HAND-PORT of gpu/gpu_descrypt_core.cl rev 1.1; cl2metal.py UNSUITABLE per architect Task #293 Option A; last Unix-crypt op to migrate to Metal) */
 #include "gpu/metal_bcrypt_core_str.h" /* Phase 2d.9b BCRYPT carrier (op=450; SALTED-ONLY; single algo_mode=8; HASH_WORDS=6 (first 6-word Metal family); 2^cost Eksblowfish iter INSIDE template_finalize; HAND-PORT of gpu/gpu_bcrypt_core.cl rev 1.1; cl2metal.py UNSUITABLE per architect Task #293; uses NEW threadgroup-shared sbox_pool (32 KB per WG = exactly Apple Silicon maxThreadgroupMemoryLength); requires NEW GPU_TEMPLATE_HAS_LOCAL_BUFFER scaffold extension + per-op threadsPerThreadgroup=8 dispatch-site override; FINAL Phase 2d sub-phase; 51 -> 52 families) */
 #include "gpu/metal_md5_rules_str.h"
+/* The UTF-32 rule walker, generated from gpu_u32_walker.inc alongside the
+ * OpenCL copy so the two cannot drift. */
+#include "gpu/metal_u32_walker_str.h"
 #include "gpu/metal_template_str.h"
+
+/* Host side of the UTF-32 rule path.  gpu_u32_active() is the ONE predicate
+ * that decides whether this dispatch runs the UTF-32 kernel variant, and it
+ * is the same predicate gpujob_metal.m's hit replay reads -- a Metal-local
+ * copy of that decision is exactly the divergence that produced 15,165
+ * unverifiable OpenCL hit lines.  Header only; the bodies are compiled once
+ * into the backend-neutral gpu/gpu_u32_host.c. */
+#include "gpu/gpu_u32_host.h"
+/* The host's copy of the two case tables, generated from ../latin_case.h by
+ * gen_u32_tables.py, uploaded once per device as a kernel argument at buffer
+ * 18.  They travel as an argument rather than in the source because on
+ * NVIDIA the equivalent OpenCL __constant copy put the program past the
+ * 64 KB constant bank; Metal has no such limit but the two backends read the
+ * same generated table on purpose. */
+#include "gpu/gpu_u32_case_host.h"
 #include "gpu/metal_kernel_a_rules_str.h" /* Phase 1a sub-phase 1a.1b-continued (2026-05-20): translator-driven kernel A1 source for Metal dispatcher */
 #include "gpu/metal_kernel_a_masks_str.h" /* Phase 1a sub-phase 1a.2 (2026-05-21): translator-driven kernel A2 (masks-only) source for Metal dispatcher */
 #include "gpu/metal_kernel_a_rules_masks_str.h" /* Phase 1a sub-phase 1a.3 (2026-05-21): hand-port kernel A3 (rules+masks) source for Metal dispatcher */
@@ -564,9 +590,13 @@ static size_t   mtl_audit_shown_bytes    = 0;
  * ever rebinds them (Phase 2a does not, but the guard is cheap). */
 static id<MTLBuffer> buf_rule_program     = nil;
 static id<MTLBuffer> buf_rule_offset      = nil;
-static unsigned char *cached_rule_program  = NULL;
-static uint32_t      *cached_rule_offsets  = NULL;
-static int            cached_rule_count    = 0;
+/* const-qualified because on the UTF-32 path these hold the pointers
+ * gpu_u32_get_program() handed out, which are const by design: a backend
+ * able to rewrite the built program could diverge from the one the hit
+ * replay reads, and the single cache exists to prevent exactly that. */
+static const unsigned char *cached_rule_program  = NULL;
+static const uint32_t      *cached_rule_offsets  = NULL;
+static int                  cached_rule_count    = 0;
 
 /* Phase 2b row 4: mask charset table + per-position sizes MTLBuffers.
  * Populated by gpu_metal_set_mask; bound at buffers 12 and 13 in the M-
@@ -625,6 +655,43 @@ static uint32_t      buf_scratch_pool_words_cap = 0;
 #define METAL_RULE_BUF_MAX 40960
 #endif
 
+/* ---- UTF-32 rule path: the per-lane scratch pool and the case tables ----
+ *
+ * The UTF-32 walker needs three arrays per lane, and on Metal they cannot be
+ * thread-local for the same reason the byte walker's buf[] could not (task
+ * #250: a 40 KB thread array blew the M2 Max PSO-create register-allocator
+ * gate).  So they come from a device pool, one contiguous slice per word,
+ * exactly like buf_scratch_pool:
+ *
+ *   u32buf  U32_BUF_ELEMS uint32   the decoded codepoints / working buffer
+ *   u32mem  U32_BUF_ELEMS uint32   the walker's `M` memory register
+ *   out     4 * U32_BUF_ELEMS byte the re-encoded UTF-8 candidate
+ *
+ * = U32_BUF_ELEMS * 12 bytes = 24,576 per lane, which is the kernel's
+ * U32_SLOT_BYTES in gpu/gpu_u32_walker.inc.  BOTH sides derive it from
+ * GPU_RULES_WALKER_BUF_ELEMS -- the host by the expression below, the kernel
+ * by the -D U32_BUF_ELEMS injected in metal_compile_opts() -- so the stride
+ * and the layout cannot drift.  Keep the expression, not the number.
+ *
+ * At the 16,384-word peak that is ~302 MB, against the 640 MB the byte
+ * walker's pool already takes at the same peak; the operator ruled that
+ * trivial (2026-09-14) next to what the pre-#250 40 KB buffers cost.
+ *
+ * Private storage: the kernel reads and writes it, the host never looks. */
+#define METAL_U32_SLOT_BYTES ((size_t)GPU_RULES_WALKER_BUF_ELEMS * 12u)
+
+static id<MTLBuffer> buf_u32_scratch_pool = nil;
+/* Forward-declared because kernel A1's dispatch sites sit above the
+ * definitions (which live beside the template's dispatch).  Both are
+ * idempotent and both GPU_FATAL rather than returning a nil buffer. */
+static int metal_ensure_u32_scratch_pool(uint32_t need_words);
+static int metal_ensure_u32_case_tab(void);
+static uint32_t      buf_u32_scratch_pool_words_cap = 0;
+/* Uploaded once (the tables are a generated constant, not per-dispatch
+ * state).  Shared storage is fine -- it is written once by the host and read
+ * many times by the kernel; the OpenCL twin uses CL_MEM_READ_ONLY. */
+static id<MTLBuffer> buf_u32_case_tab    = nil;
+
 /* Phase 2b row 4: cached host-side mask state for the hit-replay path in
  * gpu/gpujob_metal.m. The OpenCL twin owns gpu_mask_n_prepend /
  * gpu_mask_n_append / gpu_mask_total / gpu_mask_sizes[] as file-scope
@@ -678,13 +745,65 @@ static id<MTLDevice> metal_resolve_device(void)
 /* Load the kernel library. Two-tier:
  *   default: load embedded gpu_mdxfind_metallib[] bytes via
  *            -[MTLDevice newLibraryWithData:error:].
- *   getenv("MDXFIND_METAL_JIT") == "1": concat the three _str.h sources
- *            and compile via -[MTLDevice newLibraryWithSource:...].
+ *   The MDXFIND_METAL_JIT=1 source-compile alternative was removed
+ *            2026-09-16; only the metallib load remains.
  * Returns a strong ref (nil on failure; caller's __strong static binds). */
+/* ---- single injection point for Metal compile options ------------------
+ *
+ * Every newLibraryWithSource site in this file builds its MTLCompileOptions
+ * here, so a preprocessor macro that must reach EVERY Metal library cannot be
+ * missed by a call site that forgets it.  Currently that is RULE_BUF_MAX, the
+ * walker scratch size, derived from the ONE host constant
+ * GPU_RULES_MAX_INPUT_LEN in gpujob.h -- see GPU_RULES_WALKER_BUF_ELEMS there
+ * for why it is in elements rather than bytes.
+ *
+ * DELIBERATELY NARROWER than a funnel that also builds the library.  The nine
+ * call sites' FAILURE handling is site-specific by mandate
+ * (feedback_external_failures_are_fatal: file:line, operation, host and error
+ * AT THE POINT OF FAILURE); two of them carry hostname + dev_idx.  A
+ * library-level funnel would report THIS file's __LINE__, defeating that, or
+ * need four more parameters to reproduce what each site already says
+ * correctly.  The macros must be central; the diagnostics must not be.
+ *
+ * `extra` may be nil and is never mutated -- it is copied.  Ownership matches
+ * what the nine sites did inline: the return is +1 and callers do not release
+ * it (this translation unit is manual retain/release, not ARC).
+ *
+ * First run after this change recompiles libraries that were previously cache
+ * hits: sites that passed no macros, or attached a dictionary only when
+ * non-empty, now always carry one, and Apple's MTLLibrary self-cache is keyed
+ * on source + macros.  Once each, not per dispatch.
+ */
+static MTLCompileOptions *metal_compile_opts(NSDictionary *extra)
+{
+    MTLCompileOptions   *o = [[MTLCompileOptions alloc] init];
+    NSMutableDictionary *m = [[NSMutableDictionary alloc] init];
+
+    if (extra != nil) {
+        [m addEntriesFromDictionary:extra];
+    }
+    [m setObject:@(GPU_RULES_WALKER_BUF_ELEMS) forKey:@"RULE_BUF_MAX"];
+    /* U32_BUF_ELEMS rides the same funnel as RULE_BUF_MAX, for the same
+     * reason and from the same host constant -- see the twin injection in
+     * gpu/gpu_kernel_cache.c.  It is the UTF-32 walker's ELEMENT count, and
+     * an element there is a uint32, so the same count costs 4x the scratch;
+     * 2048 is chosen for correctness parity with the byte walker (2x the
+     * 1024-byte input gate, so a duplication verb on a full-length word
+     * still fits) and is NOT settable from the environment.
+     *
+     * METAL_U32_SLOT_BYTES below is derived from the SAME constant, which is
+     * what keeps the host's scratch-pool stride and the kernel's slot layout
+     * from drifting. */
+    [m setObject:@(GPU_RULES_WALKER_BUF_ELEMS) forKey:@"U32_BUF_ELEMS"];
+    o.preprocessorMacros = m;
+    return o;
+}
+
 static id<MTLLibrary> metal_load_library(id<MTLDevice> device)
 {
-    const char *jit_env = getenv("MDXFIND_METAL_JIT");
-    int want_jit = (jit_env != NULL && jit_env[0] == '1' && jit_env[1] == '\0');
+    /* Always the embedded metallib.  MDXFIND_METAL_JIT=1 used to force the
+     * JIT path that concatenates the _str.h sources; removed 2026-09-16. */
+    int want_jit = 0;
 
     NSError *err = nil;
 
@@ -712,7 +831,7 @@ static id<MTLLibrary> metal_load_library(id<MTLDevice> device)
             fprintf(stderr, "Metal: JIT source NSString conversion failed\n");
             return nil;
         }
-        MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+        MTLCompileOptions *opts = metal_compile_opts(nil);
         id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                                   options:opts
                                                     error:&err];
@@ -721,7 +840,7 @@ static id<MTLLibrary> metal_load_library(id<MTLDevice> device)
                     err ? [[err localizedDescription] UTF8String] : "(no error)");
             return nil;
         }
-        GPU_DEBUG_FPRINTF(stderr, "Metal: library loaded via JIT (MDXFIND_METAL_JIT=1)\n");
+        GPU_DEBUG_FPRINTF(stderr, "Metal: library loaded via JIT\n");
         return lib;
     }
 
@@ -818,8 +937,7 @@ static id<MTLLibrary> metal_load_library_salt_variant(id<MTLDevice> device,
         return nil;
     }
 
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.preprocessorMacros = macros;
+    MTLCompileOptions *opts = metal_compile_opts(macros);
 
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
@@ -1052,7 +1170,18 @@ int gpu_metal_template_pso_lazy_md5_salt_rules_mask(void)
  * rules-variant precedent). */
 static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
 {
+    /* Under `-8` the shared byte walker (metal_md5_rules.metal) and the UTF-32
+     * walker are inserted BEFORE metal_kernel_a_rules.metal, and that file's
+     * own copy of case_flip_mask + apply_rule_thread is preprocessed out by
+     * GPU_U32_WALKER_PRESENT -- see the note above it.  Order is load-bearing
+     * and is the reason the shared copy has to come in at all: u32_run_pair()
+     * calls apply_rule(), so apply_rule must be defined before the walker, and
+     * the walker before the kernel that calls it -- three positions a single
+     * source file cannot provide. */
+    int _u32 = gpu_u32_active();
     size_t total = strlen(metal_common_str)
+                 + (_u32 ? strlen(metal_md5_rules_str) : 0)
+                 + (_u32 ? strlen(metal_u32_walker_str) : 0)
                  + strlen(metal_kernel_a_rules_str)
                  + 16;
     char *src = (char *)malloc(total);
@@ -1061,6 +1190,12 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
         return nil;
     }
     strcpy(src, metal_common_str);
+    if (_u32) {
+        strcat(src, "\n");
+        strcat(src, metal_md5_rules_str);
+        strcat(src, "\n");
+        strcat(src, metal_u32_walker_str);
+    }
     strcat(src, "\n");
     strcat(src, metal_kernel_a_rules_str);
 
@@ -1070,7 +1205,6 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
         fprintf(stderr, "Metal: kernel A1 JIT source NSString conversion failed\n");
         return nil;
     }
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     /* KERNEL_A_VARIANT=1 is baked into the source itself. Knob G
      * (2026-05-29, spec project_metal_knob_g_spec_2026-05-29.md):
      * when MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1 is set, thread
@@ -1102,9 +1236,7 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
     } else if (_knobg) {
         [_macros setObject:@1 forKey:@"KNOBG_VEC_WRITE"];
     }
-    if ([_macros count] > 0) {
-        opts.preprocessorMacros = _macros;
-    }
+    MTLCompileOptions *opts = metal_compile_opts(_macros);
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
@@ -1194,7 +1326,7 @@ static id<MTLLibrary> metal_load_library_kernel_a_masks(id<MTLDevice> device)
         fprintf(stderr, "Metal: kernel A2 JIT source NSString conversion failed\n");
         return nil;
     }
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    MTLCompileOptions *opts = metal_compile_opts(nil);
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
@@ -1273,7 +1405,7 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules_masks(id<MTLDevice> devi
         fprintf(stderr, "Metal: kernel A3 JIT source NSString conversion failed\n");
         return nil;
     }
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    MTLCompileOptions *opts = metal_compile_opts(nil);
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
@@ -1354,7 +1486,6 @@ static id<MTLLibrary> metal_load_library_kernel_a_bruteforce(id<MTLDevice> devic
         fprintf(stderr, "Metal: kernel A4 JIT source NSString conversion failed\n");
         return nil;
     }
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     /* PROFILE_VARIANT-for-A4 (2026-05-30 architect spec
      * project_kernel_a_a4_profile_variant_spec_2026-05-30.md D5.a + §5
      * JIT cache disambiguation): thread A4_PROFILE_VARIANT=N into
@@ -1374,9 +1505,7 @@ static id<MTLLibrary> metal_load_library_kernel_a_bruteforce(id<MTLDevice> devic
     if (_a4pv > 0) {
         [_macros setObject:@(_a4pv) forKey:@"A4_PROFILE_VARIANT"];
     }
-    if ([_macros count] > 0) {
-        opts.preprocessorMacros = _macros;
-    }
+    MTLCompileOptions *opts = metal_compile_opts(_macros);
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
@@ -1473,12 +1602,7 @@ static uint64_t metal_now_us(void)
  * to force a particular value it takes precedence. */
 static uint32_t metal_select_salt_batch(id<MTLDevice> device)
 {
-    /* Env override wins regardless of device tier. */
-    const char *env = getenv("MDXFIND_METAL_SALT_BATCH");
-    if (env != NULL) {
-        long v = strtol(env, NULL, 10);
-        if (v >= 1 && v <= 256) return (uint32_t)v;
-    }
+    /* Device tier decides.  MDXFIND_METAL_SALT_BATCH used to win over it. */
 
     if (device == nil) return 16u;  /* defensive default */
 
@@ -1526,14 +1650,10 @@ static uint32_t metal_select_salt_batch(id<MTLDevice> device)
  *   M3+ / unknown:       SALT_CHUNK = 1024  (more headroom; 2e.2 auto-tune)
  *
  * MTLDevice.name substring selection. Env override MDXFIND_METAL_SALT_CHUNK
- * (mirrors MDXFIND_METAL_RULE_CHUNK / MDXFIND_METAL_SALT_BATCH) wins. */
+ * (mirrors MDXFIND_METAL_SALT_BATCH) wins. */
 static uint32_t metal_select_salt_chunk(id<MTLDevice> device)
 {
-    const char *env = getenv("MDXFIND_METAL_SALT_CHUNK");
-    if (env != NULL) {
-        long v = strtol(env, NULL, 10);
-        if (v >= 1 && v <= 1000000) return (uint32_t)v;
-    }
+    /* Device tier decides.  MDXFIND_METAL_SALT_CHUNK used to win over it. */
 
     if (device == nil) return 256u;
 
@@ -1756,17 +1876,76 @@ static int metal_upload_rules_lazy(void)
         return -1;
     }
 
+    /* ---- which program does the device read? --------------------------
+     *
+     * On the UTF-32 path it is NOT gpu_rule_program.  gpu_u32_build_program()
+     * appends a packrule32 uint32 stream per rule to the byte program and
+     * widens the offset table to 2 * n_rules: the first half is the untagged
+     * byte offset the byte walker already used, the second half carries the
+     * 4-aligned u32 offset in bits 0-29 plus HASFORM (bit 31) and BYTEOK
+     * (bit 30).  Same two buffers, same two kernel arguments -- only the
+     * contents and the offset-table length change, which is why the UTF-32
+     * path needed no new binding and no OCLParams field.
+     *
+     * The program is asked for rather than rebuilt: the pre-filter built it
+     * at rule-load time (that timing is what makes the tier-3 membership
+     * clawback effective) and there is ONE copy, held by the module that
+     * filled it.  gpu_u32_dev_* is then published so gpujob_metal.m's replay
+     * reproduces the DEVICE's per-rule engine choice from the very table the
+     * kernel read, instead of recomputing it and being allowed to disagree. */
+    const unsigned char *src_prog  = gpu_rule_program;
+    uint32_t             src_len   = gpu_rule_program_len;
+    const uint32_t      *src_offs  = gpu_rule_offsets;
+    int                  src_count = gpu_rule_count;
+    int                  off_ents  = gpu_rule_count;
+
+    if (gpu_u32_active()) {
+        const unsigned char *u32_prog = NULL;
+        const uint32_t      *u32_offs = NULL;
+        uint32_t             u32_len  = 0;
+        int                  u32_n    = 0;
+
+        if (!gpu_u32_get_program(&u32_prog, &u32_len, &u32_offs, &u32_n)) {
+            /* A wiring error, not a configuration.  gpu_u32_active() is true,
+             * so -8 is on and this backend claimed capability; the only
+             * caller that builds the program is mdxfind.c's rule-pack block.
+             * Loud, because the quiet alternative is uploading the byte-only
+             * program and measuring a baseline while reporting UTF-32. */
+            fprintf(stderr,
+                "FATAL: %s:%d the UTF-32 device path is active but no rule "
+                "program was built. gpu_u32_membership_prefilter() must be "
+                "called from the rule-pack block, after the membership fill "
+                "loop.\n", __FILE__, __LINE__);
+            exit(1);
+        }
+        if (gpu_u32_dev_prog != u32_prog) {
+            gpu_u32_dev_prog   = u32_prog;
+            gpu_u32_dev_offs   = u32_offs;
+            gpu_u32_dev_nrules = u32_n;
+            fprintf(stderr,
+                "GPU rule engine: UTF-32 path ON (Metal) — %d device rules, "
+                "program %u bytes, %d offset entries, "
+                "gpu_legacy_slot_unused=%d\n",
+                u32_n, u32_len, u32_n * 2, gpu_legacy_slot_unused);
+        }
+        src_prog  = u32_prog;
+        src_len   = u32_len;
+        src_offs  = u32_offs;
+        src_count = u32_n;
+        off_ents  = u32_n * 2;   /* the widened table */
+    }
+
     /* Cache hit: same host pointers + count -> nothing to do. */
     if (buf_rule_program != nil && buf_rule_offset != nil
-        && cached_rule_program == gpu_rule_program
-        && cached_rule_offsets == gpu_rule_offsets
-        && cached_rule_count   == gpu_rule_count)
+        && cached_rule_program == src_prog
+        && cached_rule_offsets == src_offs
+        && cached_rule_count   == src_count)
         return 0;
 
     /* (Re)upload. ARC drops old refs when we overwrite the statics. */
-    size_t prog_bytes = (size_t)gpu_rule_program_len;
+    size_t prog_bytes = (size_t)src_len;
     if (prog_bytes < METAL_MIN_BUFFER_BYTES) prog_bytes = METAL_MIN_BUFFER_BYTES;
-    size_t off_bytes  = (size_t)gpu_rule_count * sizeof(uint32_t);
+    size_t off_bytes  = (size_t)off_ents * sizeof(uint32_t);
     if (off_bytes < METAL_MIN_BUFFER_BYTES) off_bytes = METAL_MIN_BUFFER_BYTES;
 
     buf_rule_program = [mtl_device newBufferWithLength:prog_bytes
@@ -1774,30 +1953,29 @@ static int metal_upload_rules_lazy(void)
     if (buf_rule_program == nil) {
         /* Phase D5a (Task #281): alloc failure -> fatal. */
         GPU_FATAL("Metal: rule_program newBuffer(%zu bytes) failed (rule_count=%d)",
-                  prog_bytes, gpu_rule_count);
+                  prog_bytes, src_count);
     }
     memset([buf_rule_program contents], 0, prog_bytes);
-    memcpy([buf_rule_program contents], gpu_rule_program,
-           (size_t)gpu_rule_program_len);
+    memcpy([buf_rule_program contents], src_prog, (size_t)src_len);
 
     buf_rule_offset = [mtl_device newBufferWithLength:off_bytes
                                               options:MTLResourceStorageModeShared];
     if (buf_rule_offset == nil) {
         /* Phase D5a (Task #281): alloc failure -> fatal. */
         GPU_FATAL("Metal: rule_offset newBuffer(%zu bytes) failed (rule_count=%d)",
-                  off_bytes, gpu_rule_count);
+                  off_bytes, src_count);
     }
     memset([buf_rule_offset contents], 0, off_bytes);
-    memcpy([buf_rule_offset contents], gpu_rule_offsets,
-           (size_t)gpu_rule_count * sizeof(uint32_t));
+    memcpy([buf_rule_offset contents], src_offs,
+           (size_t)off_ents * sizeof(uint32_t));
 
-    cached_rule_program = gpu_rule_program;
-    cached_rule_offsets = gpu_rule_offsets;
-    cached_rule_count   = gpu_rule_count;
+    cached_rule_program = src_prog;
+    cached_rule_offsets = src_offs;
+    cached_rule_count   = src_count;
 
     GPU_DEBUG_FPRINTF(stderr, "Metal: rule_program (%u bytes) + rule_offset "
                     "(%d entries) uploaded\n",
-            gpu_rule_program_len, gpu_rule_count);
+            src_len, off_ents);
     return 0;
 }
 
@@ -1960,6 +2138,31 @@ int gpu_metal_init(void)
      * early-return if it is clear. */
     metal_ready = 1;
     metal_register_builtin_families();
+
+    /* ---- claim the UTF-32 capability -----------------------------------
+     *
+     * This backend now HAS the UTF-32 kernel bodies -- metal_u32_walker_str
+     * (the shared walker, generated from the SAME gpu/gpu_u32_walker.inc as
+     * the OpenCL copy) plus the GPU_TEMPLATE_HAS_RULES32 arms of
+     * metal_template.metal -- so it is entitled to claim capability.  A
+     * backend carrying only the generated walker must NOT; that is what this
+     * flag is for.
+     *
+     * HERE rather than in the JIT that compiles it, which is where the
+     * OpenCL twin claims it (gpu_opencl.c gpu_opencl_rules_compile).  Metal's
+     * rules PSO is built lazily at FIRST DISPATCH, and
+     * gpu_u32_membership_prefilter() -- which reads gpu_u32_active() and is
+     * the only thing that builds the UTF-32 rule stream -- runs in mdxfind.c's
+     * rule-pack block, long before any word is read.  A claim deferred to the
+     * JIT would arrive after the decision that needs it, and -8 would print
+     * the capability-gap message on a backend that is in fact capable.
+     *
+     * Not verified against a successful compile, and neither is the OpenCL
+     * claim (it precedes its own clBuildProgram).  A failure to build the V_U
+     * variant is caught loudly at the PSO-resolve GPU_FATAL in
+     * gpu_metal_dispatch_md5_rules, not silently swallowed. */
+    gpu_u32_set_backend_capable(1);
+
     GPU_DEBUG_FPRINTF(stderr, "Metal GPU: 1 device initialized\n");
     return 0;
 }
@@ -2002,8 +2205,9 @@ void gpu_metal_shutdown(void)
         size_t nwords = mtl_audit_shown_bytes / sizeof(uint32_t);
         uint64_t bits = 0ull;
         for (size_t i = 0; i < nwords; i++) bits += (uint64_t)__builtin_popcount(hs[i]);
-        if (bits != mtl_audit_hits_delivered
-            || getenv("MDXFIND_METAL_EMIT_AUDIT") != NULL) {
+        /* Audited only on a real mismatch; MDXFIND_METAL_EMIT_AUDIT used to
+         * force the line unconditionally. */
+        if (bits != mtl_audit_hits_delivered) {
             fprintf(stderr,
                 "mdxfind: Metal legacy carrier emission audit: "
                 "dedup claims=%llu delivered records=%llu%s\n",
@@ -2022,6 +2226,13 @@ void gpu_metal_shutdown(void)
     cached_rule_program  = NULL;
     cached_rule_offsets  = NULL;
     cached_rule_count    = 0;
+    /* UTF-32 path: the pool is re-grown lazily and the case tables are
+     * re-uploaded on the next dispatch.  Dropped here for the same reason
+     * the rule buffers are -- a stale MTLBuffer from a torn-down device is
+     * not a cache hit, it is a use-after-teardown. */
+    buf_u32_scratch_pool = nil;
+    buf_u32_scratch_pool_words_cap = 0;
+    buf_u32_case_tab     = nil;
     buf_mask_charsets    = nil;
     buf_mask_sizes       = nil;
     buf_salt_data        = nil;
@@ -2292,7 +2503,13 @@ void gpu_metal_set_max_iter(int dev_idx, int max_iter)
  * 384,512}); registry count grew from 30 to 38, overrunning the prior
  * 32-entry cap. 64 gives headroom for Phase 2d.7c (Streebog) +
  * Phase 2d.7d (HMAC siblings) without another bump. */
-#define METAL_FAMILY_CAP 64
+/* 2026-09-16: 64 -> 96. The 8 HMAC KPASS ops take the registry to 70.
+ * Measured on OpenCL with a corrected -z fixture, all 8 KPASS ops are
+ * GPU-served there and none were on Metal -- a real port gap, host-wiring
+ * only (the carriers' `algo_mode >= 5` gate already covers mode 6).
+ * Overflow is loud (register_family prints "family registry full --
+ * dropping op=") but drops families, so raise before adding. */
+#define METAL_FAMILY_CAP 96
 #endif
 
 static struct gpu_metal_family *metal_families[METAL_FAMILY_CAP];
@@ -2305,8 +2522,8 @@ static int                      metal_family_count = 0;
  * (0..7). When a family migrates to .pso_for_variant_v2, its libraries +
  * PSOs land in these arrays instead of per-family statics. Mirrors the
  * existing metal_admit_mask[] parallel-array pattern at line 19737. */
-static __strong id<MTLLibrary>              metal_family_libs[METAL_FAMILY_CAP][8];
-static __strong id<MTLComputePipelineState> metal_family_psos[METAL_FAMILY_CAP][8];
+static __strong id<MTLLibrary>              metal_family_libs[METAL_FAMILY_CAP][V_BITS_MAX];
+static __strong id<MTLComputePipelineState> metal_family_psos[METAL_FAMILY_CAP][V_BITS_MAX];
 
 void gpu_metal_register_family(struct gpu_metal_family *f)
 {
@@ -2377,10 +2594,25 @@ static id<MTLLibrary> metal_load_library_generic(id<MTLDevice> device,
     int has_rules = (variant_bits & V_R) ? 1 : 0;
     int has_mask  = (variant_bits & V_M) ? 1 : 0;
     int has_salt  = (variant_bits & V_S) ? 1 : 0;
+    int has_u32   = (variant_bits & V_U) ? 1 : 0;
+
+    /* V_U implies V_R.  Asserted here rather than trusted at every call site:
+     * the UTF-32 path is a per-lane CHOICE between the two walkers, and
+     * u32_pick_engine returns the byte arm for a class-I word or a byte-only
+     * rule -- so a V_U variant without V_R would be a kernel whose fallback
+     * does not exist. */
+    if (has_u32 && !has_rules) {
+        fprintf(stderr,
+                "Metal: generic loader refused vbits=0x%x -- V_U requires V_R "
+                "(the UTF-32 kernel chooses per lane and needs the byte arm)\n",
+                (unsigned)variant_bits);
+        return nil;
+    }
 
     size_t total = strlen(metal_common_str)
                  + strlen(fam->core_str)
                  + (has_rules ? strlen(metal_md5_rules_str) : 0)
+                 + (has_u32 ? strlen(metal_u32_walker_str) : 0)
                  + strlen(metal_template_str)
                  + 64;
     char *src = (char *)malloc(total);
@@ -2396,6 +2628,15 @@ static id<MTLLibrary> metal_load_library_generic(id<MTLDevice> device,
     if (has_rules) {
         strcat(src, "\n");
         strcat(src, metal_md5_rules_str);
+    }
+    if (has_u32) {
+        /* AFTER metal_md5_rules_str and BEFORE metal_template_str, and the
+         * order is load-bearing: the UTF-32 walker's u32_run_pair() calls
+         * apply_rule() from the byte walker, and the template calls
+         * u32_run_pair().  A C-style single pass means definitions must
+         * precede uses. */
+        strcat(src, "\n");
+        strcat(src, metal_u32_walker_str);
     }
     strcat(src, "\n");
     strcat(src, metal_template_str);
@@ -2419,9 +2660,9 @@ static id<MTLLibrary> metal_load_library_generic(id<MTLDevice> device,
     if (has_rules) macros[@"GPU_TEMPLATE_HAS_RULES"] = @1;
     if (has_mask)  macros[@"GPU_TEMPLATE_HAS_MASK"]  = @1;
     if (has_salt)  macros[@"GPU_TEMPLATE_HAS_SALT"]  = @1;
+    if (has_u32)   macros[@"GPU_TEMPLATE_HAS_RULES32"] = @1;
 
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.preprocessorMacros = macros;
+    MTLCompileOptions *opts = metal_compile_opts(macros);
 
     NSError *err = nil;
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
@@ -2458,7 +2699,7 @@ static int metal_pso_lazy_generic(struct gpu_metal_family *fam,
                 fam->name ? fam->name : "?", fam->fam_idx);
         return -1;
     }
-    if (variant_bits >= 8u) {
+    if (variant_bits >= V_BITS_MAX) {
         fprintf(stderr,
                 "Metal: lazy_generic: family %s invalid variant_bits=0x%x\n",
                 fam->name ? fam->name : "?", (unsigned)variant_bits);
@@ -2743,6 +2984,167 @@ static struct gpu_metal_family metal_family_md4utf16 = {
                           | VBIT(V_R | V_M)),
     .pso_for_variant    = NULL,  /* legacy fn deleted in cleanup wave; v2 wrapper canonical */
     .pso_for_variant_v2 = metal_pso_for_variant_default,  /* Wave 2 */
+};
+
+/* e259 SQL5 -- first op taken end-to-end out of metal_unserved_ops[].
+ * Registering a family DISARMS that veto (the preflight skips a row whose
+ * op has a family), so a family is only safe to add once the op really
+ * computes: it also needs its digest width in metal_gpu_hash_words()
+ * (gpu/gpujob_metal.m) and a dispatch that actually fires. Validate on a
+ * wordlist large enough to engage the rules-engine pack and require the
+ * `backend=metal op=259` marker -- the 1-word per-type fixture passes even
+ * when the words are withheld and computed by nobody. */
+static struct gpu_metal_family metal_family_sql5 = {
+    .op                 = JOB_SQL5,
+    .name               = "sql5",
+    .op_category        = GPU_CAT_UNSALTED,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* e786 NTLMH -- re-registered 2026-09-16 now that metal_template.metal has the
+ * GPU_TEMPLATE_HAS_ALT_DIGEST hook.  The core always computed BOTH digests
+ * (st.h zero-extend, st.ha real UTF-16LE) and declared the hook at :112, but
+ * the Metal template had no reference to it, so only the zero-extend digest
+ * was ever compared and a non-ASCII password never matched -- in byte mode as
+ * well as under -8.  UNSALTED, so none of the salted widening applies. */
+static struct gpu_metal_family metal_family_ntlmh = {
+    .op                 = JOB_NTLMH,
+    .name               = "ntlmh",
+    .op_category        = GPU_CAT_UNSALTED,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* md5salt-carrier siblings.  These became possible on 2026-09-16 when
+ * metal_md5salt_core.metal moved from the mode-0-only hand-port to the
+ * translated twin, which implements algo_mode 1-5.  Before that the host set
+ * algo_mode and the kernel ignored it (`(void)algo_mode;`), so all four got
+ * mode 0's digest and silently matched nothing.  They share ONE PSO set with
+ * metal_family_md5salt; algo_mode is the runtime discriminator. */
+static void *md5salt_sibling_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+
+/* e350 -- md5salt carrier, algo_mode=1 */
+static struct gpu_metal_family metal_family_md5ucsalt = {
+    .op                 = JOB_MD5UCSALT,
+    .name               = "md5ucsalt",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = md5salt_sibling_pso_for_variant_v2,
+};
+
+/* e541 -- md5salt carrier, algo_mode=2 */
+static struct gpu_metal_family metal_family_md5revmd5salt = {
+    .op                 = JOB_MD5revMD5SALT,
+    .name               = "md5revmd5salt",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = md5salt_sibling_pso_for_variant_v2,
+};
+
+/* e542 -- md5salt carrier, algo_mode=3 */
+static struct gpu_metal_family metal_family_md5sub8_24salt = {
+    .op                 = JOB_MD5sub8_24SALT,
+    .name               = "md5sub8_24salt",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = md5salt_sibling_pso_for_variant_v2,
+};
+
+/* e367 -- md5salt carrier, algo_mode=4.  Needs the hash-salt snapshot
+ * (hex32(md5(salt)) rather than the raw salt), which metal_use_hashsalt() /
+ * metal_build_snapshot() in gpu/gpujob_metal.m now provide; Metal previously
+ * hardcoded use_hashsalt=0 and always took build_salt_snapshot. */
+static struct gpu_metal_family metal_family_md5_md5saltmd5pass = {
+    .op                 = JOB_MD5_MD5SALTMD5PASS,
+    .name               = "md5_md5saltmd5pass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = md5salt_sibling_pso_for_variant_v2,
+};
+
+
+static void *md5salt_sibling_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_md5salt, variant_bits);
+}
+
+/* e5 WRL -- same recipe as sql5 above: family + a digest-width arm in
+ * metal_gpu_hash_words(). Validated with bigsweep.sh (GPU hits > 0). */
+static struct gpu_metal_family metal_family_wrl = {
+    .op                 = JOB_WRL,
+    .name               = "wrl",
+    .op_category        = GPU_CAT_UNSALTED,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* e29 MD6256 -- same recipe as sql5 above: family + a digest-width arm in
+ * metal_gpu_hash_words(). Validated with bigsweep.sh (GPU hits > 0). */
+static struct gpu_metal_family metal_family_md6256 = {
+    .op                 = JOB_MD6256,
+    .name               = "md6256",
+    .op_category        = GPU_CAT_UNSALTED,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* e456 MYSQL3 -- same recipe as sql5 above: family + a digest-width arm in
+ * metal_gpu_hash_words(). Validated with bigsweep.sh (GPU hits > 0). */
+static struct gpu_metal_family metal_family_mysql3 = {
+    .op                 = JOB_MYSQL3,
+    .name               = "mysql3",
+    .op_category        = GPU_CAT_UNSALTED,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
 };
 
 static struct gpu_metal_family metal_family_md5raw = {
@@ -3474,6 +3876,362 @@ static struct gpu_metal_family metal_family_bcrypt = {
 };
 
 
+/* ======================================================================
+ * HMAC KSALT siblings (algo_mode 5: key=salt, msg=pass).  These eight carry
+ * TYPEOPT_NEEDUSER -- the HMAC key lives in Typeuser[op], not Typesalt[op].
+ * They were declined by mdxfind.c's GPU admission guard (nsalts_job is
+ * structurally 0 for them) until that guard was widened, at which point all
+ * eight came alive on OpenCL with no other change.  On Metal they additionally
+ * need gpu_salt_judy() to route them to Typeuser, which the OpenCL twin has
+ * always done and Metal never did.
+ * ====================================================================== */
+static void *md5salt_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha1saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha224saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha256saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha384saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha512saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+
+/* e214 -- md5salt carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_md5 = {
+    .op                 = JOB_HMAC_MD5,
+    .name               = "hmac_md5",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = md5salt_ksalt_pso_for_variant_v2,
+};
+
+/* e215 -- sha1saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_sha1 = {
+    .op                 = JOB_HMAC_SHA1,
+    .name               = "hmac_sha1",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha1saltpass_ksalt_pso_for_variant_v2,
+};
+
+/* e216 -- sha224saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_sha224 = {
+    .op                 = JOB_HMAC_SHA224,
+    .name               = "hmac_sha224",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha224saltpass_ksalt_pso_for_variant_v2,
+};
+
+/* e217 -- sha256saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_sha256 = {
+    .op                 = JOB_HMAC_SHA256,
+    .name               = "hmac_sha256",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha256saltpass_ksalt_pso_for_variant_v2,
+};
+
+/* e543 -- sha384saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_sha384 = {
+    .op                 = JOB_HMAC_SHA384,
+    .name               = "hmac_sha384",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha384saltpass_ksalt_pso_for_variant_v2,
+};
+
+/* e218 -- sha512saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_sha512 = {
+    .op                 = JOB_HMAC_SHA512,
+    .name               = "hmac_sha512",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha512saltpass_ksalt_pso_for_variant_v2,
+};
+
+/* e211 -- ripemd160saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_rmd160 = {
+    .op                 = JOB_HMAC_RMD160,
+    .name               = "hmac_rmd160",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    /* canonical: its own PSO set, because the KPASS sibling it
+                           * would otherwise share is declared later in this
+                           * file and a static struct cannot be forward-declared
+                           * then defined under newer clang. */
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* e213 -- ripemd320saltpass carrier, algo_mode=5 (KSALT, user-keyed) */
+static struct gpu_metal_family metal_family_hmac_rmd320 = {
+    .op                 = JOB_HMAC_RMD320,
+    .name               = "hmac_rmd320",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    /* canonical: its own PSO set, because the KPASS sibling it
+                           * would otherwise share is declared later in this
+                           * file and a static struct cannot be forward-declared
+                           * then defined under newer clang. */
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* Resolver bodies, deferred until after the structs they name. */
+static void *md5salt_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_md5salt, variant_bits);
+}
+static void *sha256saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha256saltpass, variant_bits);
+}
+static void *sha224saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha224saltpass, variant_bits);
+}
+static void *sha512saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha512saltpass, variant_bits);
+}
+static void *sha1saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha1saltpass, variant_bits);
+}
+static void *sha384saltpass_ksalt_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha384saltpass, variant_bits);
+}
+
+
+/* ======================================================================
+ * HMAC KPASS siblings (algo_mode 6: key=pass, msg=salt).  Host wiring only:
+ * every carrier's `algo_mode >= 5u` gate already implements mode 6 on BOTH
+ * backends, verified identical core-by-core.
+ *
+ * These are a MEASURED Metal gap, not a guess: with a corrected -z fixture
+ * (see tools/gputests/bigsweep.sh -- it needs `-s` or -z emits an empty
+ * salt) all 8 PASS on OpenCL with GPU hits and none were served on Metal.
+ * Their KSALT counterparts (e211 e213 e214-e218 e543) are CPU-only on BOTH
+ * backends and are deliberately NOT wired here.
+ * ====================================================================== */
+static void *md5salt_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha1saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha224saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha256saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha384saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+static void *sha512saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits);
+
+/* e792 -- md5salt carrier, algo_mode=6 (KPASS) */
+static struct gpu_metal_family metal_family_hmac_md5_kpass = {
+    .op                 = JOB_HMAC_MD5_KPASS,
+    .name               = "hmac_md5_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = md5salt_kpass_pso_for_variant_v2,
+};
+
+/* e793 -- sha1saltpass carrier, algo_mode=6 (KPASS) */
+static struct gpu_metal_family metal_family_hmac_sha1_kpass = {
+    .op                 = JOB_HMAC_SHA1_KPASS,
+    .name               = "hmac_sha1_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha1saltpass_kpass_pso_for_variant_v2,
+};
+
+/* e794 -- sha224saltpass carrier, algo_mode=6 (KPASS) */
+static struct gpu_metal_family metal_family_hmac_sha224_kpass = {
+    .op                 = JOB_HMAC_SHA224_KPASS,
+    .name               = "hmac_sha224_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha224saltpass_kpass_pso_for_variant_v2,
+};
+
+/* e795 -- sha256saltpass carrier, algo_mode=6 (KPASS) */
+static struct gpu_metal_family metal_family_hmac_sha256_kpass = {
+    .op                 = JOB_HMAC_SHA256_KPASS,
+    .name               = "hmac_sha256_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha256saltpass_kpass_pso_for_variant_v2,
+};
+
+/* e796 -- sha384saltpass carrier, algo_mode=6 (KPASS) */
+static struct gpu_metal_family metal_family_hmac_sha384_kpass = {
+    .op                 = JOB_HMAC_SHA384_KPASS,
+    .name               = "hmac_sha384_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha384saltpass_kpass_pso_for_variant_v2,
+};
+
+/* e797 -- sha512saltpass carrier, algo_mode=6 (KPASS) */
+static struct gpu_metal_family metal_family_hmac_sha512_kpass = {
+    .op                 = JOB_HMAC_SHA512_KPASS,
+    .name               = "hmac_sha512_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha512saltpass_kpass_pso_for_variant_v2,
+};
+
+/* e798 -- ripemd160saltpass carrier, algo_mode=6 (KPASS) */  /* CANONICAL for the ripemd160saltpass carrier */
+static struct gpu_metal_family metal_family_hmac_rmd160_kpass = {
+    .op                 = JOB_HMAC_RMD160_KPASS,
+    .name               = "hmac_rmd160_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* e799 -- ripemd320saltpass carrier, algo_mode=6 (KPASS) */  /* CANONICAL for the ripemd320saltpass carrier */
+static struct gpu_metal_family metal_family_hmac_rmd320_kpass = {
+    .op                 = JOB_HMAC_RMD320_KPASS,
+    .name               = "hmac_rmd320_kpass",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
+/* Resolver bodies, deferred until after the structs they name. */
+static void *sha384saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha384saltpass, variant_bits);
+}
+static void *sha224saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha224saltpass, variant_bits);
+}
+static void *md5salt_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_md5salt, variant_bits);
+}
+static void *sha256saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha256saltpass, variant_bits);
+}
+static void *sha1saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha1saltpass, variant_bits);
+}
+static void *sha512saltpass_kpass_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha512saltpass, variant_bits);
+}
+
+
 /* Register all built-in families. Called from gpu_metal_init at end. */
 static void metal_register_builtin_families(void)
 {
@@ -3520,6 +4278,60 @@ static void metal_register_builtin_families(void)
         @"HASH_WORDS":       @4,
         @"HASH_BLOCK_BYTES": @64,
         @"BASE_ALGO":        @"md4utf16"
+    });
+    metal_family_sql5.core_str    = metal_sql5_core_str;
+    metal_family_sql5.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @5,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sql5"
+    });
+    metal_family_ntlmh.core_str    = metal_ntlmh_core_str;
+    metal_family_ntlmh.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"ntlmh"
+    });
+    metal_family_md5ucsalt.core_str    = metal_md5salt_core_str;
+    metal_family_md5ucsalt.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5"
+    });
+    metal_family_md5revmd5salt.core_str    = metal_md5salt_core_str;
+    metal_family_md5revmd5salt.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5"
+    });
+    metal_family_md5sub8_24salt.core_str    = metal_md5salt_core_str;
+    metal_family_md5sub8_24salt.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5"
+    });
+    metal_family_md5_md5saltmd5pass.core_str    = metal_md5salt_core_str;
+    metal_family_md5_md5saltmd5pass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5"
+    });
+    metal_family_wrl.core_str    = metal_wrl_core_str;
+    metal_family_wrl.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @16,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"wrl"
+    });
+    metal_family_md6256.core_str    = metal_md6256_core_str;
+    metal_family_md6256.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @8,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md6"
+    });
+    metal_family_mysql3.core_str    = metal_mysql3_core_str;
+    metal_family_mysql3.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"mysql3"
     });
     metal_family_md5raw.core_str    = metal_md5raw_core_str;
     metal_family_md5raw.base_macros = (void *)CFBridgingRetain(@{
@@ -3886,6 +4698,15 @@ static void metal_register_builtin_families(void)
     gpu_metal_register_family(&metal_family_md5salt);
     gpu_metal_register_family(&metal_family_md4);
     gpu_metal_register_family(&metal_family_md4utf16);
+    gpu_metal_register_family(&metal_family_sql5);  /* e259 */
+    gpu_metal_register_family(&metal_family_ntlmh);  /* e786 */
+    gpu_metal_register_family(&metal_family_md5ucsalt);  /* e350 */
+    gpu_metal_register_family(&metal_family_md5revmd5salt);  /* e541 */
+    gpu_metal_register_family(&metal_family_md5sub8_24salt);  /* e542 */
+    gpu_metal_register_family(&metal_family_md5_md5saltmd5pass);  /* e367 */
+    gpu_metal_register_family(&metal_family_wrl);  /* e5 */
+    gpu_metal_register_family(&metal_family_md6256);  /* e29 */
+    gpu_metal_register_family(&metal_family_mysql3);  /* e456 */
     gpu_metal_register_family(&metal_family_md5raw);
     gpu_metal_register_family(&metal_family_md5passsalt);
     gpu_metal_register_family(&metal_family_md5saltpass);
@@ -3962,6 +4783,124 @@ static void metal_register_builtin_families(void)
      * Registry count: 51 -> 52 (cap=64, headroom 12). FINAL Phase 2d
      * sub-phase. */
     gpu_metal_register_family(&metal_family_bcrypt);
+
+    /* HMAC KSALT siblings: carrier core_str + macros */
+    metal_family_hmac_md5.core_str    = metal_md5salt_core_str;
+    metal_family_hmac_md5.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5"
+    });
+    metal_family_hmac_sha1.core_str    = metal_sha1saltpass_core_str;
+    metal_family_hmac_sha1.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @5,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha1"
+    });
+    metal_family_hmac_sha224.core_str    = metal_sha224saltpass_core_str;
+    metal_family_hmac_sha224.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @7,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha224"
+    });
+    metal_family_hmac_sha256.core_str    = metal_sha256saltpass_core_str;
+    metal_family_hmac_sha256.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @8,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha256"
+    });
+    metal_family_hmac_sha384.core_str    = metal_sha384saltpass_core_str;
+    metal_family_hmac_sha384.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @12,
+        @"HASH_BLOCK_BYTES": @128,
+        @"BASE_ALGO":        @"sha512"
+    });
+    metal_family_hmac_sha512.core_str    = metal_sha512saltpass_core_str;
+    metal_family_hmac_sha512.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @16,
+        @"HASH_BLOCK_BYTES": @128,
+        @"BASE_ALGO":        @"sha512"
+    });
+    metal_family_hmac_rmd160.core_str    = metal_ripemd160saltpass_core_str;
+    metal_family_hmac_rmd160.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @5,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"rmd160"
+    });
+    metal_family_hmac_rmd320.core_str    = metal_ripemd320saltpass_core_str;
+    metal_family_hmac_rmd320.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @10,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"rmd320"
+    });
+
+    gpu_metal_register_family(&metal_family_hmac_md5);  /* e214 */
+    gpu_metal_register_family(&metal_family_hmac_sha1);  /* e215 */
+    gpu_metal_register_family(&metal_family_hmac_sha224);  /* e216 */
+    gpu_metal_register_family(&metal_family_hmac_sha256);  /* e217 */
+    gpu_metal_register_family(&metal_family_hmac_sha384);  /* e543 */
+    gpu_metal_register_family(&metal_family_hmac_sha512);  /* e218 */
+    gpu_metal_register_family(&metal_family_hmac_rmd160);  /* e211 */
+    gpu_metal_register_family(&metal_family_hmac_rmd320);  /* e213 */
+
+    /* HMAC KPASS siblings: carrier core_str + macros */
+    metal_family_hmac_md5_kpass.core_str    = metal_md5salt_core_str;
+    metal_family_hmac_md5_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5"
+    });
+    metal_family_hmac_sha1_kpass.core_str    = metal_sha1saltpass_core_str;
+    metal_family_hmac_sha1_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @5,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha1"
+    });
+    metal_family_hmac_sha224_kpass.core_str    = metal_sha224saltpass_core_str;
+    metal_family_hmac_sha224_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @7,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha224"
+    });
+    metal_family_hmac_sha256_kpass.core_str    = metal_sha256saltpass_core_str;
+    metal_family_hmac_sha256_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @8,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha256"
+    });
+    metal_family_hmac_sha384_kpass.core_str    = metal_sha384saltpass_core_str;
+    metal_family_hmac_sha384_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @12,
+        @"HASH_BLOCK_BYTES": @128,
+        @"BASE_ALGO":        @"sha512"
+    });
+    metal_family_hmac_sha512_kpass.core_str    = metal_sha512saltpass_core_str;
+    metal_family_hmac_sha512_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @16,
+        @"HASH_BLOCK_BYTES": @128,
+        @"BASE_ALGO":        @"sha512"
+    });
+    metal_family_hmac_rmd160_kpass.core_str    = metal_ripemd160saltpass_core_str;
+    metal_family_hmac_rmd160_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @5,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"rmd160"
+    });
+    metal_family_hmac_rmd320_kpass.core_str    = metal_ripemd320saltpass_core_str;
+    metal_family_hmac_rmd320_kpass.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @10,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"rmd320"
+    });
+
+    gpu_metal_register_family(&metal_family_hmac_md5_kpass);  /* e792 */
+    gpu_metal_register_family(&metal_family_hmac_sha1_kpass);  /* e793 */
+    gpu_metal_register_family(&metal_family_hmac_sha224_kpass);  /* e794 */
+    gpu_metal_register_family(&metal_family_hmac_sha256_kpass);  /* e795 */
+    gpu_metal_register_family(&metal_family_hmac_sha384_kpass);  /* e796 */
+    gpu_metal_register_family(&metal_family_hmac_sha512_kpass);  /* e797 */
+    gpu_metal_register_family(&metal_family_hmac_rmd160_kpass);  /* e798 */
+    gpu_metal_register_family(&metal_family_hmac_rmd320_kpass);  /* e799 */
 
     /* D5b Wave 1 2026-05-16: post-registration walk to populate fam_idx
      * for every registered family. The generic loader / lazy / resolver
@@ -4140,38 +5079,10 @@ static int _cached_metal_a_variant = -2;
 
 static void gpu_metal_kernel_a_variant_compute(void)
 {
-    if (_cached_metal_a_variant != -2) return;
-
-    const char *e_a   = getenv("MDXFIND_KERNEL_A_PROTO");
-    const char *e_var = getenv("MDXFIND_KERNEL_A_VARIANT");
-
-    if (!e_a || strcmp(e_a, "1") != 0) {
-        _cached_metal_a_variant = 0;
-        return;
-    }
-    int variant = 1;
-    if (e_var && *e_var) {
-        variant = atoi(e_var);
-    }
-    if (variant != 1 && variant != 2 && variant != 3 && variant != 4) {
-        fprintf(stderr,
-            "Metal: MDXFIND_KERNEL_A_PROTO=1 with MDXFIND_KERNEL_A_VARIANT=%d "
-            "is not implemented yet (sub-phase 1a.4 ships VARIANT=1/2/3/4 "
-            "(rules/masks/rules+masks/bruteforce)); falling through to "
-            "existing wiring.\n",
-            variant);
-        _cached_metal_a_variant = 0;
-        return;
-    }
-    fprintf(stderr,
-        "Metal: Phase 1a kernel A%d (%s) production path enabled "
-        "via MDXFIND_KERNEL_A_PROTO=1 (variant=%d).\n",
-        variant,
-        variant == 1 ? "rules-only" :
-        variant == 2 ? "masks-only" :
-        variant == 3 ? "rules+masks" : "bruteforce",
-        variant);
-    _cached_metal_a_variant = variant;
+    /* Variant 0 = existing production wiring.  A1-A4 sat behind
+     * MDXFIND_KERNEL_A_PROTO / _VARIANT, removed 2026-09-16; the sources
+     * are retained but unreachable without a native flag. */
+    _cached_metal_a_variant = 0;
 }
 
 int gpu_metal_kernel_a_proto_enabled(void)
@@ -4204,9 +5115,7 @@ int gpu_metal_kernel_a_active_variant(void)
  * Phase 5 alongside the OpenCL twin. */
 int gpu_metal_hx_codegen_enabled(void)
 {
-    const char *e = getenv("MDXFIND_HX_CODEGEN");
-    if (e == NULL) return 1;
-    if (e[0] == '0' && e[1] == '\0') return 0;
+    /* Always on; MDXFIND_HX_CODEGEN=0 used to disable it. */
     return 1;
 }
 
@@ -4242,22 +5151,7 @@ int gpu_metal_hx_codegen_enabled(void)
  * (no manual cache-key extension needed). Per spec D1.a / R6. */
 int gpu_metal_experiment_knobg_vec_write_enabled(void)
 {
-    static int _cached = -1;
-    if (_cached != -1) return _cached;
-    const char *e = getenv("MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE");
-    _cached = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
-    if (_cached) {
-        fprintf(stderr,
-            "Metal: EXPERIMENT MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1 "
-            "(Knob G) -- kernel A1 (cand_rules_phase0) JIT-built with "
-            "-DKNOBG_VEC_WRITE=1; per-byte candidate write loop replaced "
-            "with direct uint stores from buf[] (no stage[] copy, per "
-            "spec D5.a -- avoids M1 register-budget spill); per-slot byte "
-            "claim rounded up to a 16-byte multiple. Crack set unchanged "
-            "(consumer reads only plen bytes; pad never accessed). "
-            "Production path e347 + Phase-5a family algos affected.\n");
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE (Knob G) */
 }
 
 /* gpu_metal_profile_variant -- PROFILE_VARIANT perf-decomposition
@@ -4307,50 +5201,7 @@ int gpu_metal_experiment_knobg_vec_write_enabled(void)
  * (per spec R10). */
 int gpu_metal_profile_variant(void)
 {
-    static int _cached = -1;
-    if (_cached != -1) return _cached;
-    const char *e = getenv("MDXFIND_METAL_PROFILE_VARIANT");
-    if (e == NULL || e[0] == '\0') {
-        _cached = 0;
-        return _cached;
-    }
-    /* Accept "0".."6"; reject anything else with warn-and-zero. */
-    if (e[0] >= '0' && e[0] <= '6' && e[1] == '\0') {
-        _cached = e[0] - '0';
-    } else {
-        fprintf(stderr,
-            "Metal: NOTICE -- MDXFIND_METAL_PROFILE_VARIANT=%s invalid "
-            "(expected 0..6); falling back to 0 / production.\n", e);
-        _cached = 0;
-        return _cached;
-    }
-    if (_cached >= 1 && _cached <= 5) {
-        fprintf(stderr,
-            "Metal: EXPERIMENT MDXFIND_METAL_PROFILE_VARIANT=%d -- kernel "
-            "A1 (cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=%d. "
-            "STUB BUILD: kernel A produces NO valid candidates for V1/V2/"
-            "V4/V5; host actual_slots=0 makes kernel B a no-op. V3 "
-            "produces only no-rule-pass survivors (the synthetic ':' "
-            "rule). Crack count expected ZERO for V1/V2/V4/V5; for V3 "
-            "expected the no-rule-baseline count. Use for kernel_a_us "
-            "timing attribution only. Timing harness auto-enabled "
-            "(MDXFIND_METAL_KERNEL_A_TIMING semantics). PROFILE_VARIANT "
-            "takes precedence over MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_"
-            "WRITE (which is IGNORED while PROFILE_VARIANT is 1..6).\n",
-            _cached, _cached);
-    } else if (_cached == 6) {
-        fprintf(stderr,
-            "Metal: EXPERIMENT MDXFIND_METAL_PROFILE_VARIANT=6 -- kernel "
-            "A1 (cand_rules_phase0) JIT-built with -DPROFILE_VARIANT=6 "
-            "(Metal Knob G micro-benchmark variant). REAL CANDIDATES "
-            "produced with direct-from-buf uint stores FORCED ON "
-            "(regardless of MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE). "
-            "Crack output is bit-equivalent to V0 + Metal Knob G ON. "
-            "The V0-vs-V6 kernel_a_us delta isolates the per-byte-write "
-            "component reduction attributable to Metal Knob G. Timing "
-            "harness auto-enabled.\n");
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_METAL_PROFILE_VARIANT */
 }
 
 /* gpu_metal_kernel_a_timing_enabled -- Phase 0 timing-harness gate
@@ -4374,29 +5225,7 @@ int gpu_metal_profile_variant(void)
  * (Per spec D3 + D2.b promote-to-implicit refactor 2026-05-29.) */
 int gpu_metal_kernel_a_timing_enabled(void)
 {
-    static int _cached = -1;
-    if (_cached != -1) return _cached;
-    const char *e = getenv("MDXFIND_METAL_KERNEL_A_TIMING");
-    int direct = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
-    int via_pv = (gpu_metal_profile_variant() != 0) ? 1 : 0;
-    _cached = (direct || via_pv) ? 1 : 0;
-    if (_cached) {
-        if (direct) {
-            fprintf(stderr,
-                "Metal: MDXFIND_METAL_KERNEL_A_TIMING=1 -- per-dispatch "
-                "kernel-A wall time will be recorded via MTLCommandBuffer "
-                "GPUStartTime/GPUEndTime; shutdown-time aggregate dumped "
-                "to stderr.\n");
-        } else {
-            fprintf(stderr,
-                "Metal: kernel-A timing auto-enabled by MDXFIND_METAL_"
-                "PROFILE_VARIANT=%d -- per-dispatch kernel-A wall time "
-                "will be recorded via MTLCommandBuffer GPUStartTime/"
-                "GPUEndTime; shutdown-time aggregate dumped to stderr.\n",
-                gpu_metal_profile_variant());
-        }
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_METAL_KERNEL_A_TIMING */
 }
 
 /* metal_kernel_a_timing -- Phase 0 timing accumulator (Knob G spec D3).
@@ -4466,19 +5295,7 @@ static void metal_kernel_a_timing_record(int dev_idx, int op, double dt_us)
  * Decision cached on first call. */
 int gpu_metal_dispatch_trace_enabled(void)
 {
-    static int _cached = -1;
-    if (_cached != -1) return _cached;
-    const char *e = getenv("MDXFIND_DISPATCH_TRACE");
-    _cached = (e && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0')) ? 1 : 0;
-    if (_cached) {
-        fprintf(stderr,
-            "Metal: MDXFIND_DISPATCH_TRACE=%s -- per-chunk "
-            "[disp-metal] line emitted with kernel_a_us / host_gap_us / "
-            "kernel_b_us / span_us derived from MTLCommandBuffer GPU-side "
-            "timestamps (twin of OpenCL gpu_opencl.c per-stage profiling).\n",
-            e);
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_DISPATCH_TRACE */
 }
 
 /* gpu_metal_now_us -- monotonic host-wall microsecond clock for span_us
@@ -4510,45 +5327,7 @@ static uint64_t gpu_metal_now_us(void)
  * feedback_check_existing_traces_first.md. */
 int gpu_metal_kernel_a4_profile_variant(void)
 {
-    static int _cached = -1;
-    if (_cached != -1) return _cached;
-    const char *e = getenv("MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT");
-    if (e == NULL || e[0] == '\0') {
-        _cached = 0;
-        return _cached;
-    }
-    if (e[0] >= '0' && e[0] <= '5' && e[1] == '\0') {
-        _cached = e[0] - '0';
-    } else {
-        fprintf(stderr,
-            "Metal: NOTICE -- MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT=%s "
-            "invalid (expected 0..5; V6 was removed by the 2026-05-30 A4 "
-            "C5 default-on refactor -- uint4 stores are now the V0 "
-            "production path); falling back to 0 / production.\n", e);
-        _cached = 0;
-        return _cached;
-    }
-    /* R5 host gate: only active when KERNEL_A_VARIANT=4 dispatching. */
-    if (_cached > 0 && gpu_metal_kernel_a_active_variant() != 4) {
-        fprintf(stderr,
-            "Metal: NOTICE -- MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT=%d "
-            "requires MDXFIND_KERNEL_A_VARIANT=4; falling through to "
-            "baseline.\n", _cached);
-        _cached = 0;
-        return _cached;
-    }
-    if (_cached >= 1 && _cached <= 5) {
-        fprintf(stderr,
-            "Metal: EXPERIMENT MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT=%d "
-            "-- kernel A4 (cand_bruteforce_phase0) JIT-built with "
-            "-DA4_PROFILE_VARIANT=%d. STUB BUILD: A4 produces NO valid "
-            "candidates (harness short-circuits on actual_slots=0). Use "
-            "for kernel_a4_us timing attribution only. Timing harness "
-            "auto-enabled (per-dispatch [metal-kA4] line + atexit "
-            "AGGREGATE).\n",
-            _cached, _cached);
-    }
-    return _cached;
+    return 0;   /* was MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT */
 }
 
 /* A4-specific timing accumulator (independent from A1 _mkt_*). */
@@ -5016,7 +5795,7 @@ static size_t gpu_metal_proto_cand_cap_bytes(int dev_idx)
     const size_t cap_max = (size_t)GPU_RULES_METAL_CAND_CAP_MAX_MB * 1024u * 1024u;
 
     size_t cap = 0;
-    const char *e = getenv("MDXFIND_METAL_GPU_CAND_CAP_MB");
+    const char *e = NULL;   /* was MDXFIND_METAL_GPU_CAND_CAP_MB */
     if (e && *e) {
         long mb = atol(e);
         if (mb > 0) cap = (size_t)mb * 1024u * 1024u;
@@ -5231,6 +6010,27 @@ static uint32_t *gpu_metal_kernelb_dispatch_proto_chunked(
         memcpy(p + 132, word_offset, wo_size);
         memcpy(p + payload_pkt, packed_words, packed_size);
 
+        /* UTF-32 path.  Two things the byte path does not need, both on the
+         * PAYLOAD COPY and never on the caller's array (the hit replay in
+         * gpujob_metal.m reads g->word_offset back and masks nothing):
+         *
+         *  - the per-word CLASS in word_offset bits 30-31, which is what routes
+         *    each (word, rule) pair to an engine.  Without it every word reads
+         *    as class A and the byte engine silently answers for class-W words.
+         *  - params.num_masks as the base of rule_offset's SECOND half.  It is
+         *    0 on every byte-mode kernel-A dispatch and unread by
+         *    cand_rules_phase0; params.num_rules cannot serve because it is the
+         *    per-CHUNK rule count under rule-axis chunking. */
+        if (gpu_u32_active()) {
+            uint32_t *pwoff = (uint32_t *)(p + 132);
+            const unsigned char *ppk = (const unsigned char *)(p + payload_pkt);
+            uint32_t cls_counts[3];
+            gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
+            ((OCLParams *)p)->num_masks = (uint32_t)gpu_u32_dev_nrules;
+            if (metal_ensure_u32_scratch_pool(num_words) < 0) return NULL;
+            if (metal_ensure_u32_case_tab() < 0) return NULL;
+        }
+
         /* --- A2. One-time buf_hashes_shown alloc + zero (cross-chunk dedup). *
          * Sized for hash_data_count + overflow_count. Zeroed ONCE for the
          * whole word-batch so a hash cracked in chunk c is not re-emitted
@@ -5389,7 +6189,13 @@ static uint32_t *gpu_metal_kernelb_dispatch_proto_chunked(
                 memset([mtl_buf_proto_state contents], 0, 3u * sizeof(uint32_t));
 
                 /* --- D3. Encode + dispatch kernel A1. */
-                NSUInteger global_a = (NSUInteger)num_words * (NSUInteger)this_count;
+                /* `-8` runs one lane per WORD with the rule axis inside the
+                 * kernel -- see the grid-shape note in
+                 * metal_kernel_a_rules.metal.  Byte mode keeps one lane per
+                 * (word, rule). */
+                NSUInteger global_a = gpu_u32_active()
+                                    ? (NSUInteger)num_words
+                                    : (NSUInteger)num_words * (NSUInteger)this_count;
                 NSUInteger padded_a = ((global_a + tg_size_a - 1) / tg_size_a) * tg_size_a;
                 NSUInteger groups_a = padded_a / tg_size_a;
                 if (groups_a == 0) groups_a = 1;
@@ -5405,6 +6211,10 @@ static uint32_t *gpu_metal_kernelb_dispatch_proto_chunked(
                 [enc_a setBuffer:mtl_buf_proto_packed       offset:0 atIndex:3];
                 [enc_a setBuffer:mtl_buf_proto_chunk_index  offset:0 atIndex:4];
                 [enc_a setBuffer:mtl_buf_proto_state        offset:0 atIndex:5];
+                if (gpu_u32_active()) {
+                    [enc_a setBuffer:buf_u32_case_tab     offset:0 atIndex:6];
+                    [enc_a setBuffer:buf_u32_scratch_pool offset:0 atIndex:7];
+                }
                 [enc_a dispatchThreadgroups:grid_a threadsPerThreadgroup:tg_a];
                 [enc_a endEncoding];
                 /* MDXFIND_DISPATCH_TRACE: host-wall span markers
@@ -5729,20 +6539,9 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
         return NULL;
     }
 
-    /* MDXFIND_HX_CODEGEN=0 opt-out FATAL per 4a.2 design. On Metal
-     * there is no legacy hand-written kernel B path to fall back to;
-     * the codegen IS the Metal kernel-B implementation. The opt-out
-     * is therefore a documented-but-unsupported configuration. */
-    if (!gpu_metal_hx_codegen_enabled()) {
-        fprintf(stderr,
-            "FATAL: %s:%d Metal GPU[%d]: MDXFIND_HX_CODEGEN=0 opt-out "
-            "is not supported on Metal -- Metal has no legacy kernel B "
-            "path (the codegen IS the Metal kernel-B implementation). "
-            "Unset MDXFIND_HX_CODEGEN or set it to any value other than "
-            "the literal \"0\" to use the codegen path on %s\n",
-            __FILE__, __LINE__, dev_idx, hostname);
-        exit(1);
-    }
+    /* On Metal the codegen IS the kernel-B implementation, so there was never
+     * anything to opt out to.  The MDXFIND_HX_CODEGEN=0 opt-out and the FATAL
+     * that rejected it here were removed 2026-09-16. */
 
     /* Build kernel A1 PSO lazily (once per process). FATAL on failure
      * via the helper's internal GPU_FATAL path. */
@@ -5963,12 +6762,36 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
         memcpy(p + 132, word_offset, wo_size);
         memcpy(p + payload_pkt, packed_words, packed_size);
 
+        /* UTF-32 path.  Two things the byte path does not need, both on the
+         * PAYLOAD COPY and never on the caller's array (the hit replay in
+         * gpujob_metal.m reads g->word_offset back and masks nothing):
+         *
+         *  - the per-word CLASS in word_offset bits 30-31, which is what routes
+         *    each (word, rule) pair to an engine.  Without it every word reads
+         *    as class A and the byte engine silently answers for class-W words.
+         *  - params.num_masks as the base of rule_offset's SECOND half.  It is
+         *    0 on every byte-mode kernel-A dispatch and unread by
+         *    cand_rules_phase0; params.num_rules cannot serve because it is the
+         *    per-CHUNK rule count under rule-axis chunking. */
+        if (gpu_u32_active()) {
+            uint32_t *pwoff = (uint32_t *)(p + 132);
+            const unsigned char *ppk = (const unsigned char *)(p + payload_pkt);
+            uint32_t cls_counts[3];
+            gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
+            ((OCLParams *)p)->num_masks = (uint32_t)gpu_u32_dev_nrules;
+            if (metal_ensure_u32_scratch_pool(num_words) < 0) return NULL;
+            if (metal_ensure_u32_case_tab() < 0) return NULL;
+        }
+
         /* Zero the kernel-A state buffer (slot/byte/overflow counters). */
         memset([mtl_buf_proto_state contents], 0, 3u * sizeof(uint32_t));
 
         /* --- 5. Encode + dispatch kernel A1 (6-arg signature). */
         const NSUInteger tg_size_a = 64;
-        NSUInteger global_a = (NSUInteger)num_words * (NSUInteger)n_rules;
+        /* `-8`: one lane per WORD -- see the chunked twin above. */
+        NSUInteger global_a = gpu_u32_active()
+                            ? (NSUInteger)num_words
+                            : (NSUInteger)num_words * (NSUInteger)n_rules;
         NSUInteger padded_a = ((global_a + tg_size_a - 1) / tg_size_a) * tg_size_a;
         NSUInteger groups_a = padded_a / tg_size_a;
 
@@ -5984,6 +6807,10 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
         [enc_a setBuffer:mtl_buf_proto_packed       offset:0 atIndex:3];
         [enc_a setBuffer:mtl_buf_proto_chunk_index  offset:0 atIndex:4];
         [enc_a setBuffer:mtl_buf_proto_state        offset:0 atIndex:5];
+        if (gpu_u32_active()) {
+            [enc_a setBuffer:buf_u32_case_tab     offset:0 atIndex:6];
+            [enc_a setBuffer:buf_u32_scratch_pool offset:0 atIndex:7];
+        }
         [enc_a dispatchThreadgroups:grid_a threadsPerThreadgroup:tg_a];
         [enc_a endEncoding];
         /* MDXFIND_DISPATCH_TRACE: host-wall span markers
@@ -6447,7 +7274,7 @@ static void gpu_metal_kernel_a_trace_dump(int dev_idx,
     const void *index_data, size_t index_bytes,
     const void *packed_data, size_t packed_bytes)
 {
-    const char *prefix = getenv("MDXFIND_KERNEL_A_TRACE");
+    const char *prefix = NULL;   /* was MDXFIND_KERNEL_A_TRACE */
     if (prefix == NULL || prefix[0] == '\0') return;
 
     char path[1024];
@@ -6515,10 +7342,9 @@ uint32_t *gpu_metal_kernelA_dispatch_proto(int dev_idx,
 {
     if (nhits_out != NULL) *nhits_out = 0;
 
-    /* Gate: either legacy MDXFIND_KERNEL_B_PROTO or new
-     * MDXFIND_KERNEL_A_PROTO=1 (variant 1) per sub-phase 1a.1 union. */
-    if (getenv("MDXFIND_KERNEL_B_PROTO") == NULL &&
-        !gpu_metal_kernel_a_proto_enabled()) {
+    /* Gate: kernel A proto only.  The legacy MDXFIND_KERNEL_B_PROTO half of
+     * this union was removed 2026-09-16. */
+    if (!gpu_metal_kernel_a_proto_enabled()) {
         return NULL;
     }
     if (op != JOB_MD5MD5SALT) return NULL;
@@ -7507,7 +8333,7 @@ uint32_t *gpu_metal_kernelA_bruteforce_dispatch(int dev_idx,
          * so the operator can collect the V0 baseline alongside
          * V1..V5. Zero overhead when env unset. */
         {
-            const char *_a4pv_env = getenv("MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT");
+            const char *_a4pv_env = NULL;   /* was MDXFIND_METAL_KERNEL_A4_PROFILE_VARIANT */
             if (_a4pv_env != NULL && _a4pv_env[0] != '\0') {
                 double t0 = cb.GPUStartTime;
                 double t1 = cb.GPUEndTime;
@@ -7613,6 +8439,77 @@ static int metal_ensure_buf_scratch_pool(uint32_t need_words)
     return 0;
 }
 
+/* Twin of metal_ensure_buf_scratch_pool for the UTF-32 walker's three
+ * per-lane arrays.  Same shape, same reasons, different stride: one
+ * METAL_U32_SLOT_BYTES slice per WORD (not per word x rule -- the rule axis
+ * is the kernel's inner loop and one lane owns its slot for the whole
+ * chunk), Private storage, grown lazily and re-allocated only upward.
+ *
+ * Deliberately a SECOND pool rather than a widened first one.  The byte
+ * walker's pool is bound for every variant including V_NONE; this one exists
+ * only when the UTF-32 variant is live, and a non-UTF-32 run should not pay
+ * 302 MB for a buffer no kernel reads.
+ *
+ * Returns 0 on success; allocation failure is fatal, not a fallback -- a
+ * quiet nil here would dispatch a kernel whose scratch pointer is null and
+ * produce a clean-looking run that computed nothing. */
+static int metal_ensure_u32_scratch_pool(uint32_t need_words)
+{
+    if (need_words == 0) need_words = 1;
+    if (buf_u32_scratch_pool != nil
+        && buf_u32_scratch_pool_words_cap >= need_words)
+        return 0;
+
+    buf_u32_scratch_pool = nil;
+
+    size_t bytes = (size_t)need_words * METAL_U32_SLOT_BYTES;
+    if (bytes < METAL_MIN_BUFFER_BYTES) bytes = METAL_MIN_BUFFER_BYTES;
+
+    buf_u32_scratch_pool =
+        [mtl_device newBufferWithLength:bytes
+                                options:MTLResourceStorageModePrivate];
+    if (buf_u32_scratch_pool == nil) {
+        GPU_FATAL("Metal: buf_u32_scratch_pool newBuffer(%zu bytes / %u words "
+                  "/ U32_SLOT_BYTES=%zu) failed",
+                  bytes, need_words, (size_t)METAL_U32_SLOT_BYTES);
+    }
+    buf_u32_scratch_pool_words_cap = need_words;
+
+    GPU_DEBUG_FPRINTF(stderr,
+            "Metal: buf_u32_scratch_pool allocated (%zu bytes / %u words / "
+            "U32_SLOT_BYTES=%zu)\n",
+            bytes, need_words, (size_t)METAL_U32_SLOT_BYTES);
+    return 0;
+}
+
+/* The case tables, uploaded once.  Generated from ../latin_case.h by
+ * gen_u32_tables.py so they cannot drift from the CPU engine's table; the
+ * kernel reads them through U32_CT_UP/U32_CT_LO, which is why the two arrays
+ * travel CONCATENATED (up at [0..N-1], lo above) in one allocation. */
+static int metal_ensure_u32_case_tab(void)
+{
+    if (buf_u32_case_tab != nil) return 0;
+
+    size_t bytes = sizeof(gpu_u32_case_host);
+    if (bytes < METAL_MIN_BUFFER_BYTES) bytes = METAL_MIN_BUFFER_BYTES;
+
+    buf_u32_case_tab =
+        [mtl_device newBufferWithLength:bytes
+                                options:MTLResourceStorageModeShared];
+    if (buf_u32_case_tab == nil) {
+        GPU_FATAL("Metal: buf_u32_case_tab newBuffer(%zu bytes) failed",
+                  bytes);
+    }
+    memset([buf_u32_case_tab contents], 0, bytes);
+    memcpy([buf_u32_case_tab contents], gpu_u32_case_host,
+           sizeof(gpu_u32_case_host));
+
+    GPU_DEBUG_FPRINTF(stderr,
+            "Metal: buf_u32_case_tab uploaded (%zu bytes / %d entries)\n",
+            sizeof(gpu_u32_case_host), 2 * GPU_U32_CASE_N);
+    return 0;
+}
+
 uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,
@@ -7709,6 +8606,26 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                             || op == JOB_SHA512PASSSALT
                             || op == JOB_SHA512SALTPASS
                             || op == JOB_SHA384SALTPASS
+                            || op == JOB_MD5UCSALT            /* e350: md5salt carrier; absent here => use_salt 0 => unsalted digest => silent zero */
+                            || op == JOB_MD5revMD5SALT        /* e541: md5salt carrier; absent here => use_salt 0 => unsalted digest => silent zero */
+                            || op == JOB_MD5sub8_24SALT       /* e542: md5salt carrier; absent here => use_salt 0 => unsalted digest => silent zero */
+                            || op == JOB_MD5_MD5SALTMD5PASS   /* e367: md5salt carrier; absent here => use_salt 0 => unsalted digest => silent zero */
+                            || op == JOB_HMAC_MD5_KPASS       /* e792 KPASS */
+                            || op == JOB_HMAC_SHA1_KPASS      /* e793 KPASS */
+                            || op == JOB_HMAC_SHA224_KPASS    /* e794 KPASS */
+                            || op == JOB_HMAC_SHA256_KPASS    /* e795 KPASS */
+                            || op == JOB_HMAC_SHA384_KPASS    /* e796 KPASS */
+                            || op == JOB_HMAC_SHA512_KPASS    /* e797 KPASS */
+                            || op == JOB_HMAC_RMD160_KPASS    /* e798 KPASS */
+                            || op == JOB_HMAC_RMD320_KPASS    /* e799 KPASS */
+                            || op == JOB_HMAC_MD5             /* e214 KSALT */
+                            || op == JOB_HMAC_SHA1            /* e215 KSALT */
+                            || op == JOB_HMAC_SHA224          /* e216 KSALT */
+                            || op == JOB_HMAC_SHA256          /* e217 KSALT */
+                            || op == JOB_HMAC_SHA384          /* e543 KSALT */
+                            || op == JOB_HMAC_SHA512          /* e218 KSALT */
+                            || op == JOB_HMAC_RMD160          /* e211 KSALT */
+                            || op == JOB_HMAC_RMD320          /* e213 KSALT */
                             /* Phase 2d.7d HMAC siblings: 5 ops via 3 carrier
                              * kernels. All salted (GPU_CAT_MASK with salt
                              * upload via standard salt_buf/salt_off/salt_lens
@@ -7789,10 +8706,44 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * V_R is active; it is idempotent and must run on every rules
          * dispatch so the rule_program / rule_offset MTLBuffers reflect
          * the current host-side gpu_rule_program. */
+        /* ---- UTF-32 rule path (-8) -------------------------------------
+         *
+         * ONE predicate, gpu_u32_active(), shared with the word-class
+         * tagging and with gpujob_metal.m's hit replay.  It was three
+         * predicates once and the disagreement between them produced an
+         * `ovr-state read err=-5`: the tag was written into word_offset
+         * while the byte kernel -- which reads those bits as part of the
+         * offset -- was still the one dispatched.
+         *
+         * Op-agnostic, and deliberately so.  The next line was once
+         * `if (gpu_u32_active() && op != JOB_MD5) GPU_FATAL(...)`, which was
+         * an ACCEPTANCE gate, not a capability one: the UTF-32 template
+         * variant computes whatever the family core computes,
+         * metal_load_library_generic assembles that source for ANY registered
+         * family (it appends metal_u32_walker_str and defines
+         * GPU_TEMPLATE_HAS_RULES32 off V_U alone), and buffers 18/19 are bound
+         * off use_u32 rather than off the op.  Nothing on the Metal path was
+         * ever MD5-specific -- unlike OpenCL, whose md5_rules_mixed_phase0
+         * computes MD5 unconditionally, which is where the restriction came
+         * from in the first place.
+         *
+         * What replaced the gate is per-type validation: one known-answer
+         * crack per hash type, carrying at least one UTF-8 rule, on both
+         * backends.  A gate that refuses a workload is not a substitute for
+         * running it. */
+        int use_u32 = (gpu_u32_active() && use_rules);
+
         uint8_t variant_bits = (uint8_t)(
                                 (use_rules ? V_R : 0u)
                               | (use_mask  ? V_M : 0u)
-                              | (use_salt  ? V_S : 0u));
+                              | (use_salt  ? V_S : 0u)
+                              /* V_U implies V_R -- the UTF-32 kernel picks
+                               * per lane between the two walkers and needs
+                               * the byte arm present.  use_u32 already
+                               * carries use_rules; metal_load_library_generic
+                               * refuses the combination anyway rather than
+                               * trusting call sites. */
+                              | (use_u32   ? V_U : 0u));
 
         /* D5b Wave 1: prefer v2 resolver when present (migrated family).
          * Unmigrated families have pso_for_variant_v2 == NULL and we fall
@@ -7864,6 +8815,15 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * pool must exist before the first dispatch — regardless of which
          * variant is selected. */
         if (metal_ensure_buf_scratch_pool(num_words) < 0) return NULL;
+
+        /* The UTF-32 twin, allocated only when the UTF-32 variant is live.
+         * Both must exist before the first dispatch: the V_U kernel reads
+         * buffer 14 (the byte walker's slot, since it falls back per lane)
+         * AND buffers 18/19. */
+        if (use_u32) {
+            if (metal_ensure_u32_scratch_pool(num_words) < 0) return NULL;
+            if (metal_ensure_u32_case_tab() < 0) return NULL;
+        }
 
         /* --- Payload layout (matches gpu_opencl.c b_dispatch_payload):
          *   offset 0..127     OCLParams
@@ -8017,7 +8977,20 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         /* D9.5.a (sub-phase 1a.2): was overflow_first_rule CAS-min sentinel.
          * Renamed to num_rules; A1/A3 dispatcher payload populator overwrites
          * pre-enqueue. Init to safe default 0 here (B3 path does not read). */
-        params->num_rules            = 0;
+        /* Except on the UTF-32 path, where the kernel needs the TOTAL device
+         * rule count -- not this chunk's.  num_masks carries the sub-batch
+         * (Metal splits the rule axis into METAL_RULE_CHUNK_SIZE chunks to
+         * stay under Apple's ~2 s command-buffer watchdog, which OpenCL does
+         * not do), and the walker needs the total to read the SECOND half of
+         * the widened offset table: the u32 entry for rule i lives at
+         * rule_offset[n_rules + i].  Using the chunk count here would index
+         * the first half and hand the walker a byte offset as a u32 offset.
+         *
+         * Deliberately NOT rewritten in the chunk loop below -- that loop
+         * rewrites num_masks and rule_cursor_start; this value is constant
+         * for the batch. */
+        params->num_rules            = use_rules
+                                       ? (uint32_t)gpu_rule_count : 0u;
         /* Phase 2c row 12 + Phase 2e.1: num_salts_per_page carries the
          * per-dispatch salt-chunk count when HAS_SALT is active (was
          * cached_salts_count in 2c when one dispatch covered the whole
@@ -8045,6 +9018,26 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         else if (op == JOB_HMAC_STREEBOG256_KPASS) params->algo_mode = 6u;
         else if (op == JOB_HMAC_STREEBOG512_KSALT) params->algo_mode = 5u;
         else if (op == JOB_HMAC_STREEBOG512_KPASS) params->algo_mode = 6u;
+        else if (op == JOB_MD5UCSALT)               params->algo_mode = 1u;  /* e350 */
+        else if (op == JOB_MD5revMD5SALT)           params->algo_mode = 2u;  /* e541 */
+        else if (op == JOB_MD5sub8_24SALT)          params->algo_mode = 3u;  /* e542 */
+        else if (op == JOB_MD5_MD5SALTMD5PASS)      params->algo_mode = 4u;  /* e367 */
+        else if (op == JOB_HMAC_MD5_KPASS)          params->algo_mode = 6u;  /* e792 */
+        else if (op == JOB_HMAC_SHA1_KPASS)         params->algo_mode = 6u;  /* e793 */
+        else if (op == JOB_HMAC_SHA224_KPASS)       params->algo_mode = 6u;  /* e794 */
+        else if (op == JOB_HMAC_SHA256_KPASS)       params->algo_mode = 6u;  /* e795 */
+        else if (op == JOB_HMAC_SHA384_KPASS)       params->algo_mode = 6u;  /* e796 */
+        else if (op == JOB_HMAC_SHA512_KPASS)       params->algo_mode = 6u;  /* e797 */
+        else if (op == JOB_HMAC_RMD160_KPASS)       params->algo_mode = 6u;  /* e798 */
+        else if (op == JOB_HMAC_RMD320_KPASS)       params->algo_mode = 6u;  /* e799 */
+        else if (op == JOB_HMAC_MD5)                params->algo_mode = 5u;  /* e214 */
+        else if (op == JOB_HMAC_SHA1)               params->algo_mode = 5u;  /* e215 */
+        else if (op == JOB_HMAC_SHA224)             params->algo_mode = 5u;  /* e216 */
+        else if (op == JOB_HMAC_SHA256)             params->algo_mode = 5u;  /* e217 */
+        else if (op == JOB_HMAC_SHA384)             params->algo_mode = 5u;  /* e543 */
+        else if (op == JOB_HMAC_SHA512)             params->algo_mode = 5u;  /* e218 */
+        else if (op == JOB_HMAC_RMD160)             params->algo_mode = 5u;  /* e211 */
+        else if (op == JOB_HMAC_RMD320)             params->algo_mode = 5u;  /* e213 */
         /* Phase 2d.8b: SHA512CRYPTMD5 (op=538) selects kernel-side MD5-
          * preprocess via algo_mode=1u. The kernel's template_finalize
          * checks `if (algo_mode == 1u)` at the top and substitutes the
@@ -8073,6 +9066,50 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         /* hit_count slot at offset 128 (already zeroed by memset). */
         memcpy(p + 132, word_offset, wo_size);
         memcpy(p + payload_pkt, packed_words, packed_size);
+
+        /* ---- UTF-32 path: tag the per-word class into bits 30-31 --------
+         *
+         * ON THE PAYLOAD COPY, deliberately and necessarily -- the twin of
+         * gpu_opencl.c's tag site, with the same two reasons.
+         *
+         * (1) The caller's word_offset[] is the jobg slot's array.  It is
+         *     reused across dispatches AND read back by the hit replay
+         *     (gpujob_metal.m, `uint32_t pos = g->word_offset[widx];`), which
+         *     masks nothing.  Tagging it in place would corrupt the emitted
+         *     plaintext of every crack while the digest stayed correct -- a
+         *     bug nothing downstream can detect.
+         * (2) On Metal there is a second reason the first site is wrong: this
+         *     payload is re-uploaded per (salt, rule) chunk from the same
+         *     caller array, so an in-place tag would be applied repeatedly.
+         *
+         * The class is re-derived with classify_utf8() over the PACKED bytes
+         * rather than carried down from mdxfind.c's LineInfo.enc: same
+         * function, same bytes, no edit to a file another agent owns.
+         *
+         * Guarded by the SAME predicate as the V_U kernel selection and the
+         * replay.  They were separate tests for one revision on OpenCL and
+         * the mismatch was immediate -- the tag went into bits 30-31 while
+         * the BYTE kernel ran, and that kernel masks nothing, so every word
+         * offset carried bit 30: wild reads and `ovr-state read err=-5`.
+         *
+         * Cost is one byte scan over at most num_words words per dispatch,
+         * against words x rules x masks lanes inside it. */
+        if (use_u32) {
+            uint32_t *pwoff = (uint32_t *)(p + 132);
+            const unsigned char *ppk = (const unsigned char *)(p + payload_pkt);
+            uint32_t cls_counts[3];
+            gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
+            /* One line per session, not per dispatch: the class mix is a
+             * property of the wordlist, and per-dispatch it would be noise. */
+            static int cls_logged = 0;
+            if (!cls_logged) {
+                cls_logged = 1;
+                fprintf(stderr,
+                    "Metal: UTF-32 word classes in first batch — "
+                    "A(ascii)=%u W(utf8)=%u I(undecodable)=%u of %u\n",
+                    cls_counts[0], cls_counts[1], cls_counts[2], num_words);
+            }
+        }
 
         /* Ensure the on-GPU dedup buffer exists. Sized to
          * hash_data_count + overflow_count slots; persisted across
@@ -8239,19 +9276,68 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * Watchdog headroom: each chunk runs ~0.6s on M1 at 16K-word grid;
          * stays well under Apple's ~2s `kIOGPUCommandBufferCallbackError
          * ImpactingInteractivity` cap. M2 Max is faster per chunk, more
-         * headroom still. Tunable via MDXFIND_METAL_RULE_CHUNK env. */
+         * headroom still.
+         *
+         * That curve is KEPT FOR THE RECORD and is no longer the operating
+         * value: the chunk calibrates itself from measured dispatch time (see
+         * below), and 8192 survives only as a ceiling on the first seed. */
 #define METAL_RULE_CHUNK_SIZE 8192u
 #endif
+        /* Adaptive-budget constants; see the note at the env read below.
+         * HIGH/LOW are per-dispatch wall microseconds, and the gap between
+         * them is wide on purpose so the size settles instead of oscillating. */
+#ifndef METAL_SEED_ITEMS
+#define METAL_SEED_ITEMS      1048576u   /* first dispatch: ~1M work items */
+#endif
+#ifndef METAL_DISPATCH_US_HIGH
+#define METAL_DISPATCH_US_HIGH 1000000u  /* over 1.0 s  -> halve           */
+#endif
+#ifndef METAL_DISPATCH_US_LOW
+#define METAL_DISPATCH_US_LOW   250000u  /* under 0.25 s -> double         */
+#endif
+#ifndef METAL_RULE_CHUNK_MAX
+#define METAL_RULE_CHUNK_MAX    32768u   /* perf plateaus here, see above  */
+#endif
         uint32_t rule_chunk_size = METAL_RULE_CHUNK_SIZE;
-        int rule_chunk_from_env = 0;
-        {
-            const char *env_chunk = getenv("MDXFIND_METAL_RULE_CHUNK");
-            if (env_chunk != NULL) {
-                long v = strtol(env_chunk, NULL, 10);
-                if (v >= 1 && v <= 1000000) {
-                    rule_chunk_size = (uint32_t)v;
-                    rule_chunk_from_env = 1;
-                }
+        /* ADAPTIVE PER-DISPATCH BUDGET.
+         *
+         * METAL_RULE_CHUNK_SIZE above is 8192 because that was the measured
+         * sweet spot -- but it was measured on ONE workload, HMD5 + rockyou
+         * through the BYTE rule engine, where a chunk ran ~0.6 s.  The budget
+         * it enforces, words x rule_chunk x mask_size x salt_chunk, counts
+         * work ITEMS and carries no term for the cost PER item.  Any engine
+         * that costs more per item goes straight through it.
+         *
+         * `-8` is exactly that engine.  MEASURED on dev1 (Apple M1),
+         * HashMob.10k over UTF8test2.txt:
+         *
+         *     chunk=8192  ~134M items/dispatch  ~15 s    FATAL, watchdog
+         *     chunk=2048  ~33.5M items/dispatch ~3.75 s  survived
+         *
+         * A fixed chunk calibrated on one engine cannot bound TIME on another,
+         * and the iter-axis scale-down further down is the same admission:
+         * cost multipliers have to reach the budget.  Rather than add a second
+         * hand-measured divisor per engine -- which is the mistake that
+         * produced this bug, one engine at a time -- the chunk CALIBRATES
+         * ITSELF from the dispatch time already measured at the commit site.
+         *
+         * Seeded from an ITEM budget rather than a rule count, because the
+         * grid width varies: at the 16,384-word peak METAL_SEED_ITEMS gives
+         * 64 rules, ~0.12 s under `-8` on the slowest device measured here.
+         * It doubles only after a dispatch under METAL_DISPATCH_US_LOW, which
+         * bounds the next one at roughly twice that -- well under the
+         * high-water mark and far under anything Apple has objected to.
+         * Nothing about the workload, the engine or the device is assumed. */
+        static uint32_t metal_rule_chunk_cal = 0u;   /* 0 = uncalibrated */
+        if (use_rules) {
+            if (metal_rule_chunk_cal != 0u) {
+                rule_chunk_size = metal_rule_chunk_cal;
+            } else {
+                uint32_t w = (num_words > 0u) ? (uint32_t)num_words : 1u;
+                uint32_t seed = METAL_SEED_ITEMS / w;
+                if (seed < 1u) seed = 1u;
+                if (seed > METAL_RULE_CHUNK_SIZE) seed = METAL_RULE_CHUNK_SIZE;
+                rule_chunk_size = seed;
             }
         }
         if (!use_rules) rule_chunk_size = 1u;  /* one-shot for non-rules */
@@ -8277,8 +9363,8 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         const char *salt_chunk_source = "default";
         if (use_salt) {
             uint32_t tier_pick = metal_select_salt_chunk(mtl_device);
-            if (getenv("MDXFIND_METAL_SALT_CHUNK") != NULL)
-                salt_chunk_source = "env";
+            /* salt_chunk_source is never "env" now; MDXFIND_METAL_SALT_CHUNK
+             * used to set it. */
             salt_chunk_size = tier_pick;
             if (salt_chunk_size > salt_total) salt_chunk_size = salt_total;
             if (salt_chunk_size == 0u) salt_chunk_size = 1u;
@@ -8321,16 +9407,13 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * Divide the rule chunk by max_iter so an iterated dispatch
          * carries the same budget as the validated non-iterated one.
          * Floor at 64 rules so the chunk-loop overhead stays bounded for
-         * very large -i. An explicit MDXFIND_METAL_RULE_CHUNK wins over
-         * this, so the operator keeps a way to say exactly what they
-         * mean. Ops that force max_iter=1 (SHA1DRU, the HMAC
+         * very large -i. Ops that force max_iter=1 (SHA1DRU, the HMAC
          * family, PHPBB3, MD5CRYPT, the SHACRYPT triple, DESCRYPT,
          * BCRYPT) are unaffected -- their internal round count is
          * accounted for separately at the salt-chunk tier. */
         {
             uint32_t iter_axis = (params->max_iter < 1u) ? 1u : params->max_iter;
-            if (!rule_chunk_from_env
-                && use_rules && iter_axis > 1u && rule_chunk_size > 64u) {
+            if (use_rules && iter_axis > 1u && rule_chunk_size > 64u) {
                 uint32_t scaled = rule_chunk_size / iter_axis;
                 if (scaled < 64u) scaled = 64u;
                 if (scaled < rule_chunk_size) rule_chunk_size = scaled;
@@ -8455,6 +9538,11 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
              *  13 mask_sizes
              *  Task #250 (all variants):
              *  14 buf_scratch_pool
+             *  Phase 2c salt variant additionally binds:
+             *  15 salt_data  16 salt_off  17 salt_lens
+             *  UTF-32 (V_U) variant additionally binds:
+             *  18 u32_case_tab     (generated case tables, uploaded once)
+             *  19 u32_scratch_pool (one U32_SLOT_BYTES slice per word)
              * Indices are gap-tolerant - M-alone (use_rules==0, use_mask==1)
              * binds 0..9, 12, 13 with the kernel signature stripping 10/11
              * via the preprocessor. */
@@ -8487,6 +9575,10 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                 [enc setBuffer:buf_salt_off  offset:0 atIndex:16];
                 [enc setBuffer:buf_salt_lens offset:0 atIndex:17];
             }
+            if (use_u32) {
+                [enc setBuffer:buf_u32_case_tab     offset:0 atIndex:18];
+                [enc setBuffer:buf_u32_scratch_pool offset:0 atIndex:19];
+            }
 
             uint64_t _disp_t0 = metal_now_us();
             [enc dispatchThreadgroups:grid threadsPerThreadgroup:threadgroup];
@@ -8497,6 +9589,43 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
             total_dispatch_wall_us += (_disp_t1 - _disp_t0);
             total_dispatches++;
             rule_chunks_this_salt++;
+
+            /* Feed the measured dispatch time back into the chunk size.  This
+             * is the whole adaptive mechanism: the loop stride above IS
+             * rule_chunk_size, so a change here takes effect on the next
+             * iteration, and metal_rule_chunk_cal carries the settled value
+             * across batches so the ramp is paid once per process rather than
+             * once per batch.
+             *
+             * Halving is immediate.  Growth waits for a dispatch under the
+             * low-water mark, which is what bounds the next one, and is
+             * skipped while this_chunk was clamped by total_rules -- the short
+             * final chunk of a run is fast because it is SMALL, not because
+             * the device has headroom, and reading it as headroom would
+             * ratchet the size up on every short tail. */
+            if (use_rules) {
+                uint64_t _us = _disp_t1 - _disp_t0;
+                uint32_t _cur = rule_chunk_size;
+                if (_us > (uint64_t)METAL_DISPATCH_US_HIGH) {
+                    _cur = (_cur > 1u) ? (_cur / 2u) : 1u;
+                } else if (_us < (uint64_t)METAL_DISPATCH_US_LOW
+                           && this_chunk == rule_chunk_size
+                           && _cur < METAL_RULE_CHUNK_MAX) {
+                    _cur *= 2u;
+                    if (_cur > METAL_RULE_CHUNK_MAX) _cur = METAL_RULE_CHUNK_MAX;
+                }
+                if (_cur != rule_chunk_size) {
+                    GPU_DEBUG_FPRINTF(stderr,
+                        "Metal: rule_chunk %u -> %u rules/dispatch "
+                        "(last dispatch %.3f s, target %.2f-%.2f s)\n",
+                        (unsigned)rule_chunk_size, (unsigned)_cur,
+                        (double)_us / 1e6,
+                        (double)METAL_DISPATCH_US_LOW / 1e6,
+                        (double)METAL_DISPATCH_US_HIGH / 1e6);
+                    rule_chunk_size = _cur;
+                }
+                metal_rule_chunk_cal = rule_chunk_size;
+            }
 
             if (cb.error != nil) {
                 /* Phase D5a (Task #281+#282) 2026-05-16: external runtime
@@ -8509,20 +9638,36 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                 /* 2026-08-30: name the watchdog explicitly. The most
                  * common cb.error on Apple silicon here is
                  * kIOGPUCommandBufferCallbackErrorImpactingInteractivity
-                 * -- the ~2 s per-command-buffer watchdog -- and the
-                 * operator's lever is the per-dispatch work budget, not
-                 * anything about the hash list. Print the full budget
-                 * shape and the knob so the failure is actionable
-                 * instead of merely loud. */
+                 * -- the per-command-buffer watchdog -- and the operator's
+                 * lever is the per-dispatch work budget, not anything about
+                 * the hash list. Print the full budget shape so the failure
+                 * is actionable instead of merely loud.
+                 *
+                 * There is deliberately NO knob named here. The advice used
+                 * to be "lower it with MDXFIND_METAL_RULE_CHUNK"; that
+                 * variable has been removed, because it could only make this
+                 * worse. MEASURED, same binary and rule file on an M1: a
+                 * pinned chunk of 2048 survives a 16,384-wide grid at 33.5M
+                 * items per dispatch and FATALs on an 8,000-wide grid at
+                 * 16.4M -- HALF the work. The threshold is not a work budget:
+                 * ImpactingInteractivity fires on whether the command buffer
+                 * kept the GPU from servicing the display, which depends on
+                 * what else the machine is doing. So no hand-picked value is
+                 * ever validated, only lucky, and offering one sent the
+                 * operator toward the failure rather than away from it.
+                 *
+                 * Reaching this line now means the feedback loop could not
+                 * keep up: report the shape, and the chunk it had settled on
+                 * when it failed, which is the diagnostic that matters. */
                 MTL_FATAL_NSERR(cb.error,
                     "Metal dispatch error op=%d salt_base=%u salt_count=%u "
                     "rule_base=%u rule_count=%u total_rules=%u "
-                    "words=%u max_iter=%u mask_size=%u "
+                    "words=%u max_iter=%u mask_size=%u settled_chunk=%u "
                     "(per-dispatch budget = words x rule_count x mask_size "
-                    "x salt_count x max_iter; if this is Apple's "
-                    "ImpactingInteractivity watchdog, lower it with "
-                    "MDXFIND_METAL_RULE_CHUNK=<rules-per-dispatch>, "
-                    "currently %u)",
+                    "x salt_count x max_iter; the chunk adapts to measured "
+                    "dispatch time and there is no override, so this is the "
+                    "adaptive path failing to converge -- report the shape "
+                    "above)",
                     op, salt_base, this_salt_chunk,
                     rule_base, this_chunk, total_rules,
                     (unsigned)num_words, (unsigned)params->max_iter,
@@ -8708,7 +9853,7 @@ int gpu_metal_jit_compile_source_with_common(int dev_idx, const char *src)
         exit(1);
     }
 
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    MTLCompileOptions *opts = metal_compile_opts(nil);
     NSError *err = nil;
     id<MTLLibrary> lib = [mtl_device newLibraryWithSource:nsstr
                                                   options:opts
@@ -8819,7 +9964,7 @@ int gpu_metal_jit_compile_source_with_common_keep(
         exit(1);
     }
 
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    MTLCompileOptions *opts = metal_compile_opts(nil);
     NSError *err = nil;
     id<MTLLibrary> lib = [mtl_device newLibraryWithSource:nsstr
                                                   options:opts

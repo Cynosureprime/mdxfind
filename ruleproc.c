@@ -41,9 +41,486 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.32 2026/09/06 15:05:48 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.46 2026/09/17 05:23:51 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.46  2026/09/17 05:23:51  dlr
+ * Drop the MDXFIND_RULE_VALIDATOR gate; the rule validator is never enabled. This file is shared with procrule, which was rebuilt and checked: both rule engines still behave, the byte engine reversing a non-ASCII word producing mojibake and the UTF-32 engine producing droewssap with correct Unicode case mapping.
+ *
+ * Revision 1.45  2026/09/14 13:03:29  dlr
+ * Make R a LOGICAL right shift, and remove L undefined behaviour. R shifted a plain char, which is signed on x86 and on Apple ARM64, so a bare >> 1 sign-extended: byte 0x83 became 0xc1 rather than 0x41. These are BYTE strings and a 1-bit must not appear at the top of a byte that had none. Operator ruling 2026-09-14: logical is correct, and hashcat is wrong here rather than mdxfind being incompatible -- hashcat rp_cpu.c mangle_chr_shiftr is arr[upos] >>= 1 on char arr[], the same defect, but it never exercises it because it works in ASCII where the sign bit is never set. Do not restore compatibility. Found by disagreement with the OpenCL rules kernel, which shifts an unsigned type and was right all along: on 2,009 encoding-diverse words the two engines differed on 182 of 28,440 candidates, every one from the single rule R0 and every one with a first byte at or above 0x80, and on a hash list carrying the device digest mdxfind emitted a hash:plaintext pair that did not verify -- a false positive, because the device computed one candidate and the host replay reconstructed another. The old code also disagreed with itself across the fleet, since plain char is unsigned by default on Linux aarch64. The unsigned cast states the intent instead of inheriting it from the ABI. L gets the same cast for a different reason: << 1 on a negative signed char is undefined behaviour, and the value is unchanged on every platform we build, so that half is a UB fix with no semantic effect. The UTF-32 engine needs no change -- it shifts a uint32_t codepoint, so it was already logical, and a value pushed past U+10FFFF or into the surrogate block is dropped by utf32_to_utf8, which the operator confirms is the acceptable outcome for an operator at this level. tools/ruletests/hcnorm could not have caught this: it has zero R operators, so the one fixture whose oracle is hashcat own code does not exercise the opcode.
+ *
+ * Revision 1.44  2026/09/13 23:50:40  dlr
+ * Gate the third compiler diagnostic site with Rulequiet. positiontranslate printed "Invalid position %c in rules" ungated -- the other two live in packrules_len and the rest route through rule_error, both already gated in 1.43. Under -8 packrules is run on every rule purely to discover which rules it refuses, because that refusal IS the UTF-32-REQUIRED tag, so this site has to be as quiet as the others. It surfaced once procrule 1.34 restored the line terminator packrules expects: that moved where the compiler gives up on a quoted operand from a gated site to this one, and the dispatch8 fixture went from 8 of 8 to a failure on the -R unreachable count. This is also the only diagnostic in the file with no trailing newline, so when it did print it glued itself onto the following line and broke a count read anchored at line start. Byte mode is unaffected -- Rulequiet is only ever set while probing under -8 -- and is byte-identical to 1.31 on 29,756,528 candidates.
+ *
+ * Revision 1.43  2026/09/13 21:06:37  dlr
+ * Add Rulequiet: suppress COMPILER diagnostics while probing rule validity.
+ *
+ * procrule under -8 now runs the byte compiler on every rule precisely to discover
+ * which rules it refuses, because that refusal is the UTF-32-REQUIRED tag. Those
+ * refusals are expected answers, not faults, so their diagnostics are noise: a
+ * 100k-rule file with 2 percent UTF-8-extension rules printed two thousand caret
+ * blocks, which made -8 unusable on a real rule file.
+ *
+ * Rulequiet gates the two compiler diagnostic sites -- rule_error() and
+ * packrules_len()s position checks -- and nothing else. It never suppresses
+ * applyrule()s runtime diagnostics, which report a different class of problem.
+ * Defaults to 0, so mdxfind and every existing caller are unaffected.
+ *
+ * procrule sets it only while the probe runs, and only when the UTF-32 compiler
+ * already accepted the rule. If BOTH compilers refuse, the rule really is bad and
+ * the caret line is the only thing that says why, so it stays audible. Verified:
+ * rules x, i and ~~~ are still refused under -8 WITH their caret diagnostic, while
+ * a quoted-operand rule is tagged silently.
+ *
+ * Revision 1.42  2026/09/13 12:17:26  dlr
+ * -Z prints retained rule SOURCE TEXT; the bytecode decoder is deleted.
+ *
+ * Completes the -Z work begun in 1.586, which fixed attribution. This fixes what
+ * -Z PRINTS, and removes an out-of-bounds read.
+ *
+ * THE DEFECT. The -Z histogram decoded packed bytecode back into a rule line by
+ * switching on ASCII opcode letters. But packrules emits 0x80 to 0xfd for verbs
+ * and stores OPERANDS as raw bytes, so an operand could collide with an opcode
+ * case. Rule $z packs to e5 7a 00: the 7a matched the position-operand case, the
+ * entry terminator was consumed as that operand, Rulepos was indexed at -1, and
+ * the walk continued past the entry into the next rule. Measured before this
+ * change on a 33-rule file whose operands cover every colliding verb: the output
+ * carried 34 bytes of 0xe5 and 35 NULs, one row printed two rules joined, and the
+ * byte census showed raw bytecode on stderr. Packed bytecode is simply not
+ * decompilable, so no version of that decoder can be made correct.
+ *
+ * THE FIX. Retain the source text instead. struct rule_ent gains srcoff and
+ * srclen, struct rulestore gains a source slab, and rs_add_src carries the text;
+ * rs_add is now that with a NULL source, so procrule is unaffected. The -r/-R
+ * load site copies the line BEFORE packrules_len compiles it in place, since
+ * s = d = line destroys it. The flatten copies the text out of the store, indexed
+ * 1..Numrules to line up with RuleCnt and Ruleindex, because rs_reset frees the
+ * store once Rules is built. Retention is unconditional, not gated on -Z:
+ * options are processed in argv order, so -r foo -Z loads rules before -Z is
+ * seen, and gating would need an argv pre-scan and create a flag-order-sensitive
+ * invisible mode. struct RuleHist gains an explicit length because the slab is
+ * packed rather than NUL-terminated. 122 lines of decoder deleted.
+ *
+ * -R PROVENANCE. rs_product joins the two parents source text with a space,
+ * which is itself a runnable rule line, since mdxfind applies the ops on a line
+ * left to right. Materialised at product time rather than kept as parent
+ * pointers because rs_product already materialises the full dst x mul BYTECODE
+ * product, so the text is the same order of growth and not a new one. A rule
+ * deduplicated away contributes no orphan text, and the FIRST spelling of a
+ * duplicated rule is the one -Z reports, which is input-file order.
+ *
+ * VALIDATED on three engines, readable text, counts matching the documented
+ * per-rule truth exactly.
+ *   mixguard, 7 of 10 GPU-eligible, the mixed partition: No rule 6, l 3, u 6,
+ *   c 4, $1 6, v2- 6, ^a 6, v3x 5, r 6, v4_ 5, d 6. CPU equals OpenCL on a
+ *   GTX 1080 equals Metal on an Apple M1, 59 of 59 found on each.
+ *   33 colliding operands, every verb whose letter an operand can collide with,
+ *   at 33 of 33 eligible so every rule crosses the GPU: all 33 render correctly
+ *   and the byte census is clean on all three, against 0xe5 x34 and NUL x35
+ *   before. 33 of 33 found.
+ *   New 2x2 -R product, which no existing fixture covered: 4 rules named
+ *   runnably as l $1, l $2, u $1, u $2 in left-major order, 5 of 5 found,
+ *   identical on all three engines.
+ *
+ * procrule builds and runs unchanged, as rs_add keeps its signature.
+ *
+ * BUILD NOTE for the next person shipping these files by hand: ruleproc.c needs
+ * rule_ops.h at 1.3 or later. Shipping ruleproc.c without it fails with
+ * rule_class_byte, rule_verb_opcodes and RULE_CLASS_MATCH undeclared. Both GPU
+ * build hosts had a stale copy.
+ *
+ * Revision 1.41  2026/09/13 02:38:37  dlr
+ * Make ruleproc32 agree with ruleproc, and give procrule the means to prove it.
+ *
+ * The UTF-32 engine had drifted from the byte engine across many of the 2026-09-11
+ * extensions. Bringing them together needed a way to SEE a divergence first, which
+ * procrule could not do: generate mode drops a rejected rule, an empty candidate
+ * and a candidate equal to its input, and each of those hides a real difference.
+ *
+ * procrule gains -A, audit mode: one line per word-and-rule pair with nothing
+ * suppressed, rejected rules marked :REJECT, unchanged ones :SAME, empty ones
+ * :EMPTY and malformed ones :BADRULE. The markers cannot collide with a candidate
+ * because any candidate containing a colon is HEX-wrapped, which is also why -A
+ * forces hex encoding on. Match mode is untouched. Note the option had to be added
+ * to BOTH getopt strings: the file has a getopt call for AIX and a getopt_long call
+ * for everyone else, and patching only the first one leaves the flag rejected at
+ * runtime on every platform that matters.
+ *
+ * The UTF-32 bridge in procrule now speaks applyrule's return contract. The two
+ * engines number their negatives INVERSELY -- byte -1 rejected, -2 output equals
+ * input, -3 bad rule, against UTF-32 -1 bad input, -2 no room, -3 rejected -- and
+ * the bridge collapsed all of them to -3. That is harmless where it is used, since
+ * generate mode skips every negative alike and the rule-validity gates bypass the
+ * bridge through validrule_u32, but it makes the engines impossible to compare: a
+ * divergence report cannot tell a rejection from a malformed rule. The bridge also
+ * now returns -2 for an unchanged candidate, which the UTF-32 engine has no code
+ * for, so the same no-op rule no longer reads as two different outcomes.
+ *
+ * Shared, in rule_ops.h, which is included by exactly the two engines: the 15-entry
+ * class membership table, the byte and codepoint match macros, rule_class_byte and
+ * rule_verb_opcodes. All four were local to ruleproc.c. A class that means one
+ * thing in one engine and another in the other is a silent wrong answer in
+ * whichever one the caller did not test. The GPU kernels keep their own generated
+ * copy of the table, which no kernel includes this header to get.
+ *
+ * THREE BUGS in ruleproc32, each a fix the byte engine had already made:
+ *
+ *   Extract guarded only the start position, so an overrunning count extracted
+ *   whatever was available -- john behaviour, superseded by ruling. x14 on aB3 gave
+ *   B3 where the oracle leaves the word alone. Omit, immediately below it, always
+ *   had the full guard and a comment stating the requirement.
+ *
+ *   Memory-insert discarded its offset operand, which is the same bug ruleproc.c
+ *   fixed on 2026-09-11, and it clamped the count instead of rejecting. MX042 on
+ *   aB3 gave aBaB33 where the oracle rejects because offset plus count exceeds what
+ *   memory holds, and X042 with no memory stored no-opped where the oracle rejects.
+ *
+ *   Insert tested greater-than where the oracle tests greater-or-equal, so
+ *   inserting at a position equal to the length silently did nothing instead of
+ *   appending. i1?d on the one-cluster word x gave xx against the oracle's
+ *   x-question-x-question.
+ *
+ * CHARACTER CLASSES implemented in ruleproc32: all ten opcodes, both syntaxes, the
+ * nine class-capable verbs and the tilde prefix, including the separate opcode for
+ * hashcat title-with-class, which is a different algorithm rather than john's with
+ * a class test substituted. Membership comes from the one shared table. Every class
+ * rule now compiles to byte-identical bytecode in the two engines.
+ *
+ * POSITION RANGE: pos_of accepted only 0-9 and A-Z, stopping at 35, while
+ * ruleproc.c has 62 positions. That refused EVERY rule with a lowercase position
+ * operand across every positional verb, not just the 3NX case that surfaced it.
+ * Note this is an mdxfind extension past hashcat, which rejects Ta outright; four
+ * lines of best64 use one.
+ *
+ * UNKNOWN VERBS are now refused by the byte engine, per operator ruling: match
+ * hcrule, which rejects. The old default arm emitted an unrecognised verb as a
+ * literal byte, so M2 packed as memory-store followed by a bare 0x32 that the
+ * walker then read as an opcode, and 0x32 is not one. hashcat reports it as an
+ * invalid or unsupported rule.
+ *
+ * VALIDATION. Both engines now accept and refuse the same rules and produce the
+ * same output: 80-rule sweep, 616 lines each, zero divergences, with both refusing
+ * exactly B, M2 and the class form of the length reject. All 13 john class forms and
+ * every tilde form agree. The byte engine is unmoved: its own audit output is
+ * identical before and after the shared-header move, hashcat-oracle conformance
+ * holds at 284 of 284 against hashcat master's own rule engine, mixguard and nulfix
+ * pass, and best64, top_500 and the HashMob files all compile to the same counts as
+ * before, so the tightening drops nothing real.
+ *
+ * NON-ASCII is characterised rather than equalised, because the engines are meant
+ * to differ there: 158 of 264 pairs agree. Reverse differs on every word, the byte
+ * engine emitting a reversed byte pair that is not valid UTF-8; truncation splits
+ * characters mid-sequence; case mapping works only under -u, where eszett becomes
+ * SS and Greek uppercases correctly; and length rejects count clusters rather than
+ * bytes. Two results confirm decisions rather than design: the class verbs agree on
+ * every non-ASCII word because membership is deliberately ASCII-bounded in both,
+ * and duplication agrees byte for byte including keeping emoji sequences whole.
+ *
+ * KNOWN LIMITS, both recorded at the code: class membership above 0xff matches only
+ * the ALL and HIGH classes, so purging lowercase does not touch Greek or Cyrillic
+ * under -u, and the class verbs toggle case in ASCII only. Making either
+ * Unicode-general would move -u away from the oracle rather than towards it, so both
+ * are decisions to take separately. The compiled streams still differ in operand
+ * encoding -- positions 1-based in the byte engine against 0-based here, the
+ * multi-append opcodes, and prepend operand order -- which is the next piece.
+ *
+ * Revision 1.40  2026/09/12 16:14:23  dlr
+ * Rule length reaches the classifier and the GPU program: NUL-bearing rules are
+ * now GPU-eligible and transferred intact, and the O-of-n-squared pack scan is gone.
+ *
+ * Stage 2 of the rule input restructure. Stage 1 made the length first-class in the
+ * host store; this carries it into classification and into the device transfer.
+ *
+ * gpu_rule_safe_phase0 is length-bounded. It used to walk the bytecode as a C string
+ * and test every operand byte with a not-zero check, so a 0x00 OPERAND read as
+ * end-of-rule and the rule was reported NOT GPU-safe. Any rule carrying one silently
+ * stayed CPU-only: correct results, no GPU, no diagnostic. The walk is now bounded by
+ * the true packed length, so an operand may be any byte, and a truncated rule is
+ * rejected because its operands run past the length rather than because one of them
+ * happens to be zero. Every fall-through label group is preserved exactly, including
+ * the four-byte X arm that sits AFTER the three-byte body which nine labels reach by
+ * falling through - moving it in front of them once took d3ad0ne from 37 CPU-only
+ * rules to 14,958.
+ *
+ * classify_rules now carries per-rule lengths through to both partitions, and records
+ * each entry's ORIGINAL index. struct rule_lists gains fulllen, gpulen, cpulen, gpuidx
+ * and cpuidx; rule_lists_free frees the new arrays.
+ *
+ * Both GPU pack sites consequently change in two ways. They size and copy each rule
+ * with its true length instead of strlen, which used to stop at a 0x00 operand and
+ * hand the device a truncated rule whose operand count still said N - the kernel then
+ * satisfied the missing operands from the next rule's bytes. And they take the original
+ * index directly from gpuidx instead of recovering it by restarting a pointer scan at
+ * zero for every entry, although classify_rules preserves order.
+ *
+ * That scan was estimated at roughly 5e9 pointer compares at HashMob.100k scale, an
+ * arithmetic figure that had never been measured. Measured now, on HashMob.100k.rule
+ * via mdxfind's own T-plus instrumentation: startup falls from 2.840s to 0.652s, a 4.3x
+ * reduction saving 2.19 seconds.
+ *
+ * MEASURED AGAINST THE PRE-CHANGE BINARY. A four-line probe whose middle two rules
+ * differ only after a NUL, run on the untouched 1.583 build, reports "4 rules read"
+ * then "3 total rules in use" - one rule silently DROPPED - and "GPU rule engine: 2/3
+ * rules eligible", the survivor refused as not GPU-safe. The same probe on stage 1 plus
+ * 2 reports 4 read, 4 in use, 4 of 4 eligible.
+ *
+ * VALIDATION. New nulfix fixture, 10 lines yielding 9 rules, 5 words, 45 unique
+ * candidates of which 25 contain a NUL byte: CPU equals GPU exactly on OpenCL against
+ * a GTX 1080 and on Metal against an M2 Max, 45 of 45, NUL-bearing 25 of 25 on both
+ * sides, 9 of 9 rules eligible. The eight existing fixtures all pass on both backends
+ * at their exact counts - classfix 232, gpufix 144, longfix 111, mixfix 145, gatefix
+ * 84, memfix 100, mixguard 59 with its CPU-partition check at 16 of 16 and its mixed
+ * partition confirmed at 7 of 10 eligible, and divfix reproducing its asserted
+ * divergence of CPU 30 against GPU 19. Rule counts are unchanged from the 1.583
+ * reference on all seven shipped files. Throughput on fpga against rockyou by best64
+ * is 4.69s wall and 1.055 hash Gh per second against a 4.68s and 1.047 baseline, with
+ * peak VRAM at 325 MiB exactly as before, 1000 of 1000 found on every repeat.
+ *
+ * NOT a regression and out of scope: a single-char NUL form, either prepend or append
+ * alone, is rejected by the loader's applyrule validity probe as a bad line. The
+ * untouched 1.583 build rejects it identically and procrule rejects its equivalent, so
+ * the two engines agree; only a multi-char form carries a NUL through today. The nulfix
+ * fixture keeps such a line deliberately to exercise that path, which is why it yields
+ * 9 rules from 10 lines.
+ *
+ * Still ahead, and the reason the format work is separate: the GPU program remains
+ * NUL-terminated, so the kernel walk still depends on every op advancing by exactly its
+ * operand count in all six kernels across OpenCL and Metal. Stage 3 replaces that with
+ * a two-byte length prefix.
+ *
+ * Revision 1.39  2026/09/12 15:00:57  dlr
+ * Rule length is now first-class: NUL-clean rules, input-file order, left-major -R.
+ *
+ * Stage 1 of the rule input restructure, per operator directive 2026-09-12: accept
+ * NULs in rules and pass the length, which rules out Judy string de-duplication and
+ * forces a hash or literal compare.
+ *
+ * THE DEFECT. The packed bytecode is not a C string. An operand byte may legitimately
+ * be 0x00 via PARSEHEX, and 0x00 is never an opcode, so deriving the length with
+ * strlen truncated a rule at its first NUL operand. Both applyrule and all six GPU
+ * kernel walkers were always NUL-clean, because each consumes operands by explicit
+ * count, so the corruption happened entirely in storage, before either engine saw the
+ * bytes. procrule was correct throughout for the same reason: it never put the packed
+ * form in a string-keyed container.
+ *
+ * Two separate wrong answers followed, both silent:
+ *
+ *   Truncation. The rule was stored short while its operand count still said N, so
+ *   applyrule read the missing operands out of whatever followed. Measured: the rule
+ *   that appends NUL then B, applied to ABC, produced the hex for ABC NUL NUL instead
+ *   of ABC NUL B, and the bad byte tracked the NEXT rule in the file - the low byte of
+ *   that entry's length prefix. For the last rule in the buffer the read goes past the
+ *   end of the Rules allocation. The emitted plaintext hashed to the emitted digest,
+ *   so nothing downstream could detect it.
+ *
+ *   Collapse, which is worse. Appending NUL then B and appending NUL then C both
+ *   stringified to the same two bytes, so JudySL treated them as ONE key and silently
+ *   DROPPED one of the two rules. A rule file could hold N rules and mdxfind would run
+ *   N-1, with the load receipt reporting the deduplicated count as though nothing had
+ *   happened.
+ *
+ * WHAT REPLACES IT. packrules_len yields the true packed length; packrules is retained
+ * as a wrapper so the callers in procrule.c, gpu_rules_test.c, rule-bench.c and pr.c
+ * are untouched. A new rule store replaces the RuleArray and NRuleArray JudySL pair:
+ * an append-only bytecode slab plus a linear entry table, deduplicated by FNV-1a-64
+ * with open addressing and every hash hit confirmed by an exact memcmp, so a false
+ * dedup - which would silently drop a rule - is impossible by construction rather than
+ * improbable. Dedup earns little, 0 to 0.13 percent on the shipped files, and is kept
+ * only because Numrules feeds the ETA; nothing was traded away for it.
+ *
+ * Two properties the JudySL could not provide. Index order is now INPUT-FILE order
+ * across multiple -r files, where JSLF and JSLN iterated in lexicographic order of the
+ * bytecode - rules executed in bytecode order, not the order written. And -R is now
+ * LEFT-MAJOR per operator ruling, first file varying slowest, which required the store
+ * to be instantiable and the -R file to be buffered before the product is formed: a
+ * streaming read can only produce right-major.
+ *
+ * Rules[] entry layout is deliberately UNCHANGED - two-byte length equal to bytecode
+ * length plus one, then the bytecode, then a NUL - so the rule_ptrs walk, applyrule
+ * and the classifier are all untouched. Only the copy becomes correct, memcpy at the
+ * true length in place of strcpy, and only the order changes.
+ *
+ * ValidRules deleted. It had exactly three references: a declaration, one malloc of
+ * MemSize plus four, and one memmove from Rules. It was never read anywhere in the
+ * tree, and at Hash-IT_Crazy_Rules scale it held roughly 150 MB to no purpose.
+ *
+ * VALIDATION. All four NUL-bearing forms now agree byte for byte with procrule, and
+ * the two rules that used to collapse both load and both fire. Note that two of the
+ * four only ever LOOKED correct: the missing operand was 0x00 and the byte read past
+ * the truncation was the NUL terminator, also 0x00, so they were right by coincidence
+ * while still overreading. Seven fixtures pass on the CPU path - classfix 232, gpufix
+ * 144, longfix 111, mixfix 145, gatefix 84, memfix 100, mixguard 59 - and divfix gives
+ * its expected CPU 30. Rule counts are identical to the pre-change 1.583 binary on
+ * every shipped rule file: best64 77, top_500 499, HashMob 1k 999, 5k 4997, 10k 9997,
+ * 100k 99995, t.rule 1. Content equivalence checked across platforms as well as
+ * versions: best64 against the first 100000 lines of rockyou with 1000 target hashes
+ * gives a found-set md5 of 9cdd812e918311b5b0988fee36e47fb9 from both the pre-change
+ * 1.583 build on Linux and this build on macOS, from inputs verified identical by md5.
+ * Execution order confirmed to follow the rule file, and the -R product confirmed
+ * left-major and complete. Scale: 100000 rules load in 1.07 seconds at 86 MB peak RSS,
+ * and a 200000-rule -R product in 1.09 seconds at 100 MB.
+ *
+ * NOT yet addressed, and staged deliberately. The GPU program packer still sizes and
+ * copies each rule with strlen, so a NUL-bearing rule is still truncated on its way to
+ * the device; the classifier still treats a NUL operand as end-of-rule and marks such a
+ * rule not GPU-safe, so it would stay CPU-only regardless. Both are stage 3, which
+ * also moves the GPU program to a two-byte length prefix across OpenCL and Metal.
+ *
+ * Revision 1.38  2026/09/12 12:54:47  dlr
+ * A bare hash character is a COMMENT, per Waffle. Correct the 1.37 wording.
+ *
+ * 1.37 called it a rule terminator and said explicitly that it is not a line
+ * comment. That was wrong. A bare hash -- one standing where a verb is expected --
+ * comments out the rest of the line and nothing after it is examined, so c then
+ * hash then dollar-one means capitalize, then a comment. packrules says this
+ * directly by testing the character in the SAME condition as carriage return and
+ * newline: a bare hash is treated as end of line.
+ *
+ * The operand case does not make it something other than a comment. That is how
+ * comment characters behave everywhere, the shell included: dollar-hash appends the
+ * character, at-hash purges it, s-a-hash substitutes it, because there the
+ * character is a verb operand and therefore data. A whole-line comment is the
+ * degenerate case with the hash first.
+ *
+ * 1.37 also framed a trailing comment as a silent truncation to be grepped for.
+ * Removed: there is nothing to diagnose in a comment working as designed.
+ *
+ * Unchanged from 1.36 and 1.37: 0xc4 is unreachable, the case that would emit it is
+ * dead code, the character cannot force a rule onto the CPU, and the CPU-only set
+ * is S 0xc5, v 0xc1 and 0x02.
+ *
+ * Revision 1.37  2026/09/12 12:51:51  dlr
+ * Tighten the 0xc4 note: a hash character terminates a rule only in OPCODE
+ * position, and is a literal as an operand. It is not a line comment.
+ *
+ * The 1.36 note said packrules breaks on the hash character anywhere in the line.
+ * That is wrong in a way that misleads: the test sits at the TOP OF THE LOOP, which
+ * is reached only where an opcode is expected, because operand bytes are consumed
+ * by the pointer increment inside each case and never reach it. Measured: dollar-
+ * hash appends the character, at-hash purges it, s-a-hash substitutes it. What does
+ * truncate is a hash in opcode position, so dollar-one hash dollar-two silently
+ * compiles to dollar-one with no diagnostic.
+ *
+ * A line starting with the character compiles to nothing and is dropped, which is
+ * why it serves for comment lines and why it is easy to mistake for one. The
+ * conclusion of 1.36 is unchanged: 0xc4 is unreachable, the case that would emit it
+ * is dead code, and the CPU-only set is S 0xc5, v 0xc1 and 0x02.
+ *
+ * Revision 1.36  2026/09/12 12:32:43  dlr
+ * Correct the CPU-only opcode count in the classifier comment: three, not four.
+ *
+ * RULE_OP_HASH_EXIT 0xc4 is not reachable and must not be counted as a way to
+ * force a rule onto the CPU. packrules breaks out of its packing loop on a hash
+ * character anywhere in the line, so the hash truncates the rule at COMPILE time
+ * and everything after it is discarded; the case that would emit 0xc4 sits in the
+ * same function after that break and is dead code. Measured: rule c then hash then
+ * dollar-one applied to pass yields Pass, while c then dollar-one yields Pass1, and
+ * the first of those classifies as GPU-eligible because it compiles to a bare c.
+ *
+ * So the CPU-only set is S 0xc5, v 0xc1 and 0x02. With 0x02 out of GPU scope by
+ * ruling and S pending the A2 restructure, v is in practice the only usable one for
+ * building the mixed GPU and CPU partition that the FastRule precondition guard
+ * needs in order to be exercised. Found during the documentation pass for 1.583,
+ * which measured it rather than taking the comment at its word.
+ *
+ * Revision 1.35  2026/09/12 12:12:51  dlr
+ * Input-word gate at 1024 bytes, walker buffer at 2048, and the memory family on GPU.
+ *
+ * The admission gate and the walker buffer size were one constant doing two jobs.
+ * They are now separate: GPU_RULES_MAX_INPUT_LEN 1024 gates the INPUT WORD only,
+ * GPU_RULES_WALKER_BUF_ELEMS is twice that, and GPU_RULES_WALKER_BUF_SLACK 15 backs
+ * the usable limit off to 2033 to cover n+1 boundary conditions such as a
+ * terminating NUL.
+ *
+ * Operator ruling that sets the policy: output length is never checked. It is not
+ * possible to bound what a rule can produce, because for any limit, on either
+ * engine, a rule that overflows it can always be written. So a limit is SET,
+ * arbitrarily, and a rule that exceeds it does what it can and stops; whatever has
+ * been generated becomes the candidate. The check is strictly and only on the input
+ * word size. A word over 1024 bytes goes to the CPU, and if the CPU engine then
+ * exceeds MAXLINE it stops the same way and the hash is computed over whatever was
+ * generated. There are no environment variable overrides, this is compile time
+ * only, and there is no retry to CPU when a rule line exceeds the GPU limit. That
+ * deliberately permits divergence between the two engines; -G none is the remedy.
+ *
+ * Memory family M 4 6 Q X promoted from CPU-only to GPU-eligible and implemented in
+ * all six rules kernels against a second RULE_BUF_MAX buffer. The earlier attempt
+ * was reverted because at 40960 bytes a second buffer doubled per-thread private
+ * memory and aborted with CL_OUT_OF_HOST_MEMORY on an RTX 3080; at 2048 the pair
+ * costs 4 KB per thread, a tenth of what ONE buffer cost before, so the resource
+ * objection is gone rather than worked around. applyrule sets memlen to 0 at the
+ * top of every call, so memory state never crosses a word-and-rule boundary and
+ * there is no cross-rule state for an independent work-item to reproduce.
+ *
+ * RULE_BUF_MAX reaches the kernels by -D through exactly one funnel per backend.
+ * OpenCL: gpu_kernel_cache.c, 67 build sites, with the define folded into
+ * defines_str so it enters compute_key and a stale cache binary built at a
+ * different size cannot load. Metal: a new metal_compile_opts helper in
+ * gpu_metal.m, 9 call sites converted. All six kernels carry a matching ifndef
+ * RULE_BUF_MAX default of 2048 so they still compile standalone. In
+ * metal_common.metal the class membership table, its helper and the class opcode
+ * defines moved OUT of the ifndef RULE_BUF_MAX block where they had been trapped:
+ * they are needed whenever the file is compiled, and with the -D live that block
+ * is skipped, which produced 20 undeclared-identifier errors.
+ *
+ * Two ruleproc.c comments corrected against their own code. The header still
+ * listed M 4 6 X Q and also = % as CPU-only after both had been promoted, and the
+ * rejection-ops comment still claimed Q stays in default-reject. Only four opcodes
+ * now sit outside the whitelist, S 0xc5, hash 0xc4, v 0xc1 and 0x02, and they are
+ * the only remaining way to build a mixed GPU and CPU partition.
+ *
+ * Validation. Seven fixtures, CPU equals GPU on a GTX 1080 and an M2 Max: classfix
+ * 232, gpufix 144, longfix 111, mixfix 145, gatefix 84 exercising the
+ * never-before-executed over-gate routing path, memfix 100, and divfix, which
+ * asserts divergence and is the functional proof the -D reached the device by
+ * finding the within-limit 19 of 30 rather than all 30. pretoday 113. A new
+ * mixguard fixture covers the FastRule precondition guard at mdxfind.c 13764, which
+ * no other fixture reaches any more now that the memory family is eligible: with
+ * the guard removed its CPU-partition recovery collapses to exactly 6 of 16, one
+ * per word. gatefix by contrast still scores 84 of 84 with the guard removed, so it
+ * never covered that guard at all.
+ *
+ * Benchmark: rockyou 14341564 lines by best64.rule, 77 rules, -m e1, 1000 hashes,
+ * median of 3 runs. fpga GTX 1080 peak VRAM 1769 MiB on the deployed 1.581 against
+ * 325 MiB here, an 81.6 percent reduction from the buffer resize, with throughput
+ * up from 0.990 to 1.047 hash Gh per second. Compiling the memory family back out
+ * saves a further 76 MiB and moves throughput by -0.57 percent, inside noise, so
+ * the family stays. mmt 72 cores with -G none: 51.13s on the deployed 1.245 against
+ * 3.14s here.
+ *
+ * Revision 1.34  2026/09/11 19:47:24  dlr
+ * Rule-engine parity block, character classes on GPU, 2-byte packed-word length, and two dispatch guards.
+ *
+ * Byte engine brought to parity with the documented john and hashcat feature sets. Character classes in both syntaxes: inline ?C uses the john table with complement-by-case-toggle, a ~ prefix selects the hashcat table. Nine verbs take a class, opcodes 0x80 to 0x89. ~e?C needs its own opcode 0x89 because hashcat class title-case is a different algorithm from the john form, not the same one with a class test substituted. The ?s class is hashcat class_sym in BOTH tables and john user classes ?0 to ?9 are not implemented, both per operator ruling. ?? is the literal-? escape, so purging a literal ? is now written @?? and 8 lines across the shipped rule files stop loading, every one of them a rule john also rejects.
+ *
+ * Other parity fixes in the same block: c C E and e act on position 0, not on the first alphabetic character, which john and hashcat agree on and mdxfind did not; x and X follow hashcat when out of range, superseding an earlier ruling for john; a candidate a rule empties is kept, following hashcat; T is bounds-checked as john does; X honours the memory offset N, which was read and then ignored so every offset gave the same answer; B is added from hashcat master. ruleproc32 refuses a class loudly rather than silently reinterpreting it, and accepts the ?? escape identically, closing a byte-versus-utf32 divergence where the same rule text produced different candidates in each engine with no diagnostic.
+ *
+ * All ten class opcodes plus =NX and %NX promoted from CPU-only to GPU-eligible and implemented in all six rules kernels, sharing one 480-byte constant-address-space membership table in gpu_common.cl and metal_common.metal so the six cannot drift. Three real rule files now have zero CPU-only rules.
+ *
+ * Packed-word length widened from one byte to two, little-endian, written and read byte by byte so it depends on neither host alignment nor host endianness. The admission gate allows GPU_RULES_MAX_INPUT_LEN 40959 while the wire field held 255, so any word of 256 to 40959 bytes was hashed as its first len mod 256 bytes: 285 as its first 29, 300 as its first 44. The emitted plaintext matched the emitted digest so nothing downstream could detect it. 11 kernel read sites across 7 files, 3 host writers, 2 host hit decoders and the buffer-full check move together.
+ *
+ * Two dispatch guards. C2.3 now tests the per-word word_packed_by_rules_engine rather than the thread-persistent my_jobg_rules, which differ whenever a word is walked but not packed. FastRule is disabled when this iteration is not the no-rule pass, making entered-at-the-rule-stream-origin a precondition rather than an assumption: the SIMD walker was re-draining the remaining rules from the first CPU-only rule output, so exactly one CPU-partition candidate survived per word.
+ *
+ * Validation: john class sweep 66 of 75 with all 9 differences the ruled empty-word policy, hashcat class sweep 21 of 21, X 22 of 22, x 16 of 16, c C E e 50 of 50 against john, rules32 conformance 165 of 165, zero silent byte-versus-utf32 divergences, wire round trip proven for all 40960 admitted lengths. Five GPU fixtures CPU equals GPU on a GTX 1080 and an M2 Max, including 113 of 113 on the fixture that measured 84 of 113 before the FastRule guard, and 126 of 126 on words from 1 to 4096 bytes. Regression on shipped rule files: Hash-IT_Crazy_Rules 6828885 rules, all_gj 208010 and T0XlC byte-identical.
+ *
+ * Also included in mdxfind.c and authored by Waffle, not by me: the AIX cmiyc challenge-3 algorithm validation comment block, recording the ppcemu emulated-oracle confirmation and the 504-hash corpus confirmation at the live parameters.
+ *
+ * Revision 1.33  2026/09/11 04:15:58  dlr
+ * Fix the `.` rule op at the last position, in the byte engine and in all six GPU rule kernels. The op replaces the character at position N with the character at N+1, and at the boundary the three implementations gave three different answers.
+ *
+ * The byte engine validated N and then read N+1: `if (y < clen) cpass[y] = cpass[y+1]` admitted y == clen-1 and read one byte past the end of the candidate, picking up whatever the shared workspace held from a previous, longer one. Output therefore depended on wordlist order and on the thread split - `K $1 .9 $0` applied to Jay020171 gave Jay020117Z0 after a run of Zs, Jay020117a0 after a run of as, and Jay0201170 with a clean buffer. Two sites, the len < FASTLEN fast path and the slow path, both now guard y+1, which is the byte actually read. The GPU kernels bounds-checked correctly but substituted a zero byte when pos+1 was out of range, embedding a NUL in the candidate - a third answer again, and a CPU/GPU divergence: the two paths could produce different candidates for the same rule, which breaks the hit-set parity the Phase 4 work established. All six now no-op instead. ruleproc32.c was already correct and is untouched.
+ *
+ * hashcat settles which answer is right, rather than preference: an out-of-range `.N` is a no-op and the candidate is still emitted. Verified with hashcat --stdout on abcdefghij - `.8` gives abcdefghjj, `.9` and `.A` give abcdefghij unchanged - then swept over every position 0-B against every word length 1-12 for both `.` and `,`, 288 cases, zero mismatches. `,` needed no change: its existing y > 0 clause already guards the y-1 read and hashcat agrees that `,0` is a no-op while `,1` applies. Note the byte engine returns -2 where hashcat emits the unchanged word, which is correct for mdxfind because the plain is already covered by the implicit no-rule pass.
+ *
+ * The corruption was live in real output, not only at the boundary of a synthetic case. Against all_gj.rule, 208,010 rules by 20 words, the pre-fix binary emitted 43 NUL bytes and the post-fix binary emits none. Both failure modes were present: truncation, which emptied 7 lines entirely and turned 0ek20171 into 0ek2017, and residue substitution, which turned 171 into 172 by reading a 2 left behind by an earlier candidate.
+ *
+ * Validated on real hardware, not by inspection. The regression fixture is built around a hash only the buggy kernel can produce - md5 of abcdefghi followed by a NUL, b2eb01e4089a69425bf845937127e68f - alongside md5 of a bare abcdefghi for the old CPU truncation, so a stale header or a build that missed the change fails positively rather than silently passing. CPU, OpenCL on fpga.local (GTX 1080) and Metal on dev3.local all found exactly the two correct hashes and neither poison hash, with the GPU rule engine confirmed active from the run output rather than assumed. Broader sweep over all 10,140 rules in all_gj.rule containing `.` or `,`: 60 words gave 453,004 unique candidates, CPU and OpenCL both 453,004 of 453,004 with an empty hash-set diff; 3 words gave 27,258 and Metal matched CPU exactly.
+ *
+ * Two things worth recording about the generated headers. gpu/metal_md5_rules_str.h was absent from the working tree entirely and the copy on dev1 was stale from May 13, while gpu_metal.m includes it at line 199 and concatenates it into the JIT MTLLibrary at 809 and 2398 - and per that file the rules variant is ALWAYS JIT, never the precompiled metallib, so the header is load-bearing. Without regenerating it the Metal build would have compiled the pre-fix kernel and reported success. It is regenerated here with metal2str.py, which is the correct generator for .metal sources; cl2str.py happens to produce identical output but relying on that would be relying on a coincidence. Separately, gpu_md5_rules_str.h was checked in with kv keyword substitution, which is wrong for a generated string header: it embeds the .cl source's own $Revision and $Log markers inside its string literals, so a kv check-in would rewrite the revision and inject unquoted log text after the $Log line, breaking the C syntax of the embedded kernel. Set to -ko before this check-in, per the standing rule for gpu_*_str.h files. The stored 1.26 predates the stanza and is not itself damaged.
+ *
+ * Flagged, not addressed here: the Metal rules-engine hit buffer is far smaller than the OpenCL packed path and has no overflow-reissue loop, so at 453,004 candidates it drops cracks - it does self-report the loss with a MISMATCH audit line. Worth an architect look on its own.
+ *
  * Revision 1.32  2026/09/06 15:05:48  dlr
  * Move the 61 RULE_OP_* opcode defines into rule_ops.h and include it.
  *
@@ -178,12 +655,24 @@ void print128(char *s,__m128i v)
  *                            ^
  *   Error: Invalid replace in rule
  */
+/* Suppress COMPILER diagnostics (this function and packrules_len's position
+ * checks).  Set by a caller that is deliberately probing whether a rule
+ * compiles and for which an refusal is an expected answer rather than an
+ * error -- procrule under -8 tries the byte compiler on every rule precisely
+ * to discover which rules it refuses, and those refusals are the UTF-32
+ * REQUIRED tag, not faults.  Defaults off, so mdxfind and every existing
+ * caller are unaffected.  It never suppresses applyrule()'s runtime
+ * diagnostics, which report a different class of problem. */
+int Rulequiet = 0;
+
 static void rule_error(const char *msg, const char *orule,
                        const char *rule)
 {
 	int pos = (int)(rule - orule);
 	int len = (int)strlen(orule);
 	int i;
+
+	if (Rulequiet) return;
 
 	/* trim trailing newline for display */
 	if (len > 0 && (orule[len-1] == '\n' || orule[len-1] == '\r'))
@@ -201,7 +690,14 @@ static inline unsigned char positiontranslate(char c) {
    char *res;
    res = strchr(Rulepos,c);
    if (!res) {
-       fprintf(stderr,"Invalid position %c in rules",c);
+       /* The THIRD compiler diagnostic site, and the one Rulequiet missed: the
+        * other two are in packrules_len and the rest route through
+        * rule_error().  Under -8 packrules is run on every rule purely to
+        * discover which rules it refuses -- that refusal IS the tag -- so this
+        * has to be as quiet as the others.  It is also the only one with no
+        * trailing newline, so when it did print it GLUED itself onto the next
+        * line and broke a fixture that reads a count anchored at line start. */
+       if (!Rulequiet) fprintf(stderr,"Invalid position %c in rules",c);
        return(1);
     }
    return(((res - Rulepos) & 0xff)+1);
@@ -523,12 +1019,108 @@ static char format_op_for_error(unsigned char b) {
         case RULE_OP_HASH_EXIT:  return '#';
         case RULE_OP_HEX_UPPER:  return 'H';
         case RULE_OP_HEX_LOWER:  return 'h';
+        case RULE_OP_CHR_ADD:    return 'B';
         case RULE_OP_DIV_INSERT: return 'v';
+        /* Class forms report as their base verb.  The caret in the error
+         * already points at the operand, which is where the class sits. */
+        case RULE_OP_SUB_CLASS:        return 's';
+        case RULE_OP_PURGE_CLASS:      return '@';
+        case RULE_OP_TITLE_CLASS:      return 'e';
+        case RULE_OP_TITLE_CLASS_HC:   return 'e';
+        case RULE_OP_REJ_HAS_CLASS:    return '!';
+        case RULE_OP_REJ_NHAS_CLASS:   return '/';
+        case RULE_OP_REJ_FIRST_CLASS:  return '(';
+        case RULE_OP_REJ_LAST_CLASS:   return ')';
+        case RULE_OP_REJ_AT_CLASS:     return '=';
+        case RULE_OP_REJ_CNT_CLASS:    return '%';
         default:                 return (char)b;
     }
 }
 
-int packrules(char *line) {
+/* ---- character classes (D6) -------------------------------------------
+ *
+ * Membership bitmap, one 32-byte row per class, in class-id order.  Generated
+ * from the reference definitions -- John's CHARS_* macros (rules.c:166-190)
+ * and hashcat's class_*() predicates (src/rp.c) -- not hand-typed.  ?s is
+ * hashcat's class_sym() in both tables per the operator's ruling.
+ *
+ * The complement bit is applied by XOR at test time, so there is no second
+ * table and a complemented class costs nothing extra.
+ */
+/* rule_class_bits and RULE_CLASS_MATCH now live in rule_ops.h so that this
+ * engine and ruleproc32.c share ONE definition rather than two that can
+ * drift.  rule_ops.h is included by exactly these two files. */
+/* Map a class letter to its packed class byte, or 0 if the letter names no
+ * class in the requested table.
+ *   table 0 -- John: inline ?C, complement by case-toggling the letter.
+ *   table 1 -- hashcat: ~-prefixed, six classes, no complement (so ?H is
+ *              uppercase hex here and "not hex" there -- the one collision
+ *              that forces the tables apart).
+ */
+/* rule_class_byte() moved to rule_ops.h: the UTF-32 engine needs the same
+ * letter-to-class mapping, and two copies of a 15-entry table keyed on
+ * single letters is exactly the kind of thing that drifts unnoticed. */
+
+/* Parse a character-or-class operand at *sp.
+ *
+ * Returns  0  literal character: *litp set, *sp advanced 1 (or 2 for `??`)
+ *         >0  packed class byte, *sp advanced 2
+ *         -1  malformed: truncated, or a letter that names no class
+ *
+ * `??` is John's escape for a literal `?`, which is why `@?` -- purge the
+ * literal `?` -- must now be written `@??`.  Under table 1 (~-prefixed) a
+ * class is mandatory: hashcat defines no literal form there.
+ */
+static int rule_parse_class_operand(char **sp, int table, char *litp) {
+  char *s = *sp;
+  unsigned char cb;
+
+  if (table) {
+    /* hashcat requires the `?`; `??` is its literal-`?` escape, verified
+     * against its own engine (rp_cpu.c RULE_OP_CLASS_BASED, the `case '?'`
+     * arm under each of ~s / ~@ / ~e). */
+    if (s[0] != '?' || !s[1]) return (-1);
+    if (s[1] == '?') { *litp = '?'; *sp = s + 2; return 0; }
+    if (!(cb = rule_class_byte(s[1], 1))) return (-1);
+    *sp = s + 2;
+    return (int)cb;
+  }
+  if (!s[0]) return (-1);
+  if (s[0] != '?') { *litp = s[0]; *sp = s + 1; return 0; }
+  if (!s[1]) return (-1);
+  if (s[1] == '?') { *litp = '?'; *sp = s + 2; return 0; }
+  if (!(cb = rule_class_byte(s[1], 0))) return (-1);
+  *sp = s + 2;
+  return (int)cb;
+}
+
+
+/* Opcode pair for the nine class-capable verbs: the plain form and the class
+ * form.  Returns 0 if the verb takes no class.  `=` and `%` pack as their
+ * literal ASCII bytes in the plain form -- a historical exception to the
+ * high-bit opcode range, kept because that encoding is already in the stream.
+ */
+/* rule_verb_opcodes() moved to rule_ops.h -- ruleproc32.c needs the same
+ * verb-to-opcode-pair mapping for the `~` prefix. */
+
+/* packrules_len -- as packrules, but also yields the TRUE packed length.
+ *
+ * The packed bytecode is NOT a C string: an operand byte may legitimately be
+ * 0x00 (`$\x00` via PARSEHEX), and 0x00 is never an opcode.  Deriving the
+ * length with strlen() therefore truncates the rule at its first NUL operand,
+ * and callers that then copy or key on it with string semantics store a short
+ * rule whose operand count still says N -- applyrule and the GPU walkers both
+ * skip operands by explicit count, so they read the missing operands out of
+ * whatever follows.  Measured before this change: `$\x00$\x42` and `$\x00$\x43`
+ * both produced $HEX[4142430000] from ABC, and the bad byte tracked the NEXT
+ * rule in the file (0x06 when that rule packed to 6 bytes -- its length-prefix
+ * low byte).  For the last rule in the buffer the read goes past the end.
+ *
+ * *packedlen receives the byte count EXCLUDING the trailing NUL that is still
+ * written for the benefit of callers that have not yet been converted.
+ * packrules() is retained as a wrapper so the existing callers in procrule.c,
+ * gpu_rules_test.c, rule-bench.c and pr.c are untouched. */
+int packrules_len(char *line, int *packedlen) {
   char *t, *s, *d, c, lbuf[10240], n,c1;
   int x, y, rulefail = 0;
 
@@ -616,22 +1208,34 @@ int packrules(char *line) {
       case '@':
       case 'e':
       case '!':
+      case '/':          /* character operand -- see the note in pass 1 */
+      case '(':
+      case ')':
+        /* Each of these takes a literal character OR an inline John class
+         * `?C`.  `??` is the escape for a literal `?`. */
         NEED_BYTES(1);
-        switch (c) {
-          case '@': *d++ = RULE_OP_PURGE;        break;
-          case 'e': *d++ = RULE_OP_TITLE_SEP;    break;
-          case '!': *d++ = RULE_OP_REJ_HAS;      break;
+        {
+          unsigned char _plain = 0, _cls = 0;
+          char _lit = 0;
+          int _cb;
+          rule_verb_opcodes(c, &_plain, &_cls);
+          _cb = rule_parse_class_operand(&s, 0, &_lit);
+          if (_cb < 0) {
+            char _msg[72]; snprintf(_msg, sizeof(_msg),
+              "Invalid character class for command '%c'", c);
+            rule_error(_msg, line, s);
+            rulefail++;
+            goto pack_op_done;
+          }
+          *d++ = (char)(_cb ? _cls : _plain);
+          *d++ = _cb ? (char)(unsigned char)_cb : _lit;
         }
-        *d++ = *s++;
         break;
 
       case 'D':
       case '\'':
       case 'Z':
       case 'z':
-      case '/':
-      case '(':
-      case ')':
       case '_':
       case '<':
       case '>':
@@ -651,9 +1255,6 @@ int packrules(char *line) {
 	  case '\'': *d++ = RULE_OP_TRUNC;      break;
 	  case 'Z':  *d++ = RULE_OP_DUP_LAST;   break;
 	  case 'z':  *d++ = RULE_OP_DUP_FIRST;  break;
-	  case '/':  *d++ = RULE_OP_REJ_NHAS;   break;
-	  case '(':  *d++ = RULE_OP_REJ_FIRST;  break;
-	  case ')':  *d++ = RULE_OP_REJ_LAST;   break;
 	  case '_':  *d++ = RULE_OP_REJ_LEN_NE; break;
 	  case '<':  *d++ = RULE_OP_REJ_LEN_GE; break;
 	  case '>':  *d++ = RULE_OP_REJ_LEN_LE; break;
@@ -671,7 +1272,7 @@ int packrules(char *line) {
 	n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-	  fprintf(stderr, "Invalid position %c for %c\n", n, c);
+	  if (!Rulequiet) fprintf(stderr, "Invalid position %c for %c\n", n, c);
           rulefail++;
         }
         *d++ = positiontranslate(n);
@@ -684,7 +1285,7 @@ int packrules(char *line) {
 	n = *s++;
         if ((n < '1') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-	  fprintf(stderr, "Invalid position %c for %c\n", n, c);
+	  if (!Rulequiet) fprintf(stderr, "Invalid position %c for %c\n", n, c);
           rulefail++;
         }
         *d++ = positiontranslate(n)-1;
@@ -692,19 +1293,32 @@ int packrules(char *line) {
 	break;
 
       case 's':
+        /* `sXY` literal, or `s?CY` -- replace every character of class C
+         * with Y. */
         NEED_BYTES(2);
-        *d++ = RULE_OP_SUB;
-        *d++ = *s++;
-        *d++ = *s++;
+        {
+          char _lit = 0;
+          int _cb = rule_parse_class_operand(&s, 0, &_lit);
+          if (_cb < 0 || !*s) {
+            rule_error("'s' needs two operands: sXY or s?CY", line, s);
+            rulefail++;
+            goto pack_op_done;
+          }
+          *d++ = (char)(_cb ? RULE_OP_SUB_CLASS : RULE_OP_SUB);
+          *d++ = _cb ? (char)(unsigned char)_cb : _lit;
+          *d++ = *s++;
+        }
 	break;
 
       case '=':
       case '%':
-        /* No applyrule case exists for '=' / '%' — they pack as legacy
-         * ASCII bytes and applyrule's default-case silently skips. No
-         * RULE_OP_* mapping needed; preserved verbatim. */
+        /* '=' and '%' pack as their literal ASCII bytes (0x3d, 0x25) rather
+         * than a RULE_OP_* value -- a historical exception to the 0xc1-0xfd
+         * opcode range, kept because that encoding is already in the stream.
+         * applyrule DOES now implement both; it previously did not, and the
+         * default case skipped only the opcode so the operands executed as
+         * instructions. */
         NEED_BYTES(2);
-        *d++ = c;
 	n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
@@ -713,14 +1327,33 @@ int packrules(char *line) {
             rule_error(_msg, line, s - 1); }
           rulefail++;
         }
-        *d++ = positiontranslate(n);
-        *d++ = *s++;
+        /* The final operand is a literal character or an inline `?C` class.
+         * The opcode is chosen after the operand is parsed, so it is emitted
+         * here rather than above. */
+        {
+          char _lit = 0;
+          int _cb = rule_parse_class_operand(&s, 0, &_lit);
+          if (_cb < 0) {
+            char _msg[72]; snprintf(_msg, sizeof(_msg),
+              "Invalid character class for command '%c'", c);
+            rule_error(_msg, line, s);
+            rulefail++;
+            goto pack_op_done;
+          }
+          *d++ = (char)(_cb ? (c == '=' ? RULE_OP_REJ_AT_CLASS
+                                        : RULE_OP_REJ_CNT_CLASS)
+                            : (unsigned char)c);
+          *d++ = positiontranslate(n);
+          *d++ = _cb ? (char)(unsigned char)_cb : _lit;
+        }
         break;
 
       case 'i':
       case 'o':
+      case 'B':          /* BNX -- add byte value of X to the byte at N */
         NEED_BYTES(2);
-        *d++ = (c == 'i') ? RULE_OP_INSERT : RULE_OP_OVERWRITE;
+        *d++ = (c == 'i') ? RULE_OP_INSERT
+             : (c == 'o') ? RULE_OP_OVERWRITE : RULE_OP_CHR_ADD;
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
@@ -816,6 +1449,65 @@ int packrules(char *line) {
         *d++ = positiontranslate(n);
 	break;
 
+      case '~':
+        /* hashcat's class-based rule prefix.  The verb that follows takes a
+         * MANDATORY `?C` operand drawn from hashcat's six-class table, which
+         * is what makes the two syntaxes able to coexist: `?H` is uppercase
+         * hex here and the complement of hex in John's inline form.
+         *
+         * hashcat documents six of the nine (~! ~/ ~( ~) ~= ~%) as -j/-k only
+         * because its device rule engine cannot reject a candidate.  mdxfind
+         * has no host/device split in the rule language and implements all
+         * nine on both paths. */
+        NEED_BYTES(3);
+        {
+          char _v = *s++, _lit = 0;
+          unsigned char _plain = 0, _cls = 0;
+          int _cb;
+          if (!rule_verb_opcodes(_v, &_plain, &_cls)) {
+            char _msg[72]; snprintf(_msg, sizeof(_msg),
+              "'~' takes no character class for command '%c'", _v);
+            rule_error(_msg, line, s - 1);
+            rulefail++;
+            goto pack_op_done;
+          }
+          if (_v == '=' || _v == '%') {
+            n = *s++;
+            if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
+                (n > 'z') ) {
+              char _msg[72]; snprintf(_msg, sizeof(_msg),
+                "Invalid position '%c' for command '~%c'", n, _v);
+              rule_error(_msg, line, s - 1);
+              rulefail++;
+              goto pack_op_done;
+            }
+          }
+          _cb = rule_parse_class_operand(&s, 1, &_lit);
+          if (_cb < 0) {
+            char _msg[80]; snprintf(_msg, sizeof(_msg),
+              "'~%c' needs a hashcat class: ?l ?u ?d ?s ?h ?H", _v);
+            rule_error(_msg, line, s);
+            rulefail++;
+            goto pack_op_done;
+          }
+          /* hashcat's ~e?C is a different algorithm from John's e?C. */
+          if (_v == 'e' && _cb) _cls = RULE_OP_TITLE_CLASS_HC;
+          /* `~@??` and `@??` are the same rule and pack identically. */
+          *d++ = (char)(_cb ? _cls : _plain);
+          if (_v == '=' || _v == '%')
+            *d++ = positiontranslate(n);
+          *d++ = _cb ? (char)(unsigned char)_cb : _lit;
+          if (_v == 's') {
+            if (!*s) {
+              rule_error("'~s?CY' needs the replacement character Y", line, s);
+              rulefail++;
+              goto pack_op_done;
+            }
+            *d++ = *s++;
+          }
+        }
+        break;
+
       case ' ':
       case '\t':
       case ':':
@@ -852,7 +1544,21 @@ int packrules(char *line) {
           case '#': *d++ = RULE_OP_HASH_EXIT;   break;
           case 'H': *d++ = RULE_OP_HEX_UPPER;   break;
           case 'h': *d++ = RULE_OP_HEX_LOWER;   break;
-          default:  *d++ = c;                   break;
+          default:
+            /* Refuse an unrecognised verb rather than emitting it as a literal
+             * byte.  Operator ruling 2026-09-12: match hcrule, which rejects.
+             * The old passthrough turned a typo into malformed bytecode -- `M2`
+             * packed as MEM_STORE followed by a bare 0x32, which the walker then
+             * read as an OPCODE, and 0x32 is not one.  hashcat 6.2.5 reports
+             * "Skipping invalid or unsupported rule" for the same input. */
+            {
+              char _msg[64];
+              snprintf(_msg, sizeof(_msg), "Unknown rule command '%c'",
+                       (c >= ' ' && c < 127) ? c : '?');
+              rule_error(_msg, line, s - 1);
+              rulefail++;
+            }
+            break;
         }
         break;
     }
@@ -861,7 +1567,204 @@ pack_op_done:
                             * we don't keep reading past truncated input */
   }
   *d++ = 0;
+  if (packedlen)
+    *packedlen = (int)(d - line - 1);   /* exclude the trailing NUL */
   return (rulefail);
+}
+
+int packrules(char *line) {
+  int ignored;
+  return packrules_len(line, &ignored);
+}
+
+/* ---------------------------------------------------------------------------
+ * Rule store: length-carrying, input-order, hash-deduplicated.
+ *
+ * Replaces the JudySL (JSLI) rule arrays.  A JudySL key is a NUL-terminated
+ * string, which cannot represent a packed rule containing a 0x00 OPERAND, so
+ * the old store truncated such rules at load; see packrules_len above for the
+ * measured consequence.  Operator directive 2026-09-12: accept NULs in rules
+ * and pass the length, which rules out Judy's string de-duplication and forces
+ * a hash or literal compare.
+ *
+ * Two further properties the JudySL could not give us:
+ *   - INPUT ORDER.  JSLF/JSLN iterate in lexicographic order of the bytecode,
+ *     so rules executed in bytecode order, not the order of the rule file.
+ *     rs_ent[] is linear and append-only, so index order IS input order,
+ *     across multiple -r files.
+ *   - A stable ordinal per rule, which -Z and -R provenance hang off later.
+ *
+ * Dedup is by FNV-1a-64 over (bytes,len) with linear probing, and every hash
+ * hit is confirmed by an exact memcmp.  A false dedup silently DROPS a rule,
+ * which is a correctness bug, so equality is never inferred from the hash
+ * alone.  Dedup earns little -- 0 to 0.13% on the shipped rule files and
+ * EXACTLY ZERO on Hash-IT_Crazy_Rules (6,828,885 in, 6,828,885 out) -- it is
+ * kept because Numrules feeds the ETA, and nothing is traded away for it.
+ * --------------------------------------------------------------------------- */
+
+/* One instance per store.  -R needs two live at once: the accumulated product
+ * and the file being multiplied in, and left-major order (operator ruling,
+ * 2026-09-12: A1B1, A1B2, A1B3, A2B1...) requires the second file to be fully
+ * buffered before the product is formed, because the first file must vary
+ * slowest.  A singleton could not express either. */
+
+static uint64_t rs_hash(const char *b, int len)
+{
+    uint64_t h = 1469598103934665603ULL;          /* FNV-1a-64 offset basis */
+    for (int i = 0; i < len; i++) {
+        h ^= (unsigned char)b[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int rs_grow_htab(struct rulestore *rs)
+{
+    size_t newmask = rs->hmask ? ((rs->hmask + 1) * 2 - 1) : 1023;
+    uint32_t *nt = calloc(newmask + 1, sizeof(uint32_t));
+    if (!nt) return -1;
+    for (int i = 0; i < rs->n; i++) {
+        size_t j = rs_hash(rs->slab + rs->ent[i].off, rs->ent[i].len) & newmask;
+        while (nt[j]) j = (j + 1) & newmask;
+        nt[j] = (uint32_t)(i + 1);
+    }
+    free(rs->htab);
+    rs->htab  = nt;
+    rs->hmask = newmask;
+    return 0;
+}
+
+/* rs_add -- append a packed rule unless an identical one is already present.
+ * Returns the slot index (>= 0) for a new rule, -1 for an exact duplicate,
+ * -2 on allocation failure or an out-of-range length.
+ *
+ * A length of 0 is accepted and stored: it is what `:` packs to.  The LOADER
+ * filters those out rather than this function, because the implicit no-rule
+ * pass is foundational and an explicit `:` must not add a second one. */
+int rs_add(struct rulestore *rs, const char *bytes, int len)
+{
+    return rs_add_src(rs, bytes, len, NULL, 0);
+}
+
+/* rs_add_src -- rs_add, plus retention of the rule's ORIGINAL SOURCE TEXT.
+ * The source is appended only when the rule is actually stored, so a rule
+ * deduplicated away does not leave orphan text and the FIRST spelling of a
+ * duplicated rule is the one -Z reports -- which is input-file order. */
+int rs_add_src(struct rulestore *rs, const char *bytes, int len,
+               const char *src, int srclen)
+{
+    if (!rs || len < 0 || len > 65535) return -2;   /* 16-bit length field  */
+    if (srclen < 0 || srclen > 65535) return -2;
+    if (!src) srclen = 0;
+
+    if (!rs->htab && rs_grow_htab(rs) < 0) return -2;
+    if ((size_t)rs->n * 10 >= (rs->hmask + 1) * 7 && rs_grow_htab(rs) < 0) return -2;
+
+    uint64_t h = rs_hash(bytes, len);
+    size_t   j = h & rs->hmask;
+    while (rs->htab[j]) {
+        struct rule_ent *e = &rs->ent[rs->htab[j] - 1];
+        if (e->len == len && memcmp(rs->slab + e->off, bytes, (size_t)len) == 0)
+            return -1;                              /* exact duplicate      */
+        j = (j + 1) & rs->hmask;                    /* hash collision only  */
+    }
+
+    if (rs->used + (size_t)len > rs->cap) {
+        size_t nc = rs->cap ? rs->cap * 2 : (1 << 20);
+        while (nc < rs->used + (size_t)len) nc *= 2;
+        char *ns = realloc(rs->slab, nc);
+        if (!ns) return -2;
+        rs->slab = ns;
+        rs->cap  = nc;
+    }
+    if (rs->n >= rs->entcap) {
+        int ne = rs->entcap ? rs->entcap * 2 : 4096;
+        struct rule_ent *nn = realloc(rs->ent, (size_t)ne * sizeof(*nn));
+        if (!nn) return -2;
+        rs->ent    = nn;
+        rs->entcap = ne;
+    }
+
+    if (srclen) {
+        if (rs->srcused + (size_t)srclen > rs->srccap) {
+            size_t nc = rs->srccap ? rs->srccap * 2 : (1 << 20);
+            while (nc < rs->srcused + (size_t)srclen) nc *= 2;
+            char *nsrc = realloc(rs->src, nc);
+            if (!nsrc) return -2;
+            rs->src    = nsrc;
+            rs->srccap = nc;
+        }
+    }
+
+    memcpy(rs->slab + rs->used, bytes, (size_t)len);
+    rs->ent[rs->n].off = (uint32_t)rs->used;
+    rs->ent[rs->n].len = (unsigned short)len;
+    rs->used += (size_t)len;
+    if (srclen) {
+        memcpy(rs->src + rs->srcused, src, (size_t)srclen);
+        rs->ent[rs->n].srcoff = (uint32_t)rs->srcused;
+        rs->ent[rs->n].srclen = (unsigned short)srclen;
+        rs->srcused += (size_t)srclen;
+    } else {
+        rs->ent[rs->n].srcoff = 0;
+        rs->ent[rs->n].srclen = 0;
+    }
+    rs->htab[j] = (uint32_t)(rs->n + 1);
+    return rs->n++;
+}
+
+void rs_reset(struct rulestore *rs)
+{
+    if (!rs) return;
+    free(rs->slab); free(rs->ent); free(rs->htab); free(rs->src);
+    memset(rs, 0, sizeof(*rs));
+}
+
+/* rs_product -- replace `dst` with the LEFT-MAJOR concatenation of dst x mul.
+ * Left-major: dst varies slowest, so the emitted order is
+ * dst0.mul0, dst0.mul1, ... dst0.mulN, dst1.mul0, ...
+ * A pair whose combined length would exceed `maxlen` is skipped, matching the
+ * previous loader's `(curlen + len) < MAXLINE` guard.  Returns 0, or -1 on
+ * allocation failure, in which case dst is left untouched. */
+int rs_product(struct rulestore *dst, const struct rulestore *mul, int maxlen)
+{
+    struct rulestore out;
+    char *tmp, *stmp;
+    int i, k;
+
+    if (!dst || !mul) return -1;
+    memset(&out, 0, sizeof(out));
+    tmp = malloc((size_t)maxlen + 2);
+    if (!tmp) return -1;
+    /* Source text for a product rule is the two parents' text joined by a
+     * space, which is itself a runnable rule line -- mdxfind applies the ops
+     * on a line left to right, so "l" x "$1" really is "l $1".  Materialised
+     * here rather than kept as parent pointers because this function already
+     * materialises the full |dst| x |mul| BYTECODE product, so the text is the
+     * same order of growth and not a new one. */
+    stmp = malloc((size_t)maxlen * 2 + 4);
+    if (!stmp) { free(tmp); return -1; }
+
+    for (i = 0; i < dst->n; i++) {
+        for (k = 0; k < mul->n; k++) {
+            int la = dst->ent[i].len, lb = mul->ent[k].len;
+            if (la + lb >= maxlen) continue;
+            int sa = dst->ent[i].srclen, sb = mul->ent[k].srclen, sl = 0;
+            memcpy(tmp,      dst->slab + dst->ent[i].off, (size_t)la);
+            memcpy(tmp + la, mul->slab + mul->ent[k].off, (size_t)lb);
+            if (sa) { memcpy(stmp, dst->src + dst->ent[i].srcoff, (size_t)sa); sl = sa; }
+            if (sa && sb) stmp[sl++] = ' ';
+            if (sb) { memcpy(stmp + sl, mul->src + mul->ent[k].srcoff, (size_t)sb); sl += sb; }
+            if (rs_add_src(&out, tmp, la + lb, sl ? stmp : NULL, sl) == -2) {
+                free(tmp); free(stmp); rs_reset(&out); return -1;
+            }
+        }
+    }
+    free(tmp);
+    free(stmp);
+    rs_reset(dst);
+    *dst = out;
+    return 0;
 }
 #undef NEED_BYTES
 
@@ -939,16 +1842,35 @@ char * parserules(char *line) {
       case '@':
       case 'e':
       case '!':
-        s++;
+      /* `/`, `(` and `)` take a CHARACTER operand, not a position.  They were
+       * grouped with the position verbs below, so packrules ran
+       * positiontranslate() over a literal character: `/s` stored 0x37, the
+       * index of 's' in Rulepos plus one, instead of 0x73.  The executors are
+       * correct; the compiler mangled the operand, so all three always
+       * rejected.  John and hashcat both document them as character tests:
+       * "/X reject the word unless it contains character X", "(X ... unless
+       * its first character is X", ")X ... unless its last character is X".
+       * Moving them here also correctly relaxes validation -- any character
+       * is a legal operand, where the position group refused anything outside
+       * [0-9A-Za-z]. */
+      case '/':
+      case '(':
+      case ')':
+        {
+          char _lit = 0;
+          if (rule_parse_class_operand(&s, 0, &_lit) < 0) {
+            char _msg[72]; snprintf(_msg, sizeof(_msg),
+              "Invalid character class for command '%c'", c);
+            rule_error(_msg, line, s);
+            rulefail++;
+          }
+        }
         break;
 
       case 'D':
       case '\'':
       case 'Z':
       case 'z':
-      case '/':
-      case '(':
-      case ')':
       case '_':
       case '<':
       case '>':
@@ -977,13 +1899,28 @@ char * parserules(char *line) {
         n = *s++;
         if ((n < '1') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
-	  fprintf(stderr, "Invalid position %c for %c\n", n, c);
+	  if (!Rulequiet) fprintf(stderr, "Invalid position %c for %c\n", n, c);
           rulefail++;
         }
 	n = *s++;
 	break;
 
       case 's':
+        /* This arm consumed NOTHING before the class work, so `s`'s two
+         * operands were re-entered as verbs: `sxy` validated 'x' as the
+         * two-position extract op, read 'y' as one position and NUL as the
+         * other, and reported a bogus "Invalid position".  It now consumes
+         * its own operands. */
+        {
+          char _lit = 0;
+          int _cb = rule_parse_class_operand(&s, 0, &_lit);
+          if (_cb < 0 || !*s) {
+            rule_error("'s' needs two operands: sXY or s?CY", line, s);
+            rulefail++;
+          } else {
+            s++;
+          }
+        }
 	break;
 
       case '=':
@@ -996,11 +1933,20 @@ char * parserules(char *line) {
             rule_error(_msg, line, s - 1); }
           rulefail++;
         }
-        s++;
+        {
+          char _lit = 0;
+          if (rule_parse_class_operand(&s, 0, &_lit) < 0) {
+            char _msg[72]; snprintf(_msg, sizeof(_msg),
+              "Invalid character class for command '%c'", c);
+            rule_error(_msg, line, s);
+            rulefail++;
+          }
+        }
         break;
 
       case 'i':
       case 'o':
+      case 'B':
         n = *s++;
         if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
 	   (n > 'z') ) {
@@ -1073,6 +2019,47 @@ char * parserules(char *line) {
         }
 	break;
 
+      case '~':
+        /* hashcat class prefix -- validate the same shape packrules packs. */
+        {
+          char _v = *s++, _lit = 0;
+          unsigned char _plain = 0, _cls = 0;
+          if (!rule_verb_opcodes(_v, &_plain, &_cls)) {
+            char _msg[72]; snprintf(_msg, sizeof(_msg),
+              "'~' takes no character class for command '%c'", _v);
+            rule_error(_msg, line, s - 1);
+            rulefail++;
+            break;
+          }
+          if (_v == '=' || _v == '%') {
+            n = *s++;
+            if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
+                (n > 'z') ) {
+              char _msg[72]; snprintf(_msg, sizeof(_msg),
+                "Invalid position '%c' for command '~%c'", n, _v);
+              rule_error(_msg, line, s - 1);
+              rulefail++;
+              break;
+            }
+          }
+          if (rule_parse_class_operand(&s, 1, &_lit) < 0) {
+            char _msg[80]; snprintf(_msg, sizeof(_msg),
+              "'~%c' needs a hashcat class: ?l ?u ?d ?s ?h ?H", _v);
+            rule_error(_msg, line, s);
+            rulefail++;
+            break;
+          }
+          if (_v == 's') {
+            if (!*s) {
+              rule_error("'~s?CY' needs the replacement character Y", line, s);
+              rulefail++;
+              break;
+            }
+            s++;
+          }
+        }
+        break;
+
       case ' ':
       case '\t':
       case ':':
@@ -1130,19 +2117,50 @@ char * parserules(char *line) {
  *   variable:    0xff (multi-char append for $X$Y$Z chains, 2+N bytes)
  *                0xfe (multi-char prepend for ^X^Y^Z chains, 2+N bytes)
  *
- * NOT supported (rule routes to CPU):
- *   - M 4 6 X Q                     — memory ops (slice-4 path B revert;
- *                                     mem[40K] OOM'd on 3080)
- *   - S # v = %                     — mdxfind-specific / placeholder ops
- *   - 0x02 (slowrule escape: base64-encode-word)
+ * NOT supported (rule routes to CPU).  After the 2026-09-11 promotions this
+ * is only four opcodes; M 4 6 X Q and = % are now GPU-eligible and are listed
+ * in the switch below, not here:
+ *   - S  (0xc5)                     — mdxfind-specific; pending the A2
+ *                                     restructure to john CONV_SOURCE/CONV_SHIFT
+ *   - v  (0xc1)                     — divide-insert
+ *   - 0x02 (slowrule escape: base64-encode-word) — out of GPU scope by ruling
  *   - Anything else
+ *
+ * THREE, not four: RULE_OP_HASH_EXIT 0xc4 is NOT reachable and must not be
+ * counted here.  '#' IS A COMMENT.  A bare '#' -- one standing where a verb is
+ * expected -- comments out the rest of the line, and nothing after it is
+ * examined; packrules() says so directly by testing it in the SAME condition as
+ * '\r' and '\n', so a bare '#' is treated as end of line.  c#$1 therefore means
+ * capitalize, then a comment.  As a verb's OPERAND, '#' is ordinary data, which
+ * is how comment characters behave everywhere: $# appends '#', @# purges it, sa#
+ * substitutes it.  A whole-line comment is just the degenerate case with the '#'
+ * first.
+ *
+ * Consequence for this switch: '#' never reaches the packed bytecode, so 0xc4
+ * cannot appear here, the 'case' that would emit it is dead code, and '#' CANNOT
+ * be used to force a rule onto the CPU.  c#$1 classifies as GPU-eligible because
+ * it compiles to a bare c.
+ *
+ * Those three are the ONLY way to build a mixed GPU/CPU partition now, which is
+ * what the FastRule precondition guard at mdxfind.c:13764 needs in order to be
+ * exercised at all.  With 0x02 out of scope by ruling and S pending the A2
+ * restructure, v is in practice the only usable one.  See the mixguard fixture.
  *
  * For multi-byte ops we must consume the parameter bytes too, otherwise
  * the next iteration would misinterpret them as ops.
  */
-static int gpu_rule_safe_phase0(const char *packed_rule) {
-    unsigned char c;
-    while ((c = (unsigned char)*packed_rule++)) {
+/* Length-bounded since 2026-09-12.  It used to walk the bytecode as a C string,
+ * `while ((c = *packed_rule++))`, and every multi-byte arm tested its operand
+ * bytes with `if (!*packed_rule++) return 0;`.  That treated a 0x00 OPERAND as
+ * end-of-rule, so any rule carrying one -- `$\x00` via PARSEHEX -- was reported
+ * NOT GPU-safe and silently stayed CPU-only: correct results, no GPU, no
+ * diagnostic.  The walk is now bounded by the true packed length, so an operand
+ * may be any byte including 0x00, and a truncated rule is rejected because its
+ * operands run past `len` rather than because one of them happens to be zero. */
+static int gpu_rule_safe_phase0(const char *packed_rule, int len) {
+    int k = 0;
+    while (k < len) {
+        unsigned char c = (unsigned char)packed_rule[k++];
         switch (c) {
             case RULE_OP_LOWER: case RULE_OP_UPPER: case RULE_OP_REVERSE:
             case RULE_OP_CAP: case RULE_OP_CAP_INV: case RULE_OP_TOGGLE:
@@ -1153,6 +2171,17 @@ static int gpu_rule_safe_phase0(const char *packed_rule) {
             case RULE_OP_SWAP_FRONT: case RULE_OP_SWAP_BACK:
             case RULE_OP_NOOP:
             case RULE_OP_NOOP_SP: case RULE_OP_NOOP_TAB:
+            /* Memory family, GPU-enabled 2026-09-11 (operator ruling).  All
+             * six rules kernels now implement M 4 6 Q X against a second
+             * RULE_BUF_MAX buffer.  The 2026 attempt was reverted because at
+             * 40960 bytes a second buffer doubled per-thread private memory
+             * and FATAL'd CL_OUT_OF_HOST_MEMORY on an RTX 3080; at 2048 the
+             * pair costs 4 KB per thread, a tenth of what ONE buffer cost
+             * before, so the resource objection is gone.
+             * memlen resets per applyrule call on the CPU, so there is no
+             * cross-rule state for an independent work-item to reproduce. */
+            case RULE_OP_MEM_STORE: case RULE_OP_MEM_APP:
+            case RULE_OP_MEM_PRE:   case RULE_OP_MEM_REJ:
                 continue;
             case RULE_OP_TOGGLE_AT: case RULE_OP_TITLE_SEP:
             case RULE_OP_APPEND: case RULE_OP_PREPEND:
@@ -1168,15 +2197,28 @@ static int gpu_rule_safe_phase0(const char *packed_rule) {
              * `_ < > ! / ( )` with byte-exact applyrule semantics and
              * returns -1 to signal rejection. The four md5_rules kernels
              * (production, test, test_iter, validate) honor the sentinel.
-             * Memory-op rejection Q (RULE_OP_MEM_REJ) stays in default-reject
-             * — the M/4/6/X/Q family is CPU-only (slice-4 path B reverted
-             * the kernel impl, see gpu/gpu_md5_rules.cl rev 1.24). */
+             * Q (RULE_OP_MEM_REJ) is NO LONGER in default-reject: it moved up
+             * into the memory-family group above on 2026-09-11 along with
+             * M 4 6 X, which superseded the slice-4 path B revert described
+             * there (that revert is why gpu/gpu_md5_rules.cl rev 1.24 dropped
+             * the kernel impl; RULE_BUF_MAX 2048 removed the resource cost). */
             case RULE_OP_REJ_LEN_NE: case RULE_OP_REJ_LEN_GE:
+            /* Character-class forms, promoted to GPU 2026-09-11: the six
+             * rules kernels implement all ten, sharing one 480-byte
+             * membership table in the constant address space of the common
+             * source.  Promoting them matters beyond speed -- every class
+             * rule used to force a mixed GPU/CPU partition, and a
+             * partitioned run has to union two result sets. */
+            case RULE_OP_PURGE_CLASS:     case RULE_OP_TITLE_CLASS:
+            case RULE_OP_TITLE_CLASS_HC:  case RULE_OP_REJ_HAS_CLASS:
+            case RULE_OP_REJ_NHAS_CLASS:  case RULE_OP_REJ_FIRST_CLASS:
+            case RULE_OP_REJ_LAST_CLASS:
             case RULE_OP_REJ_LEN_LE: case RULE_OP_REJ_HAS:
             case RULE_OP_REJ_NHAS: case RULE_OP_REJ_FIRST:
             case RULE_OP_REJ_LAST:
-                /* Two-byte op: consume one parameter byte. */
-                if (!*packed_rule++) return 0;
+                /* Two-byte op: one operand byte, any value. */
+                if (k + 1 > len) return 0;
+                k += 1;
                 continue;
             /* Hex emit ops (rev 1.26): kernel rev 1.22 implements `H` and
              * `h` (RULE_OP_HEX_UPPER / RULE_OP_HEX_LOWER) with byte-exact
@@ -1184,23 +2226,46 @@ static int gpu_rule_safe_phase0(const char *packed_rule) {
             case RULE_OP_HEX_UPPER: case RULE_OP_HEX_LOWER:
                 continue;
             case RULE_OP_SUB:
+            case RULE_OP_CHR_ADD:
             case RULE_OP_INSERT: case RULE_OP_OVERWRITE:
+            /* Three-byte class forms, plus `=NX`/`%NX` which pack as their
+             * literal ASCII bytes and were CPU-only for no reason other than
+             * that this switch never listed them. */
+            case RULE_OP_SUB_CLASS: case RULE_OP_REJ_AT_CLASS:
+            case RULE_OP_REJ_CNT_CLASS:
+            case 0x3d: case 0x25:
             case RULE_OP_SWAP_AT: case RULE_OP_EXTRACT: case RULE_OP_OMIT:
             case RULE_OP_TOGGLE_SEP:
-                /* Three-byte op: consume two parameter bytes.
+                /* Three-byte op: two operand bytes, any value.
                  * RULE_OP_TOGGLE_SEP is hashcat RULE_OP_MANGLE_TOGGLE_AT_SEP —
                  * same wire shape (op + position-byte + literal-byte) as
                  * 'i'/'o', so it joins this group. */
-                if (!*packed_rule++) return 0;
-                if (!*packed_rule++) return 0;
+                if (k + 2 > len) return 0;
+                k += 2;
+                continue;
+            /* `X N M I` is the only FOUR-byte op: opcode plus three
+             * position-encoded operands.  Placed AFTER the three-byte group's
+             * body on purpose -- the labels above it (SUB, CHR_ADD, INSERT,
+             * OVERWRITE, the three-byte class forms, `=`, `%`) have no body of
+             * their own and FALL THROUGH to it.  Inserting a four-byte body in
+             * front of them made all nine consume three operand bytes instead
+             * of two, desynchronising the walk: d3ad0ne.rule went from 37
+             * CPU-only rules to 14,958. */
+            case RULE_OP_MEM_INSERT:
+                if (k + 3 > len) return 0;
+                k += 3;
                 continue;
             case 0xff: case 0xfe: {
-                /* Multi-char append/prepend: 2+N bytes total. */
-                unsigned char N = (unsigned char)*packed_rule++;
+                /* Multi-char append/prepend: 2+N bytes total.  N operand bytes
+                 * of ANY value -- this arm is where the old NUL test did the
+                 * most damage, because a multi-char append is exactly how a
+                 * 0x00 reaches a rule. */
+                unsigned char N;
+                if (k + 1 > len) return 0;
+                N = (unsigned char)packed_rule[k++];
                 if (N == 0) return 0;
-                for (unsigned int j = 0; j < N; j++) {
-                    if (!*packed_rule++) return 0;
-                }
+                if (k + N > len) return 0;
+                k += N;
                 continue;
             }
             default:
@@ -1217,26 +2282,42 @@ static int gpu_rule_safe_phase0(const char *packed_rule) {
  * pointers are stable for the lifetime of full[]. Both partitions
  * preserve original input order.
  *
+ * lens[] is REQUIRED and parallel to rules[]: it carries each rule's true
+ * packed length, because the bytecode is not a C string -- an operand byte may
+ * be 0x00.  gpulen[]/cpulen[] carry the lengths through to the partitions, and
+ * gpuidx[]/cpuidx[] record each entry's ORIGINAL index so a caller never has to
+ * recover it by searching for the pointer.  The GPU pack sites used to do
+ * exactly that, restarting the scan at 0 for every entry although this function
+ * preserves order -- roughly 5e9 pointer compares at HashMob.100k scale.
+ *
  * Returns: ngpu (number of GPU-eligible rules; 0..nrules). */
-int classify_rules(char **rules, int nrules, struct rule_lists *out) {
-    if (!out) return -1;
-    out->full  = rules;
-    out->nfull = nrules;
-    out->gpu   = (char **)malloc((size_t)nrules * sizeof(char *));
-    out->cpu   = (char **)malloc((size_t)nrules * sizeof(char *));
-    if (!out->gpu || !out->cpu) {
-        free(out->gpu); free(out->cpu);
-        out->gpu = out->cpu = NULL;
-        out->ngpu = out->ncpu = 0;
+int classify_rules(char **rules, const unsigned short *lens, int nrules,
+                   struct rule_lists *out) {
+    if (!out || !lens) return -1;
+    memset(out, 0, sizeof(*out));
+    out->full    = rules;
+    out->fulllen = lens;
+    out->nfull   = nrules;
+    out->gpu     = (char **)malloc((size_t)nrules * sizeof(char *));
+    out->cpu     = (char **)malloc((size_t)nrules * sizeof(char *));
+    out->gpulen  = (unsigned short *)malloc((size_t)nrules * sizeof(unsigned short));
+    out->cpulen  = (unsigned short *)malloc((size_t)nrules * sizeof(unsigned short));
+    out->gpuidx  = (int *)malloc((size_t)nrules * sizeof(int));
+    out->cpuidx  = (int *)malloc((size_t)nrules * sizeof(int));
+    if (!out->gpu || !out->cpu || !out->gpulen || !out->cpulen ||
+        !out->gpuidx || !out->cpuidx) {
+        rule_lists_free(out);
         return -1;
     }
-    out->ngpu = 0;
-    out->ncpu = 0;
     for (int i = 0; i < nrules; i++) {
-        if (gpu_rule_safe_phase0(rules[i])) {
-            out->gpu[out->ngpu++] = rules[i];
+        if (gpu_rule_safe_phase0(rules[i], (int)lens[i])) {
+            out->gpulen[out->ngpu] = lens[i];
+            out->gpuidx[out->ngpu] = i;          /* original Rules[] index */
+            out->gpu[out->ngpu++]  = rules[i];
         } else {
-            out->cpu[out->ncpu++] = rules[i];
+            out->cpulen[out->ncpu] = lens[i];
+            out->cpuidx[out->ncpu] = i;
+            out->cpu[out->ncpu++]  = rules[i];
         }
     }
     return out->ngpu;
@@ -1247,9 +2328,10 @@ int classify_rules(char **rules, int nrules, struct rule_lists *out) {
  * alone (caller owns). */
 void rule_lists_free(struct rule_lists *rl) {
     if (!rl) return;
-    free(rl->gpu); rl->gpu = NULL; rl->ngpu = 0;
-    free(rl->cpu); rl->cpu = NULL; rl->ncpu = 0;
-    rl->full = NULL; rl->nfull = 0;
+    free(rl->gpu);    free(rl->cpu);
+    free(rl->gpulen); free(rl->cpulen);
+    free(rl->gpuidx); free(rl->cpuidx);
+    memset(rl, 0, sizeof(*rl));   /* full[]/fulllen[] are aliases, caller-owned */
 }
 
 
@@ -1282,7 +2364,7 @@ int applyrule(char *line, char *pass, int len, char *rule,
     static int _validate_cached = -1;
     int validate;
     if (_validate_cached == -1)
-        _validate_cached = (getenv("MDXFIND_RULE_VALIDATOR") != NULL) ? 1 : 0;
+        _validate_cached = 0;   /* was MDXFIND_RULE_VALIDATOR */
     validate = _validate_cached;
 
     memlen = 0;
@@ -1305,6 +2387,40 @@ if (len < FASTLEN) {
     switch (c) {
       case 0x02: /* control B */
 	goto slowrule;
+
+      /* `=NX` reject unless the character at position N is X.
+       * `%NX` reject unless X occurs at least N times.
+       *
+       * Documented and AGREEING in both references -- John: "reject the word
+       * unless character in position N is equal to X" / "unless it contains
+       * at least N instances of X"; hashcat: "reject plains that do not
+       * contain char X at pos N" / "that contain char X less than N times".
+       *
+       * packrules already emitted the right shape (opcode, then the
+       * position/count position-translated, then the literal character) but
+       * no executor existed, and the default case skipped only the OPCODE
+       * byte.  The two operand bytes were then executed as instructions, so
+       * `=0p $Z` yielded `passe` instead of `passerZ` -- silent
+       * misexecution, not the documented no-op.  198 rules in
+       * HashMob.100k.rule and 83,494 in rules/Hash-IT_Crazy_Rules.rule
+       * contain one of these verbs.  Verified against john.  Both are
+       * CPU-only: classify_rules does not list 0x3d/0x25, so such rules fall
+       * to its default and route away from the GPU, which is correct. */
+      case '=':
+        y = *rule++ - 1;
+        c = *rule++;
+        if (y >= clen || (unsigned char)cpass[y] != c)
+          { _retval = (-1); goto _validate_exit; }
+        break;
+
+      case '%':
+        y = *rule++ - 1;
+        c = *rule++;
+        { int _cnt = 0;
+          for (x = 0; x < clen; x++)
+            if ((unsigned char)cpass[x] == c) _cnt++;
+          if (_cnt < y) { _retval = (-1); goto _validate_exit; } }
+        break;
 
       default:
         /*
@@ -1382,17 +2498,44 @@ if (len < FASTLEN) {
 
     case RULE_OP_MEM_INSERT:
     case 'X':
+        /* `X N M I`: insert M characters of the memory buffer, starting at
+         * OFFSET N within it, at position I of the candidate.
+         *
+         * N was read and then ignored -- the copy was Memory[x] rather than
+         * Memory[y + x] -- so every offset produced the same result:
+         * MX034/MX134/MX234 on "abcdef" all gave "abcdabcef" where john and
+         * hashcat give abcdabcef / abcdbcdef / abcdcdeef.  Both references
+         * agree on that, so it was simply wrong.  Fixed 2026-09-11.
+         *
+         * OUT-OF-RANGE FOLLOWS HASHCAT (operator ruling, 2026-09-11; this
+         * reverses an earlier reading that clamped like john).  hashcat's
+         * mangle_insert_multi() rejects rather than clamping, on exactly
+         * these conditions:
+         *   no memory stored           mem_len < 1
+         *   insert position past end   I > clen
+         *   offset past memory         N > memlen
+         *   range overruns memory      N + M > memlen
+         *   zero count                 M < 1
+         *   result too long            clen + M > buffer
+         * john instead clamps I to the end and M to what memory holds, so
+         * MX049 on "abcdef" is "abcdefabcd" in john and a reject here.
+         *
+         * NOTE hashcat's own implementation also MUTATES its memory buffer
+         * while reading it (the memmove in mangle_insert_multi), so a second
+         * X in the same rule sees shifted memory.  That is not replicated:
+         * it reads as a defect in hashcat, not as semantics.  Reported. */
         y = *rule++ - 1;
 	tlen = *rule++ - 1;
 	z = *rule++ - 1;
+	if (memlen < 1 || tlen < 1 || z > clen || y > memlen ||
+	    (y + tlen) > memlen)
+	    { _retval = (-1); goto _validate_exit; }
 	if ((clen + tlen) > FASTLEN) 
 	    goto slowrule;
-	if (tlen > memlen)
-	    tlen = memlen;
 	for (x=clen; x >= z; x--)
 	   cpass[x+tlen] = cpass[x];
 	for (x=0; x < tlen; x++) 
-	   cpass[x+z] = Memory[x];
+	   cpass[x+z] = Memory[y+x];
 	clen += tlen;
 	break;
 
@@ -1401,22 +2544,150 @@ if (len < FASTLEN) {
 
       case RULE_OP_REJ_LEN_NE:
       case '_':
+        /* John: "_N reject the word unless it is N characters long" -- the
+         * CURRENT length at this point in the rule, not the original word's.
+         * This tested `len`, so `$a _5` on a 4-char word rejected even though
+         * the candidate is 5 characters by then, and `$a _4` wrongly kept it.
+         * `<` and `>` alongside already use clen. */
         y = *rule++ - 1;
-	if (y != len)
+	if (y != clen)
 	    { _retval = (-1); goto _validate_exit; }
 	break;
       case RULE_OP_REJ_LEN_GE:
       case '<':
-        y = *rule++ - 1; 
-        if (clen < y)
+        /* John: "<N reject the word unless it is less than N characters
+         * long" -- so reject when clen >= N.  This tested clen < y, i.e. it
+         * kept clen >= N, the exact complement.  Operator ruling 2026-09-11:
+         * match John, which is both documented and runnable; hashcat's doc
+         * says "reject plains of length greater than N" (inclusive) and its
+         * release will not run the verb at all. */
+        y = *rule++ - 1;
+        if (clen >= y)
           { _retval = (-1); goto _validate_exit; }
         break;
       case RULE_OP_REJ_LEN_LE:
       case '>':
-        y = *rule++ - 1; 
-        if (clen > y)
+        /* John: ">N reject the word unless it is greater than N characters
+         * long" -- so reject when clen <= N.  Complement of the old test.
+         * Same ruling as `<` above. */
+        y = *rule++ - 1;
+        if (clen <= y)
           { _retval = (-1); goto _validate_exit; }
         break;
+
+      /* ---- character-class forms (D6, 2026-09-11) --------------------
+       * Each mirrors its literal-operand sibling with RULE_CLASS_MATCH() in
+       * place of the equality test.  The complement lives in the high bit of
+       * the class byte and is applied by XOR inside the macro, so `?D` costs
+       * exactly what `?d` costs.
+       *
+       * CPU-only: classify_rules does not admit 0x80-0x88, so a rule using
+       * one routes to the CPU list.  That is correct, not a gap -- the same
+       * arrangement as `=` and `%`.
+       */
+      case RULE_OP_SUB_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        c = *rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, cpass[x]))
+            cpass[x] = c;
+        break; }
+
+      case RULE_OP_PURGE_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        d = cpass;
+        s = cpass;
+        for (x = 0; x < clen; x++) {
+          if (!RULE_CLASS_MATCH(_cb, *s))
+            *d++ = *s;
+          s++;
+        }
+        clen -= (s - d);
+        if (clen < 0)
+          clen = 0;
+        break; }
+
+      case RULE_OP_TITLE_CLASS: {
+        /* John's e?C -- the literal `e` shape with a class separator test.
+         * Positional word start, as for `e`. */
+        unsigned char _cb = (unsigned char)*rule++;
+        for (z = 0, x = 0; x < clen; x++) {
+          c = cpass[x];
+          if (RULE_CLASS_MATCH(_cb, c)) { z = 0; continue; }
+          if (z == 0) {
+            z = 1;
+            if (c >= 'a' && c <= 'z') cpass[x] = c ^ 0x20;
+          } else {
+            if (c >= 'A' && c <= 'Z') cpass[x] = c ^ 0x20;
+          }
+        }
+        break; }
+
+      case RULE_OP_TITLE_CLASS_HC: {
+        /* hashcat mangle_title_sep_class_*: lowercase every position, then
+         * uppercase position 0 and every position whose PREDECESSOR was in
+         * the class.  The class test reads the byte before it is modified,
+         * and the separator is itself case-normalised -- both differences
+         * from John's e?C above. */
+        unsigned char _cb = (unsigned char)*rule++;
+        int _up = 1;
+        for (x = 0; x < clen; x++) {
+          int _this = _up;
+          c = cpass[x];
+          _up = RULE_CLASS_MATCH(_cb, c) ? 1 : 0;
+          if (c >= 'A' && c <= 'Z') { c ^= 0x20; cpass[x] = c; }
+          if (_this && c >= 'a' && c <= 'z')
+            cpass[x] = c ^ 0x20;
+        }
+        break; }
+
+      case RULE_OP_REJ_HAS_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, cpass[x]))
+            { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_NHAS_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, cpass[x]))
+            break;
+        if (x >= clen)
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_FIRST_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        if (clen > 0 && !RULE_CLASS_MATCH(_cb, cpass[0]))
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_LAST_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        if (clen > 0 && !RULE_CLASS_MATCH(_cb, cpass[clen - 1]))
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_AT_CLASS: {
+        unsigned char _cb;
+        y = *rule++ - 1;
+        _cb = (unsigned char)*rule++;
+        if (y >= clen || !RULE_CLASS_MATCH(_cb, cpass[y]))
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_CNT_CLASS: {
+        unsigned char _cb;
+        int _cnt = 0;
+        y = *rule++ - 1;
+        _cb = (unsigned char)*rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, cpass[x]))
+            _cnt++;
+        if (_cnt < y)
+          { _retval = (-1); goto _validate_exit; }
+        break; }
 
       case RULE_OP_REJ_HAS:
       case '!':
@@ -1522,17 +2793,21 @@ if (len < FASTLEN) {
 
       case RULE_OP_CAP:
       case 'c':
+        /* John and hashcat both act on POSITION 0, not on the first
+         * alphabetic character: `c` on "!bang" is "!bang" in both, where
+         * mdxfind gave "!Bang".  Same for `C`: "!BANG" in both, "!bANG"
+         * here.  Verified word-by-word against john --stdout and against
+         * hashcat's own _old_apply_rule().  Fixed 2026-09-11. */
 #ifdef NOTINTEL
-        for (z = x = 0; x < clen; x++) {
+        for (x = 0; x < clen; x++) {
           c = cpass[x];
-          if (z == 0 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
-            if (c >= 'a' && c <= 'z')
-              cpass[x] = c - 0x20;
-            z = 1;
-            continue;
-          }
           if (c >= 'A' && c <= 'Z')
             cpass[x] = c + 0x20;
+        }
+        if (clen > 0) {
+          c = cpass[0];
+          if (c >= 'a' && c <= 'z')
+            cpass[0] = c - 0x20;
         }
 #else
 	for (t=cpass,x=0; ((unsigned long) t & 15) && x < clen; x++, t++) {
@@ -1548,12 +2823,10 @@ if (len < FASTLEN) {
 	    c128 = _mm_andnot_si128(b128,_mm_set1_epi8(0x20));
 	    *p128++ = _mm_xor_si128(d128,c128);
 	}
-	for (x=0; x < clen; x++) {
-	    c = cpass[x];
-	    if (c >= 'a' && c <= 'z') {
-	        cpass[x] = c ^ 0x20;
-		break;
-	    }
+	if (clen > 0) {
+	    c = cpass[0];
+	    if (c >= 'a' && c <= 'z')
+	        cpass[0] = c ^ 0x20;
 	}
 #endif
         break;
@@ -1561,16 +2834,15 @@ if (len < FASTLEN) {
       case RULE_OP_CAP_INV:
       case 'C':
 #ifdef NOTINTEL
-        for (z = x = 0; x < clen; x++) {
+        for (x = 0; x < clen; x++) {
           c = cpass[x];
-          if (z == 0 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
-            if (c >= 'A' && c <= 'Z')
-              cpass[x] = c + 0x20;
-            z = 1;
-            continue;
-          }
           if (c >= 'a' && c <= 'z')
             cpass[x] = c - 0x20;
+        }
+        if (clen > 0) {
+          c = cpass[0];
+          if (c >= 'A' && c <= 'Z')
+            cpass[0] = c + 0x20;
         }
 #else
 	for (t=cpass,x=0; ((unsigned long) t & 15) && x < clen; x++, t++) {
@@ -1586,12 +2858,10 @@ if (len < FASTLEN) {
 	    c128 = _mm_andnot_si128(b128,_mm_set1_epi8(0x20));
 	    *p128++ = _mm_xor_si128(d128,c128);
 	}
-	for (x=0; x < clen; x++) {
-	    c = cpass[x];
-	    if (c >= 'A' && c <= 'Z') {
-	        cpass[x] = c ^ 0x20;
-		break;
-	    }
+	if (clen > 0) {
+	    c = cpass[0];
+	    if (c >= 'A' && c <= 'Z')
+	        cpass[0] = c ^ 0x20;
 	}
 #endif
         break;
@@ -1626,10 +2896,19 @@ if (len < FASTLEN) {
 
       case RULE_OP_TOGGLE_AT:
       case 'T':
+        /* Bounds check: john guards this explicitly (rules.c case 'T':
+         * "if (pos < length)").  Without it a position up to 61 reads --
+         * and can write -- shared workspace past the candidate, the same
+         * shape as the `.N` one-past-the-end read.  Not observable today
+         * because the bytes there are NUL, so nothing toggles and clen is
+         * unchanged; all three engines agree on T3/T9/TZ for "abc".  The
+         * guard is one compare and removes the hazard. */
         y = *rule++ - 1;
-        c = cpass[y];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-          cpass[y] = c ^ 0x20;
+        if (y < clen) {
+          c = cpass[y];
+          if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+            cpass[y] = c ^ 0x20;
+        }
         break;
 
       case RULE_OP_REVERSE:
@@ -1759,15 +3038,27 @@ if (len < FASTLEN) {
 
       case RULE_OP_EXTRACT:
       case 'x':
+        /* `x N M`: extract M characters from position N.
+         *
+         * FOLLOWS HASHCAT (operator ruling 2026-09-11, superseding an earlier
+         * ruling for john).  hashcat's mangle_extract() no-ops on BOTH
+         * out-of-range conditions and never extracts a partial run:
+         *     if (upos >= arr_len)          return arr_len;
+         *     if ((upos + ulen) > arr_len)  return arr_len;
+         * john instead rejects an out-of-range START and extracts as much as
+         * is available when the COUNT overruns, so on "abc":
+         *     x22   john "c"     hashcat "abc"
+         *     x23   john "c"     hashcat "abc"
+         *     x90   john REJECT  hashcat "abc"
+         * A zero count with an in-range start still yields an EMPTY
+         * candidate in both, which john then rejects under its empty-word
+         * policy -- also ruled to hashcat, so it is kept here. */
         y = *rule++ - 1;
         z = *rule++ - 1;
-        if (clen > y) {
-          for (x = 0; x < z && ((y + x) < clen); x++) {
+        if (y < clen && (y + z) <= clen) {
+          for (x = 0; x < z; x++)
             cpass[x] = cpass[y + x];
-          }
-          clen = x;
-          if (clen < 0)
-            clen = 0;
+          clen = z;
         }
         break;
       case RULE_OP_OMIT:
@@ -1791,7 +3082,13 @@ if (len < FASTLEN) {
           fprintf(stderr, "Invalid insert character in rule %s\n", orule);
           { _retval = (-3); goto _validate_exit; }
         }
-        if (clen > y) {
+        /* `>=`, not `>`: inserting at position == length is an APPEND, and
+         * both references do it -- `i1a` on "a" gives "aa" in john and in
+         * hashcat 6.2.5, where this gave "a" unchanged.  The shift loop
+         * degenerates correctly at y == clen.  Position BEYOND the length
+         * stays a no-op, which matches hashcat; john appends there instead
+         * and the two references disagree, so that case is left alone. */
+        if (clen >= y) {
 	  if ((clen+1) > FASTLEN)
 	      goto slowrule;
 	   for (x = clen; x >= y && x > 0; x--)
@@ -1982,14 +3279,47 @@ if (len < FASTLEN) {
       case 'L':
         y = *rule++ - 1;
         if (y < clen)
-          cpass[y] = cpass[y] << 1;
+        /* Unsigned cast for the same reason as SHR below, plus one of its own:
+         * `<< 1` on a NEGATIVE signed char is undefined behaviour in C.  The
+         * value produced is unchanged on every platform we build -- the top bit
+         * is discarded either way -- so this is a UB fix, not a semantic one. */
+          cpass[y] = (char)(((unsigned char)cpass[y]) << 1);
         break;
 
       case RULE_OP_BIT_SHR:
       case 'R':
         y = *rule++ - 1;
         if (y < clen)
-          cpass[y] = cpass[y] >> 1;
+        /* LOGICAL shift, not arithmetic.  `pass` is `char *`, which is SIGNED
+         * on x86 and on Apple ARM64, so a bare `>> 1` sign-extends: byte 0x83
+         * became 0xc1 rather than 0x41.  These are BYTE strings; a 1-bit must
+         * not appear at the top of a byte that had none.  The unsigned cast
+         * makes the intent explicit rather than inheriting it from the ABI --
+         * plain char is UNSIGNED by default on Linux aarch64, so the old code
+         * also disagreed with itself across the fleet.
+         *
+         * hashcat's rp_cpu.c has the same bug (`char arr[]`, `arr[upos] >>= 1`)
+         * but never exercises it, because it works in ASCII where the sign bit
+         * is never set.  Operator ruling 2026-09-14: logical is correct and
+         * hashcat is wrong here; do NOT "restore" compatibility.
+         *
+         * Measured cost of the old behaviour: on 2,009 encoding-diverse words
+         * the CPU and the GPU kernel disagreed on 182 of 28,440 candidates from
+         * the single rule R0, and on a hash list containing the device's digest
+         * mdxfind emitted a hash:plaintext pair that did not verify.
+         */
+          cpass[y] = (char)(((unsigned char)cpass[y]) >> 1);
+        break;
+
+      /* hashcat `BNX`: add the byte value of X to the byte at position N,
+       * wrapping.  Out of range is a no-op, matching hashcat's
+       * mangle_chr_add().  hashcat-only; John has no `B`. */
+      case RULE_OP_CHR_ADD:
+      case 'B':
+        y = *rule++ - 1;
+        c = *rule++;
+        if (y < clen)
+          cpass[y] = (unsigned char)(cpass[y] + c);
         break;
 
       case RULE_OP_INC:
@@ -2008,8 +3338,25 @@ if (len < FASTLEN) {
 
       case RULE_OP_REPL_NEXT:
       case '.':
+        /* Guard y+1, which is the byte actually READ, not just y.  `y < clen`
+         * admitted y == clen-1 and then read cpass[clen] -- one past the end
+         * of the candidate, picking up whatever the shared workspace held
+         * from a previous, longer candidate.  The output therefore depended
+         * on wordlist order and thread split: `K $1 .9 $0` on Jay020171 gave
+         * Jay020117Z0 after a run of Zs, Jay020117a0 after a run of as, and
+         * Jay0201170 with a clean buffer.
+         *
+         * hashcat settles what the right answer is: an out-of-range `.N` is a
+         * NO-OP and the candidate is still emitted.  Verified with
+         * `hashcat --stdout` on abcdefghij: `.8` gives abcdefghjj, `.9` and
+         * `.A` both give abcdefghij unchanged.  ruleproc32.c already did this;
+         * the GPU kernels wrote a NUL instead, which is a third answer again
+         * and is fixed in the same revision.
+         *
+         * `,` below needs no change: its `y > 0` clause already guards the
+         * y-1 read, and hashcat agrees -- `,0` is a no-op, `,1` applies. */
         y = *rule++ - 1;
-        if (y < clen)
+        if (y + 1 < clen)
           cpass[y] = cpass[y + 1];
         break;
 
@@ -2044,29 +3391,43 @@ if (len < FASTLEN) {
 
       case RULE_OP_TITLE_SP:
       case 'E':
-        for (z = x = 0; x < clen; x++) {
+        /* `E` is `e` with a space separator -- see the note on
+         * RULE_OP_TITLE_SEP below for why the word start is positional. */
+        for (z = 0, x = 0; x < clen; x++) {
           c = cpass[x];
-          if (c == ' ')
-            z = 0;
-          else if (z == 0 && (c >= 'a' && c <= 'z')) {
+          if (c == ' ') { z = 0; continue; }
+          if (z == 0) {
             z = 1;
-            cpass[x] = c ^ 0x20;
-          } else if (c >= 'A' && c <= 'Z')
-            cpass[x] = c ^ 0x20;
+            if (c >= 'a' && c <= 'z') cpass[x] = c ^ 0x20;
+          } else {
+            if (c >= 'A' && c <= 'Z') cpass[x] = c ^ 0x20;
+          }
         }
         break;
       case RULE_OP_TITLE_SEP:
       case 'e':
 	c1 = *rule++;
-        for (z = x = 0; x < clen; x++) {
+        /* Word start is POSITIONAL: the first character after a
+         * separator (or position 0), whether or not it is a letter.  The
+         * old code only consumed the word start when it SAW a letter, so a
+         * leading non-letter left it pending and the next letter was
+         * capitalised instead: "!bang" gave "!Bang" where john and hashcat
+         * both give "!bang", and "9nine" gave "9Nine" for "9nine".
+         *
+         * hashcat additionally force-uppercases position 0 at the end
+         * (mangle_title_sep's trailing MANGLE_UPPER_AT(arr,0)), so `ea` on
+         * "apple" is "APple" there and "aPple" in john.  We follow john --
+         * that is also what mdxfind has always done -- and the difference
+         * only shows when the separator itself sits at position 0. */
+        for (z = 0, x = 0; x < clen; x++) {
           c = cpass[x];
-          if (c == c1)
-            z = 0;
-          else if (z == 0 && (c >= 'a' && c <= 'z')) {
+          if (c == c1) { z = 0; continue; }   /* next char starts a word */
+          if (z == 0) {
             z = 1;
-            cpass[x] = c ^ 0x20;
-          } else if (c >= 'A' && c <= 'Z')
-            cpass[x] = c ^ 0x20;
+            if (c >= 'a' && c <= 'z') cpass[x] = c ^ 0x20;
+          } else {
+            if (c >= 'A' && c <= 'Z') cpass[x] = c ^ 0x20;
+          }
         }
         break;
 
@@ -2115,6 +3476,40 @@ slowrule:
   while ((c = *rule++)) {
     /* printf("rule=%c%s len=%d curpass=%s\n",c,rule,clen,pass);   */
     switch (c) {
+      /* `=NX` reject unless the character at position N is X.
+       * `%NX` reject unless X occurs at least N times.
+       *
+       * Documented and AGREEING in both references -- John: "reject the word
+       * unless character in position N is equal to X" / "unless it contains
+       * at least N instances of X"; hashcat: "reject plains that do not
+       * contain char X at pos N" / "that contain char X less than N times".
+       *
+       * packrules already emitted the right shape (opcode, then the
+       * position/count position-translated, then the literal character) but
+       * no executor existed, and the default case skipped only the OPCODE
+       * byte.  The two operand bytes were then executed as instructions, so
+       * `=0p $Z` yielded `passe` instead of `passerZ` -- silent
+       * misexecution, not the documented no-op.  198 rules in
+       * HashMob.100k.rule and 83,494 in rules/Hash-IT_Crazy_Rules.rule
+       * contain one of these verbs.  Verified against john.  Both are
+       * CPU-only: classify_rules does not list 0x3d/0x25, so such rules fall
+       * to its default and route away from the GPU, which is correct. */
+      case '=':
+        y = *rule++ - 1;
+        c = *rule++;
+        if (y >= clen || (unsigned char)pass[y] != c)
+          { _retval = (-1); goto _validate_exit; }
+        break;
+
+      case '%':
+        y = *rule++ - 1;
+        c = *rule++;
+        { int _cnt = 0;
+          for (x = 0; x < clen; x++)
+            if ((unsigned char)pass[x] == c) _cnt++;
+          if (_cnt < y) { _retval = (-1); goto _validate_exit; } }
+        break;
+
       default:
         /*
 	      { char _msg[64]; snprintf(_msg, sizeof(_msg),
@@ -2211,17 +3606,44 @@ slowrule:
 
     case RULE_OP_MEM_INSERT:
     case 'X':
+        /* `X N M I`: insert M characters of the memory buffer, starting at
+         * OFFSET N within it, at position I of the candidate.
+         *
+         * N was read and then ignored -- the copy was Memory[x] rather than
+         * Memory[y + x] -- so every offset produced the same result:
+         * MX034/MX134/MX234 on "abcdef" all gave "abcdabcef" where john and
+         * hashcat give abcdabcef / abcdbcdef / abcdcdeef.  Both references
+         * agree on that, so it was simply wrong.  Fixed 2026-09-11.
+         *
+         * OUT-OF-RANGE FOLLOWS HASHCAT (operator ruling, 2026-09-11; this
+         * reverses an earlier reading that clamped like john).  hashcat's
+         * mangle_insert_multi() rejects rather than clamping, on exactly
+         * these conditions:
+         *   no memory stored           mem_len < 1
+         *   insert position past end   I > clen
+         *   offset past memory         N > memlen
+         *   range overruns memory      N + M > memlen
+         *   zero count                 M < 1
+         *   result too long            clen + M > buffer
+         * john instead clamps I to the end and M to what memory holds, so
+         * MX049 on "abcdef" is "abcdefabcd" in john and a reject here.
+         *
+         * NOTE hashcat's own implementation also MUTATES its memory buffer
+         * while reading it (the memmove in mangle_insert_multi), so a second
+         * X in the same rule sees shifted memory.  That is not replicated:
+         * it reads as a defect in hashcat, not as semantics.  Reported. */
         y = *rule++ - 1;
 	tlen = *rule++ - 1;
 	z = *rule++ - 1;
+	if (memlen < 1 || tlen < 1 || z > clen || y > memlen ||
+	    (y + tlen) > memlen)
+	    { _retval = (-1); goto _validate_exit; }
 	if ((clen + tlen) > MAXLINE) 
 	    tlen = MAXLINE - clen;
-	if (tlen > memlen)
-	    tlen = memlen;
 	for (x=clen; x >= z; x--)
 	   pass[x+tlen] = pass[x];
 	for (x=0; x < tlen; x++) 
-	   pass[x+z] = Memory[x];
+	   pass[x+z] = Memory[y+x];
 	clen += tlen;
 	break;
 
@@ -2230,22 +3652,150 @@ slowrule:
 
       case RULE_OP_REJ_LEN_NE:
       case '_':
+        /* John: "_N reject the word unless it is N characters long" -- the
+         * CURRENT length at this point in the rule, not the original word's.
+         * This tested `len`, so `$a _5` on a 4-char word rejected even though
+         * the candidate is 5 characters by then, and `$a _4` wrongly kept it.
+         * `<` and `>` alongside already use clen. */
         y = *rule++ - 1;
-	if (y != len)
+	if (y != clen)
 	    { _retval = (-1); goto _validate_exit; }
 	break;
       case RULE_OP_REJ_LEN_GE:
       case '<':
-        y = *rule++ - 1; 
-        if (clen < y)
+        /* John: "<N reject the word unless it is less than N characters
+         * long" -- so reject when clen >= N.  This tested clen < y, i.e. it
+         * kept clen >= N, the exact complement.  Operator ruling 2026-09-11:
+         * match John, which is both documented and runnable; hashcat's doc
+         * says "reject plains of length greater than N" (inclusive) and its
+         * release will not run the verb at all. */
+        y = *rule++ - 1;
+        if (clen >= y)
           { _retval = (-1); goto _validate_exit; }
         break;
       case RULE_OP_REJ_LEN_LE:
       case '>':
-        y = *rule++ - 1; 
-        if (clen > y)
+        /* John: ">N reject the word unless it is greater than N characters
+         * long" -- so reject when clen <= N.  Complement of the old test.
+         * Same ruling as `<` above. */
+        y = *rule++ - 1;
+        if (clen <= y)
           { _retval = (-1); goto _validate_exit; }
         break;
+
+      /* ---- character-class forms (D6, 2026-09-11) --------------------
+       * Each mirrors its literal-operand sibling with RULE_CLASS_MATCH() in
+       * place of the equality test.  The complement lives in the high bit of
+       * the class byte and is applied by XOR inside the macro, so `?D` costs
+       * exactly what `?d` costs.
+       *
+       * CPU-only: classify_rules does not admit 0x80-0x88, so a rule using
+       * one routes to the CPU list.  That is correct, not a gap -- the same
+       * arrangement as `=` and `%`.
+       */
+      case RULE_OP_SUB_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        c = *rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, pass[x]))
+            pass[x] = c;
+        break; }
+
+      case RULE_OP_PURGE_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        d = pass;
+        s = pass;
+        for (x = 0; x < clen; x++) {
+          if (!RULE_CLASS_MATCH(_cb, *s))
+            *d++ = *s;
+          s++;
+        }
+        clen -= (s - d);
+        if (clen < 0)
+          clen = 0;
+        break; }
+
+      case RULE_OP_TITLE_CLASS: {
+        /* John's e?C -- the literal `e` shape with a class separator test.
+         * Positional word start, as for `e`. */
+        unsigned char _cb = (unsigned char)*rule++;
+        for (z = 0, x = 0; x < clen; x++) {
+          c = pass[x];
+          if (RULE_CLASS_MATCH(_cb, c)) { z = 0; continue; }
+          if (z == 0) {
+            z = 1;
+            if (c >= 'a' && c <= 'z') pass[x] = c ^ 0x20;
+          } else {
+            if (c >= 'A' && c <= 'Z') pass[x] = c ^ 0x20;
+          }
+        }
+        break; }
+
+      case RULE_OP_TITLE_CLASS_HC: {
+        /* hashcat mangle_title_sep_class_*: lowercase every position, then
+         * uppercase position 0 and every position whose PREDECESSOR was in
+         * the class.  The class test reads the byte before it is modified,
+         * and the separator is itself case-normalised -- both differences
+         * from John's e?C above. */
+        unsigned char _cb = (unsigned char)*rule++;
+        int _up = 1;
+        for (x = 0; x < clen; x++) {
+          int _this = _up;
+          c = pass[x];
+          _up = RULE_CLASS_MATCH(_cb, c) ? 1 : 0;
+          if (c >= 'A' && c <= 'Z') { c ^= 0x20; pass[x] = c; }
+          if (_this && c >= 'a' && c <= 'z')
+            pass[x] = c ^ 0x20;
+        }
+        break; }
+
+      case RULE_OP_REJ_HAS_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, pass[x]))
+            { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_NHAS_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, pass[x]))
+            break;
+        if (x >= clen)
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_FIRST_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        if (clen > 0 && !RULE_CLASS_MATCH(_cb, pass[0]))
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_LAST_CLASS: {
+        unsigned char _cb = (unsigned char)*rule++;
+        if (clen > 0 && !RULE_CLASS_MATCH(_cb, pass[clen - 1]))
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_AT_CLASS: {
+        unsigned char _cb;
+        y = *rule++ - 1;
+        _cb = (unsigned char)*rule++;
+        if (y >= clen || !RULE_CLASS_MATCH(_cb, pass[y]))
+          { _retval = (-1); goto _validate_exit; }
+        break; }
+
+      case RULE_OP_REJ_CNT_CLASS: {
+        unsigned char _cb;
+        int _cnt = 0;
+        y = *rule++ - 1;
+        _cb = (unsigned char)*rule++;
+        for (x = 0; x < clen; x++)
+          if (RULE_CLASS_MATCH(_cb, pass[x]))
+            _cnt++;
+        if (_cnt < y)
+          { _retval = (-1); goto _validate_exit; }
+        break; }
 
       case RULE_OP_REJ_HAS:
       case '!':
@@ -2351,17 +3901,21 @@ slowrule:
 
       case RULE_OP_CAP:
       case 'c':
+        /* John and hashcat both act on POSITION 0, not on the first
+         * alphabetic character: `c` on "!bang" is "!bang" in both, where
+         * mdxfind gave "!Bang".  Same for `C`: "!BANG" in both, "!bANG"
+         * here.  Verified word-by-word against john --stdout and against
+         * hashcat's own _old_apply_rule().  Fixed 2026-09-11. */
 #ifdef NOTINTEL
-        for (z = x = 0; x < clen; x++) {
+        for (x = 0; x < clen; x++) {
           c = pass[x];
-          if (z == 0 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
-            if (c >= 'a' && c <= 'z')
-              pass[x] = c - 0x20;
-            z = 1;
-            continue;
-          }
           if (c >= 'A' && c <= 'Z')
             pass[x] = c + 0x20;
+        }
+        if (clen > 0) {
+          c = pass[0];
+          if (c >= 'a' && c <= 'z')
+            pass[0] = c - 0x20;
         }
 #else
 	for (t=pass,x=0; ((unsigned long) t & 15) && x < clen; x++, t++) {
@@ -2377,12 +3931,10 @@ slowrule:
 	    c128 = _mm_andnot_si128(b128,_mm_set1_epi8(0x20));
 	    *p128++ = _mm_xor_si128(d128,c128);
 	}
-	for (x=0; x < clen; x++) {
-	    c = pass[x];
-	    if (c >= 'a' && c <= 'z') {
-	        pass[x] = c ^ 0x20;
-		break;
-	    }
+	if (clen > 0) {
+	    c = pass[0];
+	    if (c >= 'a' && c <= 'z')
+	        pass[0] = c ^ 0x20;
 	}
 #endif
         break;
@@ -2390,16 +3942,15 @@ slowrule:
       case RULE_OP_CAP_INV:
       case 'C':
 #ifdef NOTINTEL
-        for (z = x = 0; x < clen; x++) {
+        for (x = 0; x < clen; x++) {
           c = pass[x];
-          if (z == 0 && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
-            if (c >= 'A' && c <= 'Z')
-              pass[x] = c + 0x20;
-            z = 1;
-            continue;
-          }
           if (c >= 'a' && c <= 'z')
             pass[x] = c - 0x20;
+        }
+        if (clen > 0) {
+          c = pass[0];
+          if (c >= 'A' && c <= 'Z')
+            pass[0] = c + 0x20;
         }
 #else
 	for (t=pass,x=0; ((unsigned long) t & 15) && x < clen; x++, t++) {
@@ -2415,12 +3966,10 @@ slowrule:
 	    c128 = _mm_andnot_si128(b128,_mm_set1_epi8(0x20));
 	    *p128++ = _mm_xor_si128(d128,c128);
 	}
-	for (x=0; x < clen; x++) {
-	    c = pass[x];
-	    if (c >= 'A' && c <= 'Z') {
-	        pass[x] = c ^ 0x20;
-		break;
-	    }
+	if (clen > 0) {
+	    c = pass[0];
+	    if (c >= 'A' && c <= 'Z')
+	        pass[0] = c ^ 0x20;
 	}
 #endif
         break;
@@ -2455,10 +4004,19 @@ slowrule:
 
       case RULE_OP_TOGGLE_AT:
       case 'T':
+        /* Bounds check: john guards this explicitly (rules.c case 'T':
+         * "if (pos < length)").  Without it a position up to 61 reads --
+         * and can write -- shared workspace past the candidate, the same
+         * shape as the `.N` one-past-the-end read.  Not observable today
+         * because the bytes there are NUL, so nothing toggles and clen is
+         * unchanged; all three engines agree on T3/T9/TZ for "abc".  The
+         * guard is one compare and removes the hazard. */
         y = *rule++ - 1;
-        c = pass[y];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-          pass[y] = c ^ 0x20;
+        if (y < clen) {
+          c = pass[y];
+          if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+            pass[y] = c ^ 0x20;
+        }
         break;
 
       case RULE_OP_REVERSE:
@@ -2586,15 +4144,27 @@ slowrule:
 
       case RULE_OP_EXTRACT:
       case 'x':
+        /* `x N M`: extract M characters from position N.
+         *
+         * FOLLOWS HASHCAT (operator ruling 2026-09-11, superseding an earlier
+         * ruling for john).  hashcat's mangle_extract() no-ops on BOTH
+         * out-of-range conditions and never extracts a partial run:
+         *     if (upos >= arr_len)          return arr_len;
+         *     if ((upos + ulen) > arr_len)  return arr_len;
+         * john instead rejects an out-of-range START and extracts as much as
+         * is available when the COUNT overruns, so on "abc":
+         *     x22   john "c"     hashcat "abc"
+         *     x23   john "c"     hashcat "abc"
+         *     x90   john REJECT  hashcat "abc"
+         * A zero count with an in-range start still yields an EMPTY
+         * candidate in both, which john then rejects under its empty-word
+         * policy -- also ruled to hashcat, so it is kept here. */
         y = *rule++ - 1;
         z = *rule++ - 1;
-        if (clen > y) {
-          for (x = 0; x < z && ((y + x) < clen); x++) {
+        if (y < clen && (y + z) <= clen) {
+          for (x = 0; x < z; x++)
             pass[x] = pass[y + x];
-          }
-          clen = x;
-          if (clen < 0)
-            clen = 0;
+          clen = z;
         }
         break;
       case RULE_OP_OMIT:
@@ -2618,7 +4188,9 @@ slowrule:
           fprintf(stderr, "Invalid insert character in rule %s\n", orule);
           { _retval = (-3); goto _validate_exit; }
         }
-        if (clen > y) {
+        /* `>=`, not `>`: see the note in the FASTLEN path above -- inserting
+         * at position == length is an append, and both references do it. */
+        if (clen >= y) {
 	  if ((clen+1) < MAXLINE) {
 	    for (x = clen; x >= y && x > 0; x--)
 	      pass[x] = pass[x - 1];
@@ -2807,14 +4379,47 @@ slowrule:
       case 'L':
         y = *rule++ - 1;
         if (y < clen)
-          pass[y] = pass[y] << 1;
+        /* Unsigned cast for the same reason as SHR below, plus one of its own:
+         * `<< 1` on a NEGATIVE signed char is undefined behaviour in C.  The
+         * value produced is unchanged on every platform we build -- the top bit
+         * is discarded either way -- so this is a UB fix, not a semantic one. */
+          pass[y] = (char)(((unsigned char)pass[y]) << 1);
         break;
 
       case RULE_OP_BIT_SHR:
       case 'R':
         y = *rule++ - 1;
         if (y < clen)
-          pass[y] = pass[y] >> 1;
+        /* LOGICAL shift, not arithmetic.  `pass` is `char *`, which is SIGNED
+         * on x86 and on Apple ARM64, so a bare `>> 1` sign-extends: byte 0x83
+         * became 0xc1 rather than 0x41.  These are BYTE strings; a 1-bit must
+         * not appear at the top of a byte that had none.  The unsigned cast
+         * makes the intent explicit rather than inheriting it from the ABI --
+         * plain char is UNSIGNED by default on Linux aarch64, so the old code
+         * also disagreed with itself across the fleet.
+         *
+         * hashcat's rp_cpu.c has the same bug (`char arr[]`, `arr[upos] >>= 1`)
+         * but never exercises it, because it works in ASCII where the sign bit
+         * is never set.  Operator ruling 2026-09-14: logical is correct and
+         * hashcat is wrong here; do NOT "restore" compatibility.
+         *
+         * Measured cost of the old behaviour: on 2,009 encoding-diverse words
+         * the CPU and the GPU kernel disagreed on 182 of 28,440 candidates from
+         * the single rule R0, and on a hash list containing the device's digest
+         * mdxfind emitted a hash:plaintext pair that did not verify.
+         */
+          pass[y] = (char)(((unsigned char)pass[y]) >> 1);
+        break;
+
+      /* hashcat `BNX`: add the byte value of X to the byte at position N,
+       * wrapping.  Out of range is a no-op, matching hashcat's
+       * mangle_chr_add().  hashcat-only; John has no `B`. */
+      case RULE_OP_CHR_ADD:
+      case 'B':
+        y = *rule++ - 1;
+        c = *rule++;
+        if (y < clen)
+          pass[y] = (unsigned char)(pass[y] + c);
         break;
 
       case RULE_OP_INC:
@@ -2833,8 +4438,10 @@ slowrule:
 
       case RULE_OP_REPL_NEXT:
       case '.':
+        /* Same one-past-the-end read as the FASTLEN path above, same fix.
+         * Guard y+1, which is the byte read; hashcat no-ops out of range. */
         y = *rule++ - 1;
-        if (y < clen)
+        if (y + 1 < clen)
           pass[y] = pass[y + 1];
         break;
 
@@ -2869,29 +4476,43 @@ slowrule:
 
       case RULE_OP_TITLE_SP:
       case 'E':
-        for (z = x = 0; x < clen; x++) {
+        /* `E` is `e` with a space separator -- see the note on
+         * RULE_OP_TITLE_SEP below for why the word start is positional. */
+        for (z = 0, x = 0; x < clen; x++) {
           c = pass[x];
-          if (c == ' ')
-            z = 0;
-          else if (z == 0 && (c >= 'a' && c <= 'z')) {
+          if (c == ' ') { z = 0; continue; }
+          if (z == 0) {
             z = 1;
-            pass[x] = c ^ 0x20;
-          } else if (c >= 'A' && c <= 'Z')
-            pass[x] = c ^ 0x20;
+            if (c >= 'a' && c <= 'z') pass[x] = c ^ 0x20;
+          } else {
+            if (c >= 'A' && c <= 'Z') pass[x] = c ^ 0x20;
+          }
         }
         break;
       case RULE_OP_TITLE_SEP:
       case 'e':
 	c1 = *rule++;
-        for (z = x = 0; x < clen; x++) {
+        /* Word start is POSITIONAL: the first character after a
+         * separator (or position 0), whether or not it is a letter.  The
+         * old code only consumed the word start when it SAW a letter, so a
+         * leading non-letter left it pending and the next letter was
+         * capitalised instead: "!bang" gave "!Bang" where john and hashcat
+         * both give "!bang", and "9nine" gave "9Nine" for "9nine".
+         *
+         * hashcat additionally force-uppercases position 0 at the end
+         * (mangle_title_sep's trailing MANGLE_UPPER_AT(arr,0)), so `ea` on
+         * "apple" is "APple" there and "aPple" in john.  We follow john --
+         * that is also what mdxfind has always done -- and the difference
+         * only shows when the separator itself sits at position 0. */
+        for (z = 0, x = 0; x < clen; x++) {
           c = pass[x];
-          if (c == c1)
-            z = 0;
-          else if (z == 0 && (c >= 'a' && c <= 'z')) {
+          if (c == c1) { z = 0; continue; }   /* next char starts a word */
+          if (z == 0) {
             z = 1;
-            pass[x] = c ^ 0x20;
-          } else if (c >= 'A' && c <= 'Z')
-            pass[x] = c ^ 0x20;
+            if (c >= 'a' && c <= 'z') pass[x] = c ^ 0x20;
+          } else {
+            if (c >= 'A' && c <= 'Z') pass[x] = c ^ 0x20;
+          }
         }
         break;
 

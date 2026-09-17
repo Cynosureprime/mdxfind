@@ -1,6 +1,40 @@
 /*
- * $Revision: 1.18 $
+ * $Revision: 1.22 $
  * $Log: gpu_template.cl,v $
+ * Revision 1.22  2026/09/17 04:24:53  dlr
+ * Correct the header note to match the code: this kernel is no longer side-by-side with md5_rules_phase0 behind an env selector. B5 made the template the production path for every wired algorithm and the MDXFIND_GPU_TEMPLATE selector was removed on 2026-09-16; md5_rules_phase0 survives only as an MD5 fallback for a failed template compile. Comment only, no kernel change.
+ *
+ * Revision 1.21  2026/09/17 03:37:43  dlr
+ * Add the GPU_TEMPLATE_HAS_ALT_DIGEST second-digest hook, the OpenCL twin of the metal_template.metal 1.11 change. A candidate may need two digests compared per pass; the template now carries an optional alt slot and the dispatch compares both.
+ *
+ * Revision 1.20  2026/09/15 21:32:33  dlr
+ * UTF-32 rule path on the shared template: 57 programs, 75 hash types, one source.
+ *
+ * GPU_U32_WALKER_PRESENT is defined by gpu_u32_walker.cl, which the host appends to a program's source list only when -8 is active, so this one file serves both engines and a byte-mode run compiles text that is byte-identical to the pre-UTF-32 program. Proven rather than asserted: cc -E -P of this file against its 1.19 copy, with the marker undefined, differs by ZERO lines, so the kernel cache key, the private-memory footprint and the PTX are all unchanged. A -DGPU_U32_RULES build option would have done the same job but would have had to be threaded through 57 per-algorithm compile helpers and could drift out of step with the source list it describes; the marker cannot, because it IS the source list.
+ *
+ * word_offset is masked with U32_OFF_MASK and the word class read from bits 30-31. Unmasked was the prior failure: the tag went in while the byte kernel ran, every offset carried bit 30, and the result was wild global reads and md5_rules ovr-state read err=-5. The UTF-32 half of rule_offset is based at params.num_masks, which this kernel already overloads as its rule count. buf is passed as BOTH bytebuf and out to u32_run_pair, which is safe by inspection because the byte arm's closing copy degenerates to self-assignment and the UTF-32 arm never touches bytebuf; one buffer means the mask block, the no-op test and the hash are the same code for both engines instead of a fork of every line after the walker. The buffer widens to TPL_BUF_BYTES equal to U32_OUT_BYTES under the gate, because the UTF-32 arm encodes up to U32_BUF_LIMIT codepoints at 4 bytes each, and TPL_BUF_LIMIT replaces RULE_BUF_LIMIT in the MASK block ONLY: the input-length clamp stays on RULE_BUF_LIMIT because that is the input gate, not a property of the output buffer, and the MD5 mixed kernel clamps the same way.
+ *
+ * template_phase0_test is deliberately untouched. It is the byte-exact differ against md5_rules_phase0_test, driven from a fixture that writes untagged word offsets, so the tag it would have to mask is never present.
+ *
+ * Validated with one known-answer crack per hash type per backend: class-W base word A-umlaut O-umlaut U-umlaut STRASSE under rule l, whose correct result the byte engine cannot produce because it lowercases only the ASCII tail, so a hit is positive proof the UTF-32 arm ran and produced the right codepoints. 73 of 75 types pass on a GTX 1080 and 59 of 75 on an Apple M1; every miss on both backends was confirmed pre-existing by re-running the same fixture in byte mode with no rules, and a sample re-confirmed against a pre-change binary. CPU and GPU byte-identical at volume: MD5 800 of 800, and SHA1, SHA256, SHA512, SHA3-512, MD4, RMD160, KECCAK224 and MD5RAW 300 to 400 each, over about 2 million word-rule pairs per type.
+ *
+ * Revision 1.19  2026/09/11 19:46:35  dlr
+ * Rule-engine parity block, character classes on GPU, 2-byte packed-word length, and two dispatch guards.
+ *
+ * Byte engine brought to parity with the documented john and hashcat feature sets. Character classes in both syntaxes: inline ?C uses the john table with complement-by-case-toggle, a ~ prefix selects the hashcat table. Nine verbs take a class, opcodes 0x80 to 0x89. ~e?C needs its own opcode 0x89 because hashcat class title-case is a different algorithm from the john form, not the same one with a class test substituted. The ?s class is hashcat class_sym in BOTH tables and john user classes ?0 to ?9 are not implemented, both per operator ruling. ?? is the literal-? escape, so purging a literal ? is now written @?? and 8 lines across the shipped rule files stop loading, every one of them a rule john also rejects.
+ *
+ * Other parity fixes in the same block: c C E and e act on position 0, not on the first alphabetic character, which john and hashcat agree on and mdxfind did not; x and X follow hashcat when out of range, superseding an earlier ruling for john; a candidate a rule empties is kept, following hashcat; T is bounds-checked as john does; X honours the memory offset N, which was read and then ignored so every offset gave the same answer; B is added from hashcat master. ruleproc32 refuses a class loudly rather than silently reinterpreting it, and accepts the ?? escape identically, closing a byte-versus-utf32 divergence where the same rule text produced different candidates in each engine with no diagnostic.
+ *
+ * All ten class opcodes plus =NX and %NX promoted from CPU-only to GPU-eligible and implemented in all six rules kernels, sharing one 480-byte constant-address-space membership table in gpu_common.cl and metal_common.metal so the six cannot drift. Three real rule files now have zero CPU-only rules.
+ *
+ * Packed-word length widened from one byte to two, little-endian, written and read byte by byte so it depends on neither host alignment nor host endianness. The admission gate allows GPU_RULES_MAX_INPUT_LEN 40959 while the wire field held 255, so any word of 256 to 40959 bytes was hashed as its first len mod 256 bytes: 285 as its first 29, 300 as its first 44. The emitted plaintext matched the emitted digest so nothing downstream could detect it. 11 kernel read sites across 7 files, 3 host writers, 2 host hit decoders and the buffer-full check move together.
+ *
+ * Two dispatch guards. C2.3 now tests the per-word word_packed_by_rules_engine rather than the thread-persistent my_jobg_rules, which differ whenever a word is walked but not packed. FastRule is disabled when this iteration is not the no-rule pass, making entered-at-the-rule-stream-origin a precondition rather than an assumption: the SIMD walker was re-draining the remaining rules from the first CPU-only rule output, so exactly one CPU-partition candidate survived per word.
+ *
+ * Validation: john class sweep 66 of 75 with all 9 differences the ruled empty-word policy, hashcat class sweep 21 of 21, X 22 of 22, x 16 of 16, c C E e 50 of 50 against john, rules32 conformance 165 of 165, zero silent byte-versus-utf32 divergences, wire round trip proven for all 40960 admitted lengths. Five GPU fixtures CPU equals GPU on a GTX 1080 and an M2 Max, including 113 of 113 on the fixture that measured 84 of 113 before the FastRule guard, and 126 of 126 on words from 1 to 4096 bytes. Regression on shipped rule files: Hash-IT_Crazy_Rules 6828885 rules, all_gj 208010 and T0XlC byte-identical.
+ *
+ * Also included in mdxfind.c and authored by Waffle, not by me: the AIX cmiyc challenge-3 algorithm validation comment block, recording the ppcemu emulated-oracle confirmation and the 504-hash corpus confirmation at the live parameters.
+ *
  * Revision 1.18  2026/05/18 14:38:29  dlr
  * Fix nested comment that broke OpenCL JIT compile. Inner '+'*' inside doc comment terminated the outer block, exposing prose as code (Pascal err -11). Symptom: e31 GPU dispatch fell back to CPU. Replace inline note with a second line outside the offending position.
  *
@@ -59,13 +93,13 @@
  * algorithm tuples receive distinct cache keys even though the
  * gpu_template.cl source text is identical.
  *
- * Side-by-side with gpu_md5_rules.cl rev 1.28+: B2 ships this kernel
- * alongside md5_rules_phase0; the production path remains the latter
- * unless MDXFIND_GPU_TEMPLATE=md5 is set in the environment. Default
- * off keeps R2 (register pressure on AMD gfx1201) from blocking
- * merge -- B5 flips the default once enough algorithms are wired
- * through the template that the side-by-side kernels become carrying
- * cost.
+ * B2 shipped this kernel side-by-side with gpu_md5_rules.cl's
+ * md5_rules_phase0, behind an MDXFIND_GPU_TEMPLATE env selector, so that
+ * R2 (register pressure on AMD gfx1201) could not block the merge. B5
+ * then made the template the production path for every wired algorithm
+ * and the selector became dead weight; it was removed on 2026-09-16.
+ * md5_rules_phase0 survives only as an MD5 fallback for a failed
+ * template compile.
  *
  * R1 mitigation (AMD ROCm comgr addrspace fragility): the template
  * keeps the single-private-buffer pattern from gpu_md5_rules.cl r28.
@@ -145,6 +179,38 @@
 #define SALT_BATCH 16
 #endif
 
+/* ----------------------------------------------------------------------
+ * Working-buffer geometry.
+ *
+ * GPU_U32_WALKER_PRESENT is defined by gpu_u32_walker.cl, which the host
+ * appends to this program's source list ONLY when `-8` is active
+ * (gpu_template_sources(), gpu_opencl.c).  It is the whole switch: one
+ * template source serves both engines, and a byte-mode run compiles a
+ * program that is byte-identical to the pre-UTF-32 one -- same text, same
+ * cache key, same private-memory footprint.
+ *
+ * The UTF-32 arm needs a wider output buffer than the byte arm: a 1024-byte
+ * input word is at most 1024 codepoints, a duplicating verb can take that to
+ * U32_BUF_LIMIT, and encoding those back to UTF-8 costs up to 4 bytes each.
+ * U32_OUT_BYTES (8192) is that bound and is the same constant the MD5 mixed
+ * kernel sizes its `cand` with, so the two kernels cannot disagree about what
+ * the walker may emit.  Under `-8` the per-lane private cost is
+ * 8192 + 2 * U32_BUF_ELEMS * 4 = 24,576 bytes, against 2,048 for byte mode.
+ * That is the occupancy price of the mode and it is paid only when asked for.
+ *
+ * TPL_BUF_LIMIT replaces RULE_BUF_LIMIT in the MASK block below -- and only
+ * there.  The input-length clamp stays on RULE_BUF_LIMIT because that is the
+ * INPUT gate (GPU_RULES_MAX_INPUT_LEN's companion), not a property of the
+ * output buffer, and the mixed kernel clamps the same way.
+ * ---------------------------------------------------------------------- */
+#ifdef GPU_U32_WALKER_PRESENT
+#define TPL_BUF_BYTES  U32_OUT_BYTES
+#define TPL_BUF_LIMIT  (U32_OUT_BYTES - 15)
+#else
+#define TPL_BUF_BYTES  RULE_BUF_MAX
+#define TPL_BUF_LIMIT  RULE_BUF_LIMIT
+#endif
+
 #ifdef GPU_TEMPLATE_HAS_LOCAL_BUFFER
 __kernel __attribute__((reqd_work_group_size(BCRYPT_WG_SIZE, 1, 1)))
 #else
@@ -211,6 +277,18 @@ void template_phase0(
     , __global const uchar  *salt_buf
     , __global const uint   *salt_off
     , __global const ushort *salt_lens
+#endif
+    /* UTF-32 path: the two 1:1 case tables, CONCATENATED (up at
+     * [0 .. U32_CASE_N-1], lo above it).  Appended LAST -- after the salt
+     * args -- so every existing argument index is unchanged and the host's
+     * single SETARG ladder needs one extra bind at the end rather than a
+     * renumbering.  __global rather than __constant because 26,048 bytes of
+     * constant data put the program past NVIDIA's 64 KB bank and ptxas
+     * refused the build; see gpu_u32_walker.inc.  Present only when `-8` is
+     * active, because that is the only time the host appends the walker
+     * source -- see gpu_template_sources() in gpu_opencl.c. */
+#ifdef GPU_U32_WALKER_PRESENT
+    , __global const uint   *case_tab
 #endif
     )
 {
@@ -356,10 +434,14 @@ void template_phase0(
     __global volatile uint *ovr_gid =
         (__global volatile uint *)(payload + 104);
 
-    /* Single private buffer; same RULE_BUF_MAX as gpu_md5_rules.cl
-     * (the macro is defined there and visible to us via the shared
-     * compile unit). 16-byte aligned for any vectorized fast paths. */
-    __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
+    /* Single private buffer.  TPL_BUF_BYTES is RULE_BUF_MAX (2048) for the
+     * byte engine and U32_OUT_BYTES (8192) when the UTF-32 walker is in the
+     * compile unit, because the UTF-32 arm of u32_run_pair() encodes up to
+     * U32_BUF_LIMIT codepoints at 4 bytes each.  Both macros are defined in
+     * other sources of the same shared compile unit (gpu_md5_rules.cl,
+     * gpu_u32_walker.cl); see the TPL_BUF_BYTES block above the kernel.
+     * 16-byte aligned for any vectorized fast paths. */
+    __attribute__((aligned(16))) uchar buf[TPL_BUF_BYTES];
 
     /* Phase 6 BCRYPT (2026-05-08): workgroup-shared __local buffer for the
      * Eksblowfish S-boxes (4 × 256 uint = 4 KB per lane × BCRYPT_WG_SIZE
@@ -378,8 +460,55 @@ void template_phase0(
     __local uint sbox_pool[BCRYPT_WG_SIZE * GPU_TEMPLATE_LOCAL_BUFFER_PER_LANE];
 #endif
 
+#ifdef GPU_U32_WALKER_PRESENT
+    /* ---- UTF-32 path (`-8`) -------------------------------------------
+     * word_offset carries the word CLASS in bits 30-31 under `-8`
+     * (gpu_u32_tag_word_offsets), so the offset MUST be masked.  The byte
+     * kernel md5_rules_phase0 masks NOTHING, and when the tag was first
+     * written while that kernel ran every word offset carried bit 30: wild
+     * global reads and `md5_rules ovr-state read err=-5`.  That is the
+     * reason the legacy kernel is fatal under `-8` in gpu_opencl.c.
+     *
+     * `buf` is passed as BOTH bytebuf and out.  That aliasing is safe by
+     * inspection of u32_run_pair: its byte arm's final `out[i] = bytebuf[i]`
+     * copy degenerates to self-assignment, and its UTF-32 arm never touches
+     * bytebuf.  One buffer means the mask block, the no-op test and the hash
+     * below are the SAME code for both engines -- the alternative, hashing
+     * from a separate `cand`, would have forked every line after this one. */
+    uint raw  = word_offset[word_idx];
+    uint wpos = raw & U32_OFF_MASK;
+    uint wcls = raw >> U32_TAG_SHIFT;
+    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
+    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
+    if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
+
+    /* rule_offset is TWO halves under `-8`: [rule_idx] is the byte stream,
+     * untagged and unchanged; [n_rules + rule_idx] carries the UTF-32 stream
+     * offset plus the two capability bits.  See gpu_md5_rules32.cl. */
+    uint rpos      = rule_offset[rule_idx];
+    uint u32_rpos  = rule_offset[n_rules + rule_idx];
+
+    /* Synthetic no-rule discriminator (preserves feedback_no_rule_pass.md
+     * semantics).  Detected on the BYTE stream because the synthetic entry
+     * has no UTF-32 form by construction. */
+    int is_no_rule = (rule_program[rpos] == 0);
+
+    __attribute__((aligned(16))) uint u32buf[U32_BUF_ELEMS];
+    __attribute__((aligned(16))) uint u32mem[U32_BUF_ELEMS];
+
+    int engine = 0;
+    int new_len = u32_run_pair(words, wpos, wlen, rule_program,
+                              rpos, u32_rpos, wcls,
+                              buf, u32buf, u32mem,
+                              buf, TPL_BUF_BYTES, case_tab, &engine);
+
+    /* Rejection sentinel, a strict-decode failure, or a no-room return: the
+     * pair emits nothing, exactly as the CPU bridge does for a negative. */
+    if (new_len < 0) return;
+#else
     uint wpos = word_offset[word_idx];
-    int wlen = (int)words[wpos++];
+    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
+    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
     for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
 
@@ -393,6 +522,7 @@ void template_phase0(
 
     /* Rejection sentinel: apply_rule fired a `_ < > ! / ( )` op. */
     if (new_len < 0) return;
+#endif
 
     /* No-op detection: if at least one op was processed AND the post-
      * rule buffer is bit-identical to the input, the synthetic ":" pass
@@ -436,7 +566,7 @@ void template_phase0(
      * same kernel-side behavior as B7.2. mask_charsets[0*256+...] reads
      * the same byte. Byte-exact backward-compatible.
      *
-     * Bounds-checked against RULE_BUF_LIMIT for safety. */
+     * Bounds-checked against TPL_BUF_LIMIT for safety. */
     uint npre = params.n_prepend;
     uint napp = params.n_append;
     if (npre > 16u) npre = 16u;
@@ -473,12 +603,12 @@ void template_phase0(
          * (only when npre > 0). Iterate from high to low to avoid clobber. */
         if (npre > 0u) {
             uint shift_dst_end = (uint)new_len + npre;
-            if (shift_dst_end > RULE_BUF_LIMIT) {
+            if (shift_dst_end > TPL_BUF_LIMIT) {
                 /* Truncate the shift to keep within bounds. */
-                if ((uint)new_len + npre > RULE_BUF_LIMIT) {
+                if ((uint)new_len + npre > TPL_BUF_LIMIT) {
                     /* Drop trailing bytes that would exceed the limit. */
-                    if (new_len > (int)(RULE_BUF_LIMIT - npre))
-                        new_len = (int)(RULE_BUF_LIMIT - npre);
+                    if (new_len > (int)(TPL_BUF_LIMIT - npre))
+                        new_len = (int)(TPL_BUF_LIMIT - npre);
                 }
             }
             for (int i = new_len - 1; i >= 0; i--) {
@@ -500,7 +630,7 @@ void template_phase0(
                 if (psize == 0u) psize = 1u;
                 uint pidx = (uint)(remaining % (ulong)psize);
                 remaining /= (ulong)psize;
-                if (i < RULE_BUF_LIMIT) {
+                if (i < TPL_BUF_LIMIT) {
                     buf[i] = mask_charsets[i * 256u + pidx];
                 }
             }
@@ -522,18 +652,18 @@ void template_phase0(
                 uint pidx = (uint)(remaining % (ulong)psize);
                 remaining /= (ulong)psize;
                 uint dst = append_base + i;
-                if (dst < RULE_BUF_LIMIT) {
+                if (dst < TPL_BUF_LIMIT) {
                     buf[dst] = mask_charsets[row * 256u + pidx];
                 }
             }
         }
 
-        /* Step 4: advance new_len. Truncate at RULE_BUF_LIMIT. */
+        /* Step 4: advance new_len. Truncate at TPL_BUF_LIMIT. */
         uint new_total = (uint)new_len + npre + napp;
-        if (new_total <= RULE_BUF_LIMIT) {
+        if (new_total <= TPL_BUF_LIMIT) {
             new_len = (int)new_total;
         } else {
-            new_len = RULE_BUF_LIMIT;
+            new_len = TPL_BUF_LIMIT;
         }
     }
 
@@ -663,6 +793,63 @@ void template_phase0(
                               hashes_shown, matched_idx, mask,
                               ovr_set, ovr_gid, gid);
         }
+#ifdef GPU_TEMPLATE_HAS_ALT_DIGEST
+        /* SECOND DIGEST VARIANT (2026-09-15).
+         *
+         * Some CPU algorithms compute more than one digest per candidate and
+         * count a match on ANY of them.  JOB_NTLMH is the one that needs it:
+         * mdxfind.c:19254-19277 hashes the candidate BOTH through
+         * iconv("UTF-16LE//IGNORE","UTF-8") and through a byte zero-extend,
+         * and checkhash()es each.  A single-probe kernel can only ever cover
+         * one of the two, and the arm it does not cover is not merely slower
+         * on the GPU -- it is UNREACHABLE, because the GPU claims the batch
+         * and the CPU never redoes the work.  The run then exits 0 saying
+         * "None found, sorry!".
+         *
+         * Only a core that defines GPU_TEMPLATE_HAS_ALT_DIGEST compiles this
+         * block; today that is gpu_ntlmh_core.cl alone.  Every other template
+         * program's preprocessed text is unchanged -- verified with
+         * `cc -E -P` against the 1.20 copy of this file, zero lines differ,
+         * the same proof rev 1.20 used for the GPU_U32_WALKER_PRESENT gate.
+         * So the kernel cache key, the private-memory footprint and the PTX
+         * of the other 56 programs are untouched.
+         *
+         * The second probe is a full emit, not a fallback, so a hash file
+         * holding BOTH variants of the same password recovers both -- the
+         * on-device dedup bit is per matched_idx, and the two variants of a
+         * non-ASCII candidate are different digests at different indices.
+         * The core is expected to make template_digest_compare_alt cheap
+         * (return 0 with no memory traffic) when the two variants coincide,
+         * which for NTLMH is every all-ASCII candidate.
+         *
+         * Mutually exclusive with the salt axis: a salted alt-digest carrier
+         * would need the three-axis combined_ridx encoding below and has no
+         * caller, so refuse it at compile time rather than emit a hit the
+         * host would decode against the wrong salt. */
+#ifdef GPU_TEMPLATE_HAS_SALT
+#error "GPU_TEMPLATE_HAS_ALT_DIGEST is unsalted-only; no salted carrier exists"
+#endif
+        {
+            uint matched_idx_alt = 0u;
+            if (template_digest_compare_alt(&st,
+                                        compact_fp, compact_idx,
+                                        params.compact_mask, params.max_probe,
+                                        params.hash_data_count,
+                                        hash_data_buf, hash_data_off,
+                                        overflow_keys, overflow_hashes,
+                                        overflow_offsets, params.overflow_count,
+                                        &matched_idx_alt))
+            {
+                uint combined_ridx_alt = rule_idx * mask_size + mask_idx_local;
+                uint mask_alt = 1u << (iter & 31);
+                template_emit_hit_alt_or_overflow(hits, hit_count,
+                                  params.max_hits,
+                                  &st, word_idx, combined_ridx_alt, iter,
+                                  hashes_shown, matched_idx_alt, mask_alt,
+                                  ovr_set, ovr_gid, gid);
+            }
+        }
+#endif /* GPU_TEMPLATE_HAS_ALT_DIGEST */
         if (iter < max_iter) {
             /* B7.7a (2026-05-07): MD5UC algo_mode threading. Only
              * gpu_md5_core.cl defines GPU_TEMPLATE_ITERATE_HAS_ALGO_MODE
@@ -721,7 +908,8 @@ void template_phase0_test(
 
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
     uint wpos = word_offset[word_idx];
-    int wlen = (int)words[wpos++];
+    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
+    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
     for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
 

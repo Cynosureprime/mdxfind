@@ -1,5 +1,11 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.37  2026/09/17 11:45:26  dlr
+ * Report the PRESENCE of SHA-256 hardware assist, never its absence. The previous revision printed the dispatch result unconditionally, including "x86 SHA-NI unavailable (CPUID bit clear)" on hosts without the extensions -- which is a line of noise on the majority of hosts and reads like a fault where there is none. SHA-256 computes correctly either way; the portable routine is slower, not wrong. Now mirrors the arm_ce_detect contract: a single line, only when the accelerated arm was actually engaged. ARM is not reported at this site because arm_ce_detect already lists SHA256 in its ARM CE acceleration enabled line, and SHA-1 is not reported although it shares the CPUID bit, because sha1_block_init resolves that pointer lazily on first use so at init time there is nothing truthful to say. Verified both directions on real hardware: fpga Ryzen 1800X with sha_ni prints x86 SHA-NI acceleration enabled: SHA256, while the Broadwell Xeon on mmt and the older Xeon on .205 print nothing, and dev1 arm64 shows only its existing ARM CE line with no duplicate.
+ *
+ * Revision 1.36  2026/09/17 05:23:51  dlr
+ * The SHA-256 dispatch report is now unconditional instead of gated on MDXFIND_SHA256_DEBUG. The comment there argued the line must exist because a silent fallback to the portable routine is correct but slow, and that is the failure mode that is otherwise invisible. With the env var removed the choice was to print it or lose it, and losing it re-hides exactly what the diagnostic exists to expose, so it now sits with the other acceleration lines printed at start-up. It earns its place immediately: on the Linux x86-64 build host it reports x86 SHA-NI unavailable, CPUID bit clear.
+ *
  * Revision 1.35  2026/08/12 01:22:09  dlr
  * Streaming SHA-256 over a caller-owned workspace, plus an x86 SHA-NI arm. mysha256() is one-shot, so any type needing incremental hashing had nowhere to go inside this file and escaped to sph_sha256 or OpenSSL EVP, both unaccelerated -- so every incremental type ran at reference speed regardless of CPU. Adds mysha256_begin/add/end over a caller-owned fixed-size MYSHA256 struct carved from the existing per-thread buffers: no allocation on any path, no teardown, and thread-safe because every mutable byte is the callers and the dispatch pointer is written once at startup before workers exist. mysha256_add dispatches ONCE per run of blocks rather than once per 64 bytes. Three arms behind one gate: x86 SHA-NI via sha256_blocks_shani, ARM CE via sha256_compress_armce, portable C otherwise. Pointer starts NULL so a missed detection degrades to correct-and-slow, never SIGILL. New mysha256_cpu_detect called unconditionally from main; arm_ce_detect could not serve since it is compiled and called only under the aarch64 guard. MDXFIND_SHA256_DEBUG=1 reports which arm won. Measured dev1 M1 e1000 131 to 646 cand/s end-to-end.
  *
@@ -3054,20 +3060,24 @@ void mysha256_cpu_detect(void)
   if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) && (ebx & (1u << 29)))
     sha256_x86_fn = sha256_blocks_shani;
 #endif
-  /* MDXFIND_SHA256_DEBUG=1 reports which arm won. Kept deliberately: a
-   * silent fallback to the portable routine is correct but slow, and that
-   * is exactly the failure mode that is otherwise invisible. */
-  if (getenv("MDXFIND_SHA256_DEBUG")) {
-#if defined(MYSHA256_HAVE_X86_SHANI)
-    fprintf(stderr, "sha256 dispatch: x86 SHA-NI %s\n",
-            sha256_x86_fn ? "ENGAGED" : "unavailable (CPUID bit clear)");
-#elif defined(ARM) && ARM >= 8 && defined(__aarch64__)
-    fprintf(stderr, "sha256 dispatch: ARM CE %s\n",
-            sha256_arm_fn ? "ENGAGED" : "unavailable");
-#else
-    fprintf(stderr, "sha256 dispatch: portable C (no accelerated arm compiled)\n");
+  /* Report the PRESENCE of hardware assist, never its absence -- the same
+   * contract as arm_ce_detect() above, and for the same reason: SHA-256
+   * computes correctly either way.  The portable routine is slower, not
+   * wrong, so announcing it reads like a fault where there is none, and on
+   * the great majority of hosts it would be a line of noise on every run.
+   * Silence here means no SHA-NI, which is the normal case.
+   *
+   * ARM is deliberately not reported at this site: arm_ce_detect() already
+   * lists SHA256 among the algorithms in its "ARM CE acceleration enabled:"
+   * line, and a second line would say the same thing twice.
+   *
+   * SHA-1 is not reported either, though it shares this CPUID bit: its
+   * pointer is resolved lazily inside sha1_block_init() on first use, so at
+   * init time there is nothing truthful to say about it yet. */
+#ifdef MYSHA256_HAVE_X86_SHANI
+  if (sha256_x86_fn)
+    fprintf(stderr, "x86 SHA-NI acceleration enabled: SHA256\n");
 #endif
-  }
 }
 
 /* The single per-processor gate for streaming SHA-256. One call covers a run

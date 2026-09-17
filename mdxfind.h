@@ -1,5 +1,210 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.30  2026/09/17 06:11:54  dlr
+ * Correct the bf_fast_eligible note: the condition no longer includes an environment variable. MDXFIND_GPU_FAST_DISABLE could veto the BF-fast MD5 template kernel and was removed 2026-09-16.
+ *
+ * Revision 1.29  2026/09/17 03:22:25  dlr
+ * Remove JOBFLAG_IP with the -n i IPv4 append mode. Waffle: its purpose has been served and externally generating IP address ranges is trivial. Bit 8 is free; the three unbuilt unversioned copies mdxnew.c, mdxfindsparc64.c and mdxfindnew.c still reference it and are unaffected by the product build. rotcheck.c carries its own define and does not include this header.
+ *
+ * Revision 1.28  2026/09/13 12:17:26  dlr
+ * -Z prints retained rule SOURCE TEXT; the bytecode decoder is deleted.
+ *
+ * Completes the -Z work begun in 1.586, which fixed attribution. This fixes what
+ * -Z PRINTS, and removes an out-of-bounds read.
+ *
+ * THE DEFECT. The -Z histogram decoded packed bytecode back into a rule line by
+ * switching on ASCII opcode letters. But packrules emits 0x80 to 0xfd for verbs
+ * and stores OPERANDS as raw bytes, so an operand could collide with an opcode
+ * case. Rule $z packs to e5 7a 00: the 7a matched the position-operand case, the
+ * entry terminator was consumed as that operand, Rulepos was indexed at -1, and
+ * the walk continued past the entry into the next rule. Measured before this
+ * change on a 33-rule file whose operands cover every colliding verb: the output
+ * carried 34 bytes of 0xe5 and 35 NULs, one row printed two rules joined, and the
+ * byte census showed raw bytecode on stderr. Packed bytecode is simply not
+ * decompilable, so no version of that decoder can be made correct.
+ *
+ * THE FIX. Retain the source text instead. struct rule_ent gains srcoff and
+ * srclen, struct rulestore gains a source slab, and rs_add_src carries the text;
+ * rs_add is now that with a NULL source, so procrule is unaffected. The -r/-R
+ * load site copies the line BEFORE packrules_len compiles it in place, since
+ * s = d = line destroys it. The flatten copies the text out of the store, indexed
+ * 1..Numrules to line up with RuleCnt and Ruleindex, because rs_reset frees the
+ * store once Rules is built. Retention is unconditional, not gated on -Z:
+ * options are processed in argv order, so -r foo -Z loads rules before -Z is
+ * seen, and gating would need an argv pre-scan and create a flag-order-sensitive
+ * invisible mode. struct RuleHist gains an explicit length because the slab is
+ * packed rather than NUL-terminated. 122 lines of decoder deleted.
+ *
+ * -R PROVENANCE. rs_product joins the two parents source text with a space,
+ * which is itself a runnable rule line, since mdxfind applies the ops on a line
+ * left to right. Materialised at product time rather than kept as parent
+ * pointers because rs_product already materialises the full dst x mul BYTECODE
+ * product, so the text is the same order of growth and not a new one. A rule
+ * deduplicated away contributes no orphan text, and the FIRST spelling of a
+ * duplicated rule is the one -Z reports, which is input-file order.
+ *
+ * VALIDATED on three engines, readable text, counts matching the documented
+ * per-rule truth exactly.
+ *   mixguard, 7 of 10 GPU-eligible, the mixed partition: No rule 6, l 3, u 6,
+ *   c 4, $1 6, v2- 6, ^a 6, v3x 5, r 6, v4_ 5, d 6. CPU equals OpenCL on a
+ *   GTX 1080 equals Metal on an Apple M1, 59 of 59 found on each.
+ *   33 colliding operands, every verb whose letter an operand can collide with,
+ *   at 33 of 33 eligible so every rule crosses the GPU: all 33 render correctly
+ *   and the byte census is clean on all three, against 0xe5 x34 and NUL x35
+ *   before. 33 of 33 found.
+ *   New 2x2 -R product, which no existing fixture covered: 4 rules named
+ *   runnably as l $1, l $2, u $1, u $2 in left-major order, 5 of 5 found,
+ *   identical on all three engines.
+ *
+ * procrule builds and runs unchanged, as rs_add keeps its signature.
+ *
+ * BUILD NOTE for the next person shipping these files by hand: ruleproc.c needs
+ * rule_ops.h at 1.3 or later. Shipping ruleproc.c without it fails with
+ * rule_class_byte, rule_verb_opcodes and RULE_CLASS_MATCH undeclared. Both GPU
+ * build hosts had a stale copy.
+ *
+ * Revision 1.27  2026/09/12 16:14:23  dlr
+ * Rule length reaches the classifier and the GPU program: NUL-bearing rules are
+ * now GPU-eligible and transferred intact, and the O-of-n-squared pack scan is gone.
+ *
+ * Stage 2 of the rule input restructure. Stage 1 made the length first-class in the
+ * host store; this carries it into classification and into the device transfer.
+ *
+ * gpu_rule_safe_phase0 is length-bounded. It used to walk the bytecode as a C string
+ * and test every operand byte with a not-zero check, so a 0x00 OPERAND read as
+ * end-of-rule and the rule was reported NOT GPU-safe. Any rule carrying one silently
+ * stayed CPU-only: correct results, no GPU, no diagnostic. The walk is now bounded by
+ * the true packed length, so an operand may be any byte, and a truncated rule is
+ * rejected because its operands run past the length rather than because one of them
+ * happens to be zero. Every fall-through label group is preserved exactly, including
+ * the four-byte X arm that sits AFTER the three-byte body which nine labels reach by
+ * falling through - moving it in front of them once took d3ad0ne from 37 CPU-only
+ * rules to 14,958.
+ *
+ * classify_rules now carries per-rule lengths through to both partitions, and records
+ * each entry's ORIGINAL index. struct rule_lists gains fulllen, gpulen, cpulen, gpuidx
+ * and cpuidx; rule_lists_free frees the new arrays.
+ *
+ * Both GPU pack sites consequently change in two ways. They size and copy each rule
+ * with its true length instead of strlen, which used to stop at a 0x00 operand and
+ * hand the device a truncated rule whose operand count still said N - the kernel then
+ * satisfied the missing operands from the next rule's bytes. And they take the original
+ * index directly from gpuidx instead of recovering it by restarting a pointer scan at
+ * zero for every entry, although classify_rules preserves order.
+ *
+ * That scan was estimated at roughly 5e9 pointer compares at HashMob.100k scale, an
+ * arithmetic figure that had never been measured. Measured now, on HashMob.100k.rule
+ * via mdxfind's own T-plus instrumentation: startup falls from 2.840s to 0.652s, a 4.3x
+ * reduction saving 2.19 seconds.
+ *
+ * MEASURED AGAINST THE PRE-CHANGE BINARY. A four-line probe whose middle two rules
+ * differ only after a NUL, run on the untouched 1.583 build, reports "4 rules read"
+ * then "3 total rules in use" - one rule silently DROPPED - and "GPU rule engine: 2/3
+ * rules eligible", the survivor refused as not GPU-safe. The same probe on stage 1 plus
+ * 2 reports 4 read, 4 in use, 4 of 4 eligible.
+ *
+ * VALIDATION. New nulfix fixture, 10 lines yielding 9 rules, 5 words, 45 unique
+ * candidates of which 25 contain a NUL byte: CPU equals GPU exactly on OpenCL against
+ * a GTX 1080 and on Metal against an M2 Max, 45 of 45, NUL-bearing 25 of 25 on both
+ * sides, 9 of 9 rules eligible. The eight existing fixtures all pass on both backends
+ * at their exact counts - classfix 232, gpufix 144, longfix 111, mixfix 145, gatefix
+ * 84, memfix 100, mixguard 59 with its CPU-partition check at 16 of 16 and its mixed
+ * partition confirmed at 7 of 10 eligible, and divfix reproducing its asserted
+ * divergence of CPU 30 against GPU 19. Rule counts are unchanged from the 1.583
+ * reference on all seven shipped files. Throughput on fpga against rockyou by best64
+ * is 4.69s wall and 1.055 hash Gh per second against a 4.68s and 1.047 baseline, with
+ * peak VRAM at 325 MiB exactly as before, 1000 of 1000 found on every repeat.
+ *
+ * NOT a regression and out of scope: a single-char NUL form, either prepend or append
+ * alone, is rejected by the loader's applyrule validity probe as a bad line. The
+ * untouched 1.583 build rejects it identically and procrule rejects its equivalent, so
+ * the two engines agree; only a multi-char form carries a NUL through today. The nulfix
+ * fixture keeps such a line deliberately to exercise that path, which is why it yields
+ * 9 rules from 10 lines.
+ *
+ * Still ahead, and the reason the format work is separate: the GPU program remains
+ * NUL-terminated, so the kernel walk still depends on every op advancing by exactly its
+ * operand count in all six kernels across OpenCL and Metal. Stage 3 replaces that with
+ * a two-byte length prefix.
+ *
+ * Revision 1.26  2026/09/12 15:00:57  dlr
+ * Rule length is now first-class: NUL-clean rules, input-file order, left-major -R.
+ *
+ * Stage 1 of the rule input restructure, per operator directive 2026-09-12: accept
+ * NULs in rules and pass the length, which rules out Judy string de-duplication and
+ * forces a hash or literal compare.
+ *
+ * THE DEFECT. The packed bytecode is not a C string. An operand byte may legitimately
+ * be 0x00 via PARSEHEX, and 0x00 is never an opcode, so deriving the length with
+ * strlen truncated a rule at its first NUL operand. Both applyrule and all six GPU
+ * kernel walkers were always NUL-clean, because each consumes operands by explicit
+ * count, so the corruption happened entirely in storage, before either engine saw the
+ * bytes. procrule was correct throughout for the same reason: it never put the packed
+ * form in a string-keyed container.
+ *
+ * Two separate wrong answers followed, both silent:
+ *
+ *   Truncation. The rule was stored short while its operand count still said N, so
+ *   applyrule read the missing operands out of whatever followed. Measured: the rule
+ *   that appends NUL then B, applied to ABC, produced the hex for ABC NUL NUL instead
+ *   of ABC NUL B, and the bad byte tracked the NEXT rule in the file - the low byte of
+ *   that entry's length prefix. For the last rule in the buffer the read goes past the
+ *   end of the Rules allocation. The emitted plaintext hashed to the emitted digest,
+ *   so nothing downstream could detect it.
+ *
+ *   Collapse, which is worse. Appending NUL then B and appending NUL then C both
+ *   stringified to the same two bytes, so JudySL treated them as ONE key and silently
+ *   DROPPED one of the two rules. A rule file could hold N rules and mdxfind would run
+ *   N-1, with the load receipt reporting the deduplicated count as though nothing had
+ *   happened.
+ *
+ * WHAT REPLACES IT. packrules_len yields the true packed length; packrules is retained
+ * as a wrapper so the callers in procrule.c, gpu_rules_test.c, rule-bench.c and pr.c
+ * are untouched. A new rule store replaces the RuleArray and NRuleArray JudySL pair:
+ * an append-only bytecode slab plus a linear entry table, deduplicated by FNV-1a-64
+ * with open addressing and every hash hit confirmed by an exact memcmp, so a false
+ * dedup - which would silently drop a rule - is impossible by construction rather than
+ * improbable. Dedup earns little, 0 to 0.13 percent on the shipped files, and is kept
+ * only because Numrules feeds the ETA; nothing was traded away for it.
+ *
+ * Two properties the JudySL could not provide. Index order is now INPUT-FILE order
+ * across multiple -r files, where JSLF and JSLN iterated in lexicographic order of the
+ * bytecode - rules executed in bytecode order, not the order written. And -R is now
+ * LEFT-MAJOR per operator ruling, first file varying slowest, which required the store
+ * to be instantiable and the -R file to be buffered before the product is formed: a
+ * streaming read can only produce right-major.
+ *
+ * Rules[] entry layout is deliberately UNCHANGED - two-byte length equal to bytecode
+ * length plus one, then the bytecode, then a NUL - so the rule_ptrs walk, applyrule
+ * and the classifier are all untouched. Only the copy becomes correct, memcpy at the
+ * true length in place of strcpy, and only the order changes.
+ *
+ * ValidRules deleted. It had exactly three references: a declaration, one malloc of
+ * MemSize plus four, and one memmove from Rules. It was never read anywhere in the
+ * tree, and at Hash-IT_Crazy_Rules scale it held roughly 150 MB to no purpose.
+ *
+ * VALIDATION. All four NUL-bearing forms now agree byte for byte with procrule, and
+ * the two rules that used to collapse both load and both fire. Note that two of the
+ * four only ever LOOKED correct: the missing operand was 0x00 and the byte read past
+ * the truncation was the NUL terminator, also 0x00, so they were right by coincidence
+ * while still overreading. Seven fixtures pass on the CPU path - classfix 232, gpufix
+ * 144, longfix 111, mixfix 145, gatefix 84, memfix 100, mixguard 59 - and divfix gives
+ * its expected CPU 30. Rule counts are identical to the pre-change 1.583 binary on
+ * every shipped rule file: best64 77, top_500 499, HashMob 1k 999, 5k 4997, 10k 9997,
+ * 100k 99995, t.rule 1. Content equivalence checked across platforms as well as
+ * versions: best64 against the first 100000 lines of rockyou with 1000 target hashes
+ * gives a found-set md5 of 9cdd812e918311b5b0988fee36e47fb9 from both the pre-change
+ * 1.583 build on Linux and this build on macOS, from inputs verified identical by md5.
+ * Execution order confirmed to follow the rule file, and the -R product confirmed
+ * left-major and complete. Scale: 100000 rules load in 1.07 seconds at 86 MB peak RSS,
+ * and a 200000-rule -R product in 1.09 seconds at 100 MB.
+ *
+ * NOT yet addressed, and staged deliberately. The GPU program packer still sizes and
+ * copies each rule with strlen, so a NUL-bearing rule is still truncated on its way to
+ * the device; the classifier still treats a NUL operand as end-of-rule and marks such a
+ * rule not GPU-safe, so it would stay CPU-only regardless. Both are stage 3, which
+ * also moves the GPU program to a two-byte length prefix across OpenCL and Metal.
+ *
  * Revision 1.25  2026/08/12 01:22:09  dlr
  * Add MYSHA256 streaming workspace struct and mysha256_begin/add/end plus mysha256_cpu_detect prototypes. Caller-owned fixed-size struct carved from the existing per-thread work buffers like any other procjob workspace, so there is no allocation and nothing to free.
  *
@@ -136,8 +341,9 @@ struct job {
     /* Phase 1.9 Tranche A1 (2026-05-10): when 1, the chunk producer has
      * pre-qualified this BF chunk for the BF-fast MD5 template kernel
      * (gpu_md5_bf.cl). Conditions: op==JOB_MD5, Numrules<=1, unsalted,
-     * append-only mask (npre==0, napp in [1,8]), and env
-     * MDXFIND_GPU_FAST_DISABLE is unset. Procjob short-circuit copies
+     * append-only mask (npre==0, napp in [1,8]).  An
+     * MDXFIND_GPU_FAST_DISABLE env var could also veto it; that was
+     * removed 2026-09-16.  Procjob short-circuit copies
      * this into jobg.bf_fast_eligible. Default 0 = slow template path.
      * Wider eligibility (multi-rule, prepend, salted) is intentionally
      * out of A1 scope; A2-A4 do not widen this gate. */
@@ -150,7 +356,6 @@ struct job {
 #define JOBFLAG_PRINT 1
 #define JOBFLAG_HEX 2
 #define JOBFLAG_NUMBERS 4
-#define JOBFLAG_IP 8
 #define JOBFLAG_PREPEND 16
 #define JOBFLAG_GPU 32
 #define JOBFLAG_BRUTEFORCE 64
@@ -242,6 +447,40 @@ struct rule_workspace {
 
 extern int applyrule(char *line, char *pass, int len, char *rule, struct rule_workspace *ws);
 extern int packrules(char *line);
+/* As packrules, but yields the true packed length (excluding the trailing
+ * NUL).  Required by any caller that copies or keys on the bytecode: a
+ * packed rule may contain a 0x00 OPERAND, so strlen() truncates it. */
+extern int packrules_len(char *line, int *packedlen);
+
+/* Rule store -- length-carrying, input-order, hash-deduplicated.  Replaces the
+ * JudySL rule arrays, which keyed on a NUL-terminated string and so could not
+ * hold a packed rule containing a 0x00 operand, and which iterated in
+ * bytecode order rather than input-file order. */
+/* srcoff/srclen locate this rule's ORIGINAL SOURCE TEXT in rulestore.src.
+ * packrules compiles in place (s = d = line) and destroys the source, so the
+ * text must be captured BEFORE packing and carried here -- the packed bytecode
+ * cannot be decompiled back to a rule line, and the -Z decoder that tried to do
+ * so read out of bounds.  srclen == 0 means no source was supplied. */
+struct rule_ent { uint32_t off; unsigned short len;
+                  uint32_t srcoff; unsigned short srclen; };
+struct rulestore {
+    char            *slab;     /* packed bytecode, back to back          */
+    size_t           used, cap;
+    struct rule_ent *ent;      /* linear -- index order IS input order   */
+    int              n, entcap;
+    uint32_t        *htab;     /* slot+1 into ent; 0 = empty             */
+    size_t           hmask;
+    char            *src;      /* rule SOURCE TEXT, back to back          */
+    size_t           srcused, srccap;
+};
+extern int  rs_add(struct rulestore *rs, const char *bytes, int len);
+/* As rs_add, but also retains the rule's source text for -Z.  rs_add is this
+ * with src == NULL, so existing callers (procrule) are unaffected. */
+extern int  rs_add_src(struct rulestore *rs, const char *bytes, int len,
+                       const char *src, int srclen);
+extern void rs_reset(struct rulestore *rs);
+extern int  rs_product(struct rulestore *dst, const struct rulestore *mul,
+                       int maxlen);
 
 /* GPU rule engine — three-list partition (Phase 0 design memo).
  * `full` is the original (caller-owned) array; gpu and cpu are owned
@@ -250,9 +489,20 @@ struct rule_lists {
     char **full;     int nfull;
     char **gpu;      int ngpu;
     char **cpu;      int ncpu;
+    /* Parallel length arrays.  The packed bytecode is not a C string -- an
+     * operand byte may be 0x00 -- so a length must travel with every rule.
+     * fulllen[] is an alias of the caller's array; gpulen[]/cpulen[] are
+     * malloc'd alongside gpu[]/cpu[].  gpuidx[]/cpuidx[] give each entry's
+     * ORIGINAL index, so no caller needs to search for it. */
+    const unsigned short *fulllen;
+    unsigned short *gpulen;
+    unsigned short *cpulen;
+    int            *gpuidx;
+    int            *cpuidx;
 };
 
-extern int classify_rules(char **rules, int nrules, struct rule_lists *out);
+extern int classify_rules(char **rules, const unsigned short *lens,
+                          int nrules, struct rule_lists *out);
 extern void rule_lists_free(struct rule_lists *rl);
 
 /* Startup-phase diagnostic instrumentation (Shooter 12-GPU rig).

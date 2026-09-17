@@ -107,6 +107,12 @@
 #include "sqlite3.h"
 
 #include "mdxfind.h"
+/* AFTER mdxfind.h, which defines MAXLINE: ruleproc32.h carries a fallback
+ * MAXLINE for the standalone test tools, and this order makes mdxfind's
+ * win, exactly as procrule.c does it. */
+#include "rule_ops.h"   /* RULE_OP_* opcode numbers, shared with both engines */
+#include "ruleproc32.h"
+#include "classify_utf8.h"
 #include "userdef.h"  /* unknown-key forward-compat fix: userdef.c r1.11 */
 
 /*
@@ -270,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.579 2026/09/06 16:36:36 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.590 2026/09/17 05:23:50 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.579 2026/09/06 16:36:36 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.590 2026/09/17 05:23:50 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -291,6 +297,287 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.590  2026/09/17 05:23:50  dlr
+ * Remove every remaining environment input from the driver: MDXFIND_PIN_TRACE, _BF_CHUNK_SIZE, _BF_INNER_ITER, _BF_ADAPTIVE_TRACE, _SPP, _7Z_MIN_BITS, _7Z_STRICT, _KERNEL_A_FIXTURE_BF, _KERNEL_A_TRACE, _RULE_VALIDATOR, _GPU_FAST_DISABLE and the five-strong MDXFIND_HX_CODEGEN family. MDXFIND_CACHE is now the only variable mdxfind reads. Every one had unset as the production path, so the defaults are hardcoded: the brute-force servo decides chunk and inner iteration, salts per page defaults to 1024, SevenZipMinBits and SevenZipStrict keep their compiled-in values, the GPU fast path is never vetoed, and the adaptive brute-force telemetry stays on because it was already default-on and only "=0" suppressed it. The hx codegen harness and the kernel-A brute-force fixture are retained in the source but are no longer reachable; both need a native CLI flag, which is the right home for them since an option appears in the invocation and can be regression-tested. Verified CPU equals GPU with nonzero GPU hits on six types over 200k words on both backends: mmt RTX 4070 Ti SUPER and dev1 M1, the latter including the -8 UTF-32 path.
+ *
+ * Revision 1.589  2026/09/17 03:22:10  dlr
+ * Channel fix: -f is the PLAIN HEX channel and must discard the line remainder. -f and -F shared one load_hash_file and the only distinguishing argument was pDoload, which is NULL for BOTH -J and -f, so the loader could not tell the channels apart. The plain-hex fast path is gated on !LoadStructured, so selecting any structured type diverted a -f file into the slow path where all 46 format recognizers saw the whole line. Reported by Waffle and replicated with a 40-hex SHA1 followed by colon password read under -h ^SHA1 or ^MD4 or ^NTLM or ^SMF: password loaded as a SALT for SHA1-8TRACK, MD4DESCRYPT, SHA1DESCRYPT, MD4UTF16DESCRYPT, SHA1-S1PS2 and SHA1CRYPT and as a USERID for SMF and SHA1-HMAC-MD5, reading 1 hashes, 6 salts, 2 users where it must read 1 hashes, 0 salts, 0 users. The fast path already truncated at the first non-hex character; the two paths simply disagreed and which one ran depended on the type selection, so the defect was invisible until a selection happened to include a structured type. load_hash_file gains a hex_only parameter, set 1 at the -f call site and 0 at -F and -J. On the plain-hex channel each line is truncated at the first non-hex character before any recognizer runs and an empty result is skipped. Verified: -f now reads 1 hashes, 0 salts, 0 users while -F on the same file still reads 1 hashes, 6 salts, 2 users, and a 40,000-hash regression fixture read via -f produces a byte-identical result set, 610 lines across 61 types. Consequence worth noting: a 13-char descrypt string fed to -f now truncates below the 8-byte floor and does not load at all rather than loading wrongly, which is correct for the channel but is a behaviour change. Also in this revision: -n and -N digit counts desugar to the equivalent mask at option-parse time so -n 2 IS ?d?d, which fixes a keyspace shortfall where -n 2 delivered 10 of 100 candidates and a GPU mask-axis drop, with candidate order verified identical and the old sequence a strict prefix of the new one; -n i IPv4 removed at Waffle request with strict argument validation so an old script fails loudly; and the GPU admission guard widened for the eight user-keyed HMAC KSALT ops, which carry TYPEOPT_NEEDUSER so their key lives in Typeuser and nsalts_job is structurally 0, leaving them declined on BOTH backends despite each having a chokepoint admit. e211 e213 e214 e215 e216 e217 e218 now GPU-served on OpenCL and Metal, measured with GPU hit counts on a 150k-word fixture.
+ *
+ * Revision 1.588  2026/09/14 19:28:11  dlr
+ * Add -8: UTF-8 rule support with per-(word,rule) engine dispatch, and put UTF-32-required rules on the GPU. Links ruleproc32 and classify_utf8 into mdxfind for the first time, so the tool now carries both rule engines rather than the byte engine alone. -8 enables the UTF-32 engine; without it nothing changes and byte mode is byte-identical to 1.587 over 299,025,078 candidates on HashMob.100k.rule and 1,950,708 on the 1k. Every word is classified by classify_utf8 AFTER the HEX unwrap, never before, because the wrapper text is pure ASCII and classifying the raw line calls every wrapped non-ASCII word ASCII: measured 8,819 of 53,976 lines of UTF8test1.txt are ASCII raw and non-ASCII decoded. The class lands in a new enc byte inside struct LineInfo, which cost nothing because offset plus len was 6 bytes in an 8-byte-aligned struct, and a static assert now stops a future field widening every wordlist read by a third. Engine choice is one helper, pick_engine, called from all four apply sites. The settled predicate was word is valid UTF-8 OR rule requires UTF-32, which assumes every rule CAN run on UTF-32; that is false for 31 rules of HashMob.100k.rule whose own rule text is not valid UTF-8, and sending a UTF-8 word to the UTF-32 engine for one of those produced nothing at all, silently, 2 candidates becoming 1. So each rule carries TWO bits, what each compiler accepts, and the word class states a preference while the compilers decide what is possible. Only the genuinely dead cell is refused and counted. Rules the byte compiler refuses and the UTF-32 compiler accepts are now ADMITTED rather than dropped, carrying a placeholder payload of a 0x00 byte followed by the source text: 0x00 is never an opcode, verified over 338,310 rule lines with zero hits and the lowest first byte seen being 0xc2, so it identifies the entry, stops the byte walker at once if one ever reaches it, and keeps the payload unique per rule so the store dedup still works. Such rules now also reach the GPU, which needed the device pack block to count them before its rl.ngpu guard, since a rule file whose every line is UTF-32-required leaves rl.ngpu at zero and sent nothing to the device at all. The membership pre-filter must run AFTER the membership array is allocated, not before, or its guard skips silently and 6 of 14 rules are walked by neither side: 8,446 recovered of 13,435. And its return value folds into gpu_legacy_slot_unused, because that flag gates the currule NULL short-circuit and therefore whether the CPU rule walk happens at all, so a rule handed back by the pre-filter must count as CPU residue again. Validated against procrule as oracle: identical candidate sets on the dispatch fixtures, and on the new u8future MD5 fixture byte mode recovers 2 of 16,223 targets where -8 recovers 15,950, with the 273-target remainder attributed exactly to the locale-variant limitation rather than estimated. GPU byte-exact against the CPU on both OpenCL and Metal.
+ *
+ * Revision 1.587  2026/09/13 12:17:26  dlr
+ * -Z prints retained rule SOURCE TEXT; the bytecode decoder is deleted.
+ *
+ * Completes the -Z work begun in 1.586, which fixed attribution. This fixes what
+ * -Z PRINTS, and removes an out-of-bounds read.
+ *
+ * THE DEFECT. The -Z histogram decoded packed bytecode back into a rule line by
+ * switching on ASCII opcode letters. But packrules emits 0x80 to 0xfd for verbs
+ * and stores OPERANDS as raw bytes, so an operand could collide with an opcode
+ * case. Rule $z packs to e5 7a 00: the 7a matched the position-operand case, the
+ * entry terminator was consumed as that operand, Rulepos was indexed at -1, and
+ * the walk continued past the entry into the next rule. Measured before this
+ * change on a 33-rule file whose operands cover every colliding verb: the output
+ * carried 34 bytes of 0xe5 and 35 NULs, one row printed two rules joined, and the
+ * byte census showed raw bytecode on stderr. Packed bytecode is simply not
+ * decompilable, so no version of that decoder can be made correct.
+ *
+ * THE FIX. Retain the source text instead. struct rule_ent gains srcoff and
+ * srclen, struct rulestore gains a source slab, and rs_add_src carries the text;
+ * rs_add is now that with a NULL source, so procrule is unaffected. The -r/-R
+ * load site copies the line BEFORE packrules_len compiles it in place, since
+ * s = d = line destroys it. The flatten copies the text out of the store, indexed
+ * 1..Numrules to line up with RuleCnt and Ruleindex, because rs_reset frees the
+ * store once Rules is built. Retention is unconditional, not gated on -Z:
+ * options are processed in argv order, so -r foo -Z loads rules before -Z is
+ * seen, and gating would need an argv pre-scan and create a flag-order-sensitive
+ * invisible mode. struct RuleHist gains an explicit length because the slab is
+ * packed rather than NUL-terminated. 122 lines of decoder deleted.
+ *
+ * -R PROVENANCE. rs_product joins the two parents source text with a space,
+ * which is itself a runnable rule line, since mdxfind applies the ops on a line
+ * left to right. Materialised at product time rather than kept as parent
+ * pointers because rs_product already materialises the full dst x mul BYTECODE
+ * product, so the text is the same order of growth and not a new one. A rule
+ * deduplicated away contributes no orphan text, and the FIRST spelling of a
+ * duplicated rule is the one -Z reports, which is input-file order.
+ *
+ * VALIDATED on three engines, readable text, counts matching the documented
+ * per-rule truth exactly.
+ *   mixguard, 7 of 10 GPU-eligible, the mixed partition: No rule 6, l 3, u 6,
+ *   c 4, $1 6, v2- 6, ^a 6, v3x 5, r 6, v4_ 5, d 6. CPU equals OpenCL on a
+ *   GTX 1080 equals Metal on an Apple M1, 59 of 59 found on each.
+ *   33 colliding operands, every verb whose letter an operand can collide with,
+ *   at 33 of 33 eligible so every rule crosses the GPU: all 33 render correctly
+ *   and the byte census is clean on all three, against 0xe5 x34 and NUL x35
+ *   before. 33 of 33 found.
+ *   New 2x2 -R product, which no existing fixture covered: 4 rules named
+ *   runnably as l $1, l $2, u $1, u $2 in left-major order, 5 of 5 found,
+ *   identical on all three engines.
+ *
+ * procrule builds and runs unchanged, as rs_add keeps its signature.
+ *
+ * BUILD NOTE for the next person shipping these files by hand: ruleproc.c needs
+ * rule_ops.h at 1.3 or later. Shipping ruleproc.c without it fails with
+ * rule_class_byte, rule_verb_opcodes and RULE_CLASS_MATCH undeclared. Both GPU
+ * build hosts had a stale copy.
+ *
+ * Revision 1.586  2026/09/13 11:52:03  dlr
+ * GPU -Z attribution: 1-based rule slots, and the auto-skip now skips.
+ *
+ * Two defects, both making -Z wrong with a GPU and both fixed here. Neither
+ * affects which hashes are found; the CPU histogram was already correct.
+ *
+ * DEFECT 1, off-by-one attribution. classify_rules records a 0-BASED Rules[]
+ * index (ruleproc.c:2165, i from 0) and both backends assigned it straight into
+ * job->Ruleindex. But Ruleindex is 1-BASED: the CPU walker starts at 0 for the
+ * no-rule pass and pre-increments per rule (:13963), which is why the C2.3 gate
+ * reads gpu_rule_membership[Ruleindex - 1] (:13991), and RuleCnt[0] is the
+ * No rule bucket. So every GPU hit was credited one slot low and the first rule
+ * landed in No rule. It was not a uniform shift because a mixed partition
+ * attributes its CPU-only rules correctly while the GPU-eligible ones move,
+ * each landing on whichever rule sits one slot below in Rules[] order.
+ *
+ * gpu_rule_origin[] becomes 1-based gpu_rule_slot[] with sentinel 0 instead of
+ * -1, so the sentinel coincides with the correct No rule bucket and needs no
+ * special attribution case. Rules[] and gpu_rule_membership[] stay 0-based and
+ * subtract 1, which is now the only minus-one on the path. Four build sites
+ * (two per backend) and two consumer blocks.
+ *
+ * DEFECT 2, the auto-skip did not skip. applyrule returning -2 means output
+ * equals input, so the synthetic colon no-rule pass already covers that
+ * candidate; the CPU walker skips the hash entirely (:14016, Either way skip
+ * the hash). Both GPU replay paths instead kept the hit, emitting the plaintext
+ * a second time AND crediting the rule for a candidate it did not produce,
+ * inflating that rule by exactly its output-equals-input count. Now -2 and -1
+ * share one branch and continue, matching the CPU.
+ *
+ * VALIDATED, three engines, byte-for-byte identical histograms.
+ * mixguard 7/10 eligible, the mixed partition that exposes the non-uniform
+ * shift: CPU equals OpenCL on a GTX 1080 equals Metal on an Apple M1, 59 of 59
+ * found on each. A new all-eligible fixture at 8/8 eligible, where every rule
+ * including the first goes through the GPU path and no CPU partition can mask a
+ * shift: identical on all three, 49 of 49 found.
+ *
+ * NEGATIVE CONTROL. The deployed 1.581 on fpga, same mixguard fixture, same
+ * GTX 1080, reports No rule 12 against a truth of 6 and only 8 histogram rows
+ * against 11. That binary predates other fixes and also finds 49 of 59 rather
+ * than 59, so it is not a clean single-variable control, but it independently
+ * confirms GPU -Z was wrong and that No rule absorbed the first rule.
+ *
+ * NOT fixed here: -Z still prints packed bytecode rather than rule text, and
+ * the decoder still reads out of bounds. That is the provenance stage, which
+ * needs source text retained before packrules destroys it.
+ *
+ * Revision 1.585  2026/09/12 16:14:22  dlr
+ * Rule length reaches the classifier and the GPU program: NUL-bearing rules are
+ * now GPU-eligible and transferred intact, and the O-of-n-squared pack scan is gone.
+ *
+ * Stage 2 of the rule input restructure. Stage 1 made the length first-class in the
+ * host store; this carries it into classification and into the device transfer.
+ *
+ * gpu_rule_safe_phase0 is length-bounded. It used to walk the bytecode as a C string
+ * and test every operand byte with a not-zero check, so a 0x00 OPERAND read as
+ * end-of-rule and the rule was reported NOT GPU-safe. Any rule carrying one silently
+ * stayed CPU-only: correct results, no GPU, no diagnostic. The walk is now bounded by
+ * the true packed length, so an operand may be any byte, and a truncated rule is
+ * rejected because its operands run past the length rather than because one of them
+ * happens to be zero. Every fall-through label group is preserved exactly, including
+ * the four-byte X arm that sits AFTER the three-byte body which nine labels reach by
+ * falling through - moving it in front of them once took d3ad0ne from 37 CPU-only
+ * rules to 14,958.
+ *
+ * classify_rules now carries per-rule lengths through to both partitions, and records
+ * each entry's ORIGINAL index. struct rule_lists gains fulllen, gpulen, cpulen, gpuidx
+ * and cpuidx; rule_lists_free frees the new arrays.
+ *
+ * Both GPU pack sites consequently change in two ways. They size and copy each rule
+ * with its true length instead of strlen, which used to stop at a 0x00 operand and
+ * hand the device a truncated rule whose operand count still said N - the kernel then
+ * satisfied the missing operands from the next rule's bytes. And they take the original
+ * index directly from gpuidx instead of recovering it by restarting a pointer scan at
+ * zero for every entry, although classify_rules preserves order.
+ *
+ * That scan was estimated at roughly 5e9 pointer compares at HashMob.100k scale, an
+ * arithmetic figure that had never been measured. Measured now, on HashMob.100k.rule
+ * via mdxfind's own T-plus instrumentation: startup falls from 2.840s to 0.652s, a 4.3x
+ * reduction saving 2.19 seconds.
+ *
+ * MEASURED AGAINST THE PRE-CHANGE BINARY. A four-line probe whose middle two rules
+ * differ only after a NUL, run on the untouched 1.583 build, reports "4 rules read"
+ * then "3 total rules in use" - one rule silently DROPPED - and "GPU rule engine: 2/3
+ * rules eligible", the survivor refused as not GPU-safe. The same probe on stage 1 plus
+ * 2 reports 4 read, 4 in use, 4 of 4 eligible.
+ *
+ * VALIDATION. New nulfix fixture, 10 lines yielding 9 rules, 5 words, 45 unique
+ * candidates of which 25 contain a NUL byte: CPU equals GPU exactly on OpenCL against
+ * a GTX 1080 and on Metal against an M2 Max, 45 of 45, NUL-bearing 25 of 25 on both
+ * sides, 9 of 9 rules eligible. The eight existing fixtures all pass on both backends
+ * at their exact counts - classfix 232, gpufix 144, longfix 111, mixfix 145, gatefix
+ * 84, memfix 100, mixguard 59 with its CPU-partition check at 16 of 16 and its mixed
+ * partition confirmed at 7 of 10 eligible, and divfix reproducing its asserted
+ * divergence of CPU 30 against GPU 19. Rule counts are unchanged from the 1.583
+ * reference on all seven shipped files. Throughput on fpga against rockyou by best64
+ * is 4.69s wall and 1.055 hash Gh per second against a 4.68s and 1.047 baseline, with
+ * peak VRAM at 325 MiB exactly as before, 1000 of 1000 found on every repeat.
+ *
+ * NOT a regression and out of scope: a single-char NUL form, either prepend or append
+ * alone, is rejected by the loader's applyrule validity probe as a bad line. The
+ * untouched 1.583 build rejects it identically and procrule rejects its equivalent, so
+ * the two engines agree; only a multi-char form carries a NUL through today. The nulfix
+ * fixture keeps such a line deliberately to exercise that path, which is why it yields
+ * 9 rules from 10 lines.
+ *
+ * Still ahead, and the reason the format work is separate: the GPU program remains
+ * NUL-terminated, so the kernel walk still depends on every op advancing by exactly its
+ * operand count in all six kernels across OpenCL and Metal. Stage 3 replaces that with
+ * a two-byte length prefix.
+ *
+ * Revision 1.584  2026/09/12 15:00:56  dlr
+ * Rule length is now first-class: NUL-clean rules, input-file order, left-major -R.
+ *
+ * Stage 1 of the rule input restructure, per operator directive 2026-09-12: accept
+ * NULs in rules and pass the length, which rules out Judy string de-duplication and
+ * forces a hash or literal compare.
+ *
+ * THE DEFECT. The packed bytecode is not a C string. An operand byte may legitimately
+ * be 0x00 via PARSEHEX, and 0x00 is never an opcode, so deriving the length with
+ * strlen truncated a rule at its first NUL operand. Both applyrule and all six GPU
+ * kernel walkers were always NUL-clean, because each consumes operands by explicit
+ * count, so the corruption happened entirely in storage, before either engine saw the
+ * bytes. procrule was correct throughout for the same reason: it never put the packed
+ * form in a string-keyed container.
+ *
+ * Two separate wrong answers followed, both silent:
+ *
+ *   Truncation. The rule was stored short while its operand count still said N, so
+ *   applyrule read the missing operands out of whatever followed. Measured: the rule
+ *   that appends NUL then B, applied to ABC, produced the hex for ABC NUL NUL instead
+ *   of ABC NUL B, and the bad byte tracked the NEXT rule in the file - the low byte of
+ *   that entry's length prefix. For the last rule in the buffer the read goes past the
+ *   end of the Rules allocation. The emitted plaintext hashed to the emitted digest,
+ *   so nothing downstream could detect it.
+ *
+ *   Collapse, which is worse. Appending NUL then B and appending NUL then C both
+ *   stringified to the same two bytes, so JudySL treated them as ONE key and silently
+ *   DROPPED one of the two rules. A rule file could hold N rules and mdxfind would run
+ *   N-1, with the load receipt reporting the deduplicated count as though nothing had
+ *   happened.
+ *
+ * WHAT REPLACES IT. packrules_len yields the true packed length; packrules is retained
+ * as a wrapper so the callers in procrule.c, gpu_rules_test.c, rule-bench.c and pr.c
+ * are untouched. A new rule store replaces the RuleArray and NRuleArray JudySL pair:
+ * an append-only bytecode slab plus a linear entry table, deduplicated by FNV-1a-64
+ * with open addressing and every hash hit confirmed by an exact memcmp, so a false
+ * dedup - which would silently drop a rule - is impossible by construction rather than
+ * improbable. Dedup earns little, 0 to 0.13 percent on the shipped files, and is kept
+ * only because Numrules feeds the ETA; nothing was traded away for it.
+ *
+ * Two properties the JudySL could not provide. Index order is now INPUT-FILE order
+ * across multiple -r files, where JSLF and JSLN iterated in lexicographic order of the
+ * bytecode - rules executed in bytecode order, not the order written. And -R is now
+ * LEFT-MAJOR per operator ruling, first file varying slowest, which required the store
+ * to be instantiable and the -R file to be buffered before the product is formed: a
+ * streaming read can only produce right-major.
+ *
+ * Rules[] entry layout is deliberately UNCHANGED - two-byte length equal to bytecode
+ * length plus one, then the bytecode, then a NUL - so the rule_ptrs walk, applyrule
+ * and the classifier are all untouched. Only the copy becomes correct, memcpy at the
+ * true length in place of strcpy, and only the order changes.
+ *
+ * ValidRules deleted. It had exactly three references: a declaration, one malloc of
+ * MemSize plus four, and one memmove from Rules. It was never read anywhere in the
+ * tree, and at Hash-IT_Crazy_Rules scale it held roughly 150 MB to no purpose.
+ *
+ * VALIDATION. All four NUL-bearing forms now agree byte for byte with procrule, and
+ * the two rules that used to collapse both load and both fire. Note that two of the
+ * four only ever LOOKED correct: the missing operand was 0x00 and the byte read past
+ * the truncation was the NUL terminator, also 0x00, so they were right by coincidence
+ * while still overreading. Seven fixtures pass on the CPU path - classfix 232, gpufix
+ * 144, longfix 111, mixfix 145, gatefix 84, memfix 100, mixguard 59 - and divfix gives
+ * its expected CPU 30. Rule counts are identical to the pre-change 1.583 binary on
+ * every shipped rule file: best64 77, top_500 499, HashMob 1k 999, 5k 4997, 10k 9997,
+ * 100k 99995, t.rule 1. Content equivalence checked across platforms as well as
+ * versions: best64 against the first 100000 lines of rockyou with 1000 target hashes
+ * gives a found-set md5 of 9cdd812e918311b5b0988fee36e47fb9 from both the pre-change
+ * 1.583 build on Linux and this build on macOS, from inputs verified identical by md5.
+ * Execution order confirmed to follow the rule file, and the -R product confirmed
+ * left-major and complete. Scale: 100000 rules load in 1.07 seconds at 86 MB peak RSS,
+ * and a 200000-rule -R product in 1.09 seconds at 100 MB.
+ *
+ * NOT yet addressed, and staged deliberately. The GPU program packer still sizes and
+ * copies each rule with strlen, so a NUL-bearing rule is still truncated on its way to
+ * the device; the classifier still treats a NUL operand as end-of-rule and marks such a
+ * rule not GPU-safe, so it would stay CPU-only regardless. Both are stage 3, which
+ * also moves the GPU program to a two-byte length prefix across OpenCL and Metal.
+ *
+ * Revision 1.583  2026/09/11 19:47:25  dlr
+ * Rule-engine parity block, character classes on GPU, 2-byte packed-word length, and two dispatch guards.
+ *
+ * Byte engine brought to parity with the documented john and hashcat feature sets. Character classes in both syntaxes: inline ?C uses the john table with complement-by-case-toggle, a ~ prefix selects the hashcat table. Nine verbs take a class, opcodes 0x80 to 0x89. ~e?C needs its own opcode 0x89 because hashcat class title-case is a different algorithm from the john form, not the same one with a class test substituted. The ?s class is hashcat class_sym in BOTH tables and john user classes ?0 to ?9 are not implemented, both per operator ruling. ?? is the literal-? escape, so purging a literal ? is now written @?? and 8 lines across the shipped rule files stop loading, every one of them a rule john also rejects.
+ *
+ * Other parity fixes in the same block: c C E and e act on position 0, not on the first alphabetic character, which john and hashcat agree on and mdxfind did not; x and X follow hashcat when out of range, superseding an earlier ruling for john; a candidate a rule empties is kept, following hashcat; T is bounds-checked as john does; X honours the memory offset N, which was read and then ignored so every offset gave the same answer; B is added from hashcat master. ruleproc32 refuses a class loudly rather than silently reinterpreting it, and accepts the ?? escape identically, closing a byte-versus-utf32 divergence where the same rule text produced different candidates in each engine with no diagnostic.
+ *
+ * All ten class opcodes plus =NX and %NX promoted from CPU-only to GPU-eligible and implemented in all six rules kernels, sharing one 480-byte constant-address-space membership table in gpu_common.cl and metal_common.metal so the six cannot drift. Three real rule files now have zero CPU-only rules.
+ *
+ * Packed-word length widened from one byte to two, little-endian, written and read byte by byte so it depends on neither host alignment nor host endianness. The admission gate allows GPU_RULES_MAX_INPUT_LEN 40959 while the wire field held 255, so any word of 256 to 40959 bytes was hashed as its first len mod 256 bytes: 285 as its first 29, 300 as its first 44. The emitted plaintext matched the emitted digest so nothing downstream could detect it. 11 kernel read sites across 7 files, 3 host writers, 2 host hit decoders and the buffer-full check move together.
+ *
+ * Two dispatch guards. C2.3 now tests the per-word word_packed_by_rules_engine rather than the thread-persistent my_jobg_rules, which differ whenever a word is walked but not packed. FastRule is disabled when this iteration is not the no-rule pass, making entered-at-the-rule-stream-origin a precondition rather than an assumption: the SIMD walker was re-draining the remaining rules from the first CPU-only rule output, so exactly one CPU-partition candidate survived per word.
+ *
+ * Validation: john class sweep 66 of 75 with all 9 differences the ruled empty-word policy, hashcat class sweep 21 of 21, X 22 of 22, x 16 of 16, c C E e 50 of 50 against john, rules32 conformance 165 of 165, zero silent byte-versus-utf32 divergences, wire round trip proven for all 40960 admitted lengths. Five GPU fixtures CPU equals GPU on a GTX 1080 and an M2 Max, including 113 of 113 on the fixture that measured 84 of 113 before the FastRule guard, and 126 of 126 on words from 1 to 4096 bytes. Regression on shipped rule files: Hash-IT_Crazy_Rules 6828885 rules, all_gj 208010 and T0XlC byte-identical.
+ *
+ * Also included in mdxfind.c and authored by Waffle, not by me: the AIX cmiyc challenge-3 algorithm validation comment block, recording the ppcemu emulated-oracle confirmation and the 504-hash corpus confirmation at the live parameters.
+ *
+ * Revision 1.582  2026/09/10 02:55:04  dlr
+ * APACHE-SHA e457 never incremented hashcnt, so Tothash did not advance for it: h/s displayed 0.00 for the whole run while Found kept rising, and LINEHINTS(457).rate stayed pinned at 0 because the EMA update at 44893 is gated on accum > 0 and never fired. The case computes mysha1 and calls checkhash inline rather than reaching SHA1_start, which is where every other SHA1 variant does the count. Single-site omission: the other three checkhash(&curin,40,1,job) callers all count (SHA1DRU earlier in its case, and the two at 31878/31911).
+ *
+ * Revision 1.581  2026/09/09 17:08:22  dlr
+ * List user-defined types in the -h table. They were invisible there for two independent reasons, and a tool building a known-type list from -h could therefore never contain a USER_ type although -m u<id> and -c USER_<name> both work. First, ordering: the -h block runs at the top of main() and exits, while userdef_load() is called further down, so nothing was loaded yet. It now loads inside the block, silently, since userdef_verbose is 0 unless -Y asked for the report, and the block always exits so it cannot double-register. Second, the built-in loop walks Types[] and user types are not in it: they live in the userdef registry and are reached through userdef_count and userdef_get_by_index, which mdxfind already uses elsewhere. The new section prints after the built-ins and their trailing note. Rows are keyed on the DECLARED id, printed as u<idstr>, and never on the internal op. That is deliberate and load-bearing: Userdef_base is derived at startup as (maxtype + 63) & ~63 and moves whenever built-ins are added, and the comment at that derivation states the invariant that makes deriving it safe -- op numbers never escape the process. Printing one in a listing meant for machine consumption would publish an unstable number and break exactly that. The name always carries the USER_ prefix, which per Waffle 2026-09-09 is the required public label for these types; the bare stanza name matches only internally, by regex. Option letters are derived from the expression slot mask rather than from TypeOpts, because TypeOpts for user types is assembled further down main() and is still empty at this point: f always (plain hex), F if the stanza declared a stored form, s if the expression references salt, u if it references user. Verified against the local userdef.txt: u47 f USER_Cust1 and u4713 f,F,s USER_BWTDT. Built-in row count is 1027 with and without MDXFIND_CACHE set, and with no user types the section is absent entirely. Regress e1, e31, e260, e439 and e918 unchanged. NOT fixed here, found while testing and reported separately: a user-defined type with no form declaration cannot match anything at all. The loader files every user hash into JUDYJ(op) and claims the line, so it never reaches commit_compact, while the matcher consults JudyJ only for form-bearing types and otherwise calls checkhash against the compact table. The receipt says "1 hashes read" and then "Searching through 0 unique hex hashes". Proved by A/B on one type: BWTDT with its form line cracks, the same type and password with the form line removed does not.
+ *
+ * Revision 1.580  2026/09/08 21:29:20  dlr
+ * e918 DCC2 accepts usernames through -u and -U, not only inside a $DCC2$ wrapper. TypeOpts[918] gains TYPEOPT_NEEDUSER, which is all the generic plumbing needs: the Douser/LoadUser registration, the UseridJudy binding and the help letter are all driven off that one flag, so the Options column now reads f,s,u with no separate edit and no chance of the table drifting from behaviour. NEEDUSER is ADDED, not swapped for NEEDSALT: NEEDSALT drives LoadSalt and Dosalt and the $DCC2$ loader still calls store_typesalt, so clearing it would break the structured path. Userids are folded into Typesalt as iter:username after the UseridJudy binding, so reading TYPEUSER alone covers both -u and -U, carrying each userid OWN reference count rather than inventing one. That gives the three-way model: -F byte-exact, since store_typesalt is called once per hash line; -U the occurrence count from the userid file, which retires when its hashes are solved; -u the 1000000 pool, effectively non-retiring. Iteration count is DCC2_DEFAULT_ITER, the Windows default the $DCC2$ loader already falls back to, since -u and -U carry none. Two things this needed that scoping missed, both found by testing. DCC2 compares against its own JudyJ rather than the compact table, because the $DCC2$ loader files digests there, so plain hex loaded, printed a receipt and was never comparable; 16-byte digests are now filed into JUDYJ(JOB_DCC2) when e918 is selected. And there are TWO hex load paths: fixing only the slow fallthrough left -F working while -f still returned zero, because -f takes the fast path with its own commit_compact and goto load_done. Both sites now file. -U also no longer stamps 1000000 over the count: it accumulates, which additionally stops it CLOBBERING the byte-exact count the hash file itself builds one increment per hash line. Consequence, and it is a contract change: a userid must appear in a -U file once per hit it accounts for, which is its hashes multiplied by the depths -i searches. Measured on 260 MD5USERIDMD5 under -i 5, a x11 user list gives 510 of 550 and x55 gives 550; under-counting loses hits silently, over-counting only delays retirement. regress.sh now generates its user file at expected occurrences per name instead of the static 10-line testuser.txt. Verified: e918 5 of 5 on all four channels, -F and -f and -U and -u; three hashes sharing one username give -F 3 of 3, -U listed once 1 of 3, -U listed three times 3 of 3, -u 3 of 3. Regression green on 1, 31, 260, 347, 414, 439, 450, 511, 540, 786, 855, 857, 896, 918. e856 JUNIPERSSG fails at 0 of 11 and is PRE-EXISTING, confirmed by building the pre-change binary from backup and reproducing it.
+ *
  * Revision 1.579  2026/09/06 16:36:36  dlr
  * Split the phpBB3 family salt arrays, so PHPBB3MD5 stops finding one hash per salt. The loader keys the phpBB3 salt on 12 characters, the dollar-H-dollar prefix plus cost character plus 8-character salt, so every hash sharing a salt maps to ONE Typesalt entry and store_typesalt counts them as it inserts. PHPBB3MD5 never got that count: the bootstrap copied PHPBB3 salt keys across and stamped each with a hardcoded 1. That count is what the per-job salt snapshot decrements, so the salt retired the moment the first hash matched and every other hash carrying it was silently never tried. Measured on the regression fixture, 11 salts by 11 passwords: PHPBB3MD5 returned 11 of 121, one per salt, every one of them the first word in the wordlist, and each of the 121 cracked when run alone. Same failure as the MSSQL salt accounting fixed in 1.560; the audit accompanying that fix cleared twelve other bootstraps on the grounds that each keys Typesalt on the whole stored line so one entry maps to one hash, which is true for eleven of them and untrue for phpBB3, whose key is the salt. Fixed per Waffle by SEPARATING the arrays rather than by carrying the count across. New table Phpbb3Family lists the ops that consume the wrapper; the loader files each SELECTED member salts into that member own Typesalt, counted by the same call that inserts them, and commits the digest once per line. No copy step and no count produced anywhere that does not know the answer. A future member, a PHPBB3SHA1 for instance, is one entry in the table plus its compute arm. The bootstrap now sums the per-member array sizes rather than walking one array, which is what makes the disjoint case correct: dash-M e455 dash-F one.txt dash-M e537 dash-F two.txt loads two files into two arrays and the total is their sum. The minus-z default-salt path seeds every selected member. Two consequences beyond the count. Selecting e537 alone no longer populates the salt array of e455, a type the user did not select, and the startup line names the type actually loaded. That line now says salts rather than hashes, because the number has always been the count of distinct Typesalt entries and printed per type it would have read 11 unique PHPBB3MD5 hashes while 121 hashes were loaded. Deliberately unchanged: Numsalts is incremented by phpbb3cnt twice in that block, which reads like a double count, but it feeds progress and ETA arithmetic and correcting it is a separate question. Measured: two hashes sharing one salt generated by minus-z now crack 2 of 2 for both types where e537 gave 1 of 2; the fixture gives e455 11 of 11 and e537 121 of 121; the disjoint two-file case gives 11 plus 121; e537 alone gives 121 of 121 and reports PHPBB3MD5; minus-z still generates for both. Ten types spanning the salted paths, including the two changed and MD5CAP, pass the per-type regression. No GPU exposure: JOB_PHPBB3MD5 is in no GPU list and the salt-snapshot precondition names JOB_PHPBB3, whose array is still filled whenever e455 is selected.
  *
@@ -1357,7 +1644,7 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
  * Revision 1.352  2026/04/28 02:25:42  dlr
  * GPU rule engine Layer 3 sub-commit A: classify rules + per-device upload at session start.
  *
- * After Numrules is finalized in the rule-load block (~line 42437), walk the length-prefixed Rules buffer to build a char** of rule-bytecode pointers, call classify_rules(), and for each GPU-eligible rule pack its bytecode (with trailing NUL) into a contiguous program buffer. Upload to every available GPU device via gpu_opencl_set_rules(). Cache the program, offset table, and gpu->original-rule-index map in new globals (gpu_rule_program / gpu_rule_offsets / gpu_rule_origin / gpu_rule_program_len / gpu_rule_count) — sub-commits B/C/D will use them for chokepoint dispatch and applyrule-replay hit decoding.
+ * After Numrules is finalized in the rule-load block (~line 42437), walk the length-prefixed Rules buffer to build a char** of rule-bytecode pointers, call classify_rules(), and for each GPU-eligible rule pack its bytecode (with trailing NUL) into a contiguous program buffer. Upload to every available GPU device via gpu_opencl_set_rules(). Cache the program, offset table, and gpu->original-rule-index map in new globals (gpu_rule_program / gpu_rule_offsets / gpu_rule_slot / gpu_rule_program_len / gpu_rule_count) — sub-commits B/C/D will use them for chokepoint dispatch and applyrule-replay hit decoding.
  *
  * Reports a one-line summary to stderr: 'GPU rule engine: N/M rules eligible (P%), B-byte program uploaded to D/D device(s)'. On all-uploads-failed (likely __constant size limit on rule programs > ~64 KB — HashMob.5k packs to ~25 KB which fits, but HashMob.100k at ~500 KB does not), gpu_rule_count remains 0 and sub-commit C will fall back to the existing CPU rule-expansion path.
  *
@@ -3404,8 +3691,7 @@ static int Pin_trace_cached = -1;
 
 static int tsfprintf_pin_trace(void) {
   if (Pin_trace_cached == -1) {
-    const char *e = getenv("MDXFIND_PIN_TRACE");
-    Pin_trace_cached = (e && *e && *e != '0') ? 1 : 0;
+    Pin_trace_cached = 0;   /* was MDXFIND_PIN_TRACE */
   }
   return Pin_trace_cached;
 }
@@ -3593,7 +3879,17 @@ void *malloc_pinned(size_t size, const char *reason)
 struct LineInfo {
   unsigned int offset;
   unsigned short int len;
+  /* -8: the word's encoding class from classify_utf8(), one of the U8C_*
+   * masks, or U8C_NONE when -8 is off and no classification was done.
+   *
+   * This costs NOTHING: offset + len is 6 bytes in an 8-byte-aligned struct,
+   * so two padding bytes were already here.  The static assert below is the
+   * guard -- if a future field pushes sizeof past 8, every wordlist read in
+   * the program gets 33% wider, and the compile should stop rather than let
+   * that happen quietly. */
+  unsigned char enc;
 };
+typedef char mdx_lineinfo_size_check[(sizeof(struct LineInfo) == 8) ? 1 : -1];
 
 char *Curfile;
 unsigned long long int Lowline, LowSkip, TotLines, Fileline;
@@ -3611,7 +3907,13 @@ Pvoid_t JuniperIVE;  /* secondary mapping: md5crypt hash → original Juniper IV
 Pvoid_t DoUser;
 
 
-Pvoid_t Dohash, Doload, SaltArray, UserArray, KeyArray, RuleArray, NRuleArray, PepperArray;
+Pvoid_t Dohash, Doload, SaltArray, UserArray, KeyArray, PepperArray;
+/* Rule storage.  Replaces the RuleArray/NRuleArray JudySL pair: a JudySL key
+ * is a NUL-terminated string, so it could neither hold a packed rule
+ * containing a 0x00 operand nor preserve input-file order.  Rulestore is the
+ * accumulated set; Rulefile buffers one -R file so the product can be formed
+ * LEFT-MAJOR (first file varies slowest), which a streaming read cannot do. */
+struct rulestore Rulestore, Rulefile;
 /* JudyJ[] array and individual Judy name aliases defined after JOB_ constants */
 
 /* Hybrid compact hash table (replaces Bloom + JudyL HashL) */
@@ -3842,6 +4144,7 @@ int Debug, DoHistogram;
 struct RuleHist {
   char *rule;
   unsigned long long val;
+  unsigned short rlen;   /* rule[] is NOT NUL-terminated: Rulesrc is packed */
 };
 
 
@@ -3906,7 +4209,11 @@ Pvoid_t UseridJudy;
 char **Typepepper;
 int XOR_key_len;
 char *XOR_key;
-char *Keys, *Readbuf, *Rules, *ValidRules, *Peppers;
+char *Keys, *Readbuf, *Rules, *Peppers;
+/* ValidRules deleted 2026-09-12: it had exactly three references -- this
+ * declaration, one malloc_lock of MemSize+4 and one memmove from Rules --
+ * and was never read anywhere in the tree.  At Hash-IT_Crazy_Rules scale
+ * (6,828,885 rules) it was holding roughly 150 MB to no purpose. */
 int Rulesize;
 
 /* GPU rule engine — Layer 3 globals. Populated after rule load by the
@@ -3916,13 +4223,312 @@ int Rulesize;
  * GPU hits has the same bytecode the kernel saw. */
 unsigned char *gpu_rule_program = NULL;   /* packed bytecodes, NUL-separated */
 uint32_t      *gpu_rule_offsets = NULL;   /* byte offset of each rule */
-int           *gpu_rule_origin  = NULL;   /* maps gpu rule idx -> original Rules[] index;
-                                             -1 sentinel = synthetic `:` no-rule pass
-                                             (no corresponding Rules[] entry) */
+int           *gpu_rule_slot    = NULL;   /* maps gpu rule idx -> 1-BASED rule slot: the
+                                             job->Ruleindex / RuleCnt[] index of that rule.
+                                             The CPU walker is 1-based (:13963 starts at 0
+                                             for the no-rule pass then pre-increments), so
+                                             the GPU must be too or every hit is credited
+                                             one slot low and rule 1 lands in RuleCnt[0].
+                                             0 sentinel = the synthetic `:` no-rule pass,
+                                             which IS RuleCnt[0] ("No rule"), so it needs
+                                             no special case.  Rules[] and
+                                             gpu_rule_membership[] are 0-based, so those
+                                             subtract 1 -- the only `- 1` left on this
+                                             path. */
 uint32_t       gpu_rule_program_len = 0;
 int            gpu_rule_count   = 0;      /* nonzero = engine active for this session;
                                              includes the synthetic `:` rule, so this is
                                              rl.ngpu+1 not rl.ngpu */
+/* Rule SOURCE TEXT, retained for -Z.  Indexed 1..Numrules to match RuleCnt[]
+ * and job->Ruleindex -- slot 0 is the no-rule pass and has no source line.
+ * Captured before packrules destroys the line (see the -r/-R load site) and
+ * copied out of the rulestore during the flatten, because the store is reset
+ * once Rules[] is built.  This replaces the -Z bytecode decoder, which could
+ * not be made correct: packed operands collide with its ASCII opcode cases. */
+char           *Rulesrc    = NULL;
+uint32_t       *Rulesrcoff = NULL;
+unsigned short *Rulesrclen = NULL;
+
+/* -8: enable UTF-8 rule support -- the UTF-32 engine alongside the byte engine,
+ * with the engine chosen per (word, rule) pair.  procrule calls the same global
+ * the same thing, and `-8` is the same flag there; mdxfind's `-u` is already the
+ * userid file, which is why the letter differs from procrule's original `-u`.
+ *
+ * Off, nothing changes: the byte engine is the only engine, exactly as before,
+ * and rule lines carrying UTF-8 extensions are refused at load as they always
+ * were.  See DESIGN-dash8-rule-dispatch.md. */
+int Utf32Rules = 0;
+
+/* -L: pin the locale of an ambiguous case mapping.  Same flag, same accepted
+ * spellings and the same implies-`-8` behaviour as procrule, because a locale
+ * means nothing to the byte engine and silently doing nothing there is the
+ * failure this suite can least afford -- it looks exactly like an honest
+ * result.
+ *
+ * What differs from procrule, and it is not cosmetic.  procrule's default
+ * emits EVERY variant, so it cannot miss a candidate.  These walkers advance
+ * currule once per RULE, so mdxfind can only ever try ONE variant per
+ * (word, rule); its default is variant 0 with Variants_dropped counting what
+ * that costs.  -L therefore CHOOSES which single variant is tried rather than
+ * narrowing a set, and pinning it is what makes the count meaningless -- the
+ * operator has decided, so nothing is being dropped behind their back. */
+#define U32LOC_UNPINNED 0   /* no -L: variant 0, and count what that drops */
+#define U32LOC_ROOT     1   /* -L c|root|posix|none: variant 0, chosen      */
+#define U32LOC_TR       2   /* -L tr|az|turkish|azeri: variant 1            */
+int Utf32Locale = U32LOC_UNPINNED;
+
+/* Rules the BYTE compiler refuses that the UTF-32 compiler accepts -- the
+ * U32-REQUIRED class -- counted under -8 so the operator can see what the flag
+ * is worth on their own rule file before anything depends on it. */
+long Rule_u32_only = 0;   /* byte refuses, UTF-32 accepts: -8 would gain these */
+long Rule_both_bad = 0;   /* both refuse: genuinely bad, refused in either mode */
+
+/* Does the UTF-32 compiler accept this rule line?  0 = yes, -1 = no.
+ *
+ * Deliberately NOT the apply path: the byte engine's gate reads applyrule()
+ * == -3 as "invalid rule", but the UTF-32 engine uses -3 for a candidate a
+ * REJECTION rule refused, which is a normal result.  Reusing apply as the gate
+ * would discard every rejection rule in the file.  Ask only whether it compiles.
+ *
+ * DUPLICATED from procrule.c, where it is static.  It belongs in ruleproc32.c
+ * so the two tools cannot drift, and should move there when the mdxfind
+ * dispatch lands; it is copied for now to keep an incomplete change to one
+ * file.  If you edit one, edit both. */
+/* A word the UTF-32 engine can ingest: either it has no high bytes at all, or
+ * every high byte is part of a valid sequence.  Anything else utf8_to_utf32
+ * refuses. */
+#define U8C_DECODABLE(e) (!((e) & U8C_HI) || ((e) & U8C_UTF8))
+
+/* Per-rule engine capability, indexed 0-BASED like gpu_rule_membership[], i.e.
+ * job->Ruleindex - 1.  Both facts are needed, not a single "requires UTF-32"
+ * tag: see DESIGN-dash8-rule-dispatch.md sec 2 and sec 6. */
+unsigned char *Rule_u32ok  = NULL;   /* UTF-32 compiler accepts this rule */
+/* A NUL-TERMINATED copy of each rule's source text, 1-based like
+ * job->Ruleindex.  Rulesrc CANNOT be used directly: rs_add_src() packs the
+ * retained source entries back-to-back with NO separator (ruleproc.c,
+ * memcpy(rs->src + rs->srcused, src, srclen) and nothing more), so every
+ * consumer must use Rulesrclen[].  A strlen() on an entry runs into the
+ * following rules and yields a long concatenation that does not compile --
+ * measured, before this array existed: 9,245 of 9,997 rules in
+ * HashMob.10k.rule were misreported as byte-only, against a true count of 1.
+ * applyrule_u32 wants a C string, so the terminator is added once here at
+ * load rather than copied per (word, rule) at runtime.  Built under -8 only. */
+char     *Rule_u32src    = NULL;
+uint32_t *Rule_u32srcoff = NULL;   /* 1-based, indexed by Ruleindex */
+unsigned char *Rule_byteok = NULL;   /* byte compiler accepts this rule   */
+volatile long  Unreachable = 0;      /* (word,rule) pairs NO engine can run */
+volatile long  Variants_dropped = 0; /* pairs with >1 UTF-32 locale variant */
+
+/* Choose the engine for ONE (word, rule) pair under -8.  1 = UTF-32,
+ * 0 = byte, -1 = neither (count it, emit nothing).
+ *
+ * IDENTICAL to procrule.c's pick_engine and deliberately so -- procrule is the
+ * oracle this is validated against, and the two disagreeing is the failure
+ * this whole design is meant to prevent.  Keep them token-for-token. */
+static int pick_engine(unsigned wenc, int u32_can, int byte_can)
+{
+    int wide     = ((wenc & U8C_WIDE) == U8C_WIDE);
+    int u32_must = (u32_can && !byte_can);
+
+    if ((wide || u32_must) && u32_can && U8C_DECODABLE(wenc)) return 1;
+    if (byte_can) return 0;
+    return -1;
+}
+
+
+/* The UTF-32 bridge, COPIED VERBATIM from procrule.c (where it is static) and
+ * kept token-for-token identical on purpose: procrule is the oracle mdxfind is
+ * validated against, so a paraphrase here would make a divergence report
+ * meaningless.  Like validrule_u32 above it belongs in ruleproc32.c; move both
+ * together, and until then, if you edit one, edit both.
+ *
+ * Takes the rule SOURCE TEXT, not the packed bytecode: the byte compiler's
+ * output cannot be decompiled, which is why Rulesrc/Rulesrcoff/Rulesrclen
+ * retain the authored line per rule.  Callers pass Rule_src(Ruleindex). */
+static int applyrule_u32(const char *plainrule, const char *in, int inlen,
+                         char *out, int outmax, int variant, int *nvariants)
+{
+    static __thread char cached[MAXLINE + 16];
+    static __thread int cached_ok = 0, cached_set = 0;
+    static __thread uint32_t rl32[MAXLINE + 16];
+    static __thread uint32_t packed[RULE32_MAXCP];
+    static __thread uint32_t inbuf[RULE32_MAXCP];
+    static __thread uint32_t outbuf[RULE32_MAXCP];
+    int rl, il, ol, bl;
+
+    if (!cached_set || strcmp(plainrule, cached) != 0) {
+        strncpy(cached, plainrule, sizeof(cached) - 1);
+        cached[sizeof(cached) - 1] = 0;
+        cached_set = 1;
+        cached_ok = 0;
+        rl = utf8_to_utf32((const unsigned char *)plainrule, (int)strlen(plainrule),
+                           rl32, (int)(sizeof rl32 / sizeof rl32[0]));
+        if (rl < 0) return -3;                  /* rule file not valid UTF-8 */
+        if (packrule32(rl32, rl, packed, RULE32_MAXCP) < 0) return -3;
+        cached_ok = 1;
+    }
+    if (!cached_ok) return -3;
+
+    il = utf8_to_utf32((const unsigned char *)in, inlen, inbuf, RULE32_MAXCP);
+    if (il < 0) return -3;                      /* invalid input dies */
+    ol = applyrule32(packed, inbuf, il, outbuf, RULE32_MAXCP, variant, nvariants);
+    /* Translate to applyrule()'s contract.  The two engines number their
+     * negatives INVERSELY, which is a standing trap for any caller that treats
+     * them uniformly:
+     *
+     *              byte applyrule()        UTF-32 applyrule32()
+     *      -1      rejected                RULE32_ERR_INVALID (bad UTF-8 in)
+     *      -2      output == input         RULE32_ERR_NOROOM  (caller bug)
+     *      -3      bad rule                RULE32_REJECTED    (rejected)
+     *
+     * Collapsing all three to -3, as this bridge used to, is harmless in
+     * generate mode -- `if (llen <= 0) continue` skips every negative alike --
+     * and the rule-validity gates bypass the bridge entirely via
+     * validrule_u32().  But it makes the two engines impossible to COMPARE:
+     * a divergence report cannot tell a rejection from a malformed rule.
+     * Speaking one contract is what lets procrule -A diff the two streams. */
+    if (ol == RULE32_REJECTED)    return -1;    /* a rejection rule fired  */
+    if (ol == RULE32_ERR_INVALID) return -3;    /* malformed rule          */
+    if (ol == RULE32_ERR_NOROOM)  return -3;    /* caller sized it wrongly */
+    if (ol < 0)                   return -3;    /* unknown negative        */
+    bl = utf32_to_utf8(outbuf, ol, (unsigned char *)out, outmax - 1, NULL);
+    if (bl < 0) return -3;
+    /* -2 for an unchanged candidate, as the byte engine reports it.  The UTF-32
+     * engine has no such code and returns the length, so without this the same
+     * no-op rule reads as two different outcomes and every one of them shows up
+     * as a false divergence. procrule's own emit path also checks this with a
+     * strncmp, so output is unaffected -- it is the COMPARISON that needs it. */
+    if (bl == inlen && memcmp(out, in, (size_t)bl) == 0) {
+        out[bl] = 0;
+        return -2;
+    }
+    /* NUL-terminate. utf32_to_utf8 writes a counted buffer and returns the
+     * count, so without this the output is not a C string -- while the byte
+     * engine's applyrule() ends with pass[clen] = 0 and always is. Every
+     * match in procrule is JSLG(Match, ruleword), a Judy STRING lookup that
+     * reads to the first NUL, and outline is malloc'd and reused across rules
+     * and words without clearing. An unterminated candidate therefore carries
+     * the tail of whatever longer output preceded it and cannot match: -G
+     * reported zero rules and -m under-counted, both silently. outmax - 1
+     * above reserves this byte rather than relying on the caller's slack. */
+    out[bl] = 0;
+    return bl;
+}
+
+/* Source text of rule `ri` (1-BASED, i.e. job->Ruleindex), or NULL if the rule
+ * source was not retained.  A NULL here means the UTF-32 engine cannot be used
+ * for that rule and pick_engine must not have selected it. */
+/* Defined below at the salt/rule counter block; declared here because these
+ * helpers live beside the other engine glue rather than after it. */
+extern unsigned int Numrules;
+
+static const char *Rule_src(int ri)
+{
+    if (!Rule_u32src || !Rule_u32srcoff) return NULL;
+    if (ri < 1 || ri > (int)Numrules) return NULL;
+    if (!Rulesrclen || Rulesrclen[ri] == 0) return NULL;
+    return (const char *)(Rule_u32src + Rule_u32srcoff[ri]);
+}
+
+/* Thread-local: the class of the word this thread is currently walking rules
+ * for.  Set once at the word setup, read at every apply site.  Per-thread
+ * rather than a local because the apply sites are spread across the walker and
+ * the SIMD batch path, and a parameter would have to be threaded through both.
+ * One word per thread at a time, so this is exact. */
+static __thread unsigned Word_enc = 0;
+
+static int validrule_u32(const char *plainrule)
+{
+    static uint32_t vr32[MAXLINE + 16];
+    static uint32_t vpk[RULE32_MAXCP];
+    int rl;
+
+    rl = utf8_to_utf32((const unsigned char *)plainrule, (int)strlen(plainrule),
+                       vr32, (int)(sizeof vr32 / sizeof vr32[0]));
+    if (rl < 0) return -1;
+    if (packrule32(vr32, rl, vpk, (int)(sizeof vpk / sizeof vpk[0])) < 0) return -1;
+    return 0;
+}
+
+/* ONE dispatch, called from every apply site.  `ruleindex` is 1-BASED, as
+ * job->Ruleindex is, and the tag arrays are 0-based like gpu_rule_membership[].
+ *
+ * Every site calls this rather than carrying its own copy of the predicate.
+ * procrule's -G reported zero rules for months because three sites each had
+ * their own copy and they disagreed; there are FOUR here, in two different
+ * walkers, and one of them increments Ruleindex after the call instead of
+ * before, so the copies would not even share an index convention.
+ *
+ * Contract is applyrule()'s exactly -- >=0 length, -1 skip this pair, -2
+ * output equals input, -3 bad rule -- because every caller already handles
+ * those and applyrule_u32 was written to speak them. */
+static int mdx_apply(int ruleindex, char *in, int inlen, char *out, int outmax,
+                     char *packed, struct rule_workspace *ws)
+{
+    int ri0, eng, uok, bok, nvar = 1;
+    const char *rsrc;
+
+    if (!Utf32Rules) return applyrule(in, out, inlen, packed, ws);
+
+    ri0 = ruleindex - 1;
+    if (ri0 >= 0 && ri0 < (int)Numrules) {
+        uok = Rule_u32ok[ri0];
+        bok = Rule_byteok[ri0];
+    } else {
+        /* Out of range: the synthetic no-rule pass and anything else without a
+         * Rules[] entry.  Byte engine, which is what ran before -8 existed. */
+        uok = 0;
+        bok = 1;
+    }
+    eng = pick_engine(Word_enc, uok, bok);
+
+    if (eng > 0) {
+        rsrc = Rule_src(ruleindex);
+        if (rsrc) {
+            int lvar = (Utf32Locale == U32LOC_TR) ? 1 : 0;
+            int r = applyrule_u32(rsrc, in, inlen, out, outmax, lvar, &nvar);
+            /* LIMITATION, counted rather than hidden: a case mapping can be
+             * locale-ambiguous, so the UTF-32 engine can have more than one
+             * right answer for one (word, rule).  procrule emits every
+             * variant; these walkers advance currule once per RULE, so
+             * emitting N candidates for one rule needs the advance
+             * restructured.  Variant 0 only for now, and the counter says how
+             * often it mattered.  -L pins the dotted/dotless I and makes nvar
+             * 1, which is why procrule's -L implies the UTF-32 engine. */
+            if (nvar > 1 && Utf32Locale == U32LOC_UNPINNED)
+                __atomic_fetch_add(&Variants_dropped, 1L, __ATOMIC_RELAXED);
+            return r;
+        }
+        /* UTF-32 was chosen but the source text was not retained, so the rule
+         * cannot be handed to that engine.  Fall back only if the byte engine
+         * actually accepted this rule -- otherwise `packed` is not a rule it
+         * can run, and running it would be the uncompiled-bytecode bug that
+         * procrule 1.34 fixed. */
+        if (!bok) {
+            __atomic_fetch_add(&Unreachable, 1L, __ATOMIC_RELAXED);
+            return -1;
+        }
+        return applyrule(in, out, inlen, packed, ws);
+    }
+    if (eng < 0) {
+        /* Neither engine: the rule needs UTF-32 and the word cannot be decoded
+         * into it.  -1 is "skip this pair", which every caller already does. */
+        __atomic_fetch_add(&Unreachable, 1L, __ATOMIC_RELAXED);
+        return -1;
+    }
+    return applyrule(in, out, inlen, packed, ws);
+}
+
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
+/* Defined in gpu/gpu_u32_host.h, which this file deliberately does NOT include:
+ * that header carries its own static cache state and a non-static definition,
+ * so including it here would put a second copy of both in mdxfind.o.  An extern
+ * declaration is the whole dependency. */
+extern int gpu_u32_membership_prefilter(const unsigned char *byte_prog,
+                                        uint32_t byte_len,
+                                        const uint32_t *byte_offs, int n_rules);
+#endif
+
 unsigned char *gpu_rule_membership = NULL;  /* membership[i]==1 if rule i is GPU-eligible.
                                               Indexed by original Rules[] order (0..Numrules-1).
                                               Synthetic `:` does NOT appear here (no Rules[] entry).
@@ -7648,6 +8254,10 @@ NULL
 #define JOB_AXCRYPTSHA1      916
 #define JOB_CISCO9           917
 #define JOB_DCC2             918
+/* Windows default iteration count, and the value the $DCC2$ loader already
+ * falls back to when the wrapper carries no usable count. Used when the
+ * username arrives via -u/-U, which carry no iteration count of their own. */
+#define DCC2_DEFAULT_ITER 10240
 #define JOB_PWSAFE3          919
 #define JOB_IKEPSK_MD5       920
 #define JOB_IKEPSK_SHA1      921
@@ -8742,7 +9352,7 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [915] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* AXCRYPT */
     [916] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* AXCRYPTSHA1 */
     [917] = TYPEOPT_NEEDSJ | TYPEOPT_SALTJUDY,  /* CISCO9 */
-    [918] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* DCC2 */
+    [918] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY | TYPEOPT_NEEDUSER,  /* DCC2 */
     [919] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* PWSAFE3 */
     [920] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* IKEPSK_MD5 */
     [921] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* IKEPSK_SHA1 */
@@ -8874,7 +9484,6 @@ static inline unsigned short *typeopts_ref(unsigned op) {
 
 unsigned long Iter_Count[] = {0, 10, 10, 100, 100, 1000, 1000, 1000, 1000, 10000, 10000, 10000, 10000, 100000, 100000, 100000, 100000};
 
-char *NumbersFmt;
 
 /* Mask-based hybrid attack support.
  *
@@ -11556,14 +12165,14 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
      * BF Phase 1.8: env value is interpreted as NDRange-bound (no inner iter)
      * so the existing debug semantics are preserved. inner_iter forced to 1
      * unless MDXFIND_BF_INNER_ITER is ALSO set (debug-only Phase 1.8 override). */
-    const char *env = getenv("MDXFIND_BF_CHUNK_SIZE");
+    const char *env = NULL;   /* was MDXFIND_BF_CHUNK_SIZE */
     if (env && *env) {
         unsigned long long v = strtoull(env, NULL, 0);
         if (v > 0 && v <= NDRANGE_HARD) {
             uint64_t ct = (uint64_t)v;
             if (ct > mask_total - chunk_cursor) ct = mask_total - chunk_cursor;
             uint32_t env_inner = 1u;
-            const char *ie = getenv("MDXFIND_BF_INNER_ITER");
+            const char *ie = NULL;   /* was MDXFIND_BF_INNER_ITER */
             if (ie && *ie) {
                 int iv = atoi(ie);
                 if (iv >= 1 && iv <= (int)INNER_ITER_CAP)
@@ -11736,7 +12345,7 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
         int total_salts = Typesaltcnt[op];
         if (total_salts > 0) {
             uint32_t spp_default = 1024u;
-            const char *spp_env = getenv("MDXFIND_SPP");
+            const char *spp_env = NULL;   /* was MDXFIND_SPP */
             if (spp_env && *spp_env) {
                 int v = atoi(spp_env);
                 if (v >= 1 && v <= 65536) spp_default = (uint32_t)v;
@@ -11854,12 +12463,9 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
         }
     }
 
-    /* Step 7: telemetry. Default-on; suppress only when explicit "0". */
+    /* Step 7: telemetry, always on.  MDXFIND_BF_ADAPTIVE_TRACE=0 used to
+     * suppress it; the default was on, so this is unchanged behaviour. */
     int trace_on = 1;
-    {
-        const char *te = getenv("MDXFIND_BF_ADAPTIVE_TRACE");
-        if (te && te[0] == '0' && te[1] == 0) trace_on = 0;
-    }
     if (trace_on) {
         uint32_t emit_every = (bf_chunks_produced < WARMUP_CHUNKS) ? 5 : 50;
         if (bf_chunks_produced == 0 || (bf_chunks_produced % emit_every) == 0) {
@@ -12164,7 +12770,8 @@ while (1) {
          * slots point to this same offset; the kernel's mask_idx +=
          * mask_start + word_idx * mask_offset_per_word decomposes each
          * word_idx into a distinct mask range. */
-        g->packed_buf[0] = 0;     /* plen = 0 */
+        g->packed_buf[0] = 0;     /* plen = 0, low byte  */
+        g->packed_buf[1] = 0;     /* plen = 0, high byte (2-byte header) */
         uint32_t bf_num_masks_v       = job->bf_num_masks;
         uint32_t bf_offset_per_word_v = job->bf_offset_per_word;
         /* BF Phase 1.8 (2026-05-10): each word slot covers
@@ -12525,6 +13132,11 @@ while (1) {
     s = &job->readbuf[job->readindex[curline].offset];
     d = job->line;
     len = job->readindex[curline].len;
+    /* -8: the word's encoding class, classified once at read time into the
+     * two spare bytes of struct LineInfo.  Read here, beside the length it
+     * belongs to, so the rule loop below never has to reach back into the
+     * index and cannot pick up a different word's class. */
+    Word_enc = job->readindex[curline].enc;
     Lfstate = 0;
 
     cur = job->line;
@@ -12645,23 +13257,63 @@ while (1) {
           * GPU_CAT_SALTED/SALTPASS ops + iter-types whitelist excludes
           * SHA1DRU). */
          job->op == JOB_SHA1DRU ||
-         /* B5 sub-batch 6 Tier B (2026-05-03): NTLMH (NT password hash).
-          * MD4(UTF-16LE-zero-extend(p)) — hashcat-compatible. The
-          * gpu_ntlmh_core template_finalize handles arbitrary length via
-          * a per-32-input-byte-block while loop; the standard
-          * GPU_RULES_MAX_INPUT_LEN cap is sufficient. The CPU JOB_NTLMH
-          * tests up to 3 iconv variants for non-Unicode mode; the GPU
-          * path implements ONLY the zero-extend variant (hashcat-compat
-          * by design — same gap as the existing slab kernel). */
+        /* B5 sub-batch 6 Tier B (2026-05-03): NTLMH (NT password hash).
+         * MD4 over the candidate widened to UTF-16LE by ZERO-EXTENSION,
+         * which is what hashcat does and is NOT what Windows does.
+         *
+         * Microsoft invented this hash when their wide character WAS
+         * UTF-16LE, and the operating system mapped the user's code page
+         * into UTF-16LE with real conversion tables.  It never
+         * zero-extended.  CP1252 0x80 is U+20AC, so Windows hashes AC 20;
+         * zero-extension hashes 80 00 and yields a digest Windows would
+         * never emit.  The two agree only over 0xA0-0xFF, where the CP1252
+         * code points happen to equal the byte values -- a coincidence of
+         * that band, not a property of the mapping.  All of 0x80-0x9F
+         * diverges, and that is exactly where the characters people put in
+         * passwords live: euro sign, curly quotes, en and em dashes,
+         * trademark sign.
+         *
+         * So e786 is a HACK, and it exists because hashcat cannot convert
+         * a code page at all -- no tables, candidate bytes opaque.  Do not
+         * read "CP1252 maps 1:1 into Unicode" as "CP1252 to UTF-16LE means
+         * zero fill"; that confusion is why this type keeps being mistaken
+         * for the specification.  e369 JOB_NTLM does the real conversions.
+         *
+         * The GPU path implements the zero-extend variant, which for THIS
+         * type is the defining behaviour rather than a shortfall -- e786
+         * exists to agree with hashcat where hashcat is wrong.  The CPU
+         * case also emits the iconv reading, so a single-probe kernel
+         * covers one of two emissions; see the alt-digest block in
+         * gpu_template.cl. */
          job->op == JOB_NTLMH ||
-         /* B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496). Same
-          * MD4(UTF-16LE-zero-extend(p)) as NTLMH but with iter loop
-          * support: iter > 1 feeds back lowercase hex of prior digest
-          * zero-extended to UTF-16LE (64 bytes) and MD4'd. The iconv
-          * variant remains on CPU for non-ASCII inputs (same hashcat-
-          * compat gap as NTLMH); on the iter feedback path the input is
-          * always lowercase hex chars [0-9a-f] (pure ASCII) so the gap
-          * does not apply to iter > 1 work. */
+        /* B5 sub-batch 8 (2026-05-05): MD4UTF16 (-m e496).
+         *
+         * NOT the same as NTLMH, though the wording here used to say it
+         * was.  e496 is the SPECIFICATION type: its password path emits
+         * exactly ONE candidate and that candidate is the real iconv
+         * conversion from UTF-8 to UTF-16LE.  There is no zero-extend arm
+         * on the password path at all, so a GPU that zero-extended here
+         * did not have a "hashcat-compat gap" -- it computed a digest that
+         * appears in no CPU output for any non-ASCII input.  That was the
+         * defect fixed in gpu_md4utf16_core.cl and
+         * metal_md4utf16_core.metal.  An ASCII test cannot see it, because
+         * both widenings coincide there, which is how it survived four
+         * months.
+         *
+         * to_utf16le DOES appear in this case, on the iter feedback path,
+         * where the input is 32 lowercase hex characters.  That is not an
+         * encoding choice: over [0-9a-f] the two widenings are the same
+         * operation.  Do not read its presence as a zero-extend arm.
+         *
+         * The real remaining limitation has nothing to do with hashcat:
+         * e496 assumes the wordlist bytes are UTF-8, and cannot accept a
+         * code-page encoding where Windows natively could.  Windows held
+         * UTF-16LE internally and did the code-page conversion on OUTPUT,
+         * so the code page is recorded nowhere in the resulting text and
+         * the recipient is simply required to know it.  That is the mess
+         * encforce exists to untangle, and the reason the output side is
+         * moving to UTF-8: e496 converts back to UTF-8 for the solved
+         * output so the answer carries its own encoding. */
          job->op == JOB_MD4UTF16 ||
          /* B7.7b (2026-05-07): JOB_MD6256 (-m 17800) — final M5 closure
           * from B9 gate-fail. MD6-256 single-block leaf compression,
@@ -13452,7 +14104,31 @@ while (1) {
            * placeholder is uploaded by the gpujob_*.c proto route gate
            * downstream so the 16-arg kernel binding succeeds. */
           ) ||
-         nsalts_job > 0) &&
+         nsalts_job > 0 ||
+         /* The eight user-keyed HMAC KSALT ops (Families A-H) carry
+          * TYPEOPT_NEEDUSER: the HMAC key lives in Typeuser[op], NOT
+          * Typesalt[op]. TYPESALT() is therefore NULL for them, the
+          * salt-snapshot block above is skipped entirely, and nsalts_job
+          * stays 0 -- so this guard declined them even though each had a
+          * chokepoint admit from when its family shipped. That is why
+          * e211 e213 e214 e215 e216 e217 e218 e543 measured CPU-only on
+          * BOTH backends. Their KPASS siblings are TYPEOPT_NEEDSALT with a
+          * real Typesalt entry, which is why those already worked.
+          *
+          * The GPU worker does not need nsalts_job: it builds its own
+          * snapshot from gpu_salt_judy(op), which already returns
+          * Typeuser[op] for exactly these eight, and gates on that being
+          * non-NULL. Only permission to reach it was missing.
+          *
+          * Testing for KEYS PRESENT rather than re-pointing the snapshot at
+          * Typeuser is deliberate: that block also feeds the CPU
+          * salt-iteration path and sets TYPEDONE when empty, so changing it
+          * would alter CPU behaviour. This only widens GPU admission. */
+         ((job->op == JOB_HMAC_MD5    || job->op == JOB_HMAC_SHA1   ||
+           job->op == JOB_HMAC_SHA224 || job->op == JOB_HMAC_SHA256 ||
+           job->op == JOB_HMAC_SHA384 || job->op == JOB_HMAC_SHA512 ||
+           job->op == JOB_HMAC_RMD160 || job->op == JOB_HMAC_RMD320) &&
+          TYPEUSER(job->op) != NULL)) &&
         len > 0 && len <= GPU_RULES_MAX_INPUT_LEN) {
       /* Maxiter > 1 is now handled by the iter loop inside
        * md5_rules_phase0 (mirrors gpu_md5_packed.cl). The host upload
@@ -13515,7 +14191,7 @@ while (1) {
          * >=100% (overflow with lost count) — see rev 1.65 of that file. */
         int max_words_lanes = (int)my_jobg_rules->word_offset_entries;
         if ((int)my_jobg_rules->packed_count >= max_words_lanes ||
-            my_jobg_rules->packed_pos + 1 + len > my_jobg_rules->packed_buf_size) {
+            my_jobg_rules->packed_pos + 2 + len > my_jobg_rules->packed_buf_size) {
           gpujob_submit(my_jobg_rules);
           my_jobg_rules = gpujob_get_free_rules(job->filename, job->startline);
           if (my_jobg_rules) {
@@ -13596,7 +14272,26 @@ while (1) {
          * (acceptable -- same as CPU). Phase 6 of the slab-retirement
          * ladder (final major slab kernel). */
         if (job->op == JOB_BCRYPT && pack_len > 72) pack_len = 72;
-        my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] = (char)pack_len;
+        /* 2-BYTE LITTLE-ENDIAN LENGTH HEADER (2026-09-11, operator ruling).
+         * This field was ONE byte, while the admission gate at :13469 allows
+         * GPU_RULES_MAX_INPUT_LEN (40959).  Any word of 256..40959 bytes was
+         * therefore hashed as its first (len mod 256) bytes -- a 285-byte word
+         * as its first 29 -- and the emitted plaintext matched the emitted
+         * digest, so nothing downstream could detect it.  Silent lost coverage,
+         * measured at 7 words in rockyou's 14.3M and unbounded on lists where
+         * MAXLINE was raised deliberately, which is exactly the tail the 40959
+         * gate was widened to admit.  The kernels' `if (wlen > RULE_BUF_LIMIT)`
+         * guard could never fire: 255 is never > 40959.
+         *
+         * Written byte-by-byte rather than as a uint16 store: the packed buffer
+         * is an unaligned byte stream uploaded verbatim to the device, so this
+         * must not depend on host alignment or host endianness.  Every reader
+         * (11 kernel sites across 7 .cl/.metal files, plus the two hit decoders
+         * in gpujob_opencl.c and gpujob_metal.m) reassembles it the same way. */
+        my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] =
+            (char)(pack_len & 0xff);
+        my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] =
+            (char)((pack_len >> 8) & 0xff);
         memcpy(my_jobg_rules->packed_buf + my_jobg_rules->packed_pos, cur, pack_len);
         my_jobg_rules->packed_pos += pack_len;
         my_jobg_rules->packed_count++;
@@ -13687,6 +14382,32 @@ do {
  * first, which silently broke the interlock and double-fired the no-rule
  * pass on every word for 100%-GPU-eligible workloads (task #46). */
 __attribute__((unused)) int was_pass0_zero = (pass0 == 0);
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
+/* FastRule PRECONDITION (2026-09-11, operator ruling).
+ *
+ * The SIMD/NEON walker inside `case JOB_MD5` (~:29689-29850) assumes it is
+ * entered at the rule-stream ORIGIN with cur/len still the original word: it
+ * does `job->Ruleindex = 0`, calls applyrule with (cur, len) rather than
+ * (tline, orig_len), drains every remaining rule, and then NULLs currule to
+ * end the walk.  On the pure-CPU path that assumption always holds, which is
+ * why `-G none` is always correct.
+ *
+ * With the rules engine active the kernel absorbs the no-rule pass, and the
+ * interlock below only jumps the switch when was_pass0_zero.  So the FIRST
+ * CPU-only rule returning >= 0 falls into the switch with FastRule still 1,
+ * and the walker re-drains the remaining rules FROM THAT RULE'S OUTPUT before
+ * ending the walk.  Net effect: per word, exactly one CPU-partition candidate
+ * survives -- the first, in ascending packed-bytecode order, that does not
+ * reject.  Measured 119/145 and 84/113 on a GTX 1080 and byte-identically on
+ * an M2 Max (the ARM path takes the same DOSIMD branch), against 145/145 and
+ * 113/113 on CPU.  Root cause in /tmp/mdx_fastrule_walker_rootcause_2026-09-11.md.
+ *
+ * Making the precondition explicit costs the already-accepted B7.9 CPU-
+ * fallback (~5%) on the CPU-only fraction of MIXED rule sets only: a word
+ * that fell back entirely still gets its full fast-path drain at pass0, and
+ * 100%-GPU-eligible sets never reach here with pass0 != 0. */
+if (!was_pass0_zero) FastRule = 0;
+#endif
 cur = job->line;
 len = orig_len;
 /* For mask with prepend, restore the original word each iteration.
@@ -13745,7 +14466,20 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
           (MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
            MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
            (MaskPrependLen + MaskAppendLen) >= 1);
-      if (gpu_rule_membership && my_jobg_rules &&
+      /* C2.3 tested `my_jobg_rules` -- the THREAD's slot pointer, which
+       * persists across words -- where it must test the PER-WORD flag.  The
+       * two differ whenever a word is admitted to the walker but not packed
+       * to the GPU: the thread still holds a slot from an earlier word, so
+       * the skip fires and the GPU-eligible rules are dropped on BOTH sides.
+       * That path has never executed, because MAXLINE(40960) makes the
+       * `len > GPU_RULES_MAX_INPUT_LEN(40959)` rejection at :13469
+       * unreachable -- so the only way in was a failed slot acquisition,
+       * where `my_jobg_rules` is NULL and the old test happened to be right.
+       * Lowering the input cap activates it for the first time, onto a wrong
+       * guard.  Fixed now, in the same change as the wire-format work, rather
+       * than left as a trap for whoever lowers the cap.  (Operator ruling
+       * 2026-09-11.) */
+      if (gpu_rule_membership && word_packed_by_rules_engine &&
           (job->Ruleindex - 1) < (int)Numrules &&
           gpu_rule_membership[job->Ruleindex - 1] &&
           gpu_rule_count > 0 && job->op == JOB_MD5 &&
@@ -13760,7 +14494,8 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
         continue;
       }
 #endif /* OPENCL_GPU || METAL_GPU */
-      len = applyrule(tline, cur, orig_len, currule + 2, rule_ws);
+      len = mdx_apply(job->Ruleindex, tline, orig_len, cur, MAXLINE,
+                      currule + 2, rule_ws);
       job->len = job->clen = len;
       currule += *((unsigned short int *) currule) + 2;
       if (len < 0) {
@@ -13814,13 +14549,7 @@ if (Email && emailcur < emailpow) {
 
 if (job->flags & JOBFLAG_NUMBERS) {
   FastRule = 0;
-  if (job->flags & JOBFLAG_IP)
-    len += sprintf(&job->line[len], "%d.%d.%d.%d",
-		   (int) ((job->Numbers >> 24) & 0xff),
-		   (int) ((job->Numbers >> 16) & 0xff),
-		   (int) ((job->Numbers >> 8) & 0xff),
-		   (int) ((job->Numbers) & 0xff));
-  else if (job->MaskCount) {
+  if (job->MaskCount) {
     /* B9 (2026-05-07): legacy mask short-circuit retired. The prior
      * #ifdef GPU_ENABLED block packed mask-only-no-rules workloads via
      * either gpu_try_pack_unsalted (unsalted slab kernels — retired in
@@ -13866,8 +14595,15 @@ if (job->flags & JOBFLAG_NUMBERS) {
       len += mlen;
     }
     job->line[len] = 0;
-  } else
-    len += sprintf(&job->line[len], NumbersFmt, job->digits, job->Numbers);
+  } else {
+    /* Unreachable: JOBFLAG_NUMBERS is set only when a mask is configured,
+     * and a configured mask always yields MaskCount > 0. Reaching here is
+     * an internal invariant violation, not a user error. Abort where it
+     * can be diagnosed rather than emitting a candidate with no mask. */
+    fprintf(stderr, "FATAL: %s:%d JOBFLAG_NUMBERS set with MaskCount == 0\n",
+            __FILE__, __LINE__);
+    exit(1);
+  }
 
   job->Numbers++;
   job->MaskIndex++;
@@ -25305,13 +26041,38 @@ sha11saltmd5:
                  * X is copied out before buf[i] is overwritten, so the j==i
                  * case still reads the OLD block, matching the reference.
                  *
-                 * *** UNVALIDATED ALGORITHM ***
-                 * cmiyc_ref.py carries its own "NOT YET VALIDATED AGAINST
-                 * GROUND TRUTH" banner: no (password, hash) pair is known and
-                 * no AIX host is reachable to run the binary as an oracle. A
-                 * single wrong offset yields a silently wrong digest, so a
-                 * clean "not found" here proves nothing until one real pair
-                 * confirms the construction end to end.
+                 * VALIDATED. Two independent confirmations, neither of
+                 * which needed AIX hardware.
+                 *
+                 * 1. An emulated oracle. contest/cmiyc26/ppcemu/aixemu.py is a
+                 *    user-mode PPC32 big-endian interpreter plus an XCOFF32
+                 *    loader plus host implementations of the 30 libc symbols
+                 *    challenge_3 (cmiyc111) imports. The binary's own .text --
+                 *    SHA-512, HMAC, the memory-hard loop, base64, the encoder
+                 *    -- is executed instruction by instruction, so nothing
+                 *    derived from the reverse engineering is reimplemented and
+                 *    a misread offset in the spec would show up as the emulator
+                 *    and this code disagreeing. A real run was validated
+                 *    against it. ppcemu/selftest.py closes the circularity by
+                 *    checking the emulator's own CPU against hashlib, which is
+                 *    independent of the RE.
+                 *
+                 * 2. The corpus, later and at the live parameters. 504 contest
+                 *    hashes at $4$20$ verify against this code with recovered
+                 *    plaintexts that are coherent English passphrases. The
+                 *    hashes are the organisers', so a different function would
+                 *    not have matched one of them, let alone 504 on meaningful
+                 *    text.
+                 *
+                 * Together those pin the operand order, the X-before-overwrite
+                 * rule and the reverse pass reading buf[i][8..15] rather than
+                 * [0..7].
+                 *
+                 * cmiyc_ref.py still carries its own "NOT YET VALIDATED
+                 * AGAINST GROUND TRUTH" banner; it predates both. Use the 504
+                 * as the regression fixture -- the $1$10$ self-test vector
+                 * exercises neither the live cost nor the round structure at
+                 * scale.
                  *
                  * Cost at the live parameters (rounds=4, memlog=20):
                  * ~1.3 GB of SHA-512 and a 64 MiB working set PER CANDIDATE
@@ -29070,7 +29831,9 @@ md5sha256:
                   if (currule && *((unsigned short int *) currule) != 0) {
                     job->Ruleindex++;
                     ljob[ljobi].Ruleindex = job->Ruleindex;
-                    x = applyrule(cur, ljob[ljobi].pass, len, currule + 2, rule_ws);
+                    /* Ruleindex was incremented just above, so it names this rule. */
+                    x = mdx_apply(job->Ruleindex, cur, len, ljob[ljobi].pass,
+                                  MAXLINE, currule + 2, rule_ws);
                     if (x >= 0) {
                       rulecnt++;
                       s = ljob[ljobi].pass;
@@ -29614,7 +30377,9 @@ md5sha256:
                     }
                     cur = job->pass;
                     job->Ruleindex++;
-                    x = applyrule(tline,cur,orig_len,currule+2, rule_ws);
+                    /* Ruleindex was incremented just above, so it names this rule. */
+                    x = mdx_apply(job->Ruleindex, tline, orig_len, cur,
+                                  MAXLINE, currule + 2, rule_ws);
                     currule += *((unsigned short int *)currule) + 2;
                     if (x >= 0) {
                       rulecnt++;
@@ -29703,7 +30468,12 @@ md5sha256:
                       while (MDXpause) sleep(2);
                       __sync_fetch_and_sub(&MDXpaused_count, 1);
                     }
-                    x = applyrule(cur, ljob[ljobi].pass, len, currule + 2, rule_ws);
+                    /* Ruleindex is incremented BELOW this call, not above it, so the
+                     * current rule is Ruleindex + 1 here.  The two ljob sites read
+                     * identically and differ ONLY in this -- exactly the asymmetry a
+                     * copied predicate gets wrong, which is why there is one helper. */
+                    x = mdx_apply(job->Ruleindex + 1, cur, len, ljob[ljobi].pass,
+                                  MAXLINE, currule + 2, rule_ws);
                     currule += *((unsigned short int *) currule) + 2;
                     job->Ruleindex++;
                     if (x >= 0) {
@@ -31606,6 +32376,7 @@ sha1sha256:
                 if (len > MAXLINE)
                   break;
                 mysha1(cur, len, curin.h);
+                hashcnt++;
                 checkhash(&curin, 40, 1, job);
                 break;
 
@@ -41360,6 +42131,15 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
         rlen = get32(&curpos[curindex + 5], (unsigned char *)&curpos[curindex], len - 6);
       }
       readindex[Linecount].len = rlen;
+      /* Classify AFTER the $HEX[] unwrap above, never before: the wrapper text
+       * is pure ASCII, so classifying the raw line would call every wrapped
+       * non-ASCII word ASCII and route it to the byte engine.  Measured on
+       * tools/ruletests/encoding/UTF8test1.txt: 8,819 of 53,976 lines (16.3%)
+       * are ASCII raw and non-ASCII decoded.  Gated on -8, which is safe here
+       * because wordlists are trailing arguments consumed after getopt. */
+      readindex[Linecount].enc = Utf32Rules
+          ? (unsigned char)classify_utf8(&curpos[curindex], (size_t)rlen)
+          : (unsigned char)U8C_NONE;
       curpos[curindex + rlen] = 0;
       curindex += len + 1;
     } else {
@@ -41374,6 +42154,13 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
           rlen = get32(&curpos[curindex + 5], (unsigned char *)&curpos[curindex], len - 6);
         }
         readindex[Linecount].len = rlen;
+        /* Same classification, for the last line of a file with no trailing
+         * newline.  There are exactly TWO places this struct's len is set and
+         * both need it; a word classified in only one of them would behave
+         * differently depending on its position in the file. */
+        readindex[Linecount].enc = Utf32Rules
+            ? (unsigned char)classify_utf8(&curpos[curindex], (size_t)rlen)
+            : (unsigned char)U8C_NONE;
         if (rlen < MAXLINE) {
           Linecount++;
           doneline = 1;
@@ -43379,16 +44166,14 @@ void build_compact_table(void) {
      * MDXFIND_HX_CODEGEN_VALIDATE so gpu_opencl_init fires and the
      * harness can JIT-compile.
      *
-     * Phase 4 sub-phase 4a.1 (2026-05-21): the gate was previously
-     * `getenv("MDXFIND_HX_CODEGEN")` (presence). That collided with the
-     * 4a.1 production opt-out semantics where MDXFIND_HX_CODEGEN=0 means
-     * "force legacy hand-written kernel for e347" (production dispatch),
-     * NOT "fire harness". Narrowing the harness gate to require an
-     * explicit harness-specific env (_JOB or _VALIDATE) preserves all
-     * existing harness invocations (they all set one of these) and lets
-     * MDXFIND_HX_CODEGEN=0 work as the production opt-out. */
-    if (!need_gpu && (getenv("MDXFIND_HX_CODEGEN_JOB")
-                      || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
+     * Every MDXFIND_HX_CODEGEN* environment variable was removed on
+     * 2026-09-16, so this gate is never taken and the harness never fires.
+     * It read _JOB or _VALIDATE rather than plain MDXFIND_HX_CODEGEN because
+     * the latter's "=0" meant "force the legacy hand-written kernel for
+     * e347" in production dispatch, not "fire the harness". Reaching the
+     * harness again needs a native CLI flag, not an environment variable. */
+    if (!need_gpu && (NULL /* was MDXFIND_HX_CODEGEN_JOB */
+                      || NULL /* was MDXFIND_HX_CODEGEN_VALIDATE */)) {
         need_gpu = 1;
     }
     if (!need_gpu) NoMetal = 1;
@@ -43467,13 +44252,12 @@ void build_compact_table(void) {
      * dispatch path. Full e347 (MD5MD5SALT) tp0 emission arrives with
      * sub-phase 2a.3; Metal twin with 2a.4.
      *
-     * Phase 4 sub-phase 4a.1 (2026-05-21): harness gate narrowed from
-     * `getenv("MDXFIND_HX_CODEGEN")` (presence) to require an explicit
-     * harness-specific env (_JOB or _VALIDATE). Avoids collision with
-     * MDXFIND_HX_CODEGEN=0 production opt-out semantics. */
+     * The harness env vars (_JOB / _VALIDATE) were removed 2026-09-16, so
+     * this block is unreachable. They were preferred over plain
+     * MDXFIND_HX_CODEGEN because its "=0" was a production opt-out. */
     if (gpu_ok == 0
-        && (getenv("MDXFIND_HX_CODEGEN_JOB")
-            || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
+        && (NULL /* was MDXFIND_HX_CODEGEN_JOB */
+            || NULL /* was MDXFIND_HX_CODEGEN_VALIDATE */)) {
         char hxhost[256];
         mdx_gethostname(hxhost, sizeof(hxhost));
 
@@ -43481,7 +44265,7 @@ void build_compact_table(void) {
          * hx_specs_data[] (replaces 2a.1's hardcoded trivial spec).
          * MDXFIND_HX_CODEGEN_JOB env var overrides the default eN. */
         int target_job = 1; /* e1 MD5 default */
-        const char *job_env = getenv("MDXFIND_HX_CODEGEN_JOB");
+        const char *job_env = NULL /* was MDXFIND_HX_CODEGEN_JOB */;
         if (job_env && *job_env) target_job = atoi(job_env);
 
         const struct hx_spec_entry *entry = hx_specs_lookup(target_job);
@@ -43571,8 +44355,8 @@ void build_compact_table(void) {
          * head) implement the canonical chain
          *     MD5( hex32(MD5(hex32(MD5(pass)))) || salt )
          * which matches case JOB_MD5MD5SALT: at line 23174 above. */
-        const char *validate_env = getenv("MDXFIND_HX_CODEGEN_VALIDATE");
-        const char *fixture_env  = getenv("MDXFIND_HX_CODEGEN_FIXTURE");
+        const char *validate_env = NULL /* was MDXFIND_HX_CODEGEN_VALIDATE */;
+        const char *fixture_env  = NULL /* was MDXFIND_HX_CODEGEN_FIXTURE */;
         int validate_on = (validate_env && *validate_env &&
                            *validate_env != '0');
 
@@ -43997,18 +44781,17 @@ void build_compact_table(void) {
      * so a single build can exercise both backends (mutually exclusive at
      * runtime since each backend's GPU init is platform-conditional).
      *
-     * Phase 4 sub-phase 4a.1 (2026-05-21): harness gate narrowed from
-     * `getenv("MDXFIND_HX_CODEGEN")` (presence) to require an explicit
-     * harness-specific env (_JOB or _VALIDATE). Avoids collision with
-     * MDXFIND_HX_CODEGEN=0 production opt-out semantics. */
+     * The harness env vars (_JOB / _VALIDATE) were removed 2026-09-16, so
+     * this block is unreachable. They were preferred over plain
+     * MDXFIND_HX_CODEGEN because its "=0" was a production opt-out. */
     if (gpu_ok == 0
-        && (getenv("MDXFIND_HX_CODEGEN_JOB")
-            || getenv("MDXFIND_HX_CODEGEN_VALIDATE"))) {
+        && (NULL /* was MDXFIND_HX_CODEGEN_JOB */
+            || NULL /* was MDXFIND_HX_CODEGEN_VALIDATE */)) {
         char hxhost[256];
         mdx_gethostname(hxhost, sizeof(hxhost));
 
         int target_job = 1;
-        const char *job_env = getenv("MDXFIND_HX_CODEGEN_JOB");
+        const char *job_env = NULL /* was MDXFIND_HX_CODEGEN_JOB */;
         if (job_env && *job_env) target_job = atoi(job_env);
 
         const struct hx_spec_entry *entry = hx_specs_lookup(target_job);
@@ -44094,8 +44877,8 @@ void build_compact_table(void) {
          * the shared helper hx_e347_validate_run_shared (defined above the
          * function). backend_id=1 selects the Metal dispatch arm. The helper
          * exits with code 0 (PASS) or 1 (FAIL); never returns. */
-        const char *m_validate_env = getenv("MDXFIND_HX_CODEGEN_VALIDATE");
-        const char *m_fixture_env  = getenv("MDXFIND_HX_CODEGEN_FIXTURE");
+        const char *m_validate_env = NULL /* was MDXFIND_HX_CODEGEN_VALIDATE */;
+        const char *m_fixture_env  = NULL /* was MDXFIND_HX_CODEGEN_FIXTURE */;
         int m_validate_on = (m_validate_env && *m_validate_env &&
                              *m_validate_env != '0');
         if (target_job == 347 && m_validate_on) {
@@ -45341,7 +46124,8 @@ static int store_typesalt(int job, const char *src, int slen) {
 static const int Phpbb3Family[] = { JOB_PHPBB3, JOB_PHPBB3MD5 };
 #define PHPBB3FAMILY_N ((int)(sizeof(Phpbb3Family) / sizeof(Phpbb3Family[0])))
 
-static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
+static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
+                           int hex_only) {
   char line[MAXLINE + 16], *cur, *s;
   int len, x, y, cryptlen, any;
   Word_t *PV, RC;
@@ -45430,9 +46214,23 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
       unsigned int Linecount, curline;
       while ((Linecount = cacheline(gi, &readbuf, &readindex))) {
         for (curline = 0; curline < Linecount; curline++) {
-          int hlen = get32(&readbuf[readindex[curline].offset], inhashbuf + 2, 256);
+          char *_fl = &readbuf[readindex[curline].offset];
+          int hlen = get32(_fl, inhashbuf + 2, 256);
           if (hlen >= 8 && hlen <= 255) {
             commit_compact(hlen);
+            /* Same DCC2 filing as the slow path below. This is the branch a
+             * plain hex list actually takes under -f, so omitting it here left
+             * -f -u loading the digests, printing a receipt, and matching
+             * nothing -- while -F worked. See the comment at the slow-path
+             * copy for why DCC2 needs its own JudyJ at all. */
+            if (hlen == 16 && lf[JOB_DCC2]) {
+              char _dh[33];
+              int _dy;
+              for (_dy = 0; _dy < 32; _dy++)
+                _dh[_dy] = tolower((unsigned char)_fl[_dy]);
+              _dh[32] = 0;
+              JSLI(PV, JUDYJ(JOB_DCC2), (unsigned char *)_dh);
+            }
           }
         }
       }
@@ -45450,6 +46248,36 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
     cur = strchr(line, 10);
     if (cur) *cur = 0;
     len = mystrlen(line);
+    /* -f is the PLAIN HEX channel: parse hex from the start of the line and
+     * DISCARD the remainder. Any non-hex character terminates the hash, and
+     * what follows it is not a salt, not a userid and not structure.
+     *
+     * Without this the slow path below sees the whole line. The plain-hex
+     * fast path further up is gated on !LoadStructured, so selecting ANY
+     * structured type diverts a -f file into the slow path and every format
+     * recognizer gets a look at it. Reported by Waffle 2026-09-16 and
+     * replicated with
+     *     echo 5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8:password >r.txt
+     *     mdxfind -h "^SHA1|^MD4|^NTLM|^SMF" -h '!salt,!user,!md5x,!sha1x' \
+     *             -f r.txt
+     * which loaded "password" as a SALT for SHA1-8TRACK, MD4DESCRYPT,
+     * SHA1DESCRYPT, MD4UTF16DESCRYPT, SHA1-S1PS2 and SHA1CRYPT, and as a
+     * USERID for SMF and SHA1-HMAC-MD5: "1 hashes, 6 salts, 2 users loaded"
+     * where it must read "1 hashes, 0 salts, 0 users loaded".
+     *
+     * -F and -J pass hex_only = 0 and are untouched; a type whose Options
+     * column says F still does not load from -f, which is the documented
+     * contract. */
+    if (hex_only) {
+      int _hx = 0;
+      while (_hx < len &&
+             ((line[_hx] >= '0' && line[_hx] <= '9') ||
+              (line[_hx] >= 'a' && line[_hx] <= 'f') ||
+              (line[_hx] >= 'A' && line[_hx] <= 'F')))
+        _hx++;
+      if (_hx < len) { line[_hx] = 0; len = _hx; }
+      if (len == 0) continue;
+    }
     /* AIX {smd5}salt$hash (6-char prefix + salt + $ + 22 encoded) */
     if (lf[JOB_AIXMD5] && len > 6 && strncmp(line, "{smd5}", 6) == 0) {
       char *p = line + 6; /* points to salt$hash */
@@ -50378,6 +51206,21 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload) {
        * in "Working on hash types". */
       if (hlen >= 8 && hlen <= 255) {
         commit_compact(hlen);
+        /* DCC2 (e918) compares against its OWN JudyJ, not the compact table,
+         * because the $DCC2$ loader files digests there. A plain hex list whose
+         * usernames arrive via -u/-U must therefore be filed there too, or the
+         * digests load, report on the receipt, and are never comparable -- a
+         * clean zero indistinguishable from an honest one. 16 bytes only: that
+         * is the sole width DCC2 emits. Additive; the $DCC2$ path is untouched
+         * and a wrapper-loaded digest simply re-inserts the same key. */
+        if (hlen == 16 && lf[JOB_DCC2]) {
+          char _dh[33];
+          int _dy;
+          for (_dy = 0; _dy < 32; _dy++)
+            _dh[_dy] = tolower((unsigned char)line[_dy]);
+          _dh[32] = 0;
+          JSLI(PV, JUDYJ(JOB_DCC2), (unsigned char *)_dh);
+        }
         /* Check for :suffix on hex hashes (salt and/or user) */
         if ((LoadSalt || LoadUser) && line[hlen * 2] == ':' && line[hlen * 2 + 1]) {
           char *suffix = line + hlen * 2 + 1;
@@ -50501,7 +51344,11 @@ unsigned long long Numbers = 0, Maxnumbers = 0;
 unsigned int val, maxtype;
   int len, x, y, z, ch, Printsource, maxt;
   char *tok, *s, *d;
-  int doneprint, donedashh, Addlf, Dodigits, Dighex;
+  int doneprint, donedashh, Addlf, Dodigits;
+  /* Digit-count -n/-N is sugar for a mask: -n 2 IS "?d?d".  Rewritten into
+   * this buffer at getopt time so both spellings travel one code path.
+   * Two characters per position; its size sets the digit limit. */
+  char digitmask[2 * 16 + 1];
   /* A structured hash file read BEFORE any -m/-M/-h: -F and -J parse
    * their file at the moment getopt reaches them, so a selection that
    * arrives later cannot reach it. Remembered here so that selection can
@@ -50509,7 +51356,6 @@ unsigned int val, maxtype;
   int structfile_preselect = 0;
   const char *structfile_preselect_name = NULL, *structfile_preselect_opt = NULL;
 int HashesLoaded = 0;
-unsigned int Doip;
   FILE *fi;
   gzFile input, zfi;
   int isstdin, isdone;
@@ -50556,15 +51402,9 @@ union HashU curin;
   /* 7ZIP (e1000) load-time triage tunables. Read BEFORE getopt, because -F
    * loads its hash file at the moment getopt reaches it, which is when the
    * triage runs. */
-  { const char *e7 = getenv("MDXFIND_7Z_MIN_BITS");
-    if (e7 && *e7) {
-      long v = strtol(e7, NULL, 10);
-      if (v >= 0 && v <= 128) SevenZipMinBits = v;
-      else fprintf(stderr, "MDXFIND_7Z_MIN_BITS=%s out of range 0..128, ignored\n", e7);
-    }
-    e7 = getenv("MDXFIND_7Z_STRICT");
-    if (e7 && *e7 && *e7 != '0') SevenZipStrict = 1;
-  }
+  /* SevenZipMinBits and SevenZipStrict keep their compiled-in defaults.
+   * MDXFIND_7Z_MIN_BITS and MDXFIND_7Z_STRICT used to set them here, before
+   * getopt, because -F triages its hash file as getopt reaches it. */
   TsfLock = new_lock(0);   /* tsfprintf() stderr serialization (startup-phase diagnostics) */
   /* Seed the tsfprintf monotonic origin now so every later timestamp
    * is relative to a known mdxfind-start point. Without this the
@@ -50646,8 +51486,9 @@ union HashU curin;
   Minhashlen = 256;
   JUDYJ(JOB_SHA512CRYPT) = JUDYJ(JOB_SHA256CRYPT) = JUDYJ(JOB_MD5CRYPT) = JUDYJ(JOB_APR1) = Dohash = NULL;
   Doload = NULL;
-  JUDYJ(JOB_PHPBB3) = RuleArray = PepperArray = UserArray = KeyArray = NULL;
-  NRuleArray = NULL;
+  JUDYJ(JOB_PHPBB3) = PepperArray = UserArray = KeyArray = NULL;
+  memset(&Rulestore, 0, sizeof Rulestore);
+  memset(&Rulefile,  0, sizeof Rulefile);
   RuleCnt = NULL;
   rhash_library_init();
   gosthash_init();
@@ -50686,10 +51527,17 @@ union HashU curin;
   UserLivesalts = (volatile unsigned int *)malloc_lock(USERDEF_MAX * sizeof(unsigned int), "UserLivesalts");
   J1S(RC, Dohash, JOB_MD5);
   donedashh = 0;
-  Doip = Dighex = Dodigits = 0;
+  Dodigits = 0;
   infilename = "<STDIN>";
   Maxniter = 1;
   if (argc == 2 && strncmp(argv[1],"-h",2) == 0) {
+        /* User-defined types are registered by userdef_load(), which runs
+         * further down main() -- AFTER this block, which exits. Without this
+         * the listing showed built-ins only, so a tool building a known-type
+         * list from -h could never contain a USER_ type even though -m u<id>
+         * and -c USER_<name> both work. Silent: userdef_verbose is 0 unless
+         * -Y asked for the report. Cannot double-register: this block exits. */
+        userdef_load(getenv("MDXFIND_CACHE"));
         z = 0;
         for (x = 1; Types[x]; x++) {
           y = strlen(Types[x]);
@@ -50752,6 +51600,40 @@ union HashU curin;
 	printf("\nA type marked F does not load from -f at all. A type marked s does, but\n"
                "-f keeps only the hex hash and discards the salt after the first colon, so\n"
                "the run finds nothing and still exits 0. Use -F for hash:salt input.\n");
+        {
+          /* User-defined types live in a SEPARATE address space from the
+           * built-ins, and are listed separately for that reason. They are
+           * keyed on the DECLARED id -- what -m u<id> takes -- never on the
+           * internal op: Userdef_base is derived from the built-in count at
+           * startup and moves when built-ins are added, and op numbers are
+           * documented as never escaping the process. Printing one here would
+           * publish an unstable number. The name always carries the USER_
+           * prefix, which is the public label for these types. */
+          int _un = userdef_count(), _ui;
+          if (_un > 0) {
+            printf("\nUser-defined types, from $MDXFIND_CACHE/userdef.txt"
+                   " (select with -m u<id>):\n\n");
+            for (_ui = 0; _ui < _un; _ui++) {
+              struct userdef_type *_ut = userdef_get_by_index(_ui);
+              char _ub[16];
+              int _uo = 0;
+              if (!_ut) continue;
+              /* Derived from the expression slot mask, not from TypeOpts:
+               * that array is assembled further down main() and is still
+               * empty here. Every user type reads plain hex, hence f. */
+              _ub[_uo++] = 'f';
+              if (_ut->form.npieces > 0) { _ub[_uo++] = ','; _ub[_uo++] = 'F'; }
+              if (_ut->slot_mask & USERDEF_SLOT_SALT) { _ub[_uo++] = ','; _ub[_uo++] = 's'; }
+              if (_ut->slot_mask & USERDEF_SLOT_USER) { _ub[_uo++] = ','; _ub[_uo++] = 'u'; }
+              _ub[_uo] = 0;
+              printf("u%-*s  %-7s  %-*s  na\n", ch - 1, _ut->idstr, _ub,
+                     z, _ut->dispname);
+            }
+            printf("\nA user type is always labelled USER_<name> on output;"
+                   " the bare name matches\nonly internally. Digest length and"
+                   " expression are shown by -Y.\n");
+          }
+        }
 	printf("For full usage, use -?, or supply no arguments\n");
         exit(1);
   }
@@ -50842,7 +51724,7 @@ union HashU curin;
     }
   }
 
-  while ((ch = getopt(argc, argv, "?abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:N:R:M:S:U:P:W:X:")) != -1) {
+  while ((ch = getopt(argc, argv, "?8abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:L:N:R:M:S:U:P:W:X:")) != -1) {
     switch (ch) {
       case 'X':
         s = optarg;
@@ -51019,6 +51901,33 @@ union HashU curin;
         XMLchar = 1;
         break;
 
+      case '8':
+        fprintf(stderr, "UTF-8 rule support enabled (UTF-32 engine available)\n");
+        Utf32Rules = 1;
+        break;
+
+      case 'L':
+        /* Implies -8, exactly as procrule's does. */
+        Utf32Rules = 1;
+        if (!strcasecmp(optarg, "tr") || !strcasecmp(optarg, "az") ||
+            !strcasecmp(optarg, "turkish") || !strcasecmp(optarg, "azeri"))
+          Utf32Locale = U32LOC_TR;
+        else if (!strcasecmp(optarg, "c") || !strcasecmp(optarg, "root") ||
+                 !strcasecmp(optarg, "posix") || !strcasecmp(optarg, "none"))
+          Utf32Locale = U32LOC_ROOT;
+        else {
+          fprintf(stderr, "Unknown locale \"%s\" for -L.\n"
+                  "  tr, az     Turkish and Azeri dotted/dotless I\n"
+                  "  c, root    the mapping everyone else uses\n"
+                  "  omit -L    try the default mapping and count the rest\n",
+                  optarg);
+          exit(1);
+        }
+        fprintf(stderr, "UTF-8 rule support enabled (UTF-32 engine available), "
+                        "case mapping pinned to %s\n",
+                Utf32Locale == U32LOC_TR ? "tr/az" : "c/root");
+        break;
+
       case 'e':
         fprintf(stderr, "Extended match mode for long hashes\n");
         Minhashlen = 1;
@@ -51188,39 +52097,105 @@ union HashU curin;
               JSLI(PV, KeyArray, (unsigned char *)line);
               break;
             case 'r':
-            case 'R':
-              if (packrules(line)) {
+            case 'R': {
+              /* packedlen, NOT mystrlen(line): the packed bytecode is not a C
+               * string.  An operand byte may legitimately be 0x00 and 0x00 is
+               * never an opcode, so strlen truncates the rule at its first NUL
+               * operand.  That truncation used to reach both the JudySL key and
+               * the Rules[] copy, so `$\x00$\x42` and `$\x00$\x43` collapsed to
+               * one key -- one of the two rules was silently DROPPED -- and the
+               * survivor was stored short while its operand count still said 2,
+               * leaving applyrule to read the missing operand out of the next
+               * entry's length prefix. */
+              int packedlen = 0;
+              int u32_placeholder = 0;
+              /* Block-static, not stack: MAXLINE is 40 KB and rule loading is
+               * single-threaded at startup. */
+              static char srcline[MAXLINE + 16];
+              /* Capture the SOURCE TEXT before packrules_len compiles in place
+               * (s = d = line) and destroys it.  The packed bytecode cannot be
+               * decompiled back to a rule line -- the -Z decoder that tried
+               * switched on ASCII opcode letters, so an OPERAND byte could
+               * collide with an opcode case, and it read out of bounds.  -Z now
+               * prints this text, which is the authored line and therefore
+               * itself runnable. */
+              int srclen = (int)mystrlen(line);
+              if (srclen > (int)sizeof(srcline) - 1) srclen = (int)sizeof(srcline) - 1;
+              memcpy(srcline, line, (size_t)srclen);
+              srcline[srclen] = 0;
+              u32_placeholder = 0;
+              if (packrules_len(line, &packedlen)) {
 badrule:
-                fprintf(stderr, "Rule file %s: bad line %d\n", optarg, x + 1);
-                line[0] = 0;
+                /* Reached from BOTH byte-compiler refusals: packrules_len
+                 * failing, and the test-apply returning -3.  Either way the
+                 * byte engine will not run this line.  srcline holds the source
+                 * text -- packrules_len compiled `line` in place and destroyed
+                 * it.  Never loops: the only path back here is the test-apply,
+                 * which is skipped once u32_placeholder is set. */
+                if (Utf32Rules && validrule_u32(srcline) == 0) {
+                  /* U32-REQUIRED: the byte compiler refuses it and the UTF-32
+                   * compiler accepts it, so under -8 it is a usable rule and
+                   * must be ADMITTED rather than dropped.  It has no byte
+                   * bytecode, and Rules[] entries ARE bytecode, so it carries a
+                   * placeholder payload instead: 0x00 followed by the source
+                   * text.
+                   *
+                   * 0x00 does three jobs at once and was chosen for all three.
+                   * It is never an opcode, verified over 338,310 rule lines of
+                   * HashMob.100k, all_gj and game.rule -- not one packed rule
+                   * begins with it, and the lowest first byte seen was 0xc2 --
+                   * so it identifies the entry unambiguously in the Rules[]
+                   * build below, where Rule_byteok is cleared for it.  If the
+                   * byte walker ever did reach one it would stop at once rather
+                   * than misread the source text as bytecode.  And appending
+                   * the source keeps the payload unique per distinct rule, so
+                   * the store's bytecode dedup still collapses real duplicates
+                   * and only those.
+                   *
+                   * pick_engine() guarantees this is never handed to
+                   * applyrule(): byte_can is 0, so it returns UTF-32 or, for a
+                   * word that cannot be decoded, -1. */
+                  /* Bound the buffer being WRITTEN, which is `line`, not the
+                   * one being read.  Both happen to be MAXLINE + 16 and fgets
+                   * caps the content at MAXLINE - 1, so this cannot trip today;
+                   * naming srcline here was accidentally correct, which is the
+                   * kind of thing that stops being correct silently. */
+                  if (srclen + 1 <= (int)sizeof(line)) {
+                    line[0] = 0;
+                    memcpy(line + 1, srcline, (size_t)srclen);
+                    packedlen = srclen + 1;
+                    u32_placeholder = 1;
+                    Rule_u32_only++;
+                  } else {
+                    fprintf(stderr, "Rule file %s: line %d too long to admit\n",
+                            optarg, x + 1);
+                    packedlen = 0;
+                  }
+                } else {
+                  if (Utf32Rules) Rule_both_bad++;
+                  fprintf(stderr, "Rule file %s: bad line %d\n", optarg, x + 1);
+                  packedlen = 0;
+                }
               }
               strcpy(workline, "Password");
-              if (line[0] && applyrule(workline, last, 8, line, &main_rule_ws) == -3)
+              if (!u32_placeholder && packedlen &&
+                  applyrule(workline, last, 8, line, &main_rule_ws) == -3)
                 goto badrule;
-              len = mystrlen(line);
-              if (len != 0 && line[0] != '#') {
-                if (ch == 'R') {
-                  int curlen;
-                  if (!RuleArray) {
-                    JSLI(PV, NRuleArray, (unsigned char *)line);
-                    break;
-                  }
-                  last[0] = 0;
-                  JSLF(PV, RuleArray, (unsigned char *)last);
-                  while (PV) {
-                    curlen = mystrlen(last);
-                    if ((curlen + len) < MAXLINE) {
-                      memmove(workline, last, curlen);
-                      memmove(workline + curlen, line, len + 1);
-                      JSLI(PV, NRuleArray, (unsigned char *)workline);
-                    }
-                    JSLN(PV, RuleArray, (unsigned char *)last);
-                  }
-                  break;
+              /* packedlen == 0 covers a blank line, a whole-line comment and an
+               * explicit `:`.  All three are skipped deliberately: the implicit
+               * no-rule pass is foundational, and an explicit `:` must not add a
+               * second one. */
+              if (packedlen != 0) {
+                if (rs_add_src(ch == 'R' ? &Rulefile : &Rulestore,
+                               line, packedlen, srcline, srclen) == -2) {
+                  fprintf(stderr,
+                          "Rule file %s: out of memory storing rule at line %d\n",
+                          optarg, x + 1);
+                  exit(1);
                 }
-                JSLI(PV, RuleArray, (unsigned char *)line);
               }
               break;
+            }
 
             default:
               break;
@@ -51238,11 +52213,21 @@ badrule:
         if (ch == 'r' || ch == 'R')
           tok = "rules";
         if (ch == 'R') {
-          if (NRuleArray) {
-            JSLFA(RC, RuleArray);
-            RuleArray = NRuleArray;
+          /* Left-major product: the accumulated set varies slowest.  With no
+           * prior -r the -R file simply becomes the set, which is what the old
+           * `if (!RuleArray)` shortcut did. */
+          if (Rulestore.n == 0) {
+            rs_reset(&Rulestore);
+            Rulestore = Rulefile;
+            memset(&Rulefile, 0, sizeof Rulefile);
+          } else {
+            if (rs_product(&Rulestore, &Rulefile, MAXLINE) < 0) {
+              fprintf(stderr, "Rule file %s: out of memory forming -R product\n",
+                      optarg);
+              exit(1);
+            }
+            rs_reset(&Rulefile);
           }
-          NRuleArray = NULL;
         }
 
         fprintf(stderr, "%d %s read from %s\n", x, tok, optarg);
@@ -51266,7 +52251,7 @@ badrule:
             structfile_preselect_name = optarg;
             structfile_preselect_opt = "-F";
           }
-          load_hash_file(gf, optarg, &Doload);
+          load_hash_file(gf, optarg, &Doload, /*hex_only=*/0);
           if (strcmp(optarg, "stdin") != 0)
             gzclose(gf);
         }
@@ -51290,7 +52275,7 @@ badrule:
             structfile_preselect_name = optarg;
             structfile_preselect_opt = "-J";
           }
-          load_hash_file(gj, optarg, NULL);
+          load_hash_file(gj, optarg, NULL, /*hex_only=*/0);
           if (strcmp(optarg, "stdin") != 0)
             gzclose(gj);
         }
@@ -51298,6 +52283,27 @@ badrule:
 
       case 'N':
         mask_init_classes();
+        /* Same desugar as -n, see there: -N 3 is exactly "?d?d?d".  The
+         * digit-count prepend form never accepted the x/X hex suffix, so
+         * neither does this. */
+        if (!strchr(optarg, '?') && !strchr(optarg, '[')) {
+          /* Strict decimal digit count, see -n. No x/X: the digit-count
+           * prepend form never accepted a hex suffix. */
+          const char *q = optarg;
+          int nd = 0;
+          while (*q >= '0' && *q <= '9' && nd < 1000)
+            nd = nd * 10 + (*q++ - '0');
+          if (q != optarg && *q == 0 && nd >= 1) {
+            if (nd > (int)(sizeof(digitmask) - 1) / 2) {
+              fprintf(stderr, "Too many digits\n");
+              exit(1);
+            }
+            for (x = 0; x < nd; x++)
+              memcpy(&digitmask[2 * x], "?d", 2);
+            digitmask[2 * nd] = 0;
+            optarg = digitmask;
+          }
+        }
         if (strchr(optarg, '?') || strchr(optarg, '[')) {
           /* Mask prepend mode */
           if (parse_mask_into(optarg, MaskPrependPattern, &MaskPrependLen,
@@ -51310,7 +52316,6 @@ badrule:
           MaskTotal = MaskPrependTotal * MaskAppendTotal;
           Dodigits = MaskPrependLen + MaskAppendLen;
           Maxnumbers = MaskTotal;
-          NumbersFmt = NULL;
           /* MaskChunkSize: rightmost non-literal class in the combined pattern */
           { int ci;
             MaskChunkSize = 1;
@@ -51331,20 +52336,46 @@ badrule:
           }
           fprintf(stderr, "Mask prepend: %s (%llu combinations)\n", optarg, MaskPrependTotal);
         } else {
-          /* Legacy numeric prepend: -N 3 */
-          MaskPrepend = 1;
-          Dodigits = atoi(optarg);
-          if (Dodigits > 16) { fprintf(stderr, "Too many digits\n"); exit(1); }
-          NumbersFmt = "%0*llu";
-          Maxnumbers = 1;
-          for (x = 0; x < Dodigits; x++) Maxnumbers *= 10;
-          MaskLen = 0;
-          MaskPrependLen = 0;
+          fprintf(stderr, "-N %s: expected a mask (?d, ?l, ?[abc], ...) or a "
+                          "digit count 1-16\n", optarg);
+          exit(1);
         }
         break;
 
       case 'n':
         mask_init_classes();
+        /* Desugar the digit-count form into the mask that means the same
+         * thing: -n 2 is exactly "?d?d", -n 2x is "?h?h", -n 2X is "?H?H".
+         * Same candidates in the same order -- the sequences were compared
+         * position by position and are identical, so no result changes.
+         * What does change is that the mask path enumerates the WHOLE
+         * keyspace (digit-count mode stopped after one batch of
+         * Iter_Count[] candidates) and sets MaskTotal, which is what the
+         * GPU dispatcher reads to size its keyspace. */
+        if (!strchr(optarg, '?') && !strchr(optarg, '[')) {
+          /* Accepted digit-count form is strict: decimal digits, then an
+           * optional single x or X for hex, then end of string. Trailing
+           * junk is REJECTED rather than silently ignored -- atoi() would
+           * read "4i" as 4 and quietly run an old -n i (IPv4, removed) as
+           * a four-digit sweep. Anything not matching falls through to the
+           * diagnostic below. */
+          const char *q = optarg;
+          int nd = 0;
+          while (*q >= '0' && *q <= '9' && nd < 1000)
+            nd = nd * 10 + (*q++ - '0');
+          if (q != optarg && nd >= 1 &&
+              (*q == 0 || ((*q == 'x' || *q == 'X') && q[1] == 0))) {
+            const char *cls = (*q == 'X') ? "?H" : (*q == 'x') ? "?h" : "?d";
+            if (nd > (int)(sizeof(digitmask) - 1) / 2) {
+              fprintf(stderr, "Too many digits, won't finish in your lifetime\n");
+              exit(1);
+            }
+            for (x = 0; x < nd; x++)
+              memcpy(&digitmask[2 * x], cls, 2);
+            digitmask[2 * nd] = 0;
+            optarg = digitmask;
+          }
+        }
         if (strchr(optarg, '?') || strchr(optarg, '[')) {
           /* Mask append mode */
           if (parse_mask_into(optarg, MaskAppendPattern, &MaskAppendLen,
@@ -51357,7 +52388,6 @@ badrule:
           MaskTotal = MaskPrependTotal * MaskAppendTotal;
           Dodigits = MaskPrependLen + MaskAppendLen;
           Maxnumbers = MaskTotal;
-          NumbersFmt = NULL;
           /* MaskChunkSize: rightmost non-literal class */
           { int ci;
             MaskChunkSize = 1;
@@ -51376,43 +52406,15 @@ badrule:
           chunk_done_n: ;
           }
           fprintf(stderr, "Mask append: %s (%llu combinations)\n", optarg, MaskAppendTotal);
-        } else if (strchr(optarg, 'i')) {
-          /* IP mode: unchanged legacy behavior */
-          Doip = 1;
-          Dodigits = 4;
-          Maxnumbers = 0x100000000ll;
-          NumbersFmt = "%0*llu";
-          MaskLen = 0;
-          MaskAppendLen = 0;
         } else {
-          /* Legacy numeric mode: -n 2, -n 3x, -n 4X */
-          Dodigits = atoi(optarg);
-          if (Dodigits > 16) {
-            fprintf(stderr, "Too many digits, won't finish in your lifetime\n");
-            exit(1);
-          }
-          NumbersFmt = "%0*llu";
-          if (strchr(optarg, 'x') || strchr(optarg, 'X'))
-            Dighex = 1;
-
-          Maxnumbers = 1;
-          if (Dighex) {
-            NumbersFmt = "%0*llx";
-            if (strchr(optarg, 'X'))
-              NumbersFmt = "%0*llX";
-            for (x = 0; x < Dodigits; x++)
-              Maxnumbers *= 16;
-            y = 16;
-            for (x = 1; x < 16; x++) {
-              if ((x % 4) == 0) y *= 16;
-              Iter_Count[x] = y;
-            }
-          } else {
-            for (x = 0; x < Dodigits; x++)
-              Maxnumbers *= 10;
-          }
-          MaskLen = 0; /* not using mask */
-          MaskAppendLen = 0;
+          /* Not a mask and not a digit count the desugar above accepted.
+           * -n 0 appended nothing, and -n i (IPv4) was removed: an IP
+           * range is trivial to generate externally and pipe in as a
+           * wordlist, so it does not need to live in the option parser.
+           * Fail loudly rather than run as though no -n were given. */
+          fprintf(stderr, "-n %s: expected a mask (?d, ?l, ?[abc], ...) or a "
+                          "digit count 1-16 with optional x/X for hex\n", optarg);
+          exit(1);
         }
         break;
 
@@ -51800,7 +52802,12 @@ badrule:
             cur = strchr(line, 13); if (cur) *cur = 0;
             cur = strchr(line, 10); if (cur) *cur = 0;
             if (mystrlen(line) > 0) {
+              /* Count occurrences: a userid supplied N times is a userid that
+               * accounts for N hashes, and that count becomes its reference
+               * count below, so it retires when its hashes are solved. JSLI
+               * initialises a new value to 0, so ++ yields 1 on first sight. */
               JSLI(PV, TmpUser, (unsigned char *)line);
+              if (PV) (*PV)++;
               ucnt++;
             }
           }
@@ -51814,8 +52821,15 @@ badrule:
                 tline[0] = 0;
                 JSLF(PV, TmpUser, (unsigned char *)tline);
                 while (PV) {
+                  /* Accumulate the occurrence count; do NOT stamp a sentinel.
+                   * Each occurrence in a -U file is a separate hash that userid
+                   * accounts for, so the count is real and the userid retires
+                   * once its hashes are solved. The old `= 1000000` also
+                   * CLOBBERED the byte-exact count the hash file itself builds
+                   * (loader: `if ((*_UV)++ == 0)` once per hash line), so a run
+                   * combining hash:user input with -U lost the real count. */
                   JSLI(TPV, TYPEUSER(ti), (unsigned char *)tline);
-                  if (TPV) *TPV = 1000000;
+                  if (TPV) *TPV += *PV;
                   JSLN(PV, TmpUser, (unsigned char *)tline);
                 }
               }
@@ -51899,6 +52913,31 @@ badrule:
         goto usage;
     }
   }
+  /* -L tr/az and the GPU do not compose yet, so take the CPU and say so.
+   *
+   * The device UTF-32 walker carries the `turkish` parameter but every call
+   * site passes 0 -- variant 0 only, by its own comment -- so a pinned
+   * Turkish run would compute the tr mapping on the CPU and the default one
+   * on the GPU.  The GPU claims the batch and the CPU does not recompute it,
+   * so the difference would surface as a quiet under-recovery, which is the
+   * one outcome this tool must not produce.
+   *
+   * -L c/root is variant 0 and therefore already exactly what the device
+   * computes, so it runs on the GPU unchanged and costs nothing.
+   *
+   * Forced rather than refused: the run is correct on the CPU, and refusing
+   * would turn a slower answer into no answer.  Loud, because losing GPU
+   * acceleration silently is its own kind of wrong. */
+  if (Utf32Locale == U32LOC_TR && !NoMetal) {
+    fprintf(stderr,
+        "-L tr/az: GPU disabled for this run. The device UTF-32 walker "
+        "implements the default case mapping only, so leaving the GPU on "
+        "would compute the Turkish mapping on the CPU and the default one on "
+        "the GPU. Use -L c/root to keep the GPU, or accept CPU speed for "
+        "Turkish output.\n");
+    NoMetal = 1;
+  }
+
   argc -= optind;
   argv += optind;
   J1T(RC, Dohash, JOB_ED2000);
@@ -52144,31 +53183,95 @@ badrule:
     JSLFA(RC, KeyArray);
   }
 
-  line[0] = 0;
-  JSLF(PV, RuleArray, (unsigned char *)line);
-  MemSize = y = x = 0;
-  while (PV) {
-    x++;
-    MemSize += mystrlen(line) + 3;
-    JSLN(PV, RuleArray, (unsigned char *)line);
-  }
+  /* Build the length-prefixed Rules[] buffer from the rule store.
+   *
+   * Entry layout is UNCHANGED -- 2-byte length (= bytecode length + 1), then the
+   * bytecode, then a NUL -- so the rule_ptrs walk, applyrule and the classifier
+   * all keep working untouched.  Two things change: the bytecode is copied with
+   * memcpy at its TRUE length instead of strcpy (which stopped at a 0x00 operand
+   * and stored a short rule whose operand count still said N), and entries are
+   * emitted in rs_ent order, which is INPUT-FILE order.  The old JudySL walk
+   * emitted them in lexicographic order of the bytecode.
+   *
+   * The trailing NUL is retained deliberately: every in-tree bytecode walker
+   * terminates on a 0 OPCODE and skips operands by explicit count, so a NUL
+   * operand is never mistaken for the terminator. */
+  x = Rulestore.n;
+  MemSize = 0;
+  for (y = 0; y < x; y++)
+    MemSize += Rulestore.ent[y].len + 3;      /* 2 prefix + bytecode + NUL */
   if (x) {
     unsigned short int *si;
+    size_t u32srcused = 0;
     Rulesize = MemSize + 4;
     RuleCnt = malloc_lock((x + 2)* sizeof(unsigned long long),"Rulecnt");
+    /* Per-rule engine capability, 0-based like gpu_rule_membership[].  Every rule
+     * that reaches here was accepted by the BYTE compiler -- packrules refusing it
+     * is what sends it to the badrule path -- so byteok is 1 throughout and only
+     * u32ok has to be computed.  That is why -8 still buys something on a file with
+     * ZERO U32-REQUIRED rules: the dispatch that matters on real data is the
+     * WORD's class, not the rule's. */
+    Rule_byteok = malloc_lock(x + 2, "Rule_byteok");
+    Rule_u32ok  = malloc_lock(x + 2, "Rule_u32ok");
+    memset(Rule_byteok, 1, x + 2);
+    memset(Rule_u32ok,  0, x + 2);
+    if (Utf32Rules && Rulestore.srcused) {
+      Rule_u32src    = malloc_lock(Rulestore.srcused + x + 2, "Rule_u32src");
+      Rule_u32srcoff = malloc_lock((x + 2) * sizeof(uint32_t), "Rule_u32srcoff");
+      memset(Rule_u32srcoff, 0, (x + 2) * sizeof(uint32_t));
+    }
     d = Rules = malloc_lock(MemSize + 4,"Rules");
-    ValidRules = malloc_lock(MemSize+4,"ValidRules");
-    line[0] = 0;
-    JSLF(PV, RuleArray, (unsigned char *)line);
-    while (PV) {
-      y = mystrlen(line) + 1;
-      if (y > 1) {
-        si = (unsigned short int *) d;
-        *si = y;
-        strcpy(d + 2, line);
-        d += y + 2;
+    /* Copy the retained source text out of the store, which rs_reset frees
+     * below.  Indexed y + 1 so it lines up with RuleCnt[] and Ruleindex. */
+    if (Rulestore.srcused) {
+      Rulesrc    = malloc_lock(Rulestore.srcused + 1, "Rulesrc");
+      Rulesrcoff = malloc_lock((x + 2) * sizeof(uint32_t), "Rulesrcoff");
+      Rulesrclen = malloc_lock((x + 2) * sizeof(unsigned short), "Rulesrclen");
+      memcpy(Rulesrc, Rulestore.src, Rulestore.srcused);
+      Rulesrc[Rulestore.srcused] = 0;
+      memset(Rulesrcoff, 0, (x + 2) * sizeof(uint32_t));
+      memset(Rulesrclen, 0, (x + 2) * sizeof(unsigned short));
+    }
+    for (y = 0; y < x; y++) {
+      int rlen = Rulestore.ent[y].len;
+      si = (unsigned short int *) d;
+      *si = rlen + 1;
+      memcpy(d + 2, Rulestore.slab + Rulestore.ent[y].off, (size_t)rlen);
+      d[2 + rlen] = 0;
+      d += rlen + 1 + 2;
+      if (Rulesrcoff) {
+        Rulesrcoff[y + 1] = Rulestore.ent[y].srcoff;
+        Rulesrclen[y + 1] = Rulestore.ent[y].srclen;
       }
-      JSLN(PV, RuleArray, (unsigned char *)line);
+        /* Ask the UTF-32 compiler about the SOURCE text, not the bytecode -- the
+         * bytecode cannot be decompiled.  Only under -8: without it the byte engine is
+         * the only engine and this answer is never read, and a second compile of every
+         * rule in a 6.8-million-rule file is not free.  One compile per rule at LOAD,
+         * never per (word, rule). */
+        /* Terminated copy first, then ask the UTF-32 compiler about it.  The
+         * bytecode cannot be decompiled, so the SOURCE is the only thing either
+         * question can be asked of.  One compile per rule at LOAD, never per
+         * (word, rule). */
+        if (Rule_u32src && Rulestore.ent[y].srclen) {
+          int sl = Rulestore.ent[y].srclen;
+          char *dst = Rule_u32src + u32srcused;
+          memcpy(dst, Rulestore.src + Rulestore.ent[y].srcoff, (size_t)sl);
+          dst[sl] = 0;
+          Rule_u32srcoff[y + 1] = (uint32_t)u32srcused;
+          u32srcused += (size_t)sl + 1;
+          Rule_u32ok[y] = (validrule_u32(dst) == 0) ? 1 : 0;
+        }
+        /* A placeholder payload marks a U32-REQUIRED rule: it has no byte bytecode,
+         * so the byte engine must never be chosen for it.  Without this the ASCII
+         * words took the byte engine onto the placeholder and produced NOTHING --
+         * measured: 10 candidates missing against procrule on u32-ops.rule, every one
+         * of them an ASCII word crossed with a UTF-32-only rule.
+         *
+         * 0x00 is never an opcode (checked over 338,310 rule lines; zero hits, lowest
+         * first byte 0xc2) so the marker cannot collide with a real packed rule. */
+        if (Rulestore.ent[y].len > 0 &&
+            Rulestore.slab[Rulestore.ent[y].off] == 0)
+          Rule_byteok[y] = 0;
     }
     *d++ = 0;
     *d++ = 0;
@@ -52178,11 +53281,29 @@ badrule:
       exit(1);
     }
     Rulesize = y;
-    memmove(ValidRules,Rules,Rulesize);
     fprintf(stderr, "%d total rules in use\n", x);
+    if (Utf32Rules) {
+      /* Three classes, not two.  Counting only "u32ok" called every admitted
+       * UTF-32-only rule "either engine", which is the opposite of true. */
+      long both = 0, u32only = 0, byteonly = 0;
+      for (y = 0; y < x; y++) {
+        if (Rule_u32ok[y] && Rule_byteok[y])      both++;
+        else if (Rule_u32ok[y])                   u32only++;
+        else                                      byteonly++;
+      }
+      fprintf(stderr,
+              "  -8: %ld rule(s) run on either engine, %ld UTF-32 only, "
+              "%ld byte only\n", both, u32only, byteonly);
+    }
+    /* Only under -8, so byte-mode stderr is untouched. */
+    if (Utf32Rules && (Rule_u32_only || Rule_both_bad))
+      fprintf(stderr,
+              "  -8: %ld rule(s) the byte engine refuses were ADMITTED for the "
+              "UTF-32 engine, %ld bad in both and refused\n",
+              Rule_u32_only, Rule_both_bad);
     Numrules = x;
     Numsalts += x;
-    JSLFA(RC, RuleArray);
+    rs_reset(&Rulestore);
   }
 
 
@@ -52310,6 +53431,13 @@ usage:
     printf("-l\tAppend CR/LF/CRLF and print in hex\n");
     printf("-r\tFile to read rules from (concatenated)\n");
     printf("-R\tFile to read rules from (dot-product form)\n");
+    printf("-8\tInterpret rules in UTF-32 (codepoints and grapheme clusters)\n");
+    printf("  \tas well as over bytes. The engine is chosen per (word,rule)\n");
+    printf("  \tpair: an all-ASCII word runs on the byte engine either way\n");
+    printf("-L\tPin the locale of an ambiguous case mapping. Implies -8.\n");
+    printf("  \t  -L tr, -L az    Turkish/Azeri dotted and dotless I\n");
+    printf("  \t  -L c, -L root   the mapping everyone else uses\n");
+    printf("  \tomit -L to try the default mapping and count the rest\n");
     printf("-v\tDo not mark salts as found.\n");
     printf("-V\tDisplay version\n");
     printf("-Y\tLoad userdef.txt, print the load report, and exit\n");
@@ -52345,7 +53473,8 @@ usage:
       isstdin = 1;
     }
 
-    load_hash_file(input, infilename ? infilename : "stdin", NULL);
+    load_hash_file(input, infilename ? infilename : "stdin", NULL,
+                 /*hex_only=*/1);
     gzclose(input);
   } else {
     infilename = "previously named files";
@@ -52400,11 +53529,11 @@ usage:
      * salt_len were never bound (GTX 1650 user crash). */
     unsigned char *prog = malloc(1);
     uint32_t      *offs = malloc(sizeof(uint32_t));
-    int           *orig = malloc(sizeof(int));
-    if (prog && offs && orig) {
+    int           *slot = malloc(sizeof(int));
+    if (prog && offs && slot) {
       prog[0] = 0;
       offs[0] = 0;
-      orig[0] = -1;
+      slot[0] = 0;
       int n_dev = gpu_opencl_num_devices();
       int n_uploaded = 0;
       {
@@ -52427,7 +53556,7 @@ usage:
       if (n_uploaded > 0) {
         gpu_rule_program       = prog;
         gpu_rule_offsets       = offs;
-        gpu_rule_origin        = orig;
+        gpu_rule_slot        = slot;
         gpu_rule_program_len   = 1;
         gpu_rule_count         = 1;       /* synthetic `:` only */
         gpu_rule_membership    = NULL;    /* no Numrules array — not needed when 0 user rules */
@@ -52438,13 +53567,13 @@ usage:
          * still emit since those represent actual user-visible problems. */
         (void)n_uploaded;
       } else {
-        free(prog); free(offs); free(orig);
+        free(prog); free(offs); free(slot);
         fprintf(stderr,
           "GPU rule engine: synthetic-only program upload failed on all %d device(s) — "
           "no GPU acceleration for this workload\n", n_dev);
       }
     } else {
-      free(prog); free(offs); free(orig);
+      free(prog); free(offs); free(slot);
       fprintf(stderr,
         "GPU rule engine: malloc failed for synthetic-only program — "
         "no GPU acceleration for this workload\n");
@@ -52454,60 +53583,87 @@ usage:
      * of bytecode pointers (skipping the 2-byte length prefix on each
      * entry). classify_rules wants pointers to the raw bytecode. */
     char **rule_ptrs = malloc(Numrules * sizeof(char *));
-    if (rule_ptrs) {
+    unsigned short *rule_lens = malloc(Numrules * sizeof(unsigned short));
+    if (rule_ptrs && rule_lens) {
       char *rp = Rules;
       int rn = 0;
       while (rn < Numrules) {
         unsigned short int rlen = *((unsigned short int *)rp);
         if (rlen == 0) break;       /* end-of-rules sentinel */
-        rule_ptrs[rn++] = rp + 2;   /* skip length prefix → bytecode */
+        rule_lens[rn]   = (unsigned short)(rlen - 1);  /* bytecode, no NUL */
+        rule_ptrs[rn++] = rp + 2;   /* skip length prefix -> bytecode */
         rp += rlen + 2;
       }
       if (rn == Numrules) {
         struct rule_lists rl;
-        if (classify_rules(rule_ptrs, Numrules, &rl) >= 0 && rl.ngpu > 0) {
+        /* Counted BEFORE the guard below, and the guard admits n_u32only on its own.
+         * A rule file whose every line is U32-REQUIRED leaves rl.ngpu == 0 -- every
+         * rule carries the 0x00 placeholder, which gpu_rule_safe_phase0 refuses -- so
+         * a guard of rl.ngpu > 0 alone skipped this whole block and sent NOTHING to
+         * the device, including the very rules this change exists to admit. */
+        int n_u32only = 0;
+        if (Utf32Rules && Rule_u32ok && Rule_byteok) {
+          for (unsigned y = 0; y < Numrules; y++)
+            if (!Rule_byteok[y] && Rule_u32ok[y]) n_u32only++;
+        }
+        if (classify_rules(rule_ptrs, rule_lens, Numrules, &rl) >= 0 && (rl.ngpu > 0 || n_u32only > 0)) {
           /* Pack the GPU-eligible subset into a contiguous bytecode
-           * buffer + uint32 offset table. Each bytecode is already
-           * NUL-terminated in the source Rules buffer, so we copy
-           * including the trailing NUL. */
+           * buffer + uint32 offset table.  Copied at the rule's TRUE length
+           * plus its trailing NUL -- strlen would stop at a 0x00 operand and
+           * hand the device a truncated rule whose operand count still said N,
+           * which the kernel would then satisfy from the next rule's bytes. */
           uint32_t prog_cap = 0;
           for (int i = 0; i < rl.ngpu; i++) {
-            prog_cap += (uint32_t)(strlen(rl.gpu[i]) + 1);
+            prog_cap += (uint32_t)rl.gpulen[i] + 1;
           }
-          /* +1 byte for the synthetic `:` no-rule pass: empty bytecode
-           * (just a NUL terminator). Kernel reads NUL → loop exits
-           * immediately → md5(original word) is computed. This makes
-           * the GPU produce the no-rule pass that mdxfind treats as
-           * foundational (feedback_no_rule_pass.md), so the legacy
-           * chokepoint can skip packing it for this workload. */
+          prog_cap += (uint32_t)n_u32only * 2u;
           prog_cap += 1;
           unsigned char *prog = malloc(prog_cap);
-          uint32_t      *offs = malloc((rl.ngpu + 1) * sizeof(uint32_t));
-          int           *orig = malloc((rl.ngpu + 1) * sizeof(int));
-          if (prog && offs && orig) {
+          uint32_t      *offs = malloc((rl.ngpu + 1 + n_u32only) * sizeof(uint32_t));
+          int           *slot = malloc((rl.ngpu + 1 + n_u32only) * sizeof(int));
+          if (prog && offs && slot) {
             uint32_t pos = 0;
             for (int i = 0; i < rl.ngpu; i++) {
               offs[i] = pos;
-              size_t blen = strlen(rl.gpu[i]) + 1;
+              size_t blen = (size_t)rl.gpulen[i] + 1;   /* + trailing NUL */
               memcpy(prog + pos, rl.gpu[i], blen);
               pos += (uint32_t)blen;
-              /* Map gpu_rule_idx -> original Rules[] index. rl.gpu[i]
-               * is a pointer into Rules; we resolve to the original
-               * sequential index by matching against rule_ptrs[]. */
-              orig[i] = -1;
-              for (int j = 0; j < Numrules; j++) {
-                if (rule_ptrs[j] == rl.gpu[i]) { orig[i] = j; break; }
-              }
+               /* Original Rules[] index, straight from classify_rules, which
+                * preserves order and records it.  This used to be recovered by
+                * restarting a pointer scan at 0 for every entry -- about 5e9
+                * compares at HashMob.100k scale and 2.3e13 at Hash-IT. */
+               slot[i] = rl.gpuidx[i] + 1;   /* 1-BASED: RuleCnt[] index */
             }
             /* Synthetic `:` no-rule pass at gpu_rule_idx == rl.ngpu.
-             * Empty bytecode (one NUL byte). orig sentinel = -1 so
+             * Empty bytecode (one NUL byte). slot sentinel = 0 so
              * the worker hit decoder knows to skip applyrule replay
              * and use the original word as plaintext directly. */
             offs[rl.ngpu] = pos;
             prog[pos++] = 0;
-            orig[rl.ngpu] = -1;
+            slot[rl.ngpu] = 0;
 
-            int n_rules_with_synth = rl.ngpu + 1;
+            /* The U32-REQUIRED entries go AFTER the synthetic `:`, which stays at index
+             * rl.ngpu exactly where it is today so nothing that special-cases it by
+             * position moves.
+             *
+             * The byte stream is RULE_OP_NOOP then the terminator, NOT a bare NUL.  The
+             * kernel detects the synthetic pass as (rule_program[byte_roff] == 0); a bare
+             * NUL would make one of these indistinguishable from it, bypassing the no-op
+             * detection and crediting the rule for the no-rule pass -- the -Z inflation
+             * this codebase has already fixed once.  A two-byte no-op is also harmless if
+             * the byte walker is ever handed the rule, which bit 30 says it must not be. */
+            int n_devrules = rl.ngpu + 1;
+            if (n_u32only) {
+              for (unsigned y = 0; y < Numrules; y++) {
+                if (Rule_byteok[y] || !Rule_u32ok[y]) continue;
+                offs[n_devrules]   = pos;
+                prog[pos++]   = (unsigned char)RULE_OP_NOOP;
+                prog[pos++]   = 0;
+                slot[n_devrules]   = (int)y + 1;   /* 1-BASED, as rl.gpuidx[i] + 1 is */
+                n_devrules++;
+              }
+            }
+            int n_rules_with_synth = n_devrules;
             /* Upload to every available GPU device — Memo C parallel.
              * Per-device clEnqueueWriteBuffer + bookkeeping fanned across
              * yarn threads; rule data is shared read-only. */
@@ -52533,33 +53689,73 @@ usage:
             if (n_uploaded > 0) {
               gpu_rule_program     = prog;
               gpu_rule_offsets     = offs;
-              gpu_rule_origin      = orig;
+              gpu_rule_slot      = slot;
               gpu_rule_program_len = pos;
               gpu_rule_count       = n_rules_with_synth;  /* includes synthetic `:` */
               gpu_rule_membership = calloc(Numrules, 1);
               if (gpu_rule_membership) {
                   int member_count = 0;
-                  for (int i = 0; i < rl.ngpu; i++) {
-                      if (orig[i] >= 0 && orig[i] < (int)Numrules) {
-                          gpu_rule_membership[orig[i]] = 1;
+                  for (int i = 0; i < n_rules_with_synth; i++) {
+                      if (slot[i] >= 1 && slot[i] <= (int)Numrules) {
+                          gpu_rule_membership[slot[i] - 1] = 1;
                           member_count++;
+                  /* -8: a rule with no byte bytecode must never reach the
+                   * device byte walker.  It cannot today -- such a rule carries
+                   * a 0x00 placeholder payload, gpu_rule_safe_phase0() has no
+                   * case for 0x00 and its default returns 0, so the rule
+                   * classifies CPU-only and never enters rl.gpu.  This says so
+                   * out loud instead of leaving the property incidental, since
+                   * the cost of it silently ceasing to hold is the device
+                   * executing source text as bytecode. */
+                  /* A GPU-eligible rule with no byte bytecode is now the INTENDED state for a
+                   * U32-REQUIRED rule, so warn only when NEITHER engine can run it -- which is
+                   * the genuinely broken case.  The old form fired once per U32-only rule, 14
+                   * times per run on the mixed fixture. */
+                  if (Rule_byteok && Rule_u32ok &&
+                      !Rule_byteok[slot[i] - 1] && !Rule_u32ok[slot[i] - 1])
+                      fprintf(stderr,
+                        "%s WARNING rule %d is GPU-eligible but neither engine "
+                        "can run it\n", "GPU rule engine:", slot[i]);
                       }
                   }
-                  /* Sanity: member_count must equal rl.ngpu if orig[] map is correct.
-                   * Note: synthetic `:` (orig[rl.ngpu] = -1) is intentionally NOT
+                  /* Sanity: member_count must equal rl.ngpu if slot[] map is correct.
+                   * Note: synthetic `:` (slot[rl.ngpu] = 0) is intentionally NOT
                    * counted — it has no Rules[] entry to mark. */
-                  if (member_count != rl.ngpu)
+                  if (member_count != rl.ngpu + n_u32only)
                       fprintf(stderr,
                         "GPU rule engine: WARNING membership count %d != rl.ngpu %d\n",
                         member_count, rl.ngpu);
               }
+              /* AFTER the membership fill, not before it.  This call clears membership for
+               * any admitted rule the device walker cannot run -- a tier-3 string-operand
+               * rule -- and it reads gpu_rule_membership to do so.  Placed before the
+               * calloc above, the pointer was still NULL, the clawback guard skipped
+               * SILENTLY, and the pre-filter reported success having changed nothing:
+               * syntax.md5 under MODE=1 gave 8,446 of 13,435, the 6 of 14 tier-3 rules
+               * walked by neither side.  Still long before any word is read. */
+              int u32_clawed = gpu_u32_membership_prefilter(prog, pos, offs,
+                                                          n_rules_with_synth);
+              if (u32_clawed < 0) u32_clawed = 0;   /* -1 = could not apply */
+              /* + u32_clawed, and this is not bookkeeping.  The flag gates the
+               * currule = NULL short-circuit: when set, the outer do/while exits after the
+               * no-rule pass and THE CPU RULE WALK DOES NOT HAPPEN.  Correct only while
+               * every rule really is on the device.  The clawback above hands the tier-3
+               * string-operand rules BACK to the CPU, so without counting them here the
+               * short-circuit stops the CPU walking rules the device also skipped --
+               * measured 8,446 of 13,435 on u32-ops.rule, and appending one byte-refused
+               * rule (v2-) to raise rl.ncpu made the same run byte-exact, which is what
+               * isolated it. */
               /* If all original rules are GPU-eligible, the legacy jobg slot
                * (my_jobg in the chokepoint) is never used: the no-rule pass
                * is now handled by the synthetic `:` on the GPU, and there
                * are no CPU-only rules to expand. Slot allocations can use
                * the smaller GPUBATCH_RULES_*_SIZE constants for ~96x memory
                * savings on the typical HashMob workload. */
-              gpu_legacy_slot_unused = (rl.ncpu == 0) ? 1 : 0;
+              /* A U32-REQUIRED rule sits in rl.cpu ONLY because its placeholder is not byte
+               * bytecode.  Now that it runs on the device it is not CPU residue, and if it
+               * still counted as such it would hold gpu_legacy_slot_unused at 0 and disable
+               * the currule = NULL short-circuit -- measured at roughly half the wall time. */
+              gpu_legacy_slot_unused = ((rl.ncpu - n_u32only + u32_clawed) == 0) ? 1 : 0;
               gpu_rules_engine_active = 1;
               tsfprintf(stderr,
                 "GPU rule engine: %d/%d rules eligible (%.1f%%), "
@@ -52573,7 +53769,7 @@ usage:
                * (HashMob.100k ~500 KB > 64 KB on most NVIDIA). Free
                * the host-side copies; sub-commit C will fall back to
                * CPU rule expansion when gpu_rule_count == 0. */
-              free(prog); free(offs); free(orig);
+              free(prog); free(offs); free(slot);
               fprintf(stderr,
                 "GPU rule engine: %d eligible rules but upload failed "
                 "on all %d device(s) — falling back to CPU rule path "
@@ -52582,7 +53778,7 @@ usage:
                 rl.ngpu, n_dev, pos);
             }
           } else {
-            free(prog); free(offs); free(orig);
+            free(prog); free(offs); free(slot);
             fprintf(stderr,
               "GPU rule engine: malloc failed for %d-rule program — "
               "falling back to CPU rule path\n", rl.ngpu);
@@ -52591,6 +53787,7 @@ usage:
         }
       }
       free(rule_ptrs);
+      free(rule_lens);
     }
    }  /* end Numrules > 0 branch */
   }  /* end gpu_opencl_available() */
@@ -52615,86 +53812,151 @@ usage:
       /* Synthetic 1-byte no-rule pass; same semantics as OpenCL synth arm. */
       unsigned char *prog = malloc(1);
       uint32_t      *offs = malloc(sizeof(uint32_t));
-      int           *orig = malloc(sizeof(int));
-      if (prog && offs && orig) {
+      int           *slot = malloc(sizeof(int));
+      if (prog && offs && slot) {
         prog[0] = 0;
         offs[0] = 0;
-        orig[0] = -1;
+        slot[0] = 0;
         gpu_rule_program        = prog;
         gpu_rule_offsets        = offs;
-        gpu_rule_origin         = orig;
+        gpu_rule_slot         = slot;
         gpu_rule_program_len    = 1;
         gpu_rule_count          = 1;
         gpu_rule_membership     = NULL;
         gpu_legacy_slot_unused  = 1;
         gpu_rules_engine_active = 1;
       } else {
-        free(prog); free(offs); free(orig);
+        free(prog); free(offs); free(slot);
       }
     } else {
       /* Numrules > 0: classify + pack the GPU-eligible subset. */
       char **rule_ptrs = malloc(Numrules * sizeof(char *));
-      if (rule_ptrs) {
+      unsigned short *rule_lens = malloc(Numrules * sizeof(unsigned short));
+      if (rule_ptrs && rule_lens) {
         char *rp = Rules;
         int rn = 0;
         while (rn < Numrules) {
           unsigned short int rlen = *((unsigned short int *)rp);
           if (rlen == 0) break;
+          rule_lens[rn]   = (unsigned short)(rlen - 1);  /* bytecode, no NUL */
           rule_ptrs[rn++] = rp + 2;
           rp += rlen + 2;
         }
         if (rn == Numrules) {
           struct rule_lists rl;
-          if (classify_rules(rule_ptrs, Numrules, &rl) >= 0 && rl.ngpu > 0) {
+          /* Counted BEFORE the guard below, and the guard admits n_u32only on its own.
+           * A rule file whose every line is U32-REQUIRED leaves rl.ngpu == 0 -- every
+           * rule carries the 0x00 placeholder, which gpu_rule_safe_phase0 refuses -- so
+           * a guard of rl.ngpu > 0 alone skipped this whole block and sent NOTHING to
+           * the device, including the very rules this change exists to admit. */
+          int n_u32only = 0;
+          if (Utf32Rules && Rule_u32ok && Rule_byteok) {
+            for (unsigned y = 0; y < Numrules; y++)
+              if (!Rule_byteok[y] && Rule_u32ok[y]) n_u32only++;
+          }
+          if (classify_rules(rule_ptrs, rule_lens, Numrules, &rl) >= 0 && (rl.ngpu > 0 || n_u32only > 0)) {
             uint32_t prog_cap = 0;
-            for (int i = 0; i < rl.ngpu; i++) prog_cap += (uint32_t)(strlen(rl.gpu[i]) + 1);
+            for (int i = 0; i < rl.ngpu; i++) prog_cap += (uint32_t)rl.gpulen[i] + 1;
+            prog_cap += (uint32_t)n_u32only * 2u;
             prog_cap += 1; /* synthetic `:` */
             unsigned char *prog = malloc(prog_cap);
-            uint32_t      *offs = malloc((rl.ngpu + 1) * sizeof(uint32_t));
-            int           *orig = malloc((rl.ngpu + 1) * sizeof(int));
-            if (prog && offs && orig) {
+            uint32_t      *offs = malloc((rl.ngpu + 1 + n_u32only) * sizeof(uint32_t));
+            int           *slot = malloc((rl.ngpu + 1 + n_u32only) * sizeof(int));
+            if (prog && offs && slot) {
               uint32_t pos = 0;
               for (int i = 0; i < rl.ngpu; i++) {
                 offs[i] = pos;
-                size_t blen = strlen(rl.gpu[i]) + 1;
+                size_t blen = (size_t)rl.gpulen[i] + 1;   /* + trailing NUL */
                 memcpy(prog + pos, rl.gpu[i], blen);
                 pos += (uint32_t)blen;
-                orig[i] = -1;
-                for (int j = 0; j < Numrules; j++) {
-                  if (rule_ptrs[j] == rl.gpu[i]) { orig[i] = j; break; }
-                }
+                slot[i] = rl.gpuidx[i] + 1;   /* 1-BASED: RuleCnt[] index */
               }
               offs[rl.ngpu] = pos;
               prog[pos++] = 0;
-              orig[rl.ngpu] = -1;
-              int n_rules_with_synth = rl.ngpu + 1;
+              slot[rl.ngpu] = 0;
+              /* The U32-REQUIRED entries go AFTER the synthetic `:`, which stays at index
+               * rl.ngpu exactly where it is today so nothing that special-cases it by
+               * position moves.
+               *
+               * The byte stream is RULE_OP_NOOP then the terminator, NOT a bare NUL.  The
+               * kernel detects the synthetic pass as (rule_program[byte_roff] == 0); a bare
+               * NUL would make one of these indistinguishable from it, bypassing the no-op
+               * detection and crediting the rule for the no-rule pass -- the -Z inflation
+               * this codebase has already fixed once.  A two-byte no-op is also harmless if
+               * the byte walker is ever handed the rule, which bit 30 says it must not be. */
+              int n_devrules = rl.ngpu + 1;
+              if (n_u32only) {
+                for (unsigned y = 0; y < Numrules; y++) {
+                  if (Rule_byteok[y] || !Rule_u32ok[y]) continue;
+                  offs[n_devrules]   = pos;
+                  prog[pos++]   = (unsigned char)RULE_OP_NOOP;
+                  prog[pos++]   = 0;
+                  slot[n_devrules]   = (int)y + 1;   /* 1-BASED, as rl.gpuidx[i] + 1 is */
+                  n_devrules++;
+                }
+              }
+              int n_rules_with_synth = n_devrules;
               gpu_rule_program     = prog;
               gpu_rule_offsets     = offs;
-              gpu_rule_origin      = orig;
+              gpu_rule_slot      = slot;
               gpu_rule_program_len = pos;
               gpu_rule_count       = n_rules_with_synth;
               gpu_rule_membership  = calloc(Numrules, 1);
               if (gpu_rule_membership) {
-                for (int i = 0; i < rl.ngpu; i++) {
-                  if (orig[i] >= 0 && orig[i] < (int)Numrules) {
-                    gpu_rule_membership[orig[i]] = 1;
+                for (int i = 0; i < n_rules_with_synth; i++) {
+                  if (slot[i] >= 1 && slot[i] <= (int)Numrules) {
+                    gpu_rule_membership[slot[i] - 1] = 1;
+                    /* Same guard as the OpenCL block above; see it for why. */
+                    /* A GPU-eligible rule with no byte bytecode is now the INTENDED state for a
+                     * U32-REQUIRED rule, so warn only when NEITHER engine can run it -- which is
+                     * the genuinely broken case.  The old form fired once per U32-only rule, 14
+                     * times per run on the mixed fixture. */
+                    if (Rule_byteok && Rule_u32ok &&
+                        !Rule_byteok[slot[i] - 1] && !Rule_u32ok[slot[i] - 1])
+                        fprintf(stderr,
+                          "%s WARNING rule %d is GPU-eligible but neither engine "
+                          "can run it\n", "Metal: rule engine", slot[i]);
                   }
                 }
               }
-              gpu_legacy_slot_unused  = (rl.ncpu == 0) ? 1 : 0;
+              /* AFTER the membership fill, not before it.  This call clears membership for
+               * any admitted rule the device walker cannot run -- a tier-3 string-operand
+               * rule -- and it reads gpu_rule_membership to do so.  Placed before the
+               * calloc above, the pointer was still NULL, the clawback guard skipped
+               * SILENTLY, and the pre-filter reported success having changed nothing:
+               * syntax.md5 under MODE=1 gave 8,446 of 13,435, the 6 of 14 tier-3 rules
+               * walked by neither side.  Still long before any word is read. */
+              int u32_clawed = gpu_u32_membership_prefilter(prog, pos, offs,
+                                                          n_rules_with_synth);
+              if (u32_clawed < 0) u32_clawed = 0;   /* -1 = could not apply */
+              /* + u32_clawed, and this is not bookkeeping.  The flag gates the
+               * currule = NULL short-circuit: when set, the outer do/while exits after the
+               * no-rule pass and THE CPU RULE WALK DOES NOT HAPPEN.  Correct only while
+               * every rule really is on the device.  The clawback above hands the tier-3
+               * string-operand rules BACK to the CPU, so without counting them here the
+               * short-circuit stops the CPU walking rules the device also skipped --
+               * measured 8,446 of 13,435 on u32-ops.rule, and appending one byte-refused
+               * rule (v2-) to raise rl.ncpu made the same run byte-exact, which is what
+               * isolated it. */
+              /* A U32-REQUIRED rule sits in rl.cpu ONLY because its placeholder is not byte
+               * bytecode.  Now that it runs on the device it is not CPU residue, and if it
+               * still counted as such it would hold gpu_legacy_slot_unused at 0 and disable
+               * the currule = NULL short-circuit -- measured at roughly half the wall time. */
+              gpu_legacy_slot_unused  = ((rl.ncpu - n_u32only + u32_clawed) == 0) ? 1 : 0;
               gpu_rules_engine_active = 1;
               fprintf(stderr,
                 "Metal: rule engine — %d/%d rules GPU-eligible, "
                 "%u-byte program, %d total kernel rules (incl. synthetic ':')\n",
                 rl.ngpu, (int)Numrules, pos, n_rules_with_synth);
             } else {
-              free(prog); free(offs); free(orig);
+              free(prog); free(offs); free(slot);
             }
           }
           /* classify_rules allocates rl.gpu/rl.cpu internally — they're
            * stable pointers into Rules, no free needed. */
         }
         free(rule_ptrs);
+        free(rule_lens);
       }
     }
     /* Pre-upload overflow chain to GPU — mirrors the OpenCL arm above. */
@@ -55883,6 +57145,47 @@ usage:
           J1N(RC, Dohash, ti);
       }
   }
+
+  /* DCC2 (e918) accepts its usernames through -u / -U as well as inside a
+   * $DCC2$ wrapper. The hot loop keys on Typesalt entries of the form
+   * "iter:username", so fold each supplied userid into Typesalt here, carrying
+   * the userid's OWN reference count rather than inventing one:
+   *
+   *   -F   byte-exact: store_typesalt is called once per hash line
+   *   -U   occurrence count from the userid file -- retires when solved
+   *   -u   1000000 -- a generic pool, effectively non-retiring
+   *
+   * This runs after the -u binding above, so reading TYPEUSER alone covers both
+   * channels. Counts are ADDED to any salt a $DCC2$ file already contributed,
+   * so mixing -F and -U in one run sums rather than clobbers. Typical DCC2
+   * lists carry one unique user per hash, which is why a -U count of 1 is
+   * correct and lets the salt retire once its hash is solved. */
+  { Word_t dti = JOB_DCC2;
+    J1T(RC, Dohash, dti);
+    if (RC && TYPEUSER(JOB_DCC2)) {
+      Pvoid_t dcc_uj = (Pvoid_t)TYPEUSER(JOB_DCC2);
+      char dcc_u[256], dcc_s[288];
+      Word_t *DUPV, *DSPV;
+      int dcc_n = 0;
+      dcc_u[0] = 0;
+      JSLF(DUPV, dcc_uj, (unsigned char *)dcc_u);
+      while (DUPV) {
+        int ul = mystrlen(dcc_u), k, off;
+        if (ul > 0 && ul < 200) {
+          off = snprintf(dcc_s, sizeof(dcc_s), "%d:", DCC2_DEFAULT_ITER);
+          for (k = 0; k < ul; k++)
+            dcc_s[off + k] = tolower((unsigned char)dcc_u[k]);
+          dcc_s[off + ul] = 0;
+          JSLI(DSPV, TYPESALT(JOB_DCC2), (unsigned char *)dcc_s);
+          if (DSPV) { *DSPV += *DUPV; dcc_n++; }
+        }
+        JSLN(DUPV, dcc_uj, (unsigned char *)dcc_u);
+      }
+      if (dcc_n)
+        fprintf(stderr, "DCC2: %d userid(s) from -u/-U folded into salts "
+                        "at %d iterations\n", dcc_n, DCC2_DEFAULT_ITER);
+    }
+  }
   if (combo_pepper) {
       Word_t ti = 0;
       J1F(RC, Dohash, ti);
@@ -56360,7 +57663,7 @@ usage:
    * MDXFIND_KERNEL_A_TRACE files; harness picks up from there. */
 #ifdef GPU_ENABLED
   {
-    const char *bf_fixture = getenv("MDXFIND_KERNEL_A_FIXTURE_BF");
+    const char *bf_fixture = NULL;   /* was MDXFIND_KERNEL_A_FIXTURE_BF */
     if (bf_fixture != NULL && *bf_fixture != '\0') {
       uint32_t fx_num_words = 0;
       uint64_t fx_bf_start  = 0;
@@ -56418,7 +57721,8 @@ usage:
        * at mdxfind.c:10487). All lanes point at the same zero-length
        * slot; A4 ignores packed_buf/word_offset entirely (BF candidate
        * IS the mask expansion). */
-      fxg->packed_buf[0]    = 0;
+      fxg->packed_buf[0]    = 0;   /* plen = 0, low byte  */
+      fxg->packed_buf[1]    = 0;   /* plen = 0, high byte (2-byte header) */
       if (fx_num_words > fxg->word_offset_entries) {
         fprintf(stderr,
             "FATAL: %s:%d fixture-bf num_words=%u exceeds word_offset_entries=%u\n",
@@ -56455,8 +57759,7 @@ usage:
       fprintf(stderr,
           "[fixture-bf] dispatch returned res=%p nhits=%d (trace=%s)\n",
           (void *)fx_res, fx_nhits,
-          getenv("MDXFIND_KERNEL_A_TRACE") ?
-              getenv("MDXFIND_KERNEL_A_TRACE") : "(unset)");
+          "(removed)");
       /* Clean exit. The trace files have been written by the dispatcher's
        * gpu_*_kernel_a_trace_dump() call. */
       exit(0);
@@ -56480,8 +57783,6 @@ usage:
    * everything before this marker so loader-time CPU records do not appear
    * as CPU-only divergences against the GPU validator. Gated; production
    * stderr is identical when MDXFIND_RULE_VALIDATOR is unset. */
-  if (getenv("MDXFIND_RULE_VALIDATOR") != NULL)
-    fprintf(stderr, "VALIDATE_PHASE_RUNTIME\n");
   launch(ReportStats, NULL);
 
   /* Auto-enable -W auto if MDXFIND_CACHE is set and -W was not specified */
@@ -56521,7 +57822,6 @@ usage:
         MaskTotal = MaskAppendTotal;
         Dodigits = MaskAppendLen;
         Maxnumbers = MaskTotal;
-        NumbersFmt = NULL;
         { int ci;
           MaskChunkSize = 1;
           for (ci = MaskAppendLen - 1; ci >= 0; ci--) {
@@ -56768,10 +58068,8 @@ usage:
                           (TYPESALT(x) == NULL) &&
                           (MaskPrependLen == 0) &&
                           (MaskAppendLen >= 1) && (MaskAppendLen <= 8);
-                      if (_bf_fast_ok &&
-                          getenv("MDXFIND_GPU_FAST_DISABLE") != NULL) {
-                          _bf_fast_ok = 0;
-                      }
+                      /* MDXFIND_GPU_FAST_DISABLE used to veto the fast path
+                       * here. */
                       job->bf_fast_eligible = (unsigned int)(_bf_fast_ok ? 1 : 0);
                   }
                   /* num_words derived in procjob from MaskCount/bf_num_masks
@@ -57045,7 +58343,6 @@ usage:
       isdone = 0;
       while (!isdone) {
         Numbers = 0;
-reprocess:
         NextX = 0;
 
 	isdone = 1;
@@ -57195,8 +58492,6 @@ reprocess:
               job->flags = (Printsource | Addlf);
               if (Dodigits)
                 job->flags |= JOBFLAG_NUMBERS;
-              if (Doip)
-                job->flags |= JOBFLAG_IP;
               if (MaskPrepend || MaskPrependLen > 0)
                 job->flags |= JOBFLAG_PREPEND;
               job->Numbers = Numbers;
@@ -57247,11 +58542,6 @@ reprocess:
             }
           }
           J1N(RC, Dohash, NextX);
-        }
-        if (Dodigits && !(MaskLen || MaskPrependLen || MaskAppendLen)) {
-          Numbers += Iter_Count[Dodigits];
-          if (Numbers < Maxnumbers)
-            goto reprocess;
         }
       }
     }
@@ -57314,6 +58604,17 @@ bf_done:
   fprintf(stderr, "%s lines processed in %llu seconds\n", commify(Totallines), (unsigned long long) start);
   {
     unsigned long long _gpu_rules_total = atomic_load(&Totrules_gpu);
+    /* -8 accounting, reported for the same reason procrule reports it: a pair no
+     * engine can run, and a pair whose UTF-32 answer was locale-ambiguous, are
+     * both real losses of coverage, and a silent one reads as "the wordlist did
+     * not contain it".  Printed only when non-zero, and only under -8. */
+    if (Utf32Rules && Unreachable)
+      fprintf(stderr, "%s (word,rule) pairs skipped: rule needs UTF-32 and the "
+                      "word is not valid UTF-8\n", commify(Unreachable));
+    if (Utf32Rules && Variants_dropped)
+      fprintf(stderr, "%s (word,rule) pairs had more than one UTF-32 locale "
+                      "variant; only the first was tried (use -L to pin one)\n",
+              commify(Variants_dropped));
     if (Totrules || _gpu_rules_total) {
       fprintf(stderr, "%s total rule-generated passwords tested\n",
               commify(Totrules + Totallines + _gpu_rules_total));
@@ -57361,27 +58662,34 @@ bf_done:
     fprintf(stderr, "%s Total hashes found\n", commify(Totfound));
 
   if (DoHistogram && RuleCnt) {
-    unsigned short int *si;
     for (z = x = 0; x <= Numrules; x++) {
       if (RuleCnt[x]) z++;
     }
 
     rulehist = malloc_lock((z + 2)*sizeof(struct RuleHist),"rulehist");
-    d = Rules;
     y = 0;
     if (RuleCnt[0]) {
-      rulehist[y].rule = "No rule";
+      rulehist[y].rule  = "No rule";
+      rulehist[y].rlen  = 7;
       rulehist[y++].val = RuleCnt[0];
     }
     for (x = 1; x <= Numrules; x++) {
-      si = (unsigned short int *) d;
-      len = *si++;
-      d = (char *) si;
-      if (RuleCnt[x]) {
-        rulehist[y].rule = d;
-        rulehist[y++].val = RuleCnt[x];
+      if (!RuleCnt[x]) continue;
+      /* The rule's SOURCE TEXT, captured at the -r/-R load site before
+       * packrules compiled the line in place.  There is deliberately no decode
+       * step here: packed bytecode is not decompilable, because an operand byte
+       * can hold the same value as an opcode letter.  The decoder that tried it
+       * printed `$z` as \345z^@^B and then walked past the entry NUL into the
+       * next rule -- an out-of-bounds read, and the reason -Z output could not
+       * be trusted for rule attribution. */
+      if (Rulesrclen && Rulesrclen[x]) {
+        rulehist[y].rule = Rulesrc + Rulesrcoff[x];
+        rulehist[y].rlen = Rulesrclen[x];
+      } else {
+        rulehist[y].rule = "(source not retained)";
+        rulehist[y].rlen = 21;
       }
-      d += len;
+      rulehist[y++].val = RuleCnt[x];
     }
     z = y;
     if (y > 0) {
@@ -57395,91 +58703,9 @@ bf_done:
       if (Totfound > 999999999999L)
         y = 19;
       fprintf(stderr, "%*s  Rule\n", y, "Count");
-      for (x = 0; x < z; x++) {
-        unsigned char *d1;
-        fprintf(stderr, "%*s  ", y, commify(rulehist[x].val));
-        d = rulehist[x].rule;
-	if (strcmp(d,"No rule") == 0) {
-	    fprintf(stderr,"%s\n",d);
-	    continue;
-	}
-        while (*d) {
-	  int slen,i;
-          d1 = (unsigned char *) d;
-	  switch (*d1) {
-	    case 0xff:
-		slen = *++d1 & 0xff;
-		for (i = 0; i < slen; i++)
-		  fprintf(stderr, "$%c", d1[i+1]);
-		d += slen + 1;
-		break;
-	    case 0xfe:
-		slen = *++d1 & 0xff;
-		d1 += slen;
-		for (i = 0; i <slen; i++)
-		  fprintf(stderr, "^%c", *d1--);
-		d += slen +1;
-		break;
-	    case 'X':
-	        fprintf(stderr,"%c%c%c%c",*d1,Rulepos[d1[1]-1],Rulepos[d1[2]-1],Rulepos[d1[3]-1]);
-		d += 3;
-		break;
-	    case '_':
-	    case '<':
-	    case '>':
-	    case 'L':
-	    case 'R':
-	    case '+':
-	    case '-':
-	    case '.':
-	    case ',':
-	    case 'y':
-	    case 'Y':
-	    case 'T':
-	    case 'p':
-	    case 'D':
-	    case 'Z':
-	    case 'z':
-	        fprintf(stderr,"%c%c",*d1,Rulepos[d1[1]-1]);
-		d++;
-		break;
-	    case '^':
-	    case '$':
-	    case '/':
-	    case '!':
-	    case '(':
-	    case ')':
-	    case 'e':
-	    case '@':
-	        fprintf(stderr,"%c%c",*d1,d1[1]);
-		d++;
-		break;
-	    case '=':
-	    case '%':
-	    case 'i':
-	    case 'o':
-	        fprintf(stderr,"%c%c%c",*d1,Rulepos[d1[1]-1],d1[2]);
-		d += 2;
-		break;
-	    case '*':
-	    case 'x':
-	    case 'O':
-	        fprintf(stderr,"%c%c%c",*d1,Rulepos[d1[1]-1],Rulepos[d1[2]-1]);
-		d += 2;
-		break;
-	    case 's':
-	        fprintf(stderr,"%c%c%c",*d1,d1[1],d1[2]);
-		d += 2;
-		break;
-	    default:
-	        fprintf(stderr,"%c",*d1);
-		break;
-
-          } 
-          d++;
-        }
-        fprintf(stderr, "\n");
-      }
+      for (x = 0; x < z; x++)
+        fprintf(stderr, "%*s  %.*s\n", y, commify(rulehist[x].val),
+                (int)rulehist[x].rlen, rulehist[x].rule);
     }
   }
 

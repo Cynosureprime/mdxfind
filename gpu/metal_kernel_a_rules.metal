@@ -112,8 +112,9 @@
  * KNOB G (Metal twin, 2026-05-29) -- coalesced uint4 (16-byte)
  * candidate writes.
  * --------------------------------------------------------------------
- * Build-gated by -DKNOBG_VEC_WRITE=1 (host env-flag MDXFIND_METAL_-
- * EXPERIMENT_KNOBG_VEC_WRITE=1). Metal preprocessorMacros at the
+ * Build-gated by -DKNOBG_VEC_WRITE=1, which the host sets.  It used to be
+ * reachable with MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1, removed
+ * 2026-09-16. Metal preprocessorMacros at the
  * library-load site in gpu_metal.m forks the JIT cache automatically
  * (Apple's MTLLibrary self-cache is keyed on source + macros).
  *
@@ -171,9 +172,10 @@
  * ====================================================================
  * PROFILE_VARIANT scaffolding (Metal twin, 2026-05-29)
  * --------------------------------------------------------------------
- * Build-gated by -DPROFILE_VARIANT=N (N in 1..6); host env-flag
- *   MDXFIND_METAL_PROFILE_VARIANT=N
- * threads the macro via MTLCompileOptions.preprocessorMacros at JIT
+ * Build-gated by -DPROFILE_VARIANT=N (N in 1..6), set by the host.  An
+ * MDXFIND_METAL_PROFILE_VARIANT=N env var used to thread it through and was
+ * removed 2026-09-16.  The host still threads the macro via
+ * MTLCompileOptions.preprocessorMacros at JIT
  * library load. Apple's MTLLibrary self-cache is keyed on source +
  * macros, so cache forks automatically per variant (no manual cache-
  * key threading needed).
@@ -209,8 +211,8 @@
  *   V6              V0 + Metal Knob G FORCED ON (D5.a direct-from-buf
  *                   shape, NOT OpenCL stage[]). PRODUCES VALID
  *                   CANDIDATES (unlike V1..V5); kernel B runs
- *                   normally; crack output is bit-equivalent to V0 +
- *                   MDXFIND_METAL_EXPERIMENT_KNOBG_VEC_WRITE=1. The
+ *                   normally; crack output is bit-equivalent to V0 with
+ *                   Knob G built in. The
  *                   V0-vs-V6 kernel_a_us delta is the empirical
  *                   per-byte-write-component reduction attributable
  *                   to Metal Knob G. Closes the prediction-
@@ -294,9 +296,18 @@
 #define RULE_OP_HEX_UPPER   0xc3
 #define RULE_OP_HEX_LOWER   0xc2
 #define RULE_OP_DIV_INSERT  0xc1
+#define RULE_OP_CHR_ADD     0xc0
 
-#define RULE_BUF_MAX   40960
-#define RULE_BUF_LIMIT (RULE_BUF_MAX - 1)
+/* Rule-walker scratch in ELEMENTS; host injects -D RULE_BUF_MAX from
+ * GPU_RULES_WALKER_BUF_ELEMS (gpujob.h).  Fallback only.  LIMIT is MAX-15
+ * (NUL + n+1 slack), and exceeding it is defined behaviour: the rule stops
+ * and what it produced becomes the candidate.  See gpu_md5_rules.cl. */
+#ifndef RULE_BUF_MAX
+#define RULE_BUF_MAX   2048
+#endif
+#ifndef RULE_BUF_LIMIT
+#define RULE_BUF_LIMIT (RULE_BUF_MAX - 15)
+#endif
 
 /* Kernel-A state buffer offsets. Single source of truth for host wiring
  * (Phase 4) to mirror via fixed-offset writes/reads. */
@@ -310,6 +321,71 @@
  * case_flip_mask(c) returns 0x20 if `c` is alphabetic (A-Z or a-z),
  * else 0. Verbatim from gpu_md5_rules.cl rev 1.30.
  */
+/* Candidate-buffer width and address space.  See the note above: under `-8`
+ * the buffer is a slice of the device-side pool, U32_OUT_BYTES wide because the
+ * UTF-32 arm encodes up to U32_BUF_LIMIT codepoints at 4 bytes each. */
+#ifdef GPU_U32_WALKER_PRESENT
+#define KA_BUF_BYTES  U32_OUT_BYTES
+#else
+#define KA_BUF_BYTES  RULE_BUF_MAX
+#endif
+
+/* Grid shape, and why it differs between the engines on THIS backend only.
+ *
+ * Byte mode: one lane per (word, rule).  The candidate buffer is 2 KB of
+ * `thread` memory and a lane is cheap, so the whole cross product is one grid
+ * and a lane that finishes just exits.
+ *
+ * `-8`: one lane per WORD, with the rule axis as an inner loop, because the
+ * UTF-32 walker needs U32_SLOT_BYTES (24 KB) of working memory per lane and
+ * Apple Metal does NOT spill -- a `thread` array that size fails PSO creation
+ * outright ("Compute function exceeds available temporary registers"), and a
+ * `device` pool with one slot per (word, rule) lane would be tens of GB at the
+ * 16,384-word peak.  One slot per WORD is 402 MB, which is exactly what
+ * metal_template.metal already allocates, and the rule loop costs nothing: the
+ * host's rule chunking is unchanged, so the DISPATCH count is unchanged too.
+ *
+ * KA_SKIP is what makes one body serve both.  Every early exit in the
+ * per-candidate body means "this (word, rule) pair emits nothing" -- which is
+ * a `return` when the pair IS the lane and a `continue` when it is one
+ * iteration of the lane's rule loop.  The two exits that mean "this LANE has
+ * no work" (the grid bound and the PROFILE_VARIANT==5 stub) stay `return` in
+ * both shapes.
+ *
+ * The OpenCL twin keeps one lane per (word, rule) on both engines: private
+ * arrays there spill to scratch, which is exactly the thing Metal will not do.
+ */
+#ifdef GPU_U32_WALKER_PRESENT
+#define KA_SKIP  continue
+#else
+#define KA_SKIP  return
+#endif
+
+/* ---- The private byte walker, and when it is NOT compiled ------------
+ *
+ * Kernel A carries its own copy of case_flip_mask() and the byte walker (named
+ * apply_rule_thread here, with a `thread` candidate buffer).  Under `-8` the
+ * host puts metal_md5_rules.metal in this library instead -- the UTF-32
+ * walker's byte arm calls apply_rule(), and the walker has to be defined
+ * between apply_rule and the kernel, which one source file cannot express --
+ * so both copies would be in the same translation unit and case_flip_mask
+ * would be a redefinition.
+ *
+ * The substitution is semantically exact: the two Metal copies differ only in
+ * loop-variable hoisting (`int j = 0; for (; ...)` against
+ * `for (int j = 0; ...)`), the PROFILE_VARIANT==3 timing stub, and kernel-A's
+ * own KERNELA_STATE_* constants, which are outside this region.  The 62 opcode
+ * macros the two files share are identical token for token, so they are left
+ * UNGUARDED -- an identical redefinition is legal and keeping them visible
+ * means this file still compiles standalone.
+ *
+ * The address space changes with the guard: `thread` for kernel A's own
+ * walker, `device` for the shared one, because Apple Metal does not spill and
+ * a 24 KB thread array fails PSO creation outright.  Under `-8` the candidate
+ * buffer therefore lives in the device-side pool (buffer 7) alongside the
+ * walker's two uint buffers, the same arrangement metal_template.metal uses.
+ * -------------------------------------------------------------------- */
+#ifndef GPU_U32_WALKER_PRESENT
 static inline uchar case_flip_mask(uchar c)
 {
     uchar v = (uchar)((c | (uchar)0x20) - (uchar)'a');
@@ -336,6 +412,16 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
     return len;
 #else
     int k = 0;
+    /* ---- memory family: M 4 6 Q X (GPU-enabled 2026-09-11) ------------
+     * Per-call scratch, matching ruleproc.c: applyrule() sets memlen = 0 at
+     * the top of EVERY call, so memory never crosses a (word, rule) boundary
+     * -- which is what makes these ops portable to an independent work-item.
+     * `thread` here to match buf; 2048 elements, affordable where a second
+     * 40960-byte buffer FATAL'd an RTX 3080 in the reverted 2026 attempt.
+     * NOTE this walker is a documented hand-copy of gpu_kernel_a_rules.cl
+     * (see the file header); these arms are byte-identical to that file's. */
+    thread uchar mem[RULE_BUF_MAX];
+    int          memlen = 0;
     int orig_len = len;
 
     for (int n = 0; n < 256; n++) {
@@ -378,7 +464,9 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
             case RULE_OP_INSERT: {
                 int pos = (int)prog[k + 1] - 1;
                 uchar ch = prog[k + 2];
-                if (pos >= 0 && pos < len && len < RULE_BUF_LIMIT) {
+                /* pos <= len: inserting at position == length is an APPEND,
+                 * which john and hashcat 6.2.5 both do. */
+                if (pos >= 0 && pos <= len && len < RULE_BUF_LIMIT) {
                     for (int j = len; j > pos; j--) buf[j] = buf[j - 1];
                     buf[pos] = ch;
                     len++;
@@ -404,6 +492,19 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
             }
 
             /* ---- Per-position arithmetic (branchless) ---- */
+            /* hashcat `BNX`: add the byte value of X to the byte at
+             * position N, wrapping.  No-op out of range, matching
+             * hashcat's mangle_chr_add() and ruleproc.c.  Branchless,
+             * in the style of RULE_OP_INC below. */
+            case RULE_OP_CHR_ADD: {
+                int pos = (int)prog[k + 1] - 1;
+                uchar add = prog[k + 2];
+                int valid = ((pos >= 0) & (pos < len));
+                int safe_pos = valid ? pos : 0;
+                buf[safe_pos] = (uchar)(buf[safe_pos] + (valid ? add : (uchar)0));
+                k += 3;
+                break;
+            }
             case RULE_OP_INC: {
                 int pos = (int)prog[k + 1] - 1;
                 int valid = ((pos >= 0) & (pos < len));
@@ -474,12 +575,13 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
                     uchar c = buf[j];
                     if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
                 }
-                for (int q = 0; q < len; q++) {
-                    uchar c = buf[q];
-                    if (c >= 'a' && c <= 'z') {
-                        buf[q] = c ^ (uchar)0x20;
-                        break;
-                    }
+                /* john and hashcat both act on POSITION 0, not on the
+                 * first alphabetic character: `c` on "!bang" gives "!bang"
+                 * in both, where the find-first form gave "!Bang".  Mirrors
+                 * ruleproc.c. */
+                if (len > 0) {
+                    uchar c = buf[0];
+                    if (c >= 'a' && c <= 'z') buf[0] = c ^ (uchar)0x20;
                 }
                 k += 1;
                 break;
@@ -491,12 +593,13 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
                     uchar c = buf[j];
                     if (c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
                 }
-                for (int q = 0; q < len; q++) {
-                    uchar c = buf[q];
-                    if (c >= 'A' && c <= 'Z') {
-                        buf[q] = c ^ (uchar)0x20;
-                        break;
-                    }
+                /* john and hashcat both act on POSITION 0, not on the
+                 * first alphabetic character: `c` on "!bang" gives "!bang"
+                 * in both, where the find-first form gave "!Bang".  Mirrors
+                 * ruleproc.c. */
+                if (len > 0) {
+                    uchar c = buf[0];
+                    if (c >= 'A' && c <= 'Z') buf[0] = c ^ (uchar)0x20;
                 }
                 k += 1;
                 break;
@@ -530,9 +633,18 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
                 int z = 0;
                 for (int j = 0; j < len; j++) {
                     uchar c = buf[j];
-                    if (c == ' ') { z = 0; }
-                    else if (z == 0 && c >= 'a' && c <= 'z') { z = 1; buf[j] = c ^ case_flip_mask(c); }
-                    else if (c >= 'A' && c <= 'Z') { buf[j] = c ^ case_flip_mask(c); }
+                    /* An already-uppercase letter at a word start IS the
+                     * capital: keep it and mark the word started.  The old
+                     * form left z at 0 so the NEXT lowercase letter was
+                     * capitalised -- Hello1 became hEllo1. */
+                    /* Word start is POSITIONAL: the first character after a
+                     * separator, or position 0, whether or not it is a letter.
+                     * The old form only consumed the word start when it SAW a
+                     * letter, so "!bang" gave "!Bang" where john and hashcat
+                     * both give "!bang".  Mirrors ruleproc.c. */
+                    if (c == ' ') { z = 0; continue; }
+                    if (z == 0) { z = 1; if (c >= 'a' && c <= 'z') buf[j] = c ^ case_flip_mask(c); }
+                    else { if (c >= 'A' && c <= 'Z') buf[j] = c ^ case_flip_mask(c); }
                 }
                 k += 1;
                 break;
@@ -542,9 +654,14 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
                 int z = 0;
                 for (int j = 0; j < len; j++) {
                     uchar c = buf[j];
-                    if (c == delim) { z = 0; }
-                    else if (z == 0 && c >= 'a' && c <= 'z') { z = 1; buf[j] = c ^ case_flip_mask(c); }
-                    else if (c >= 'A' && c <= 'Z') { buf[j] = c ^ case_flip_mask(c); }
+                    /* Word start is POSITIONAL: the first character after a
+                     * separator, or position 0, whether or not it is a letter.
+                     * The old form only consumed the word start when it SAW a
+                     * letter, so "!bang" gave "!Bang" where john and hashcat
+                     * both give "!bang".  Mirrors ruleproc.c. */
+                    if (c == delim) { z = 0; continue; }
+                    if (z == 0) { z = 1; if (c >= 'a' && c <= 'z') buf[j] = c ^ case_flip_mask(c); }
+                    else { if (c >= 'A' && c <= 'Z') buf[j] = c ^ case_flip_mask(c); }
                 }
                 k += 2;
                 break;
@@ -674,7 +791,15 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
             case RULE_OP_REPL_NEXT: {
                 int pos = (int)prog[k + 1] - 1;
                 if (pos >= 0 && pos < len) {
-                    buf[pos] = (pos + 1 < len) ? buf[pos + 1] : (uchar)0;
+                    /* NO-OP when pos+1 is out of range, matching hashcat and
+                     * ruleproc.c: `hashcat --stdout` on abcdefghij gives
+                     * abcdefghjj for `.8` and abcdefghij unchanged for `.9`.
+                     * This wrote (uchar)0 instead, embedding a NUL in the
+                     * candidate -- a third answer again, different from both
+                     * the CPU engine's one-past-the-end read and hashcat's
+                     * no-op, so CPU and GPU hit sets could disagree on any
+                     * rule using `.` at the last position. */
+                    if (pos + 1 < len) buf[pos] = buf[pos + 1];
                 }
                 k += 2;
                 break;
@@ -765,24 +890,202 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
                 k += 3;
                 break;
             }
+
+            /* ---- character classes (0x80-0x89) and =NX / %NX ----------
+             * Mirrors ruleproc.c's class arms exactly.  The 480-byte
+             * membership table and rule_class_match() live in the COMMON
+             * source, in the constant address space -- deliberately not a
+             * function-local array, which is what put the retired memory-op
+             * attempt over the per-thread private-memory budget.
+             *
+             * Promoting these off the CPU-only list is the point: every
+             * character-class rule used to force a mixed GPU/CPU partition,
+             * and a partitioned run has to union two result sets.
+             */
+            case RULE_OP_SUB_CLASS: {
+                uchar cb = prog[k + 1];
+                uchar y  = prog[k + 2];
+                for (int j = 0; j < len; j++)
+                    if (rule_class_match(cb, buf[j])) buf[j] = y;
+                k += 3; break;
+            }
+            case RULE_OP_PURGE_CLASS: {
+                uchar cb = prog[k + 1];
+                int d = 0;
+                for (int j = 0; j < len; j++)
+                    if (!rule_class_match(cb, buf[j])) buf[d++] = buf[j];
+                len = d;
+                k += 2; break;
+            }
+            case RULE_OP_TITLE_CLASS: {
+                /* john's e?C: positional word start, separator untouched. */
+                uchar cb = prog[k + 1];
+                int z = 0;
+                for (int j = 0; j < len; j++) {
+                    uchar c = buf[j];
+                    if (rule_class_match(cb, c)) { z = 0; continue; }
+                    if (z == 0) {
+                        z = 1;
+                        if (c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
+                    } else {
+                        if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
+                    }
+                }
+                k += 2; break;
+            }
+            case RULE_OP_TITLE_CLASS_HC: {
+                /* hashcat's ~e?C is a DIFFERENT algorithm from john's e?C
+                 * above: it lowercases every position, uppercases position 0
+                 * and every position whose PREDECESSOR was in the class, and
+                 * case-normalises the separator itself.  The class test reads
+                 * the pre-modification byte. */
+                uchar cb = prog[k + 1];
+                int up = 1;
+                for (int j = 0; j < len; j++) {
+                    uchar c = buf[j];
+                    int this_up = up;
+                    up = rule_class_match(cb, c) ? 1 : 0;
+                    if (c >= 'A' && c <= 'Z') { c ^= (uchar)0x20; buf[j] = c; }
+                    if (this_up && c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
+                }
+                k += 2; break;
+            }
+            case RULE_OP_REJ_HAS_CLASS: {
+                uchar cb = prog[k + 1];
+                for (int j = 0; j < len; j++)
+                    if (rule_class_match(cb, buf[j])) return -1;
+                k += 2; break;
+            }
+            case RULE_OP_REJ_NHAS_CLASS: {
+                uchar cb = prog[k + 1];
+                int found = 0;
+                for (int j = 0; j < len; j++)
+                    if (rule_class_match(cb, buf[j])) { found = 1; break; }
+                if (!found) return -1;
+                k += 2; break;
+            }
+            case RULE_OP_REJ_FIRST_CLASS: {
+                uchar cb = prog[k + 1];
+                if (len > 0 && !rule_class_match(cb, buf[0])) return -1;
+                k += 2; break;
+            }
+            case RULE_OP_REJ_LAST_CLASS: {
+                uchar cb = prog[k + 1];
+                if (len > 0 && !rule_class_match(cb, buf[len - 1])) return -1;
+                k += 2; break;
+            }
+            case RULE_OP_REJ_AT_CLASS: {
+                int   y  = (int)prog[k + 1] - 1;
+                uchar cb = prog[k + 2];
+                if (y >= len || !rule_class_match(cb, buf[y])) return -1;
+                k += 3; break;
+            }
+            case RULE_OP_REJ_CNT_CLASS: {
+                int   y  = (int)prog[k + 1] - 1;
+                uchar cb = prog[k + 2];
+                int cnt = 0;
+                for (int j = 0; j < len; j++)
+                    if (rule_class_match(cb, buf[j])) cnt++;
+                if (cnt < y) return -1;
+                k += 3; break;
+            }
+            case RULE_OP_REJ_AT_CHR: {
+                /* `=NX` reject unless the character at position N is X. */
+                int   y = (int)prog[k + 1] - 1;
+                uchar c = prog[k + 2];
+                if (y >= len || buf[y] != c) return -1;
+                k += 3; break;
+            }
+            case RULE_OP_REJ_CNT_CHR: {
+                /* `%NX` reject unless X occurs at least N times. */
+                int   y = (int)prog[k + 1] - 1;
+                uchar c = prog[k + 2];
+                int cnt = 0;
+                for (int j = 0; j < len; j++) if (buf[j] == c) cnt++;
+                if (cnt < y) return -1;
+                k += 3; break;
+            }
+            /* ---- memory family, mirroring ruleproc.c's SLOW path ---------
+             * The CPU fast path escapes to slowrule on overflow; the slow
+             * path CLAMPS (y = MAXLINE - clen) rather than skipping, and that
+             * is the behaviour with a real limit, so it is what we mirror at
+             * RULE_BUF_LIMIT.  `6` prepends by memmove-right-then-copy
+             * because a GPU buffer has no headroom before index 0, where the
+             * CPU walks cpass backwards into its 512-byte slack. */
+            case RULE_OP_MEM_STORE: {          /* M -- store candidate */
+                for (int j = 0; j < len; j++) mem[j] = buf[j];
+                memlen = len;
+                k += 1; break;
+            }
+            case RULE_OP_MEM_APP: {            /* 4 -- append memory */
+                int y = memlen;
+                if (len + y > RULE_BUF_LIMIT) y = RULE_BUF_LIMIT - len;
+                if (y < 0) y = 0;
+                if (y > 0) {
+                    for (int j = 0; j < y; j++) buf[len + j] = mem[j];
+                    len += y;
+                }
+                k += 1; break;
+            }
+            case RULE_OP_MEM_PRE: {            /* 6 -- prepend memory */
+                int y = memlen;
+                if (len + y > RULE_BUF_LIMIT) y = RULE_BUF_LIMIT - len;
+                if (y < 0) y = 0;
+                if (y > 0) {
+                    for (int j = len - 1; j >= 0; j--) buf[j + y] = buf[j];
+                    for (int j = 0; j < y; j++) buf[j] = mem[j];
+                    len += y;
+                }
+                k += 1; break;
+            }
+            case RULE_OP_MEM_REJ: {            /* Q -- reject if == memory */
+                if (memlen == len) {
+                    int same = 1;
+                    for (int j = 0; j < len; j++) {
+                        if (buf[j] != mem[j]) { same = 0; break; }
+                    }
+                    if (same) return -1;
+                }
+                k += 1; break;
+            }
+            case RULE_OP_MEM_INSERT: {         /* X N M I */
+                /* Insert M chars of memory from OFFSET N at position I.
+                 * Out-of-range REJECTS, following hashcat's
+                 * mangle_insert_multi -- operator ruling 2026-09-11, and
+                 * identical to the CPU arm. */
+                int y    = (int)prog[k + 1] - 1;   /* offset within memory */
+                int tlen = (int)prog[k + 2] - 1;   /* count              */
+                int z    = (int)prog[k + 3] - 1;   /* insert position    */
+                if (memlen < 1 || tlen < 1 || z > len ||
+                    y > memlen || (y + tlen) > memlen) return -1;
+                if (len + tlen > RULE_BUF_LIMIT) tlen = RULE_BUF_LIMIT - len;
+                if (tlen > 0) {
+                    for (int j = len; j >= z; j--) buf[j + tlen] = buf[j];
+                    for (int j = 0; j < tlen; j++) buf[z + j] = mem[y + j];
+                    len += tlen;
+                }
+                k += 4; break;
+            }
             case RULE_OP_EXTRACT: {
+                /* xAB: extract B characters from position A.  Mirrors
+                 * ruleproc.c, which follows HASHCAT here (operator ruling
+                 * 2026-09-11, superseding an earlier ruling for john).
+                 * hashcat's mangle_extract() no-ops on BOTH out-of-range
+                 * conditions and never extracts a partial run:
+                 *     if (upos >= arr_len)         return arr_len;
+                 *     if ((upos + ulen) > arr_len) return arr_len;
+                 * On "abc": x22 and x23 are "abc" here and "c" in john;
+                 * x90 is "abc" here and a reject in john.  A zero count
+                 * with an in-range start yields an EMPTY candidate, which
+                 * is kept -- john's empty-word rejection was also ruled to
+                 * hashcat.  start==0 self-copies, as on the CPU. */
                 int start = (int)prog[k + 1] - 1;
                 int count = (int)prog[k + 2] - 1;
-                if (start > 0 && start < len && count > 0) {
-                    int actual = 0;
-                    while (actual < count && (start + actual) < len) {
-                        buf[actual] = buf[start + actual];
-                        actual++;
+                if (start >= 0 && start < len && (start + count) <= len) {
+                    for (int q = 0; q < count; q++) {
+                        buf[q] = buf[start + q];
                     }
-                    len = actual;
-                } else if (start == 0 && start < len && count > 0) {
-                    int actual = 0;
-                    while (actual < count && actual < len) {
-                        actual++;
-                    }
-                    len = actual;
-                } else if (start >= len || start < 0) {
-                    /* applyrule: clen > y false branch, no change. */
+                    len = count;
                 }
                 k += 3;
                 break;
@@ -833,20 +1136,25 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
 
             /* ---- Rejection ops ---- */
             case RULE_OP_REJ_LEN_NE: {
+                /* CURRENT length, not the original word's. */
                 int y = (int)prog[k + 1] - 1;
-                if (y != orig_len) return -1;
+                if (y != len) return -1;
                 k += 2;
                 break;
             }
             case RULE_OP_REJ_LEN_GE: {
+                /* john: "<N reject unless less than N chars" -- reject when
+                 * len >= N.  This was the complement, matching ruleproc.c's
+                 * old behaviour; both fixed together so CPU and GPU agree. */
                 int y = (int)prog[k + 1] - 1;
-                if (len < y) return -1;
+                if (len >= y) return -1;
                 k += 2;
                 break;
             }
             case RULE_OP_REJ_LEN_LE: {
+                /* john: ">N reject unless greater than N chars". */
                 int y = (int)prog[k + 1] - 1;
-                if (len > y) return -1;
+                if (len <= y) return -1;
                 k += 2;
                 break;
             }
@@ -927,6 +1235,7 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
     return len;
 #endif  /* PROFILE_VARIANT == 3 stub guard */
 }
+#endif  /* !GPU_U32_WALKER_PRESENT -- see the note above */
 
 /* ---- Kernel A1 (rules-only) production kernel --------------------
  *
@@ -969,6 +1278,17 @@ void cand_rules_phase0(device uchar         *payload,
                                 device uchar         *b_packed_buf,
                                 device uint          *b_chunk_index,
                                 device atomic_uint *b_kernelA_state,
+#ifdef GPU_U32_WALKER_PRESENT
+                                /* UTF-32 path, buffers 6 and 7.  `device`, not
+                                 * `constant`: the same 26,048-byte case table
+                                 * in a constant bank put the OpenCL twin past
+                                 * NVIDIA's 64 KB limit and ptxas refused the
+                                 * build.  The pool is U32_SLOT_BYTES per word,
+                                 * carved exactly as metal_template.metal
+                                 * carves it. */
+                                device const uint  *u32_case_tab,
+                                device uchar       *u32_scratch_pool,
+#endif
                                 uint gid [[thread_position_in_grid]])
 {
     device const OCLParams *params_buf = (device const OCLParams *)payload;
@@ -993,11 +1313,17 @@ void cand_rules_phase0(device uchar         *payload,
     uint n_rules    = params.num_rules;           /* this chunk's rule_count */
     uint total      = n_words * n_rules;
 
+#ifdef GPU_U32_WALKER_PRESENT
+    /* One lane per WORD -- see the grid-shape note at KA_SKIP. */
+    if (gid >= n_words) return;
+    uint word_idx        = gid;
+#else
     if (gid >= total) return;
 
     uint word_idx        = gid % n_words;
     uint rule_idx_local  = gid / n_words;           /* 0..(rule_count-1) */
     uint rule_idx        = rule_start + rule_idx_local;  /* GLOBAL rule index */
+#endif
 
     /* ==== PROFILE_VARIANT scaffolding (2026-05-29, perf decomposition) =====
      * Mirrors OpenCL twin gpu_kernel_a_rules.cl rev 1.7 lines 935-1184.
@@ -1017,13 +1343,37 @@ void cand_rules_phase0(device uchar         *payload,
     uint pkt_off = 132u + (n_words * 4u);
     device thread const uchar  * words= payload + pkt_off;
 
+#ifdef GPU_U32_WALKER_PRESENT
+    /* Carve this lane's slice of the device pool, laid out exactly as
+     * U32_SLOT_BYTES documents: u32buf, then u32mem, then the candidate.
+     * One lane per WORD under this gate, so the pool is indexed by word_idx
+     * and the host sizes it at num_words slots -- the same allocation
+     * metal_template.metal makes. */
+    device uchar *u32slot =
+        u32_scratch_pool + (ulong)word_idx * (ulong)U32_SLOT_BYTES;
+    device uint  *u32buf = (device uint *)(u32slot);
+    device uint  *u32mem = (device uint *)(u32slot + (ulong)U32_BUF_ELEMS * 4u);
+    device uchar *buf    = u32slot + (ulong)U32_BUF_ELEMS * 8u;
+
+    /* Bits 30-31 carry the per-word CLASS under `-8`
+     * (gpu_u32_tag_word_offsets), so the offset MUST be masked.  No staging
+     * loop: u32_run_pair reads the word out of `words` itself on both arms. */
+    uint raw_woff = word_offset[word_idx];
+    uint wpos = raw_woff & U32_OFF_MASK;
+    uint wcls = raw_woff >> U32_TAG_SHIFT;
+    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
+    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
+    if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
+#else
     /* Private buffer (16-byte aligned, matches md5_rules_phase0). */
-    __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
+    __attribute__((aligned(16))) uchar buf[KA_BUF_BYTES];
 
     uint wpos = word_offset[word_idx];
-    int wlen = (int)words[wpos++];
+    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
+    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
     for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
+#endif
 
 #if defined(PROFILE_VARIANT) && PROFILE_VARIANT == 4
     /* V4 (walker only): word-read into buf is done; skip apply_rule_-
@@ -1038,15 +1388,41 @@ void cand_rules_phase0(device uchar         *payload,
             &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 0u,
             memory_order_relaxed);
     }
-    return;
+    return;   /* outside the rule loop: this LANE is done */
 #endif
 
+#ifdef GPU_U32_WALKER_PRESENT
+    /* The rule axis, as an inner loop -- see the grid-shape note at KA_SKIP.
+     * `total` keeps its cross-product meaning so the slot-bound check inside
+     * the body is unchanged. */
+    for (uint rule_idx_local = 0u; rule_idx_local < n_rules; rule_idx_local++) {
+    uint rule_idx = rule_start + rule_idx_local;
+#endif
     uint rpos = rule_offset[rule_idx];
     int is_no_rule = (rule_program[rpos] == 0);
+#ifdef GPU_U32_WALKER_PRESENT
+    /* The second half of rule_offset holds the UTF-32 stream offset plus the
+     * two capability bits, based at params.num_masks -- 0 on every byte-mode
+     * kernel-A dispatch and unread by this kernel, set by the host to the
+     * FIRST-HALF ENTRY COUNT under `-8`.  params.num_rules cannot serve: it is
+     * the per-CHUNK rule count under rule-axis chunking, so chunk 1 onward
+     * would index the wrong half.
+     *
+     * `buf` is passed as both bytebuf and out; the aliasing is safe by
+     * inspection of u32_run_pair (its byte arm's closing copy becomes
+     * self-assignment, its UTF-32 arm never touches bytebuf). */
+    uint u32_rpos = rule_offset[params.num_masks + rule_idx];
+    int engine = 0;
+    int new_len = u32_run_pair(words, wpos, wlen, rule_program,
+                               rpos, u32_rpos, wcls,
+                               buf, u32buf, u32mem,
+                               buf, KA_BUF_BYTES, u32_case_tab, &engine);
+#else
     int new_len = apply_rule_thread(rule_program + rpos, buf, wlen);
+#endif
 
     /* Rejection sentinel: no slot reserved, no buffer write. */
-    if (new_len < 0) return;
+    if (new_len < 0) KA_SKIP;
 
     /* No-op detection: synthetic ":" no-rule pass already covered this
      * candidate; skip slot emission. Foundational mdxfind behavior
@@ -1056,7 +1432,7 @@ void cand_rules_phase0(device uchar         *payload,
         for (int i = 0; i < wlen; i++) {
             if (buf[i] != words[wpos + i]) { changed = 1; break; }
         }
-        if (!changed) return;
+        if (!changed) KA_SKIP;
     }
 
     /* Clamp new_len to fit in the [len] byte. RULE_BUF_LIMIT < 65536 so
@@ -1079,8 +1455,8 @@ void cand_rules_phase0(device uchar         *payload,
     {
         uint byte_off = gid * 256u;
         uint slot     = gid;
-        if (byte_off + need_bytes > params.packed_size) return;
-        if (slot >= total) return;
+        if (byte_off + need_bytes > params.packed_size) KA_SKIP;
+        if (slot >= total) KA_SKIP;
         b_packed_buf[byte_off] = (uchar)emit_len;
         for (uint i = 0; i < emit_len; i++) {
             b_packed_buf[byte_off + 1u + i] = buf[i];
@@ -1126,7 +1502,7 @@ void cand_rules_phase0(device uchar         *payload,
             atomic_fetch_or_explicit(
                 &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u,
                 memory_order_relaxed);
-            return;
+            KA_SKIP;
         }
         uint slot = atomic_fetch_add_explicit(
             &b_kernelA_state[KERNELA_STATE_SLOT_COUNTER / 4u], 1u,
@@ -1135,7 +1511,7 @@ void cand_rules_phase0(device uchar         *payload,
             atomic_fetch_or_explicit(
                 &b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u,
                 memory_order_relaxed);
-            return;
+            KA_SKIP;
         }
         device uint *dst = (device uint *)(b_packed_buf + byte_off);
         uint hdr = (uint)emit_len
@@ -1171,7 +1547,7 @@ void cand_rules_phase0(device uchar         *payload,
      * check (otherwise the tail uint stores could spill past packed). */
     if (byte_off + need_aligned > params.packed_size) {
         atomic_fetch_or_explicit(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u, memory_order_relaxed);
-        return;
+        KA_SKIP;
     }
 #else
     uint byte_off = atomic_fetch_add_explicit(
@@ -1183,7 +1559,7 @@ void cand_rules_phase0(device uchar         *payload,
      * (so the slot count reflects only successfully-emitted candidates). */
     if (byte_off + need_bytes > params.packed_size) {
         atomic_fetch_or_explicit(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u, memory_order_relaxed);
-        return;
+        KA_SKIP;
     }
 #endif
 
@@ -1195,7 +1571,7 @@ void cand_rules_phase0(device uchar         *payload,
      * past 'total' early-returned at line 1086), flag and skip. */
     if (slot >= total) {
         atomic_fetch_or_explicit(&b_kernelA_state[KERNELA_STATE_OVERFLOW_FLAG / 4u], 1u, memory_order_relaxed);
-        return;
+        KA_SKIP;
     }
 
     /* --- Write [len][bytes] into packed buf ----------------------- */
@@ -1244,4 +1620,7 @@ void cand_rules_phase0(device uchar         *payload,
      * single-queue FIFO to ensure these writes are visible to kernel B
      * before kernel B dispatches. No explicit fence; the queue boundary
      * provides the cross-kernel global-memory visibility. */
+#ifdef GPU_U32_WALKER_PRESENT
+    }   /* rule_idx_local loop -- see the grid-shape note at KA_SKIP */
+#endif
 }

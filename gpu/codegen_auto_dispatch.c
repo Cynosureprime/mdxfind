@@ -10,18 +10,21 @@
  * 2026-05-31 (gpu_metal.m 1.128; metal_kernel_a_rules.metal 1.6).
  *
  * Decision authority (per spec §2):
- *   1. MDXFIND_GPU_BACKEND={auto|legacy|codegen}  developer/test FORCE
+ *   1. (removed 2026-09-16) an MDXFIND_GPU_BACKEND developer/test FORCE
  *   2. hardcoded capability table (consulted at route gates)
  *
  * Advisory output (per spec §3): one stderr line per JOB-change, deduped
- * on (op, backend_pick). MDXFIND_GPU_BACKEND_QUIET=1 suppresses.
+ * on (op, backend_pick).  Nothing suppresses them any more.
  *
  * Deprecation shim (per spec §4 R3): MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5
  * triggers a one-shot stderr WARNING; flag value is IGNORED (matrix
  * decision fires). One-version retention; remove in v1.50x.
  *
- * $Revision: 1.2 $
+ * $Revision: 1.3 $
  * $Log: codegen_auto_dispatch.c,v $
+ * Revision 1.3  2026/09/17 05:24:07  dlr
+ * Remove MDXFIND_GPU_BACKEND, MDXFIND_GPU_BACKEND_QUIET and the MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 deprecation shim. The FORCE override bypassed the capability table for every eligible cell, which could produce 0 cracks where legacy is broken or FATAL where codegen is unsupported; the table decides now, always. The three dead branches are deleted rather than left unreachable, because codegen_auto_dispatch_dump_matrix -- the -V output -- was advertising all three variables to the user as though they still worked. It now says selection is automatic with no override.
+ *
  * Revision 1.2  2026/05/31 19:43:11  dlr
  * iter v1.2 (#386): admit JOB_SHA1 (e8) + JOB_SHA256 (e10) hex-feedback siblings of SHA1RAW/SHA256RAW into the codegen route gate at ANY iter; closes user item #5 from 2026-05-31 not-working list. Per #379 v1.1 widen option (a). Verified op-ids in job_types.h. CPU paths mdxfind.c:28666-28679 (SHA1) + :29088-29097 (SHA256) confirm hex-feedback (prmd5 between iters), distinct from binary-feedback RAW siblings (:27994, :29077). codegen/hx_emit_primitives.c adds 2 rows to unsalted_job_table (auto-propagates digest_bytes). gpu/gpujob_*.c widens admit + adds iter-aware full-digest recompute that walks N iters of mysha1/mysha256+prmd5 chain mirroring CPU loop. gpu_metal.m widens _is_exp_md5 admission gate. gpu/codegen_auto_dispatch.c+h add cells 9b/9c/9d for SHA1/SHA256 + 6 matrix-dump probes + docstring update. Apple Metal template_iterate empirically BROKEN for SHA1/SHA256 iter>1 (returns 0 cracks; same root cause as MD5: metal_template.metal:684 Phase 1 intentionally not called) — auto-dispatcher Metal SHA1/SHA256 iter>1 cell picks CODEGEN (flagship class). Latent iter-aware-recompute bug found+fixed during validation (was iter=1-only; broke immediately for new ops at i=2). 24-cell new-op parity matrix + 38-cell regression matrix ALL PASS byte-exact vs CPU oracle on dev1 M1 + fpga Pascal + hpi7 Maxwell. Cross-host CPU-oracle md5s match. Advisory dedup verified.
  *
@@ -40,7 +43,7 @@
 
 /* ---- internal state -------------------------------------------------- */
 
-/* FORCE-override state, decoded from MDXFIND_GPU_BACKEND env var on
+/* FORCE-override state.  Always 0 = auto since 2026-09-16; was decoded on
  * first call. -1 = uninspected; 0 = auto (default); 1 = force LEGACY;
  * 2 = force CODEGEN. Cached for the life of the process. */
 static int _force_mode = -1;  /* -1 uninspected, 0 auto, 1 legacy, 2 codegen */
@@ -56,7 +59,7 @@ typedef struct {
 static adv_dedup_entry_t _adv_dedup[ADV_DEDUP_MAX];
 static int _adv_dedup_n = 0;
 
-/* Quiet flag: MDXFIND_GPU_BACKEND_QUIET=1 suppresses advisories. */
+/* Quiet flag: always 0.  An env var used to set it. */
 static int _quiet_cached = -1;
 
 /* OLD env var deprecation shim state: one-shot WARNING. */
@@ -64,71 +67,30 @@ static int _deprecation_warned = 0;
 
 /* ---- helpers --------------------------------------------------------- */
 
-/* Lazy-init the FORCE-override mode from MDXFIND_GPU_BACKEND. Per spec
- * §2: "auto" (or unrecognized) falls through to the capability table;
- * "legacy" forces LEGACY; "codegen" forces CODEGEN. Unrecognized values
- * print a stderr NOTICE and fall through to auto. */
+/* There is no FORCE override.  The mode is always 0 = auto, i.e. the
+ * capability table decides.  Until 2026-09-16 an MDXFIND_GPU_BACKEND env var
+ * could force LEGACY or CODEGEN for every eligible cell, bypassing the table
+ * -- a diagnostic mode that could produce 0 cracks on cells where legacy is
+ * broken, or FATAL where codegen is unsupported.  Nothing should be able to
+ * ask for that from the environment. */
 static void _force_init(void)
 {
-    if (_force_mode != -1) return;
-    const char *e = getenv("MDXFIND_GPU_BACKEND");
-    if (e == NULL || e[0] == '\0' || !strcmp(e, "auto")) {
-        _force_mode = 0;
-        return;
-    }
-    if (!strcmp(e, "legacy")) {
-        _force_mode = 1;
-        fprintf(stderr,
-            "mdxfind: GPU dispatcher FORCE-override active: "
-            "MDXFIND_GPU_BACKEND=legacy. Capability table consultation "
-            "bypassed; all eligible cells route through the legacy hand-"
-            "tuned engine. Diagnostic/test mode -- may produce 0 cracks "
-            "on cells where legacy is broken (e.g., Apple Metal -m e1 "
-            "-i N>1 with rules).\n");
-        return;
-    }
-    if (!strcmp(e, "codegen")) {
-        _force_mode = 2;
-        fprintf(stderr,
-            "mdxfind: GPU dispatcher FORCE-override active: "
-            "MDXFIND_GPU_BACKEND=codegen. Capability table consultation "
-            "bypassed; all eligible cells route through the codegen two-"
-            "engine pipeline. Diagnostic/test mode -- may FATAL or run "
-            "slower than auto on cells where codegen is unsupported "
-            "(mask, BF) or measurably slower (OpenCL JOB_MD5).\n");
-        return;
-    }
-    fprintf(stderr,
-        "mdxfind: NOTICE -- MDXFIND_GPU_BACKEND=%s unrecognized "
-        "(expected auto|legacy|codegen); falling back to auto.\n", e);
     _force_mode = 0;
 }
 
-/* Lazy-init the QUIET flag from MDXFIND_GPU_BACKEND_QUIET. */
+/* Advisories are never suppressed; MDXFIND_GPU_BACKEND_QUIET=1 used to. */
 static int _quiet(void)
 {
-    if (_quiet_cached != -1) return _quiet_cached;
-    const char *e = getenv("MDXFIND_GPU_BACKEND_QUIET");
-    _quiet_cached = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    _quiet_cached = 0;
     return _quiet_cached;
 }
 
+/* Retained as a no-op so callers need not change.  It warned that
+ * MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 was deprecated and ignored; both that
+ * variable and the shim went on 2026-09-16, as did the
+ * MDXFIND_GPU_BACKEND=codegen forcing the warning used to recommend. */
 void codegen_auto_dispatch_deprecation_check(void)
 {
-    if (_deprecation_warned) return;
-    const char *e = getenv("MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5");
-    if (e == NULL || e[0] == '\0') {
-        _deprecation_warned = 1;
-        return;
-    }
-    fprintf(stderr,
-        "mdxfind: WARNING -- MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 is "
-        "deprecated and IGNORED. The dispatcher now auto-selects the "
-        "codegen path when needed (Apple Metal -m e1 -i N>1 with rules; "
-        "JOB_MD5MD5SALT / MAKE_MD5PASS family). Set "
-        "MDXFIND_GPU_BACKEND=codegen to force codegen for diagnostics "
-        "(symmetric force-legacy is also available). This shim is "
-        "scheduled for removal in the next minor version.\n");
     _deprecation_warned = 1;
 }
 
@@ -443,9 +405,7 @@ void codegen_auto_dispatch_dump_matrix(FILE *out)
             GPU_BACKEND_KIND_OPENCL, GPU_BACKEND_KIND_METAL);
     fprintf(out, "  Picks:     LEGACY=%d / CODEGEN=%d / FATAL=%d\n",
             GPU_BACKEND_LEGACY, GPU_BACKEND_CODEGEN, GPU_BACKEND_FATAL);
-    fprintf(out, "  FORCE:     MDXFIND_GPU_BACKEND={auto|legacy|codegen} (default auto)\n");
-    fprintf(out, "  Quiet:     MDXFIND_GPU_BACKEND_QUIET=1 suppresses per-JOB advisories\n");
-    fprintf(out, "  Deprecated: MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 IGNORED (shim warns once)\n\n");
+    fprintf(out, "  Selection: automatic, from the table below.  There is no override.\n\n");
 
     static const struct {
         int backend;

@@ -1,3 +1,230 @@
+# mdxfind v1.590 — every environment variable but `MDXFIND_CACHE` is gone
+
+Source: mdxfind.c rev 1.589 -> 1.590, mymd5.c 1.35 -> 1.36, ruleproc.c 1.45 -> 1.46,
+gpu_metal.m 1.139 -> 1.140, gpu_metal.h 1.66 -> 1.67, gpu/gpu_opencl.c 1.213 -> 1.215,
+gpu/gpujob_opencl.c 1.163 -> 1.164, gpu/gpujob_metal.m 1.49 -> 1.50,
+gpu/codegen_auto_dispatch.c 1.2 -> 1.3.
+
+**If you have a script that sets an `MDXFIND_*` variable other than `MDXFIND_CACHE`, it
+now does nothing.** No error, no warning — the variable is simply not read. Nothing is
+silently reconfigured either: every one of them had "unset" as the production path, so a
+run that did not set them behaves exactly as before.
+
+`MDXFIND_CACHE` is unchanged and is now the only environment input. Backend choice,
+work-group and page sizing, salt batching, warm-up, kernel selection and every tracing
+channel are decided by the program from the work in front of it.
+
+## Why, and the two that were doing harm
+
+A selector whose default is the shipping path is a selector nothing tests. Two of these
+had drifted past useless into harmful:
+
+- `MDXFIND_OOO_QUEUE` put the OpenCL command queue in out-of-order mode. Its own warning
+  said this **loses cracks on some NVIDIA drivers**.
+- `MDXFIND_GPU_BACKEND=legacy|codegen` bypassed the capability table for every eligible
+  cell, so it could produce 0 cracks on cells where legacy is broken, or FATAL where
+  codegen is unsupported.
+
+`MDXFIND_GPU_TEMPLATE`, removed in the same pass, is the clearest illustration: setting it
+to an algorithm other than the one being dispatched made the resolver hand back nothing,
+and the caller then ran the **legacy MD5 kernel against non-MD5 work** and emitted wrong
+digests. Its id space had rotted unnoticed too — `SHA384SALTPASS` and `SHA1DRU` were both
+46, so those two were indistinguishable, and 40-42 were unassigned. Nothing caught it
+because production never set it.
+
+`MDXFIND_GPU_MAX_GLOBAL` is worth a word for anyone who met the `-63`
+(`CL_INVALID_GLOBAL_WORK_SIZE`) failure: it only moved a ceiling constant. The
+`salts_per_page` cap that actually fixes that failure is unconditional and remains.
+
+## One new line on stderr, on x86 hosts that have SHA-NI
+
+`MDXFIND_SHA256_DEBUG` used to report which SHA-256 implementation won. In its place,
+x86 hosts with the SHA extensions now say so at start-up, in the same form as the ARM
+line that has always been there:
+
+    x86 SHA-NI acceleration enabled: SHA256
+
+**Presence only.** A host without SHA-NI prints nothing, exactly as before. SHA-256 is
+computed correctly either way — the portable routine is slower, not wrong — so there is
+nothing to announce, and announcing it would put a line of noise on every run of the
+majority of hosts and read like a fault where there is none.
+
+ARM is unchanged: `arm_ce_detect()` already lists SHA256 in its `ARM CE acceleration
+enabled:` line, so there is no second line there. SHA-1 shares the same CPUID bit but is
+not reported, because its dispatch pointer is resolved lazily on first use and at
+start-up there is nothing truthful to say about it yet.
+
+## Diagnostics and prototypes that are no longer reachable
+
+The tracing channels (`MDXFIND_*_TRACE`), the GPU and rule validators, the hx codegen
+harness (`MDXFIND_HX_CODEGEN_JOB` / `_VALIDATE` / `_FIXTURE`), the kernel-A brute-force
+fixture, and the kernel A1-A4 prototype selectors are all gone. The prototype and harness
+**sources are retained**, but nothing reaches them. Driving any of them again means adding
+a command-line option: an option is visible in the invocation, appears in `mdxfind -?`,
+and can be regression-tested. An environment variable is none of those things.
+
+Verified CPU-equals-GPU with non-zero GPU hits over 200,000 words on both backends — an
+RTX 4070 Ti SUPER under OpenCL and an M1 under Metal — across MD5, NTLMH, MD4UTF16,
+MD5SALTPASS, MD5PASSSALT and SHA1PASSSALT, plus the `-8` UTF-32 rule path on Metal.
+
+# mdxfind v1.583 — the rule engine reached parity with john and hashcat, and some existing rule files mean something different now
+
+Source: mdxfind.c rev 1.582 -> 1.583, ruleproc.c rev 1.34 -> 1.35, gpujob.h rev 1.48 -> 1.49.
+
+Read the first two sections before running anything with `-r`. Four changes alter what an
+unchanged rule file produces, and one of them made earlier results wrong rather than
+merely different.
+
+## Rule files that use a literal `?` stop loading
+
+`??` is now the literal-`?` escape, in both class syntaxes. A rule that purges or
+substitutes a question mark has to be rewritten:
+
+    @?      ->  @??
+    s?!     ->  s??!
+
+Eight lines across the rule files shipped with mdxfind are refused at load for this
+reason — four in `HashMob.100k.rule`, three in `d3ad0ne.rule`, one in `generated.rule`.
+John rejects all eight as well, so nothing is lost by fixing them. The refusal is loud,
+with the caret on the operand:
+
+      Rule: @?
+             ^
+      Error: Invalid character class for command '@'
+    Invalid rule line. Ignored.: @?
+
+## Long words were hashed as a truncation of themselves
+
+The GPU rules path carried the packed word's length in one byte while the admission gate
+let words of up to 40959 bytes through. Any word of 256 bytes or more was therefore
+hashed as its first `len mod 256` bytes: a 285-byte word as its first 29, a 300-byte word
+as its first 44. The emitted plaintext matched the emitted digest, so nothing downstream
+could detect it and the run looked clean.
+
+The length field is now two bytes, little-endian, written and read byte by byte so it
+depends on neither host alignment nor host endianness, and the round trip is proven for
+every admitted length. If you have run rules against a wordlist containing words of 256
+bytes or more with a GPU enabled, those results are incomplete.
+
+## Four verbs changed what they do
+
+- **`c`, `C`, `E` and `eX` act on position 0**, not on the first alphabetic character.
+  `c` on `!bang` now leaves it alone; `C` gives `!BANG`. John and hashcat agree on this
+  and mdxfind did not.
+- **`x` and `X` follow hashcat when out of range** — no-op unless the whole range fits,
+  never a partial run. On `abc`, `x22` and `x23` now give `abc` where they used to
+  produce `c`. The count-overrun case is the one to re-check: it used to produce output
+  and now produces none.
+- **`XNMI` honours its offset `N`.** It was read and then ignored, so every offset gave
+  the same answer. `MX034`, `MX134` and `MX234` on `abcdef` now give `abcdabcef`,
+  `abcdbcdef` and `abcdcdeef`, matching both references.
+- **`TN` is bounds-checked**, as john does. No observable change — the position past the
+  end held NUL and nothing toggled — but it was reading, and could write, one byte of
+  shared workspace past the candidate.
+
+Two long-standing behaviours are now rulings rather than accidents. A candidate that a
+rule empties is **kept**, following hashcat; john rejects it and abandons the rest of the
+rule. And the rest of the rule still runs, so `'0 $Z` yields `Z` here and nothing in
+john. This is the single cause of every remaining difference from john in the class
+sweep — 9 rules of 75 — so a comparison that does not account for it will look like a
+class defect and is not one.
+
+## Character classes
+
+Nine verbs now accept a character class in place of a literal character. There are two
+syntaxes and the prefix selects the class table as well as the notation:
+
+| Syntax | Table | Classes | Complement |
+|--------|-------|---------|------------|
+| `?C` | john's | `?l ?u ?d ?s ?v ?c ?w ?p ?a ?x ?o ?b ?y ?z` | yes — uppercase the letter |
+| `~?C` | hashcat's | `?l ?u ?d ?s ?h ?H` | no |
+
+The verbs, in either syntax: `s?CY`, `@?C`, `e?C`, `!?C`, `/?C`, `(?C`, `)?C`, `=N?C`
+and `%N?C`.
+
+    @?d   on Pass1     ->  Pass
+    @?D   on pass1     ->  1
+    ~@?H  on Pass1 x   ->  Pass x
+
+Three things are decisions, not oversights. `?s` is hashcat's `class_sym()` in **both**
+tables — 33 characters, space plus every printable non-alphanumeric — so it is wider than
+john's. John's user classes `?0`-`?9` are not implemented; john refuses them too. And hex
+classes exist only in the hashcat table, which is what forces the tables apart:
+unprefixed, an uppercase letter means "not the lowercase class", so a john-table `?h`
+would make `?H` mean "not lower hex" instead of hashcat's "uppercase hex". Unprefixed
+`?h` and `?H` therefore name no class and are refused, exactly as in john.
+
+`e?C` and `~e?C` are different algorithms, not one algorithm with the class test swapped.
+John's treats a class member as a separator and leaves it as it stands. Hashcat's
+lowercases every position, then uppercases position 0 and every position whose
+*predecessor* is in the class, judged on the original bytes. `e?u` on `aBcDe` gives
+`ABCDE`; `~e?u` gives `AbCdE`. Use the `~` form only when reproducing a hashcat run.
+
+Against hashcat's own engine the class sweep is 21 of 21. Against john, 66 of 75, with
+all nine differences being the empty-candidate ruling above.
+
+`BNX` is also new — add the byte value of X to the byte at position N, wrapping. It is
+`RULE_OP_MANGLE_CHR_ADD` in hashcat **master**, absent from the 6.2.5 release and from
+john entirely.
+
+## The rules GPU took on the classes and the memory family, and its VRAM fell 81%
+
+All ten class opcodes, plus `=NX` and `%NX`, are implemented in all six rules kernels,
+sharing one 480-byte membership table in the constant address space so the six cannot
+drift. Three of the shipped rule files now have no CPU-only rules at all. That matters
+beyond throughput: a class rule used to force a mixed GPU/CPU partition, and a
+partitioned run has to union two result sets.
+
+The memory family `M 4 6 Q X` came with them. It was tried on the GPU once before and
+reverted, because at 40960 bytes a second walker buffer doubled per-thread private memory
+and failed with `CL_OUT_OF_HOST_MEMORY` on an RTX 3080. The walker buffer is now 2048
+bytes, so the pair costs a tenth of what one buffer cost before and the objection is
+gone.
+
+Measured on an NVIDIA GTX 1080, `rockyou.txt` (14,341,564 lines) x `best64.rule`
+(77 rules in use), 1,000 MD5 hashes, `-m e1`, median of 3:
+
+| Build | Hash rate | Peak VRAM |
+|-------|----------:|----------:|
+| v1.581 | 0.990 Gh/s | 1769 MiB |
+| v1.583 | 1.047 Gh/s | 325 MiB |
+
+Three verbs remain CPU-only: `S`, `vNC` and Control-B. A rule using one of them routes to
+the CPU list while the rest of the set still runs on the GPU, and the reported hit set is
+the union of the two.
+
+## The two engines can disagree, and that is the design
+
+The input word is gated at 1024 bytes. A longer word goes to the CPU, which applies every
+rule to it there.
+
+Nothing is checked about what a rule *produces*, and nothing will be. Rule output cannot
+be bounded in principle, because for any limit, on either engine, a rule that overflows
+it can be written. So a limit is set arbitrarily: a rule that reaches it does what it can,
+stops, and whatever has been generated becomes the candidate — no error, no warning, no
+status indication. On the GPU that limit is 2033 bytes, 15 below the 2048-byte walker
+buffer to cover a terminating NUL and the `n+1` boundary conditions in the per-verb bounds
+checks. On the CPU it is `MAXLINE`.
+
+So a rule generating more than 2033 bytes produces different candidates on the two paths.
+There is no retry to the CPU and no fallback that would hide it. `-G none` is the answer
+if you need CPU-exact output.
+
+Both limits are compile-time. There are no environment variables that change either one.
+
+## `procrule -u` refuses a class rather than reinterpreting it
+
+The UTF-32 engine does not implement classes, and until this release it did not uniformly
+refuse them either: `@?d` under `-u` took the `?` as the literal operand and re-read the
+`d` as the next verb, so the rule compiled, ran, and meant something else — `Pass1 x`
+became `Pass1 xPass1 x` where the byte engine gives `Pass x`. No diagnostic, and the
+output was plausible.
+
+Every class form is now refused at load time, naming the rule. The `??` escape is the
+exception and is byte-identical across the two engines for all nine unprefixed forms, so
+the `@?` -> `@??` migration above is safe under `-u` as well. A `~`-prefixed rule is
+refused under `-u` whatever follows it.
+
 # mdxfind v1.579 — PHPBB3MD5 found one hash per salt and silently skipped the rest
 
 Source: mdxfind.c rev 1.578 -> 1.579.

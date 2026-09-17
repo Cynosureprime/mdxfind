@@ -108,7 +108,7 @@ YESCRYPT_OBJS = yescrypt/yescrypt-common.o yescrypt/yescrypt-opt.o \
 
 # SQLite amalgamation: https://www.sqlite.org/2025/sqlite-amalgamation-3490100.zip
 MDXFIND_OBJS = mdxfind.o sqlite3.o yarn.o gosthash/gosthash.o rmd128.o mymd5.o \
-               ruleproc.o crypt-des.o myprogress.o
+               ruleproc.o ruleproc32.o classify_utf8.o crypt-des.o myprogress.o
 MDSPLIT_OBJS = mdsplit.o
 
 # sha1_block.s requires yasm and is x86_64-only
@@ -118,12 +118,12 @@ endif
 
 # Metal GPU objects (macOS only)
 ifdef METAL_GPU
-  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o gpu/gpu_codegen_eligible.o gpu/codegen_auto_dispatch.o
+  MDXFIND_OBJS += gpu_metal.o gpu/gpujob_metal.o gpu/gpu_codegen_eligible.o gpu/codegen_auto_dispatch.o gpu/gpu_u32_host.o
 endif
 
 # OpenCL GPU objects (Linux, FreeBSD, aarch64)
 ifdef OPENCL_GPU
-  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o gpu/gpu_codegen_eligible.o gpu/codegen_auto_dispatch.o
+  MDXFIND_OBJS += gpu/gpu_opencl.o gpu/gpujob_opencl.o gpu/opencl_dynload.o gpu/gpu_kernel_cache.o gpu/gpu_codegen_eligible.o gpu/codegen_auto_dispatch.o gpu/gpu_u32_host.o
   CFLAGS += -Igpu
 endif
 
@@ -165,6 +165,15 @@ sqlite3.o: sqlite3.c sqlite3.h
 
 ruleproc.o: ruleproc.c mdxfind.h
 	$(CC) $(CFLAGS) -c ruleproc.c
+
+# The UTF-32 rule engine.  mdxfind.c calls utf8_to_utf32 / utf32_to_utf8 and
+# packrule32 unconditionally, so these two are in MDXFIND_OBJS for every
+# build, GPU or not -- leaving them out is a link error, not a lost feature.
+ruleproc32.o: ruleproc32.c ruleproc32.h rule_ops.h latin_case.h combining.h
+	$(CC) $(CFLAGS) -c ruleproc32.c
+
+classify_utf8.o: classify_utf8.c classify_utf8.h
+	$(CC) $(CFLAGS) -c classify_utf8.c
 
 yarn.o: yarn.c yarn.h
 	$(CC) $(CFLAGS) -c yarn.c
@@ -317,6 +326,11 @@ endif
 # nor -DMETAL_GPU.
 gpu/gpu_codegen_eligible.o: gpu/gpu_codegen_eligible.c gpu/gpu_codegen_eligible.h job_types.h
 	$(CC) $(CFLAGS) -c gpu/gpu_codegen_eligible.c -o gpu/gpu_codegen_eligible.o
+
+# Host side of the UTF-32 GPU walker.  Referenced from both gpu_metal.m and
+# gpu/gpu_opencl.c, so it is added in both GPU blocks above.
+gpu/gpu_u32_host.o: gpu/gpu_u32_host.c gpu/gpu_u32_host.h ruleproc32.h classify_utf8.h gpujob.h
+	$(CC) $(CFLAGS) -c gpu/gpu_u32_host.c -o gpu/gpu_u32_host.o
 
 # codegen_auto_dispatch: in-engine capability+perf matrix for GPU rules
 # backend selection (legacy vs codegen). Pure C; replaces the
