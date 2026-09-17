@@ -11,8 +11,11 @@
  * (lowercase). Per 5a.1 audit the hx compiler emits lowercase names
  * verbatim into _hx_callnames_NNN[] sidecar arrays.
  *
- * $Revision: 1.14 $
+ * $Revision: 1.15 $
  * $Log: hx_emit_primitives.c,v $
+ * Revision 1.15  2026/09/17 03:22:25  dlr
+ * Remove the 123 HX_PRIM_MD5 row from job_to_prim_table so e123 MD5MD5PASS is no longer GPU-eligible. The row was added in sub-phase 5c.2 and admitted e123 as a side effect: HX_PRIM_MD5 was already supported as the INNER hash of every MAKE_MD5PASS member, so the row made the eligibility predicate return 1 with no other change, and the header of gpu_codegen_eligible.h still documented the op as intentionally excluded. e123 is the family only multi-emit member, two digests per candidate being the hex32 form and the colon form, and the downstream emitter never produced both, so the GPU found 0 of 10 known-answer targets on BOTH backends while the CPU found 10 of 10 - a silent total miss. Waffle confirms it was never intended as a GPU type: the criterion is popular types, in practice those with a hashcat mode, and e123 has none. Verified after removal: e123 reads 10 of 10 with the GPU enabled on OpenCL and Metal. The absence of this row IS the gate; do not re-add it to close the family at 30 of 30, which is the reason it went in the first time.
+ *
  * Revision 1.14  2026/05/31 19:43:11  dlr
  * iter v1.2 (#386): admit JOB_SHA1 (e8) + JOB_SHA256 (e10) hex-feedback siblings of SHA1RAW/SHA256RAW into the codegen route gate at ANY iter; closes user item #5 from 2026-05-31 not-working list. Per #379 v1.1 widen option (a). Verified op-ids in job_types.h. CPU paths mdxfind.c:28666-28679 (SHA1) + :29088-29097 (SHA256) confirm hex-feedback (prmd5 between iters), distinct from binary-feedback RAW siblings (:27994, :29077). codegen/hx_emit_primitives.c adds 2 rows to unsalted_job_table (auto-propagates digest_bytes). gpu/gpujob_*.c widens admit + adds iter-aware full-digest recompute that walks N iters of mysha1/mysha256+prmd5 chain mirroring CPU loop. gpu_metal.m widens _is_exp_md5 admission gate. gpu/codegen_auto_dispatch.c+h add cells 9b/9c/9d for SHA1/SHA256 + 6 matrix-dump probes + docstring update. Apple Metal template_iterate empirically BROKEN for SHA1/SHA256 iter>1 (returns 0 cracks; same root cause as MD5: metal_template.metal:684 Phase 1 intentionally not called) — auto-dispatcher Metal SHA1/SHA256 iter>1 cell picks CODEGEN (flagship class). Latent iter-aware-recompute bug found+fixed during validation (was iter=1-only; broke immediately for new ops at i=2). 24-cell new-op parity matrix + 38-cell regression matrix ALL PASS byte-exact vs CPU oracle on dev1 M1 + fpga Pascal + hpi7 Maxwell. Cross-host CPU-oracle md5s match. Advisory dedup verified.
  *
@@ -213,17 +216,24 @@ struct job_to_prim_row {
 static const struct job_to_prim_row job_to_prim_table[] = {
     { 120, HX_PRIM_MD2     },  /* e120 JOB_MD2MD5PASS    -- 5b.1a Tier 1 */
     { 122, HX_PRIM_MD4     },  /* e122 JOB_MD4MD5PASS    -- 5a */
-    /* Sub-phase 5c.2 (2026-05-27): e123 JOB_MD5MD5PASS -- the FIRST
-     * multi-emit member, now GPU-eligible. The eligibility GATE is THIS
-     * table row, not a global supported_5a flag: HX_PRIM_MD5 was already
-     * supported_5a=1 (it is the INNER hash used by every family member),
-     * but no job mapped to MD5-as-OUTER until now. Adding this row makes
-     * hx_primitive_for_job(123) return HX_PRIM_MD5 -> eligible, admitting
-     * ONLY job 123 (no other family member maps to an MD5 outer). The
-     * multi-emit behavior is keyed on the SPEC ENTRY's emit_class
-     * (HX_EMIT_MULTI for e123) in the family emitter, NOT on this prim id.
-     * Family = 30/30 GPU-eligible after this ship. */
-    { 123, HX_PRIM_MD5     },  /* e123 JOB_MD5MD5PASS    -- 5c.2 multi-emit */
+    /* e123 JOB_MD5MD5PASS is deliberately NOT in this table, and this
+     * absence is its GPU gate: with no row, hx_primitive_for_job(123)
+     * returns HX_PRIM_UNKNOWN, the eligibility predicate returns 0, and
+     * the type routes to the CPU where it is correct.
+     *
+     * A { 123, HX_PRIM_MD5 } row was added in sub-phase 5c.2 and admitted
+     * e123 as a side effect -- HX_PRIM_MD5 was already supported as the
+     * INNER hash of every family member, so the row made the predicate
+     * return 1 with no other change. e123 is the family's only multi-emit
+     * member (two digests per candidate: the hex32 form and the colon
+     * form) and the downstream emitter never produced both, so the GPU
+     * found 0 of 10 known-answer targets on BOTH backends while the CPU
+     * found 10 of 10 -- a silent total miss, not a partial one.
+     *
+     * It is also not a target for GPU work: the criterion is popular
+     * types, in practice those with a hashcat mode, and e123 has none.
+     * Do not re-add the row to "close the family at 30/30" -- that count
+     * was the reason it went in the first time. Measured 2026-09-16. */
     { 125, HX_PRIM_GOST    },  /* e125 JOB_GOSTMD5PASS   -- 5b.4b Tier 4 (pre-staged 5b.4a; supported_5a=0 until 5b.4b) */
     { 127, HX_PRIM_HAV128_3 }, /* e127 JOB_HAV128MD5PASS   -- 5b.3a Tier 3 */
     { 129, HX_PRIM_HAV128_4 }, /* e129 JOB_HAV128_4MD5PASS -- 5b.3b */

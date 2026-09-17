@@ -31175,28 +31175,40 @@ static const hx_program _hx_program_914 = {
     .has_emit  = 0,
 };
 
-/* eidx=915 e918 DCC2 : `pbkdf2_sha1(md4(utf16le(pass)), utf16le(username), 10240, 16)` (hx.8 line 944) */
+/* eidx=915 e918 DCC2 : `pbkdf2_sha1(md4_bin(md4_bin(utf16le(pass)) . utf16le(lower(user))), utf16le(lower(user)), N, 16)` (hx.8 line 944) */
 static const char *_hx_callnames_915[] = {
     [0] = NULL,
     [1] = "utf16le",
     [2] = "md4",
     [3] = NULL,
-    [4] = "utf16le",
-    [5] = NULL,
+    [4] = "lower",
+    [5] = "utf16le",
     [6] = NULL,
-    [7] = "pbkdf2_sha1",
+    [7] = "md4",
     [8] = NULL,
+    [9] = "lower",
+    [10] = "utf16le",
+    [11] = NULL,
+    [12] = NULL,
+    [13] = "pbkdf2_sha1",
+    [14] = NULL,
 };
-static const hx_inst _hx_code_915[9] = {
+static const hx_inst _hx_code_915[15] = {
     [0] = { .op = 0, .u.slot = 0 },
     [1] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="utf16le" */ },
-    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="md4" */ },
-    [3] = { .op = 0, .u.slot = 5 },
-    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="utf16le" */ },
-    [5] = { .op = 2, .u.ival = (int64_t)10240 },
-    [6] = { .op = 2, .u.ival = (int64_t)16 },
-    [7] = { .op = 4, .u.call = { .entry = NULL, .nargs = 4, .role = 0 } /* fn="pbkdf2_sha1" */ },
-    [8] = { .op = 6 },
+    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 1 } /* fn="md4" */ },
+    [3] = { .op = 0, .u.slot = 4 },
+    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="lower" */ },
+    [5] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="utf16le" */ },
+    [6] = { .op = 5 },
+    [7] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 1 } /* fn="md4" */ },
+    [8] = { .op = 0, .u.slot = 4 },
+    [9] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="lower" */ },
+    [10] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="utf16le" */ },
+    [11] = { .op = 0, .u.slot = 5 },
+    [12] = { .op = 2, .u.ival = (int64_t)16 },
+    [13] = { .op = 4, .u.call = { .entry = NULL, .nargs = 4, .role = 0 } /* fn="pbkdf2_sha1" */ },
+    [14] = { .op = 6 },
 };
 static const char *_hx_varnames_915[6] = {
     [0] = "pass",
@@ -31204,11 +31216,11 @@ static const char *_hx_varnames_915[6] = {
     [2] = "salt2",
     [3] = "pepper",
     [4] = "user",
-    [5] = "username",
+    [5] = "N",
 };
 static const hx_program _hx_program_915 = {
     .code      = (hx_inst *)_hx_code_915,
-    .ncode     = 9,
+    .ncode     = 15,
     .strings   = NULL,
     .strlens   = NULL,
     .nstrings  = 0,
@@ -34922,7 +34934,7 @@ const struct hx_spec_entry hx_specs_data[] = {
     { .job_enum = 915, .name = "AXCRYPT", .expression = "axcrypt(pass, fromhex(salt), iter)", .hx8_line = 941, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_912, .call_names = _hx_callnames_912, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 916, .name = "AXCRYPTSHA1", .expression = "cut(sha1(pass), 0, 32)", .hx8_line = 942, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_913, .call_names = _hx_callnames_913, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 917, .name = "CISCO9", .expression = "scrypt(pass, salt, 16384, 1, 1)", .hx8_line = 943, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_914, .call_names = _hx_callnames_914, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 918, .name = "DCC2", .expression = "pbkdf2_sha1(md4(utf16le(pass)), utf16le(username), 10240, 16)", .hx8_line = 944, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_915, .call_names = _hx_callnames_915, .emit_class = 0, .note_ref = 51 },
+    { .job_enum = 918, .name = "DCC2", .expression = "pbkdf2_sha1(md4_bin(md4_bin(utf16le(pass)) . utf16le(lower(user))), utf16le(lower(user)), N, 16)", .hx8_line = 944, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_915, .call_names = _hx_callnames_915, .emit_class = 0, .note_ref = 51 },
     { .job_enum = 919, .name = "PWSAFE3", .expression = "T{", .hx8_line = 945, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 920, .name = "IKEPSK-MD5", .expression = "hmac_md5(psk, ike_payload)", .hx8_line = 948, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_917, .call_names = _hx_callnames_917, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 921, .name = "IKEPSK-SHA1", .expression = "hmac_sha1(psk, ike_payload)", .hx8_line = 949, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_918, .call_names = _hx_callnames_918, .emit_class = 0, .note_ref = 0 },

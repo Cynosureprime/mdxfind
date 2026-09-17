@@ -1,0 +1,32 @@
+# cl2metal overlay for wrl (gpu/gpu_wrl_core.cl ->
+# gpu/metal_wrl_core.metal).
+#
+# Closes part of the OpenCL/Metal core gap: wrl had an OpenCL core and no
+# Metal twin, which made the whole-run Metal veto fire for any selection
+# containing it.  WRL, SQL5 and MYSQL3 are in the curated -h '.' set, so
+# that veto cost the GPU on the most common Apple invocation.
+#
+# Apple-specific tweak:
+#
+#   1. arg_address_space: template_finalize.data -> "device const".
+#      The call site in metal_template.metal passes the per-lane scratch
+#      slice as a `device uchar *`, so the translator's default
+#      `thread const uchar *data` inference will not compile.  Same
+#      pattern as md4.yaml / md4utf16.yaml / sha224saltpass.yaml.
+#
+#   2. symbol_rename: gpu_wrl_core.cl spells the shared WRL macro and table
+#      names as gpu_common.cl defines them (WRL_OP x32, WRL_RC x2 in code;
+#      WRL_SBOX appears only in this file's prose and needs no rename),
+#      but metal_common.metal namespaces every lifted primitive with an
+#      MTL_ prefix per Pattern 2 (sibling MTL_TIGER_SBOX, MTL_SNEFRU_SBOX,
+#      MTL_HAVAL_IV).  All three exist there under the prefixed spelling.
+
+algo: wrl
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+symbol_rename:
+  WRL_OP:   MTL_WRL_OP
+  WRL_RC:   MTL_WRL_RC

@@ -415,6 +415,36 @@ def substitute_pass(token_stream):
     return out
 
 
+def apply_symbol_rename(token_stream, renames: dict):
+    """Rename identifier references in code / preprocessor regions.
+
+    metal_common.metal namespaces every table and macro it lifts out of
+    gpu_common.cl with an MTL_ prefix (Pattern 2: MTL_WRL_SBOX, MTL_WRL_OP,
+    MTL_TIGER_T1, MTL_SNEFRU_SBOX, MTL_HAVAL_IV, ...).  A core that spells
+    the OpenCL name therefore will not resolve against the Metal twin --
+    gpu_wrl_core.cl referencing WRL_OP / WRL_RC / WRL_SBOX is the case that
+    motivated this.  Aliasing the unprefixed names in metal_common.metal
+    would also compile but would defeat the namespacing, so the rename
+    belongs here, in the translator.
+
+    `renames` is a plain mapping of OpenCL spelling -> Metal spelling.
+    Matching is whole-identifier (\b-anchored), applied to 'code' and
+    'preproc' tokens only and never to comments or string literals, so a
+    symbol merely NAMED in prose survives untouched.
+    """
+    if not renames:
+        return token_stream
+    compiled = [(re.compile(r'\b%s\b' % re.escape(k)), v)
+                for k, v in renames.items()]
+    out = []
+    for kind, text in token_stream:
+        if kind in ('code', 'preproc'):
+            for pat, repl in compiled:
+                text = pat.sub(repl, text)
+        out.append((kind, text))
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Pass 2: Structural rewriter
 #
@@ -1415,6 +1445,9 @@ def translate(src_path: str, overlay_path: Optional[str] = None) -> str:
     # Pass 1: tokenize + substitute
     tokens = list(tokenize(src))
     tokens = substitute_pass(tokens)
+    # Pass 1b: overlay symbol renames (OpenCL spelling -> Metal spelling for
+    # the MTL_-namespaced primitives in metal_common.metal).
+    tokens = apply_symbol_rename(tokens, overlay.get('symbol_rename') or {})
     code = ''.join(t[1] for t in tokens)
 
     # Pass 2: structural rewrites

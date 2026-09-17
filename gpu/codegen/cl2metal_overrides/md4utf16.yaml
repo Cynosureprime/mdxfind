@@ -21,12 +21,25 @@ skip_line_ranges:
   # Mirrors md4.yaml. The Metal hand-port pattern keeps only the
   # template_emit_hit_or_overflow form. NOTE: source line range
   # differs from md4.yaml because gpu_md4utf16_core.cl lacks the
-  # 3-line comment header above the macro (md4 has it at 269-271;
-  # md4utf16 starts the macro directly at line 262).
-  - start: 262
-    end:   265
+  # 3-line comment header above the macro.
+  #
+  # MOVED 262-265 -> 373-376 (2026-09-15): md4_over_utf16le was added
+  # above this point when the UTF-16LE widening replaced the byte
+  # zero-extend, and 262-265 is now the TAIL of that helper.  Skipping
+  # the old range deleted `return nunits;` and a closing brace out of
+  # the middle of a function, which does not compile -- and the macro
+  # it was meant to skip would then have been emitted as well.  If this
+  # helper ever moves again, re-derive the range; do not adjust it by
+  # the delta.
+  - start: 373
+    end:   376
     reason: "template_emit_hit macro -- replaced by template_emit_hit_or_overflow"
 
 arg_address_space:
   template_finalize:
+    data: "device const"
+  # md4_over_utf16le reads the candidate straight out of the packed word
+  # buffer, which is a device pointer.  Without this the translator emits
+  # `thread const uchar *data` and the call site will not compile.
+  md4_over_utf16le:
     data: "device const"

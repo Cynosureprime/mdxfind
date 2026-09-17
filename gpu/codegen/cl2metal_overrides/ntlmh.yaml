@@ -1,0 +1,25 @@
+# cl2metal overlay for ntlmh (gpu/gpu_ntlmh_core.cl ->
+# gpu/metal_ntlmh_core.metal).
+#
+# Closes part of the OpenCL/Metal core gap: ntlmh had an OpenCL core and no
+# Metal twin, which made the whole-run Metal veto fire for any selection
+# containing it.  WRL, SQL5 and MYSQL3 are in the curated -h '.' set, so
+# that veto cost the GPU on the most common Apple invocation.
+#
+# Apple-specific tweak:
+#
+#   1. arg_address_space: template_finalize.data -> "device const".
+#      The call site in metal_template.metal passes the per-lane scratch
+#      slice as a `device uchar *`, so the translator's default
+#      `thread const uchar *data` inference will not compile.  Same
+#      pattern as md4.yaml / md4utf16.yaml / sha224saltpass.yaml.
+
+algo: ntlmh
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+  md4_zeroext_ntlmh:
+    data: "device const"
+  md4_over_utf16le_ntlmh:
+    data: "device const"

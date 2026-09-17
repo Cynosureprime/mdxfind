@@ -1,11 +1,25 @@
 #!/bin/sh
+
+# ---------------------------------------------------------------------------
+# INERT as of mdxfind 1.590 (2026-09-16).  This driver sets MDXFIND_HX_CODEGEN*
+# environment variables, and mdxfind no longer reads any variable except
+# MDXFIND_CACHE.  A run would exercise nothing while still looking clean, so
+# it refuses.  To revive it, add a command-line option to mdxfind and drive
+# that instead.  See RELEASE_NOTES.md v1.590.
+echo "$0: REFUSING TO RUN -- drives mdxfind via MDXFIND_* env vars that 1.590 no longer reads." >&2
+exit 2
+# ---------------------------------------------------------------------------
+
 # run_validation_e347.sh -- driver for the 2a.5 e347 byte-exact harness.
 #
 # Sub-phase 2a.5 (2026-05-21). Ships the fixture to the target host then
 # invokes mdxfind with MDXFIND_HX_CODEGEN_VALIDATE=1.
 #
-# $Revision: 1.2 $
+# $Revision: 1.3 $
 # $Log: run_validation_e347.sh,v $
+# Revision 1.3  2026/09/17 06:11:43  dlr
+# Refuse to run. This harness drives mdxfind through MDXFIND_* environment variables, and mdxfind 1.590 reads none of them except MDXFIND_CACHE. Left as it was, it would exercise nothing and still look like a clean pass, which is the exact false-green this suite exists to catch. Now exits 2 with an explanation. Reviving it means giving mdxfind a command-line option for the feature and driving that: an option is visible in the invocation, is listed by mdxfind -?, and can be regression-tested.
+#
 # Revision 1.2  2026/05/23 18:55:10  dlr
 # sub-phase 5a7 cleanup fix latent harness invocation bug mdxfind dash V exits at version print before build compact table runs so the e347 harness body was never actually exercised by this script switch to -m e347 -f empty -f empty wordlist pattern matching run validation family md5pass dot sh which reaches build compact table and fires the harness body adds dummy hash and wordlist touch on remote noted by 5a6 agent
 #

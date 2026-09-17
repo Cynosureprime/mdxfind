@@ -1,0 +1,21 @@
+# cl2metal overlay for ripemd160saltpass (gpu/gpu_ripemd160saltpass_core.cl ->
+# gpu/metal_ripemd160saltpass_core.metal).
+#
+# Closes part of the OpenCL/Metal core gap: ripemd160saltpass had an OpenCL core and no
+# Metal twin, which made the whole-run Metal veto fire for any selection
+# containing it.  WRL, SQL5 and MYSQL3 are in the curated -h '.' set, so
+# that veto cost the GPU on the most common Apple invocation.
+#
+# Apple-specific tweak:
+#
+#   1. arg_address_space: template_finalize.data -> "device const".
+#      The call site in metal_template.metal passes the per-lane scratch
+#      slice as a `device uchar *`, so the translator's default
+#      `thread const uchar *data` inference will not compile.  Same
+#      pattern as md4.yaml / md4utf16.yaml / sha224saltpass.yaml.
+
+algo: ripemd160saltpass
+
+arg_address_space:
+  template_finalize:
+    data: "device const"

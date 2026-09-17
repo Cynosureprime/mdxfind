@@ -1,4 +1,15 @@
 #!/bin/sh
+
+# ---------------------------------------------------------------------------
+# INERT as of mdxfind 1.590 (2026-09-16).  This driver sets MDXFIND_HX_CODEGEN*
+# environment variables, and mdxfind no longer reads any variable except
+# MDXFIND_CACHE.  A run would exercise nothing while still looking clean, so
+# it refuses.  To revive it, add a command-line option to mdxfind and drive
+# that instead.  See RELEASE_NOTES.md v1.590.
+echo "$0: REFUSING TO RUN -- drives mdxfind via MDXFIND_* env vars that 1.590 no longer reads." >&2
+exit 2
+# ---------------------------------------------------------------------------
+
 # run_validation_family_md5pass.sh -- driver for the 5a.6 MAKE_MD5PASS
 #                                     family byte-exact validation harness.
 #
@@ -9,8 +20,11 @@
 # Tier 1; e157 (RMD128MD5PASS) added in sub-phase 5b.1b (2026-05-27)
 # Tier 1.
 #
-# $Revision: 1.12 $
+# $Revision: 1.13 $
 # $Log: run_validation_family_md5pass.sh,v $
+# Revision 1.13  2026/09/17 06:11:43  dlr
+# Refuse to run. This harness drives mdxfind through MDXFIND_* environment variables, and mdxfind 1.590 reads none of them except MDXFIND_CACHE. Left as it was, it would exercise nothing and still look like a clean pass, which is the exact false-green this suite exists to catch. Now exits 2 with an explanation. Reviving it means giving mdxfind a command-line option for the feature and driving that: an option is visible in the invocation, is listed by mdxfind -?, and can be regression-tested.
+#
 # Revision 1.12  2026/05/28 06:12:50  dlr
 # sub-phase 5c.2.3 widen FAMILY_JOBS 29 to 30 add 123 MD5MD5PASS e123 numeric-sorted after 122 before 125 the FIRST multi-emit family member closes MAKE_MD5PASS family at 30 of 30 GPU-eligible; e123 emits TWO digests per password canonical plus colon variant harness plants both requires GPU to emit both cracks G1b dual-hash canary; update JOB_ENUM validation case parallel and header comment
 #

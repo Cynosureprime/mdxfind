@@ -1,0 +1,30 @@
+# cl2metal overlay for mysql3 (gpu/gpu_mysql3_core.cl ->
+# gpu/metal_mysql3_core.metal).
+#
+# Closes part of the OpenCL/Metal core gap: mysql3 had an OpenCL core and no
+# Metal twin, which made the whole-run Metal veto fire for any selection
+# containing it.  WRL, SQL5 and MYSQL3 are in the curated -h '.' set, so
+# that veto cost the GPU on the most common Apple invocation.
+#
+# Apple-specific tweak:
+#
+#   1. arg_address_space: template_finalize.data -> "device const".
+#      The call site in metal_template.metal passes the per-lane scratch
+#      slice as a `device uchar *`, so the translator's default
+#      `thread const uchar *data` inference will not compile.  Same
+#      pattern as md4.yaml / md4utf16.yaml / sha224saltpass.yaml.
+
+algo: mysql3
+
+arg_address_space:
+  template_finalize:
+    data: "device const"
+
+# mysql3_compute is called from BOTH template_iterate (thread-local hexbuf) and
+# template_finalize (device-const buf_scratch_pool slice). Metal forbids
+# generic address-space pointers in a signature, so the translator emits
+# TWO overloads and lets overload resolution pick per call site. Same
+# pattern as keccak256.yaml / sha3_*.yaml (Phase 2d.7b).
+dual_addr_space_helpers:
+  - name: mysql3_compute
+    arg: data
