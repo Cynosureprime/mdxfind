@@ -2,8 +2,14 @@
 .\" NOTE: this is the man page for the hx COMMAND.  The hx LANGUAGE
 .\" specification is a separate mm-macro document of the same stem, kept in
 .\" a different directory.  Neither is derived from the other.
-.\" $Revision: 1.3 $
+.\" $Revision: 1.5 $
 .\" $Log: hx.1,v $
+.\" Revision 1.5  2026/09/04 17:16:55  dlr
+.\" Wording in the revision notes.
+.\"
+.\" Revision 1.4  2026/08/29 18:06:35  dlr
+.\" Update the hashpipe -X note: it decodes $HEX[...] identically as of hashpipe.c 1.114, so the two surfaces of the language now agree on input. Keeps the pre-1.114 divergence as a single clause, since it explains output from older builds. The output asymmetry is unchanged and still documented: hx does not wrap on the way out, and a _bin expression writes raw bytes.
+.\"
 .\" Revision 1.3  2026/08/29 17:35:32  dlr
 .\" Document the $HEX[] asymmetry, all verified by running. Input: -p and stdin lines decode $HEX[] and $TESTVEC[], shown with a pair of equivalent runs, and this is how a password containing a colon or a high-bit byte is supplied on a command line at all. Output: NOT wrapped -- a _bin expression writes raw bytes, unsafe to pipe into a line-oriented tool, so either encode inside the expression with hex() or wrap on the way out with rehex(1). Also notes that hashpipe -X does not perform the input decoding despite running the same language.
 .\"
@@ -77,11 +83,10 @@ $ hx \-p '$HEX[616c706861]' 'md5(pass)'
 .RE
 .PP
 The wrapper is how a password containing a colon, a control character or a
-high-bit byte is supplied on a command line at all.  Note that
+high-bit byte is supplied on a command line at all.
 .B hashpipe \-X
-does
-.I not
-perform this decoding, though it runs the same language.
+decodes it identically as of hashpipe.c 1.114; before that release it did
+not, and hashed the wrapper as literal text.
 .PP
 Output is
 .I not
