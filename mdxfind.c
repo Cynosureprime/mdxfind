@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.590 2026/09/17 05:23:50 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.596 2026/09/19 13:39:16 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.590 2026/09/17 05:23:50 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.596 2026/09/19 13:39:16 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,31 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.596  2026/09/19 13:39:16  dlr
+ * Add e1028 CRYPTOPPLEGACY and e1029 CRYPTOPPDEFAULT: Crypto++ DataEncryptor
+ * stored forms (LegacyEncryptor = DES-EDE2-CBC keyed by SHA-1 mash, DefaultEncryptor
+ * = the SHA-256 variant). Both are key-recovery types, not digests: the stored record
+ * is salt . keycheck . ciphertext and the recovered plaintext is the encrypted body.
+ * The site key is carried as an ordinary salt via -s/-S, so a found line is the
+ * self-contained TYPE record:sitekey:plaintext and survives mdxfind into hashpipe.
+ * Loaded structurally through -F. Also adds the bench_rates entries measured natively
+ * on dev1, and regress typemap/typeflags/testhash coverage, 11 vectors per type.
+ *
+ * Revision 1.595  2026/09/18 21:21:43  dlr
+ * Map hashcat 15000 FileZilla Server to e386 instead of the no-equivalent sentinel. Found by auditing all 70 sentinel-mapped modes against hashcat own per-module test vectors, ST_HASH with ST_PASS, run through hashpipe -m auto with -L raised so an expensive verify is not silently declined. FileZilla Server 0.9.55 and later is sha512(pass . salt), which e386 SHA512PASSSALT already computes; e386 keeps its existing hashcat 1710 mapping and now answers to 15000 as well, which the table already does elsewhere, for instance modes 10 and 11 both pointing at 373. Verified: -M 15000 selects SHA512PASSSALT and recovers hashcat vector bfa9fe5a...556767 with its 64-character salt for password hashcat, and recovers nothing when the password is wrong. Audit result for the record: of 70 sentinel modes, one real mis-mapping, this one; one false positive, 6600 1Password agilekeychain, where hashpipe split the container on colons and took the 4-character iteration count 1000 as the hash and the zero-filled container body as the password, which still verified under a deliberately wrong password and so was rejected; and 68 genuine gaps, being container, archive, cipher and document formats such as WPA, the TrueCrypt and VeraCrypt families, MS Office, PDF, the wallet formats and the 1Password keychains. A wrong-password control is mandatory on this kind of sweep; without it the 6600 artefact reads as a find.
+ *
+ * Revision 1.594  2026/09/18 21:11:01  dlr
+ * Map hashcat mode 13900 OpenCart to e438 instead of the no-equivalent sentinel. OpenCart is sha1(salt . sha1(salt . sha1(pass))), which e438 SHA1SALTSHA1SALTSHA1PASS has implemented all along; the table already carried the mode number and the product name in its comment while pointing at 65535. Verified against hashcats own published vector rather than a self-generated one: 058c1c3773340c8563421e2b17e60eb7c916787e with salt 827500576 and password hashcat recovers through -F, and hashpipe confirms it on a whole-digest compare. Not cosmetic: 65535 in the mdx field means no equivalent, and the -M selection loop at 51980 assigns that value straight into Dohash and Doload, so -M 13900 was selecting a nonexistent op 65535. It now selects e438. The hc field keeps 65535 as the table terminator, untouched. No algorithm is added or altered, so no stored result changes. Sixty-nine other modes remain sentinel-mapped and are mostly genuine container and KDF gaps such as WPA, TrueCrypt and the 1Password keychains, but OpenCart shows the list has not been audited against the catalog and tools/hx_dedup_check makes that mechanically checkable.
+ *
+ * Revision 1.593  2026/09/18 20:42:55  dlr
+ * Brute-force progress display reported candidate position multiplied by the iterated types internal round count. Tothash counts hash OPERATIONS, so for an iterated type the GPU accounting has already multiplied by gpu_compute_iter_sum, which is iter times nsalts_packed; the display divided by the live salt count alone, leaving the iteration factor in. Measured on fpga against a 10M 7-digit mask over 3,471 DESCRYPT salts: the old build printed 157.3M of 10.0M at 1572.9 percent and 209.7M at 2097.2 percent, with the sample candidate clamped to the final mask value and ETA reporting done, while the run was 62.9 and 83.9 percent complete respectively. The ratio is exactly the 25 rounds of Unix DES crypt. Three symptoms, one cause: the percentage, the clamped position sample, and the false completion signal all follow from progress exceeding the keyspace. Now divides by iter times salts, so the same runs print 62.9 and 83.9 percent with real positions and a falling ETA of 2m56s then 1m03s. New helper bf_progress_iter_per_salt carries the fixed round counts, 25 for DES crypt and 1000 for md5crypt and 1000000 for Drupal SHA1, and is paired by comment with gpu_compute_iter_sum which holds the same protocol values. It is compiled unconditionally because the display exists in non-GPU builds while that function is static in a GPU-only unit. The types whose round count is encoded per salt, bcrypt cost and phpBB3 iter char and the rounds equals prefix on dollar-5 and dollar-6, clear an exactness flag and return 1: their true divisor needs the salt strings of the salts still live, and a retired salt has left LIVESALTS while its operations remain in Tothash, so it is not reconstructible at this site. For those the percentage is capped at 100 and the ETA prints unknown rather than naming a wrong time. Non-iterated types are unaffected and MD5 brute force was already correct. Display only: nothing computed changes, Tothash is untouched, and the same run reports 90,990,182,400 total hash calculations before and after.
+ *
+ * Revision 1.592  2026/09/18 18:44:50  dlr
+ * Brute-force GPU hits were computed and then discarded before emission. The BF chunk producer set the synthetic jobg packed_pos to 1, but the plaintext length prefix is a 2-byte little-endian header, so the hit replay bounds check, word_offset plus 2 plus plen greater than packed_pos, evaluated 0 plus 2 plus 0 greater than 1 and rejected every hit unconditionally. The kernel found them and the counters recorded them, so a brute-force run reported N hits and a correct found-count summary while emitting no cracked lines at all. Affects every algorithm whose brute-force chunks reach the GPU rules-engine replay, not only DESCRYPT: confirmed on e1 MD5 and e500 DESCRYPT, each 0 emitted lines against 2 counted hits before and 2 lines after. Not a regression from recent work; the producer was written when the header was a single byte and was not revisited when it widened. The A4 fixture producer carried the same value and is fixed identically, although that block is unreachable now that its environment gate is gone. The producer sits inside a defined OPENCL_GPU gate, so no Metal twin exists to correct, but a future Metal BF producer must also set 2. Validated on fpga GTX 1080: BF GPU output equals the -G none CPU oracle for e1 and e500 with byte-identical plaintexts, and the non-brute-force paths are unchanged against the pre-fix binary at wordlist-only 3 of 3, -n 2 mask 3 of 3, -n mask with literal separators 2 of 2, and descrypt -n mask 2 of 2.
+ *
+ * Revision 1.591  2026/09/17 17:34:17  dlr
+ * Fix an out-of-bounds access in the four DES-crypt salt-compaction loops (MD4DESCRYPT, MD5DESCRYPT, DESCRYPT, BSDICRYPT). Each had si-- inside a while whose condition re-reads saltsnap[si], so removing the salt at index 0 left si at -1 and the condition dereferenced saltsnap[-1].PV. Confirmed SIGSEGV, with lldb putting the fault on the condition itself: EXC_BAD_ACCESS at address 0x0, cmpq $0x0,(%rdi) followed by the saltlen compare. A null deref was the lucky outcome, because the body then writes through that same pointer, so a heap layout where those bytes read as a valid writable pointer gives a wild write instead of a stop. Reachable through -F with a DES type and a plain-hex type both selected, which is what a broad -h sweep over a mixed list does: the hex:suffix path files a salt into every NEEDSALT type with no length check, and build_salt_snapshot does not filter by length, so this loop is the filter. Dropping si-- makes the loop re-test the same index, which now holds the swapped-in entry, and si < nsalts_job bounds the case where the removed entry was the last; si >= nsalts_job subsumes the old nsalts_job == 0 test. Same si---to--1 family as the KRB5PA23 and IPMI2 fixes recorded at mdxfind.c:23275, but those sit inside an if and fail by using saltsnap[si] after compaction, while these four re-read it in the condition. Validated against a pre-fix binary built from the same tree: of eleven cases, nine segfault before and pass after, and the two that pass on both are the controls, no injected salts and a conforming 2-char salt. Coverage includes salt lengths 1, 2, 3, 5, 8, 9, 255, 300, 4096 and 5000, $HEX[] salts that decode to a different length than written, three DESCRYPT hashes sharing one salt with different plaintexts and two BSDICRYPT hashes likewise, which also proves the compaction does not retire a shared salt early. CPU equals GPU on mmt RTX 4070 Ti SUPER for the former crash case and the mixed-salt cases. Also carries a publish-safety scrub of a real name out of the embedded log text, which mdxfind-release copies verbatim into the public repo.
+ *
  * Revision 1.590  2026/09/17 05:23:50  dlr
  * Remove every remaining environment input from the driver: MDXFIND_PIN_TRACE, _BF_CHUNK_SIZE, _BF_INNER_ITER, _BF_ADAPTIVE_TRACE, _SPP, _7Z_MIN_BITS, _7Z_STRICT, _KERNEL_A_FIXTURE_BF, _KERNEL_A_TRACE, _RULE_VALIDATOR, _GPU_FAST_DISABLE and the five-strong MDXFIND_HX_CODEGEN family. MDXFIND_CACHE is now the only variable mdxfind reads. Every one had unset as the production path, so the defaults are hardcoded: the brute-force servo decides chunk and inner iteration, salts per page defaults to 1024, SevenZipMinBits and SevenZipStrict keep their compiled-in values, the GPU fast path is never vetoed, and the adaptive brute-force telemetry stays on because it was already default-on and only "=0" suppressed it. The hx codegen harness and the kernel-A brute-force fixture are retained in the source but are no longer reachable; both need a native CLI flag, which is the right home for them since an option appears in the invocation and can be regression-tested. Verified CPU equals GPU with nonzero GPU hits on six types over 200k words on both backends: mmt RTX 4070 Ti SUPER and dev1 M1, the latter including the -8 UTF-32 path.
  *
@@ -3125,6 +3150,437 @@ static int sunmd5_flip(const unsigned char *dig, int round)
     return SUNMD5_BIT(dig, ia) ^ SUNMD5_BIT(dig, ib);
 }
 
+
+/* ============ Crypto++ DataEncryptor core (e1028/e1029) ============
+ * e1028 CRYPTOPPLEGACY  -- 1998-era Crypto++ DefaultEncryptor, which modern
+ *                          Crypto++ calls LegacyEncryptor.  CONFIRMED against
+ *                          real Dynu.dll output.
+ * e1029 CRYPTOPPDEFAULT -- MODERN Crypto++ DefaultEncryptor, a DIFFERENT
+ *                          construction that reuses the same name.  Upstream-
+ *                          verified, but NO FIELD SAMPLE EXISTS.
+ *
+ * PAIRED CODE. The same core lives in hashpipe.c immediately above
+ * cppenc_verify_common(). The two tools MUST agree byte for byte, so any
+ * change here has to be made there in the same session; there is no build
+ * check that catches a divergence, only a missed crack. The ONLY function
+ * that differs between the two copies is cppenc_hash, which names each
+ * tool's own SHA-1 / SHA-256 entry point; everything else is identical text.
+ *
+ * These types are NOT digests. The stored value is a ciphertext:
+ *
+ *     record   = salt(8) || CBC_enc(key,IV, keycheck || plaintext || pkcs7)
+ *     keycheck = H(passphrase || salt)[0 .. BLOCKSIZE-1]   (but see below)
+ *     key||IV  = Mash(passphrase || salt, KEYLENGTH + BLOCKSIZE, ITERATIONS)
+ *
+ * so the secret being searched is a SITE-WIDE KEY rather than a user
+ * password, and one recovered key opens every record encrypted under it.
+ * Three consequences that shape the integration, not just the arithmetic:
+ *
+ *  - THE KEY ARRIVES ON THE SALT CHANNEL. It is a SALT OF CARDINALITY ONE:
+ *    one value covering every record on an installation, typed into a config
+ *    file by whoever installed the component, which is structurally the same
+ *    thing as a salt column holding one distinct value. So it comes inline
+ *    as <record>:<sitekey>, or as candidate keys from mdxfind's -s <file>
+ *    (or -S <file> after -M): one key means "decrypt with a known key", N
+ *    keys means "search N candidates". The password WORDLIST CANNOT AFFECT
+ *    THE RESULT, which is why both types show 's' in the -h Options column
+ *    and the legend there says so in words.
+ *
+ *    This was read as a PEPPER (-j) in an earlier revision. That was WRONG
+ *    and it broke the toolchain: a pepper is by definition never written
+ *    into the output record, so the emitted line carried no key -- and
+ *    verifying one of these records means DECRYPTING it, which needs the
+ *    key. mdxfind | hashpipe verified 0 of 3 lines, all of them to stderr.
+ *    Do not restore that reading.
+ *
+ *  - THE LAST FIELD IS THE DECRYPTED PLAINTEXT, NEVER THE KEY. The emitted
+ *    line is <record>:<sitekey>:<plaintext>, byte for byte the shape every
+ *    salted type already uses, so getpass, mdsplit and this tool's own
+ *    verifier need no special case. At the instant a key validates the
+ *    plaintext is known, so the plaintext is what goes in the LAST field.
+ *    Putting the key there instead would file every record on the site as
+ *    solved under one value that is no user's password. The key ALSO goes to
+ *    stderr, once, as per-site metadata. See the procjob case.
+ *
+ *  - The oracle needs no plaintext: decrypt the FIRST ciphertext block and
+ *    compare it with the keycheck. ONE record therefore settles one
+ *    candidate key, which is why the procjob case anchors on a single record
+ *    instead of looping the whole snapshot per candidate.
+ *
+ * THE KEYCHECK CONTENT IS CONFIRMED, NOT INFERRED. The shipped DLL of the
+ * application that prompted these types was extracted from the vendor's own
+ * installer, registered, and driven with known passphrases; its output is
+ * decrypted correctly by the code below. Over those records:
+ *
+ *     keycheck == H(passphrase || salt)[0 .. BLOCKSIZE-1]   CONFIRMED
+ *     keycheck == salt                                      REFUTED
+ *     keycheck == an undeliverable nonce                    REFUTED
+ *     ITERATIONS == 200                                     UNIQUE -- no other
+ *                                                           value in 1..3000
+ *                                                           decrypts anything
+ *
+ * So there is ONE oracle and cppenc_check implements it. An earlier revision
+ * of this work accepted `keycheck == salt` as a second variant, on the reading
+ * of an intermediate analysis note; that variant is gone. Do not reintroduce
+ * it -- it widens the accept surface for no gain now that the question is
+ * settled by the artifact itself.
+ *
+ * WHAT THAT CONFIRMATION DOES AND DOES NOT COVER. It settles the ALGORITHM:
+ * given a record of this format and its key, this code decrypts it. It says
+ * nothing about whether any particular unidentified hex value in a corpus IS
+ * a record of this format. A key search that finds nothing bounds only the
+ * candidates it tried; it is not evidence either way about a record's format,
+ * and must not be quoted as though it were.
+ *
+ * ============ THE NAMING TRAP -- READ BEFORE RENAMING ANYTHING ============
+ *
+ * The DLL's RTTI strings say DefaultEncryptor, DefaultDecryptor,
+ * DES_EDE_Encryption and SHA, over an embedded build path naming a 1998
+ * VC98 tree. THAT NAMING IS CORRECT FOR ITS ERA and is not a mistake in the
+ * analysis that recovered it. In the Crypto++ of that period:
+ *
+ *     DefaultEncryptor  WAS  DES_EDE + SHA, salt 8, 200 iterations
+ *     DES_EDE           MEANT 2-key triple DES  (later renamed DES_EDE2)
+ *     SHA               MEANT SHA-1             (later renamed SHA1)
+ *
+ * Modern Crypto++ renamed that whole construction to LegacyEncryptor and
+ * reassigned the DefaultEncryptor NAME to a NEW and incompatible type: AES,
+ * SHA-256, 2500 iterations. Two consequences:
+ *
+ *   - mdxfind's type name CRYPTOPPLEGACY is the right name for the DLL's
+ *     construction, even though the DLL says "Default".
+ *   - e1029 CRYPTOPPDEFAULT is the MODERN type. It is verified bidirectionally
+ *     against a locally built upstream libcryptopp.a, but it has NO FIELD
+ *     SAMPLE and IT IS NOT WHAT THAT DLL PRODUCES. Measured, not assumed:
+ *     modern-DefaultEncryptor parameters fail to decrypt every DLL record.
+ *     NEVER read a CRYPTOPPDEFAULT hit as a record from that application.
+ *
+ * Implementing the modern parameters for the 1998 records reproduces nothing,
+ * and the shared name is exactly how someone loses a day to it.
+ * =========================================================================
+ *
+ * Parameters are pinned from upstream Crypto++ default.h:66-67 and default.cpp
+ * (Mash / GenerateKeyIV / FirstPut / CheckKey), and were cross-validated
+ * bidirectionally against a locally built upstream libcryptopp.a -- upstream
+ * decrypts our output and we decrypt upstream's, for both parameter sets:
+ *
+ *   type      BLOCKSIZE KEYLENGTH DIGESTSIZE SALT ITER  cipher        hash
+ *   LEGACY        8        16         20       8    200 DES-EDE2-CBC  SHA-1
+ *   DEFAULT      16        16         32       8   2500 AES-128-CBC   SHA-256
+ *
+ * Two traps worth stating, both of which yield a plausible WRONG oracle that
+ * nothing downstream would catch:
+ *   - keycheck width is BLOCKSIZE, so 16 for DEFAULT and 8 only for LEGACY.
+ *   - record lengths OVERLAP COMPLETELY: Legacy is 8+8k and Default is 8+16m,
+ *     so every Default length is also a Legacy length. Length cannot tell the
+ *     two apart, and an 11-byte plaintext gives 80 hex characters under both.
+ *
+ * Default costs about 7.1x Legacy (2500 SHA-256 over 34 bytes against 400
+ * SHA-1 over 42), which is why the two carry SEPARATE bench_rates.h entries.
+ */
+struct cppenc_params { int blk, keylen, dig, salt, iters; };
+static const struct cppenc_params CPPENC_LEGACY  = {  8, 16, 20, 8,  200 };
+static const struct cppenc_params CPPENC_DEFAULT = { 16, 16, 32, 8, 2500 };
+
+/* Mash working width. The largest bufSize in play is 40 (Legacy: outLen 24
+ * rounded up to a multiple of the 20-byte digest); Default is 32. */
+#define CPPENC_MAXBUF 128
+
+/* Caller-provided FIXED scratch, CPPENC_FIXED bytes. Byte offsets into fx:
+ *
+ *     off  name  size  largest real use
+ *       0  kiv     64  32  (KEYLENGTH 16 + BLOCKSIZE 16)
+ *      64  kc      64  32  (SHA-256 digest)
+ *     128  ob     128  40  (mash bufSize, Legacy)
+ *     256  pt      64  16  (one decrypted block)
+ *     320  iv      32  16  (one cipher block)
+ *     352  sv      32   8  (the record's salt, decoded from hex)
+ *     384  cs     640 256  (cipher state: 2 x DES_key_schedule, or AES_KEY)
+ *
+ * Every field carries at least 2x headroom over its largest real use, and the
+ * cipher-state slot is checked at COMPILE time below rather than trusted.
+ * None of this may live on the stack: in procjob it comes from the per-thread
+ * malloc_lock() buffers, in hashpipe from WS->ctxN. */
+#define CPPENC_FIXED   1024
+#define CPPENC_CS_SIZE 640
+#define CPPENC_KIV(fx) ((unsigned char *)(fx) +   0)
+#define CPPENC_KC(fx)  ((unsigned char *)(fx) +  64)
+#define CPPENC_OB(fx)  ((unsigned char *)(fx) + 128)
+#define CPPENC_PT(fx)  ((unsigned char *)(fx) + 256)
+#define CPPENC_IV(fx)  ((unsigned char *)(fx) + 320)
+#define CPPENC_SV(fx)  ((unsigned char *)(fx) + 352)
+#define CPPENC_CS(fx)  ((void *)((unsigned char *)(fx) + 384))
+
+/* A wrong scratch layout is silent at run time, so make it a build error. */
+typedef char cppenc_cs_fits[(CPPENC_CS_SIZE >= (int)sizeof(AES_KEY) &&
+                             CPPENC_CS_SIZE >= 2 * (int)sizeof(DES_key_schedule) &&
+                             CPPENC_FIXED >= 384 + CPPENC_CS_SIZE) ? 1 : -1];
+
+/* Caller-provided LENGTH-FED staging buffer, CPPENC_HBLEN(passlen) bytes. It
+ * holds the 2-byte Mash counter prefix followed by the hash input, which is
+ * passphrase||salt on the first pass and the Mash feedback buffer after it. */
+#define CPPENC_HBLEN(passlen) (2 + (passlen) + 8 + CPPENC_MAXBUF)
+
+/* Cap for the two paths that BUILD a record rather than testing one: -z
+ * forward generation, whose output has to fit prfound's job->outbuf, and the
+ * -K passphrase. It is NOT a limit on the oracle -- capping that would report
+ * a correct long passphrase as a non-match, which is the silent-negative the
+ * hashpipe stack-buffer sweep was about. The search paths bound themselves
+ * against the buffer they were handed instead. */
+#define CPPENC_MAXPASS 4096
+
+static void cppenc_hash(const struct cppenc_params *p,
+                        unsigned char *in, int len, unsigned char *out)
+{
+  if (p->dig == 20) mysha1(in, len, out);
+  else              mysha256((char *)in, len, out);
+}
+
+/* Mash(), faithful to Crypto++ default.cpp.
+ *
+ * CLOBBERS hb[2 ..]: the feedback buffer Crypto++ calls `buf` is staged there
+ * so the inner hash needs no second copy. Anything else that needs
+ * passphrase||salt -- the keycheck above all -- must be computed BEFORE this
+ * is called.
+ *
+ * The two loops are bounded differently upstream, outLen here and bufSize
+ * below. At both parameter sets they cover the same i, so it is a no-op today;
+ * kept faithful rather than simplified. */
+static void cppenc_mash(const struct cppenc_params *p, unsigned char *hb, int inLen,
+                        unsigned char *out, int outLen, int iterations,
+                        unsigned char *fx)
+{
+  unsigned char *ob = CPPENC_OB(fx);
+  int bufSize = ((outLen + p->dig - 1) / p->dig) * p->dig, i;
+
+  memset(ob, 0, bufSize);
+  for (i = 0; i < outLen; i += p->dig) {
+    hb[0] = (unsigned char)(i >> 8); hb[1] = (unsigned char)i;
+    cppenc_hash(p, hb, 2 + inLen, ob + i);
+  }
+  while (iterations-- > 1) {
+    memcpy(hb + 2, ob, bufSize);        /* the snapshot upstream calls buf */
+    for (i = 0; i < bufSize; i += p->dig) {
+      hb[0] = (unsigned char)(i >> 8); hb[1] = (unsigned char)i;
+      cppenc_hash(p, hb, 2 + bufSize, ob + i);
+    }
+  }
+  memcpy(out, ob, outLen);
+}
+
+/* Hashes per candidate, for honest h/s accounting. One keycheck plus
+ * iterations x (bufSize / DIGESTSIZE): 401 for Legacy, 2501 for Default. This
+ * counts ONE record, because one record settles one candidate. */
+static int cppenc_hashcount(const struct cppenc_params *p)
+{
+  int outLen  = p->keylen + p->blk;
+  int bufSize = ((outLen + p->dig - 1) / p->dig) * p->dig;
+  return 1 + p->iters * (bufSize / p->dig);
+}
+
+/* keycheck into kc, then key||IV into kiv. Order matters: mash clobbers hb. */
+static void cppenc_derive(const struct cppenc_params *p,
+                          const unsigned char *pass, int passlen,
+                          const unsigned char *salt,
+                          unsigned char *hb, unsigned char *fx)
+{
+  memcpy(hb + 2, pass, passlen);
+  memcpy(hb + 2 + passlen, salt, p->salt);
+  cppenc_hash(p, hb + 2, passlen + p->salt, CPPENC_KC(fx));
+  cppenc_mash(p, hb, passlen + p->salt, CPPENC_KIV(fx),
+              p->keylen + p->blk, p->iters, fx);
+}
+
+/* CBC over len bytes. in == out is permitted: both OpenSSL primitives here
+ * stage each block through a temporary. enc != 0 encrypts. */
+static void cppenc_cbc(const struct cppenc_params *p, const unsigned char *kiv,
+                       const unsigned char *in, int len, unsigned char *out,
+                       unsigned char *fx, int enc)
+{
+  unsigned char *iv = CPPENC_IV(fx);
+  memcpy(iv, kiv + p->keylen, p->blk);
+  if (p->blk == 8) {
+    /* DES-EDE2: two 8-byte keys used as K1 K2 K1, which is what Crypto++
+     * DES_EDE2 is. Passing three distinct keys here would be EDE3. */
+    DES_key_schedule *ks = (DES_key_schedule *)CPPENC_CS(fx);
+    DES_set_key_unchecked((DES_cblock *)(void *)kiv,     &ks[0]);
+    DES_set_key_unchecked((DES_cblock *)(void *)(kiv + 8), &ks[1]);
+    DES_ede3_cbc_encrypt(in, out, (long)len, &ks[0], &ks[1], &ks[0],
+                         (DES_cblock *)iv, enc ? DES_ENCRYPT : DES_DECRYPT);
+  } else {
+    AES_KEY *ak = (AES_KEY *)CPPENC_CS(fx);
+    if (enc) {
+      AES_set_encrypt_key(kiv, 128, ak);
+      AES_cbc_encrypt(in, out, (size_t)len, ak, iv, AES_ENCRYPT);
+    } else {
+      AES_set_decrypt_key(kiv, 128, ak);
+      AES_cbc_encrypt(in, out, (size_t)len, ak, iv, AES_DECRYPT);
+    }
+  }
+}
+
+/* Structural test: can a record of reclen bytes be of THIS type at all?
+ * Cheap, and it runs before any hashing. */
+static int cppenc_reclen_ok(const struct cppenc_params *p, int reclen)
+{
+  int ctlen = reclen - p->salt;
+  return ctlen >= 2 * p->blk && (ctlen % p->blk) == 0;
+}
+
+/* THE ORACLE, and it is a COMPLETE one: no plaintext is needed to settle a
+ * candidate key. rec points at the whole record, salt first. Decrypt the
+ * FIRST ciphertext block and compare it with the keycheck:
+ *
+ *     accept iff decrypted[0 .. BLOCKSIZE-1]
+ *                  == H(passphrase || salt)[0 .. BLOCKSIZE-1]
+ *
+ * which is Crypto++ default.cpp, DataEncryptor::FirstPut writing the block and
+ * DataDecryptor::CheckKey testing it, and is CONFIRMED against real DLL output
+ * (see the header). Returns 1 on accept, 0 otherwise. False-positive rate
+ * 2^-64 per try, so one record is enough and a second buys nothing.
+ *
+ * Where a PLAINTEXT is also available, comparing the plaintext is strictly
+ * stronger -- it covers every block rather than the first BLOCKSIZE bytes --
+ * and costs nothing extra once the record is decrypted. cppenc_decrypt reports
+ * the keycheck verdict separately from the plaintext so a caller can use
+ * either or both; hashpipe's verifier has a plaintext and uses it. */
+static int cppenc_check(const struct cppenc_params *p,
+                        const unsigned char *pass, int passlen,
+                        const unsigned char *rec,
+                        unsigned char *hb, unsigned char *fx)
+{
+  cppenc_derive(p, pass, passlen, rec, hb, fx);
+  cppenc_cbc(p, CPPENC_KIV(fx), rec + p->salt, p->blk, CPPENC_PT(fx), fx, 0);
+  return memcmp(CPPENC_PT(fx), CPPENC_KC(fx), p->blk) == 0;
+}
+
+/* Full decrypt. Returns the plaintext length, or -1 when the record cannot be
+ * a record of this type or its PKCS#7 padding does not decrypt to valid
+ * padding -- so a wrong passphrase is overwhelmingly reported as -1 and never
+ * yields garbage that could be mistaken for a password.
+ *
+ * *keyok receives the cppenc_check verdict for the same record: 1 when the
+ * keycheck block matched, 0 when it did not. It is reported SEPARATELY from
+ * the return value on purpose. A caller with NO plaintext must treat
+ * *keyok == 0 as a failure, which is what mdxfind's key search does; a caller
+ * that HAS the plaintext can compare the plaintext instead, which is what
+ * hashpipe's verifier does and which is the stronger of the two tests.
+ *
+ * out needs reclen - salt bytes. */
+static int cppenc_decrypt(const struct cppenc_params *p,
+                          const unsigned char *pass, int passlen,
+                          const unsigned char *rec, int reclen,
+                          unsigned char *out, unsigned char *hb, unsigned char *fx,
+                          int *keyok)
+{
+  int ctlen = reclen - p->salt, n, pad, k;
+  *keyok = 0;
+  if (!cppenc_reclen_ok(p, reclen)) return -1;
+  cppenc_derive(p, pass, passlen, rec, hb, fx);
+  cppenc_cbc(p, CPPENC_KIV(fx), rec + p->salt, ctlen, out, fx, 0);
+  if (memcmp(out, CPPENC_KC(fx), p->blk) == 0) *keyok = 1;
+  n = ctlen - p->blk;
+  memmove(out, out + p->blk, n);
+  /* PKCS#7, strictly. Every record carries 1..BLOCKSIZE pad bytes, so invalid
+   * padding is not a short plaintext -- it is a wrong key, and returning the
+   * undecoded bytes would put ciphertext into the plaintext field. */
+  if (n < 1) return -1;
+  pad = out[n - 1];
+  if (pad < 1 || pad > p->blk || pad > n) return -1;
+  for (k = 0; k < pad; k++) if (out[n - 1 - k] != pad) return -1;
+  return n - pad;
+}
+
+/* Forward generation, for -z / Printall and for hashpipe's own vectors. Builds
+ * a complete record from a passphrase, an 8-byte salt and a plaintext, and
+ * returns its length in bytes. out needs salt + blk + plainlen + blk bytes. */
+static int cppenc_encrypt(const struct cppenc_params *p,
+                          const unsigned char *pass, int passlen,
+                          const unsigned char *salt,
+                          const unsigned char *plain, int plainlen,
+                          unsigned char *out, unsigned char *hb, unsigned char *fx)
+{
+  int body = p->blk + plainlen, pad = p->blk - (body % p->blk), i;
+  cppenc_derive(p, pass, passlen, salt, hb, fx);
+  memcpy(out, salt, p->salt);
+  memcpy(out + p->salt, CPPENC_KC(fx), p->blk);
+  memcpy(out + p->salt + p->blk, plain, plainlen);
+  for (i = 0; i < pad; i++) out[p->salt + body + i] = (unsigned char)pad;
+  cppenc_cbc(p, CPPENC_KIV(fx), out + p->salt, body + pad, out + p->salt, fx, 1);
+  return p->salt + body + pad;
+}
+
+/* Report a recovered site key. It goes to a STREAM, and the only stream it is
+ * ever given is stderr: the key is per-site metadata and must never appear on
+ * stdout, where mdsplit would read it as the plaintext of whatever record it
+ * followed. A key that is not printable ASCII is wrapped the way the rest of
+ * the suite wraps such things, so it can be pasted back into a keyfile. */
+static void cppenc_keyreport(FILE *f, const unsigned char *k, int n)
+{
+  int i, printable = 1;
+  for (i = 0; i < n; i++)
+    if (k[i] < 0x20 || k[i] > 0x7e) { printable = 0; break; }
+  if (printable) { fprintf(f, "\"%.*s\"", n, (const char *)k); return; }
+  fprintf(f, "$HEX[");
+  for (i = 0; i < n; i++) fprintf(f, "%02x", k[i]);
+  fprintf(f, "]");
+}
+
+/* Uppercase hex, the form these records are written in in the wild. Writes
+ * 2*n characters plus a NUL. */
+static void cppenc_tohex(const unsigned char *in, int n, char *out)
+{
+  static const char uc[] = "0123456789ABCDEF";
+  int i;
+  for (i = 0; i < n; i++) {
+    out[i * 2]     = uc[in[i] >> 4];
+    out[i * 2 + 1] = uc[in[i] & 15];
+  }
+  out[n * 2] = 0;
+}
+
+/* Append ":<sitekey>" to a record-hex string for the salt field of a found line,
+ * $HEX[]-wrapping the key when it is not printable-without-colon. This is the
+ * ordinary $HEX[] salt convention the tool already applies throughout, not a
+ * special case for this type.
+ *
+ * Returns the new length. buf needs room for len + 7 + 2*klen + 1. */
+static int cppenc_append_key(char *buf, int len, const unsigned char *k, int klen)
+{
+  static const char lc[] = "0123456789abcdef";
+  int i, clean = (klen > 0);
+  for (i = 0; i < klen; i++)
+    if (k[i] < '!' || k[i] > '~' || k[i] == ':') { clean = 0; break; }
+  buf[len++] = ':';
+  if (clean) {
+    memcpy(buf + len, k, (size_t)klen);
+    len += klen;
+  } else {
+    memcpy(buf + len, "$HEX[", 5); len += 5;
+    for (i = 0; i < klen; i++) {
+      buf[len++] = lc[k[i] >> 4];
+      buf[len++] = lc[k[i] & 15];
+    }
+    buf[len++] = ']';
+  }
+  buf[len] = 0;
+  return len;
+}
+/* ========== end Crypto++ DataEncryptor core ========== */
+
+/* Cap on the number of key sweeps over one record list. A key opens ONE site,
+ * so a list holding records from several sites needs one sweep per site (see
+ * the procjob case). Bounded so that a pathological list -- one distinct key
+ * per record -- degrades to a diagnostic rather than to keys x records. */
+#define CPPENC_MAXROUNDS 32
+
+/* Set once, by the first thread that runs the key sweep for that parameter
+ * set: index 0 Legacy, 1 Default. The sweep is driven by the SALT ARRAY -- the
+ * site keys -- and not by the wordlist, so it is a fixed amount of work whose
+ * answer no candidate can change; running it once per candidate would multiply
+ * that fixed cost by the length of the wordlist for no information. */
+static volatile int Cppenc_swept[2] = { 0, 0 };
+
 extern char *crypt_rn(const char *key, const char *setting, void *data, int size);
 
 #include "argon2/argon2.h"
@@ -4128,6 +4584,7 @@ static void blake2b_hash(unsigned char *out, size_t outlen,
 }
 
 int NoMarkSalt, Hexkey, Rotatehash, Unicode, Dedupe, XMLchar, Email, Printall;
+
 #ifdef GPU_ENABLED
 int NoMetal;
 #else
@@ -6669,7 +7126,7 @@ struct MapHashcat {
     {13762, 65535},
     {13763, 65535},
     {13800, 928},  /* 13800 | Windows Phone 8+ PIN/password */
-    {13900, 65535}, /* 13900 | OpenCart */
+    {13900, 438},  /* 13900 | OpenCart -- e438 sha1(salt.sha1(salt.sha1(pass))) */
     {14000, 848},  /* 14000 | DES (PT = $salt, key = $pass) */
     {14100, 849},  /* 14100 | 3DES (PT = $salt, key = $pass) */
     {14200, 929},  /* 14200 | RACF KDFAES */
@@ -6678,7 +7135,7 @@ struct MapHashcat {
     {14700, 65535}, /* 14700 | iTunes backup < 10.0 */
     {14800, 65535}, /* 14800 | iTunes backup >= 10.0 */
     {14900, 65535},
-    {15000, 65535}, /* 15000 | FileZilla Server >= 0.9.55 */
+    {15000, 386}, /* 15000 | FileZilla Server >= 0.9.55 -- e386 sha512(pass.salt) */
     {15100, 999},   /* 15100 | Juniper/NetBSD sha1crypt */
     {15200, 65535}, /* 15200 | Blockchain, My Wallet, V2 */
     {15300, 65535}, /* 15300 | DPAPI masterkey file v1 and v2  */
@@ -7308,6 +7765,8 @@ char *Types[] = {
     "GOST12256CRYPT",
     "GOST94CRYPT",
     "SUNMD5",
+    "CRYPTOPPLEGACY",
+    "CRYPTOPPDEFAULT",
 
 NULL
 
@@ -8367,6 +8826,11 @@ NULL
 #define JOB_GOST12256CRYPT   1025
 #define JOB_GOST94CRYPT      1026
 #define JOB_SUNMD5           1027
+/* Crypto++ DataEncryptor framework (default.h:66-67). NOT digests: the stored
+ * value is salt || CBC ciphertext, the candidate stream is the SITE PASSPHRASE,
+ * and one recovered passphrase unlocks every record on that site. */
+#define JOB_CRYPTOPPLEGACY   1028
+#define JOB_CRYPTOPPDEFAULT  1029
 
 #define JOB_DONE 2000
 
@@ -9462,6 +9926,38 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [1025] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* GOST12256CRYPT */
     [1026] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* GOST94CRYPT */
     [1027] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* SUNMD5 */
+    /* Crypto++ Legacy/Default Encryptor: read by a recognizer in
+     * load_hash_file, not through the compact table -- the value is not a
+     * digest and carries its own 8-byte salt in the clear.
+     *
+     * NEEDSJ, not NEEDSF, even though the stored form is plain hex, for the
+     * same reason e451/e452 BCRYPT and CRAMMD5-DOVECOT are NEEDSJ: with only
+     * NEEDSF selected, load_hash_file takes the plain-hex FAST path, which
+     * commits to the compact table and never reaches a format recognizer, so
+     * these records would load as digests of some other type and this type
+     * would find nothing. NEEDSJ also keeps the ops out of gen_salts(), which
+     * would otherwise manufacture every 2- and 3-character ASCII salt for
+     * them. The recognizer itself is reached from -f as well as -F, because
+     * selecting any non-NEEDSF type diverts the file to the slow path. */
+    /* The site key is a SALT OF CARDINALITY ONE, not a pepper, so it arrives
+     * on the salt channel: inline as <record>:<sitekey> under -F, or as
+     * candidate keys from -s <file>, or -S <file> after -M.
+     *
+     * An earlier revision read it as a pepper and took it from -j. That BROKE
+     * THE TOOLCHAIN, and not subtly: a pepper is by definition never written
+     * into the output record, so the emitted line carried no key, and
+     * verifying one of these records means DECRYPTING it, which needs the
+     * key. mdxfind | hashpipe verified 0 of 3 lines. One value covering every
+     * record on an installation is what a static site-wide salt IS -- the
+     * same shape as a salt column with one distinct value in it -- and it
+     * belongs in the record like any other salt.
+     *
+     * What does NOT change: the PASSWORD WORDLIST CANNOT AFFECT THE RESULT of
+     * these two types. The candidate stream is the salt array, never the
+     * wordlist, and the 's' in the Options column is where the -h legend gets
+     * to say so before an operator spends a run on a wordlist. */
+    [1028] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CRYPTOPPLEGACY */
+    [1029] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CRYPTOPPDEFAULT */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -10514,6 +11010,17 @@ static const struct { int job; const char *salt; } default_salts[] = {
   { JOB_GOST12256CRYPT, "$gost12256hash$defaultS$" },
   { JOB_GOST94CRYPT, "$gost94hash$defaultS$" },
   { JOB_SUNMD5, "$md5$rounds=904$defaultSalt$" },
+  /* -z uses only the leading 8 salt bytes of these records; the ciphertext is
+   * ignored because Printall forward-generates. Both records were GENERATED at
+   * a fixed salt (the real thing randomises it per call) and verified against
+   * upstream Crypto++ LegacyDecryptor/DefaultDecryptor with passphrase
+   * password123, which is why -z on password123 reproduces each of them byte
+   * for byte and the generated line cracks back. The independent, non-circular
+   * vector -- a record from the real vendor DLL -- is registered in
+   * hashpipe.c's self-test table instead, where there is a plaintext to check
+   * it against. */
+  { JOB_CRYPTOPPLEGACY,  "0123456789ABCDEF0F4127ADFA2E97A8E043BE067112BF796C053027329CB7D5" },
+  { JOB_CRYPTOPPDEFAULT, "0123456789ABCDEF325C10900B9C608A24F808F8A3CD67A5DE74E19206E90D899617BA6318EB8AB3" },
   { JOB_YESCRYPT, "$y$j9T$oJqQoBLMgF5$" },
   /* verified against libxcrypt 4.4.27 gost-yescrypt 2026-08-07 */
   { JOB_GOSTYESCRYPT, "$gy$j9T$2WmURad1wKLkIzjayhv/41$" },
@@ -12791,7 +13298,16 @@ while (1) {
         if (num_words < 1) num_words = 1;
         for (uint32_t i = 0; i < num_words; i++) g->word_offset[i] = 0;
         g->packed_count = num_words;
-        g->packed_pos   = 1;       /* one byte (the plen=0 prefix) used */
+        /* Two bytes used: the plen=0 header written above is a 2-byte
+         * little-endian length prefix, the same shape the rules-engine
+         * pack site writes (two packed_buf[packed_pos++] stores before the
+         * payload). packed_pos is the authoritative extent the GPU hit
+         * replay bounds-checks against -- it rejects a hit whose
+         * word_offset + 2 + plen exceeds it -- so a value of 1 here
+         * discards EVERY brute-force hit: pos 0 + 2 + plen 0 > 1. The
+         * kernel found them and the counters recorded them, which is why
+         * a BF run reported hits and printed nothing. */
+        g->packed_pos   = 2;
         g->op           = job->op;
         g->filename     = job->filename;
         g->flags        = job->flags;
@@ -15835,6 +16351,373 @@ do {
 	  }
 	}
 	if (!nsalts_job) TYPEDONE(job->op) = 1;
+	}
+	break;
+      case JOB_CRYPTOPPLEGACY:
+      case JOB_CRYPTOPPDEFAULT:
+	/* Crypto++ Legacy/Default Encryptor -- KEY RECOVERY types, not digests.
+	 * The core is at the top of this file; read its header before changing
+	 * anything here. Four things make this unlike every other salted case
+	 * in this switch, and each of them is a way to get it wrong silently.
+	 *
+	 * 1. TYPESALT HOLDS TWO KINDS OF THING: whole stored RECORDS, and
+	 *    candidate SITE KEYS. A record's leading 8 bytes ARE its salt and
+	 *    what follows is the ciphertext the oracle reads, so nothing is
+	 *    re-derived from a separate salt field. The bootstrap FREES JudyJ
+	 *    after copying the records into Typesalt, so a JSLG against JudyJ
+	 *    could never hit; the key-check is the oracle, not a digest
+	 *    compare. The keys arrive on that same channel because the site
+	 *    key IS a salt -- one of cardinality one -- supplied inline as
+	 *    <record>:<sitekey> or from -s/-S. The partition below separates
+	 *    the two structurally, which is the only place that can be done:
+	 *    the length sets overlap (Legacy 8+8k, Default 8+16m), so the
+	 *    loader files a 40-byte record under BOTH types and a Legacy-only
+	 *    length must not be tried as Default.
+	 *
+	 * 2. THE CANDIDATE STREAM IS THE SALT ARRAY, NOT THE WORDLIST. The
+	 *    secret is one site-wide key, chosen by whoever installed the
+	 *    component. Nothing in the wordlist can change the answer, so the
+	 *    sweep runs ONCE per run -- the CAS on Cppenc_swept -- rather than
+	 *    once per candidate; and with no key anywhere the type reports its
+	 *    records UNSATISFIABLE rather than returning a clean zero that
+	 *    looks exactly like an honest miss.
+	 *
+	 *    This was read as a PEPPER (-j) in an earlier revision and that
+	 *    BROKE THE TOOLCHAIN. A pepper is by definition never written into
+	 *    the output record, so the emitted line carried no key, and
+	 *    hashpipe -- which has to DECRYPT in order to verify -- could not
+	 *    check a single line of it. Measured: 0 of 3 verified.
+	 *
+	 * 3. THE LAST FIELD IS THE DECRYPTED PLAINTEXT, NEVER THE KEY. The
+	 *    line is <record>:<sitekey>:<plaintext>, byte for byte the shape
+	 *    every salted type already emits, so getpass, mdsplit and hashpipe
+	 *    need no special case. Putting the key last is what falls out
+	 *    naturally if the key is read as "the password found", and it is a
+	 *    ledger catastrophe: mdsplit treats everything after the record as
+	 *    opaque and getpass takes everything after the LAST delimiter, so
+	 *    it would file EVERY record on the site as solved under one value
+	 *    that is no user's password, retire them all from the unsolved
+	 *    ledger, and discard the real plaintexts that were in hand at that
+	 *    moment. The key is ALSO reported once on stderr, where it belongs
+	 *    as per-site metadata, with its counts.
+	 *
+	 * 4. A wrong key produces NOTHING to print, so -z cannot use the
+	 *    normal path at all. Under Printall we FORWARD-GENERATE: encrypt
+	 *    the candidate as the plaintext, under itself as the key, with the
+	 *    default record's salt. -z therefore emits for ANY input, in the
+	 *    same 3-field shape a real recovery emits, and for password123 it
+	 *    reproduces the default_salts record byte for byte.
+	 *
+	 * Buffers, all from the per-thread malloc_lock() pool, none on the
+	 * stack (2x headroom rule; MAXLINE is 40960):
+	 *   mdbuf            MAXLINE+16  hash staging, CPPENC_HBLEN(passlen) =
+	 *                                passlen+138. Both the key path and the
+	 *                                Printall path cap passlen at
+	 *                                CPPENC_MAXPASS 4096, giving 4234.
+	 *   newbuf           MAXLINE+16  fixed scratch, CPPENC_FIXED = 1024
+	 *   linebuf          MAXLINE*3   binary record: a stored record is at
+	 *                                most MAXLINE/2 bytes, a generated one
+	 *                                8+16+4096+16
+	 *   linebuf+MAXLINE  (same buf)  decrypted plaintext, always shorter
+	 *                                than the record it came from
+	 *   linebuf2         MAXLINE*3   the emitted <record>:<sitekey> field:
+	 *                                under MAXLINE of record hex plus at
+	 *                                most 6+2*4096 of key
+	 */
+	{
+	  const struct cppenc_params *cp = (job->op == JOB_CRYPTOPPLEGACY) ?
+	                                   &CPPENC_LEGACY : &CPPENC_DEFAULT;
+	  unsigned char *cp_hb  = (unsigned char *)mdbuf;
+	  unsigned char *cp_fx  = (unsigned char *)newbuf;
+	  unsigned char *cp_rec = (unsigned char *)linebuf;
+	  unsigned char *cp_pt  = (unsigned char *)linebuf + MAXLINE;
+	  int si, cp_nh = cppenc_hashcount(cp);
+	  int cp_kbase = 0, cp_nkey = 0;
+
+	  if (TYPEDONE(job->op)) break;
+	  /* NO GUARD ON len HERE, DELIBERATELY. Every other case in this switch
+	   * opens with one, because every other case hashes the CANDIDATE. This
+	   * one does not: on the search path the material staged into cp_hb is
+	   * a SITE KEY, capped at CPPENC_MAXPASS by the sweep below, and
+	   * `cur`/`len` are not read at all. A `if (len > MAXLINE - 1024)
+	   * break;` here was a silent-negative hazard rather than a safety
+	   * belt: it bailed out BEFORE the Cppenc_swept CAS, so a wordlist
+	   * whose lines are all long would skip the one sweep the type gets and
+	   * report a clean zero. The Printall path is the only one that reads
+	   * `cur`, and it caps itself at CPPENC_MAXPASS -- far below this
+	   * buffer -- where the cap belongs. */
+	  if (!snap_valid) {
+	    nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+	                    TYPESALT(job->op), tsalt, Printall);
+	    snap_valid = 1;
+	  }
+	  /* PARTITION the snapshot into records and candidate keys. This runs
+	   * on EVERY entry, and deliberately NOT under `if (!snap_valid)`:
+	   * procjob builds the snapshot itself at job start, so this case is
+	   * reached with snap_valid already 1 and work hidden under that test
+	   * is dead code. The cost of it being dead is not cosmetic -- slot 0
+	   * would be free to hold a key, and the type would then report a clean
+	   * zero with a perfectly correct compute behind it.
+	   *
+	   * The classification is structural: even length, all hex, and a byte
+	   * count that is a legal record length for THIS parameter set makes a
+	   * RECORD; anything else is a candidate KEY. load_hash_file's
+	   * hex:suffix path also files arbitrary suffixes as salts for every
+	   * NEEDSALT type, and those arrive here -- as keys, which is now the
+	   * right reading of them rather than something to drop.
+	   *
+	   * Records land in [0, nsalts_job) and keys in
+	   * [cp_kbase, cp_kbase+cp_nkey). cp_kbase is the ORIGINAL record count
+	   * and never moves, so the retire-swap
+	   * `saltsnap[si] = saltsnap[--nsalts_job]` can only ever pull another
+	   * RECORD down: the record region shrinks from its top and leaves a
+	   * hole below cp_kbase that nothing reads. Getting that wrong would
+	   * splice a key into the record list.
+	   *
+	   * Known ambiguity, stated rather than guessed at: a candidate key
+	   * that is itself 48 or more hex characters of a legal record length
+	   * classifies as a RECORD. Supply such a key inline, or as $HEX[]
+	   * (build_salt_snapshot decodes it, and the decoded bytes are then not
+	   * hex text), rather than as bare hex in a -s file. */
+	  { int cp_i, cp_nrec = 0;
+	    for (cp_i = 0; cp_i < nsalts_job; cp_i++) {
+	      int tl = saltsnap[cp_i].saltlen;
+	      if (!(tl & 1) && tl >= 2 && tl < MAXLINE &&
+	          cppenc_reclen_ok(cp, tl / 2) &&
+	          get32(saltsnap[cp_i].salt, cp_rec, tl / 2) == tl / 2) {
+	        if (cp_i != cp_nrec) {
+	          struct saltentry cp_tmp = saltsnap[cp_nrec];
+	          saltsnap[cp_nrec] = saltsnap[cp_i];
+	          saltsnap[cp_i] = cp_tmp;
+	        }
+	        cp_nrec++;
+	      }
+	    }
+	    cp_kbase   = cp_nrec;
+	    cp_nkey    = nsalts_job - cp_nrec;
+	    nsalts_job = cp_nrec;
+	  }
+	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+
+	  if (Printall) {
+	    int cp_gl, cp_el;
+	    /* The generated record, the key and the plaintext all go through
+	     * prfound into job->outbuf, which is OUTBUFSIZE+1024 =
+	     * 2*MAXLINE+1024. A MAXLINE-long candidate would emit ~80 KB of hex
+	     * plus the key plus the plaintext and overrun it, so -z generation
+	     * caps the plaintext at CPPENC_MAXPASS: 4096 gives 8272 characters
+	     * of record hex, at most 8198 of key, and 4096 of plaintext, which
+	     * is a quarter of that buffer.
+	     *
+	     * Key and plaintext are both the candidate here. That is not a
+	     * shortcut: -z has one input and this type needs two. What matters
+	     * is that the emitted line is a TRUE TRIPLE -- record, the key that
+	     * opens it, and the plaintext inside it -- so the generated line
+	     * verifies through hashpipe unchanged and cracks back through -F. */
+	    if (len > CPPENC_MAXPASS) break;
+	    if (get32(saltsnap[0].salt, CPPENC_SV(cp_fx), cp->salt) != cp->salt)
+	      break;
+	    cp_gl = cppenc_encrypt(cp, (unsigned char *)cur, len,
+	                           CPPENC_SV(cp_fx), (unsigned char *)cur, len,
+	                           cp_rec, cp_hb, cp_fx);
+	    cppenc_tohex(cp_rec, cp_gl, linebuf2);
+	    cp_el = cppenc_append_key(linebuf2, cp_gl * 2,
+	                              (unsigned char *)cur, len);
+	    (void)cp_el;
+	    hashcnt += cp_nh;
+	    prfound(job, linebuf2);
+	    break;
+	  }
+
+	  {
+	    int cp_idx = (job->op == JOB_CRYPTOPPDEFAULT);
+	    char *cp_savepass = job->pass;
+	    int cp_saveclen = job->clen;
+	    int cp_round = 0, cp_keys = 0, cp_total = nsalts_job, cp_capped = 0;
+	    int cp_toolong = 0, cp_widest = 0, cp_oversize = 0;
+
+	    if (!__sync_bool_compare_and_swap(&Cppenc_swept[cp_idx], 0, 1)) {
+	      TYPEDONE(job->op) = 1;
+	      break;
+	    }
+	    if (!cp_nkey) {
+	      /* UNSATISFIABLE, not a miss. The type's arity is not met: there
+	       * are records and no key anywhere. Printing these as plain
+	       * unresolved lines would make "no key supplied" indistinguishable
+	       * from "wrong key" and from "wrong plaintext", which is the one
+	       * case where the operator most needs telling. */
+	      fprintf(stderr,
+	        "%s: UNSATISFIABLE -- no site key available, so %d record(s)"
+	        " were not attempted.\n"
+	        "      These records are ENCRYPTED under a site-wide KEY, not"
+	        " hashed from a user\n"
+	        "      password, so the wordlist cannot affect the result. That"
+	        " key is a salt of\n"
+	        "      cardinality one: supply it inline as <record>:<sitekey>"
+	        " with -F, or put the\n"
+	        "      candidate keys one per line in a file and pass it with"
+	        " -s (or -S after -M).\n"
+	        "      The 's' in the -h Options column marks the types that"
+	        " read it.\n",
+	        TYPENAME(job->op), nsalts_job);
+	      TYPEDONE(job->op) = 1;
+	      break;
+	    }
+
+	    /* ANCHORED sweeps, not one pass over the keys, and not the full
+	     * keys x records cross product either.
+	     *
+	     * ONE record settles ONE key: the key-check is a complete oracle
+	     * needing no plaintext, and the key is site-wide, so testing a
+	     * candidate against a second record of the same site buys nothing
+	     * and would multiply both the cost and the reported rate by the
+	     * length of the list. So each sweep picks ONE anchor record and
+	     * tests every key against just that.
+	     *
+	     * But a record list can hold records from several sites, and a key
+	     * that is not the anchor's key is rejected at the anchor and never
+	     * reaches the other site's records. Anchoring on one record only
+	     * -- slot 0, say -- therefore MISSES every key except that site's,
+	     * and misses it in the way that looks exactly like an honest miss.
+	     * Measured: a four-record fixture whose Judy-sorted slot 0 belonged
+	     * to a second site reported "none opened" with the correct key
+	     * sitting in the key file.
+	     *
+	     * So: sweep, then pick a record that has not yet BEEN an anchor,
+	     * and sweep again. Each record that opens is retired, so a
+	     * single-site list costs exactly one sweep, and the anchor count
+	     * settles at roughly the number of distinct sites present. The
+	     * marker is the snapshot's own hashsalt field, which
+	     * build_salt_snapshot sets to NULL and these types never otherwise
+	     * use; it travels with the struct when the retire-swap moves an
+	     * entry, so the bookkeeping survives compaction. (hashlen is NOT
+	     * usable for this -- build_salt_snapshot leaves it uninitialised.)
+	     *
+	     * When the loop runs out of un-anchored records the negative is
+	     * COMPLETE: every remaining record has been tested against every
+	     * key. That is worth reporting differently from the capped case,
+	     * which has not. */
+	    for (;;) {
+	      int ki;
+	      int cp_anchor = -1;
+	      for (si = 0; si < nsalts_job; si++)
+	        if (!saltsnap[si].hashsalt) { cp_anchor = si; break; }
+	      if (cp_anchor < 0) break;          /* exhaustive: nothing left */
+	      if (cp_round >= CPPENC_MAXROUNDS) { cp_capped = 1; break; }
+	      cp_round++;
+	      saltsnap[cp_anchor].hashsalt = saltsnap[cp_anchor].salt;
+	      for (ki = 0; ki < cp_nkey && nsalts_job; ki++) {
+	        int pl, keyok, opened = 0, failed = 0;
+	        unsigned char *pk;
+	        pl = saltsnap[cp_kbase + ki].saltlen;
+	        pk = (unsigned char *)saltsnap[cp_kbase + ki].salt;
+	        if (pl <= 0) continue;
+	        /* The retired pepper channel capped a key at 127 bytes; a salt
+	         * carries no such cap, and cp_hb is fed CPPENC_HBLEN(pl) =
+	         * pl+138 bytes of a MAXLINE+16 buffer. Counted and REPORTED
+	         * below rather than silently skipped: a key that cannot be
+	         * staged returns exactly the same nothing as a wrong key. */
+	        if (pl > CPPENC_MAXPASS) {
+	          cp_toolong++;
+	          if (pl > cp_widest) cp_widest = pl;
+	          continue;
+	        }
+	        if (cp_round == 1) cp_keys++;
+	        if (get32(saltsnap[cp_anchor].salt, cp_rec,
+	                  saltsnap[cp_anchor].saltlen / 2) !=
+	            saltsnap[cp_anchor].saltlen / 2) break;
+	        hashcnt += cp_nh;
+	        if (!cppenc_check(cp, pk, pl, cp_rec, cp_hb, cp_fx)) continue;
+
+	        /* This key is a site key. Now, and only now, sweep the rest:
+	         * other records may belong to other sites under other keys, so
+	         * every record is tested rather than assumed. Slot 0 is
+	         * re-tested to keep one code path -- one extra derivation, once
+	         * per recovered key. */
+	        for (si = 0; si < nsalts_job; si++) {
+	          int tl = saltsnap[si].saltlen, ptl;
+	          if (get32(saltsnap[si].salt, cp_rec, tl / 2) != tl / 2)
+	            continue;
+	          hashcnt += cp_nh;
+	          ptl = cppenc_decrypt(cp, pk, pl, cp_rec, tl / 2,
+	                               cp_pt, cp_hb, cp_fx, &keyok);
+	          /* No plaintext to compare against here, so the key-check IS
+	           * the oracle and keyok == 0 means this record is not this
+	           * key's. Reported as a per-record failure below; never
+	           * emitted, because emitting an unchecked decrypt would put
+	           * ciphertext into the plaintext field. */
+	          if (ptl < 0 || !keyok) { failed++; continue; }
+	          /* <record>:<sitekey> in the hash field; prfound appends
+	           * ":<plaintext>". prfound sizes its own flush on the PASS
+	           * length alone, so a pathological record plus a long key
+	           * could overrun job->outbuf; such a record is refused and
+	           * COUNTED rather than truncated, and the key still reaches
+	           * stderr. Unreachable for any real record: a Dynu record is
+	           * 64 or 80 hex characters. */
+	          if (tl + 7 + 2 * pl + 2 * ptl + 64 > OUTBUFSIZE) {
+	            cp_oversize++;
+	            continue;
+	          }
+	          memcpy(linebuf2, saltsnap[si].salt, (size_t)tl);
+	          cppenc_append_key(linebuf2, tl, pk, pl);
+	          job->pass = (char *)cp_pt;   /* THE PLAINTEXT, never the key */
+	          job->clen = ptl;
+	          PV_DEC(saltsnap[si].PV);
+	          prfound(job, linebuf2);
+	          opened++;
+	          if (*saltsnap[si].PV == 0) {
+	            saltsnap[si] = saltsnap[--nsalts_job];
+	            si--;
+	          }
+	        }
+	        job->pass = cp_savepass;
+	        job->clen = cp_saveclen;
+	        fprintf(stderr, "%s: site key ", TYPENAME(job->op));
+	        cppenc_keyreport(stderr, pk, pl);
+	        fprintf(stderr, " accepted, %d of %d record(s) decrypt",
+	                opened, opened + failed);
+	        if (failed)
+	          fprintf(stderr, "; %d failed their own key check (another"
+	                  " site's key, or not this type)", failed);
+	        fprintf(stderr, "\n");
+	        fflush(stderr);
+	        /* The anchor may itself have been retired by the sweep above,
+	         * in which case a different record now occupies that slot and
+	         * the remaining keys should be tried against the NEW anchor
+	         * rather than continued against a record that is already
+	         * solved. Leaving the inner walk restarts the outer loop,
+	         * which picks the next un-anchored record. */
+	        if (saltsnap[cp_anchor].hashsalt != saltsnap[cp_anchor].salt)
+	          break;
+	      }
+	    }
+	    if (cp_toolong)
+	      fprintf(stderr, "%s: %d candidate key(s) REFUSED as too long to"
+	              " stage, the widest %d bytes (limit %d). Those keys were"
+	              " NOT tried.\n",
+	              TYPENAME(job->op), cp_toolong, cp_widest, CPPENC_MAXPASS);
+	    if (cp_oversize)
+	      fprintf(stderr, "%s: %d record(s) opened but were NOT emitted:"
+	              " record plus key plus plaintext exceeds the output line"
+	              " buffer.\n", TYPENAME(job->op), cp_oversize);
+	    if (cp_capped)
+	      fprintf(stderr, "%s: stopped after %d anchored key sweeps with %d"
+	              " record(s) still unopened. Those records have NOT been"
+	              " tested against\n      every key -- split the file by"
+	              " site and rerun, or raise CPPENC_MAXROUNDS\n",
+	              TYPENAME(job->op), CPPENC_MAXROUNDS, nsalts_job);
+	    else if (nsalts_job == cp_total)
+	      fprintf(stderr, "%s: %d candidate key(s) from the salt channel"
+	              " tried against every one of the %d record(s), none"
+	              " opened\n",
+	              TYPENAME(job->op), cp_keys, cp_total);
+	    else if (nsalts_job)
+	      fprintf(stderr, "%s: %d candidate key(s) tried, %d of %d"
+	              " record(s) still unopened (tested against every key)\n",
+	              TYPENAME(job->op), cp_keys, nsalts_job, cp_total);
+	    fflush(stderr);
+	    TYPEDONE(job->op) = 1;
+	  }
 	}
 	break;
       case JOB_GOST12256CRYPT:
@@ -28363,11 +29246,23 @@ nextsalt1:
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
+		  /* Bounded compaction.  The si-- that used to sit in this loop made
+		   * the condition re-read saltsnap[si] at si-1, so removing the salt
+		   * at index 0 dereferenced saltsnap[-1].PV -- SIGSEGV when those
+		   * heap bytes read as NULL, a wild write through *PV when they do
+		   * not.  Reachable via -F with a DES type and a plain-hex type both
+		   * selected: mdxfind.c:51228 files a hex:suffix salt into every
+		   * NEEDSALT type unchecked, and build_salt_snapshot does not filter
+		   * by length -- this loop is the filter.  Without si-- the loop
+		   * re-tests the SAME index, which now holds the swapped-in entry,
+		   * and si < nsalts_job bounds the case where the removed entry was
+		   * the last one.  Same si---to--1 family as the KRB5PA23 and IPMI2
+		   * fixes noted at mdxfind.c:23275. */
+		  while (si < nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
 		    *saltsnap[si].PV = 0;
-		    saltsnap[si] = saltsnap[--nsalts_job]; si--;
+		    saltsnap[si] = saltsnap[--nsalts_job];
 		  }
-		  if (nsalts_job == 0) break;
+		  if (si >= nsalts_job) break;
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   hashcnt += Maxiter;
@@ -28451,11 +29346,23 @@ nextsalt1:
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
+		  /* Bounded compaction.  The si-- that used to sit in this loop made
+		   * the condition re-read saltsnap[si] at si-1, so removing the salt
+		   * at index 0 dereferenced saltsnap[-1].PV -- SIGSEGV when those
+		   * heap bytes read as NULL, a wild write through *PV when they do
+		   * not.  Reachable via -F with a DES type and a plain-hex type both
+		   * selected: mdxfind.c:51228 files a hex:suffix salt into every
+		   * NEEDSALT type unchecked, and build_salt_snapshot does not filter
+		   * by length -- this loop is the filter.  Without si-- the loop
+		   * re-tests the SAME index, which now holds the swapped-in entry,
+		   * and si < nsalts_job bounds the case where the removed entry was
+		   * the last one.  Same si---to--1 family as the KRB5PA23 and IPMI2
+		   * fixes noted at mdxfind.c:23275. */
+		  while (si < nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
 		    *saltsnap[si].PV = 0;
-		    saltsnap[si] = saltsnap[--nsalts_job]; si--;
+		    saltsnap[si] = saltsnap[--nsalts_job];
 		  }
-		  if (nsalts_job == 0) break;
+		  if (si >= nsalts_job) break;
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   hashcnt += Maxiter;
@@ -28508,11 +29415,23 @@ nextsalt1:
                 Word_t *HPV;
                 { int si;
                 for (si = 0; si < nsalts_job; si++) {
-		  while (nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
+		  /* Bounded compaction.  The si-- that used to sit in this loop made
+		   * the condition re-read saltsnap[si] at si-1, so removing the salt
+		   * at index 0 dereferenced saltsnap[-1].PV -- SIGSEGV when those
+		   * heap bytes read as NULL, a wild write through *PV when they do
+		   * not.  Reachable via -F with a DES type and a plain-hex type both
+		   * selected: mdxfind.c:51228 files a hex:suffix salt into every
+		   * NEEDSALT type unchecked, and build_salt_snapshot does not filter
+		   * by length -- this loop is the filter.  Without si-- the loop
+		   * re-tests the SAME index, which now holds the swapped-in entry,
+		   * and si < nsalts_job bounds the case where the removed entry was
+		   * the last one.  Same si---to--1 family as the KRB5PA23 and IPMI2
+		   * fixes noted at mdxfind.c:23275. */
+		  while (si < nsalts_job && *saltsnap[si].PV && saltsnap[si].saltlen != 2) {
 		    *saltsnap[si].PV = 0;
-		    saltsnap[si] = saltsnap[--nsalts_job]; si--;
+		    saltsnap[si] = saltsnap[--nsalts_job];
 		  }
-		  if (nsalts_job == 0) break;
+		  if (si >= nsalts_job) break;
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   hashcnt++;
@@ -28593,12 +29512,15 @@ nextsalt1:
                   int si;
                 for (si = 0; si < nsalts_job; si++) {
                   /* Skip salts that are not 9-char extended DES (_CCCCSSSS) */
-		  while (nsalts_job && *saltsnap[si].PV &&
+		  /* Bounded compaction -- see the note at the JOB_DESCRYPT site.  The
+		   * si-- made this condition read saltsnap[-1] once the entry at
+		   * index 0 was removed. */
+		  while (si < nsalts_job && *saltsnap[si].PV &&
                          !(saltsnap[si].saltlen == 9 && saltsnap[si].salt[0] == '_')) {
                     *saltsnap[si].PV = 0;
-                    saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                    saltsnap[si] = saltsnap[--nsalts_job];
                   }
-                  if (nsalts_job == 0) break;
+                  if (si >= nsalts_job) break;
                   saltlen = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
                   hashcnt++;
@@ -45523,6 +46445,37 @@ static void format_eta(double seconds, char *buf, size_t bufsz) {
     snprintf(buf, bufsz, "~%dy%dmo", (int)(seconds/(86400*365)), ((int)seconds%(86400*365))/(86400*30));
 }
 
+/* Fixed internal round count per candidate-salt pair, for the brute-force
+ * progress divisor only. PAIRED WITH gpu_compute_iter_sum() in
+ * gpu/gpujob_opencl.c -- these constants are the same protocol values
+ * (25 for Unix DES crypt(3), 1000 for md5crypt, 1000000 for Drupal SHA1)
+ * and must stay in step with that table. Compiled unconditionally: the
+ * progress display exists in non-GPU builds too, whereas
+ * gpu_compute_iter_sum is static inside a GPU-only translation unit.
+ *
+ * Types whose round count is encoded per salt (bcrypt cost, phpBB3 iter
+ * char, the rounds= prefix on $5$/$6$) return 1 and clear *exact, because
+ * reconstructing their true divisor needs the salt strings of the salts
+ * that are still live, and a salt that retired has left LIVESALTS while
+ * its operations remain in Tothash. Reporting 1 under-divides, which is
+ * why the caller caps the percentage and refuses to print an ETA rather
+ * than showing a confident wrong one. */
+static unsigned long long bf_progress_iter_per_salt(int op, int *exact) {
+  switch (op) {
+    case JOB_DESCRYPT:       return 25ULL;
+    case JOB_MD5CRYPT:       return 1000ULL;
+    case JOB_SHA1DRU:        return 1000000ULL;
+    case JOB_BCRYPT:
+    case JOB_PHPBB3:
+    case JOB_SHA256CRYPT:
+    case JOB_SHA512CRYPT:
+    case JOB_SHA512CRYPTMD5:
+      if (exact) *exact = 0;
+      return 1ULL;
+    default:                 return 1ULL;
+  }
+}
+
 static void format_rate(double val, double *out, char **suffix) {
   *suffix = "";
   if (val < 0.0) val = 0.0;
@@ -45731,17 +46684,36 @@ MDXALIGN void ReportStats(void *dummy) {
        * For salted types, each candidate is also multiplied by the salt count.
        * Divide by the total multiplier to recover the candidate progress. */
       unsigned long long progress = Tothash;
+      /* Recover candidate progress from Tothash. Tothash counts hash
+       * OPERATIONS, so for an iterated type it already carries that type's
+       * internal round count per candidate-salt pair: the GPU accounting
+       * multiplies by gpu_compute_iter_sum() (gpu/gpujob_opencl.c), which is
+       * iter x nsalts_packed. Dividing by the live salt count alone therefore
+       * leaves the iteration factor in, and the displayed position runs past
+       * the keyspace -- DESCRYPT showed 1730% of a 100M 8-digit mask at 69%
+       * complete, which also clamped the sample candidate to the last mask
+       * value and forced ETA to report done. Divide by iter x salts instead.
+       *
+       * iter_exact stays 1 only while every selected type has a FIXED round
+       * count. The variable-iter types derive theirs per salt from the salt
+       * string, and a retired salt is gone from LIVESALTS but its operations
+       * are still in Tothash, so their divisor is not reconstructible here.
+       * For those the percentage is capped and the ETA says unknown rather
+       * than naming a wrong time -- see the iter_exact uses below. */
+      int iter_exact = 1;
       { unsigned long long multiplier = 0;
         Word_t ti = 0; int trc;
         J1F(trc, Dohash, ti);
         while (trc) {
           unsigned int ns = LIVESALTS(ti);
-          multiplier += (ns > 0) ? ns : 1;
+          unsigned long long iter = bf_progress_iter_per_salt((int)ti, &iter_exact);
+          multiplier += ((ns > 0) ? (unsigned long long)ns : 1ULL) * iter;
           J1N(trc, Dohash, ti);
         }
         if (multiplier > 1) progress /= multiplier;
       }
       double pct = (BruteForceTotal > 0) ? (100.0 * progress / BruteForceTotal) : 0;
+      if (pct > 100.0) pct = 100.0;
       /* Generate sample candidate from completed progress position */
       char sample[MAX_MASK_POS + 1];
       unsigned long long sample_idx = progress < BruteForceTotal ? progress : BruteForceTotal - 1;
@@ -45752,7 +46724,10 @@ MDXALIGN void ReportStats(void *dummy) {
       double remaining = (rate > 0 && progress < BruteForceTotal) ?
                           (BruteForceTotal - progress) / rate : 0;
       char eta[64];
-      format_eta(remaining, eta, sizeof(eta));
+      if (!iter_exact && progress >= BruteForceTotal)
+        snprintf(eta, sizeof(eta), "unknown");
+      else
+        format_eta(remaining, eta, sizeof(eta));
       /* Format progress with SI prefix */
       double dprog = (double)progress, dtotal = (double)BruteForceTotal;
       char *pmult = "", *tmult = "";
@@ -51191,6 +52166,129 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
       memmove(line, line + 8, mystrlen(line + 8) + 1);
       /* fall through to hex loader */
     }
+    /* Crypto++ Legacy/Default Encryptor (e1028/e1029). The whole line is one
+     * hex record: salt(8) || CBC ciphertext. Uppercase in the wild; either
+     * case is read, and the key is NORMALISED TO UPPERCASE here. The procjob
+     * case compares and emits that same Judy key, so the normalisation has to
+     * happen in exactly one place -- a case mismatch between loader and
+     * compute presents as "hash not found" with a perfectly correct compute.
+     *
+     * PLACED LAST, immediately above the plain-hex loader, deliberately. The
+     * claim is only "all hex, byte length a multiple of 8, at least 24
+     * bytes", which is broad enough to swallow shapes belonging to a more
+     * specific recognizer -- Oracle 12+ is exactly 160 hex characters, 80
+     * bytes, and 80 is a legal Legacy length. Every structured recognizer
+     * above therefore gets first refusal.
+     *
+     * ONE block serves BOTH types rather than two sequential recognizers,
+     * because the two length sets overlap completely: Legacy is 8+8k, Default
+     * is 8+16m, and every Default length is also a Legacy length. A 40-, 56-
+     * or 72-byte record is a legal record of either type, so each selected
+     * type whose block size can hold it gets it and the line is consumed
+     * once. With two blocks the first `continue` would starve the second.
+     * There is thus no ordering hazard BETWEEN the two types; the order that
+     * IS load-bearing is this block against the plain-hex loader below, and
+     * this block wins.
+     *
+     * Claim and consume: the value is ciphertext, and letting the hex loader
+     * have it would file ciphertext as a digest of whatever type shares its
+     * width. But a consumed line is otherwise invisible, so when the width is
+     * also a standard digest width AND a plain-hex type is selected in the
+     * same run, say so once on stderr. LoadHex is the available proxy for
+     * "some plain-hex type is selected" -- mdxfind keeps no per-type digest
+     * width table, so the note can name the widths but not prove that the
+     * specific colliding type is among them. It over-warns rather than
+     * staying silent. */
+    if ((lf[JOB_CRYPTOPPLEGACY] || lf[JOB_CRYPTOPPDEFAULT]) && len >= 48) {
+      /* Single-threaded: load_hash_file runs on the main thread, before any
+       * procjob worker exists.
+       *
+       * THREE input shapes are accepted, and all three are the ordinary
+       * salted convention rather than anything new:
+       *
+       *   <record>                       record only; keys come from -s/-S
+       *   <record>:<sitekey>             key inline -- the normal form
+       *   <record>:<sitekey>:<plaintext> mdxfind's own output, fed back
+       *
+       * The site key is a SALT of cardinality one, so it goes where a salt
+       * goes: TYPESALT of each claiming type. The third field is the
+       * recovered PLAINTEXT and mdxfind IGNORES it; it exists so that a
+       * founds file verifies through hashpipe unchanged and so that a -z
+       * generated line cracks back through -F. The record is pure hex and can
+       * never itself contain a colon, so the split is unambiguous.
+       *
+       * The length test is on the LEADING HEX RUN, not on the whole line,
+       * which is what makes the colon forms reachable at all. `len >= 48`
+       * above only skips lines too short to hold the 24-byte minimum record
+       * in hex; the real gate is cpe_hl below. */
+      static int cppenc_collide_warned = 0;
+      int cpe_hl = 0, cpe_bytes, cpe_claimed = 0, cpe_kl = 0;
+      char *cpe_key = NULL, *cpe_c;
+      while (cpe_hl < MAXLINE && isxdigit((unsigned char)line[cpe_hl])) cpe_hl++;
+      cpe_bytes = cpe_hl / 2;
+      if (cpe_hl >= 48 && (cpe_hl & 1) == 0 && (cpe_bytes % 8) == 0 &&
+          cpe_hl < MAXLINE && (line[cpe_hl] == 0 || line[cpe_hl] == ':')) {
+        if (line[cpe_hl] == ':') {
+          cpe_key = line + cpe_hl + 1;
+          cpe_c = strchr(cpe_key, ':');
+          cpe_kl = cpe_c ? (int)(cpe_c - cpe_key) : (int)mystrlen(cpe_key);
+          /* Terminate the key in place. `line` is this function's own buffer
+           * and the block always `continue`s once it has claimed, so nothing
+           * downstream reads past here. */
+          if (cpe_kl <= 0) { cpe_key = NULL; cpe_kl = 0; }
+          else cpe_key[cpe_kl] = 0;
+        }
+        for (x = 0; x < cpe_hl; x++)
+          salttmp[x] = toupper((unsigned char)line[x]);
+        salttmp[cpe_hl] = 0;
+        if (lf[JOB_CRYPTOPPLEGACY] && cppenc_reclen_ok(&CPPENC_LEGACY, cpe_bytes)) {
+          JSLI(PV, JUDYJ(JOB_CRYPTOPPLEGACY), (unsigned char *)salttmp);
+          Foundcnt[JOB_CRYPTOPPLEGACY]++;
+          cpe_claimed = 1;
+          if (cpe_key) {
+            JSLI(PV, TYPESALT(JOB_CRYPTOPPLEGACY), (unsigned char *)cpe_key);
+            if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_CRYPTOPPLEGACY]++; }
+          }
+        }
+        if (lf[JOB_CRYPTOPPDEFAULT] && cppenc_reclen_ok(&CPPENC_DEFAULT, cpe_bytes)) {
+          JSLI(PV, JUDYJ(JOB_CRYPTOPPDEFAULT), (unsigned char *)salttmp);
+          Foundcnt[JOB_CRYPTOPPDEFAULT]++;
+          cpe_claimed = 1;
+          if (cpe_key) {
+            JSLI(PV, TYPESALT(JOB_CRYPTOPPDEFAULT), (unsigned char *)cpe_key);
+            if (PV) { if ((*PV)++ == 0) Saltloaded[JOB_CRYPTOPPDEFAULT]++; }
+          }
+        }
+        if (cpe_claimed) {
+          if (LoadHex && !cppenc_collide_warned) {
+            const char *cpe_coll = NULL;
+            switch (cpe_bytes) {
+              case 24: cpe_coll = "Tiger and the other 192-bit digests"; break;
+              case 32: cpe_coll = "SHA-256 and the other 256-bit digests"; break;
+              case 48: cpe_coll = "SHA-384"; break;
+              case 64: cpe_coll = "SHA-512 and Whirlpool"; break;
+            }
+            if (cpe_coll) {
+              cppenc_collide_warned = 1;
+              fprintf(stderr,
+                "NOTE: %s: a %d-byte hex value was claimed as a Crypto++ "
+                "encryptor record.\n"
+                "      %d bytes is also the width of %s, and a plain-hex "
+                "type is selected in this run.\n"
+                "      The Crypto++ recognizer consumes the line, so the hex "
+                "loader never sees it and\n"
+                "      those digests will NOT load, nor will a trailing "
+                ":salt reach another salted type.\n"
+                "      Run the digest type in a separate pass, or drop "
+                "CRYPTOPPLEGACY/CRYPTOPPDEFAULT\n"
+                "      from the selection.\n",
+                filename, cpe_bytes, cpe_bytes, cpe_coll);
+            }
+          }
+          continue;
+        }
+      }
+    }
     /* Plain hex hashes: load into compact table */
     if (LoadHex && inhashbuf) {
       int hlen = get32(line, inhashbuf + 2, 256);
@@ -51554,6 +52652,14 @@ union HashU curin;
                "    F   wrapped or structured hash, read with -F\n"
                "        (-J offers the file to every selected type instead of the -M set)\n"
                "    s   takes a salt: use -F with hash:salt lines, or -s <saltfile>\n"
+               "        (-S <file> after -M loads salts for the selected types only)\n"
+               "        CRYPTOPPLEGACY and CRYPTOPPDEFAULT are the exception that\n"
+               "        matters here: those records are ENCRYPTED, not hashed, so\n"
+               "        the salt is ONE SITE-WIDE KEY and THE WORDLIST CANNOT\n"
+               "        AFFECT THE RESULT. Supply it inline as record:sitekey, or\n"
+               "        put candidate keys in a -s/-S file to search them. Output\n"
+               "        is record:sitekey:plaintext -- the LAST field is the\n"
+               "        decrypted PLAINTEXT, never the key.\n"
                "    u   takes a username: -F with hash:user lines, or -u <userfile>\n"
                "    j   takes a pepper: -j <file>, or -P <file> after -M\n"
                "  The -m/-M selection MUST come BEFORE -F/-J on the command line;\n"
@@ -56453,6 +57559,48 @@ usage:
             } else { J1U(RC, Dohash, JOB_SUNMD5); }
           }
         }
+        /* CRYPTOPPLEGACY / CRYPTOPPDEFAULT: copy JudyJ to Typesalt, free
+         * JudyJ, exactly as SUNMD5 above. The record IS the salt here: its
+         * leading 8 bytes are the salt and the rest is the ciphertext the
+         * oracle reads, so Typesalt carries the whole line and the refcount
+         * of 1 is right by construction -- each key maps to exactly one
+         * record, which is the condition the MSSQL salt-accounting fix
+         * identified as making a hardcoded 1 safe.
+         *
+         * In -z mode there is normally nothing loaded and
+         * init_default_salts() has already put the default record in
+         * Typesalt; the insert below is the belt to that brace and is a
+         * no-op when it is already there. */
+        { int cpz;
+          static const int cpz_ops[2] = { JOB_CRYPTOPPLEGACY, JOB_CRYPTOPPDEFAULT };
+          static const char *cpz_def[2] = {
+            "0123456789ABCDEF0F4127ADFA2E97A8E043BE067112BF796C053027329CB7D5",
+            "0123456789ABCDEF325C10900B9C608A24F808F8A3CD67A5DE74E19206E90D899617BA6318EB8AB3" };
+          for (cpz = 0; cpz < 2; cpz++) {
+            long cpcnt = 0;
+            line[0] = 0;
+            JSLF(PV, JUDYJ(cpz_ops[cpz]), (unsigned char *)line);
+            while (PV) {
+              Word_t *SPV;
+              JSLI(SPV, TYPESALT(cpz_ops[cpz]), (unsigned char *)line);
+              if (SPV && *SPV == 0) *SPV = 1;
+              cpcnt++;
+              JSLN(PV, JUDYJ(cpz_ops[cpz]), (unsigned char *)line);
+            }
+            JSLFA(RC, JUDYJ(cpz_ops[cpz]));
+            if (cpcnt) {
+              Numsalts += cpcnt;
+              fprintf(stderr, "Searching through %ld unique %s records\n",
+                      cpcnt, TYPENAME(cpz_ops[cpz]));
+            } else {
+              J1T(RC, Dohash, cpz_ops[cpz]);
+              if (RC && Printall) {
+                JSLI(PV, TYPESALT(cpz_ops[cpz]), (unsigned char *)cpz_def[cpz]);
+                if (PV && *PV == 0) *PV = 1;
+              } else { J1U(RC, Dohash, cpz_ops[cpz]); }
+            }
+          }
+        }
         /* GOST12256CRYPT: copy JudyJ to Typesalt, free JudyJ (like GOST12512CRYPT) */
         { long gcnt = 0;
           line[0] = 0;
@@ -57053,8 +58201,18 @@ usage:
       Word_t ti = 0;
       J1F(RC, Dohash, ti);
       while (RC) {
+        /* !TYPESALT(ti) keeps -s from stamping over salts a -F file already
+         * supplied. CRYPTOPPLEGACY/CRYPTOPPDEFAULT are exempt because for
+         * them TYPESALT is ALSO the record store: the bootstrap above has
+         * already copied the records into it out of JudyJ, so the guard would
+         * see a non-empty Judy and silently drop every -s candidate key the
+         * moment any record was loaded -- which is every real run. procjob
+         * separates records from keys structurally, so a mixed Judy is the
+         * intended state here, not an accident. */
         if (ti < JOB_DONE && (TYPEOPTS(ti) & TYPEOPT_SALTJUDY) &&
-            (TYPEOPTS(ti) & TYPEOPT_NEEDSALT) && !TYPESALT(ti)) {
+            (TYPEOPTS(ti) & TYPEOPT_NEEDSALT) &&
+            (!TYPESALT(ti) || ti == JOB_CRYPTOPPLEGACY ||
+             ti == JOB_CRYPTOPPDEFAULT)) {
           { int _sc = 0;
             int _sp = (Numsalts > 500000);
             line[0] = 0;
@@ -57731,7 +58889,10 @@ usage:
       }
       for (uint32_t i = 0; i < fx_num_words; i++) fxg->word_offset[i] = 0;
       fxg->packed_count     = fx_num_words;
-      fxg->packed_pos       = 1;
+      /* Two bytes, per the 2-byte plen=0 header written above; see the
+       * BF chunk producer's note on why packed_pos must cover the whole
+       * header or the hit replay discards every hit. */
+      fxg->packed_pos       = 2;
       fxg->op               = JOB_MD5;          /* arbitrary; A4 ignores */
       fxg->filename         = "fixture-bf";
       fxg->flags            = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE | JOBFLAG_BF_CHUNK;

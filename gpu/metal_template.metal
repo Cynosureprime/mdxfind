@@ -152,6 +152,32 @@
 #define SALT_BATCH 16
 #endif
 
+/* Phase 0a DESCRYPT (2026-09-18): GPU_TEMPLATE_HAS_SHARED_LOCAL.
+ * Lockstep twin of the block of the same name in gpu_template.cl.
+ *
+ * A SECOND threadgroup hook, distinct from GPU_TEMPLATE_HAS_LOCAL_BUFFER:
+ *   HAS_LOCAL_BUFFER (BCRYPT)    per-lane PARTITION of a writable slab,
+ *                                tg pinned to 8 by .dispatch_tg_size,
+ *                                no barrier (no lane reads another's).
+ *   HAS_SHARED_LOCAL (DESCRYPT)  ONE threadgroup copy of a READ-ONLY
+ *                                table block, sized absolutely, tg
+ *                                unpinned, and it DOES need a barrier.
+ *
+ * The barrier is why the init sits above the `gid >= n_words` early
+ * return: a threadgroup_barrier below that return is not reached by the
+ * tail lanes of the last threadgroup.  hashcat's SYNC_THREADS() sits in
+ * exactly the same place (OpenCL/m01500_a0-pure.cl:56-68).
+ *
+ * The core must define GPU_TEMPLATE_SHARED_LOCAL_UINTS and
+ * template_shared_local_init(threadgroup uint*, uint lid, uint lsz), and
+ * take a trailing `threadgroup const uint *` on template_finalize (and on
+ * template_pre_salt / template_finalize_post under HAS_PRE_SALT).  Both
+ * macros are set BY THE CORE, whose source string precedes this one in
+ * the per-family JIT concat (gpu_metal.m metal_load_library_family). */
+#if defined(GPU_TEMPLATE_HAS_SHARED_LOCAL) && defined(GPU_TEMPLATE_HAS_LOCAL_BUFFER)
+#error "GPU_TEMPLATE_HAS_SHARED_LOCAL and GPU_TEMPLATE_HAS_LOCAL_BUFFER are mutually exclusive"
+#endif
+
 kernel void template_phase0(
     device uchar          *payload          [[buffer(0)]],
     device const uint     *compact_fp       [[buffer(1)]],
@@ -251,6 +277,15 @@ kernel void template_phase0(
      * (byte-identity gate per TRAP 1 of the Phase 2d.9b brief). */
     uint                   lid              [[thread_position_in_threadgroup]]
 #endif
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    ,
+    /* Phase 0a DESCRYPT: lane index and threadgroup width, for the
+     * strided cooperative fill of the shared table block.  Added only
+     * under HAS_SHARED_LOCAL so every other family keeps its exact
+     * pre-Phase-0a signature. */
+    uint                   tg_lid           [[thread_position_in_threadgroup]],
+    uint                   tg_size          [[threads_per_threadgroup]]
+#endif
     )
 {
     /* Decode payload header. Copy params to thread (lane-private) memory
@@ -259,6 +294,16 @@ kernel void template_phase0(
     device const MetalParams *params_buf =
         (device const MetalParams *)payload;
     MetalParams params = *params_buf;
+
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    /* Phase 0a (2026-09-18): ONE threadgroup copy of the core's read-only
+     * table block, filled cooperatively and then fenced.  MUST stay above
+     * the `gid >= n_words` early return below -- see the macro's block
+     * comment near SALT_BATCH. */
+    threadgroup uint tpl_shared[GPU_TEMPLATE_SHARED_LOCAL_UINTS];
+    template_shared_local_init(tpl_shared, tg_lid, tg_size);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#endif
 
     uint n_words = params.num_words;
 #ifdef GPU_TEMPLATE_HAS_RULES
@@ -666,7 +711,12 @@ kernel void template_phase0(
              * once per (word, rule, mask). All SALT_BATCH-tiled salt
              * iterations below reuse pre_state. */
             template_pre_salt_state pre_state;
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+            template_pre_salt(buf, new_len, params.algo_mode, pre_state,
+                              tpl_shared);
+#else
             template_pre_salt(buf, new_len, params.algo_mode, pre_state);
+#endif
 #endif
             for (uint salt_base = 0u; salt_base < salt_count; salt_base += (uint)SALT_BATCH) {
                 uint tile_end = salt_base + (uint)SALT_BATCH;
@@ -699,10 +749,17 @@ kernel void template_phase0(
                 uint  s_off = salt_off[salt_idx_global];
                 uint  s_len = (uint)salt_lens[salt_idx_global];
 #ifdef GPU_TEMPLATE_HAS_PRE_SALT
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                template_finalize_post(st, pre_state,
+                                       buf, new_len,
+                                       salt_buf + s_off, s_len,
+                                       params.algo_mode, tpl_shared);
+#else
                 template_finalize_post(st, pre_state,
                                        buf, new_len,
                                        salt_buf + s_off, s_len,
                                        params.algo_mode);
+#endif
 #else
 #ifdef GPU_TEMPLATE_HAS_LOCAL_BUFFER
                 /* Phase 2d.9b BCRYPT (2026-05-16): 8-arg signature variant.
@@ -717,6 +774,12 @@ kernel void template_phase0(
                                   salt_buf + s_off, s_len,
                                   params.algo_mode,
                                   sbox_pool, lid);
+#elif defined(GPU_TEMPLATE_HAS_SHARED_LOCAL)
+                /* Phase 0a DESCRYPT: trailing threadgroup table-block
+                 * pointer. */
+                template_finalize(st, buf, new_len,
+                                  salt_buf + s_off, s_len,
+                                  params.algo_mode, tpl_shared);
 #else
                 template_finalize(st, buf, new_len,
                                   salt_buf + s_off, s_len,
@@ -724,7 +787,11 @@ kernel void template_phase0(
 #endif
 #endif
 #else
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                template_finalize(st, buf, new_len, tpl_shared);
+#else
                 template_finalize(st, buf, new_len);
+#endif
 #endif
 
                 /* --- Iterated probe loop — Phase 1 fires it exactly once. --- */

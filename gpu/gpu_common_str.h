@@ -1,8 +1,11 @@
 /* Auto-generated from gpu_common.cl -- do not edit */
 static const char gpu_common_str[] =
     "/*\n"
-    " * $Revisio" "n: 1.36 $\n"
+    " * $Revisio" "n: 1.37 $\n"
     " * $Lo" "g: gpu_common.cl,v $\n"
+    " * Revision 1.37  2026/09/17 16:56:03  dlr\n"
+    " * Publish-safety scrub: the embedded og text carried a real name, which mdxfind-release copies verbatim into the public repo. Replaced with Waffle throughout. Comment text only; no kernel change, and the generated _str.h were regenerated to match.\n"
+    " *\n"
     " * Revision 1.36  2026/09/15 21:32:33  dlr\n"
     " * Gate the TIGER, SNEFRU and GOST constant tables behind GPU_COMMON_LEAN: 28,672 bytes, and without it six hash types stop building.\n"
     " *\n"

@@ -1,6 +1,12 @@
 /*
- * $Revision: 1.22 $
+ * $Revision: 1.24 $
  * $Log: gpu_template.cl,v $
+ * Revision 1.24  2026/09/18 20:45:02  dlr
+ * Phase 0a DESCRYPT e500 GPU speedup, both backends. Three increments to the existing scalar carrier, no new kernel and no new family: one, the SP tables staged into local and threadgroup memory via a new sibling hook GPU_TEMPLATE_HAS_SHARED_LOCAL, one shared 2 KB workgroup copy rather than the per-lane writable slab of HAS_LOCAL_BUFFER, which pins the workgroup to 8 and does not compose with HAS_PRE_SALT; two, a nibble-table key setup built on device from the same DESCRYPT_pc2 walk the bit loop used; three, GPU_TEMPLATE_HAS_PRE_SALT on the scalar kernel, hoisting the key schedule out of the salt loop where it had been recomputed for every one of 4,096 salts. The two backends ship at different levels because the measurements disagree about which increment pays, and the reason is structural. OpenCL ships level 1: increment 1 alone takes a GTX 1080 from 13.5 to 146.1 M crypt per second at 3,471 salts, 10.79 times, and 1.40 times ahead of hashcat -a 0 measured on the same non-cracking fixture the same hour at 104.6. Increment 2 is neutral there at minus 0.04 percent and increment 3 costs 75.9 percent at 16 salts because it divides the NDRange by SALT_BATCH. Metal ships level 3 with the key tables off: increment 1 gives only 10 to 11 percent because Apple has no constant-cache broadcast penalty to relieve, increment 2 is a loss of 9.5 to 11.2 percent, and increment 3 is the whole win at plus 32.8 percent on an M1 and plus 44.2 percent on an M2 Max, because the Metal generic-family grid is num_words alone with rule and mask and salt as inner loops, so the hoist removes work without removing a grid axis. Net shipped gain over pre-0a at 3,471 salts: 10.79 times on the 1080, 35.8 percent on M1, 42.3 percent on M2 Max. Both Apple GPUs independently agree level 3 is fastest at every salt count, so no per-GPU selection is warranted. DESCRYPT_SALT_BATCH is its own constant at 16 and deliberately not dynsize_compile_time_N, whose single shared 64 belongs to the MD5SALT servo and would make two algorithms re-JIT each other. All knobs are compile-time ifndef; no environment variable is read. Byte identity of the shared templates proven rather than assumed: 111 OpenCL program variants and 162 Metal variants preprocessed against the prior revision with zero lines differing, the template additions being pure insertions inside the new ifdef. Correctness validated against glibc and Darwin crypt 3, an implementation by different authors rather than mdxfind own crypt-des.c, over 8 passwords by all 4,096 salts, 32,768 of 32,768 recovered with zero differences on both backends and zero CPU versus GPU divergence, plus CPU equals GPU on the real 47,366-hash list, the five adjacent DES-family types unchanged, the 1.591 salt-compaction bounds fix not regressed, and -z mode unchanged. Two brief assumptions were measured wrong and are recorded here: the key schedule does not become 25 to 35 percent of the kernel once the tables move, and increment 1 returns no constant-bank headroom because the constant table is the source the local copy initialises from, with dot-const totalling 21,324 bytes before and after.
+ *
+ * Revision 1.23  2026/09/17 16:56:05  dlr
+ * Publish-safety scrub: the embedded og text carried a real name, which mdxfind-release copies verbatim into the public repo. Replaced with Waffle throughout. Comment text only; no kernel change, and the generated _str.h were regenerated to match.
+ *
  * Revision 1.22  2026/09/17 04:24:53  dlr
  * Correct the header note to match the code: this kernel is no longer side-by-side with md5_rules_phase0 behind an env selector. B5 made the template the production path for every wired algorithm and the MDXFIND_GPU_TEMPLATE selector was removed on 2026-09-16; md5_rules_phase0 survives only as an MD5 fallback for a failed template compile. Comment only, no kernel change.
  *
@@ -179,6 +185,50 @@
 #define SALT_BATCH 16
 #endif
 
+/* Phase 0a DESCRYPT (2026-09-18): GPU_TEMPLATE_HAS_SHARED_LOCAL.
+ *
+ * A SECOND, different __local hook, and the difference from
+ * GPU_TEMPLATE_HAS_LOCAL_BUFFER above is the whole point of it being
+ * separate:
+ *
+ *   HAS_LOCAL_BUFFER (BCRYPT)     per-lane PARTITION of a writable slab,
+ *                                 1024 uints x BCRYPT_WG_SIZE lanes, WG
+ *                                 pinned to 8 by reqd_work_group_size,
+ *                                 no barrier because no lane reads
+ *                                 another lane's slot.
+ *   HAS_SHARED_LOCAL (DESCRYPT)   ONE workgroup copy of a READ-ONLY
+ *                                 table block, sized absolutely (not per
+ *                                 lane), WG unpinned, and it DOES need a
+ *                                 barrier because every lane reads every
+ *                                 slot.
+ *
+ * The barrier is why the init sits at the very top of the kernel, ahead
+ * of the `gid >= total` early return: a barrier below that return is not
+ * reached by the tail lanes of the last workgroup (global is rounded up
+ * to a multiple of local), which is undefined behaviour and deadlocks on
+ * some drivers.  hashcat puts its SYNC_THREADS() in the same place, ahead
+ * of `if (gid >= GID_CNT) return;` -- OpenCL/m01500_a0-pure.cl:56-68.
+ *
+ * Hooks the algorithm core must define when it sets the macro:
+ *
+ *   GPU_TEMPLATE_SHARED_LOCAL_UINTS     size of the block, in uints
+ *   void template_shared_local_init(__local uint *tbl, uint lid, uint lsz)
+ *
+ * and the extra trailing `__local const uint *` argument on
+ * template_finalize (and on template_pre_salt / template_finalize_post
+ * when HAS_PRE_SALT is also set).  Both macros are defined BY THE CORE,
+ * not by host build_opts, because the core source string precedes this
+ * one in gpu_template_sources() (gpu/gpu_opencl.c) -- same mechanism
+ * GPU_TEMPLATE_HAS_ALT_DIGEST uses.
+ *
+ * Unlike HAS_LOCAL_BUFFER this one composes with HAS_PRE_SALT; DESCRYPT
+ * needs both (shared SP table AND a key schedule hoisted out of the salt
+ * loop).  Pairing it with HAS_LOCAL_BUFFER has no caller and two
+ * conflicting notions of what the __local block is for, so refuse it. */
+#if defined(GPU_TEMPLATE_HAS_SHARED_LOCAL) && defined(GPU_TEMPLATE_HAS_LOCAL_BUFFER)
+#error "GPU_TEMPLATE_HAS_SHARED_LOCAL and GPU_TEMPLATE_HAS_LOCAL_BUFFER are mutually exclusive"
+#endif
+
 /* ----------------------------------------------------------------------
  * Working-buffer geometry.
  *
@@ -296,6 +346,17 @@ void template_phase0(
      * private memory so subsequent field accesses stay in registers. */
     __global const OCLParams *params_buf = (__global const OCLParams *)payload;
     OCLParams params = *params_buf;
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    /* Phase 0a (2026-09-18): ONE workgroup copy of the core's read-only
+     * table block, filled cooperatively and then fenced.  MUST stay above
+     * the `gid >= total` early return below -- see the macro's block
+     * comment near SALT_BATCH for why. */
+    __local uint tpl_shared[GPU_TEMPLATE_SHARED_LOCAL_UINTS];
+    template_shared_local_init(tpl_shared,
+                               (uint)get_local_id(0),
+                               (uint)get_local_size(0));
+    barrier(CLK_LOCAL_MEM_FENCE);
+#endif
     uint n_words = params.num_words;
     uint n_rules = params.num_masks;
     /* B7.1-B7.5 mask geometry: third axis is mask_idx in [0, mask_size).
@@ -678,7 +739,11 @@ void template_phase0(
      * template_finalize_post to consume pre_state + salt and produce the
      * final per-salt digest in st. */
     template_pre_salt_state pre_state;
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    template_pre_salt(buf, new_len, params.algo_mode, &pre_state, tpl_shared);
+#else
     template_pre_salt(buf, new_len, params.algo_mode, &pre_state);
+#endif
 
     for (uint i = 0u; i < (uint)SALT_BATCH; i++) {
         uint salt_local = salt_base + i;
@@ -689,10 +754,17 @@ void template_phase0(
 
         template_state st;
         template_init(&st);
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+        template_finalize_post(&st, &pre_state,
+                               buf, new_len,
+                               salt_buf + s_off, s_len,
+                               params.algo_mode, tpl_shared);
+#else
         template_finalize_post(&st, &pre_state,
                                buf, new_len,
                                salt_buf + s_off, s_len,
                                params.algo_mode);
+#endif
 #else
     template_state st;
     template_init(&st);
@@ -713,11 +785,19 @@ void template_phase0(
      * sets this define. */
     template_finalize(&st, buf, new_len, salt_buf + s_off, s_len,
                       params.algo_mode, sbox_pool, (uint)get_local_id(0));
+#elif defined(GPU_TEMPLATE_HAS_SHARED_LOCAL)
+    /* Phase 0a DESCRYPT: trailing __local table-block pointer. */
+    template_finalize(&st, buf, new_len, salt_buf + s_off, s_len,
+                      params.algo_mode, tpl_shared);
 #else
     template_finalize(&st, buf, new_len, salt_buf + s_off, s_len, params.algo_mode);
 #endif
 #else
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    template_finalize(&st, buf, new_len, tpl_shared);
+#else
     template_finalize(&st, buf, new_len);
+#endif
 #endif
 #endif /* GPU_TEMPLATE_HAS_PRE_SALT */
 

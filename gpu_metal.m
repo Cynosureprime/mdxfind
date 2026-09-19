@@ -3839,6 +3839,36 @@ static struct gpu_metal_family metal_family_sha512cryptmd5 = {
     .pso_for_variant_v2 = sha512cryptmd5_pso_for_variant_v2,  /* Wave 4 */
 };
 
+/* DESCRYPT Phase 0a level knob -- mirrors DESCRYPT_PHASE0A_LEVEL in
+ * gpu/gpu_opencl.c.  Compile-time only, deliberately not an environment
+ * variable: MDXFIND_CACHE is the only env input mdxfind reads. */
+/* MEASURED 2026-09-18 on dev1.local (Apple M1, Mac mini 9,1), all 4,096
+ * salts of contest/history/descrypt-remaining-2026-09-18.txt, M crypt/s:
+ *
+ *   salts |  L0   |  L1   |  L2   |  L3   | L3+KS0
+ *       1 | 2.508 | 2.508 | 2.503 | 2.508 | 2.508
+ *      16 | 3.818 | 3.885 | 3.757 | 4.326 | 4.408
+ *     256 | 5.794 | 6.428 | 5.991 | 7.514 | 7.856
+ *    4096 | 6.158 | 6.855 | 6.165 | 8.447 | 8.440
+ *
+ * SHIPPED: level 3 with increment 2 OFF -- +37% over pre-Phase-0a at
+ * 4,096 salts and no regression at any salt count.
+ *
+ * The OpenCL twin ships at level 1 instead, and the asymmetry is
+ * structural, not a tuning difference.  gpu_template.cl carries the salt
+ * on the GID, so GPU_TEMPLATE_HAS_PRE_SALT divides its parallelism by
+ * SALT_BATCH and costs up to 76% at low salt counts.  metal_template.metal
+ * already runs one thread per WORD with rule x mask x salt as inner loops
+ * (task #250), so there is no salt axis to lose and the hoist is pure
+ * saving.  Increment 2 is off on both backends: neutral on OpenCL,
+ * -10% here without the hoist and -4% with it. */
+#ifndef DESCRYPT_PHASE0A_LEVEL
+#define DESCRYPT_PHASE0A_LEVEL 3
+#endif
+#ifndef DESCRYPT_PHASE0A_KS_TABLE
+#define DESCRYPT_PHASE0A_KS_TABLE 0
+#endif
+
 static struct gpu_metal_family metal_family_descrypt = {
     .op                 = JOB_DESCRYPT,
     .name               = "descrypt",
@@ -4581,12 +4611,40 @@ static void metal_register_builtin_families(void)
         @"HASH_BLOCK_BYTES": @64,
         @"BASE_ALGO":        @"md5crypt"
     });
+    /* DESCRYPT Phase 0a (2026-09-18) -- lockstep with the OpenCL knob in
+     * gpu/gpu_opencl.c (DESCRYPT_PHASE0A_LEVEL).  Same three increments,
+     * same level numbering:
+     *   1  threadgroup-shared SP table  (core sets HAS_SHARED_LOCAL)
+     *   2  nibble-table PC-2            (DESCRYPT_KS_TABLE)
+     *   3  key schedule hoisted out of the salt loop (HAS_PRE_SALT)
+     *
+     * Increment 3 needs NO host geometry change on Metal, unlike OpenCL:
+     * metal_template.metal already runs one thread per word with the salt
+     * axis as an INNER loop (task #250), so template_pre_salt simply moves
+     * above that loop.  SALT_BATCH is only the tile/unroll boundary there
+     * and the pre_state is computed outside it, so the template default
+     * (16) is left alone rather than threading metal_select_salt_batch --
+     * that selector is tuned for the MD5SALT inner-MD5 tile and means
+     * something different here. */
     metal_family_descrypt.core_str    = metal_descrypt_core_str;
+#if DESCRYPT_PHASE0A_LEVEL >= 3
     metal_family_descrypt.base_macros = (void *)CFBridgingRetain(@{
-        @"HASH_WORDS":       @4,
-        @"HASH_BLOCK_BYTES": @64,
-        @"BASE_ALGO":        @"descrypt"
+        @"HASH_WORDS":               @4,
+        @"HASH_BLOCK_BYTES":         @64,
+        @"BASE_ALGO":                @"descrypt",
+        @"DESCRYPT_PHASE0A":         @(DESCRYPT_PHASE0A_LEVEL),
+        @"DESCRYPT_KS_TABLE":        @(DESCRYPT_PHASE0A_KS_TABLE),
+        @"GPU_TEMPLATE_HAS_PRE_SALT": @1
     });
+#else
+    metal_family_descrypt.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":               @4,
+        @"HASH_BLOCK_BYTES":         @64,
+        @"BASE_ALGO":                @"descrypt",
+        @"DESCRYPT_PHASE0A":         @(DESCRYPT_PHASE0A_LEVEL),
+        @"DESCRYPT_KS_TABLE":        @(DESCRYPT_PHASE0A_KS_TABLE)
+    });
+#endif
 
     /* D5b Wave 4 2026-05-16: 9 quirky families migrated to the generic
      * loader path. Final new-migration wave -- 52 of 52 Metal families now

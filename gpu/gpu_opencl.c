@@ -8974,6 +8974,75 @@ static int gpu_opencl_template_kernel_lazy_sha512crypt(struct gpu_device *d, int
  * host-side. HASH_WORDS=4 (state = pre-FP (l, r) in h[0..1], h[2..3]
  * zero-pad to match the host compact-table layout). Phase 5 of the
  * Unix-crypt ladder (FINAL phase). */
+/* ----------------------------------------------------------------------
+ * DESCRYPT Phase 0a (2026-09-18).  ONE compile-time knob, deliberately
+ * not an environment variable and not a CLI flag -- it exists so the
+ * three increments can be priced separately and then left at 3.
+ *
+ *   0  pre-Phase-0a: __constant SP table, bit-loop PC-2, key schedule
+ *      recomputed for every salt.
+ *   1  + the 2 KB SP table in ONE workgroup-shared __local copy.
+ *   2  + PC-2 from nibble tables built on device into the same __local
+ *        block (448 more uints).
+ *   3  + the key schedule hoisted out of the salt loop via
+ *        GPU_TEMPLATE_HAS_PRE_SALT, which replaces the gid's salt axis
+ *        with a salt_chunk axis of DESCRYPT_SALT_BATCH salts.
+ *
+ * Levels 1 and 2 need no host cooperation at all: the core defines
+ * GPU_TEMPLATE_HAS_SHARED_LOCAL itself and its source string precedes
+ * gpu_template.cl in gpu_template_sources().  Level 3 DOES, because the
+ * host computes the NDRange and must divide the salt axis by the same
+ * SALT_BATCH the kernel was built with -- see the salted-page recompute
+ * near the `kern == d->kern_template_phase0_descrypt` arm below.
+ *
+ * DESCRYPT_SALT_BATCH is a plain constant, NOT dynsize_compile_time_N():
+ * that servo is keyed to d->dynsize_md5salt and belongs to MD5SALT.
+ * Sharing it would make two unrelated algorithms re-JIT each other. */
+/* MEASURED 2026-09-18 on fpga.local (GTX 1080, driver 535.183.01), all
+ * 4,096 salts of contest/history/descrypt-remaining-2026-09-18.txt, M
+ * crypt/s (mdxfind's own h/s counts DES rounds, 25x this):
+ *
+ *   salts |   L0   |    L1   |    L2   |  L3(sb16) | L3(sb4)
+ *       1 |  3.568 |   4.718 |   4.734 |    4.734  |  4.718
+ *      16 | 10.908 |  38.061 |  38.061 |    9.169  | 25.416
+ *     256 | 15.054 | 120.258 | 120.258 |  102.195  | 120.258
+ *    4096 | 15.997 | 146.181 | 146.129 |  151.535  | 157.356
+ *
+ * SHIPPED LEVEL IS 1, and the two increments left off are left off for
+ * reasons that are measurements, not taste:
+ *
+ *  - increment 2 (nibble-table PC-2) is EXACTLY NEUTRAL here -- 146.129
+ *    against 146.181 -- and costs 10% on Metal.  It buys nothing and adds
+ *    448 uints of __local plus an on-device table build.  Left compiled
+ *    and correct; just not enabled.
+ *  - increment 3 (the PRE_SALT hoist) is NOT a win on OpenCL, and the
+ *    reason is structural rather than fixable by tuning: this template
+ *    carries the salt on the GID, so replacing that axis with a
+ *    salt_chunk axis DIVIDES THE AVAILABLE PARALLELISM BY SALT_BATCH.
+ *    At 4,096 salts there is parallelism to spare and the hoist nets
+ *    +3.7%; at 16 salts chunks_per_page collapses to 1, the salt axis
+ *    disappears, and throughput falls 76%.  SALT_BATCH=4 recovers most
+ *    of that (25.4 vs 38.1) and gains 7.6% at 4,096 -- so the sign of
+ *    increment 3 depends on the salt count, and shipping it at ANY fixed
+ *    SALT_BATCH trades a large loss on small salt lists for a small gain
+ *    on large ones.  If it is ever wanted, the shape is a salt-count-aware
+ *    SALT_BATCH chosen at JIT time (the salt count is known before the
+ *    compile), not a constant.  Metal has no such tradeoff -- its
+ *    template already runs the salt axis as an INNER loop -- and Metal
+ *    therefore ships at level 3.  See gpu_metal.m. */
+#ifndef DESCRYPT_PHASE0A_LEVEL
+#define DESCRYPT_PHASE0A_LEVEL 1
+#endif
+#ifndef DESCRYPT_SALT_BATCH
+#define DESCRYPT_SALT_BATCH    16
+#endif
+/* Increment 2 (the nibble-table PC-2) named separately from the level so
+ * it can be switched off with 1 and 3 left on.  Follows the level unless
+ * overridden; the only reason to override is a measurement. */
+#ifndef DESCRYPT_PHASE0A_KS_TABLE
+#define DESCRYPT_PHASE0A_KS_TABLE ((DESCRYPT_PHASE0A_LEVEL >= 2) ? 1 : 0)
+#endif
+
 static int gpu_opencl_template_compile_descrypt(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_descrypt) return 0;
     cl_int err = CL_SUCCESS;
@@ -8989,12 +9058,39 @@ static int gpu_opencl_template_compile_descrypt(struct gpu_device *d, int dev_id
      * build_opts.md: only NON-default widths need the -D). The build_-
      * opts pattern matches MD5CRYPT / PHPBB3 (also HASH_WORDS=4 default,
      * no -DHASH_WORDS override). */
-    const char *defines =
+    /* Phase 0a: the level token joins the cache key so a level change
+     * re-JITs rather than reusing a program built at another level.  The
+     * source-text hash would catch a .cl edit on its own, but not a host
+     * -D change with the .cl untouched. */
+    char defines_buf[192];
+    char build_opts_buf[256];
+#if DESCRYPT_PHASE0A_LEVEL >= 3
+    snprintf(defines_buf, sizeof(defines_buf),
         "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
-        "SALT_POSITION=PREPEND,BASE_ALGO=descrypt";
+        "SALT_POSITION=PREPEND,BASE_ALGO=descrypt,"
+        "PHASE0A=%d,KS_TABLE=%d,HAS_PRE_SALT=1,SALT_BATCH=%d",
+        DESCRYPT_PHASE0A_LEVEL, DESCRYPT_PHASE0A_KS_TABLE,
+        DESCRYPT_SALT_BATCH);
+    snprintf(build_opts_buf, sizeof(build_opts_buf),
+        "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1 "
+        "-DDESCRYPT_PHASE0A=%d -DDESCRYPT_KS_TABLE=%d "
+        "-DGPU_TEMPLATE_HAS_PRE_SALT=1 -DSALT_BATCH=%d",
+        DESCRYPT_PHASE0A_LEVEL, DESCRYPT_PHASE0A_KS_TABLE,
+        DESCRYPT_SALT_BATCH);
+#else
+    snprintf(defines_buf, sizeof(defines_buf),
+        "HASH_WORDS=4,HASH_BLOCK_BYTES=64,HAS_SALT=1,"
+        "SALT_POSITION=PREPEND,BASE_ALGO=descrypt,PHASE0A=%d,KS_TABLE=%d",
+        DESCRYPT_PHASE0A_LEVEL, DESCRYPT_PHASE0A_KS_TABLE);
+    snprintf(build_opts_buf, sizeof(build_opts_buf),
+        "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1 "
+        "-DDESCRYPT_PHASE0A=%d -DDESCRYPT_KS_TABLE=%d",
+        DESCRYPT_PHASE0A_LEVEL, DESCRYPT_PHASE0A_KS_TABLE);
+#endif
+    const char *defines = defines_buf;
     d->prog_template_descrypt = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources,
-        "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
+        build_opts_buf,
         defines, &err);
     if (!d->prog_template_descrypt || err != CL_SUCCESS) {
         char log[8192] = {0};
@@ -16742,6 +16838,22 @@ validator_skip:
             {
                 size_t local2 = local;
                 size_t salt_axis = (size_t)this_page_salts;
+#if DESCRYPT_PHASE0A_LEVEL >= 3
+                /* DESCRYPT Phase 0a increment 3: the DESCRYPT program is
+                 * also built with GPU_TEMPLATE_HAS_PRE_SALT, so its salt
+                 * axis is a salt_chunk axis of DESCRYPT_SALT_BATCH salts.
+                 * Without this arm the host would launch this_page_salts
+                 * work-items while the kernel's own `total` covers only
+                 * ceil(this_page_salts / SALT_BATCH) of them -- the surplus
+                 * lanes bound-check out and the dispatch does SALT_BATCH x
+                 * the work for the same result. */
+                if (kern == d->kern_template_phase0_descrypt) {
+                    salt_axis = ((size_t)this_page_salts
+                                 + (size_t)DESCRYPT_SALT_BATCH - 1)
+                              / (size_t)DESCRYPT_SALT_BATCH;
+                    if (salt_axis == 0) salt_axis = 1;
+                } else
+#endif
                 if (kern == d->kern_template_phase0_md5salt) {
                     /* Host/kernel SALT_BATCH agreement: draw from the same
                      * source of truth that the kernel's -DSALT_BATCH=N was

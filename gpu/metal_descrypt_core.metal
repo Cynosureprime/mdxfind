@@ -136,6 +136,48 @@ constant uchar METAL_DESCRYPT_pc2[48] = {
     41,52,31,37,47,55,30,40,51,45,33,48,44,49,39,56,34,53,46,42,50,36,29,32 };
 constant uchar METAL_DESCRYPT_key_shifts[16] = {1,1,2,2,2,2,2,2,1,2,2,2,2,2,2,1};
 
+/* ----------------------------------------------------------------------
+ * Phase 0a (2026-09-18) -- lockstep twin of the gpu_descrypt_core.cl
+ * block of the same name.  Levels and layout are identical; only the
+ * address-space qualifiers differ (`threadgroup` for `__local`,
+ * `constant` for `__constant`, `device` for `__global`).
+ *
+ *   >= 1  the 2 KB SP table in ONE threadgroup-shared copy
+ *         (GPU_TEMPLATE_HAS_SHARED_LOCAL)
+ *   >= 2  PC-2 from nibble tables built on device into the same block
+ *   >= 3  key schedule hoisted out of the salt loop
+ *         (GPU_TEMPLATE_HAS_PRE_SALT)
+ *
+ * The Metal scaffold already runs ONE THREAD PER WORD with rule x mask x
+ * salt as INNER LOOPS (metal_template.metal, task #250), so increment 3
+ * is cheaper here than on OpenCL -- there is no gid salt axis to divide,
+ * SALT_BATCH stays an unroll knob, and no host geometry change is needed.
+ * Increment 1 is worth correspondingly more on Metal, because one lane
+ * makes every SP lookup for its whole word.
+ * ---------------------------------------------------------------------- */
+#ifndef DESCRYPT_PHASE0A
+#define DESCRYPT_PHASE0A 3
+#endif
+#ifndef DESCRYPT_KS_TABLE
+#if DESCRYPT_PHASE0A >= 2
+#define DESCRYPT_KS_TABLE 1
+#else
+#define DESCRYPT_KS_TABLE 0
+#endif
+#endif
+
+#if DESCRYPT_PHASE0A >= 1
+#define GPU_TEMPLATE_HAS_SHARED_LOCAL 1
+#define DESCRYPT_SP_UINTS   512u
+#if DESCRYPT_KS_TABLE
+#define DESCRYPT_KS_OFF     512u
+#define DESCRYPT_KS_UINTS   448u
+#define GPU_TEMPLATE_SHARED_LOCAL_UINTS (DESCRYPT_SP_UINTS + DESCRYPT_KS_UINTS)
+#else
+#define GPU_TEMPLATE_SHARED_LOCAL_UINTS (DESCRYPT_SP_UINTS)
+#endif
+#endif
+
 /* Bit extraction helpers (ported byte-for-byte from gpu_descrypt_core.cl
  * rev 1.1). The METAL_DESCRYPT_ prefix avoids any symbol collision with
  * future Metal cores that might want similarly-named helpers. */
@@ -155,6 +197,53 @@ static inline uint metal_descrypt_compute_saltbits(uint salt) {
     return sb;
 }
 
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+/* template_shared_local_init: cooperative fill of the threadgroup-shared
+ * table block.  metal_template.metal calls this at kernel scope ABOVE its
+ * `gid >= n_words` early return and follows it with a
+ * threadgroup_barrier -- a barrier below that return is not reached by
+ * the tail lanes of the last threadgroup.  Every table is derived from
+ * the SAME `constant` arrays the inline bit loops read. */
+static inline void template_shared_local_init(threadgroup uint *tbl,
+                                              uint lid, uint lsz)
+{
+    for (uint i = lid; i < DESCRYPT_SP_UINTS; i += lsz) {
+        tbl[i] = METAL_DESCRYPT_SPtrans[i >> 6][i & 63u];
+    }
+#if DESCRYPT_KS_TABLE
+    for (uint e = lid; e < 112u; e += lsz) {
+        uint g = e >> 4;
+        uint v = e & 15u;
+        uint tckl = 0u, tckr = 0u, tdkl = 0u, tdkr = 0u;
+        for (uint i = 0u; i < 24u; i++) {
+            uint bl = (uint)METAL_DESCRYPT_pc2[i];
+            uint br = (uint)METAL_DESCRYPT_pc2[24u + i];
+            if (bl <= 28u) {
+                if (((bl - 1u) >> 2) == g)
+                    tckl |= ((v >> (3u - ((bl - 1u) & 3u))) & 1u) << (23u - i);
+            } else {
+                uint b = bl - 28u;
+                if (((b - 1u) >> 2) == g)
+                    tdkl |= ((v >> (3u - ((b - 1u) & 3u))) & 1u) << (23u - i);
+            }
+            if (br <= 28u) {
+                if (((br - 1u) >> 2) == g)
+                    tckr |= ((v >> (3u - ((br - 1u) & 3u))) & 1u) << (23u - i);
+            } else {
+                uint b = br - 28u;
+                if (((b - 1u) >> 2) == g)
+                    tdkr |= ((v >> (3u - ((b - 1u) & 3u))) & 1u) << (23u - i);
+            }
+        }
+        tbl[DESCRYPT_KS_OFF +   0u + e] = tckl;
+        tbl[DESCRYPT_KS_OFF + 112u + e] = tckr;
+        tbl[DESCRYPT_KS_OFF + 224u + e] = tdkl;
+        tbl[DESCRYPT_KS_OFF + 336u + e] = tdkr;
+    }
+#endif
+}
+#endif /* GPU_TEMPLATE_HAS_SHARED_LOCAL */
+
 /* Build 16 round keys (ek_l[0..15], ek_r[0..15]) from the 64-bit key
  * (khi, klo). Mirrors gpu_descrypt_core.cl descrypt_des_key_schedule
  * byte-for-byte (PC-1, 16 left-rotations with cumulative shift counts,
@@ -162,7 +251,11 @@ static inline uint metal_descrypt_compute_saltbits(uint salt) {
  * uint[16] arrays). */
 static inline void metal_descrypt_des_key_schedule(uint khi, uint klo,
                                                    thread uint *ek_l,
-                                                   thread uint *ek_r)
+                                                   thread uint *ek_r
+#if DESCRYPT_KS_TABLE
+                                                   , threadgroup const uint *ks
+#endif
+                                                   )
 {
     uint c = 0, d = 0;
     for (int i = 0; i < 28; i++) {
@@ -175,6 +268,15 @@ static inline void metal_descrypt_des_key_schedule(uint khi, uint klo,
         uint tc = ((c << total_shift) | (c >> (28 - total_shift))) & 0x0FFFFFFFu;
         uint td = ((d << total_shift) | (d >> (28 - total_shift))) & 0x0FFFFFFFu;
         uint kl = 0, kr = 0;
+#if DESCRYPT_KS_TABLE
+        for (uint g = 0u; g < 7u; g++) {
+            uint base = g << 4;
+            uint nc = (tc >> (24u - (g << 2))) & 15u;
+            uint nd = (td >> (24u - (g << 2))) & 15u;
+            kl |= ks[         base + nc] | ks[224u + base + nd];
+            kr |= ks[112u  + base + nc] | ks[336u + base + nd];
+        }
+#else
         for (int i = 0; i < 24; i++) {
             uint b = METAL_DESCRYPT_pc2[i];
             kl |= ((b <= 28) ? metal_descrypt_gb28(tc, b)
@@ -185,16 +287,20 @@ static inline void metal_descrypt_des_key_schedule(uint khi, uint klo,
             kr |= ((b <= 28) ? metal_descrypt_gb28(tc, b)
                              : metal_descrypt_gb28(td, b - 28)) << (23 - i);
         }
+#endif
         ek_l[rnd] = kl;
         ek_r[rnd] = kr;
     }
 }
 
 /* DES Feistel round. r' = E(r) salted XOR with key, then 8-way SP-table
- * lookup. Reads from `constant METAL_DESCRYPT_SPtrans` (the slab gpu_
- * descrypt.cl uses __local cache; the template path skips the workgroup-
- * shared cache to keep the shared template scaffold barrier-free). */
-static inline uint metal_descrypt_des_f(uint r, uint kl, uint kr, uint saltbits) {
+ * lookup. Phase 0a >= 1 reads the threadgroup-shared copy; below that it
+ * reads `constant METAL_DESCRYPT_SPtrans` directly. */
+static inline uint metal_descrypt_des_f(uint r, uint kl, uint kr, uint saltbits
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                                        , threadgroup const uint *s_sp
+#endif
+                                        ) {
     uint r48l = ((r & 0x00000001u) << 23) | ((r & 0xf8000000u) >> 9) |
                 ((r & 0x1f800000u) >> 11) | ((r & 0x01f80000u) >> 13) |
                 ((r & 0x001f8000u) >> 15);
@@ -204,6 +310,16 @@ static inline uint metal_descrypt_des_f(uint r, uint kl, uint kr, uint saltbits)
     uint f = (r48l ^ r48r) & saltbits;
     r48l ^= f ^ kl;
     r48r ^= f ^ kr;
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    return s_sp[  0u + ((r48l >> 18) & 0x3fu)]
+         | s_sp[ 64u + ((r48l >> 12) & 0x3fu)]
+         | s_sp[128u + ((r48l >>  6) & 0x3fu)]
+         | s_sp[192u + ( r48l        & 0x3fu)]
+         | s_sp[256u + ((r48r >> 18) & 0x3fu)]
+         | s_sp[320u + ((r48r >> 12) & 0x3fu)]
+         | s_sp[384u + ((r48r >>  6) & 0x3fu)]
+         | s_sp[448u + ( r48r        & 0x3fu)];
+#else
     return METAL_DESCRYPT_SPtrans[0][(r48l >> 18) & 0x3fu]
          | METAL_DESCRYPT_SPtrans[1][(r48l >> 12) & 0x3fu]
          | METAL_DESCRYPT_SPtrans[2][(r48l >>  6) & 0x3fu]
@@ -212,12 +328,13 @@ static inline uint metal_descrypt_des_f(uint r, uint kl, uint kr, uint saltbits)
          | METAL_DESCRYPT_SPtrans[5][(r48r >> 12) & 0x3fu]
          | METAL_DESCRYPT_SPtrans[6][(r48r >>  6) & 0x3fu]
          | METAL_DESCRYPT_SPtrans[7][ r48r        & 0x3fu];
+#endif
 }
 
 /* Per-lane state struct. DES emits a pre-FP (l, r) pair = 64 bits. We
  * carry it in h[0..1]; h[2..3] are zero-padded so probe_compact_idx
  * sees the same 16-byte layout the host's compact-table loader stores
- * (mdxfind.c:40433-40435: 4 il + 4 ir + 8 zero pad). HASH_WORDS=4 stays
+ * (mdxfind.c:48283-48327: 4 il + 4 ir + 8 zero pad). HASH_WORDS=4 stays
  * the canonical width for this template instantiation. */
 struct template_state {
     uint h[HASH_WORDS];
@@ -233,108 +350,172 @@ static inline void template_init(thread template_state &st) {
 }
 
 /* template_transform: stub for interface symmetry. DESCRYPT's
- * template_finalize manages the full DES state inline -- never routes
- * through this. Provided for completeness (matches PHPBB3 / MD5CRYPT
- * pattern). */
+ * template_finalize manages the full DES state inline. */
 static inline void template_transform(thread template_state &st,
-                                      thread const uchar *block)
+                                      device const uchar *block)
 {
     (void)st;
     (void)block;
 }
 
-/* template_finalize: full DESCRYPT chain.
- *
- * Step 1: build 8-byte DES key from data[0..min(plen,8)) with KEY left-
- *   shift (mirrors crypt-des.c:626-630 byte-for-byte; bytes past first
- *   NUL pad with zero, but mdxfind's input is fixed-length post-rule so
- *   we just use min(plen, 8) bytes shifted left by 1 and zero-pad the
- *   rest).
- *
- * Step 2: decode 2-char phpitoa64 salt from salt_bytes[0..2) into a
- *   12-bit salt, then expand via metal_descrypt_compute_saltbits to
- *   24-bit saltbits.
- *
- * Step 3: run 25 DES iterations, each with 16 Feistel rounds + final
- *   swap (mirrors gpu_descrypt_core.cl rev 1.1 byte-for-byte).
- *
- * Step 4: install pre-FP (l, r) into st.h[0..1]; zero h[2..3] for the
- *   compact-table probe.
- *
- * algo_mode: DESCRYPT has only one mode (7). The arg is unused; kept
- * for interface symmetry with the salted-template signature. */
+/* descrypt_build_key: 8-byte DES key from data[0..min(len,8)) with the
+ * crypt-des.c:626-630 left-shift-by-1, zero padded. */
+static inline void metal_descrypt_build_key(device const uchar *data, int len,
+                                            thread uint &khi, thread uint &klo)
+{
+    int plen = len;
+    if (plen > 8) plen = 8;
+    uchar kb[8];
+    for (int i = 0; i < 8; i++) {
+        kb[i] = (i < plen) ? (uchar)((uint)data[i] << 1) : (uchar)0u;
+    }
+    khi = ((uint)kb[0] << 24) | ((uint)kb[1] << 16)
+        | ((uint)kb[2] <<  8) |  (uint)kb[3];
+    klo = ((uint)kb[4] << 24) | ((uint)kb[5] << 16)
+        | ((uint)kb[6] <<  8) |  (uint)kb[7];
+}
+
+/* metal_descrypt_run: the salt-dependent half -- decode the 2-char
+ * phpitoa64 salt, expand to 24 saltbits, 25 x 16 Feistel rounds from a
+ * zero block, install the pre-FP (l, r). */
+static inline void metal_descrypt_run(thread template_state &st,
+                                      thread const uint *ek_l,
+                                      thread const uint *ek_r,
+                                      device const uchar *salt_bytes
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                                      , threadgroup const uint *s_sp
+#endif
+                                      )
+{
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+#define MDESF(rr, kk) metal_descrypt_des_f((rr), ek_l[kk], ek_r[kk], saltbits, s_sp)
+#else
+#define MDESF(rr, kk) metal_descrypt_des_f((rr), ek_l[kk], ek_r[kk], saltbits)
+#endif
+    uint salt = metal_descrypt_a2b((uint)salt_bytes[0])
+              | (metal_descrypt_a2b((uint)salt_bytes[1]) << 6);
+    uint saltbits = metal_descrypt_compute_saltbits(salt);
+
+    uint l = 0u, r = 0u;
+    for (int iter = 0; iter < 25; iter++) {
+        uint fv;
+        fv = MDESF(r,  0) ^ l; l = r; r = fv;
+        fv = MDESF(r,  1) ^ l; l = r; r = fv;
+        fv = MDESF(r,  2) ^ l; l = r; r = fv;
+        fv = MDESF(r,  3) ^ l; l = r; r = fv;
+        fv = MDESF(r,  4) ^ l; l = r; r = fv;
+        fv = MDESF(r,  5) ^ l; l = r; r = fv;
+        fv = MDESF(r,  6) ^ l; l = r; r = fv;
+        fv = MDESF(r,  7) ^ l; l = r; r = fv;
+        fv = MDESF(r,  8) ^ l; l = r; r = fv;
+        fv = MDESF(r,  9) ^ l; l = r; r = fv;
+        fv = MDESF(r, 10) ^ l; l = r; r = fv;
+        fv = MDESF(r, 11) ^ l; l = r; r = fv;
+        fv = MDESF(r, 12) ^ l; l = r; r = fv;
+        fv = MDESF(r, 13) ^ l; l = r; r = fv;
+        fv = MDESF(r, 14) ^ l; l = r; r = fv;
+        fv = MDESF(r, 15) ^ l; l = r; r = fv;
+        uint tmp = l; l = r; r = tmp;
+    }
+    st.h[0] = l;
+    st.h[1] = r;
+    st.h[2] = 0u;
+    st.h[3] = 0u;
+#undef MDESF
+}
+
+#if defined(GPU_TEMPLATE_HAS_PRE_SALT) && defined(GPU_TEMPLATE_HAS_SALT)
+/* Phase 0a increment 3: the key schedule depends only on the candidate,
+ * so it is computed once per (word, rule, mask) and reused for every
+ * salt in the metal_template.metal salt-inner loop.  No sentinel arm --
+ * DESCRYPT has one algo_mode and the schedule is always hoistable. */
+struct template_pre_salt_state {
+    uint ek_l[16];
+    uint ek_r[16];
+};
+
+static inline void template_pre_salt(device const uchar *data,
+                                     int len,
+                                     uint algo_mode,
+                                     thread template_pre_salt_state &pre
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                                     , threadgroup const uint *shared_tbl
+#endif
+                                     )
+{
+    (void)algo_mode;
+    uint khi = 0u, klo = 0u;
+    metal_descrypt_build_key(data, len, khi, klo);
+#if DESCRYPT_KS_TABLE
+    metal_descrypt_des_key_schedule(khi, klo, pre.ek_l, pre.ek_r,
+                                    shared_tbl + DESCRYPT_KS_OFF);
+#else
+    metal_descrypt_des_key_schedule(khi, klo, pre.ek_l, pre.ek_r);
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    (void)shared_tbl;
+#endif
+#endif
+}
+
+static inline void template_finalize_post(thread template_state &st,
+                                thread const template_pre_salt_state &pre,
+                                device const uchar *data,
+                                int len,
+                                device const uchar *salt_bytes,
+                                uint salt_len,
+                                uint algo_mode
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                                , threadgroup const uint *shared_tbl
+#endif
+                                )
+{
+    (void)data;
+    (void)len;
+    (void)salt_len;
+    (void)algo_mode;
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    metal_descrypt_run(st, pre.ek_l, pre.ek_r, salt_bytes, shared_tbl);
+#else
+    metal_descrypt_run(st, pre.ek_l, pre.ek_r, salt_bytes);
+#endif
+}
+#endif /* GPU_TEMPLATE_HAS_PRE_SALT && GPU_TEMPLATE_HAS_SALT */
+
+/* template_finalize: full DESCRYPT chain (key build -> schedule -> 25
+ * DES iterations -> pre-FP (l, r) install).  Under
+ * GPU_TEMPLATE_HAS_PRE_SALT the template calls template_pre_salt +
+ * template_finalize_post instead, but this stays compiled and correct so
+ * the two paths can be diffed. */
 static inline void template_finalize(thread template_state &st,
                                      device const uchar *data,
                                      int len,
                                      device const uchar *salt_bytes,
                                      uint salt_len,
-                                     uint algo_mode)
+                                     uint algo_mode
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+                                     , threadgroup const uint *shared_tbl
+#endif
+                                     )
 {
     (void)algo_mode;
     (void)salt_len;
 
-    /* Defensive cap: standard DES uses only the first 8 bytes of the
-     * key (host-side rules-engine pack site already clamps for the
-     * synthetic no-rule pass; clamp here too so masked / rule-extended
-     * outputs bigger than 8 bytes silently truncate). */
-    int plen = len;
-    if (plen > 8) plen = 8;
+    uint khi = 0u, klo = 0u;
+    metal_descrypt_build_key(data, len, khi, klo);
 
-    /* Step 1: build 8-byte DES key buffer. byte = (data[i] << 1)
-     * with bytes past min(plen,8) zero-padded. */
-    uchar kb[8];
-    for (int i = 0; i < 8; i++) {
-        kb[i] = (i < plen) ? (uchar)((uint)data[i] << 1) : (uchar)0u;
-    }
-
-    /* Pack to two 32-bit halves (BE) for des_key_schedule. */
-    uint khi = ((uint)kb[0] << 24) | ((uint)kb[1] << 16)
-             | ((uint)kb[2] <<  8) |  (uint)kb[3];
-    uint klo = ((uint)kb[4] << 24) | ((uint)kb[5] << 16)
-             | ((uint)kb[6] <<  8) |  (uint)kb[7];
-
-    /* Step 2: 16 round keys via PC-1, left-rotations, PC-2. */
     uint ek_l[16], ek_r[16];
+#if DESCRYPT_KS_TABLE
+    metal_descrypt_des_key_schedule(khi, klo, ek_l, ek_r,
+                                    shared_tbl + DESCRYPT_KS_OFF);
+#else
     metal_descrypt_des_key_schedule(khi, klo, ek_l, ek_r);
+#endif
 
-    /* Step 3a: decode 2-char phpitoa64 salt + expand to 24-bit saltbits.
-     * Defensive: assume salt_len == 2 (guaranteed by the host's
-     * gpu_pack_salts filter which skips saltlen != 2 for JOB_DESCRYPT). */
-    uint salt = metal_descrypt_a2b((uint)salt_bytes[0])
-              | (metal_descrypt_a2b((uint)salt_bytes[1]) << 6);
-    uint saltbits = metal_descrypt_compute_saltbits(salt);
-
-    /* Step 3b: 25 DES iterations of (l, r) -> 16 rounds + final swap.
-     * Mirrors gpu_descrypt_core.cl rev 1.1 byte-for-byte. */
-    uint l = 0u, r = 0u;
-    for (int iter = 0; iter < 25; iter++) {
-        uint fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 0], ek_r[ 0], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 1], ek_r[ 1], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 2], ek_r[ 2], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 3], ek_r[ 3], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 4], ek_r[ 4], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 5], ek_r[ 5], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 6], ek_r[ 6], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 7], ek_r[ 7], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 8], ek_r[ 8], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[ 9], ek_r[ 9], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[10], ek_r[10], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[11], ek_r[11], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[12], ek_r[12], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[13], ek_r[13], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[14], ek_r[14], saltbits) ^ l; l = r; r = fv;
-        fv = metal_descrypt_des_f(r, ek_l[15], ek_r[15], saltbits) ^ l; l = r; r = fv;
-        uint tmp = l; l = r; r = tmp;
-    }
-
-    /* Step 4: install pre-FP (l, r) into compact-table-probe state.
-     * h[2..3] zero-padded to match the host's compact-table layout
-     * (mdxfind.c:40433-40435 stores 4 il + 4 ir + 8 zero pad = 16 B). */
-    st.h[0] = l;
-    st.h[1] = r;
-    st.h[2] = 0u;
-    st.h[3] = 0u;
+#ifdef GPU_TEMPLATE_HAS_SHARED_LOCAL
+    metal_descrypt_run(st, ek_l, ek_r, salt_bytes, shared_tbl);
+#else
+    metal_descrypt_run(st, ek_l, ek_r, salt_bytes);
+#endif
     return;
 }
 

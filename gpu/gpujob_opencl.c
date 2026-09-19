@@ -1490,7 +1490,15 @@ void gpujob(void *arg) {
                     && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 16
                     && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                     && gpu_mask_total > 0) {
-                    b71_mask_size_acct = gpu_mask_total;
+                    /* BF chunks cover only bf_num_masks of the keyspace per
+                     * word slot, not the whole mask space, so gpu_mask_total
+                     * over-counts them by the chunk ratio. Same substitution
+                     * the hit-replay divmod base makes below, and for the same
+                     * reason: this must equal the kernel-side mask_size the
+                     * dispatch actually iterated. */
+                    b71_mask_size_acct = (g->bf_chunk && g->bf_num_masks > 0u)
+                                       ? (uint64_t)g->bf_num_masks
+                                       : gpu_mask_total;
                 }
                 /* gpu_rule_count includes the synthetic NUL no-op pass that
                  * the host always prepends to the rule program (mdxfind.c

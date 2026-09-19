@@ -1,8 +1,11 @@
 /* Auto-generated from metal_common.metal -- do not edit */
 static const char metal_common_str[] =
     "/*\n"
-    " * $Revisio" "n: 1.38 $\n"
+    " * $Revisio" "n: 1.39 $\n"
     " * $Lo" "g: metal_common.metal,v $\n"
+    " * Revision 1.39  2026/09/17 16:56:06  dlr\n"
+    " * Publish-safety scrub: the embedded og text carried a real name, which mdxfind-release copies verbatim into the public repo. Replaced with Waffle throughout. Comment text only; no kernel change, and the generated _str.h were regenerated to match.\n"
+    " *\n"
     " * Revision 1.38  2026/09/17 03:23:13  dlr\n"
     " * Lift md5_block_from8 as a Metal twin of the gpu_common.cl helper. It runs MD5 compression rounds 9 to 64 from a state pre-rolled through rounds 1 to 8, which the md5salt carrier does once per word, rule and mask because M[0..7], the hex32, is salt-independent - 12.5 percent of the outer MD5 saved per word and salt. Needed because metal_md5salt_core.metal moves from a mode-0-only hand-port to the translated twin, and the translated source calls this. Its absence was one of the real OpenCL to Metal port gaps. Two deliberate differences from the OpenCL twin: static inline rather than noinline, since the noinline there is a Pascal register-pressure guard and Metal wants the opposite; and the MTL_MD5 namespaced round macros per Pattern 2. Pointer args not references, to match the translated call sites. Additive - nothing else calls it - and verified not to disturb the other 54 cores by a 77 of 77 sweep.\n"
     " *\n"
