@@ -3,56 +3,63 @@
 Complete list of all hash types supported by hashpipe, with internal type index,
 hash name, hashcat mode mapping, and an example hash:password pair.
 
-**988 types** as of v1.76.
+**1028 types**.
 
 Each example is the complete self-test vector from `hashpipe -T`, shown as
-`hash[:salt]:password` — the same format hashpipe accepts as input.  Types
-with no example listed (31 of 988) are alternate-encoding or composed variants
-that share a compute function with another type and do not have a dedicated
-self-test vector; they are still fully functional.
+`hash[:salt]:password` — the same format hashpipe accepts as input.
+Every vector here passes its self-test in this build; nothing is listed
+that does not currently verify.
+
+26 types share a compute function with another type and carry no
+dedicated self-test vector; they are still fully functional.
+
+The house test password is `password123`. A few types cannot use it by
+construction — DES crypt and the SAP BCODE, AS/400 and RACF KDFAES
+families truncate the password to 8 bytes, so those use `pass1234` or
+`password`, and WPA-PMK takes a 32-byte key rather than a password.
 
 ## Type List
 
 | Index | Name | Hashcat Mode | Example (hash:password) |
 |-------|------|-------------|------------------------|
-| e1 | MD5 | 0,2600,5100 | `482c811da5d5b4bc6d497ffa98491e38:password123` |
+| e1 | MD5 | 0,2600,3500,5100 | `482c811da5d5b4bc6d497ffa98491e38:password123` |
 | e2 | MD5UC | 4300 | `482C811DA5D5B4BC6D497FFA98491E38:password123` |
 | e3 | MD4 | 900 | `fc7b71b67e964466cec486ab12f4b558:password123` |
 | e4 | MD2 | n/a | `01d78cde2365535ed93abaae48a9abc2:password123` |
-| e5 | WRL | 6100 | `0087cb3eead9d0bc1796172993099071c1495d7edc2531a8c3d3985616394666d08333cc9cb84354c0833f5918628446a...` |
+| e5 | WRL | 6100 | `0087cb3eead9d0bc1796172993099071c1495d7edc2531a8c3d3985616394666d08333cc9cb84354c0833f5918628446a4794db8a805a993f0b46f53e5c9e658:password123` |
 | e6 | HAV128 | n/a | `ab71f5c32f8720509626227686136dff:password123` |
 | e7 | SHA0 | n/a | `40e43bfb5f73a156bfc863708ba7c66ce9e69b9d:password123` |
 | e8 | SHA1 | 100,4500 | `cbfdac6008f9cab4083784cbd1874f76618d2a97:password123` |
 | e9 | SHA224 | 1300,34400 | `3d45597256050bb1e93bd9c10aee4c8716f8774f5a48c995bf0cf860:password123` |
 | e10 | SHA256 | 1400 | `ef92b778bafe771e89245b89ecbc08a44a4e166c06659911881f383d4473e94f:password123` |
-| e11 | SHA384 | 10800 | `648357a04407e0a73fe201d9aad9bec165cbf63b6db4311b28f7e256b214a0725e45069c0162232d31412580255c461e:...` |
-| e12 | SHA512 | 1700 | `bed4efa1d4fdbd954bd3705d6a2a78270ec9a52ecfbfb010c61862af5c76af1761ffeb1aef6aca1bf5d02b3781aa854fa...` |
+| e11 | SHA384 | 10800 | `648357a04407e0a73fe201d9aad9bec165cbf63b6db4311b28f7e256b214a0725e45069c0162232d31412580255c461e:password123` |
+| e12 | SHA512 | 1700 | `bed4efa1d4fdbd954bd3705d6a2a78270ec9a52ecfbfb010c61862af5c76af1761ffeb1aef6aca1bf5d02b3781aa854fabd2b69c790de74e17ecfec3cb6ac4bf:password123` |
 | e13 | GOST | 6900 | `24f45a9606420485883f18dde536194ee1d1debf2af5706ac65809b4cca98f92:password123` |
 | e14 | GOST-CRYPTO | n/a | `ff8ab4e789fbe4a170835cf0dd52b8ddb0b8e22a86bb297bfca09f397777207e:password123` |
 | e15 | HAV256 | n/a | `426c08f266fdf8898ac806a4ff499c98911235e7f1164f6ed6c0532892cba11e:password123` |
 | e16 | RMD128 | n/a | `701db377f35e7d8834b501ab9b6c0c42:password123` |
-| e17 | RMD160 | n/a | `604081c4e43c8fc4b7c8c03da55534a2ead5bb05:password123` |
+| e17 | RMD160 | 6000 | `604081c4e43c8fc4b7c8c03da55534a2ead5bb05:password123` |
 | e18 | TIGER | n/a | `763cfa83b7d3dd5fd82d536e6a2f912142721444b919367e:password123` |
 | e19 | TTH | n/a | `fb32a871465e1660a287dd697d50d6fbb3331316c4ae3db3:password123` |
 | e20 | ED2K | n/a | `fc7b71b67e964466cec486ab12f4b558:password123` |
 | e21 | AICH | n/a | `cbfdac6008f9cab4083784cbd1874f76618d2a97:password123` |
 | e22 | HAS160 | n/a | `75f1d00d7a4897e09475e9bfd0a0e3175e312a0d:password123` |
 | e23 | EDON256 | n/a | `6f811a412d9c1269abf4d27e4c89aee088afd5ad0c7a262383ebc61264211b32:password123` |
-| e24 | EDON512 | n/a | `442f2f293dabec55c34d8cc37b15d5fe7b4cccd42a4c59aad908ce6d04c5cea6a3cbb67877539995ac9a86c3380bc4d58...` |
+| e24 | EDON512 | n/a | `442f2f293dabec55c34d8cc37b15d5fe7b4cccd42a4c59aad908ce6d04c5cea6a3cbb67877539995ac9a86c3380bc4d586e26f13163a06d08c651bf5bdf11589:password123` |
 | e25 | SNE128 | n/a | `e3558e2a3a7878e2055ad7391baa6f42:password123` |
 | e26 | SNE256 | n/a | `2f6e918a85cbfd8b021388ab4bddcbc5e506722a01aac5afb22aa0ed3796c98d:password123` |
 | e27 | MD6 | n/a | `4837cb1bac01aa6b2cb171f1bb8d3fcb:password123` |
 | e28 | MD6128 | n/a | `4837cb1bac01aa6b2cb171f1bb8d3fcb:password123` |
 | e29 | MD6256 | 34600 | `04516e374f0ad9f74c3fc62045a597e732b3387020f7646bf8ea5643e8ab3037:password123` |
-| e30 | MD6512 | n/a | `099cc4f53aebc83286c2e3f4e0b2c6d3c53638a83d54b1225deb34614cd13e7170c1650df3c6afef0a848b1f4e86ab97c...` |
+| e30 | MD6512 | n/a | `099cc4f53aebc83286c2e3f4e0b2c6d3c53638a83d54b1225deb34614cd13e7170c1650df3c6afef0a848b1f4e86ab97c013c3852bd6fe2f0b5dc94b6c1fb67d:password123` |
 | e31 | MD5SALT | 2611,2711 | `6e9057ee06b64a08594997e1b1b2dec2:zxQ:password123` |
 | e32 | MDC2 | n/a | `62bab9c63e5adc67ab2192afcaf586ff:password123` |
 | e33 | MD5RAW | n/a | `ebc56e4d393f9084d3941ca228c31aea:password123` |
 | e34 | SHA1RAW | n/a | `a0f874bc7f54ee086fce60a37ce7887d8b31086b:password123` |
 | e35 | SHA224RAW | n/a | `74a4786c76600ab8d99ca8cf960509f8243ee21fe6a614723f06b586:password123` |
 | e36 | SHA256RAW | 21400,30420 | `92342313fa33728f8da85edfb3458ef9c0030b28c364781f446a4730d953637d:password123` |
-| e37 | SHA384RAW | n/a | `563f046e9eb35bf564c6cc4260676ed22b7e4e783aa0d7c3cc81698dc3211292fc95f338e346b0f59c48c7bc73fef42d:...` |
-| e38 | SHA512RAW | 21000 | `b335d77abf42f6da1b6d0864129fa176c7c499b70c389b273e719473e5f029f54b9b8914e96a6585db2f16c987e6b988e...` |
+| e37 | SHA384RAW | n/a | `563f046e9eb35bf564c6cc4260676ed22b7e4e783aa0d7c3cc81698dc3211292fc95f338e346b0f59c48c7bc73fef42d:password123` |
+| e38 | SHA512RAW | 21000 | `b335d77abf42f6da1b6d0864129fa176c7c499b70c389b273e719473e5f029f54b9b8914e96a6585db2f16c987e6b988e78a0e497bbe8bc88d62df0eb81b7010:password123` |
 | e39 | HAV128-4 | n/a | `ebf3b07e42498535c44f4215e0e0c471:password123` |
 | e40 | HAV128-5 | n/a | `db98b98d746d601572f0ae07e74e7b78:password123` |
 | e41 | HAV160-3 | n/a | `099ffe0e508d2822715efeb69c11df9d0fd54bba:password123` |
@@ -68,76 +75,76 @@ self-test vector; they are still fully functional.
 | e51 | HAV256-5 | n/a | `ee5fb4c5c51f42dd02809711cbaef7e2bd5403c922a4b7fe4b3e784fcd84d1d4:password123` |
 | e52 | BLAKE224 | n/a | `c5fade2447fc8f1b6a0ee063e142ce4882d1580cc2bf28f969484491:password123` |
 | e53 | BLAKE256 | n/a | `74f57269fe25014a902785c11e078d46384c0543c5d04fdc9385d9f8ff4a7c96:password123` |
-| e54 | BLAKE384 | n/a | `1b9b44dd391bdf699f42828d9be688574282b60936905b9cac68cdd7dfa4eb5a23ebe3c33329e3f64c256b28956044c2:...` |
-| e55 | BLAKE512 | n/a | `709b55595c785bbb53c10e0ba7168fa21a201705cbc95814df7aea223e11c43986506d2c5f74ef11a92a476e39bf978f4...` |
+| e54 | BLAKE384 | n/a | `1b9b44dd391bdf699f42828d9be688574282b60936905b9cac68cdd7dfa4eb5a23ebe3c33329e3f64c256b28956044c2:password123` |
+| e55 | BLAKE512 | n/a | `709b55595c785bbb53c10e0ba7168fa21a201705cbc95814df7aea223e11c43986506d2c5f74ef11a92a476e39bf978f4b29e04f9305f83d7c6d8847d9c65a56:password123` |
 | e56 | BMW224 | n/a | `4e1b75d40fe7663f1ea282aa477f3df919354b46ebd30b94a9c4047a:password123` |
 | e57 | BMW256 | n/a | `3597bed522e7113c49ec27ac2106f87aa8625e7f4cde3630ae4d4db6e042ea8c:password123` |
-| e58 | BMW384 | n/a | `c62da84e334d1f9792c07876e8be42382626673242d8a4b9567867266ddb4b70cfd6416c372327297f381f904c78904f:...` |
-| e59 | BMW512 | n/a | `8fbb7784a88335a04c2e3b472cf21da60072d23a2ca1fa8f718439b1e9c071ecb923f3f67ae3a8b825126de815e0988e4...` |
+| e58 | BMW384 | n/a | `c62da84e334d1f9792c07876e8be42382626673242d8a4b9567867266ddb4b70cfd6416c372327297f381f904c78904f:password123` |
+| e59 | BMW512 | n/a | `8fbb7784a88335a04c2e3b472cf21da60072d23a2ca1fa8f718439b1e9c071ecb923f3f67ae3a8b825126de815e0988e453394e7ccfb86e25e4b6cd9cc7f91d1:password123` |
 | e60 | CUBE224 | n/a | `4b13b939e4b9b9bdb61ffae999c0ac41e3c30ec828d0ccc7cfb49a82:password123` |
 | e61 | CUBE256 | n/a | `8971b66cb1df1a39e7068b26b20607177439a9a390a776f9343412170f07a99c:password123` |
-| e62 | CUBE384 | n/a | `a5321d2e894561cc035aa769ed0b4b545ccba96fd70e6ec9f539d63b79cffbdec3ce8753540ec8201735f257b9f501c2:...` |
-| e63 | CUBE512 | n/a | `cdb35e73407a538a74b1b60a33bb5c03c36acf7d723d8086d617d8a740e260d6622c819991e2c532b8145122571d6fedd...` |
+| e62 | CUBE384 | n/a | `a5321d2e894561cc035aa769ed0b4b545ccba96fd70e6ec9f539d63b79cffbdec3ce8753540ec8201735f257b9f501c2:password123` |
+| e63 | CUBE512 | n/a | `cdb35e73407a538a74b1b60a33bb5c03c36acf7d723d8086d617d8a740e260d6622c819991e2c532b8145122571d6fedd65558ef2b0e59de0b8aa9a97659ff9e:password123` |
 | e64 | ECHO224 | n/a | `260fc725ae9a734b7e0f25858ce5d85ecaa727d23d3be90ea46bdba8:password123` |
 | e65 | ECHO256 | n/a | `d6c672888a580c44c262658e2fa3d9c5fadbb55fb112ec04a3799747be888c38:password123` |
-| e66 | ECHO384 | n/a | `b4dc5f3324e8aece18d4c2aaaacc2efbe2ffb828f67a2f5baaee6456ae2879e601e3a60569537add38ab25d320cbbcf9:...` |
-| e67 | ECHO512 | n/a | `3ef0d8b036a715dedf3df6b88982b72f15157b0dedf77af37ba58fcce65d5cf2074c63995051309c8527576bf8b1ec56e...` |
+| e66 | ECHO384 | n/a | `b4dc5f3324e8aece18d4c2aaaacc2efbe2ffb828f67a2f5baaee6456ae2879e601e3a60569537add38ab25d320cbbcf9:password123` |
+| e67 | ECHO512 | n/a | `3ef0d8b036a715dedf3df6b88982b72f15157b0dedf77af37ba58fcce65d5cf2074c63995051309c8527576bf8b1ec56e3285797156735c9395cc5225ec74305:password123` |
 | e68 | FUGUE224 | n/a | `fa086bd57f808d74e38c08c37c3943c2028f45d0b0bbc1a703cd0bd2:password123` |
 | e69 | FUGUE256 | n/a | `80caed1431abdddee79745c986e1a27e0e1559af08854e3db9bfd839ccf98555:password123` |
-| e70 | FUGUE384 | n/a | `b1ab19adb6b2ed585ffa090223ac1c1ae4af83d652c1df11b258bb1b42fa745ab45182b1de19e0443cb09e7580025a15:...` |
-| e71 | FUGUE512 | n/a | `67f3eaafa613238083a2b31b37676af4ca8434c84991ab69120ccaf8cc90711a6e6a3b3357ef5186b52cc585a71a5ce65...` |
+| e70 | FUGUE384 | n/a | `b1ab19adb6b2ed585ffa090223ac1c1ae4af83d652c1df11b258bb1b42fa745ab45182b1de19e0443cb09e7580025a15:password123` |
+| e71 | FUGUE512 | n/a | `67f3eaafa613238083a2b31b37676af4ca8434c84991ab69120ccaf8cc90711a6e6a3b3357ef5186b52cc585a71a5ce65a69f4cb90aa80051d9756a9c8cef6ad:password123` |
 | e72 | GROESTL224 | n/a | `c247af45740643f48b452ef9420005efcba2aa06ce65ccce95ab427e:password123` |
 | e73 | GROESTL256 | n/a | `04fb95a1d28f870faf9c81b625fafe804e2aad26cb883fcc6ab27ab1078d1189:password123` |
-| e74 | GROESTL384 | n/a | `2f686c58ed893e4534e36d43d6e2577c81df209cfa5d03aa946b45256de67e9e9bf2e4863e0738fe81fce120e949224f:...` |
-| e75 | GROESTL512 | n/a | `f34a0060081ce2a50c061f47b25914e7fbf256cb70be304faef5e31360db5bcf8d7dbe2b9e708208a1c9d53e122c7dc98...` |
+| e74 | GROESTL384 | n/a | `2f686c58ed893e4534e36d43d6e2577c81df209cfa5d03aa946b45256de67e9e9bf2e4863e0738fe81fce120e949224f:password123` |
+| e75 | GROESTL512 | n/a | `f34a0060081ce2a50c061f47b25914e7fbf256cb70be304faef5e31360db5bcf8d7dbe2b9e708208a1c9d53e122c7dc986098fa3d3520eb610def13334f2a766:password123` |
 | e76 | HAMSI224 | n/a | `be4215757a4ab8584003a8c88ddcb8f9a27765f30e519eb55f4b6306:password123` |
 | e77 | HAMSI256 | n/a | `8a6c83311c4853421798d43b68682148dad2d0aa274b9bf325742df8635b76ac:password123` |
-| e78 | HAMSI384 | n/a | `31d4b3fcc84a324190ab71a4e6b7775d30addbc02396caadfb0a9ec1ef3c08016bdbe9618a7187fea8af520e83e8c533:...` |
-| e79 | HAMSI512 | n/a | `1b13fb127eed7bb1f0a2c3e0e31bed7743ae1d0c7d7922a52d1647ca36db0e83295755210e37047d21c0db4068157401a...` |
+| e78 | HAMSI384 | n/a | `31d4b3fcc84a324190ab71a4e6b7775d30addbc02396caadfb0a9ec1ef3c08016bdbe9618a7187fea8af520e83e8c533:password123` |
+| e79 | HAMSI512 | n/a | `1b13fb127eed7bb1f0a2c3e0e31bed7743ae1d0c7d7922a52d1647ca36db0e83295755210e37047d21c0db4068157401a7ccfefd2d81a8d96779b4e99555002a:password123` |
 | e80 | JH224 | n/a | `9eabd4d41067fa7836cef15fe54e4972b95a1e81a66bb6bd179b32d6:password123` |
 | e81 | JH256 | n/a | `4213ce43a33521d327404ee2f3f708353ec7ca41507040569ab3c4a515a2a4af:password123` |
-| e82 | JH384 | n/a | `48fef9a17db6a4fc5ccb529943537f03f0a1bf1467c6b5291c966fc5e2696e15bd50ff25a9e11f7626c0443c306206a6:...` |
-| e83 | JH512 | n/a | `bb7a46a33626921a8223964f605273eac6ddac46d70f29295037a034cf9dea5c93208b52b8128629f810a4dd225e3fabd...` |
+| e82 | JH384 | n/a | `48fef9a17db6a4fc5ccb529943537f03f0a1bf1467c6b5291c966fc5e2696e15bd50ff25a9e11f7626c0443c306206a6:password123` |
+| e83 | JH512 | n/a | `bb7a46a33626921a8223964f605273eac6ddac46d70f29295037a034cf9dea5c93208b52b8128629f810a4dd225e3fabd08999503ddf6947dbb3e38f9f36ccee:password123` |
 | e84 | KECCAK224 | 17700 | `2781d12d1d761b02bab1fc3f61d66ddbf3c5622d01da8297bd37fd7a:password123` |
 | e85 | KECCAK256 | 17800 | `0d45e19766c0cadfe3af48b801102a9de4337ee41088e3561d9f1e9897aeeeae:password123` |
-| e86 | KECCAK384 | 17900 | `21ff54d0e51d8542ce409b7541bed6b5e853d7e2408507eba3d823f94749d118b69fd3971239a5c35673cc5531b2ed87:...` |
-| e87 | KECCAK512 | 18000 | `aa77c1b9b7021937f820cc53cfa234ff49695dbfcfee83d283d1d68b180c2a56a3984d637e677a7c0cb8d943d01c90198...` |
+| e86 | KECCAK384 | 17900 | `21ff54d0e51d8542ce409b7541bed6b5e853d7e2408507eba3d823f94749d118b69fd3971239a5c35673cc5531b2ed87:password123` |
+| e87 | KECCAK512 | 18000 | `aa77c1b9b7021937f820cc53cfa234ff49695dbfcfee83d283d1d68b180c2a56a3984d637e677a7c0cb8d943d01c9019810e5608266bb18ca649f1a64c661c7f:password123` |
 | e88 | SHA3-224 | 17300 | `cc782e5480878ba3fb6bb07905fdcf4a00e056adb957ae8a03c53a52:password123` |
 | e89 | SHA3-256 | 17400 | `ab3fe4003f14e3ef573417f95e47d4985c482eadd139c08b3758eeae7cc60b9d:password123` |
-| e90 | SHA3-384 | 17500 | `d9b644c85745fe084746ef61cd2b5c0981ad524b9ab114c1e88966687479a0fbbe87f09a647a92b08437d1b63c555b06:...` |
-| e91 | SHA3-512 | 17600 | `4ad2c01fc6007f58720b00fc99b978c2a17c577859d31fdbba4b3a749de9383ac4b0738aeaf0b13337db8bfeaf9d8f87f...` |
+| e90 | SHA3-384 | 17500 | `d9b644c85745fe084746ef61cd2b5c0981ad524b9ab114c1e88966687479a0fbbe87f09a647a92b08437d1b63c555b06:password123` |
+| e91 | SHA3-512 | 17600 | `4ad2c01fc6007f58720b00fc99b978c2a17c577859d31fdbba4b3a749de9383ac4b0738aeaf0b13337db8bfeaf9d8f87faa236fc3c8a68fbf23eb6862fadb86e:password123` |
 | e92 | LUFFA224 | n/a | `0e70a2758b9c643c60e40f369c07f38c9e487b3d75cfadc4c2338b6c:password123` |
 | e93 | LUFFA256 | n/a | `0e70a2758b9c643c60e40f369c07f38c9e487b3d75cfadc4c2338b6c70071ba1:password123` |
-| e94 | LUFFA384 | n/a | `f10624a65c48ff31475bf97c4d66f166f21c46da1c41dad95b2158aa1071bb94d1552702b0f61841e267ee980ff87d16:...` |
-| e95 | LUFFA512 | n/a | `489ff5b40ce4c8864747265c942bbff3360d2916c94db14e47773ad1270ef3eb646b96d5efb422e274246e6aca3e67c73...` |
+| e94 | LUFFA384 | n/a | `f10624a65c48ff31475bf97c4d66f166f21c46da1c41dad95b2158aa1071bb94d1552702b0f61841e267ee980ff87d16:password123` |
+| e95 | LUFFA512 | n/a | `489ff5b40ce4c8864747265c942bbff3360d2916c94db14e47773ad1270ef3eb646b96d5efb422e274246e6aca3e67c739c4ca744b88d08e705eb5358f2d3df1:password123` |
 | e96 | PANAMA | n/a | `209756afbb2888b00fd3ceb3ddd33327ccbfe9fcdfc0e030ee124afd8f00c69d:password123` |
 | e97 | RADIOGATUN32 | n/a | `41df49dcea7772a04016b92522bd79a0:password123` |
 | e98 | RADIOGATUN64 | n/a | `1e69083b924d85f77cb27761f4baf3b3e6e456e2ee4213582b297d7a3319add1:password123` |
 | e99 | SHABAL224 | n/a | `6abab1f4f5f0ef56fc4aad3220fe360d5cf73a18e8826bc1b6944e23:password123` |
 | e100 | SHABAL256 | n/a | `f8dedc7bcdb0738410c90f4b1aa265979cf8229956f63e3fce658173e56b6791:password123` |
-| e101 | SHABAL384 | n/a | `4e7363106e1276c251c36e5b898fd5c136cbdca059b7b47160b31f78825f161b6088c35de8a05c6021ca7009f603a3f7:...` |
-| e102 | SHABAL512 | n/a | `287d6313b8c953ed49aa2ef79e0139608e8a4e4848fdb15ec258b5be2f4156d42d392f30be164e5c85f5694faaeeba647...` |
+| e101 | SHABAL384 | n/a | `4e7363106e1276c251c36e5b898fd5c136cbdca059b7b47160b31f78825f161b6088c35de8a05c6021ca7009f603a3f7:password123` |
+| e102 | SHABAL512 | n/a | `287d6313b8c953ed49aa2ef79e0139608e8a4e4848fdb15ec258b5be2f4156d42d392f30be164e5c85f5694faaeeba647a58b411440d54310f571b40a8a99fb8:password123` |
 | e103 | SHAVITE224 | n/a | `3068845854a52d1ae173e35714506195dbc4031fb97c09ab90a9b23a:password123` |
 | e104 | SHAVITE256 | n/a | `c4c52be909a2b88d549a94ee66818d2876eaacded692c6a12d2bb4b4766d0155:password123` |
-| e105 | SHAVITE384 | n/a | `7ea5104c9d6fcc270bd6f1e20222ed8708a02d6edb77c8ce65824f5cea660a5e4f8b97821d8e0d91e3cc49b2f6e62d69:...` |
-| e106 | SHAVITE512 | n/a | `00119cdc7fe882604d3212a8eca8666cfba6a515ee0f53f93a820f40e97e4ca21e466980a9c8776f188b8fdc9bb719571...` |
+| e105 | SHAVITE384 | n/a | `7ea5104c9d6fcc270bd6f1e20222ed8708a02d6edb77c8ce65824f5cea660a5e4f8b97821d8e0d91e3cc49b2f6e62d69:password123` |
+| e106 | SHAVITE512 | n/a | `00119cdc7fe882604d3212a8eca8666cfba6a515ee0f53f93a820f40e97e4ca21e466980a9c8776f188b8fdc9bb7195710ab361ac556bd31e16df1fdcbb767ef:password123` |
 | e107 | SIMD224 | n/a | `a254dd7c1cdca2b5ff08e734c6be841d02dad74b6b8e65f43a71763c:password123` |
 | e108 | SIMD256 | n/a | `36e481232fc97022a2dd772dd382c8889ccc033d08664c3bc69c60a1cdcfdb0a:password123` |
-| e109 | SIMD384 | n/a | `32cec19305e71af3d591bbcf6ac93540466de4002aca9aa66bf89a558062cff1ef46694683732669f4418604a1b76e98:...` |
-| e110 | SIMD512 | n/a | `ad2cd6e99de20db9149cec7b433b83747d681854d7fddcb48f8e5e7dbfb327d925f7e0f70de5ba9a3a4232852cf2f5079...` |
+| e109 | SIMD384 | n/a | `32cec19305e71af3d591bbcf6ac93540466de4002aca9aa66bf89a558062cff1ef46694683732669f4418604a1b76e98:password123` |
+| e110 | SIMD512 | n/a | `ad2cd6e99de20db9149cec7b433b83747d681854d7fddcb48f8e5e7dbfb327d925f7e0f70de5ba9a3a4232852cf2f507927cdfe4d96ceb756423d1f37e73707c:password123` |
 | e111 | SKEIN224 | n/a | `eec989ed33636d610da3b26ffd18e04b1e54a4793974868665e27429:password123` |
 | e112 | SKEIN256 | n/a | `3c25a8e83a9a294db94bcb375c18d3ec620027eb8b8c20e4843465f51ccebbaf:password123` |
-| e113 | SKEIN384 | n/a | `98c9ed948d6d88ea02f564880b9adbd922ccc049efaad769bab3788afcdd4567c972e8d34224eaa715779f494eb2e0af:...` |
-| e114 | SKEIN512 | n/a | `490bbb3ef0f8df6acbbedd71b126be9ca6916f5c4fe9368f66a0010fa2a0601586ca2e658868f9bbc02e45f3229b9c7d3...` |
+| e113 | SKEIN384 | n/a | `98c9ed948d6d88ea02f564880b9adbd922ccc049efaad769bab3788afcdd4567c972e8d34224eaa715779f494eb2e0af:password123` |
+| e114 | SKEIN512 | n/a | `490bbb3ef0f8df6acbbedd71b126be9ca6916f5c4fe9368f66a0010fa2a0601586ca2e658868f9bbc02e45f3229b9c7d3a829b168e08141ff528b02f098c0a53:password123` |
 | e115 | TIGER2 | n/a | `3a741930e19b25f7cfd71d093b46bee10fae839e6dd14e1a:password123` |
-| e116 | WRL0 | n/a | `e8d48e900fc9bee4a5a77cac5126b21a93a25533e1b32f55a40f82cf7a92a9c8006a3f5293c79851e8ad8efe129b65b85...` |
-| e117 | WRL1 | n/a | `1036a64d4e0cffdcfeb2d324c5d6ea3639e8b401b7590791e1f3d749fafaa694f865eecd0b1003790fbb5b9dcbac4b298...` |
-| e118 | RIPEMD | 6000 | `dc2b4b1ed04412f1f06f2657177327f2:password123` |
+| e116 | WRL0 | n/a | `e8d48e900fc9bee4a5a77cac5126b21a93a25533e1b32f55a40f82cf7a92a9c8006a3f5293c79851e8ad8efe129b65b854d91c8f1db5af4a11b8663d35973754:password123` |
+| e117 | WRL1 | n/a | `1036a64d4e0cffdcfeb2d324c5d6ea3639e8b401b7590791e1f3d749fafaa694f865eecd0b1003790fbb5b9dcbac4b29800ea0a87699da23bd73ce515e62800d:password123` |
+| e118 | RIPEMD | n/a | `dc2b4b1ed04412f1f06f2657177327f2:password123` |
 | e119 | MD2MD5 | n/a | `87d453c8acdc928f3f63714cd3f445dc:password123` |
 | e120 | MD2MD5PASS | n/a | `5e7db5843b5d6b9f09b377b6e7ebfc1a:password123` |
 | e121 | MD4MD5 | n/a | `afb204805372c4d49b797117e7cad74b:password123` |
 | e122 | MD4MD5PASS | n/a | `5af3fd4ab6704fd4ceda700eb3677b28:password123` |
-| e123 | MD5MD5PASS | n/a | `bd338a397028b480434dfc1f4cc73e37:password1234` |
+| e123 | MD5MD5PASS | n/a | `4e9dcbe0c0b21731e2d3e9d2cca8f384:password123` |
 | e124 | GOSTMD5 | n/a | `16d1edab552d7f1277d1a05124fe3a4dbe6294cb396512276eb47a8215d4e3f6:password123` |
 | e125 | GOSTMD5PASS | n/a | `b2a4bf185b2e1226ad2e15082dd44d09c764f26d4b019ee94da8f7149058aa83:password123` |
 | e126 | HAV128MD5 | n/a | `d7674c26a4d368d28f68c58c745e6fc2:password123` |
@@ -180,14 +187,14 @@ self-test vector; they are still fully functional.
 | e163 | SHA224MD5PASS | n/a | `de21725a64377b95c0b1cfa69c025725926ee63a0911bf0dc35bfce2:password123` |
 | e164 | SHA256MD5 | 20800 | `55a8cb419848dabd9a69aa38cc3c5537a4e74871bd1697b99dc71c5a8cab7276:password123` |
 | e165 | SHA256MD5PASS | n/a | `536a8a02cda68cda3000887a9b1d48827edd3bf1c17475ec3c1bf2ef42867da1:password123` |
-| e166 | SHA384MD5 | n/a | `4833722e5c1dcbdbbbdfe8775c615e8307a086248800cdf644f11a052e4c33af20945e5a39c6b22afb5b72252de92ff3:...` |
-| e167 | SHA384MD5PASS | n/a | `293073d9eee523c7bd640e884c16864746227cee204514fe3a8dc4f20278aec2edd0abd2de54b1889f0b35e90ade8aa9:...` |
-| e168 | SHA512MD5 | n/a | `257292c94f118c69575a635f47131cb39cf9b78981a254425923151e24e0313394f7cb31e6f875604c605955efb9a1a3c...` |
-| e169 | SHA512MD5PASS | n/a | `38bb494c6b9c05ac4f6ad553b495badea4dec10b6959bb253fe4c71c6b5111740cfa6d4b10f964f6219c4889d989d59f2...` |
+| e166 | SHA384MD5 | n/a | `4833722e5c1dcbdbbbdfe8775c615e8307a086248800cdf644f11a052e4c33af20945e5a39c6b22afb5b72252de92ff3:password123` |
+| e167 | SHA384MD5PASS | n/a | `293073d9eee523c7bd640e884c16864746227cee204514fe3a8dc4f20278aec2edd0abd2de54b1889f0b35e90ade8aa9:password123` |
+| e168 | SHA512MD5 | n/a | `257292c94f118c69575a635f47131cb39cf9b78981a254425923151e24e0313394f7cb31e6f875604c605955efb9a1a3cab919a8625bfb8950c18cac23ae35a8:password123` |
+| e169 | SHA512MD5PASS | n/a | `38bb494c6b9c05ac4f6ad553b495badea4dec10b6959bb253fe4c71c6b5111740cfa6d4b10f964f6219c4889d989d59f269b3add2fd8af9a88ad7411072ebc94:password123` |
 | e170 | TIGERMD5 | n/a | `39d29b96c55c3ba18aabe0aa34187332ece68e9e659e5fc7:password123` |
 | e171 | TIGERMD5PASS | n/a | `8c3ce48158db62996ae6653ead50b76aa94d71243236d4ad:password123` |
-| e172 | WRLMD5 | n/a | `38877a68d71d849659e759485bebbd359ba4559aa7e55836fa8a1585d81d302f46add4112fc4878feeb28fd24fb01cf20...` |
-| e173 | WRLMD5PASS | n/a | `be7f8e5d39599d1a9fccfee7f987214e8a94498ae686ac7566745f0b932d64e1453c588acafe4f764f77dcf90fbee1e0e...` |
+| e172 | WRLMD5 | n/a | `38877a68d71d849659e759485bebbd359ba4559aa7e55836fa8a1585d81d302f46add4112fc4878feeb28fd24fb01cf204c00c366f365a2c6246ce9a05f8ee7e:password123` |
+| e173 | WRLMD5PASS | n/a | `be7f8e5d39599d1a9fccfee7f987214e8a94498ae686ac7566745f0b932d64e1453c588acafe4f764f77dcf90fbee1e0efc805c056ec1a6100e051f0591290d3:password123` |
 | e174 | SNE128MD5 | n/a | `921e91c286d3f2afc1bd4b24b9b60a9b:password123` |
 | e175 | SNE128MD5PASS | n/a | `8214d0684ec152bc794503f4d0135708:password123` |
 | e176 | SNE256MD5 | n/a | `14d7dd0afdc1f1db844209a076e57f315ce6226b0fa36a96f74e1482248a756e:password123` |
@@ -197,11 +204,11 @@ self-test vector; they are still fully functional.
 | e180 | MD5SHA512 | n/a | `2dc96034c9ecbd894474ebcb79c09448:password123` |
 | e181 | SHA1PASSSHA1 | n/a | `f4ec43b2a3b850de920746ec9c701ac614db5a41:password123` |
 | e182 | SHA1UC | n/a | `CBFDAC6008F9CAB4083784CBD1874F76618D2A97:password123` |
-| e183 | MD5HEXSALT | n/a | `fbdad8ef09239075982cc64505d43a32:00:password1234` |
-| e184 | SHA1HEXSALT | n/a | `e98041847f496142921fe4401f3b6acbe53a1878:00:password1234` |
-| e185 | SHA256HEXSALT | n/a | `1da31a6fd779f719737bfa9a028a4033d544ac74a328a9253bc52f2be95f8fcf:00:password1234` |
-| e186 | GOSTHEXSALT | n/a | `a26fd15a01602db5b903935dcdf05a7c8d75ddac5e89e158d595ee7d4013a21f:00:password1234` |
-| e187 | HAV128HEXSALT | n/a | `32ca4acfb20648bf178f8bc962caf4b7:00:password1234` |
+| e183 | MD5HEXSALT | n/a |  |
+| e184 | SHA1HEXSALT | n/a |  |
+| e185 | SHA256HEXSALT | n/a |  |
+| e186 | GOSTHEXSALT | n/a |  |
+| e187 | HAV128HEXSALT | n/a |  |
 | e188 | MD5SHA1MD5 | 32800 | `3b4f022014f794549416f9c1bd25fa63:password123` |
 | e189 | MD5SHA1MD5SHA1 | n/a | `508a60f7683f2aeee51920f5000af7a7:password123` |
 | e190 | MD5SHA1MD5SHA1SHA1 | n/a | `6f853d7025b462217bf65bce41ae1b38:password123` |
@@ -215,24 +222,24 @@ self-test vector; they are still fully functional.
 | e198 | SHA256SHA512 | n/a | `91ce0064ece5029452c4145edaa737ef579c799a7cc7e2c62a7fc17265824eb3:password123` |
 | e199 | MD5WRL | n/a | `b961c2abc423335d8ca92d3f943cc03d:password123` |
 | e200 | MD5SHA1SHA1RAW | n/a | `7ae92abdb62aede2b092f11591818bb4:password123` |
-| e201 | MD5PASSMD5 | n/a | `a4bfd4666b8774bf82adff50ea9d49c1:password1234` |
-| e202 | MD5-DBL-PASS | n/a | `06bf21bb53b8c589dd3359139f0db176:password1234` |
+| e201 | MD5PASSMD5 | n/a |  |
+| e202 | MD5-DBL-PASS | n/a | `91a5b1589d8f19e1062d041ef5d85491:password123` |
 | e203 | SHA1MD5UC | n/a | `900bd2208de3ca960ecee76ee483904300ceb991:password123` |
 | e204 | SHA1MD5SHA1MD5SHA1MD5 | n/a | `e8eed22214746f4d65566bacd2dc3468b45f75a6:password123` |
 | e205 | MD5SQL5 | n/a | `4b9c0924c807868a66f7ff0e713c2cb2:password123` |
-| e206 | SHA1SQL5 | n/a | `3d597118acbe286752288c1cb9508aa4b40fd791:password1234` |
+| e206 | SHA1SQL5 | n/a |  |
 | e207 | MD5MD5UCMD5 | n/a | `d168e00fe57116e52a5e804887a05cd0:password123` |
 | e208 | HMAC-MD2 | n/a | `04912f388000a9ea3d21047d21150f0f:testsalt:password123` |
 | e209 | HMAC-MD4 | n/a | `ab18ed06836fdbf52f6e440cc603c190:testsalt:password123` |
 | e210 | HMAC-RMD128 | n/a | `f1cab4750367231d5d6a5cd4a5258d30:testsalt:password123` |
 | e211 | HMAC-RMD160 | 6060 | `bd55f8e3b904a8dec820a2ee90709a0ca8135129:testsalt:password123` |
 | e212 | HMAC-RMD256 | n/a | `a42744defb2bbe8ee7d513c259d59980af41d25dcfa901e0cd6597056e3bad04:testsalt:password123` |
-| e213 | HMAC-RMD320 | 33660 | `d1ec4c13556b193ff1ede8094a50e7bc73b8ae1be5d953c86f5f8e16ffd868045c128da194fcee1d:testsalt:passwor...` |
+| e213 | HMAC-RMD320 | 33660 | `d1ec4c13556b193ff1ede8094a50e7bc73b8ae1be5d953c86f5f8e16ffd868045c128da194fcee1d:testsalt:password123` |
 | e214 | HMAC-MD5 | 60 | `a721680d20f08b2c2cf5a1b33df1d30f:testsalt:password123` |
 | e215 | HMAC-SHA1 | 160 | `30e653bb1fcb911909896b42b2b67ef9494822a9:testsalt:password123` |
 | e216 | HMAC-SHA224 | n/a | `b42c9d7aef7eaae6a2dbd7f46b991d56e655bade669d42501653dba8:testsalt:password123` |
 | e217 | HMAC-SHA256 | 1460 | `48ab9e974e422f68a8b61f5e7b31e27c21cfad7f423fff546b3429da67f480b5:testsalt:password123` |
-| e218 | HMAC-SHA512 | 1760 | `0876e6c17ac41e68003af908be877b7a5178996eca7c91cac50fc825eef9ac5b018b9c862f7e3665317e60cc24d62a7cd...` |
+| e218 | HMAC-SHA512 | 1760 | `0876e6c17ac41e68003af908be877b7a5178996eca7c91cac50fc825eef9ac5b018b9c862f7e3665317e60cc24d62a7cdd663ed7bfc22e782d565cc17190e101:testsalt:password123` |
 | e219 | HMAC-HAV128 | n/a | `2905b64454ba83542885b6721738ebad:testsalt:password123` |
 | e220 | HMAC-HAV160 | n/a | `9865673ea8e95cc5c04bc682d883f62c136da370:testsalt:password123` |
 | e221 | HMAC-HAV192 | n/a | `c5747a29c25b1f0fa94ff5793268d05f01ad0d454f1d367e:testsalt:password123` |
@@ -251,14 +258,14 @@ self-test vector; they are still fully functional.
 | e234 | MD5SHA1BASE64 | n/a | `ca1cadacfe3b29687903c39e922ecae7:password123` |
 | e235 | MD5SHA1MD5BASE64 | n/a | `364946e99c9332ecb45913e2046bbda3:password123` |
 | e236 | SHA1BASE64 | n/a | `402720a0a1cf4494318ee024a43898d4166eed11:password123` |
-| e237 | MD5BASE64MD5RAW | n/a | `a52beba4acfe78f1094ede91ad736c13:password1234` |
+| e237 | MD5BASE64MD5RAW | n/a |  |
 | e238 | MD5BASE64SHA1RAW | n/a | `c20983cb4198e300ba28a9423660a9c9:password123` |
 | e239 | SHA1BASE64MD5RAW | n/a | `08c372085a6831b1d0af96392dc47deed1ae3a3a:password123` |
 | e240 | SHA1BASE64SHA1RAW | n/a | `d775d52d922d95e1ec4ce86ace48e4306b8fbf44:password123` |
-| e241 | MD5BASE64SHA1RAWMD5 | n/a | `c3568ae620d0bbadcb902ba9523a9da2:password123` |
-| e242 | MD5BASE64MD5RAWSHA1 | n/a | `b7f63f54c96552581ea3d529528ff869:password1234` |
-| e243 | MD5BASE64MD5RAWMD5 | n/a | `7df4a3db60ae7b21b5fd90b64e530520:password1234` |
-| e244 | MD5BASE64MD5RAWMD5MD5 | n/a | `c47e17ea94ab5ba8fac3a57e7156526f:password1234` |
+| e241 | MD5BASE64SHA1RAWMD5 | n/a | `2b37df836d04c4ec1438324b42ae2534:password123` |
+| e242 | MD5BASE64MD5RAWSHA1 | n/a |  |
+| e243 | MD5BASE64MD5RAWMD5 | n/a |  |
+| e244 | MD5BASE64MD5RAWMD5MD5 | n/a |  |
 | e245 | MD5BASE64SHA1RAWBASE64SHA1RAW | n/a | `20900515918ed3bdf0fb505e8a446287:password123` |
 | e246 | MD5SHA1UC | n/a | `840b89e46e9e5850533e834477dba072:password123` |
 | e247 | MD5SHA1UCMD5 | n/a | `1a22ce81ee0fff8670f6700195890c37:password123` |
@@ -297,10 +304,10 @@ self-test vector; they are still fully functional.
 | e280 | SHA1RADMIN2MD5 | n/a | `640ccb961495b5a0e3ceb8ef62ddc28b0370a0e4:password123` |
 | e281 | SHA1RADMIN2BASE64 | n/a | `fffdf736d6f8c25deaec20fb3671dd29b2adf3d8:password123` |
 | e282 | MD5-MULTISALT | n/a | `100b151325a157856fdbc4cf935a3a8f:angel:password123` |
-| e283 | MD52SALTMD5 | n/a | `903006b5979bbcc96cfc3717e9704d0a:$HEX[0909]:password1234` |
+| e283 | MD52SALTMD5 | n/a |  |
 | e284 | MD51SALTMD5UC | n/a | `3c7cdcfb2ea4813dca96d14fe542b28d:D:password123` |
 | e285 | MD51SALTMD5MD5 | n/a | `acedaa16f08b61bb4de2ab57099b6d86:~:password123` |
-| e286 | MD5MD5USER | n/a | `1369f158239f72c084ce44c7a89cd568:testsalt:password1234` |
+| e286 | MD5MD5USER | n/a |  |
 | e287 | SHA1MD5MD5 | 18500 | `43445e0d1298d6c987a881f361808422fb3b8ed7:password123` |
 | e288 | SHA1SHA1RAWMD5 | n/a | `2c13011ac7f9b6ce6564935154f8986a535979a9:password123` |
 | e289 | SHA1MD5MD5MD5 | n/a | `0d3ee472e2f623ab9fda6aa1afc39c329987a7a5:password123` |
@@ -317,12 +324,12 @@ self-test vector; they are still fully functional.
 | e300 | MD5SHA1SHA1 | n/a | `d53df44a44a47959ec5da72d7e31be6a:password123` |
 | e301 | MD5SQL5MD5 | n/a | `a91331088a9614fc49802194391e2b63:password123` |
 | e302 | MD5SQL5-chop40 | n/a | `53fa3e6d96e5e9745de59b8f5408272c:password123` |
-| e303 | MD5-2xMD5 | 3500 | `ff9321878a8459f4426b07a4e12a630d:password123` |
+| e303 | MD5-2xMD5 | n/a | `ff9321878a8459f4426b07a4e12a630d:password123` |
 | e304 | MD5-2xMD5-MD5 | n/a | `d7b50fae0e15dcfe4d43c0bd166a3e06:password123` |
 | e305 | MD5-2xMD5-SHA1 | n/a | `e71cba2abebcf2548647345b55ae24df:password123` |
 | e306 | MD5-2xMD5-MD5MD5 | n/a | `6175fd3774c355d762d39512f2392ce3:password123` |
 | e307 | MD5-2xMD5-MD5MD5MD5 | n/a | `7822c838b5f172ccc3fc6d9a07cc6a73:password123` |
-| e308 | SHA1MD5USER | 4711 | `a2b60995488bc3f3954166bd48779efb2707d6f4:testsalt:password1234` |
+| e308 | SHA1MD5USER | 4711 |  |
 | e309 | SHA1MD5RADMIN2 | n/a | `20bd7be8772e70bfd776c0629762b6ba04056e62:password123` |
 | e310 | SHA1SHA1USER | 4510 | `3b8240b10f2caefcc6cd7c970b332b4109d7e63c:testsalt:password123` |
 | e311 | SHA11SALTMD5 | n/a | `f635c6f7e80b172f2bd7a40e2c36804a09df3785:~:password123` |
@@ -362,52 +369,52 @@ self-test vector; they are still fully functional.
 | e345 | MD51SALTMD5MD5MD5MD5MD5 | n/a | `32e0ed968d6e554d35d6f200b1fc8a14:~:password123` |
 | e346 | MD5BASE64ROT13 | n/a | `e1f3134140c094abd2d2de53a5f7cc4f:password123` |
 | e347 | MD5MD5SALT | n/a | `966fb8f379de3a2dbdbf249470a76e86:testsalt:password123` |
-| e348 | MD52SALTMD5MD5 | n/a | `86a2519100894289d22209c1cb09c2b8:$HEX[0909]:password1234` |
-| e349 | MD52SALTMD5MD5MD5 | n/a | `c207465fbc1e7afcff045f59135a6bf6:$HEX[0909]:password1234` |
+| e348 | MD52SALTMD5MD5 | n/a |  |
+| e349 | MD52SALTMD5MD5MD5 | n/a |  |
 | e350 | MD5UCSALT | n/a | `69da68d2893de24e2d927a619bbd92bf:testsalt:password123` |
 | e351 | MD5TIGER | n/a | `a59cd29db27f3e78119ab1d001d616bc:password123` |
 | e352 | MD5SHA1MD5PASS | n/a | `57b511120d3e396e3973b2185e683f7f:password123` |
-| e353 | MD5CAP | n/a | `42f749ade7f9e195bf475f37a44cafcb:password123` |
-| e354 | MD5CAPMD5USER | n/a | `8603f0a4d1970a65ea29c491cb1a75d6:testsalt:password1234` |
-| e355 | MD5CAPMD5MD5USER | n/a | `3a83d213b43ffdac52441ed77394bfb3:testsalt:password1234` |
-| e356 | MD5MD5MD5USER | 3610 | `0ceef83865c66c3181938742b3a68263:testsalt:password1234` |
+| e353 | MD5CAP | n/a | `961edca42a4df06255aa5fb4aeec889b:password1234` |
+| e354 | MD5CAPMD5USER | n/a | `225342c927041c489e98d77561c0bb77:0:password123` |
+| e355 | MD5CAPMD5MD5USER | n/a | `203a0dc2c7fd903d8c79e1fd923d7946:0:password123` |
+| e356 | MD5MD5MD5USER | 3610 | `966fb8f379de3a2dbdbf249470a76e86:testsalt:password123` |
 | e357 | MD5MD5SALT-SALT | n/a | `87648169a3b4d61e05b6077b81eb4746:Neverfound:password123` |
 | e358 | MD5CAPSHA1 | n/a | `0d5e1292d06bf6860d98acb8fb6ce324:password123` |
 | e359 | MD5SHA1MD5x | n/a | `3b4f022014f794549416f9c1bd25fa63:1:password123` |
 | e360 | MD5SHA1BASE64MD5RAW | n/a | `c3568ae620d0bbadcb902ba9523a9da2:password123` |
 | e361 | MD5SHA1MD5MD5SHA1 | n/a | `99a6cc386824d69d0fe34b514c268b3a:password123` |
 | e362 | MD5SHA1MD5UC | n/a | `1a5ba6e4a959208325eb412e21528ae9:password123` |
-| e363 | MD5MD5HUM | n/a | `1c16bcaed64f3d1652488eab6469ea02:00- x 1:password1234` |
-| e364 | SHA1MD5HUM | n/a | `8ebd444b9af9bb5a6128a8ddd04eb04aa02231ef:00- x 1:password1234` |
-| e365 | SHA1SHA1HUM | n/a | `d7d22404d4e72197cc16d6e8ecc99415eca34480:00- x 1:password1234` |
-| e366 | MD5SHA1HUM | n/a | `9242469002a4a2a5497b61ca52d71c5b:00- x 1:password1234` |
+| e363 | MD5MD5HUM | n/a |  |
+| e364 | SHA1MD5HUM | n/a |  |
+| e365 | SHA1SHA1HUM | n/a |  |
+| e366 | MD5SHA1HUM | n/a |  |
 | e367 | MD5-MD5SALTMD5PASS | 2811 | `63a6a536607c1341f3b6c2ac076bd536:KMo),:password123` |
 | e368 | MD5NTLM | n/a | `efb08065cdc200d996d9991ec1815a01:password123` |
-| e369 | NTLM | 1000 | `a9fdfa038c4b75ebc76dc855dd74f0da:password123` |
+| e369 | NTLM | n/a | `a9fdfa038c4b75ebc76dc855dd74f0da:password123` |
 | e370 | MD5MD4 | n/a | `e1bd223f0b2165d3e46a374d04fdd90f:password123` |
 | e371 | MD5NTLMUC | n/a | `d80c2ac7c329964ee5be631a0aae9f9c:password123` |
 | e372 | MD5USERPASS | n/a | `4e48abb76d3e0295f3f89eb02d05b344:testsalt:password123` |
 | e373 | MD5PASSSALT | 10,11,2630 | `3bafc2e8611d1e4e84338b552539ce28:Aa8NB6AU6v2KsqLjbbLb4EH9mAB9BksY:password123` |
 | e374 | MD5SHA1RADMIN2MD5 | n/a | `9b6b90e5373bfe7755d79511d3435ea1:password123` |
-| e375 | MD5UCBASE64MD5RAW | n/a | `a52beba4acfe78f1094ede91ad736c13:password1234` |
-| e376 | MD5UCBASE64SHA1RAW | n/a | `c20983cb4198e300ba28a9423660a9c9:password123` |
+| e375 | MD5UCBASE64MD5RAW | n/a |  |
+| e376 | MD5UCBASE64SHA1RAW | n/a | `C20983CB4198E300BA28A9423660A9C9:password123` |
 | e377 | MD5SHA1MD5MD5UC | n/a | `ad811f10a07e284386c5474858169d00:password123` |
-| e378 | MD5SHA1MD5HUM | n/a | `cd7ee31bccad543ad9e6b38b053b37ba:00- x 1:password1234` |
+| e378 | MD5SHA1MD5HUM | n/a |  |
 | e379 | LM | 3000 | `e52cac67419a9a22664345140a852f61:PASSWORD123` |
 | e380 | MD5LM | n/a | `af9292d80b8d3673b7bd66a04d3d7cdb:PASSWORD123` |
 | e381 | MD5LMUC | n/a | `f762f0da0424f3c16520548989b5a960:PASSWORD123` |
 | e382 | SHA256SHA256SALT | 20710 | `c13ec3c0bee06d3315f743a0df31b3f23069eed4bdcf6dde4d37f894c0c9d1b6:testsalt:password123` |
-| e383 | MD5RAWUC | n/a | `E8EEB4FFDBE6D08270590C63EACEFFC3:password123` |
+| e383 | MD5RAWUC | n/a | `e8eeb4ffdbe6d08270590c63eaceffc3:password123` |
 | e384 | MD5SHA1UCu32 | n/a | `0f5f14cf8895700edd2eed170d4af5c5:password123` |
 | e385 | SHA1SALTPASS | 120,124 | `dc4615802e2920538ead6d2cfab8a16c15a62fac:administrator:password123` |
-| e386 | SHA512PASSSALT | 1710 | `8c597921f115666f5e2f315effbb8d25bc02644bee236944bf8539a3fda7dfd3704dfcf5dde96d60cce7d415a812ba73c...` |
-| e387 | SHA512SHA512SALT | 32410 | `2676843a84b1344f91452f591e9ce586b4a5d2aaa62845df122d75f65bae7ca453302b450a8fbd9d208e4e6c3a4098f26...` |
-| e388 | SHA512SALTPASS | 1720 | `50b47dc5680fcb783a962c457fffd1c1f474880621357122f7cb56b9e82d099d3f5563ab329e7150637ef188a55bc05d2...` |
-| e389 | SHA512SALTSHA512 | n/a | `b1b4706604213021f6ec950e6b2fedc9c10ca569094e4a1f686cf396ae48c67993fee570d6c4044aad2aca76514e37686...` |
-| e390 | WRLPASSSALT | n/a | `84dbfdb2a16f2d0c84f59f17b26ceac15879e363e90ea1b95d920df931fe1967e20d41f162485d5cdd10f952500df7e50...` |
-| e391 | WRLWRLSALT | n/a | `0488b47b2bf8dd700377efc9dbc809f2a0ec794bd39d41f9de0a084d9725531fc94540faee049d2c2fc4b2b4386dc9d64...` |
-| e392 | WRLSALTPASS | n/a | `3388fd1280003cf6c32025888f12b0875469066ecd735b4db79bec3c90abce86a77125c4d8dfe46a37748fbb6c971734f...` |
-| e393 | WRLSALTWRL | n/a | `f1c22deacdc74d9a4dcebc1e6565bd403f7e36f83e4469d2da87ead134ffdacf313212cebae7d354552a22ef3bc339da0...` |
+| e386 | SHA512PASSSALT | 1710,15000 | `8c597921f115666f5e2f315effbb8d25bc02644bee236944bf8539a3fda7dfd3704dfcf5dde96d60cce7d415a812ba73c248881042321a1108d78790d7beeb1b:administrator:password123` |
+| e387 | SHA512SHA512SALT | 32410 | `2676843a84b1344f91452f591e9ce586b4a5d2aaa62845df122d75f65bae7ca453302b450a8fbd9d208e4e6c3a4098f2680ceb3eef9e003d887dee24eef4e431:testsalt:password123` |
+| e388 | SHA512SALTPASS | 1720 | `50b47dc5680fcb783a962c457fffd1c1f474880621357122f7cb56b9e82d099d3f5563ab329e7150637ef188a55bc05d216b8546ccf8ced68de203a2b0a25278:administrator:password123` |
+| e389 | SHA512SALTSHA512 | n/a | `b1b4706604213021f6ec950e6b2fedc9c10ca569094e4a1f686cf396ae48c67993fee570d6c4044aad2aca76514e3768647f90835e351066524bb60753af098e:testsalt:password123` |
+| e390 | WRLPASSSALT | n/a | `84dbfdb2a16f2d0c84f59f17b26ceac15879e363e90ea1b95d920df931fe1967e20d41f162485d5cdd10f952500df7e50bc7bfff4723a0b02e61bd9ac8937c2e:testsalt:password123` |
+| e391 | WRLWRLSALT | n/a | `0488b47b2bf8dd700377efc9dbc809f2a0ec794bd39d41f9de0a084d9725531fc94540faee049d2c2fc4b2b4386dc9d64b196264e6881709645c86f29f4f1834:testsalt:password123` |
+| e392 | WRLSALTPASS | n/a | `3388fd1280003cf6c32025888f12b0875469066ecd735b4db79bec3c90abce86a77125c4d8dfe46a37748fbb6c971734fcc2520dde9048a434e381998dd9c028:testsalt:password123` |
+| e393 | WRLSALTWRL | n/a | `f1c22deacdc74d9a4dcebc1e6565bd403f7e36f83e4469d2da87ead134ffdacf313212cebae7d354552a22ef3bc339da0effb807783acea2f791eb225a6d2c46:testsalt:password123` |
 | e394 | MD5SALTPASS | 20,21,24,11000 | `e0355b9d1bd81d48a0a84ee98733ba48:00:password123` |
 | e395 | SHA1SALTPASSSALT | 4900 | `1267a9d7c10fb89d21be6a262d9d52887814da6e:administrator:password123` |
 | e396 | MD5MD5UCSHA1MD5MD5 | n/a | `346235c7e8e6688e7141f907c7be2c12:password123` |
@@ -441,24 +448,27 @@ self-test vector; they are still fully functional.
 | e424 | MD5WRLMD5 | n/a | `385e0c8d23eb1666dcc00de208ac3853:password123` |
 | e425 | NULL | n/a | `70617373776f72643132330000000000:password123` |
 | e427 | GOST2012-32 | 11700 | `6940451a91df4d17532dd11762b851572bad5362f4d885d2a20e510b2f875870:password123` |
-| e428 | GOST2012-64 | 11780,11800 | `9b7ce5af74589324a811f467795a93ad4fb5e6a62ea10e4116d134beae36dba62c29cee821927cc5ec4da0fe4c9ac6cfd...` |
+| e428 | GOST2012-64 | 11780,11800 | `9b7ce5af74589324a811f467795a93ad4fb5e6a62ea10e4116d134beae36dba62c29cee821927cc5ec4da0fe4c9ac6cfd9274cb78ac0e63c968ef55da20effc6:password123` |
+| e429 | POMELO | n/a | `bcd54363852c98fadd2d7ad0e8bb3f96d7a4f6bf3d46dcd00532e75ac4f2e01d:administrator:password123` |
 | e430 | STREEBOG-32 | n/a | `6940451a91df4d17532dd11762b851572bad5362f4d885d2a20e510b2f875870:password123` |
-| e431 | STREEBOG-64 | n/a | `9b7ce5af74589324a811f467795a93ad4fb5e6a62ea10e4116d134beae36dba62c29cee821927cc5ec4da0fe4c9ac6cfd...` |
+| e431 | STREEBOG-64 | n/a | `9b7ce5af74589324a811f467795a93ad4fb5e6a62ea10e4116d134beae36dba62c29cee821927cc5ec4da0fe4c9ac6cfd9274cb78ac0e63c968ef55da20effc6:password123` |
+| e432 | MD5AM | n/a | `b8ccf3afd896396d6250b22b478bbc82:jsmith:password123` |
+| e433 | MD5AM2 | n/a | `086931543278b7332314b832ab06c1bb:jsmith:jsmith@example.com:password123` |
 | e434 | MD5SWAP | n/a | `527069850e9352dc96d992ef3d6f9f17:password123` |
 | e435 | MD5SPECAM | n/a | `9018942a51656d6055f0c20024dd4f48:password123` |
 | e436 | SHA1HESK | n/a | `6eae5a30262eba6cad69217528a88c541e22c914:password123` |
 | e437 | MD5HESK | n/a | `b67f1f85e82c7a36fad01f5a632acddd:password123` |
-| e438 | SHA1SALTSHA1SALTSHA1PASS | n/a | `94a34fbac5bcdbea13160afdb735e834a0ad9f40:administrator:password123` |
+| e438 | SHA1SALTSHA1SALTSHA1PASS | 13900 | `94a34fbac5bcdbea13160afdb735e834a0ad9f40:administrator:password123` |
 | e439 | MSCACHE | 1100 | `559a1d5d1337e276b1db7bfab28c9223:Administrator:password123` |
 | e440 | MD5SHA1SALTMD5PASS | 21200 | `243e49e71e9fa71f33a9c1680ebe68cf:KMo),:password123` |
 | e441 | MD5SALTMD5PASS | 3710 | `28901512214aae68d950bcc54c415980:00:password123` |
 | e442 | MD5SHA1PASSMD5PASSSHA1PASS | 20900 | `a1c3bc71e56f6a5ec51b4ba2b423a73e:password123` |
 | e443 | MD5SHA1PASSSALT | 4420 | `3fb85c2c48d2bfdee012187cd8207b2c:xCg532%@%gdvf^5DGaa6&*rFTfg^FD4$OIFThrR_gh(ugf*/:password123` |
-| e444 | LEET-SHA512-WRL-USER | n/a | `a6d30e2e854f1d4cac651ceaf60653eb1bf1f65b94a5a5b74ec2cab0db1cd2884900951ce38285648a56772b20245ead1...` |
-| e445 | SHA1-SALT-SPECIAL | n/a | `f92ee20c177b89de3bfd27ca288411edeb9ff042:xy:password123` |
+| e444 | LEET-SHA512-WRL-USER | n/a | `a6d30e2e854f1d4cac651ceaf60653eb1bf1f65b94a5a5b74ec2cab0db1cd2884900951ce38285648a56772b20245ead162c3851306108ae5dc42cdcf0c85e33:testuser:password123` |
+| e445 | SHA1-SALT-SPECIAL | n/a | `e895b4b8d70c4c8c9a8e5c4198e0423d49b580aa:yD7FvdKF65umfp2Xmjrm:password123` |
 | e446 | SHA1-SALT-UTF16-PEPPER | n/a | `8477431034949d2552f59f29d754eb5894b7c56c:f5g= of8=:password123` |
 | e447 | SHA256RAWSALTPASS | n/a | `5ac28834ed8be26198bde055d77ba012ef5207441d415de9ea8e55b504d07afa:Salt:password123` |
-| e448 | SHA512-CUSTOM1 | n/a | `b854f6169f8b85d165805784be56fa8fe44178168d9dfa92e1f860e75aa95455c17a86eb4be3432bb6c6a40139996893a...` |
+| e448 | SHA512-CUSTOM1 | n/a | `b854f6169f8b85d165805784be56fa8fe44178168d9dfa92e1f860e75aa95455c17a86eb4be3432bb6c6a40139996893a72ccd7b1c95a41ee61c2f7ad449460c:$3dfhgjhgG65- 23ewdfwGh5RG65?:password123` |
 | e449 | MD5SQL3 | n/a | `9c415ceb3161de1c1b1b1e12d3133b11:password123` |
 | e450 | BCRYPT | 3200 | `$2a$12$DG3Vk1qDyvwkh96yaCuf6.HqWPKac6Ur7nOitGIbrN05iqtnveM7C:password123` |
 | e451 | BCRYPTMD5 | 25600 | `$2b$12$M708MGo3FgbZp6Fy83zKTOP3oqrEjAJam0PrYYkHr8mHEvnPqJsru:password123` |
@@ -492,7 +502,7 @@ self-test vector; they are still fully functional.
 | e479 | SHA1UCWRL | n/a | `D9136DA58EA47FF05733763BDBC72BB81F74C452:password123` |
 | e480 | SHA1WRLMD5 | n/a | `a76b923b5f08ae3f68dd5bcafc3b44230cfd0762:password123` |
 | e481 | SHA1MD5SHA1MD5SHA1MD5SHA1 | n/a | `d1a06efacaa9acad7c26f8cc4c585b18193af3ad:password123` |
-| e482 | WRLSHA512 | n/a | `368896d60816fc4450c34a948d6147978e59ec0c3ced9ad652dcfb12d552f02bef4345cb8f5f505226b45087950bbd9e2...` |
+| e482 | WRLSHA512 | n/a | `368896d60816fc4450c34a948d6147978e59ec0c3ced9ad652dcfb12d552f02bef4345cb8f5f505226b45087950bbd9e298388a4fdf86d7845cc0388c8f6e449:password123` |
 | e483 | MD5GOST | n/a | `227aa21038a73b005517deda2229bf75:password123` |
 | e484 | MD5GOSTMD5 | n/a | `0259f53a35183eab6a70043778ddbab9:password123` |
 | e485 | MD5GOSTMD5UC | n/a | `7993d4164a702624b39e89c3038a89a0:password123` |
@@ -510,7 +520,7 @@ self-test vector; they are still fully functional.
 | e497 | MD4UTF16MD5 | n/a | `b4c89d27458fd978c7c9bec66214f6b1:password123` |
 | e498 | RMD128MD4 | n/a | `e6a39d0c1c0b1b86fd9f21dd83f65536:password123` |
 | e499 | MD5SHA0 | n/a | `5798edddd31e9254aa700758e73bedeb:password123` |
-| e500 | DESCRYPT | 1500,12400 | `..UZoIyj/Hy/c:password` |
+| e500 | DESCRYPT | 1500 | `..UZoIyj/Hy/c:password` |
 | e501 | MD5DESCRYPT | n/a | `a090d5a8fd2dec240048fc92bf704dc0:..:password` |
 | e502 | MD4DESCRYPT | n/a | `1eecdf5abc568f7822aa9a00ff39e876:..:password` |
 | e503 | MD5PASSSHA1MD5 | n/a | `45f453c9017b1f02578f33b35a8e928b:password123` |
@@ -520,17 +530,17 @@ self-test vector; they are still fully functional.
 | e507 | MD5PASSSHA1 | n/a | `2ca59729699126bf622a2ee7fe6c5088:password123` |
 | e508 | MD5MD5PASSSHA1 | n/a | `dec021292cf48fd37b3cac0d2a54096d:password123` |
 | e509 | SHA1MD5MD5SHA1MD5SHA1SHA1MD5 | n/a | `fc56ae845474cc5926e0d2c6e250c1f641cf0e6b:password123` |
-| e510 | SHA512SHA512RAWUSER | 32420 | `7f132a28e5e5af1fb9536c9bed74c85a26059b43ec740e445c0dfcc97d499e8d0a7ac8dc93833f366c58fafb9dc53408f...` |
+| e510 | SHA512SHA512RAWUSER | 32420 | `7f132a28e5e5af1fb9536c9bed74c85a26059b43ec740e445c0dfcc97d499e8d0a7ac8dc93833f366c58fafb9dc53408f52118580d82fe153bea8e4dfac79229:testsalt:password123` |
 | e511 | MD5CRYPT | 500 | `$1$rndSa1t$Qprc9yqwxuXgLPGQYn8/M1:password123` |
 | e512 | SHA256CRYPT | 7400 | `$5$rndSa1t$128qLp1GH7Qcc2/kyO/.6dtTlHHiHyRcNMAdCAFSjU1:password123` |
-| e513 | SHA512CRYPT | 1800 | `$6$rndSa1t$DOby8RCDS9bqigcwmpaMwAlFOxGdrhVKkZNgli1bqKDoKl0w62cJ3BF6ze4AF0vY3wvOj6iLJNUc.D45MxjTM0...` |
-| e514 | SHA512SALTMD5 | n/a | `2a0660efed3149bb8044e51d48de13dcd85b07a183fe9ad98be137ae6f972b8438999995e000798714f89ca3b758eb22b...` |
+| e513 | SHA512CRYPT | 1800 | `$6$rndSa1t$DOby8RCDS9bqigcwmpaMwAlFOxGdrhVKkZNgli1bqKDoKl0w62cJ3BF6ze4AF0vY3wvOj6iLJNUc.D45MxjTM0:password123` |
+| e514 | SHA512SALTMD5 | n/a | `2a0660efed3149bb8044e51d48de13dcd85b07a183fe9ad98be137ae6f972b8438999995e000798714f89ca3b758eb22b8edc6d82186a6d01048b4a45c063d83:salt:password123` |
 | e515 | MD5-SALTMD5PASSSALT | 4110 | `d72fcd56bc1db14b6f6148cb82b292da:administrator:password123` |
 | e516 | MD5-SALTMD5SALTPASS | 4010 | `f9c666c5639562988f976ad1a21592f9:administrator:password123` |
 | e517 | MD5-MD5PASS-SALT | n/a | `423a170b613885b19cdc496242a80787:testsalt:password123` |
 | e518 | MD5-MD5SALT-PASS | n/a | `14aba015c7e7c73b0f92c82c73ffb693:testsalt:password123` |
 | e519 | MD5-PASS-MD5SALT | n/a | `62abbac13b4c779f04999df77a0701e9:testsalt:password123` |
-| e520 | SHA1SALTSHA1PASS | 4520 | `0048b661bdb70a4c650d452a172412d3c842932a:testsalt:password123` |
+| e520 | SHA1SALTSHA1PASS | 4520,4521,4522 | `0048b661bdb70a4c650d452a172412d3c842932a:testsalt:password123` |
 | e521 | SHA1SALTCX | 14400 | `b59b77c52921e5df0d007fec2518e0f726ce3aaf:administrator:password123` |
 | e522 | MD5SHA1MD5SHA1MD5SHA1MD5SHA1MD5SHA1MD5SHA1 | n/a | `12d206e7dea1f4a352997ccb85be4812:password123` |
 | e523 | SHA256SALTSHA256PASS | 20720 | `606344e0d3e29c3250e0b4cf2031b8115acdde10c644219107449be678129752:testsalt:password123` |
@@ -543,16 +553,17 @@ self-test vector; they are still fully functional.
 | e530 | PBKDF2-SHA256 | 10000,10900,20300 | `sha256:100:dGVzdA:EzztVA6V4NTgoFma1UJYNBCjBI3mqya9:password123` |
 | e531 | PBKDF2-MD5 | 11900 | `md5:100:dGVzdA:42hb/sqDoUziU7MbHP76e0LKwSoHJcSdDS6RMaywNFs=:password123` |
 | e532 | PBKDF2-SHA1 | 12000,20400,32050 | `sha1:100:dGVzdA:JTkptWKRlhEnUcwCFCdX/7Q8iyU=:password123` |
-| e533 | PBKDF2-SHA512 | 7100,7200,12100,20200 | `sha512:100:dGVzdA:fUaRYJbFLqw4Gz7AEjFLetYNcozT25qdphhFs+kY5REqO9NCFlt2Y256Lyx78m4jcLd7RB96inePiMC...` |
+| e533 | PBKDF2-SHA512 | 7100,7200,12100,20200 | `sha512:100:dGVzdA:fUaRYJbFLqw4Gz7AEjFLetYNcozT25qdphhFs+kY5REqO9NCFlt2Y256Lyx78m4jcLd7RB96inePiMCpYgxjNw==:password123` |
 | e534 | PKCS5S2 | 12001 | `{PKCS5S2}AAAAAAAAAAAAAAAAAAAAAN+2N9jMqA4+E7Ij9E+o21oauMEHYxLsge+y//Qrfg8E:password123` |
+| e535 | SHA1-CUSTOMUSERSALT | n/a | `Y0VT90x+SlnTt4Q/edsR5Ez4dbM=:rndSa1t:password123` |
 | e536 | PROGRESSENCODE | n/a | `abajejaayicndEbj:password123` |
 | e537 | PHPBB3MD5 | n/a | `$H$9rndSa1tXzz3PJ.hT4y5reUgL7cbu6.:password123` |
-| e538 | SHA512CRYPTMD5 | n/a | `$6$rndSa1t$VEiMRPskJtV5DgDifIJPozJKKcU9qnofAewMbRvGQz0F5pG6kimj02ELUVsQOozdhtM1X8Qya4d9HzW7Wistg/...` |
-| e539 | MYSQL5MD5 | n/a | `2c13011ac7f9b6ce6564935154f8986a:password123` |
+| e538 | SHA512CRYPTMD5 | n/a | `$6$rndSa1t$VEiMRPskJtV5DgDifIJPozJKKcU9qnofAewMbRvGQz0F5pG6kimj02ELUVsQOozdhtM1X8Qya4d9HzW7Wistg/:password123` |
+| e539 | MYSQL5MD5 | n/a | `2c13011ac7f9b6ce6564935154f8986a535979a9:password123` |
 | e540 | MANGOS | n/a | `716717f7db22169656a82f9c35fe0537458c90c7:Admin:password123` |
 | e541 | MD5revMD5SALT | n/a | `ed7a7969533f21ebb95a899796839da4:testsalt:password123` |
 | e542 | MD5sub8-24SALT | n/a | `64839daa92982301a1982264a994c91a:chloe01:password123` |
-| e543 | HMAC-SHA384 | n/a | `2264b82fed84e6b06c61ca89f5f4e6eef158ad71b6be075b67bafec9110476d88966e52f757ae1028db61087964434b4:...` |
+| e543 | HMAC-SHA384 | n/a | `2264b82fed84e6b06c61ca89f5f4e6eef158ad71b6be075b67bafec9110476d88966e52f757ae1028db61087964434b4:testsalt:password123` |
 | e544 | CRYPTEXT | n/a | `e2ebed1cf4f2e40f4f0fc57c74d403879f6cf15f:password123` |
 | e545 | MD5SHA1lsb35 | n/a | `5690e62bacddc4faa4db03790c58c382:password123` |
 | e546 | MD5sub1-20MD5 | n/a | `3a901c20194ad05ae379ba9f5833e6b5:password123` |
@@ -565,33 +576,33 @@ self-test vector; they are still fully functional.
 | e553 | MD5-6xMD5 | n/a | `40d4a565708698126d4763187371359c:password123` |
 | e554 | MD5-5xMD5 | n/a | `1ec8230aa83c626ac6f01a224316c845:password123` |
 | e555 | MD5SHA1SALT | 4410 | `2cd237c6a88649f18a4cd4a3bc22f966:testsalt:password123` |
-| e556 | MD5SHA1u39 | n/a | `e933f35ad585ac6753ee607ab8fd0a4d000000:password123` |
+| e556 | MD5SHA1u39 | n/a | `cf67d04314b051cee88c3aa65c376952:password123` |
 | e557 | MD5-MD5SHA1PASSSHA1MD5SALT | n/a | `4b581b293bcbd2fa3af8a4b512163365:salt:password123` |
-| e558 | MD5UCMD5 | n/a | `cb8bca2e221b4ae44c95ca2f70f8f407:password123` |
+| e558 | MD5UCMD5 | n/a | `d168e00fe57116e52a5e804887a05cd0:password123` |
 | e559 | MD4UTF16MD5UC | n/a | `e9feb95d8fb3d009dca526ed43e5adbd:password123` |
 | e560 | MD4UTF16MD5MD5MD5 | n/a | `5791598fea4d29cff49c093412567f8a:password123` |
-| e561 | MD4UTF16SHA1 | n/a | `5dfbf4e615e89cb5a1c8273f57eef28271f343cb:password123` |
-| e562 | MD4UTF16SHA1SHA1 | n/a | `2bec5e190f44f71bed25154f754c58ed4af9d6e0:password123` |
-| e563 | MD4UTF16SHA256 | n/a | `e9808a384e5a2c254bfd7f4a77c38bf88ce5ce0f9ea8901826ed2d6c45854b10:password123` |
-| e564 | MD4UTF16SHA256SHA256 | n/a | `3c7ba17c6979751f6cafc3d7f8fd951e54bd60179cb8f9d750cc2661e8f0480c:password123` |
-| e565 | MD4UTF16SHA256SHA256SHA256 | n/a | `2a4769204c5beafee12289647615523529581bf145f6f16eff008edfd9afd2e6:password123` |
-| e566 | MD4UTF16SHA256SHA256SHA256SHA256 | n/a | `5c7a9431cf226d02a888772b7117ae34a1a3ecb41265ac01576e4f6335837c48:password123` |
-| e567 | MD4UTF16SHA1MD5 | n/a | `64bd8beb0e43c0728d44e2bdcf1716cee383e8ec:password123` |
-| e568 | MD4UTF16MD5SHA1 | n/a | `280a73d7cf52eafb9df9baa3865166f7:password123` |
+| e561 | MD4UTF16SHA1 | n/a | `71b6aae38e2a3a62b509193a7ae57806:password123` |
+| e562 | MD4UTF16SHA1SHA1 | n/a | `28e943cc141b3e4fb67cf3ae9c91549b:password123` |
+| e563 | MD4UTF16SHA256 | n/a | `97362c2ab715d69d28382060ba6d3eb3:password123` |
+| e564 | MD4UTF16SHA256SHA256 | n/a | `58097c130f49bd5571f40a739b2dfe11:password123` |
+| e565 | MD4UTF16SHA256SHA256SHA256 | n/a | `078d1311411a91ccbe6b154aa3ca6d2a:password123` |
+| e566 | MD4UTF16SHA256SHA256SHA256SHA256 | n/a | `99871319bfa68733e9ca4953af0338a8:password123` |
+| e567 | MD4UTF16SHA1MD5 | n/a | `15eb186855982b422b60953e03d82b85:password123` |
+| e568 | MD4UTF16MD5SHA1 | n/a | `d46515b5ff10fd1ca48fffd6eeeeeb76:password123` |
 | e569 | MD4UTF16SHA256UC | n/a | `3c56bbffb2cd8ba7f5a6383099f4c2ea:password123` |
 | e570 | MD4UTF16UC | n/a | `A9FDFA038C4B75EBC76DC855DD74F0DA:password123` |
 | e571 | SHA1SHA256UC | n/a | `753877e474ee39a3411466aec66fba077a5f3c61:password123` |
-| e572 | MD5BASE64SHA1MD5 | n/a | `2b37df836d04c4ec1438324b42ae2534:password123` |
+| e572 | MD5BASE64SHA1MD5 | n/a | `d7049ebb8c960590e5d1e3713f757735:password123` |
 | e573 | SHA1DESCRYPT | n/a | `4ac9fce4c379eeaafa815a81da1bd451be87ea52:..:password` |
 | e574 | MD4UTF16DESCRYPT | n/a | `6c29032ff65d0cab0b4f83cda5af788e:..:password` |
-| e575 | MD4UTF16MD5HUM | n/a | `268181fcedec1a8720e017f4d0c2467f:00- x 1:password1234` |
-| e576 | MD4UTF16SHA1HUM | n/a | `e6f73512bbc38efce9eb4776df62be40:00- x 1:password1234` |
-| e577 | BCRYPT256 | 30600 | `$2a$12$DG3Vk1qDyvwkh96yaCuf6.HqWPKac6Ur7nOitGIbrN05iqtnveM7C:password123` |
+| e575 | MD4UTF16MD5HUM | n/a |  |
+| e576 | MD4UTF16SHA1HUM | n/a |  |
+| e577 | BCRYPT256 | 30600 | `$2a$12$DG3Vk1qDyvwkh96yaCuf6.EBCD03emZBuWMkhWNmwV/WOdRHvu4QS:password123` |
 | e578 | SHA1-MD5PASSSALT | n/a | `18768e979e77779052a467262d0cf1d486c76d2c:testsalt:password123` |
-| e579 | SHA1SHA1PASSSALT | 4521,4522 | `3b8240b10f2caefcc6cd7c970b332b4109d7e63c:testsalt:password123` |
+| e579 | SHA1SHA1PASSSALT | n/a | `3b8240b10f2caefcc6cd7c970b332b4109d7e63c:testsalt:password123` |
 | e580 | SHA1SHA256x | n/a | `178f1d54c362162cf48501121c4a5fbab5050670:salt:password123` |
 | e581 | SHA1SHA256UCx | n/a | `753877e474ee39a3411466aec66fba077a5f3c61:salt:password123` |
-| e582 | SHA1SHA256UCxSHA256 | n/a | `1906600c09e2d8755c9897e1c24ec466cdb1ab02:password123` |
+| e582 | SHA1SHA256UCxSHA256 | n/a | `1906600c09e2d8755c9897e1c24ec466cdb1ab02:1:password123` |
 | e583 | SHA1SHA256UCSHA256 | n/a | `1906600c09e2d8755c9897e1c24ec466cdb1ab02:password123` |
 | e584 | SHA1SHA256UCSHA256SHA256 | n/a | `46d3bdc93c1ecb9c0bda1f1c1fdfa6fec03ec8e9:password123` |
 | e585 | SHA1SHA256SHA512 | n/a | `bce1f0e714ffa8e2c9f961ea50c6e2dcff79a001:password123` |
@@ -609,51 +620,51 @@ self-test vector; they are still fully functional.
 | e597 | SHA1-MD5PEPPER-MD5SALT | n/a | `bfe4f8b9a5a9d291f1a711ce22e719f69e65e3ab:1122334455667788 1122334455667788:password123` |
 | e598 | SHA1MD5-PASSMD5SALT | n/a | `a0ed870e27d9a6c3083bfdd3df948c3269067c7d:salt:password123` |
 | e599 | SHA1SHA256SHA1 | n/a | `b8ae01f3706f2c73ac3444a64645e8a362da4f16:password123` |
-| e600 | SHA1MD5-SHA1PASSPASS | n/a | `4b45e3bb142acc88f392244a73b74dc4906d2835:password123` |
-| e601 | SHA1PASS-TRUNC | n/a | `cbfdac6008f9cab4083784cbd1874f76:password123` |
+| e600 | SHA1MD5-SHA1PASSPASS | n/a | `8d6880e26eebbc4e52b315fcded563572868e9e2:password123` |
+| e601 | SHA1PASS-TRUNC | n/a | `1aff295984946a012d4b0bd3027722fe17c65be0:password123` |
 | e602 | SHA1SALTMD5PASSPEPPER | n/a | `01b32171d9bddde3007607d436a702681479cccc:1122334455667788 1122334455667788:password123` |
 | e603 | SHA1MD5SALTMD5PASS | n/a | `0826e3b77f869ab50fd3f53fe18a8636d36dc639:salt:password123` |
-| e604 | SHA1SHA1u34 | n/a | `360621c68ac8101809a7a66d5a2c24694a:password123` |
-| e605 | SHA1SHA1u36 | n/a | `360621c68ac8101809a7a66d5a2c24694ae9:password123` |
-| e606 | SHA1SHA1u38 | n/a | `360621c68ac8101809a7a66d5a2c24694ae961:password123` |
-| e607 | SHA1MD5SALTPASSPEPPER | n/a | `786aab530907a783e9c25a2c7326ab7907ebf798:1122334455667788 1122334455667788:password123` |
-| e608 | SHA1SHA256u32 | n/a | `178f1d54c362162cf48501121c4a5fba:password123` |
-| e609 | SHA1SHA256u40 | n/a | `178f1d54c362162cf48501121c4a5fbab5050670:password123` |
-| e610 | SHA1SHA256u34 | n/a | `178f1d54c362162cf48501121c4a5fbab5:password123` |
+| e604 | SHA1SHA1u34 | n/a | `d3f69b924b27111493deba0db06524008f136cd7:password123` |
+| e605 | SHA1SHA1u36 | n/a | `4a4bdf0aee2394e38bd1b9e7269131861b2d6b1a:password123` |
+| e606 | SHA1SHA1u38 | n/a | `2651c64cdb507063d52e2b51fdd378fd2f2096a7:password123` |
+| e607 | SHA1MD5SALTPASSPEPPER | n/a | `0992047fa349ac4e5abb3fef6c0f3f8f8bc6d679:1122334455667788 1122334455667788:password123` |
+| e608 | SHA1SHA256u32 | n/a | `7b30b8074d062e7aec5c80715096aa3d4746cdee:password123` |
+| e609 | SHA1SHA256u40 | n/a | `6a9f6d34ca77a5e09c8072150b331aca501f704d:password123` |
+| e610 | SHA1SHA256u34 | n/a | `28cd113b67e09cf253a832f80ed526116300007e:password123` |
 | e611 | SHA1-MD5PEPPER-MD5MD5SALT | n/a | `2ddcb3e59782e68347ce0e52183c3c8ab8553b56:1122334455667788 1122334455667788:password123` |
-| e612 | SHA1SHA256u42 | n/a | `178f1d54c362162cf48501121c4a5fbab505067000:password123` |
+| e612 | SHA1SHA256u42 | n/a | `83836ba53f2b6a6370ea24aa6985883e306bf07c:password123` |
 | e613 | SHA1SHA256SHA256 | n/a | `d623838a890d00b2ec9d2c646491248c0b518e87:password123` |
 | e614 | SHA1SHA256SHA256SHA256 | n/a | `c0511496c64d87794156df93f1e0b9c0211a0235:password123` |
-| e615 | SHA1SHA256u38 | n/a | `178f1d54c362162cf48501121c4a5fbab50506:password123` |
-| e616 | SHA1SHA256u36 | n/a | `178f1d54c362162cf48501121c4a5fbab505:password123` |
+| e615 | SHA1SHA256u38 | n/a | `2752ed8b20dcd8171f10858558a7ba601129e87f:password123` |
+| e616 | SHA1SHA256u36 | n/a | `945cb93453f6ca42aff78e9411d8ff73bc1b7955:password123` |
 | e617 | SHA1NTLM | n/a | `5dfbf4e615e89cb5a1c8273f57eef28271f343cb:password123` |
 | e618 | SHA1MD5SHA1MD5SHA1 | n/a | `2239a82ac8214ecf10060148e6951a122207608f:password123` |
 | e619 | SHA1SALTSHA256 | n/a | `93091a1fda71af9d9a98a90e326ae019dba38b2f:salt:password123` |
-| e620 | SHA1SHA1u35 | n/a | `360621c68ac8101809a7a66d5a2c24694a:password123` |
-| e621 | SHA1SHA256u37 | n/a | `178f1d54c362162cf48501121c4a5fbab505:password123` |
-| e622 | SHA1SHA256TRUNC | n/a | `178f1d54c362162cf48501121c4a5fba:password123` |
-| e623 | SHA1SHA256TRUNCMD5 | n/a | `4b89f9b11e9b3d30c2c2f6f6034bda9c:password123` |
-| e624 | SHA1SHA1u39 | n/a | `360621c68ac8101809a7a66d5a2c24694ae961:password123` |
-| e625 | SHA1SHA1u37 | n/a | `360621c68ac8101809a7a66d5a2c24694ae9:password123` |
-| e626 | SHA1SHA1TRUNC | n/a | `360621c68ac8101809a7a66d5a2c2469:password123` |
+| e620 | SHA1SHA1u35 | n/a | `a9505acf8584cfd0d6fbd14ea7f450488980e9d3:password123` |
+| e621 | SHA1SHA256u37 | n/a | `26e7a1a296b3cdaf3af6cf07a0d316d8efa80fa1:password123` |
+| e622 | SHA1SHA256TRUNC | n/a | `7d10cbd8d85c05a93b9016895b0d1927a9f4a84d:50:password123` |
+| e623 | SHA1SHA256TRUNCMD5 | n/a | `35d9d30f7073efe0bec0c52a0346a325f889ab93:50:password123` |
+| e624 | SHA1SHA1u39 | n/a | `3acbedc59bfb095d71300271ae9d15971ac20152:password123` |
+| e625 | SHA1SHA1u37 | n/a | `62c88672d5c8bd2e1a693251d5a4adc2fc08bde1:password123` |
+| e626 | SHA1SHA1TRUNC | n/a | `5f3d6b203fc6a91f3571167fb7ec387905dd49c6:30:password123` |
 | e627 | SHA1-MD5SHA1PASSSHA1MD5SALT | n/a | `90177cb202c23c6290fddf630f793f5949fafaa7:salt:password123` |
-| e628 | SHA1MD5CAP | n/a | `12faef39c12d3a6384ddd308bc5a402fad5679d0:password123` |
-| e629 | SHA1MD5CAPMD5 | n/a | `008ec0d3a977525cc735779a3cf70cc9a90ce57c:password123` |
-| e630 | SHA1SHA256UCTRUNC | n/a | `753877e474ee39a3411466aec66fba07:password123` |
+| e628 | SHA1MD5CAP | n/a | `09936cb4c466edfde7c94569792dc39163bf2984:password123` |
+| e629 | SHA1MD5CAPMD5 | n/a | `997954278c421be1a92bf24cd50f6a8ba9c14016:password123` |
+| e630 | SHA1SHA256UCTRUNC | n/a | `e01089cc187a6d68e4ffca4e174360991bdd1d14:50:password123` |
 | e631 | SHA1MD5MD5UCx | n/a | `bd6afcc0dc9f9408182c17e4fd2205bb64bf200c:salt:password123` |
-| e632 | SHA1SHA256CAP | n/a | `56d2f180735b1be42d6c4757ce8e6205a4b9bed6:password123` |
-| e633 | SHA1MD5SHA1-SALT | n/a | `30bd73e67b446ec9ad36c591b7b93bcd6e47ddb5:administrator:password123` |
+| e632 | SHA1SHA256CAP | n/a | `00dedf63da0272e762a8cbe95916d091743b9b94:Godfrey123` |
+| e633 | SHA1MD5SHA1-SALT | n/a | `619a5180b7e9621059f4e3b68922bc1405c10aaf:administrator:password123` |
 | e634 | SHA1SHA224 | n/a | `d7ff97ff2b1f3794681ca364b77e98329bd3cfa2:password123` |
-| e635 | SHA1WRLTRUNC | n/a | `cc94bc2fa03f5667f924beb18cb8d875:password123` |
-| e636 | SHA1SHA512TRUNC | n/a | `0d7ab85e1039a61d62206b2e6ec0c6a2:password123` |
-| e637 | SHA1-SHA512PASSSHA512SALT | n/a | `ec64a6ccf4576e0d76345e59ba97bb315983a656:salt:password123` |
+| e635 | SHA1WRLTRUNC | n/a | `de3a08918d405d71e78ead53ff1c6dcce5c43249:100:password123` |
+| e636 | SHA1SHA512TRUNC | n/a | `831e7b34089ec0a36ab9947cb39d21f5302630cd:100:password123` |
+| e637 | SHA1-SHA512PASSSHA512SALT | n/a | `745e294d9926e240a47e0121df6857ae80ff75a2:1122334455667788:password123` |
 | e638 | SHA1SHA512TRUNC1SALT | n/a | `7a41e88b8e77d5fcf190144f31d90f96205b71a1:128 0x09:password123` |
 | e639 | SHA1SHA1PASS-TRUNC1SALT | n/a | `21b3f0a412fc7d47ba9e249a723f492b107fa1ec:0x09:password123` |
 | e640 | SHA1HAV128 | n/a | `b9659eb6e6578110b759f0c4e78147ee12332691:password123` |
-| e641 | SHA1MD5RAW | n/a | `134942a765a0757b8ceccbdccb98a577dbe4a2bf:password123` |
+| e641 | SHA1MD5RAW | n/a | `82d3e552787419fc34053c5c72d141526039c834:password123` |
 | e642 | SHA1MD2 | n/a | `3a34b827a4ca0c5c026e8c1d7325fd221094611b:password123` |
 | e643 | SHA1MD5BASE64 | n/a | `c26aac0314b821d65624805151ba434c0a99b4d0:password123` |
-| e644 | SHA1MD6TRUNC | n/a | `ca9b69f958d5f0f8bfe72ecd3b54fdfd:password123` |
+| e644 | SHA1MD6TRUNC | n/a | `979e5a079a7846a7635983f641a76b984f3fc9c8:26:password123` |
 | e645 | SHA1NTLMUC | n/a | `f9236cf0ba07853ccc8ebd030f23e610be0d0ba0:password123` |
 | e646 | SHA1MD5SHA512 | n/a | `dd6c1bd2cdc533c820ea8a2efae7681415dcb462:password123` |
 | e647 | SHA1MD5WRLSHA1 | n/a | `f0310acaa7128de3f9c58c02c12f55649206d9bb:password123` |
@@ -662,15 +673,15 @@ self-test vector; they are still fully functional.
 | e650 | SHA1-MD5PASSMD5MD5SALT | n/a | `41afff91ba03fdc5f199875024897803c9745e48:testsalt:password123` |
 | e651 | SHA1SALTMD5UCPASSPEPPER | n/a | `210fc68b2e04fb19979a9cc1405bd8383357bce0:1122334455667788 1122334455667788:password123` |
 | e652 | SHA1MD5UCSALT | n/a | `2d0bc23256be4ee1703af43ea5bdb6f6824f3b5d:ts:password123` |
-| e653 | SHA1WRLUCTRUNC | n/a | `d9136da58ea47ff05733763bdbc72bb8:password123` |
+| e653 | SHA1WRLUCTRUNC | n/a | `b41b0bc015fa0fce118ef37481c0d4064b979609:100:password123` |
 | e654 | SHA1-MD5CAPPEPPER-MD5SALT | n/a | `f9aa819520756eb6bad66c7ddc9777d9e8041c98:1122334455667788 1122334455667788:password123` |
 | e655 | SHA1-MD5CAPSALT | n/a | `3e2517f047702aa92e32b14913304040b77f7dca:ts:password123` |
 | e656 | SHA1SHA1CAPTRUNC | n/a | `df5dfb781656c687d63c337c142537d0d9055da1:40:password123` |
 | e657 | SHA1MD6CAPTRUNC | n/a | `dc336305f2c4a0ec98fdc5be57429176da2b7701:32:password123` |
 | e658 | SHA1MD5UCMD5UC | n/a | `47e0eec502dd84fe59b8ec696b45eba1e25aaa2d:password123` |
 | e659 | SHA1MD5CAPSALT | n/a | `859a4fd1459a3eaee93004bf4aed18c085530c6b:ts:password123` |
-| e660 | SHA1SQL5-32 | n/a | `839d879370f2e81cf6c02ceccc1c8bde052c643a:password123` |
-| e661 | SHA1SHA1UCTRUNC | n/a | `023d9239da6db1c77576a8881c2c284c:password123` |
+| e660 | SHA1SQL5-32 | n/a | `5739376a1bd807fca1068819f1678880d2b28d8f:password123` |
+| e661 | SHA1SHA1UCTRUNC | n/a | `6ba9c166f9c2fce9ca26f1b0ef9d7038f6718724:30:password123` |
 | e662 | SHA1-MD5UCMD5UCPASSMD5UCSALT | n/a | `1e17927889edd68d1cd51b698c12785459db4c9d:1122334455667788:password123` |
 | e663 | SHA1MD5MD5PASS | n/a | `57ca18e525942612241186c80a98e66f3a544fc9:password123` |
 | e664 | SHA1MD51CAP | n/a | `09936cb4c466edfde7c94569792dc39163bf2984:password123` |
@@ -681,10 +692,11 @@ self-test vector; they are still fully functional.
 | e669 | SHA1MD51CAPSALT | n/a | `ae90cba55af617eadcffefdffcf808340f67d37e:salt:password123` |
 | e670 | SHA1-MD5CAPMD5SALT | n/a | `c242903b408aee37e09a5c4161e1680381c30a5a:ts:password123` |
 | e671 | SHA1SHA512UC | n/a | `4afd0b1778128a55bbe3322aef6bf8131d418e53:password123` |
-| e672 | SHA1WRLUCTRUNCSALT | n/a | `76b863a553ad0cf1bb8da94f9a0d427f1e6ca395:1122334455667788 128:password123` |
+| e672 | SHA1WRLUCTRUNCSALT | n/a | `ef1948763cdad6af7bf04f40dd0d61fff5d7e534:1122334455667788 100:password123` |
 | e673 | SHA1-MD5SHA256SALT | n/a | `f07fc36baa11bb092a312cd97d016009c4a3897e:ts:password123` |
 | e674 | SHA256MD5SHA256MD5 | n/a | `423baf92af84c30c6a60763355c765c01b785d6479fcaac568f179fd3c191028:password123` |
 | e675 | SHA1SHA256MD5SHA256MD5 | n/a | `76129c197cc351c444082801633df414d5e67167:password123` |
+| e676 | SHA1-MD5sub8-24SALT | n/a | `c833ab8009bb4828618fb184dcbd1abf22b5c6ed:Xk7Qm2Rz:password123` |
 | e677 | SHA1-PEPPER-MD5SALT | n/a | `b0a272ab3102c397f593f32968491c6b30ee529e:1122334455667788 1122334455667788:password123` |
 | e678 | SHA1SHA256TRUNCSALT | n/a | `dacff3bff50db6dcacee1f52d6bc22ccbe8184b9:Salt 63:password123` |
 | e679 | SHA1SHA256TRUNCMD5SALT | n/a | `23101d128277f9cdc7bc3f1ffdd13f868c722743:1122334455667788 63:password123` |
@@ -697,7 +709,7 @@ self-test vector; they are still fully functional.
 | e686 | SHA1MD5-2xMD5-MD5 | n/a | `52b943f48a6504a5595c6a3ef0456ba115966ee9:password123` |
 | e687 | SHA1SHA1MD5MD5PASS1SALT | n/a | `125a2e1803fb08fb9f14523573f0e3b6f426ce67:0x09:password123` |
 | e688 | SHA1MD5sub1-20MD5 | n/a | `5f3d7aefecff1bb32a3d9d3bdfb6eb06ebb3e139:password123` |
-| e689 | SHA1SHA512UCTRUNC | n/a | `4afd0b1778128a55bbe3322aef6bf813:password123` |
+| e689 | SHA1SHA512UCTRUNC | n/a | `dcf04a11a65b85ecc8453564ec21b81d138427fa:100:password123` |
 | e690 | SHA1SALTSHA512UCTRUNC | n/a | `dade4eca35da0d63d9f335440921ac4a64ef9d36:Aa8NB6AU6v2KsqLjbbLb4EH9mAB9BksY 128:password123` |
 | e691 | SHA1SALTSHA256UCTRUNC | n/a | `0426f616d4c9a448828ca51996a17223ec7016d5:Aa8NB6AU6v2KsqLjbbLb4EH9mAB9BksY 64:password123` |
 | e692 | SHA1MD5UC-MD5UCSALT | n/a | `10edef8e8978c5bc48790ce2180d188667e9fc53:1122334455667788:password123` |
@@ -708,20 +720,20 @@ self-test vector; they are still fully functional.
 | e697 | SHA1MD5SHA1MD5MD5SHA1MD5 | n/a | `6bcbb52a6621cad44002307a7ef05951e4a657d4:password123` |
 | e698 | MD5SHA1MD5MD5SHA1MD5 | n/a | `376b12b58e20b74f44068c86ca516859:password123` |
 | e699 | SHA1MD5UCSHA1UCMD5UC | n/a | `3972e62890dbed1bc8cbe642fb52dbc7b4ede57b:password123` |
-| e700 | MD5MD5SHA1SALT | n/a | `ef9f2c59de7389a3b5f59481dd088843:ts:password123` |
+| e700 | MD5MD5SHA1SALT | n/a | `780212be6ed7005ce6b089ebe203f2ca:ts:password123` |
 | e701 | MD5MD5SHA256SALT | n/a | `4e8cd322dc1e1010862fabd72e6f4552:ts:password123` |
-| e702 | MD5SHA1x | n/a | `e933f35ad585ac6753ee607ab8fd0a4d:password123` |
+| e702 | MD5SHA1x | n/a | `e933f35ad585ac6753ee607ab8fd0a4d:1:password123` |
 | e703 | MD5DECBASE64MD5 | n/a | `3da8a2b276d25d0f417a7e3cdd017d82:password123` |
 | e704 | SHA1SALTMD5PASSMD5 | n/a | `916a5ae2dfc5bd52161f8f88f3bc5db73c7e8156:testsalt:password123` |
 | e705 | SHA1MD5sub8-24MD5 | n/a | `090d86b541a88535f76414be537f7464f766b51b:password123` |
 | e706 | SHA1GOST | n/a | `eae2d8c8522202a17ae6362b72fc7e976ed0c098:password123` |
-| e707 | MD4UTF16SHA256x | n/a | `e9808a384e5a2c254bfd7f4a77c38bf88ce5ce0f9ea8901826ed2d6c45854b10:password123` |
-| e708 | MD4UTF16SHA256SHA256SHA256SHA256SHA256 | n/a | `b9843d7c93cfa8dfc1c8d9d792dec04487571060b65929e8a47fa1bf032f9ba3:password123` |
+| e707 | MD4UTF16SHA256x | n/a | `97362c2ab715d69d28382060ba6d3eb3:1:password123` |
+| e708 | MD4UTF16SHA256SHA256SHA256SHA256SHA256 | n/a | `e2a98c556a0688c837fbb3e21ec470db:password123` |
 | e709 | SHA1MD5RAWUCMD5RAW | n/a | `342253134b68aeed85df679708153d6c6dfb5391:password123` |
-| e710 | SHA1SHA3-256TRUNC | n/a | `3a1f71639a8dc528b489817cd26225e9:password123` |
+| e710 | SHA1SHA3-256TRUNC | n/a | `0c1e77bd46f858d36fe27220ec0408d466021cc8:50:password123` |
 | e711 | SHA1SHA3-256 | n/a | `3a1f71639a8dc528b489817cd26225e9ce875524:password123` |
-| e712 | SHA1MD5SQL5 | n/a | `f3f90e9f0546b5d5f0171a0012f9419a04110496:password123` |
-| e713 | SHA1MD5MD5SQL5 | n/a | `1f9546990546f485f1f0f60e7fedbeb39fc9f4c1:password123` |
+| e712 | SHA1MD5SQL5 | n/a | `38af17c66c2ffed3689d77733914f2a9da26813a:password123` |
+| e713 | SHA1MD5MD5SQL5 | n/a | `56ed2ebfc796d1ddfbdf4a00c1ec06c2564cd3ec:password123` |
 | e714 | SHA1RMD128 | n/a | `8938ac86890fbabe1960983a84a4f8c756272526:password123` |
 | e715 | SHA1-SHA1SALTSHA1PASS | n/a | `2246fe3d0eb166ffed3af7798f3481daa583088f:testsalt:password123` |
 | e716 | SHA1MD5MD5UC | n/a | `bd6afcc0dc9f9408182c17e4fd2205bb64bf200c:password123` |
@@ -729,47 +741,47 @@ self-test vector; they are still fully functional.
 | e718 | SHA11SALTMD5UC | n/a | `576ff2bfc44117616a672085311ebe8c12d32772:$HEX[09]:password123` |
 | e719 | SHA1SALTMD5MD5PASSPEPPER | n/a | `ff988c10889bf8e9305e42aa6c947ad3f67d0319:1122334455667788 1122334455667788:password123` |
 | e720 | SHA1SHA1UCPASSSALT | n/a | `59aedd05e1e2949b21dc0309c70663e1c477a2ae:salt:password123` |
-| e721 | SHA1MD5sub1-20MD5MD5 | n/a | `5779411d8e27f0913005deb35f7658ea007fa131:password123` |
+| e721 | SHA1MD5sub1-20MD5MD5 | n/a | `1b5bebc94b08e3d5f957ab9234955d259b755522:password123` |
 | e722 | SHA1MD4UTF16UCMD4UTF16UC | n/a | `afa7de6fd5fd31dedbd6b674f21c76b93dd24db0:password123` |
-| e723 | SHA1SHA512TRUNCMD5 | n/a | `dd6c1bd2cdc533c820ea8a2efae76814:password123` |
+| e723 | SHA1SHA512TRUNCMD5 | n/a | `b34d9b3da5eb378180825a657a7e955ce260fd31:128:password123` |
 | e724 | SHA1MD5UCx | n/a | `900bd2208de3ca960ecee76ee483904300ceb991:salt:password123` |
 | e725 | SHA1SALTSHA256TRUNC | n/a | `28f11333c2180248c75695abdfb0ce84df9239b6:1122334455667788 64:password123` |
 | e726 | SHA1SALTSHA256TRUNCMD5 | n/a | `a032180fd741fa38d10fa1991ce8236628648be6:1122334455667788 64:password123` |
 | e727 | SHA1UTF16LE | 170 | `9400ae28448e1364174dde269b2cce1bca9d7ee8:password123` |
-| e728 | SHA1UTF16BEZ | n/a | `0bca10cd933fe613b5d606d682a81552c68ab792:password123` |
+| e728 | SHA1UTF16BEZ | n/a | `9d1a9608b5f852c04af6cb16ea566b3f1032ee9d:password123` |
 | e729 | SHA1ZUTF16LE | n/a | `9d1a9608b5f852c04af6cb16ea566b3f1032ee9d:password123` |
 | e730 | SHA1UCUTF16LE | n/a | `9400AE28448E1364174DDE269B2CCE1BCA9D7EE8:password123` |
-| e731 | SHA1MD5UC1LC | n/a | `900bd2208de3ca960ecee76ee483904300ceb991:password123` |
-| e732 | SHA1UTF7 | n/a | `8ce44a50a7671997a540067d4a9d25e62c6df85d:=password123=` |
+| e731 | SHA1MD5UC1LC | n/a | `160d592326dc89b18de0131c4532a18e64f23422:password123` |
+| e732 | SHA1UTF7 | n/a | `a88edb266aa984a409f3818e78d237af1005ce06:password123+` |
 | e733 | SHA1MD51CAPMD5 | n/a | `19743a66812323e2a7d1d3598a49e1bbab41389f:password123` |
-| e734 | SHA1BASE64MD5 | n/a | `08c372085a6831b1d0af96392dc47deed1ae3a3a:password123` |
+| e734 | SHA1BASE64MD5 | n/a | `394aed00b9ec48f43a950baaf211781990d9e661:password123` |
 | e735 | SHA1SALTSHA1UCPASS | n/a | `b720d4ed00467338d4a4bd144c46bded78ac6c16:salt:password123` |
 | e736 | SHA1MD5xSALT | n/a | `12d66f224a0fbdf4b7371400f9fece702d4c48a5:1 Salt:password123` |
 | e737 | SHA1SHA11CAP | n/a | `df5dfb781656c687d63c337c142537d0d9055da1:password123` |
-| e738 | SHA1SALTMD5SHA1PASS | n/a | `1ca58c7a52cbaad9ca017a777e4bd98fd95e5d3f:salt:password123` |
+| e738 | SHA1SALTMD5SHA1PASS | n/a | `2f6938e8a27be6e91303ea2416ceded42f7f7a43:salt:password123` |
 | e739 | SHA1SHA1TRUNCSALT | n/a | `1a42a781654831a7459659b44001c0c291711ec2:Aa8NB6AU6v2KsqLjbbLb4EH9mAB9BksY 40:password123` |
 | e740 | SHA1-MD5SALT-CR | n/a | `a1be7d556bcd65469f702ea59d84f08aa6b4b741:ts:password123` |
 | e741 | SHA1-MD5MD5SALT-CR | n/a | `cd2817aa1d583ec5eb85a2df60d1eed0efe0f726:ts:password123` |
 | e742 | SHA1SALTMD5SHA1PASSPEPPER | n/a | `66a1108561a94314c05dd789b23a0bf3509edae9:1122334455667788 1122334455667788:password123` |
 | e743 | SHA1MD5CAPMD5SALT | n/a | `fa07a0a16f53706d750ae7d2eb60c82c5955022c:ts:password123` |
 | e744 | SHA1SALTSHA1CAP | n/a | `963456f4db8d33521a7db3fb42aef0b69fdc346a:1122334455667788:password123` |
-| e745 | SHA1SHA384TRUNC | n/a | `8954403705dae6fa5d10b96de809a365:password123` |
-| e746 | SHA1RMD160TRUNC | n/a | `7eed1099ed66ef7c2555d514cf93a106:password123` |
+| e745 | SHA1SHA384TRUNC | n/a | `4b1de1a619bfe783ca1acf10a92e571d5e9d77fe:70:password123` |
+| e746 | SHA1RMD160TRUNC | n/a | `c91c49b8a000fca5e5dbda6f9daf582bc66ef378:30:password123` |
 | e747 | SHA1BASE64MD5UC | n/a | `d9ea5668f450ddcf51e01233b05ec377783d4290:password123` |
 | e748 | SHA1MD5CAPSHA1SALT | n/a | `5fee3f3bf4aba7b1647695adb08d58b995a14300:testsalt:password123` |
 | e749 | SHA1MD5x1CAP | n/a | `09936cb4c466edfde7c94569792dc39163bf2984:1:password123` |
-| e750 | SHA1SHA1SHA1TRUNC | n/a | `b8ae01f3706f2c73ac3444a64645e8a3:password123` |
+| e750 | SHA1SHA1SHA1TRUNC | n/a | `406f2667097e9913b66646d27f12294207f85bdc:40:password123` |
 | e751 | SHA1SALTSHA1MD5 | n/a | `e6926834cc560f218c991cc474eb80948ece3336:salt:password123` |
 | e752 | SHA1UTF16BE | n/a | `18527af6a7e3c4439dae6b7ef6afb40b0daecfad:password123` |
 | e753 | SHA1SHA0 | n/a | `43f47ef41bff6e7bce19658dcec81601f25284f0:password123` |
 | e754 | SHA1MD4 | n/a | `6f4e234866bb2751de7fd5ed66cfe06e4eea07ff:password123` |
-| e755 | SHA1SHA1TRUNCMD5 | n/a | `2c13011ac7f9b6ce6564935154f8986a:password123` |
+| e755 | SHA1SHA1TRUNCMD5 | n/a | `428b5c5e25c263d4f39dcdae384240f44b9eaee4:40:password123` |
 | e756 | SHA1MD5MD5UCMD5MD5UC | n/a | `e7d24dcb61b4123f5e89fd4a18a783094c1c179d:password123` |
 | e757 | SHA1SALTMD5UCMD5UC | n/a | `f64fcfa112d86a86ae338ea17486b5fdfde00830:1122334455667788:password123` |
-| e758 | SHA1MD51CAPMD5MD5 | n/a | `333574e6fa95b77c5996cd7d98c11601a0653a3e:password123` |
-| e759 | SHA1MD5SHA1PASSSALT | n/a | `30bd73e67b446ec9ad36c591b7b93bcd6e47ddb5:administrator:password123` |
-| e760 | SHA1SQL5MD5 | n/a | `60616c7f592c853d2eb255244360e4c520120c38:password1234` |
-| e761 | SHA1SQL5MD5MD5 | n/a | `ab24118bb091d46c5e380cdde2f247ced0aa4077:password1234` |
+| e758 | SHA1MD51CAPMD5MD5 | n/a | `bb4fe159c777f18f7b6556c7477298645c78cf41:1:password123` |
+| e759 | SHA1MD5SHA1PASSSALT | n/a | `52f29152257009124332a1155faad8d75aa50ddc:administrator:password123` |
+| e760 | SHA1SQL5MD5 | n/a |  |
+| e761 | SHA1SQL5MD5MD5 | n/a |  |
 | e762 | SHA1revSHA1 | n/a | `adbf03f086ae522a1b2f136bdabad0e3cb670fb6:password123` |
 | e763 | SHA11SALTMD5SHA256 | n/a | `1fbe24e8ee1bfb36376dc8715af1c2eb15764c05:$HEX[09]:password123` |
 | e764 | SHA1SHA256MD5MD5 | n/a | `9451d9164fa3f30da85ecf0a554924dba2b34196:password123` |
@@ -778,36 +790,36 @@ self-test vector; they are still fully functional.
 | e767 | MD5DECBASE64MD5BASE64MD5 | n/a | `9f9f634ab9e3e48f188f2021f82b78a7:password123` |
 | e768 | SHA1revBASE64 | n/a | `aaff177fba258a06cccc183169de9bc2e4fef050:password123` |
 | e769 | SHA1revBASE64x | n/a | `aaff177fba258a06cccc183169de9bc2e4fef050:1:password123` |
-| e770 | SHA1BASE64CUSTBASE64MD5 | n/a | `d55581fcc0d6ecaf130aabb0c8396919edb44031:password123` |
+| e770 | SHA1BASE64CUSTBASE64MD5 | n/a | `5bb5738650be2c2ac2505a85b5410c51c26db781:password123` |
 | e771 | SHA1MD5sub1-16 | n/a | `e6d2217579b858c856cb1319503ace3ab27cbf52:password123` |
-| e772 | SHA1MD5sub1-16MD5 | n/a | `d6c54f53afa672679e2b956a8742ab799a3ac58c:password123` |
-| e773 | SHA1MD5sub1-16MD5MD5 | n/a | `4f46005a8a0379f632135c74fb697c17a9b21ac5:password123` |
+| e772 | SHA1MD5sub1-16MD5 | n/a | `366c4389f9793304597105318f7a61b0569fe5ca:password123` |
+| e773 | SHA1MD5sub1-16MD5MD5 | n/a | `c728c7630b493808ff4f42f99557e1ae359d7614:password123` |
 | e774 | SHA1SHA1sub1-16 | n/a | `4f0e134407ff27d40c286993fd2082e3634dadd4:password123` |
 | e775 | MD4UTF16MD5MD5MD5MD5 | n/a | `d1d10ff2b473088fe926f736f0653f9b:password123` |
 | e776 | MD4UTF16SHA1UC | n/a | `811bb75bd03dff84905cc04e84481144:password123` |
 | e777 | MD4UTF16MD5x | n/a | `b4c89d27458fd978c7c9bec66214f6b1:salt:password123` |
 | e778 | MD4UTF16SHA1x | n/a | `71b6aae38e2a3a62b509193a7ae57806:salt:password123` |
-| e779 | MD4UTF16SHA256MD5 | n/a | `491e6a29e3713294a5727f75bf468b7fd2c52cf899c439283e40c14793e79aa0:password123` |
-| e780 | MD4UTF16SHA256SHA1 | n/a | `914216b57ed6f4cac476de01ec7432bb7447235c959c7f4745ae1eb31601e4aa:password123` |
+| e779 | MD4UTF16SHA256MD5 | n/a | `4136371033c5e9a6cc218541f453f426:password123` |
+| e780 | MD4UTF16SHA256SHA1 | n/a | `fd6f1cbb282b01937df4289b94f0e04b:password123` |
 | e781 | MD4UTF16-2xMD5 | n/a | `2afe6d33d87edb673299e98876ae606a:password123` |
-| e782 | MD4UTF16MD5PASSMD5SHA1PASS | n/a | `fbc822a040fde4ff930902c724f74e52:password123` |
+| e782 | MD4UTF16MD5PASSMD5SHA1PASS | n/a | `904b65e237e0e3d1ae178a875b78362c:password123` |
 | e783 | MD4UTF16MD5PASSMD5SALT | n/a | `6adbba6f0d932b60b5976c680e9bf785:12345:password123` |
 | e784 | MD4UTF16MD5MD5PASSMD5SALT | n/a | `cdb3fdeb0157b72ee2687b8247dc8cd9:testsalt:password123` |
 | e785 | MD4UTF16MD5PASSMD5SHA1SALT | n/a | `7580dc2df5377815adfadf80e3e3d7bb:testsalt:password123` |
-| e786 | NTLMH | n/a | `a9fdfa038c4b75ebc76dc855dd74f0da:password123` |
+| e786 | NTLMH | 1000 | `a9fdfa038c4b75ebc76dc855dd74f0da:password123` |
 | e787 | MD4UTF16SQL3 | n/a | `0f99d3030517365fa5ddf811049bba9b:password123` |
 | e788 | MD4UTF16BASE64 | n/a | `664e71493273a450547f4a95b09b334c:password123` |
 | e789 | MD4UTF16revBASE64x | n/a | `c0a08297890abfed6dd7be5356ff2130:1:password123` |
-| e790 | SHA1BASE64SHA256 | n/a | `2556ad851ca72044277a27bd808e57ebba1fb3d9:password123` |
+| e790 | SHA1BASE64SHA256 | n/a | `4c01d776df49e01a5f1419b30364f76ab29aea58:password123` |
 | e791 | MD4UTF16BASE64SHA256 | n/a | `e665c60de247442660bf1b08cb990450:password123` |
 | e792 | HMAC-MD5-KPASS | 50 | `e62cf677521d96f7f5ea48207811a97f:testsalt:password123` |
 | e793 | HMAC-SHA1-KPASS | 150 | `2b2f85e38e1c709c1c1e75e6ee4d64342b07549b:testsalt:password123` |
 | e794 | HMAC-SHA224-KPASS | n/a | `b1e6b34e060f415820939daa65d3b9681f6c5a89ef84b05b227ec74b:testsalt:password123` |
 | e795 | HMAC-SHA256-KPASS | 1450 | `4b3c0065fbf326359c48b05d4c7624b7537633f450e0b2725bbd50b76fe6e272:testsalt:password123` |
-| e796 | HMAC-SHA384-KPASS | n/a | `3aad96017b6d4a8329131f3ae3e5166d7eeef0f455cb297523b8dc086963acab748ca424212516b6fc1d90b24c64317e:...` |
-| e797 | HMAC-SHA512-KPASS | 1750 | `b05fe862891386bea0536631b38db71d1955168a9174961ca05cee238d41c920be8df3b3389cea4bac643ac15cd2a7aeb...` |
+| e796 | HMAC-SHA384-KPASS | n/a | `3aad96017b6d4a8329131f3ae3e5166d7eeef0f455cb297523b8dc086963acab748ca424212516b6fc1d90b24c64317e:testsalt:password123` |
+| e797 | HMAC-SHA512-KPASS | 1750 | `b05fe862891386bea0536631b38db71d1955168a9174961ca05cee238d41c920be8df3b3389cea4bac643ac15cd2a7aeb91f8f5a7fb7f003df5fc5b4c8f99135:testsalt:password123` |
 | e798 | HMAC-RMD160-KPASS | 6050 | `514f58996b12f1c91595c12be92d4519fff07e48:testsalt:password123` |
-| e799 | HMAC-RMD320-KPASS | 33650 | `022ee238a2e2bacfe3bcdd23d0dc06e6246813c82a79898890e1555f703ef89b52c964e8a341d8a8:testsalt:passwor...` |
+| e799 | HMAC-RMD320-KPASS | 33650 | `022ee238a2e2bacfe3bcdd23d0dc06e6246813c82a79898890e1555f703ef89b52c964e8a341d8a8:testsalt:password123` |
 | e800 | MD5UTF16LE | 70 | `f22ec811b8bf1cb6ac3aea13d3fcfebf:password123` |
 | e801 | MD5UTF16LEPASSSALT | 30 | `0488fff28516472675ba5b45e942f84e:testsalt:password123` |
 | e802 | MD5UTF16LESALTPASS | 40 | `5eddf651932d86e0ea0d501bd7c981fb:testsalt:password123` |
@@ -816,14 +828,14 @@ self-test vector; they are still fully functional.
 | e805 | SHA256UTF16LE | 1470 | `84b2cff2b372c47acb02c72fa6f0a04e9c21ae7f1b04123a40caf3d2f99d7180:password123` |
 | e806 | SHA256UTF16LEPASSSALT | 1430 | `ee1da056f122f9113a0f0a1e4a154d375d012ee8c232e64671f70d01d8dfb02c:testsalt:password123` |
 | e807 | SHA256UTF16LESALTPASS | 1440 | `2bb145aea195866dbb89ff25feeb3df2fe187ab85fdb446855846cb9fc5a0768:testsalt:password123` |
-| e808 | SHA512UTF16LE | 1770 | `86d55ca62d5cc2eb79dd30f0073db94b3e5b0cade040528322efe0a42b249d290c8fb99f65db12de69f3646cd8e07b210...` |
-| e809 | SHA512UTF16LEPASSSALT | 1730 | `1e6411c5abe4246d5530c099c7a0993fa773a65c78cfa2a77b38dfeb90616f0f7b9193f17e74b081ad8f70f97c5acf567...` |
-| e810 | SHA512UTF16LESALTPASS | 1740 | `505489751055fae2616a85ca76401c7d73685c4338637cd28fbb8d130e843c4c3d3594f9077ddce7f7d6cec342f61384a...` |
-| e811 | SHA384PASSSALT | 10810 | `ad5becb6dee94c284dc825d420f65a0a4a58102becfc8777b35f45222377f8032ab491677f2bf20e34e385b6f6a9fde2:...` |
-| e812 | SHA384SALTPASS | 10820 | `effd3c241e63f9b970d9093cf09af5fa2f180bd91e79818ca1c4b9832b66dd66683abb3687cbd0ddd765e1feefb2e09e:...` |
-| e813 | SHA384UTF16LE | 10870 | `72f0b2b5e3dc9aaa13e63ac855435ea0357d2c05f28d0bf574a1b5ba7f8ac0903f44f7deaae69143ac0a2021ad660cb0:...` |
-| e814 | SHA384UTF16LEPASSSALT | 10830 | `c517a98fbedb4a9322f4b1bec2d9581a00391e615141f5fa2b76a360076603daca839c7cb2270201780ddcc2aaeae313:...` |
-| e815 | SHA384UTF16LESALTPASS | 10840 | `ef60221a689caa3120b851bca50d080e8483bf98dd21c76bcc2ab88b48bc956b5d83cafd03cf8fc05d76b95fae967397:...` |
+| e808 | SHA512UTF16LE | 1770 | `86d55ca62d5cc2eb79dd30f0073db94b3e5b0cade040528322efe0a42b249d290c8fb99f65db12de69f3646cd8e07b21031c49d954d2ed70fb4399068aa09994:password123` |
+| e809 | SHA512UTF16LEPASSSALT | 1730 | `1e6411c5abe4246d5530c099c7a0993fa773a65c78cfa2a77b38dfeb90616f0f7b9193f17e74b081ad8f70f97c5acf56738695e5df73386d8e115a68087d42ca:testsalt:password123` |
+| e810 | SHA512UTF16LESALTPASS | 1740 | `505489751055fae2616a85ca76401c7d73685c4338637cd28fbb8d130e843c4c3d3594f9077ddce7f7d6cec342f61384a67b1004923bb1e17baa234795669af1:testsalt:password123` |
+| e811 | SHA384PASSSALT | 10810 | `ad5becb6dee94c284dc825d420f65a0a4a58102becfc8777b35f45222377f8032ab491677f2bf20e34e385b6f6a9fde2:testsalt:password123` |
+| e812 | SHA384SALTPASS | 10820 | `effd3c241e63f9b970d9093cf09af5fa2f180bd91e79818ca1c4b9832b66dd66683abb3687cbd0ddd765e1feefb2e09e:testsalt:password123` |
+| e813 | SHA384UTF16LE | 10870 | `72f0b2b5e3dc9aaa13e63ac855435ea0357d2c05f28d0bf574a1b5ba7f8ac0903f44f7deaae69143ac0a2021ad660cb0:password123` |
+| e814 | SHA384UTF16LEPASSSALT | 10830 | `c517a98fbedb4a9322f4b1bec2d9581a00391e615141f5fa2b76a360076603daca839c7cb2270201780ddcc2aaeae313:testsalt:password123` |
+| e815 | SHA384UTF16LESALTPASS | 10840 | `ef60221a689caa3120b851bca50d080e8483bf98dd21c76bcc2ab88b48bc956b5d83cafd03cf8fc05d76b95fae967397:testsalt:password123` |
 | e816 | RMD320 | 33600 | `e3a8ce82f0e176fd498227b3994bf3b238197c98a9576c7e5741b5a7f22cfab7ef9c2bbf462d2a32:password123` |
 | e817 | MD5-SHA1SALTPASS | 4430 | `d0f4bc9a10a8eecaeee46edbc09c9030:salt:password123` |
 | e818 | MD5-SALTMD5PASS-SALT | 33100 | `44713c51d1c49a189194739742a550d1:salt:password123` |
@@ -835,7 +847,7 @@ self-test vector; they are still fully functional.
 | e824 | SHA1-SALTSHA1U16 | 29000 | `5b5ca9fd4541f4a2b4c0170d7161cc446a1d04c2:53616c74:61646d696e:password123` |
 | e825 | SHA256SALTPASSSALT | 22300 | `348112f7744f0b78322338ab30d26febb2bdb5ec76a51bb273a71e6cc02118a3:testsalt:password123` |
 | e826 | SHA256-SALTSHA256RAW | 21420 | `e8ce7be541f79491609f5834c3c7ae8a3abe63d237e07fd6d492356a1697c08b:Salt:password123` |
-| e827 | WRLSALTPASSSALT | 32600 | `2d937185151d7d5c49b4ad1def0250e4459c7752e32945ac3ceb15e8ae5a2f97d21869e5b6239a51c643d0ecd48138c50...` |
+| e827 | WRLSALTPASSSALT | 32600 | `2d937185151d7d5c49b4ad1def0250e4459c7752e32945ac3ceb15e8ae5a2f97d21869e5b6239a51c643d0ecd48138c50d485078f8d410cd06a95c934af227b0:testsalt:password123` |
 | e828 | HMAC-BLAKE2S | 33300 | `ec4b78bd06fec177c3e76473f788d28cb8939f6778a417b6b9702335dc2cc818:testsalt:password123` |
 | e829 | MURMUR64A | 34200 | `ae8450e53d91404d:1234:password123` |
 | e830 | MURMUR64AZERO | 34201 | `4d8874c6a15a35f4:password123` |
@@ -844,25 +856,25 @@ self-test vector; they are still fully functional.
 | e833 | SSHA1BASE64 | 111 | `{SSHA}5vmqYXnhk1zUO+N3U/Qz0DsgALfLHQD3:password123` |
 | e834 | SHA1PASSHEXSALT | 112 | `7c72e4a4f6a11f792c62ecb43857006741997aa8:0123456789abcdef0123:password123` |
 | e835 | SSHA256BASE64 | 1411 | `{SSHA256}XhimPozJJ9oqxpCbQauJQprG3UyKnCIqQuXnN5t6Hv4O/bDZ:password123` |
-| e836 | SSHA512BASE64 | 1711 | `{SSHA512}Ez2Xp55xerUzNyNXPfxuGDxgzItJLkWWY86Rikkvqs64xKnzjdtMdHrGwd6a3r4YSgTuOx+vKeLn0EK/KKmEDnRl...` |
+| e836 | SSHA512BASE64 | 1711 | `{SSHA512}Ez2Xp55xerUzNyNXPfxuGDxgzItJLkWWY86Rikkvqs64xKnzjdtMdHrGwd6a3r4YSgTuOx+vKeLn0EK/KKmEDnRlc3Q=:password123` |
 | e837 | HMAC-STREEBOG256-KPASS | 11750 | `a4c447ef8c06c22a494113eac0b8c2a5b845fb739b8777facd92737f913de44c:testsalt:password123` |
 | e838 | HMAC-STREEBOG256 | 11760 | `35ec05ed149db7e04872e979499ad91333b040bae8c6e687ab08a1d10957f2fc:testsalt:password123` |
-| e839 | HMAC-STREEBOG512-KPASS | 11850 | `f7b1bd906c850d6de2a29c373f7786910ecb3c6f457245924432a24e8b263f14b43b4795a8c27babdb8fa5fdb1aab4f47...` |
-| e840 | HMAC-STREEBOG512 | 11860 | `116c626195369a7281346b178437085a548359b764594ebbcfc38502d17a8141c8116185389ffd3b1d4b29587e60cb513...` |
-| e841 | BLAKE2B512 | 600 | `fbdba996cade3bae2d948c2f03f8149ffa7068584731ac6efbef1688e64609b6969a52dcc203b74aa87d6d9d1b0cd93be...` |
-| e842 | BLAKE2B512PASSSALT | 610 | `74e4702fac1576179c957877cb8b4f1f5a8a5bfa3c2fd8a572ede80c6aec857152384db229489b0b89db69c62e9597637...` |
-| e843 | BLAKE2B512SALTPASS | 620 | `b0c082a1f1e2a385668619b450897546ed0f382598c0e355198a493479f0c9915ebe750092c34f844de701ab3f77ea5d3...` |
-| e844 | BLAKE2S256 | 31000 | `02027c0e103001c546eaf0688c8270aa97dcdf867964d0049cdd021936768667:password123` |
-| e845 | BLAKE2B256 | 34800 | `4482542d0cdfeb679f2e0c4d5780af2c33dc57892390c9d5a17e8fa8be01100f:password123` |
-| e846 | BLAKE2B256PASSSALT | 34810 | `eee9fc18ca12f18c0a700b07c464d58a7e6f624800d7e5b13170f4e4cd5eb1e9:testsalt:password123` |
-| e847 | BLAKE2B256SALTPASS | 34820 | `f4fdf6b1cda2872527244ff036f1670af39c39decbd9aab4765a7aaa2b1d41d0:testsalt:password123` |
+| e839 | HMAC-STREEBOG512-KPASS | 11850 | `f7b1bd906c850d6de2a29c373f7786910ecb3c6f457245924432a24e8b263f14b43b4795a8c27babdb8fa5fdb1aab4f4743521a9de9612ecb4390ed9b303ea32:testsalt:password123` |
+| e840 | HMAC-STREEBOG512 | 11860 | `116c626195369a7281346b178437085a548359b764594ebbcfc38502d17a8141c8116185389ffd3b1d4b29587e60cb513f12311de2a4986fc10b1e1fe9a0d9d2:testsalt:password123` |
+| e841 | BLAKE2B512 | 600 | `$BLAKE2$fbdba996cade3bae2d948c2f03f8149ffa7068584731ac6efbef1688e64609b6969a52dcc203b74aa87d6d9d1b0cd93bea724cddd12443f2b808bc03776b81cc:password123` |
+| e842 | BLAKE2B512PASSSALT | 610 | `$BLAKE2$74e4702fac1576179c957877cb8b4f1f5a8a5bfa3c2fd8a572ede80c6aec857152384db229489b0b89db69c62e9597637516d68a9bda2ce661464eb9d7b6f11c:testsalt:password123` |
+| e843 | BLAKE2B512SALTPASS | 620 | `$BLAKE2$b0c082a1f1e2a385668619b450897546ed0f382598c0e355198a493479f0c9915ebe750092c34f844de701ab3f77ea5d3e966016036122ce4eeeee509444388a:testsalt:password123` |
+| e844 | BLAKE2S256 | 31000 | `$BLAKE2$02027c0e103001c546eaf0688c8270aa97dcdf867964d0049cdd021936768667:password123` |
+| e845 | BLAKE2B256 | 34800 | `$BLAKE2$4482542d0cdfeb679f2e0c4d5780af2c33dc57892390c9d5a17e8fa8be01100f:password123` |
+| e846 | BLAKE2B256PASSSALT | 34810 | `$BLAKE2$eee9fc18ca12f18c0a700b07c464d58a7e6f624800d7e5b13170f4e4cd5eb1e9:testsalt:password123` |
+| e847 | BLAKE2B256SALTPASS | 34820 | `$BLAKE2$f4fdf6b1cda2872527244ff036f1670af39c39decbd9aab4765a7aaa2b1d41d0:testsalt:password123` |
 | e848 | DESENCRYPT | 14000 | `efb32954aec338ca:1172075784504605:password123` |
 | e849 | DES3ENCRYPT | 14100 | `c74ec0f283bb3efb:8152001061460743:password123` |
-| e850 | MSSQL2000 | 131 | `0x010012345678f9cf12a8bbcee0131a6068815203371250b5cb1198069a7aec5df5cb05ef43f73acbe8572cf9d744:pa...` |
+| e850 | MSSQL2000 | 131 | `0x010012345678f9cf12a8bbcee0131a6068815203371250b5cb1198069a7aec5df5cb05ef43f73acbe8572cf9d744:password123` |
 | e851 | MSSQL2005 | 132 | `0x010012345678f9cf12a8bbcee0131a6068815203371250b5cb11:password123` |
-| e852 | MSSQL2012 | 1731 | `0x020012345678d0d6c9153b0e776be47d3075c6a6cc1f7241c63f37eea7c6f0848e79d22d746de10aa011e3204748b4b...` |
+| e852 | MSSQL2012 | 1731 | `0x020012345678d0d6c9153b0e776be47d3075c6a6cc1f7241c63f37eea7c6f0848e79d22d746de10aa011e3204748b4b6bdd2ca58b6bfd4a987b94d915d78e0dc51e4a7bc6609:password123` |
 | e853 | MACOSX | 122 | `123456782ff71ecef04bd9660e9bad78ed5cf12d97d341c5:password123` |
-| e854 | MACOSX7 | 1722 | `123456780c911e4f72ab8610bd212f4fb547c6b13c0abb1b488350f19e888fe874dbcb542ab2ad0706af8d9303164a540...` |
+| e854 | MACOSX7 | 1722 | `123456780c911e4f72ab8610bd212f4fb547c6b13c0abb1b488350f19e888fe874dbcb542ab2ad0706af8d9303164a54008937f7a328404dfb81b5e2d1017b1a5c3ea141:password123` |
 | e855 | POSTGRESQL | 12 | `md5c3a6d24526b9285dd98be631e8271309:testuser:password123` |
 | e856 | JUNIPERSSG | 22 | `nKLFAKrpHSNHcHMMnsaMoCDtGrPj0n:user:password123` |
 | e857 | SKYPE | 23 | `229922b8b59931e6f8bfd223eb006806:chloe01:password123` |
@@ -874,16 +886,16 @@ self-test vector; they are still fully functional.
 | e863 | MEDIAWIKI | 3711 | `$B$56668501$20461e17ce27c23cf7927fe0aa1a7725:password123` |
 | e864 | DAHUA | 3730 | `27fd18d177daf2fc0d47833944eab52d:229381927:182719643:password123` |
 | e865 | CISCO4 | 5700 | `vt8rS9fyRlu773i7v9k6d2dC3ak4NNYFW/wsDIFnuIw:password123` |
-| e866 | CISCOISE | 5720 | `6921eaf6ba9eedb30c84a2c7fed2309e964d631f69e7f6b2972482dcb68007824d6573736167654469676573740000000...` |
+| e866 | CISCOISE | 5720 | `6921eaf6ba9eedb30c84a2c7fed2309e964d631f69e7f6b2972482dcb68007824d65737361676544696765737400000000000000000000000000000000000000:password123` |
 | e867 | SAMSUNGSHA1 | 5800 | `b663d01f50b917f6a9b1aa402207f863ba8b7c41:2173921648:password123` |
 | e868 | AIX-MD5 | 6300 | `{smd5}rndSa1t$7BZvKWug/Zy4p.iPozdxC0:password123` |
 | e869 | AIX-SHA1 | 6700 | `{ssha1}06$bJbkFGJAB30L2e23$zKSZhTrB6UjXkJlxKsxSALf2.MH:password123` |
 | e870 | AIX-SHA256 | 6400 | `{ssha256}06$aJckFGJAB30LTe10$3nmSlxZe9vAsv7ylzEjjt9K6x2zac8Zm3udVIFZ9.Qr:password123` |
-| e871 | AIX-SHA512 | 6500 | `{ssha512}06$bJbkFGJAB30L2e23$6kmLDyWSi0Y5c4.h/cUmVKFO9j.F/p/JvfeTcfEjvIANUghVYQFTVfrQ4u2fs1laoJls...` |
+| e871 | AIX-SHA512 | 6500 | `{ssha512}06$bJbkFGJAB30L2e23$6kmLDyWSi0Y5c4.h/cUmVKFO9j.F/p/JvfeTcfEjvIANUghVYQFTVfrQ4u2fs1laoJlsV/34DQaITeWwBAqN..:password123` |
 | e872 | IPMI2-SHA1 | 7300 | `00:1c9f35d812ea7ef72acdd262ec5e3ae59582103a:password123` |
 | e873 | IPMI2-MD5 | 7350 | `e83eb99a98bd696bc41c0826bb378986:00:password123` |
-| e874 | KRB5PA23 | 7500 | `$krb5pa$23$x$x$x$06e07bf14b909c6e6773b7d0bc9fd9a04602c3bd4991ffc7438a60446a40b384d2f13ce9124a8f70...` |
-| e875 | MYSQL-SHA256CRYPT | 7401 | `$mysql$A$005*0000000000*735953686774693157507A4A56526F713439744874516D6878335855747A644E416D50697...` |
+| e874 | KRB5PA23 | 7500 | `$krb5pa$23$user$realm$salt$6925dc172806e0ce5681bbaefb6781bf058c03f1a21e383fd55a7b79fa98a8078d7ebdcc6c208758de6e78fd9c8ea704f894c15d:password123` |
+| e875 | MYSQL-SHA256CRYPT | 7401 | `$mysql$A$005*0000000000*735953686774693157507A4A56526F713439744874516D6878335855747A644E416D506979304547335A37:password123` |
 | e876 | DRUPAL7 | 7900 | `$S$C00000000uP3JXd.0IL30e76wJH2NZ/Ovd0AALo.mjXytygeAP9u:password123` |
 | e877 | SYBASE-ASE | 8000 | `0xc00700000000000000000995a15a592719c9407085d7dfd203f6c11a9de5bf449e3cb93e90439d4c65aa:password123` |
 | e878 | NETSCALER | 8100 | `100000000c61de3dad73fee288fbafd575bb2d5d95c1ee79d:password123` |
@@ -893,7 +905,7 @@ self-test vector; they are still fully functional.
 | e882 | DOMINO5 | 8600 | `173127311326bb6eeacdfef5c2791514:password123` |
 | e883 | DOMINO6 | 8700 | `(G0000101iBosJ2cVSZqu):password123` |
 | e884 | SCRYPT | 8900 | `SCRYPT:1024:1:1:AA==:m3hB8eGi24+6bsMZkTf+If0G0liOTm26E7zsUzY/SRg=:password123` |
-| e885 | JUNIPERIVE | 501 | `hn9NPzVmhLxotWISQlgcHIt7y1p5zPDZXqW5AGKrTSNi7lgSKXbXGCGVIgfwMDir8FuS+x0+4MxIfdErHoaZ6aDkvMuMSlYSX...` |
+| e885 | JUNIPERIVE | 501 | `hn9NPzVmhLxotWISQlgcHIt7y1p5zPDZXqW5AGKrTSNi7lgSKXbXGCGVIgfwMDir8FuS+x0+4MxIfdErHoaZ6aDkvMuMSlYSXG8hvw==:password123` |
 | e886 | PHPS | 2612 | `$PHPS$3031$216cb30ddee43eced3bb76fd38e0b7df:password123` |
 | e887 | ARUBAOS | 125 | `5387280701b9809a521b6175cb9519910413a11227468b252f:password123` |
 | e888 | ISCSI-CHAP | 4800 | `1171aa2341d965193eeba2e514a5fc56:01020304050607080910111213141516:01:password123` |
@@ -901,105 +913,140 @@ self-test vector; they are still fully functional.
 | e890 | WERKZEUG-SHA256 | 30120 | `sha256$Salt$5470a0da1e556b61d89430bc25aa630436e7bf8d68db104d76f024d68d5fce07:password123` |
 | e891 | AUTHME | 20711 | `$SHA$1234567890123456$6b7d5ab9458f1d9ef8316945b3904d19d90eabf67a8bf98b0ddacede6baaf5a3:password123` |
 | e892 | NETWITNESS | 20712 | `7F6B6E9ECD0E25FA22A5CB1A6433CC193C70CF476B8294B9C0AAA8F583AE38D4:U2FsdA==:password123` |
-| e893 | NETSCALER-SHA512 | 22200 | `2f9282ade00462c9682f0f7d4f0546c3e5f3152f0da4f9a66fd621fd12d20e0fadb15f25ba3b6bbc93ad8e83880eebf3b...` |
+| e893 | NETSCALER-SHA512 | 22200 | `2f9282ade00462c9682f0f7d4f0546c3e5f3152f0da4f9a66fd621fd12d20e0fadb15f25ba3b6bbc93ad8e83880eebf3b17022c2de7f7fd70d8e8d98bfb98ffefd4390481:password123` |
 | e894 | SHA1SHA1SALTPASSSALT | 5000 | `47c1f3cdec346eec1c735f48b8865e07051669e2:232725102020:password123` |
-| e895 | NETSCALER-PBKDF2 | 33900 | `5567243c55099b6b10a714a350db53beea8be6ac9c247fd40fea7e96d206a9f11998b7c6b32242e28c311596e9cabcf6c...` |
+| e895 | NETSCALER-PBKDF2 | 33900 | `5567243c55099b6b10a714a350db53beea8be6ac9c247fd40fea7e96d206a9f11998b7c6b32242e28c311596e9cabcf6ccd0d14af94ae904820a36e7fb9a8277f:password123` |
 | e896 | ORACLE7 | 3100 | `192802346638CC4F:7284616727:password123` |
-| e897 | NETNTLMV1 | 5500 | `::WG:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:3a29fd33694feaa7c51547f0055054b373b5c181355...` |
-| e898 | NETNTLMV2 | 5600 | `user::domain:1122334455667788:d5add1cebafed2180b3cca8728f5aff8:01010000000000000000000000000000aa...` |
-| e899 | LASTPASS | 6800 | `e70e2b8e01e218f19f4cbfaf3c9dcd98:100100:pmix@trash-mail.com:9b071db7b8e265d4cadd3eb65ac0864a:pass...` |
+| e897 | NETNTLMV1 | 5500 | `::WG:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:3a29fd33694feaa7c51547f0055054b373b5c1813551756a:1122334455667788:password123` |
+| e898 | NETNTLMV2 | 5600 | `user::domain:1122334455667788:d5add1cebafed2180b3cca8728f5aff8:01010000000000000000000000000000aabbccdd1122334400000000:password123` |
+| e899 | LASTPASS | 6800 | `e70e2b8e01e218f19f4cbfaf3c9dcd98:100100:pmix@trash-mail.com:password123` |
 | e900 | FORTIGATE | 7000 | `AK1FCIhM0IUIQVFJgcDvmNyl2Vlb6Lq9PVehp2IN/JtDbM=:password123` |
 | e901 | DOMINO8 | 9100 | `(HC34tD3KtDp4oCZWmCJ4qC30mC30mC3KmC30mCZLHhfRy7SQG):password123` |
 | e902 | SIPHASH | 10100 | `df4e9628b5664b3f:2:4:47356410265714355482333327356688:password123` |
 | e903 | CRAMMD5 | 10200 | `$cram_md5$MTI=$dXNlciBhZTBjM2VmMGE2NTM0NWY4MzFhMDEyYjlhMTg2ZDVjNQ==:password123` |
 | e904 | SAPCODVNH | 10300 | `{x-issha, 1024}J/gd5d88iJICTDsKpDiuiED4gDw2NzU4MzE2MTA=:password123` |
-| e905 | REDHAT389DS | 10901 | `{PBKDF2_SHA256}AAAgAEFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU...` |
+| e905 | REDHAT389DS | 10901 | `{PBKDF2_SHA256}AAAgAEFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF9h4FZYLxdoiv6COGSMJkvo7NTruAVtL80gwJdyIE2RjA+v3s8nal9A3D/NjSVxlBnuEbzbyi0h2QMEBopkWRDTY5CDn/tQbfXS97KYKkG9QYWztJbPvAqPXtcGsu86TJ8WhHS3tZAyluhXdcQTPZNWFQe0x2bgYoPwUFbzfOEUl16ssQOmsslEofV3OP6U3iTIGR3BnnbfFRr818ObLdoMOwSBwXM1ffu4lu2iUkACTw93LPfT7dXlCx9HzW+3c4T5NImdICsY1OPcXb7UdjpS3ULFAM6tRkMKInZzFltmegiUqOEqWFdu7hcVzFNUfdneKg3jEXZbHngIO4sJG10:password123` |
 | e906 | POSTGRESCRAM | 11100 | `$postgres$postgres*41414141*e189d76dcdaf3bb15764784e2f24eee3:password123` |
-| e907 | MYSQLCRAM | 11200 | `$mysqlna$4141414141414141414141414141414141414141*024763fc7fa983ef4c424bb91c4c9ca58a4c6a20:passwo...` |
-| e908 | SHIRO1 | 12150 | `$shiro1$SHA-512$1024$QUFBQUFBQUFBQUFBQUFBQQ==$PGoJ83m0phYuc1i1rh7Vqv2+kkuSqxgEX+Ah0luTEOXRcKChRdW...` |
+| e907 | MYSQLCRAM | 11200 | `$mysqlna$4141414141414141414141414141414141414141*024763fc7fa983ef4c424bb91c4c9ca58a4c6a20:password123` |
+| e908 | SHIRO1 | 12150 | `$shiro1$SHA-512$1024$QUFBQUFBQUFBQUFBQUFBQQ==$PGoJ83m0phYuc1i1rh7Vqv2+kkuSqxgEX+Ah0luTEOXRcKChRdW2wI38pCMRLTWzeEhMNricVDAqJ3cwO95ItA==:password123` |
 | e909 | ECRYPTFS | 12200 | `$ecryptfs$0$1$4141414141414141$a07ae5f28a1db69d:password123` |
-| e910 | ORACLE12 | 12300 | `00A4881893C78287CD84EB39D3DA49F05A4DF2FC48A97A70B0A9FC941C3CB465C5B0EEEF06686DA9F0B1BB3E0BEBFBBB6...` |
-| e911 | COLDFUSION10 | 12600 | `443120b78d8eede52f25e291ce6621499348ba363b0b563a4e98c69a7f24993b:12345678901234567890123456789012...` |
-| e912 | AZURESYNC | 12800 | `v1;PPH1_MD4,41414141414141414141,100,9bd986554189ab1bdf2c85eed4d381cc6be472be53b9a54e08816680e939...` |
-| e913 | ANDROIDFDE | 12900 | `42424242424242424242424242424242424242424242424242424242424242424eb9e9cc64cf5d82eb7aaa88119a41123...` |
-| e914 | KRB5TGS23 | 13100 | `$krb5tgs$23$*user$REALM$test/spn*$ef5b8ff40b085c0db7b56e6c138a746b$c5f8ac38e28042d9a9b69d9667d1c8...` |
-| e915 | AXCRYPT | 13200 | `$axcrypt$*1*10467*deadbeef01020304deadbeef01020304*a85333a6027147fd1db9a67f5ec969c6cdc19f018043fe...` |
+| e910 | ORACLE12 | 12300 | `00A4881893C78287CD84EB39D3DA49F05A4DF2FC48A97A70B0A9FC941C3CB465C5B0EEEF06686DA9F0B1BB3E0BEBFBBB65192CB51118EC775C9D1941724AF65941414141414141414141414141414141:password123` |
+| e911 | COLDFUSION10 | 12600 | `443120b78d8eede52f25e291ce6621499348ba363b0b563a4e98c69a7f24993b:1234567890123456789012345678901234567890123456789012345678901234:password123` |
+| e912 | AZURESYNC | 12800 | `v1;PPH1_MD4,41414141414141414141,100,9bd986554189ab1bdf2c85eed4d381cc6be472be53b9a54e08816680e93987f9:password123` |
+| e913 | ANDROIDFDE | 12900 | `42424242424242424242424242424242424242424242424242424242424242424eb9e9cc64cf5d82eb7aaa88119a411233a1b93c15db5fcf1cee1aecf9bf844241414141414141414141414141414141:password123` |
+| e914 | KRB5TGS23 | 13100 | `$krb5tgs$23$*user$REALM$test/spn*$ef5b8ff40b085c0db7b56e6c138a746b$c5f8ac38e28042d9a9b69d9667d1c8cd7ad0a7fe2849c3502fa7437e5108c2e73932b4ac570d899bbef1aa1b96efb37406e5619ca542a13659916788ebc53cce:password123` |
+| e915 | AXCRYPT | 13200 | `$axcrypt$*1*10467*deadbeef01020304deadbeef01020304*a85333a6027147fd1db9a67f5ec969c6cdc19f018043fe68:password123` |
 | e916 | AXCRYPTSHA1 | 13300 | `$axcrypt_sha1$cbfdac6008f9cab4083784cbd1874f76:password123` |
 | e917 | CISCO9 | 9300 | `$9$rndSa1tRndSa1t$vNe65wzVje3iwyqNXv34z3vaHXV9qbyYgYB37IWc5uA:password123` |
 | e918 | DCC2 | 2100 | `$DCC2$10240#6848#4f9d6397a4756474a8ee1bdf701f4db5:password123` |
-| e919 | PWSAFE3 | 5200 | `50575333e4e2a590a5e5c8269f57ec04a8a1c0c03da55b311c51236dab8c6b96b0afca0200080000a146c17e011363b18...` |
-| e920 | IKEPSK-MD5 | 5300 | `4141414141414141:4242424242424242:4343434343434343:4444444444444444:4545454545454545:464646464646...` |
-| e921 | IKEPSK-SHA1 | 5400 | `4141414141414141:4242424242424242:4343434343434343:4444444444444444:4545454545454545:464646464646...` |
-| e922 | SAP-BCODE | 7700 | `ABCDEFGH$9512E367C5A82CC2:pass1234` |
-| e923 | SAP-BCODE4 | 7701 | `ABCDEFGH$9512E36700000000:pass1234` |
-| e924 | SAP-PASSCODE | 7800 | `ABCDEFGH$66251d3727a1d78eac92fe616a5174aa8a8f6632:password123` |
-| e925 | SAP-PASSCODE5 | 7801 | `ABCDEFGH$66251d3727000000000000000000000000000000:password123` |
-| e926 | AS400-DES | 8501 | `$as400$des$*OPEN3*EC76FC0DEF5B0A83:SYS1` |
+| e919 | PWSAFE3 | 5200 | `50575333e4e2a590a5e5c8269f57ec04a8a1c0c03da55b311c51236dab8c6b96b0afca0200080000a146c17e011363b180b2a121713dc6ea94accb57a2751a99e67528a5872622bd:password123` |
+| e920 | IKEPSK-MD5 | 5300 | `4141414141414141:4242424242424242:4343434343434343:4444444444444444:4545454545454545:4646464646464646:4747474747474747:4848484848484848:37b806b82e7cd215df7283dc417e61a1:password123` |
+| e921 | IKEPSK-SHA1 | 5400 | `4141414141414141:4242424242424242:4343434343434343:4444444444444444:4545454545454545:4646464646464646:4747474747474747:4848484848484848:8bcc01c0e06096876785012e8ddb071e7b629917:password123` |
+| e922 | SAP-BCODE | 7700 | `ABCDEFGH$246EFDAD288F373D:pass1234` |
+| e923 | SAP-BCODE4 | 7701 | `ABCDEFGH$246EFDAD00000000:pass1234` |
+| e924 | SAP-PASSCODE | 7800 | `USER$ebfec7528f4d6617b1c232ea25558c1502f6ef99:password123` |
+| e925 | SAP-PASSCODE5 | 7801 | `USER$ebfec7528f4d6617b1c200000000000000000000:password123` |
+| e926 | AS400-DES | 8501 | `$as400$des$*OPEN3*B6079DA0E2EF813D:pass1234` |
 | e927 | PS-TOKEN | 13500 | `d7ace0616a3ae62d2c271e3bb3fa4204099cfea0:deadbeef01020304:password123` |
-| e928 | WINPHONE | 13800 | `d032042e65aea887f5d3a8b9a18dfd66fb4c7df6bd45721f5f3a18dda8f01f0f:41414141414141414141414141414141...` |
-| e929 | RACF-KDFAES | 14200 | `$racf-kdfaes$*USER*E7D7E66D000180000008003200100010*00112233445566778899AABBCCDDEEFF*57558AFDA951...` |
+| e928 | WINPHONE | 13800 | `d032042e65aea887f5d3a8b9a18dfd66fb4c7df6bd45721f5f3a18dda8f01f0f:4141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141:password123` |
+| e929 | RACF-KDFAES | 14200 | `$racf-kdfaes$*USER*E7D7E66D000180000008003200100010*00112233445566778899AABBCCDDEEFF*57558AFDA9513B926E3E2BE86DFAF72D:pass1234` |
 | e930 | TACACS | 16100 | `$tacacs-plus$0$5fde8e68$2c388f382ca4$c006:password123` |
-| e931 | APPLE-SECURE-NOTES | 16200,16700 | `$ASN$*1*20000*80771171105233481004850004085037*ead1884ed4297f1087be86ae90ab696018ef07cc96fefe57:p...` |
+| e931 | APPLE-SECURE-NOTES | 16200,16700 | `$fvde$1$16$80771171105233481004850004085037$20000$ead1884ed4297f1087be86ae90ab696018ef07cc96fefe57:password123` |
 | e932 | CRAMMD5-DOVECOT | 16400 | `{CRAM-MD5}947d35b03647a7dbeb55e59aa5bee3a100000000000000000000000000000000:password123` |
-| e933 | JWT | 16500 | `eyJhbGciOiJIUzI1NiJ9.eyIzNDM2MzQyMCI6NTc2ODc1NDd9.YVWX_3IWKC7NpoDVtyr4Qzm6FQVA62aeHiTqj4U5ojI:pas...` |
+| e933 | JWT | 16500 | `eyJhbGciOiJIUzI1NiJ9.eyIzNDM2MzQyMCI6NTc2ODc1NDd9.YVWX_3IWKC7NpoDVtyr4Qzm6FQVA62aeHiTqj4U5ojI:password123` |
 | e934 | QNX-MD5 | 19000 | `@m,1000@88d84096c0656f7013e9c03af8c6f158@8741857532330050:password123` |
-| e935 | QNX-SHA256 | 19100 | `@s,1000@0f907e0c5ae79e486c0979f31b2d2ed20eaa38d6a04a720749530f12bd5bfb94@5498317092471604:passwor...` |
-| e936 | QNX-SHA512 | 19200 | `@S,1000@a16f7fee0d37b2e3bad06ba26f0caff09095e19face700ecdd8d78d626d358da4408951f714c609122444757a...` |
-| e937 | QNX7-SHA512 | 19210 | `@S,4096@GSsZxLYkRND57XdXo2rfNQ0DtKdME1c7SWdrjyFvq4RgFuTWj2NlkVJHIslAY1lIQh7j9VhN8BVVTu7jDKKqXA==@...` |
-| e938 | SHA1-S1PS2 | 19300 | `2c4b7771baf3ee5ea6576c528582db4f937db71b:18463812876898603420835420139870031762867:44495164251936...` |
+| e935 | QNX-SHA256 | 19100 | `@s,1000@0f907e0c5ae79e486c0979f31b2d2ed20eaa38d6a04a720749530f12bd5bfb94@5498317092471604:password123` |
+| e936 | QNX-SHA512 | 19200 | `@S,1000@a16f7fee0d37b2e3bad06ba26f0caff09095e19face700ecdd8d78d626d358da4408951f714c609122444757af7376555d4733e445ca0b5ecc65b4fa4209fae5@2257314490293159:password123` |
+| e937 | QNX7-SHA512 | 19210 | `@S,4096@GSsZxLYkRND57XdXo2rfNQ0DtKdME1c7SWdrjyFvq4RgFuTWj2NlkVJHIslAY1lIQh7j9VhN8BVVTu7jDKKqXA==@NDY2MDEwNjk3YjBjYzM2MzliMzc3Mzc0ZTNiMTAzNzE=:password123` |
+| e938 | SHA1-S1PS2 | 19300 | `2c4b7771baf3ee5ea6576c528582db4f937db71b:18463812876898603420835420139870031762867:4449516425193605979760642927684590668549584534278112685644182848763890902699756869283142014018311837025441092624864168514500447147373198033271040848851687108629922695275682773136540885737874252666804716579965812709728589952868736177317883550827482248620334:password123` |
 | e939 | RAILS-RESTFUL | 19500 | `738a19a9439ffbd44a5b44eb9c84843b571f4644:238769868762:8962783556527653675:password123` |
-| e940 | KRB5PA-17 | 19800 | `$krb5pa$17$hashpipe$HASHPIPEDOMAIN.FAKE$87d690b66ff46a8b55bb9eb4152848c595d6c33837954d627dc9ce19b...` |
-| e941 | KRB5PA-18 | 19900 | `$krb5pa$18$hashpipe$HASHPIPEDOMAIN.FAKE$ce165afbd18b9b6f50ed9cb9954cd77c0c7a6054a26dbe5607206ed45...` |
-| e942 | WPA-PMKID | 16800,22000 | `WPA*01*73e1a080000ac80417aa784bec8627fa*fc690c158264*f4747f87f9f4*686173686361742d6573736964***:p...` |
-| e943 | WPA-EAPOL | n/a | `WPA*02*7703121020ac20025ce3347aba2ccf55*fc690c158264*f4747f87f9f4*686173686361742d6573736964*10e3...` |
-| e944 | ANSIBLE-VAULT | 16900 | `$ansible$0*0*6b761adc6faeb0cc0bf197d3d4a4a7d3f1682e4b169cae8fa6b459b3214ed41e*426d313c5809d4a80a4...` |
-| e945 | APFS | 18300 | `$fvde$2$16$58778104701476542047675521040224$20000$c75ba59230e2d14c19eb26a75176d853c88dce8ec8996f7...` |
+| e940 | KRB5PA-17 | 19800 | `$krb5pa$17$hashpipe$HASHPIPEDOMAIN.FAKE$87d690b66ff46a8b55bb9eb4152848c595d6c33837954d627dc9ce19bbc32768e9a1dad8c63c27edbbd4e6f361534a48b8d7fe055b61f9cf:password123` |
+| e941 | KRB5PA-18 | 19900 | `$krb5pa$18$hashpipe$HASHPIPEDOMAIN.FAKE$ce165afbd18b9b6f50ed9cb9954cd77c0c7a6054a26dbe5607206ed459156b27df4a6db33cc1e39aa1263ddfd6c45540af2b316e109da4ca:password123` |
+| e942 | WPA-PMKID | 16800,22000 | `WPA*01*73e1a080000ac80417aa784bec8627fa*fc690c158264*f4747f87f9f4*686173686361742d6573736964***:password123` |
+| e943 | WPA-EAPOL | n/a | `WPA*02*7703121020ac20025ce3347aba2ccf55*fc690c158264*f4747f87f9f4*686173686361742d6573736964*10e3be3b005a629e89de088d6a2fdc489db83ad4764f2d186b9cde15446e972e*0103007502010a0000000000000000000148ce2ccba9c1fda130ff2fbbfb4fd3b063d1a93920b0f7df54a5cbf787b16171000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001630140100000fac040100000fac040100000fac028000*00:password123` |
+| e944 | ANSIBLE-VAULT | 16900 | `$ansible$0*0*6b761adc6faeb0cc0bf197d3d4a4a7d3f1682e4b169cae8fa6b459b3214ed41e*426d313c5809d4a80a4b9bc7d4823070*5c9c6a909aae4c1eb624a6ae99b952586a9ed57eb938cbe089a950d9213a98aa:password123` |
+| e945 | APFS | 18300 | `$fvde$2$16$58778104701476542047675521040224$20000$c75ba59230e2d14c19eb26a75176d853c88dce8ec8996f745fff5050073987391ac0092d7009b131:password123` |
 | e946 | OTM-SHA256 | 20600 | `otm_sha256:1000:1234567890:VXxvkQcU+34QHlMrdScpmdbKTHi8oA41M4VBfy1z3zc=:password123` |
-| e947 | TELEGRAM-SHA256 | 22301 | `$telegram$0*3f5ac7633b523d99d01ea3f99950be1d783d55e377e06f3bff98ccb9a3b20122*25184098058621950709...` |
+| e947 | TELEGRAM-SHA256 | 22301 | `$telegram$0*3f5ac7633b523d99d01ea3f99950be1d783d55e377e06f3bff98ccb9a3b20122*25184098058621950709328221838128:password123` |
 | e948 | WEB2PY-SHA512 | 21600 | `pbkdf2(1000,20,sha512)$744943$ab14362b46e20205dbab6fa947da10c05ee34027:password123` |
-| e949 | SOLARWINDS | 21500 | `$solarwinds$0$admin$M+blDF6m56Y24YMVrjDDGUEbGVsviTpp5JYS+pHfym1Z9+UDDw6iHfZRUknm89UUa/EnuH5t7x8MR...` |
-| e950 | SOLARWINDS2 | 21501 | `$solarwinds$1$3pHkk55NTYpAeV3EJjcAww==$G/b0s7BdfWnW4288yY55lK3McRo2dP9BdjInZtv7oo6V+JVh8wUHd1K13p...` |
+| e949 | SOLARWINDS | 21500 | `$solarwinds$0$admin$M+blDF6m56Y24YMVrjDDGUEbGVsviTpp5JYS+pHfym1Z9+UDDw6iHfZRUknm89UUa/EnuH5t7x8MREolxvf7jA==:password123` |
+| e950 | SOLARWINDS2 | 21501 | `$solarwinds$1$3pHkk55NTYpAeV3EJjcAww==$G/b0s7BdfWnW4288yY55lK3McRo2dP9BdjInZtv7oo6V+JVh8wUHd1K13pfwc6E2X/YEZJ63kz3GMXKrH/v27A==:password123` |
 | e951 | SIMPLACMS | 22800 | `441221148454752d603b223d12977320:8e86a279d6e182b3c811c559e6b15484:password123` |
-| e952 | APPLE-KEYCHAIN | 23100 | `$keychain$*74cd1efd49e54a8fdc8750288801e09fa26a33b1*66001ad4e0498dc7*cfc13fbe9043b537f82101e5ff7c...` |
-| e953 | APPLE-IWORK | 23300 | `$iwork$2$1$1$4000$b31b7320d1e7a5ee$01f54d6f9e5090eb16fef2b05f8242bc$be7d23232a5fc51d875ef4343586a...` |
-| e954 | BITWARDEN | 23400 | `$bitwarden$2*100000*2*bm9yZXBseUBoYXNoY2F0Lm5ldA==*7DPaaAl24R+4E1ehI4S1N2kiIBY9H3W0qS2C8o5v4nE=:p...` |
+| e952 | APPLE-KEYCHAIN | 23100 | `$keychain$*74cd1efd49e54a8fdc8750288801e09fa26a33b1*66001ad4e0498dc7*cfc13fbe9043b537f82101e5ff7c1dcda68e546fa1d225004969db9aaa8ffa0a09391a6ea5acc434da322198378f3cd0:password123` |
+| e953 | APPLE-IWORK | 23300 | `$iwork$2$1$1$4000$b31b7320d1e7a5ee$01f54d6f9e5090eb16fef2b05f8242bc$be7d23232a5fc51d875ef4343586aff0603cf9df10f24e33c34edd813eb5e770ba0b6251af83186a097820a8fabc4d1effa198a5d4556e21a8a32d3ea60781db:password123` |
+| e954 | BITWARDEN | 23400 | `$bitwarden$2*100000*2*bm9yZXBseUBoYXNoY2F0Lm5ldA==*7DPaaAl24R+4E1ehI4S1N2kiIBY9H3W0qS2C8o5v4nE=:password123` |
 | e955 | MONGODB-SHA1 | 24100 | `$mongodb-scram$*0*dXNlcg==*10000*4p+f1tKpK18hQqrVr0UGOw==*+TqMh0BgBUxzv36wfXoRiKwfw34=:password123` |
-| e956 | MONGODB-SHA256 | 24200 | `$mongodb-scram$*1**15000*qYaA1K1ZZSSpWfY+yqShlcTn0XVcrNipxiYCLQ==*B3T1SAp4Rlryqmm5sdJdGUzAM7lzQyH...` |
+| e956 | MONGODB-SHA256 | 24200 | `$mongodb-scram$*1**15000*qYaA1K1ZZSSpWfY+yqShlcTn0XVcrNipxiYCLQ==*B3T1SAp4Rlryqmm5sdJdGUzAM7lzQyH7h/XPSN71mFA=:password123` |
 | e957 | FORTIGATE256 | 26300 | `SH2FCIhM0IUIQVFJgcDRi8y4h+RPUoet9Ij4x2A2r8N+kp3ClVyJltoBYACm5M=:password123` |
 | e958 | UMBRACO | 24800 | `tq6LWqKjIla9vxhahealHJxJY8s=:password123` |
 | e959 | DAHUA-AUTH | 24900 | `sY6ww5dO:password123` |
 | e960 | BESDER-AUTH | 24901 | `sYyowxdO:password123` |
-| e961 | SQLCIPHER | 24600 | `SQLCIPHER*1*64000*25548249195677404156261816261456*85b5e156e1cf1e0be5e9f4217186817b*33265289beab0...` |
+| e961 | SQLCIPHER | 24600 | `SQLCIPHER*1*64000*25548249195677404156261816261456*85b5e156e1cf1e0be5e9f4217186817b*33265289beab040faf0d638861cba205:password123` |
 | e962 | RORAILS-SHA1 | 27200 | `9363ba0339ef7beb13b59f3b8dbcf3b8b5fbe6bf:5dcc47b04c49d3c8e1b9e4ec367fddeed21b7b85:password123` |
 | e963 | AES128-NOKDF | 26401 | `0458fc918468d9cca6e8e7e8bdb85801:86046627772965328523223752173724:password123` |
 | e964 | AES192-NOKDF | 26402 | `68045bbdee1c8d7c9d167d76177be05c:49869364034411376791729962721320:password123` |
 | e965 | AES256-NOKDF | 26403 | `6f7f3aaf0e36cd496fa9d704584afb42:61270210011294880287232432636227:password123` |
-| e966 | VMWARE-VMX | 27400 | `$vmx$0$10000$264bbab02fdf7c1a793651120bec3723$cbb368564d8dfb99f509d4922f469341a6e18a778759e00378c...` |
+| e966 | VMWARE-VMX | 27400 | `$vmx$0$10000$264bbab02fdf7c1a793651120bec3723$cbb368564d8dfb99f509d4922f469341a6e18a778759e00378c50087feaf1552:password123` |
 | e967 | BCRYPTSHA512 | 28400 | `$2a$05$RndSa1tRndSa1tRndSa1tuGAL47xENrIOe1cL89GFQH/bc4mp64Hy:password123` |
-| e968 | POSTGRESSCRAM256 | 28600 | `SCRAM-SHA-256$4096:IKfxyYOHyqPkoSUM8TgKkA==$v6UrTg19oAlY0aDMyijgZwTq9fEGNIRE650DWrsqIXQ=:*:passwo...` |
-| e969 | AWSSIGV4 | 28700 | `$AWS-Sig-v4$0$20220221T000000Z$us-east-1$s3$421ab6e4af9f49fa30fa9c253fcfeb2ce91668e139e6b23303c5f...` |
+| e968 | POSTGRESSCRAM256 | 28600 | `SCRAM-SHA-256$4096:IKfxyYOHyqPkoSUM8TgKkA==$v6UrTg19oAlY0aDMyijgZwTq9fEGNIRE650DWrsqIXQ=:*:password123` |
+| e969 | AWSSIGV4 | 28700 | `$AWS-Sig-v4$0$20220221T000000Z$us-east-1$s3$421ab6e4af9f49fa30fa9c253fcfeb2ce91668e139e6b23303c5f75b04f8a3c4$ef3a8acaee907d0810ebed5fc7fd33072c5fd787f42e17187b9a08aefdb0bcdf:password123` |
 | e970 | KRB5DB17 | 28800 | `$krb5db$17$test$TEST.LOCAL$ea35f3bdc1c4fdb75c708405d8273e51:password123` |
-| e971 | KRB5DB18 | 28900 | `$krb5db$18$test$TEST.LOCAL$d7fbc0329154eda6b067f57d206199173dfb0b5b3fea74d0ddda2127981d62f1:passw...` |
+| e971 | KRB5DB18 | 28900 | `$krb5db$18$test$TEST.LOCAL$d7fbc0329154eda6b067f57d206199173dfb0b5b3fea74d0ddda2127981d62f1:password123` |
 | e972 | MURMUR3 | 27800 | `43d88d27:00000000:password123` |
-| e973 | VEEAM-VBK | 31200 | `$vbk$*5473170276914975274149596062599620739968828454193370239477596097873069550438215522340544434...` |
-| e974 | MSSNTP | 31300 | `$sntp-ms$4da11e6ad992140a420d88062b8e2ae3$9077336975368113429621409555671085264896247165666969713...` |
+| e973 | VEEAM-VBK | 31200 | `$vbk$*54731702769149752741495960625996207399688284541933702394775960978730695504382155223405444342855920150089170058956647576461877712*10000*448812102f7669e53dde96be5614587a:password123` |
+| e974 | MSSNTP | 31300 | `$sntp-ms$4da11e6ad992140a420d88062b8e2ae3$907733697536811342962140955567108526489624716566696971338784438986103976327367763739445744705380:password123` |
 | e975 | SSPR-MD5 | 32000 | `$sspr$0$100000$NONE$b053b034085c87139bfa696318aa8086:password123` |
 | e976 | SSPR-SHA1 | 32010 | `$sspr$1$100000$NONE$af35f222b94c26aa8eec2198ce0b98c305bc3ba2:password123` |
 | e977 | SSPR-SHA1S | 32020 | `$sspr$2$100000$CxCpGqosk9PkCBcoRFp6DLjjRhVEJKK8$c87d697549444287f755ca4209bf66ccf46caefe:password123` |
-| e978 | SSPR-SHA256 | 32030,32031 | `$sspr$3$100000$ODk2NDA5Mjc2NDIwMjMwMjQyMTQ1NzMz$3cce91a82abf97b70c3836516ce2c4033cff16bffe10de6a1...` |
-| e979 | SSPR-SHA512 | 32040,32041 | `$sspr$4$100000$NzYwNjMyNDc2MTQ2OTE4NTUzODAyODE3$f1a614b4400702da2d49c8ee3f3b5f835dabc92ba1fd19247...` |
-| e980 | EMPIRECMS | 32300 | `7a9664f3d30b08ec71e6b201491392ea:726620866134417802643053384570:605629133966506031772857216549618...` |
+| e978 | SSPR-SHA256 | 32030,32031 | `$sspr$3$100000$ODk2NDA5Mjc2NDIwMjMwMjQyMTQ1NzMz$3cce91a82abf97b70c3836516ce2c4033cff16bffe10de6a1d4a900e1789e0b8:password123` |
+| e979 | SSPR-SHA512 | 32040,32041 | `$sspr$4$100000$NzYwNjMyNDc2MTQ2OTE4NTUzODAyODE3$f1a614b4400702da2d49c8ee3f3b5f835dabc92ba1fd192471cbab80e9f3acb24edcfb0fa0b7acf74233a1f87c880f76a3052d5bd68e5f1fdcfbaafd7f98c08e:password123` |
+| e980 | EMPIRECMS | 32300 | `7a9664f3d30b08ec71e6b201491392ea:726620866134417802643053384570:6056291339665060317728572165496183:password123` |
 | e981 | PBKDF1-SHA1 | 32900 | `PBKDF1:sha1:1000:cGVuZ3VpbmtlZXBlcg==:ojgqgSA34VYUi3u7iXF/vNKR6/E=:password123` |
-| e982 | MSONLINE | 33700 | `$MSONLINEACCOUNT$0$10000$6153d80b93f4f3c4082576154118d4191744911d6370b505e823d049375654ef:passwor...` |
+| e982 | MSONLINE | 33700 | `$MSONLINEACCOUNT$0$10000$6153d80b93f4f3c4082576154118d4191744911d6370b505e823d049375654ef:password123` |
 | e983 | WBB4 | 33800 | `$2a$08$aaaaaaaaaaaaaaaaaaaaaOTh6vK9mhTsqbydr1hjy8VMv24KoT/pS:password123` |
-| e984 | SAPCODVNH512 | 35000 | `{x-isSHA512, 15000}sWjKv3fK8srBNiZxspxwl2HnFSlo7tpAQkVFwOlvcS00IPHEYWM2OAG3Q8VZ7kxJq7+N5kfZI67otz...` |
+| e984 | SAPCODVNH512 | 35000 | `{x-isSHA512, 15000}sWjKv3fK8srBNiZxspxwl2HnFSlo7tpAQkVFwOlvcS00IPHEYWM2OAG3Q8VZ7kxJq7+N5kfZI67otz3E3ugXLTY4NTQ4MDY1NzQ2NA==:password123` |
 | e985 | SM3CRYPT | 35100 | `$sm3$aaaaaaaaaaaaaaaa$9hj3BsTKoxVnrt6XmdzPzkD4Xi1i8VVI6wk6t.RK.w7:password123` |
 | e986 | AS400SSHA1 | 35200 | `$as400$ssha1$*QTEST1*228267B3F408E739F5A577554E978DD05536A3ED:password123` |
-| e987 | ARGON2 | 34000 | `$argon2id$v=19$m=65536,t=3,p=1$AAAAAAAAAAAAAAAAAAAAAA$g21LGibBQ2iHFjsbopcv8xkV8FNXi1tW6wD6GcyKB7I...` |
+| e987 | ARGON2 | 34000 | `3118004b2f9ce8fcf3abc2fdf9623b85988db360951c607456beb26821381a12:aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb:3_32_2_67108864:password123` |
 | e988 | SM3 | 31100 | `2d31559bd1c4a05661c984d1c50a22ae2df2323d64756569e40b3e2f8e24884a:password123` |
 | e989 | BCRYPTHMACSHA256 | 30601 | `$bcrypt-sha256$v=2,t=2b,r=5$RndSa1tRndSa1tRndSa1tu$wLxHrJMAHPX7Br7IB1EkHSpfXdnxnTC:password123` |
-| e990 | WPA-PMK | 22001 | `WPA*01*5ce7ebe97a1bbfeb2822ae627b726d5b*27462da350ac*accd10fb464e*686173686361742d6573736964***:8...` |
+| e990 | WPA-PMK | 22001 | `WPA*01*5ce7ebe97a1bbfeb2822ae627b726d5b*27462da350ac*accd10fb464e*686173686361742d6573736964***:88f43854ae7b1624fc2ab7724859e795130f4843c7535729e819cf92f39535dc` |
 | e991 | MD5SALT1SALT2 | 33000 | `7af9397a334889154d305e3bea6e251b:salt1:salt2:password123` |
-| e992 | SYMFONY256 | 35800 | `b131e8c370fcafef01c2a7604b5fe9646e2db46df559b05237d3e45e1afb7650:salt1234salt5678:password123` |
+| e992 | SYMFONY256 | 35800 | `6237e4b6238fca766e94c3a9073f4f48fbafecc23f600be17aadefe2b380a3f4:salt1234salt5678:password123` |
 | e993 | WPBCRYPT | 35500 | `$wp$2b$05$RndSa1tRndSa1tRndSa1tugwc9wduHyReZB0wwYpf/1LAbf.pn.Fa:password123` |
-| e994 | GOST12512CRYPT | 35600 | `$gost12512hash$defaultS$NF.9WTf1BfkSz8fQjCsT9zm6REXDO8/yr50P2tYsFyrOuQJdbqeNdz6qSBaqyWCFciwEpcVIe...` |
+| e994 | GOST12512CRYPT | 35600 | `$gost12512hash$defaultS$NF.9WTf1BfkSz8fQjCsT9zm6REXDO8/yr50P2tYsFyrOuQJdbqeNdz6qSBaqyWCFciwEpcVIeCY1ZPRYshNd1.:password123` |
+| e995 | YESCRYPT | 67000 | `$y$j9T$oJqQoBLMgF5$pBqTJqEvFJtoVI6cTYyiWvIC2SChnMT0afD0GTKETv7:password123` |
+| e996 | MD5SHA256SHA256 | n/a | `8a57b25942cc35b35a6b05a9e2d7fd7d:password123` |
+| e997 | BSDICRYPT | 12400 | `_J9......I6Q/yEZj5OA:password123` |
+| e998 | GOST-YESCRYPT | 46100 | `$gy$j9T$..igJoezyNUNJoa0jZYOO/$KvgUPwQibautXy0oj28Skm4nkIM918Fn8m53qZPaNJD:password123` |
+| e999 | SHA1CRYPT | 15100 | `$sha1$5000$rndSa1t$ALxwxoUXoLh.IqKoUKiiKctunvFY:password123` |
+| e1000 | 7ZIP | 11600 | `$7z$2$19$0$$16$cbe826c3ca7eacb29c3be1fe55a1dc7c$2342977848$48$37$984c3361994832363504cead5cc83953f40044b0441a4ef07c32ac14f6372241$33$00:password123` |
+| e1001 | CMIYC | n/a | `$cmiyc$2026$1$10$AAAAAAAAAAAAAAAAAAAAAA$YreQXc5mD8bWReTEZqohX4CGrA7xWIXFX_JzDhJkLfo:password123` |
+| e1002 | RMD256 | n/a | `afbd6e228b9d8cbbcef5ca2d03e6dba10ac0bc7dcbe4680e1e42d2e975459b65:abc` |
+| e1003 | MD4SALTPASS | n/a | `6130dbd8f17cec94c3077e7bb21fa9a0:administrator:password123` |
+| e1004 | MD4PASSSALT | n/a | `0694290624fe4dc7b3b140bde0741eec:administrator:password123` |
+| e1005 | SHA1UCUSERPASS | n/a | `ed62e880d893dfe7f953000951602ce7932e8503:administrator:password123` |
+| e1006 | SHA1USERCOLONPASS | n/a | `0c0a719f6d39e6685856e8aef8317a41800bbe99:administrator:password123` |
+| e1007 | MD5PASSSALTMD5PASSSALT | n/a | `07a4c8a48e3fd0610f81d24504f34c8a:aaaSXB:password123` |
+| e1008 | QAS-VASAUTH | n/a | `3379b2f8bcff3e26cbbfff24a9e70933fc0dff54e6ca72938b09aab008ec344d:C34208EA-8C33-473D-A9B4-53FB40347EA0:password123` |
+| e1009 | POSTOFFICE | n/a | `6ea0219af11769f174c2d7cafc12411e:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:password123` |
+| e1010 | IPB2 | n/a | `801f6df476ac42760f021b979d04a46b:2e75504633:password123` |
+| e1011 | MD5USERMD5PASSSALT | n/a | `77700f6a12d5939b42df03fa313055c2:aaaSXB:administrator:password123` |
+| e1012 | RVARY | n/a | `7166b7c204ce67f4:password123` |
+| e1013 | SHA512RAWPASSSALT | n/a | `a7a2a6174d5c151e0df2052271a0184fb38ed4761209141cca085401d5be5584b4979af0f365204a11876fa7b6a83ebc31bd1fde7014e1456165393d20e74e59:DB1C19C0:password123` |
+| e1014 | EPISERVER-SID | n/a | `516aee1808f5ec7f26fe293d34dbbd1e987af364:5F1D84A6DE97E2BEFB637A3CB5318AFEF0750B856CF1836BD1D4470175BE:password123` |
+| e1015 | ORACLE11 | n/a | `EB7F2C5FFA3D1F4FC84907015EF1091E491071C7903603F2C52ED1B4D642:password123` |
+| e1016 | SAPCODVNH256 | n/a | `{x-isSHA256, 3000}UqMnsr5BYN+uornWC7yhGa/Wj0u5tshX19mDUQSlgih6OTFoZjRpMQ==:booboo` |
+| e1017 | SAPCODVNH384 | n/a | `{x-isSHA384, 5000}3O/F4YGKNmIYHDu7ZQ7Q+ioCOQi4HRY4yrggKptAU9DtmHigCuGqBiAPVbKbEAfGTzh4YlZLWUM=:booboo` |
+| e1018 | MONGODB | n/a | `$mongodb$0$sa$75692b1d11c072c6c79332e248c4f699:sa` |
+| e1019 | H3C | n/a | `$h$6$4tWqOiqovcWddOKv$XyFMVgaE46fGiqsZEHbcr+BM/m9tDkvahDbqU7HoNrvmALk2u31z9c/tuUmX7IiQhWRwN5qoZquW82A8XYaDWA==:abc` |
+| e1020 | ARGON2MD5 | n/a | `$argon2id$v=19$m=65536,t=3,p=1$QUFBQUFBQUFBQUFBQUFBQQ$tfFVjXN7s2JLYKv2e4ctPK5B/3gVohhZA/vcbKx4PVQ:password123` |
+| e1021 | DRAGONFLY3-32 | n/a | `$3$z$EBG66iBCGfUfENOfqLUH/r9xQxI1cG373/hRop6j.oWs:magnum` |
+| e1022 | DRAGONFLY3-64 | n/a | `$3$z$sNV7KLtLxvJRsj2MfBtGZFuzXP3CECITaFq/rvsy.Y.Q:magnum` |
+| e1023 | DRAGONFLY4-32 | n/a | `$4$7E48ul$K4u43llx1P184KZBoILl2hnFLBHj6.486TtxWA.EA1pLZuQS7P5k0LQqyEULux47.5vttDbSo/Cbpsez.AUI:magnum` |
+| e1024 | DRAGONFLY4-64 | n/a | `$4$7E48ul$9or6.L/T.iChtPIGY4.vIgdYEmMkTW7Ru4OJxtGJtonCQo.wu3.bS4UPlUc2B8CAfGo1Oi5PgQvfhzNQ.A8v:magnum` |
+| e1025 | GOST12256CRYPT | n/a | `$gost12256hash$password$awrQfwgXMa0BFMCtZu97GJKqeVszI/B2usmTf9cpOa/:magnum` |
+| e1026 | GOST94CRYPT | n/a | `$gost94hash$salt$sG.6rfU0vKHX4eL00bUDqjXxaAcQHqpJQlM3ctfj013:magnum` |
+| e1027 | SUNMD5 | n/a | `$md5$rounds=904$Vc3VgyFx44iS8.Yu$Scf90iLWN6O6mT9TA06NK/:test` |
+| e1028 | CRYPTOPPLEGACY | n/a | `3DDC35B38270872954DA6A445397860FA8BBFEC184353FFAAEA87A16D72B68FD:secret:password123` |
+| e1029 | CRYPTOPPDEFAULT | n/a | `0123456789ABCDEF3EE042F5D20F9FE50E19BB2ECDBC86F6C9E9C06F7788B523CEB2ECD09700248D:secret:password123` |
