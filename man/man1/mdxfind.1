@@ -1,8 +1,11 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.10 $
+.\" $Revision: 1.11 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.11  2026/09/27 15:36:20  dlr
+.\" TH to the current build: covers the seventeen hash types e1030 to e1046 added in mdxfind.c 1.604 to 1.606 and hashpipe.c 1.211 to 1.213. The type table itself lives in hx.8, which carries all seventeen; these pages are unchanged apart from the version line.
+.\"
 .\" Revision 1.10  2026/09/17 11:55:59  dlr
 .\" Bump to mdxfind 1.590; the ENVIRONMENT rewrite documents the removal that shipped in 1.590, and the .TH still said 1.589 from the -f fix.
 .\"
@@ -37,7 +40,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-09-17" "mdxfind 1.590" "Password Recovery"
+.TH MDXFIND 1 "2026-09-27" "mdxfind 1.606" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS

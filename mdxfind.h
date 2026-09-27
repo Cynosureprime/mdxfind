@@ -1,5 +1,8 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.31  2026/09/24 15:28:32  dlr
+ * Add JOBFLAG_MASK_SUBCHUNK on the free bit 8, marking the sub-chunks of a mask job split across threads so the retirement path can credit their shared seed lines once. See mdxfind.c 1.601. This revision also carries a working-file edit that was already present and is not mine: a historical log entry now reads Waffle where it read a personal name.
+ *
  * Revision 1.30  2026/09/17 06:11:54  dlr
  * Correct the bf_fast_eligible note: the condition no longer includes an environment variable. MDXFIND_GPU_FAST_DISABLE could veto the BF-fast MD5 template kernel and was removed 2026-09-16.
  *
@@ -356,6 +359,12 @@ struct job {
 #define JOBFLAG_PRINT 1
 #define JOBFLAG_HEX 2
 #define JOBFLAG_NUMBERS 4
+/* A -n/-N job split across threads: every sub-chunk carries the same seed
+ * lines and must NOT re-retire them.  The submission site already credits
+ * InflightLines once per batch; without the matching guard on the
+ * retirement side the line counters inflate by the chunk factor, which is
+ * how a 29-line wordlist came to report "line 1421" at 100 percent. */
+#define JOBFLAG_MASK_SUBCHUNK 8
 #define JOBFLAG_PREPEND 16
 #define JOBFLAG_GPU 32
 #define JOBFLAG_BRUTEFORCE 64

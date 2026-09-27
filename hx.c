@@ -12,7 +12,13 @@
  */
 
 /*
- * $Log$
+ * $Log: hx.c,v $
+ * Revision 1.6  2026/09/25 16:27:35  dlr
+ * Refuse an oversized $TESTVEC[] rather than shortening it. hx_expand_testvec clamped to HX_MAX_TESTVEC, which returns a well-formed digest for a password that was never presented and gives the caller no way to notice. It now names the requested size and the limit and exits 1. Pairs with hashpipe.c, where -X does the same and the bound is now the same number on both, so the 2 MB stated in hx.1 holds wherever a vector is read. The verify path in hashpipe keeps clamping on purpose, since a bulk ledger run should skip one oversized record rather than abort.
+ *
+ * Revision 1.5  2026/09/25 16:21:52  dlr
+ * $TESTVEC[] was never supported in the standalone hx: it is a REPEAT COUNT and both decode paths treated it as a hex container. The comment stated the belief -- dollar TESTVEC bracket, same hex decoding, for large binary vectors -- and the code hex-decoded the text after the prefix until the first non-hex character. So a vector of 10,240 zero bytes read the pattern 00, stopped at the space, and hashed ONE NUL: md5 returned 93b885adfe0da089cdf634904fd59f71 where the true digest is 1276481102f218c981e0324180bafd9f. Well formed, no diagnostic, exit 0, and the notation exists precisely for vectors too large to check by eye. The -p path and the stdin path each carried their own copy of that loop, and the stdin one decoded in place into the line buffer, which cannot hold an expansion. There is now ONE hx_expand_testvec used by both. That is not tidiness: fixing only the -p copy first left the two paths disagreeing on the same input, which is the argument for a single implementation made concrete. The pattern is hex, the count decimal, the separator any run of non-digits, the closing bracket optional; hashpipe.c decode_testvec_password is the reference and the two must accept the same shapes. HX_MAX_TESTVEC is hoisted to file scope, since a capacity constant only one function can see is how two callers come to disagree about it. Verified against independently computed digests: 10,240 NUL bytes on -p, 51,200 on stdin, and a four-fold deadbeef pattern all match, and all four channels -- hx -p, hx stdin, hashpipe -X and hashpipe -c -- now return the same digest for the same string. $HEX[] decoding is unchanged and malformed vectors still fall through to literal text.
+ *
  */
 
 #include <stdio.h>
@@ -162,6 +168,89 @@ static hx_node *do_parse(const char *expr, const char *script_file)
 	return hx_parse_result;
 }
 
+/* Hoisted to file scope from inside main: hx_expand_testvec below needs it,
+ * and a capacity constant that only one function can see is how two callers
+ * end up disagreeing about it. */
+#define HX_MAX_TESTVEC (2 * 1024 * 1024)  /* 2MB max decoded */
+
+/* Expand $TESTVEC[HH... x N] into a fresh buffer.
+ *
+ * Returns the expanded length and stores a malloc'd buffer in *out, or -1 if
+ * the string is not a well-formed vector, in which case *out is untouched and
+ * the caller should treat the text as literal.
+ *
+ * ONE implementation for both the -p and the stdin path. They each carried
+ * their own copy, both of which hex-decoded until the first non-hex character
+ * on the belief that $TESTVEC[ was a hex container like $HEX[. It is a REPEAT
+ * COUNT: $TESTVEC[00 x 10240] means 10,240 zero bytes, and the old code
+ * returned one, so md5 gave 93b885adfe0da089cdf634904fd59f71 where the true
+ * digest is 1276481102f218c981e0324180bafd9f -- well formed, no diagnostic,
+ * exit 0. Fixing one copy and not the other is how the two paths disagreed
+ * for a while during this change, which is the argument for there being one.
+ *
+ * The pattern is hex, the count is decimal, the separator is any run of
+ * non-digits, and the closing bracket is optional. hashpipe.c
+ * decode_testvec_password is the reference implementation and the two must
+ * accept the same shapes; it is static there, so this is a deliberate second
+ * implementation. If either moves, move both. */
+static int hx_expand_testvec(const char *src, int srclen, char **out)
+{
+#define HX_HEXDIG(c) ((c) >= '0' && (c) <= '9' ? (c) - '0' : \
+                      (c) >= 'a' && (c) <= 'f' ? (c) - 'a' + 10 : \
+                      (c) >= 'A' && (c) <= 'F' ? (c) - 'A' + 10 : -1)
+	const unsigned char *h = (const unsigned char *)src + 9;
+	const unsigned char *e = (const unsigned char *)src + srclen;
+	unsigned char pat[256];
+	int patlen = 0, i;
+	unsigned long long count = 0, total;
+	char *buf;
+
+	if (srclen <= 9 || strncmp(src, "$TESTVEC[", 9) != 0) return -1;
+	if (e > h && e[-1] == ']') e--;
+
+	while (h + 1 < e && patlen < (int)sizeof pat) {
+		int hi = HX_HEXDIG(h[0]);
+		int lo = HX_HEXDIG(h[1]);
+		if (hi < 0 || lo < 0) break;
+		pat[patlen++] = (unsigned char)((hi << 4) | lo);
+		h += 2;
+	}
+	while (h < e && (*h < '0' || *h > '9')) h++;
+	while (h < e && *h >= '0' && *h <= '9') {
+		if (count > 99999999ULL) return -1;   /* absurd; treat as literal */
+		count = count * 10ULL + (unsigned long long)(*h - '0');
+		h++;
+	}
+#undef HX_HEXDIG
+	if (patlen <= 0 || count == 0) return -1;
+
+	total = (unsigned long long)patlen * count;
+	if (total > (unsigned long long)HX_MAX_TESTVEC) {
+		/* Refuse rather than shorten.  A clamp here returns a
+		 * well-formed digest for a password that was never presented,
+		 * and the caller cannot tell: before this, the same 3,000,000
+		 * byte vector gave one answer from hx, a different one from
+		 * hashpipe -X, and no verify at all from hashpipe -c, because
+		 * each clamped at its own buffer size. */
+		fprintf(stderr,
+		        "hx: $TESTVEC[] expands to %llu bytes, over the %d byte "
+		        "limit; refusing to truncate it\n",
+		        total, HX_MAX_TESTVEC);
+		exit(1);
+	}
+
+	buf = malloc((size_t)total);
+	if (buf == NULL) {
+		fprintf(stderr, "hx: cannot allocate %llu bytes for the "
+		        "$TESTVEC[] vector\n", total);
+		exit(1);
+	}
+	for (i = 0; (unsigned long long)i < total; i++)
+		buf[i] = (char)pat[i % patlen];
+	*out = buf;
+	return (int)total;
+}
+
 int main(int argc, char **argv)
 {
 	int dump_ast = 0, dump_bytecode = 0;
@@ -255,9 +344,11 @@ int main(int argc, char **argv)
 	/* heap-allocated line buffer for stdin reading.
 	 * Must accommodate $TESTVEC[] up to 2MB decoded = 4MB hex + prefix.
 	 * NEVER stack-allocated — passwords can be very large. */
-#define HX_MAX_TESTVEC (2 * 1024 * 1024)  /* 2MB max decoded */
 	int linecap = HX_MAX_TESTVEC * 2 + 64;  /* room for hex + prefix */
 	char *linebuf = malloc(linecap);
+	char *tvbuf = NULL;   /* expanded $TESTVEC[] for the stdin path; a vector
+	                       * grows, so it cannot share linebuf the way the
+	                       * $HEX[] decode does */
 	if (!linebuf) { perror("malloc"); exit(1); }
 
 	if (password) {
@@ -290,27 +381,13 @@ int main(int argc, char **argv)
 			pw = decoded;
 			pwlen = dlen;
 		} else if (pwlen > 9 && strncmp(pw, "$TESTVEC[", 9) == 0) {
-			decoded = malloc(pwlen > HX_MAX_TESTVEC ? HX_MAX_TESTVEC : pwlen);
-			dlen = 0;
-			const unsigned char *h = (const unsigned char *)pw + 9;
-			while (*h) {
-				int hi, lo;
-				unsigned char c = *h;
-				if ((c >= '0' && c <= '9'))      hi = c - '0';
-				else if ((c >= 'a' && c <= 'f')) hi = c - 'a' + 10;
-				else if ((c >= 'A' && c <= 'F')) hi = c - 'A' + 10;
-				else break;
-				h++;
-				c = *h;
-				if ((c >= '0' && c <= '9'))      lo = c - '0';
-				else if ((c >= 'a' && c <= 'f')) lo = c - 'a' + 10;
-				else if ((c >= 'A' && c <= 'F')) lo = c - 'A' + 10;
-				else { decoded[dlen++] = hi << 4; break; }
-				h++;
-				decoded[dlen++] = (hi << 4) | lo;
+			int n = hx_expand_testvec(pw, pwlen, &decoded);
+			if (n >= 0) {
+				pw = decoded;
+				pwlen = n;
 			}
-			pw = decoded;
-			pwlen = dlen;
+			/* Malformed: leave pw as the literal text, which is what
+			 * every other unrecognised wrapper does here. */
 		}
 
 		{
@@ -372,28 +449,17 @@ int main(int argc, char **argv)
 				pwlen = dlen;
 			} else if (len > 9 &&
 			           strncmp(linebuf, "$TESTVEC[", 9) == 0) {
-				int dlen = 0;
-				const unsigned char *h =
-				    (const unsigned char *)linebuf + 9;
-				char *d = linebuf;
-				while (*h) {
-					int hi, lo;
-					unsigned char c = *h;
-					if ((c >= '0' && c <= '9'))      hi = c - '0';
-					else if ((c >= 'a' && c <= 'f')) hi = c - 'a' + 10;
-					else if ((c >= 'A' && c <= 'F')) hi = c - 'A' + 10;
-					else break;
-					h++;
-					c = *h;
-					if ((c >= '0' && c <= '9'))      lo = c - '0';
-					else if ((c >= 'a' && c <= 'f')) lo = c - 'a' + 10;
-					else if ((c >= 'A' && c <= 'F')) lo = c - 'A' + 10;
-					else { d[dlen++] = hi << 4; break; }
-					h++;
-					d[dlen++] = (hi << 4) | lo;
+				/* Not decoded in place: the $HEX[] branch above can
+				 * reuse linebuf because hex output is half its input,
+				 * but a vector EXPANDS and will not fit. */
+				char *tv = NULL;
+				int n = hx_expand_testvec(linebuf, len, &tv);
+				if (n >= 0) {
+					free(tvbuf);
+					tvbuf = tv;
+					pw = tvbuf;
+					pwlen = n;
 				}
-				pw = linebuf;
-				pwlen = dlen;
 			}
 
 			result = hx_vm_run(&vm,
@@ -412,6 +478,7 @@ int main(int argc, char **argv)
 	}
 
 	free(linebuf);
+	free(tvbuf);
 	}
 
 	hx_vm_free(&vm);

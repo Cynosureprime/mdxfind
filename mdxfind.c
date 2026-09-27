@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.596 2026/09/19 13:39:16 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.606 2026/09/27 06:16:49 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.596 2026/09/19 13:39:16 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.606 2026/09/27 06:16:49 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,36 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.606  2026/09/27 06:16:49  dlr
+ * Add e1043 to e1046: md5(md5(H(pass)) . H(pass)) for H in sha1, sha256, sha512 and md5. Named with the existing -1x convention rather than a new one: the -1x marker says the outer hash is over a CONCATENATION and not a chain, and a trailing p closes a term ending in (pass). Without those markers a name like MD5MD5SHA1SHA1 reads as a four-deep chain, which is a different digest with no diagnostic. The four are the exact skeleton of e330 MD5-1xSHA1MD5pSHA1p with the inner two primitives swapped, and they sit beside e322, e323, e330 and e331 in the same family. Each computes H(pass) once and reuses its hex both as the inner md5 input and as the second term, so a candidate costs H plus two md5. Appended at the END of Types[]; twelve existing indices verified byte-identical, including the four -1x siblings. All four agree with the hx VM, crack the supplied vectors at password 1111, and the dedup gate returned NO MATCH before implementation and MATCH after.
+ *
+ * Revision 1.605  2026/09/27 03:32:03  dlr
+ * Add twelve hash types, e1031 to e1042. Nine are unsalted chained-primitive types that reuse existing shared tails rather than duplicating them: WRLSHA1, MD5sub8-24MD5sub8-24MD5MD5MD5, MD5SHA1SHA1MD5SHA1MD5, MD5SHA1SHA1SHA1, MD5SHA1MD5SHA1MD5SHA1, MD5SHA512MD5, MD5sub1-16MD5, MD5sub1-28MD5, MD5MD5sub1-30MD5. Two are salted, following e441: MD5SALTLAST16 stores only the LAST 16 hex of its digest, so the last 8 bytes are copied to the front of a scratch union and reported as a 16-hex field; a prefix compare would have matched the wrong half. It is deliberately single-shot, because only the truncated value is stored and there is nothing defined to iterate: an -i 2 line was measured failing to verify in hashpipe. MD5SALTMD5PASS-PASS carries its site prefix as the SALT rather than a hardcoded literal, so one type covers every installation. APACHE-SHA-TRUNC16 is the RFC 2307 brace-SHA scheme of e457 with a 16-byte payload instead of 20; both carry the same tag so the loader routes on decoded payload length, and a 16-byte payload was previously decoded, failed the length test and was silently discarded. All names appended at the END of Types[]; fifteen existing indices verified byte-identical. Every construction was verified against the hx VM before implementation and the dedup gate returned NO MATCH for all twelve.
+ *
+ * Revision 1.604  2026/09/27 00:16:37  dlr
+ * Add e1030 MD5BASE64MD5SHA1: md5(base64(md5(sha1(pass)))). Appended at the end of Types[] as index 1030, never inserted beside its family, so no existing index moves; labels for a spread of eleven types across the table are byte-identical to 1.603. Typeopt[1030] is TYPEOPT_NEEDSF, matching the unsalted plain-hex siblings e233 and e255. The procjob case cannot simply sit next to JOB_MD5BASE64MD5, because JOB_MD5BASE64MD5MD5 already falls through into that body and would have acquired this type inner SHA-1 as well; it uses the family established idiom instead, a label b64md5 on the shared body reached by goto, as JOB_MD5BASE64SHA1RAW does with b64sha1raw. Every intermediate is consumed as its hex form; base64ing the raw bytes at either step gives a different digest and the three raw variants were each computed and differ. Verified against the supplied vector d06cfcf732dfbbd69159e55c04e0a4d3 and limpbizkit, with -z generating for arbitrary passwords and all eleven MD5BASE64 siblings unchanged. tools/hx_dedup_check reported NO MATCH over 1025 catalog entries before implementation.
+ *
+ * Revision 1.603  2026/09/24 19:17:36  dlr
+ * Restart the mask cursor at the chunk base, and lift the Numrules gates. job MaskIndex is a mutable cursor: seeded with the chunk base at submission, advanced at the bottom of the mask loop, and restarted by the rule-advance block on each new rule. It restarted at zero, which is right only when the job covers the whole keyspace; a chunked job owns base through base plus MaskCount, so every rule past the first walked the wrong range. This was not CPU-only: the rules-engine pack site takes the GPU chunk base from the same live cursor, so for each chunk the first rule got the right base and every later rule got zero, and the upper mask ranges were only ever searched by the first rule on both backends. The earlier rules-plus-mask test passed because a no-op colon rule coincides with the implicit no-rule pass, so its planted answers were reachable through the first rule. procjob now captures mask_base once per job and the three rule-advance sites restart there. The capture is guarded on a mask being configured, which keeps numeric mode correct since it carries Numbers in the same field, and makes the no-mask case literally zero so rules-only and legacy numeric paths are unchanged by construction. The pack site needs no edit; it now reads the base on every rule pass. Both Numrules at most 1 gates are gone, so rules-plus-mask gets the NDRange cap that closes its 32-bit lane exposure and the thread fan-out it lost in 1.602. Validated with answers that require a non-trivial rule at the LAST mask index, which no earlier test could reach: nine words by three rules by a six-position lowercase mask, chunked, found 4 of 4 on the CPU walker and 4 of 4 on a GTX 1080 with byte-identical hit sets, 8,340,725,952 candidates which is 27 times the mask exactly. CPU wall on four cores 529 seconds against 2066 single-threaded when gated. Regressions: the 1.600 no-rules reproducer still 2 of 2, rules-only without a mask still correct.
+ *
+ * Revision 1.602  2026/09/24 16:52:40  dlr
+ * Restore the Numrules gate on the NDRange cap. The 2026-05-26 thread fan-out carries Numrules at most 1 because the rule walker resets job MaskIndex to zero on every rule advance, discarding a chunk base; the cap added in 1.600 tested only for the presence of a mask and so chunked rules-plus-mask jobs for the first time. Measured on .205 with the CPU walker, which is the path that warning is about, 9 words by 3 rules by a six-position lowercase mask: chunked into six found 1 of 2 planted answers, gated found 2 of 2, both computing 8,340,725,952 candidates. Identical work, different coverage. The rules-plus-mask test that passed earlier ran the GPU path where the walker never executes, so it could not see this. Gating returns that combination to its pre-1.600 behaviour exactly, which means it is again uncapped and can exceed the kernel 32-bit lane bound the way the no-rules case did, and again unchunked so it runs on one worker thread. Both close together by making the per-rule reset restore the chunk base rather than zero it, after which the gate can be lifted. Verified unharmed after the change: no rules, nine words, six-position lowercase mask, 2 of 2 found, 9 lines processed, 2,780,241,984 candidates which is nine times the mask exactly.
+ *
+ * Revision 1.601  2026/09/24 15:28:31  dlr
+ * Two mask-chunking follow-ups to 1.600. (1) Line retirement is now credited once per batch, not once per sub-chunk. The submission site already guarded InflightLines with a check on chunk zero, but the retirement path credited TotLines, LINEHINTS retired_line and the InflightLines decrement on every sub-job, so the line counters inflated by the chunk factor. A 29-line wordlist under -n over a six-position printable mask reported line 1421 climbing by 261 every fifteen seconds, at 100 percent with the ETA reading finishing from the first tick, because the percentage is retired over total and the remaining-lines subtraction floors at zero once retired exceeds the file. Pre-existing since the 2026-05-26 fan-out, where the factor was the thread count; 1.600 raised it to the NDRange-derived chunk count and made it 620 times worse. New JOBFLAG_MASK_SUBCHUNK marks chunks past the first; hash, found and rule counts still accrue per sub-job because that is real work. InflightLines also stops underflowing, though nothing reads it. (2) The NDRange cap now compiles only under OPENCL_GPU. Metal omits the mask axis from its grid and walks rules and masks in an inner double loop per thread, so it cannot overflow on that axis, and because it ignores the chunk range and always uses the full mask total, every extra chunk recomputes the whole mask. Measured on an M1, one word over a four-position lowercase mask: one chunk 456,976 hashes, two chunks 913,952. The cap would have multiplied Metal work by the chunk count instead of dividing it. Verified on fpga, 29 words chunked: 2 of 2 found, 29 lines processed, 13,252,304 hashes which is 29 times the mask exactly. Verified on dev1 M1, 2000 words chunked: line 2000 not 4000, 2,000 lines processed.
+ *
+ * Revision 1.600  2026/09/24 03:17:10  dlr
+ * Mask fan-out now honours the NDRange ceiling. The -n chunker sized the mask axis alone, so the word axis entered the GPU lane count unbounded. The kernels bound themselves with a 32-bit n_words times n_rules times mask_size, which wrapped and retired most of the dispatch, while the 64-bit host counters still reported the full keyspace, so the run reconciled exactly and exited clean. Measured on a GTX 1080: nine lines of a five-position ?a mask found 0 of 2 known answers where eight lines found 2 of 2, and -t 17 found both where -t 16 found none; the production sweep of 223 prefixes returned 1 of 23. Chunk count is now the greater of the thread fan-out and the count needed to keep numline times rules times masks under MDX_NDRANGE_HARD, which is lifted to file scope out of adaptive_bf_chunk_size so both producers read one definition. That is the decision recorded in project_bf_chunk_as_job.md Q1 on 2026-05-09, which the brute-force producer has honoured since Phase 1.8 and this one never inherited. A producer that cannot chunk below a single mask index now exits rather than truncating. Validated on fpga: N=8 through 12 all 2 of 2, thread sweep 1 through 32 all 2 of 2, and no measurable throughput change at N=8 over three alternating runs. The CPU walker was never affected.
+ *
+ * Revision 1.599  2026/09/23 17:36:57  dlr
+ * BF bootstrap wait counts dispatching devices, not enumerated ones. The wait compared its seen count against gpu_opencl_num_devices(), which counts every enumerated device including one carrying device_disabled after a failed compact-table setup. gpujob_init spawns no worker for a disabled device (gpu/gpujob_opencl.c, the launch loop skips it with continue) and no dispatch ever stores into bf_dev_wall_us[] for that slot, so seen could not reach num_live on any partial-disable rig and the wait ran to the 180s safety cap: the same stall 1.598 removed for the single-device case, reached by a second route. num_live now comes from gpu_opencl_active_device_count(). my_slot is the enumerated device index, passed as launch(gpujob, (void *)(intptr_t)i), so the slot-indexed seen loop and the active count refer to the same set and n_workers equals the active count exactly. The trigger is compact-table VRAM failure on a large hash list, not -G, which selects devices by index and does not set device_disabled; a 100M-digest table cannot fit a 2 GB card, so any rig pairing a small card with a large one stalls every multi-chunk BF run. Validated on fpga 1080, single device where active equals enumerated so no behaviour change is expected and none occurred: ?b?b?b?b 1,332 hits, ?b?b?b 498, non-BF wordlist 498, -n ?b?b?b 190, all four result sets identical after sort; wall 5.82s, GPU idle 0 percent, hash_Gh/s 1.023, unchanged from 1.598. The partial-disable path itself is validated by inspection only: no host with two OpenCL devices was reachable. fpga enumerates one device, hpi7 enumerates one (GTX 960, its HD 530 disabled in BIOS, only nvidia.icd installed), ioblade did not answer.
+ *
+ * Revision 1.598  2026/09/23 15:38:12  dlr
+ * BF bootstrap-wait deadlock. adaptive_bf_chunk_size armed the Phase 1.4b bootstrap wait at bf_chunks_produced > 0, while the exit condition added by Phase 1.7c/M3 requires every live device to have completed TWO dispatches: the first per slot is deferred as JIT-contaminated and only the second stores a wall into bf_dev_wall_us[]. The producer is the sole source of chunks, so arming after one chunk made the exit condition unreachable, and every multi-chunk BF run ran to the 180s safety cap reporting seen=0/N. num_live is now computed ahead of the guard and the wait arms at bf_chunks_produced >= 2*num_live. Single-chunk runs never reach the producer a second time and were never affected, which is why the 8d/9d validation missed it; the ioblade cold-cache note in Phase 1.7c that raised the cap from 60s to 180s was this deadlock, and the raise tripled the stall rather than fixing it. Measured on fpga 1080, 667,379 digests, mask ?b?b?b?b: wall 185.04s to 5.82s, GPU idle 180.72s (98 percent) to 0.01s (0 percent), hash_Gh/s 1.034 to 1.023 which is the documented Phase 1.7 baseline, 1,332 hits with the result set identical after sort. Single-chunk ?b?b?b 498 hits identical; non-BF wordlist 498 hits identical. Known remaining path to the same cap: the wait counts gpu_opencl_num_devices() rather than gpu_opencl_active_device_count(), so a -G excluded device is waited on although it never dispatches; not changed here because it cannot be validated on a single-GPU host.
+ *
+ * Revision 1.597  2026/09/23 04:04:10  dlr
+ * mdxfind: two GPU mask defects. (1) ?b computed 1 candidate, not 256. Per-position charset sizes cross to the GPU as uint8_t and ?b is the only built-in class with 256 members, so (uint8_t)256 became 0 and the kernel enumerated one candidate per position: -n ?b?b?b did 16 of 16,777,216 hashes, reported a normal completion and said None found. Measured on a GTX 1080: 253->253, 254->254, 255->255, 256->1. CPU was never affected -- MaskClasses[].count is an int and -G none found the answer in one second. 0 is now the wire encoding for 256, which is free because the host rejects an empty class before upload; gpu_mask_wire_size() in gpu_opencl.h is the single reader, wired at 2 producer and 4 consumer sites plus 3 Metal hit-replay sites and 1 Metal producer that had guessed 1. (2) Every -n/-N run past the chunk threshold did thread-count times the GPU work. When MaskTotal reaches maxt*65536 the submission site splits the job over disjoint [MaskIndex, MaskIndex+MaskCount) ranges; the CPU walker honours them, the GPU never received them, so each sub-job re-ran the whole mask. Measured, 32 words -n ?b?b?b: 8,589,934,592 hashes and busy=4.61s at -t 16 against 536,870,912 and busy=0.30s at -t 1, hash rate identical at 1.8 Gh/s -- the counter was honestly reporting a 15.4x waste. The range now travels on the existing bf_mask_start/bf_num_masks fields (bf_chunk deliberately NOT set: it selects brute-force geometry), and the hit reconstruction that re-adds the chunk start is unconditional -- gating it on bf_chunk decoded hits at the wrong mask position and printed a plaintext that does not produce the hash. No kernel change: mask_start and num_masks were always generic. Validated on fpga GTX 1080: GPU==CPU counts across ?d?d?d, 10^6, 10^7, ?b, ?b?b, ?b?b?b and -N; 32 words x ?b?b?b now 0.30s at both -t 1 and -t 16; hit sets byte-exact GPU vs CPU, 200/200 unmasked and 40/40 on a chunked masked run.
+ *
  * Revision 1.596  2026/09/19 13:39:16  dlr
  * Add e1028 CRYPTOPPLEGACY and e1029 CRYPTOPPDEFAULT: Crypto++ DataEncryptor
  * stored forms (LegacyEncryptor = DES-EDE2-CBC keyed by SHA-1 mash, DefaultEncryptor
@@ -7767,6 +7797,23 @@ char *Types[] = {
     "SUNMD5",
     "CRYPTOPPLEGACY",
     "CRYPTOPPDEFAULT",
+    "MD5BASE64MD5SHA1",
+    "WRLSHA1",
+    "MD5sub8-24MD5sub8-24MD5MD5MD5",
+    "MD5SHA1SHA1MD5SHA1MD5",
+    "MD5SHA1SHA1SHA1",
+    "MD5SHA1MD5SHA1MD5SHA1",
+    "MD5SHA512MD5",
+    "MD5sub1-16MD5",
+    "MD5sub1-28MD5",
+    "MD5MD5sub1-30MD5",
+    "APACHE-SHA-TRUNC16",
+    "MD5SALTLAST16",
+    "MD5SALTMD5PASS-PASS",
+    "MD5-1xMD5SHA1pSHA1p",
+    "MD5-1xMD5SHA256pSHA256p",
+    "MD5-1xMD5SHA512pSHA512p",
+    "MD5-1xMD5MD5pMD5p",
 
 NULL
 
@@ -8831,6 +8878,23 @@ NULL
  * and one recovered passphrase unlocks every record on that site. */
 #define JOB_CRYPTOPPLEGACY   1028
 #define JOB_CRYPTOPPDEFAULT  1029
+#define JOB_MD5BASE64MD5SHA1 1030
+#define JOB_WRLSHA1 1031
+#define JOB_MD5sub8_24MD5sub8_24MD5MD5MD5 1032
+#define JOB_MD5SHA1SHA1MD5SHA1MD5 1033
+#define JOB_MD5SHA1SHA1SHA1 1034
+#define JOB_MD5SHA1MD5SHA1MD5SHA1 1035
+#define JOB_MD5SHA512MD5 1036
+#define JOB_MD5sub1_16MD5 1037
+#define JOB_MD5sub1_28MD5 1038
+#define JOB_MD5MD5sub1_30MD5 1039
+#define JOB_APACHE_SHA_TRUNC16 1040
+#define JOB_MD5SALTLAST16 1041
+#define JOB_MD5SALTMD5PASS_PASS 1042
+#define JOB_MD5_xMD5SHA1pSHA1p 1043
+#define JOB_MD5_xMD5SHA256pSHA256p 1044
+#define JOB_MD5_xMD5SHA512pSHA512p 1045
+#define JOB_MD5_xMD5MD5pMD5p 1046
 
 #define JOB_DONE 2000
 
@@ -9958,6 +10022,23 @@ static unsigned short TypeOpts[JOB_DONE] = {
      * to say so before an operator spends a run on a wordlist. */
     [1028] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CRYPTOPPLEGACY */
     [1029] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY, /* CRYPTOPPDEFAULT */
+    [1030] = TYPEOPT_NEEDSF,  /* MD5BASE64MD5SHA1 */
+    [1031] = TYPEOPT_NEEDSF,  /* WRLSHA1 */
+    [1032] = TYPEOPT_NEEDSF,  /* MD5sub8-24MD5sub8-24MD5MD5MD5 */
+    [1033] = TYPEOPT_NEEDSF,  /* MD5SHA1SHA1MD5SHA1MD5 */
+    [1034] = TYPEOPT_NEEDSF,  /* MD5SHA1SHA1SHA1 */
+    [1035] = TYPEOPT_NEEDSF,  /* MD5SHA1MD5SHA1MD5SHA1 */
+    [1036] = TYPEOPT_NEEDSF,  /* MD5SHA512MD5 */
+    [1037] = TYPEOPT_NEEDSF,  /* MD5sub1-16MD5 */
+    [1038] = TYPEOPT_NEEDSF,  /* MD5sub1-28MD5 */
+    [1039] = TYPEOPT_NEEDSF,  /* MD5MD5sub1-30MD5 */
+    [1040] = TYPEOPT_NEEDSJ,  /* APACHE-SHA-TRUNC16 */
+    [1041] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5SALTLAST16 */
+    [1042] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5SALTMD5PASS-PASS */
+    [1043] = TYPEOPT_NEEDSF,  /* MD5-1xMD5SHA1pSHA1p */
+    [1044] = TYPEOPT_NEEDSF,  /* MD5-1xMD5SHA256pSHA256p */
+    [1045] = TYPEOPT_NEEDSF,  /* MD5-1xMD5SHA512pSHA512p */
+    [1046] = TYPEOPT_NEEDSF,  /* MD5-1xMD5MD5pMD5p */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -10072,6 +10153,15 @@ int              MaskLen;
 int              MaskPrepend;
 unsigned long long MaskTotal;
 unsigned long long MaskChunkSize;
+
+/* The AMD-portable 1-D NDRange ceiling, shared by every producer that sizes a
+ * GPU dispatch.  Raising it above 2^31 was tried in BF Phase 1.7 and rejected
+ * by gfx1201/RDNA4 with CL_INVALID_GLOBAL_WORK_SIZE; 2^32 is in any case the
+ * hard limit, because the kernels bound themselves with a 32-bit
+ * `total = n_words * n_rules * mask_size`.  It lived as a local inside
+ * adaptive_bf_chunk_size, which is why the -n mask fan-out added later never
+ * inherited it.  One definition now. */
+#define MDX_NDRANGE_HARD ((unsigned long long)1 << 31)
 
 /* Separate prepend/append patterns for simultaneous -N/-n */
 struct MaskPos   MaskAppendPattern[MAX_MASK_POS];
@@ -10824,6 +10914,8 @@ static const struct { int job; const char *salt; } default_salts[] = {
   { JOB_MD5_SALTMD5SALTPASS, "administrator" },
   { JOB_MD5SALTPASSSALT, "00" },
   { JOB_MD5SALTMD5PASS, "00" },
+  { JOB_MD5SALTLAST16, "32903f" },
+  { JOB_MD5SALTMD5PASS_PASS, "fd" },
   { JOB_MD5SALTPASS, "00" },
   { JOB_MD5_MD5psSHA1MD5psp, "cd6bc227" },
   { JOB_MD5_MD5PASS_SALT, "Aa8NB6AU6v2KsqLjbbLb4EH9mAB9BksY" },
@@ -11307,6 +11399,7 @@ release(FreeWaiting);
         }
         switch (job->op) {
           case JOB_APACHE_SHA:
+          case JOB_APACHE_SHA_TRUNC16:
             memmove(newbuf, "{SHA}", 5);
             b64_encode((char *)curin->h, newbuf + 5, match_len);
             break;
@@ -11655,6 +11748,7 @@ struct Hashchain found;
             dohex = 1;
           switch (job->op) {
             case JOB_APACHE_SHA:
+            case JOB_APACHE_SHA_TRUNC16:
               memmove(newbuf, "{SHA}", 5);
               b64_encode((char *)curin->h, newbuf + 5, match_len);
               break;
@@ -12664,7 +12758,7 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
      * reduced to NDRANGE_HARD. The unsalted Step 4.6 branch never fires; the
      * salted branch already forced inner_iter=1. */
     const uint64_t CHUNK_MIN    = (uint64_t)1 << 28;          /*  256M */
-    const uint64_t NDRANGE_HARD = (uint64_t)1 << 31;          /*  2 GiW NDRange ceiling */
+    const uint64_t NDRANGE_HARD = (uint64_t)MDX_NDRANGE_HARD;  /*  2 GiW NDRange ceiling */
     const uint64_t CHUNK_HARD   = (uint64_t)1 << 31;          /*  Phase 1.8 REVERTED — was 2^35; collapsed to NDRANGE_HARD */
     const uint32_t INNER_ITER_CAP = 16u;                      /*  per project_bf_chunk_as_job.md */
 
@@ -12713,8 +12807,25 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
      * GPU clFinish posts feedback. Block ONCE — after chunk 0 has been
      * submitted but before sizing any subsequent chunk — until at least one
      * device reports a non-zero wall. Subsequent calls skip past instantly. */
+    /* The wait below exits only when every live device has completed TWO
+     * dispatches: the first per slot is deferred as JIT-contaminated and
+     * only the second stores a wall. The producer is the sole source of
+     * chunks, so the wait must not arm until 2*num_live chunks exist --
+     * arming earlier makes its exit condition unreachable and it runs to
+     * the safety cap with seen=0. */
+    /* Count devices that will actually dispatch, not every enumerated one.
+     * A device that fails compact-table setup carries device_disabled, gets
+     * no gpujob worker and never dispatches, so counting it here leaves the
+     * wait below unsatisfiable and it runs to the safety cap. */
+    int num_live;
+#if defined(OPENCL_GPU)
+    num_live = gpu_opencl_active_device_count();
+    if (num_live <= 0 || num_live > BF_MAX_GPU_SLOTS) num_live = 1;
+#else
+    num_live = 1;
+#endif
     if (!atomic_load_explicit(&bf_first_feedback_seen, memory_order_relaxed) &&
-        bf_chunks_produced > 0) {
+        bf_chunks_produced >= (uint32_t)(2 * num_live)) {
         /* Phase 1.7c (2026-05-09): wait for ALL live devices to post
          * feedback, not just the first. With a shared FIFO and 1:1
          * device:slot mapping, fast devices win all races and slow
@@ -12724,13 +12835,6 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
          * warmup). Combined with M3 (skip first JIT-contaminated
          * dispatch), the EMA now bootstraps from clean post-JIT samples
          * across all devices simultaneously. */
-        int num_live;
-#if defined(OPENCL_GPU)
-        num_live = gpu_opencl_num_devices();
-        if (num_live <= 0 || num_live > BF_MAX_GPU_SLOTS) num_live = 1;
-#else
-        num_live = 1;
-#endif
         int waited_us = 0;
         const int poll_interval_us = 5000;        /* 5 ms */
         const int max_wait_us = 180 * 1000 * 1000; /* 180 s safety cap (raised
@@ -13572,6 +13676,16 @@ while (1) {
   lineproc = 0;
   snap_valid = 0;
   nsalts_job = 0;
+  /* The chunk base this job was submitted with.  job->MaskIndex is a MUTABLE
+   * cursor -- it advances with job->MaskIndex++ at the bottom of the mask loop
+   * and the rule-advance block restarts it for each new rule.  Restarting it at
+   * 0 is only right when the job covers the whole keyspace; a chunked job owns
+   * [base, base + MaskCount), so rules past the first walked the wrong range
+   * and the GPU was handed base 0 at the pack site.  Guarded on a mask being
+   * configured because numeric mode carries Numbers in the same field. */
+  const unsigned long long mask_base =
+      (MaskLen || MaskPrependLen || MaskAppendLen)
+      ? (unsigned long long)job->MaskIndex : 0ULL;
   if (saltsnap && TYPESALT(job->op) && !TYPEDONE(job->op)) {
     if (Typehashsalt[job->op] && (job->op == JOB_MD5_MD5SALTMD5PASS ||
         job->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
@@ -13607,7 +13721,11 @@ while (1) {
 	job->outlen = 0;
       }
       possess(FreeWaiting);
-      if (lineproc) TotLines += lineproc;
+      /* Sub-chunks of a split mask job share the seed lines of chunk 0, which
+       * already counted them.  Line retirement is credited once; hash, found
+       * and rule counts accrue per sub-job because that is real work. */
+      int _subchunk = (job->flags & JOBFLAG_MASK_SUBCHUNK) != 0;
+      if (lineproc && !_subchunk) TotLines += lineproc;
       if (hashcnt) {
         Tothash += hashcnt;
         if (linehints && job->op < linehints_count)
@@ -13615,9 +13733,9 @@ while (1) {
       }
       if (found) Totfound += found;
       if (rulecnt) Totrules += rulecnt;
-      if (lineproc && linehints && job->op < linehints_count)
+      if (lineproc && !_subchunk && linehints && job->op < linehints_count)
         __sync_fetch_and_add(&LINEHINTS(job->op).retired_line, lineproc);
-      if (lineproc)
+      if (lineproc && !_subchunk)
         __sync_fetch_and_sub(&InflightLines, lineproc);
       lineproc = hashcnt = rulecnt = found = 0;
       ltime = current;
@@ -14811,6 +14929,35 @@ while (1) {
         memcpy(my_jobg_rules->packed_buf + my_jobg_rules->packed_pos, cur, pack_len);
         my_jobg_rules->packed_pos += pack_len;
         my_jobg_rules->packed_count++;
+        /*
+         * CARRY THIS JOB'S MASK RANGE TO THE GPU.
+         *
+         * When MaskTotal reaches maxt*65536 the submission site splits the job
+         * into maxt sub-jobs over DISJOINT [MaskIndex, MaskIndex+MaskCount)
+         * ranges, so the threads share the keyspace instead of queueing behind
+         * one worker. The CPU walker honours that range. The GPU did not: with
+         * these fields left at 0 the dispatch fell back to the full
+         * gpu_mask_total, so every sub-job re-ran the ENTIRE mask and the work
+         * was multiplied by the thread count -- measured on a GTX 1080 at
+         * -t 16, 32 words, -n ?b?b?b: 8,589,934,592 hashes and busy=4.61s
+         * against the correct 536,870,912 and busy=0.30s at -t 1, with the
+         * hash rate identical at 1.8 Gh/s. Sixteen times the GPU time for the
+         * same answer, on EVERY -n/-N run large enough to be chunked.
+         *
+         * The machinery already existed for brute force, which hit this first:
+         * gpu_opencl.c carries the warning that using the full mask here
+         * "would over-launch by (gpu_mask_total / bf_num_masks)x and burn
+         * billions of redundant work-items". The kernel takes mask_start and
+         * num_masks generically -- non-BF simply passed zeroes.
+         *
+         * bf_chunk is deliberately NOT set: it selects brute-force geometry
+         * (synthetic empty plaintext, all word_offset zero). Only the range
+         * travels.
+         */
+        if (job->MaskCount > 0 && my_jobg_rules->bf_chunk == 0) {
+            my_jobg_rules->bf_mask_start = (uint64_t)job->MaskIndex;
+            my_jobg_rules->bf_num_masks  = (uint32_t)job->MaskCount;
+        }
         word_packed_by_rules_engine = 1;  /* legacy chokepoint will skip pass0==0 below */
         /* All rules are GPU-eligible (gpu_legacy_slot_unused) AND this
          * word packed successfully — the kernel will compute every
@@ -15006,7 +15153,7 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
         /* Rule is GPU-eligible: advance currule past it and skip CPU applyrule. */
         currule += *((unsigned short int *) currule) + 2;
         number_iter = loop_bound;  /* trigger next-rule advance on next iter */
-        job->MaskIndex = 0;
+        job->MaskIndex = mask_base;
         continue;
       }
 #endif /* OPENCL_GPU || METAL_GPU */
@@ -15022,14 +15169,15 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
          * number_iter to loop_bound (rather than 0) makes the next iter take
          * the if-branch above and apply the next rule cleanly; resetting to 0
          * would instead replay the previous rule's mask cycle from rule_base.
-         * Also reset MaskIndex so the new rule's mask sequence starts at 0. */
+         * Also restart MaskIndex so the new rule's mask sequence starts at the
+         * job's chunk base. */
         number_iter = loop_bound;
-        job->MaskIndex = 0;
+        job->MaskIndex = mask_base;
         continue;
       }
       rulecnt++;
       number_iter = 0;
-      job->MaskIndex = 0;
+      job->MaskIndex = mask_base;
       job->Numbers = 0;
       if (loop_bound > 1) {
         /* Stash for cheap restore on subsequent mask iterations of this rule. */
@@ -29851,12 +29999,19 @@ nextsalt1:
                 x = 1;
                 goto MDstart;
 
+              case JOB_MD5BASE64MD5SHA1:
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, mdbuf, 40);
+                len = 40;
+                goto b64md5;
+
               case JOB_MD5BASE64MD5MD5:
                 mymd5(cur, len, curin.h);
                 cur = prmd5(curin.h, mdbuf, 32);
                 len = 32;
 
               case JOB_MD5BASE64MD5:
+              b64md5:
                 mymd5(cur, len, curin.h);
                 cur = prmd5(curin.h, mdbuf, 32);
                 len = b64_encode((char *) mdbuf, linebuf, 32);
@@ -31205,6 +31360,7 @@ md5sha256:
                 goto MDstart;
 
               case JOB_MD5sub8_24MD5sub8_24MD5:
+              MD5sub8_24x2:
                 if (len > MAXLINE) break;
                 mymd5(cur, len, md5buf.h);
                 cur = prmd5(md5buf.h + 4, newbuf, 16);
@@ -33300,6 +33456,18 @@ sha1sha256:
                 mysha1(cur, len, curin.h);
                 hashcnt++;
                 checkhash(&curin, 40, 1, job);
+                break;
+
+              case JOB_APACHE_SHA_TRUNC16:
+                /* base64(trunc(sha1_bin(pass),16)) -- a SHA-1 stored into an
+                 * MD5-sized buffer, so the low 4 bytes are gone.  Truncation
+                 * keeps the LEADING bytes, so comparing the first 16 is
+                 * correct; the width is what separates it from e457. */
+                if (len > MAXLINE)
+                  break;
+                mysha1(cur, len, curin.h);
+                hashcnt++;
+                checkhash(&curin, 32, 1, job);
                 break;
 
 	     
@@ -42493,6 +42661,260 @@ HAV256_5_start:
                 }
                 break;
 
+              /* ----- batch added 2026-09-26, e1031..e1039 -----------------------
+               * All nine are unsalted chained-primitive types.  Each builds its
+               * inner chain and then jumps to an EXISTING shared tail rather
+               * than duplicating it: MDstart does the outer md5 across -i
+               * depths, MD_SHA_start does a final sha1 then that md5, and
+               * WRL_start does the outer whirlpool.  Every intermediate is
+               * consumed as its HEX form, which is what the hx expressions in
+               * hx.8 specify; feeding the raw bytes instead is a different
+               * construction.  prmd5(bin, out, N) emits exactly N hex
+               * characters, so it doubles as the sub1-N truncation.
+               */
+              case JOB_WRLSHA1:                      /* wrl(sha1(pass)) */
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                goto WRL_start;
+
+              case JOB_MD5sub8_24MD5sub8_24MD5MD5MD5:
+                /* md5(cut(md5(cut(md5(md5(md5(pass))),8,16)),8,16)) -- two inner
+                 * md5 rounds, then the e454 body supplies md5+cut, md5+cut, md5. */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                goto MD5sub8_24x2;
+
+              case JOB_MD5SHA1SHA1MD5SHA1MD5:
+                /* md5(sha1(sha1(md5(sha1(md5(pass)))))) */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                goto MD_SHA_start;
+
+              case JOB_MD5SHA1SHA1SHA1:              /* md5(sha1(sha1(sha1(pass)))) */
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                goto MD_SHA_start;
+
+              case JOB_MD5SHA1MD5SHA1MD5SHA1:
+                /* md5(sha1(md5(sha1(md5(sha1(pass)))))) */
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                mysha1(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 40);
+                len = 40;
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                goto MD_SHA_start;
+
+              case JOB_MD5SHA512MD5:                 /* md5(sha512(md5(pass))) */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                mysha512(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 128);
+                len = 128;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5sub1_16MD5:                /* md5(cut(md5(pass),0,16)) */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 16);
+                len = 16;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5sub1_28MD5:                /* md5(cut(md5(pass),0,28)) */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 28);
+                len = 28;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5MD5sub1_30MD5:             /* md5(md5(cut(md5(pass),0,30))) */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 30);
+                len = 30;
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf, 32);
+                len = 32;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5SALTLAST16:
+                /* cut(md5(md5(pass) . salt), -16): the stored field is the LAST
+                 * 16 hex characters of the digest, i.e. its last 8 BYTES.  A
+                 * prefix compare would silently match the wrong half, so the
+                 * last 8 bytes are copied to the front of a scratch union and
+                 * reported as a 16-hex digest -- which is also the width the
+                 * loader takes from the field. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                mymd5(cur, len, md5buf.h);
+                s = linebuf + MAXLINE;
+                prmd5(md5buf.h, s, 32);
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  if (32 + saltlen > MAXLINE) continue;
+                  s = linebuf + MAXLINE;
+                  fastcopy(s + 32, s1, saltlen);
+                  mymd5(s, 32 + saltlen, md5buf.h);
+                  /* SINGLE SHOT, deliberately not looped to Maxiter.  Only the
+                   * last 8 bytes are stored, so there is no defined value to
+                   * iterate: mdxfind would have to re-hash the FULL digest while
+                   * hashpipe has nothing but the truncated 8 bytes, and the two
+                   * then disagree from x02 onward with no diagnostic.  Measured:
+                   * an -i 2 line emitted here failed to verify in hashpipe.  The
+                   * observed records are all x01, and e1040 is single-shot for
+                   * the same reason. */
+                  hashcnt++;
+                  memcpy(curin.h, md5buf.h + 8, 8);
+                  if (checkhashsalt(&curin, 16, s1, saltlen, 1, job)) {
+                    PV_DEC(saltsnap[si].PV);
+                    if (!Printall && *saltsnap[si].PV == 0) {
+                      saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_MD5SALTMD5PASS_PASS:
+                /* md5(salt . md5(pass) . ":" . pass) -- e441 with a literal
+                 * colon and the clear password appended.  The site prefix is
+                 * carried as the SALT rather than hardcoded, so one type covers
+                 * every installation instead of one type per prefix. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                mymd5(cur, len, md5buf.h);
+                s = linebuf + MAXLINE;
+                prmd5(md5buf.h, s, 32);
+                s[32] = ':';
+                fastcopy(s + 33, cur, len);
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                for (si = 0; si < nsalts_job; si++) {
+                  saltlen = saltsnap[si].saltlen;
+                  s1 = saltsnap[si].salt;
+                  if (saltlen > MAXLINE) continue;
+                  i = saltlen;
+                  s = linebuf + MAXLINE;
+                  memmove(s - i, s1, i);
+                  mymd5(s - i, i + 33 + len, md5buf.h);
+                  for (x = 1; x <= Maxiter; x++) {
+                    hashcnt++;
+                    if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
+                    if (x < Maxiter) {
+                      prmd5(md5buf.h, newbuf, 32);
+                      mymd5(newbuf, 32, md5buf.h);
+                    }
+                  }
+                }
+                if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              /* ----- e1043..e1046: md5(md5(H(pass)) . H(pass)) -------------------
+               * The -1x marker in the name says the outer md5 is over a
+               * CONCATENATION, not a chain, and a trailing p closes a term that
+               * ends in (pass).  Same skeleton as e330 MD5-1xSHA1MD5pSHA1p, with
+               * the inner two primitives swapped.  H(pass) is computed once and
+               * its hex serves as both the input to the inner md5 and as the
+               * second term, so each candidate costs H + md5 + md5.
+               */
+              case JOB_MD5_xMD5SHA1pSHA1p:              /* MD5-1xMD5SHA1pSHA1p */
+                if (len > MAXLINE) break;
+                mysha1(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 40);
+                mymd5(mdbuf, 40, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                fastcopy(linebuf + 32, mdbuf, 40);
+                cur = linebuf;
+                len = 72;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5_xMD5SHA256pSHA256p:              /* MD5-1xMD5SHA256pSHA256p */
+                if (len > MAXLINE) break;
+                mysha256(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 64);
+                mymd5(mdbuf, 64, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                fastcopy(linebuf + 32, mdbuf, 64);
+                cur = linebuf;
+                len = 96;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5_xMD5SHA512pSHA512p:              /* MD5-1xMD5SHA512pSHA512p */
+                if (len > MAXLINE) break;
+                mysha512(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 128);
+                mymd5(mdbuf, 128, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                fastcopy(linebuf + 32, mdbuf, 128);
+                cur = linebuf;
+                len = 160;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5_xMD5MD5pMD5p:              /* MD5-1xMD5MD5pMD5p */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 32);
+                mymd5(mdbuf, 32, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                fastcopy(linebuf + 32, mdbuf, 32);
+                cur = linebuf;
+                len = 64;
+                x = 1;
+                goto MDstart;
+
               default:
                 fprintf(stderr, "Unknown job type %d\n", job->op);
                 exit(1);
@@ -42562,7 +42984,8 @@ gpu_packed_done: ;
     if (snap_valid)
       LIVESALTS(job->op) = nsalts_job;
     possess(FreeWaiting);
-    if (lineproc) TotLines += lineproc;
+    int _subchunk = (job->flags & JOBFLAG_MASK_SUBCHUNK) != 0;
+    if (lineproc && !_subchunk) TotLines += lineproc;
     if (hashcnt) {
       Tothash += hashcnt;
       if (linehints && job->op > 0 && job->op < linehints_count)
@@ -42570,9 +42993,9 @@ gpu_packed_done: ;
     }
     if (found) Totfound += found;
     if (rulecnt) Totrules += rulecnt;
-    if (lineproc && linehints && job->op > 0 && job->op < linehints_count)
+    if (lineproc && !_subchunk && linehints && job->op > 0 && job->op < linehints_count)
       __sync_fetch_and_add(&LINEHINTS(job->op).retired_line, lineproc);
-    if (lineproc)
+    if (lineproc && !_subchunk)
       __sync_fetch_and_sub(&InflightLines, lineproc);
     job->op = 0;
     job->next = NULL;
@@ -49277,14 +49700,25 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
       }
     }
     /* {SHA}base64: decode to 20-byte SHA1, write to compact table */
-    if (lf[JOB_APACHE_SHA] && *line == '{' && line[1] == 'S' && line[2] == 'H' &&
+    if ((lf[JOB_APACHE_SHA] || lf[JOB_APACHE_SHA_TRUNC16]) &&
+        *line == '{' && line[1] == 'S' && line[2] == 'H' &&
         line[3] == 'A' && line[4] == '}') {
       if (inhashbuf) {  /* only when compact table available (-F, not -J) */
         len = b64_decode(&line[5], (char *)(inhashbuf + 2), &cryptlen);
-        if (len >= 20) {
+        /* Both types carry the same {SHA} tag, so the PAYLOAD LENGTH is the only
+         * discriminator: a conforming RFC 2307 payload is 20 bytes (28 base64
+         * characters), the truncated variant is 16 (24 characters).  Before
+         * e1040 existed a 16-byte payload decoded here, failed the >= 20 test
+         * and was silently dropped. */
+        if (len >= 20 && lf[JOB_APACHE_SHA]) {
           len = 20;
           commit_compact(len);
           Foundcnt[JOB_APACHE_SHA]++;
+          continue;
+        }
+        if (len == 16 && lf[JOB_APACHE_SHA_TRUNC16]) {
+          commit_compact(len);
+          Foundcnt[JOB_APACHE_SHA_TRUNC16]++;
           continue;
         }
       }
@@ -58743,6 +59177,12 @@ usage:
             MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
           m_gpu_ok = 0;
         }
+        /* Per-position charset sizes cross to the GPU as uint8_t, so a
+         * 256-member class -- ?b, the only built-in with 256 -- is sent as 0
+         * and the reader restores it via gpu_mask_wire_size(). The truncation
+         * below is therefore DELIBERATE and the cast says so; do not "fix" it
+         * by widening this array alone, which would send 256 as a byte and
+         * silently wrap it again somewhere else. */
         static uint8_t m_sizes[MAX_MASK_POS_GPU_SIDE * 2];
         static uint8_t m_tables[MAX_MASK_POS_GPU_SIDE * 2][256];
         int npre = 0, napp = 0;
@@ -59620,16 +60060,86 @@ usage:
            * seed-file sweep produces 1 job and only 1 worker thread runs the
            * entire MaskTotal sequentially (the -t flag is structurally ignored
            * because additional launches happen only on additional job submits).
-           * Chunking is gated on Numrules<=1 because per-rule MaskIndex reset at
-           * line 12147 would corrupt chunk ranges when real rules are walked. */
+           * Chunking WAS gated on Numrules<=1, because the per-rule MaskIndex
+           * reset restarted the cursor at 0 and so discarded a chunk's base
+           * when real rules were walked. The rule-advance block now restarts
+           * it at mask_base, the value the job was submitted with, so the gate
+           * is gone and rules+mask jobs chunk like any other. */
           {
             unsigned long long _chunks = 1ULL;
             unsigned long long _chunk_threshold = (unsigned long long)maxt * 65536ULL;
             if ((MaskLen || MaskPrependLen || MaskAppendLen) &&
                 MaskTotal >= _chunk_threshold &&
-                maxt > 1 && Numrules <= 1) {
+                maxt > 1) {
               _chunks = (unsigned long long)maxt;
             }
+            /* NDRange ceiling (2026-09-23).  The dispatch is one work-item per
+             * (word, rule, mask) triple and the kernel bounds itself with a
+             * 32-bit total = n_words * n_rules * mask_size.  The fan-out above
+             * sizes the MASK axis alone, so the WORD axis entered that product
+             * unbounded: 9 lines x (95^5 / 16) is 4,352,517,774, which wraps to
+             * 57,550,478 and retires 98.7 percent of the dispatch.  The host
+             * counters are 64-bit and still report the full keyspace, so the
+             * run reconciles exactly and exits clean while finding almost
+             * nothing.  Measured on a GTX 1080: 9 lines of ?a?a?a?a?a found 0
+             * of 2 known answers, 8 lines found 2 of 2, and -t 17 found 2 of 2
+             * where -t 16 found none.
+             *
+             * Cap the chunk so the lane count stays under the ceiling, which is
+             * what project_bf_chunk_as_job.md Q1 decided on 2026-05-09: chunk
+             * total at or below the NDRange bound per chunk, the absolute mask
+             * offset accumulated in 64 bits across chunks, the kernel left
+             * seeing a 32-bit in-chunk index, and the producer watching for
+             * overflow.  adaptive_bf_chunk_size has honoured that for brute
+             * force since Phase 1.8; this producer did not. */
+#if defined(OPENCL_GPU)
+            /* OpenCL only.  The cap exists because the OpenCL grid is
+             * num_words * n_rules * mask_size and the kernel bounds itself
+             * with a 32-bit total.  Metal's grid omits the mask axis
+             * (gpu_metal.m ~6856 sizes it num_words or num_words * n_rules)
+             * and walks rules and masks in an inner double loop per thread
+             * (gpu/metal_template.metal ~390 and ~494), so it cannot overflow
+             * on the mask axis and gains nothing here.  Worse,
+             * Metal ignores the chunk range entirely -- gpujob_metal.m passes
+             * literal 0 for mask_start and bf_num_masks and uses the full
+             * gpu_mask_total -- so every extra chunk recomputes the WHOLE
+             * mask.  Measured on an M1, 1 word x ?l^4: one chunk 456,976
+             * hashes, two chunks 913,952.  Applying the cap there multiplies
+             * the work by the chunk count rather than dividing it. */
+            /* Applies to rules+mask too, now that the rule-advance block
+             * restarts the mask cursor at mask_base instead of 0.  1.602 gated
+             * this on Numrules <= 1 because without that restart a chunked
+             * rules job walked the wrong ranges -- 9 words x 3 rules x a
+             * six-position lowercase mask found 1 of 2 planted answers.  With
+             * the restart the gate is unnecessary, and lifting it is what
+             * closes the 32-bit lane exposure for rules+mask and gives that
+             * combination the thread fan-out back. */
+            if (MaskLen || MaskPrependLen || MaskAppendLen) {
+              unsigned long long _lanes_per_mask =
+                  (unsigned long long)numline * ((unsigned long long)Numrules + 1ULL);
+              if (_lanes_per_mask < 1ULL)
+                _lanes_per_mask = 1ULL;
+              if (_lanes_per_mask >= MDX_NDRANGE_HARD) {
+                /* One mask index already exceeds the ceiling, so the mask axis
+                 * cannot be chunked small enough.  Silence here is what this
+                 * whole comment is about, so refuse rather than truncate. */
+                fprintf(stderr,
+                    "FATAL %s:%d: %llu lines x %d rules is %llu work-items per "
+                    "mask index, at or past the %llu NDRange ceiling; the mask "
+                    "axis cannot be chunked below one index.\n",
+                    __FILE__, __LINE__, (unsigned long long)numline, Numrules,
+                    _lanes_per_mask, MDX_NDRANGE_HARD);
+                exit(1);
+              }
+              {
+                unsigned long long _masks_cap = MDX_NDRANGE_HARD / _lanes_per_mask;
+                unsigned long long _need =
+                    (MaskTotal + _masks_cap - 1ULL) / _masks_cap;
+                if (_need > _chunks)
+                  _chunks = _need;
+              }
+            }
+#endif  /* OPENCL_GPU */
             unsigned long long _base_size = MaskTotal / _chunks;
             unsigned long long _remainder = MaskTotal - (_base_size * _chunks);
             unsigned long long _chunk_start = 0ULL;
@@ -59651,6 +60161,10 @@ usage:
 
               job->op = x;
               job->flags = (Printsource | Addlf);
+              /* Chunk 0 owns the seed lines; later chunks re-use them and must
+               * not re-retire them.  Mirrors the InflightLines guard below. */
+              if (_ci > 0ULL)
+                job->flags |= JOBFLAG_MASK_SUBCHUNK;
               if (Dodigits)
                 job->flags |= JOBFLAG_NUMBERS;
               if (MaskPrepend || MaskPrependLen > 0)

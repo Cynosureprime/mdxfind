@@ -2036,9 +2036,14 @@ int gpu_metal_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
     for (int i = 0; i < ntotal; i++) {
         memcpy(gpu_mask_charsets_host[i], tables[i], 256);
     }
+    /* 0 on this wire means 256, not 1: the size crosses as uint8_t and ?b has
+     * 256 members, so (uint8_t)256 is 0. Reading it as 1 made a ?b position
+     * contribute one candidate instead of 256 -- the guard was present and
+     * chose the wrong replacement. The OpenCL side documents the wire in
+     * gpu_opencl.h; this is the Metal reader of the same convention. */
     uint64_t total = 1;
     for (int i = 0; i < ntotal; i++) {
-        uint32_t sz = sizes[i] ? sizes[i] : 1u;
+        uint32_t sz = sizes[i] ? sizes[i] : 256u;
         total *= sz;
     }
     gpu_mask_total = total;
@@ -8577,7 +8582,6 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
     int bf_fast_eligible)
 {
     (void)packed_size;
-    (void)bf_num_masks;
     (void)bf_fast_eligible;
 
     *nhits_out = 0;
@@ -8925,7 +8929,20 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * REWRITTEN per outer salt-chunk iteration in the new salt-chunk
          * loop below. The initial values here are the non-salt defaults
          * (salt_total == 1 collapses cleanly). */
-        uint32_t mask_size_for_pack = use_mask ? (uint32_t)gpu_mask_total : 1u;
+        /* A chunked job covers only its own slice of the keyspace, and the
+         * kernel already adds params.mask_start (metal_template.metal ~602).
+         * Using the full total here made every chunk recompute the WHOLE mask
+         * -- measured on an M1, 1 word over a four-position lowercase mask:
+         * one chunk 456,976 hashes, two chunks 913,952.  It also truncated:
+         * gpu_mask_total is 64-bit and this cast drops everything above 2^32,
+         * so a five-position printable mask (7,737,809,375) enumerated
+         * 3,442,842,079 and silently lost 55 percent of the keyspace.  A
+         * chunk range is always under 2^32, so taking it when present fixes
+         * both.  Mirrors the OpenCL twin, which takes bf_num_masks over
+         * b71_mask_size at its enqueue. */
+        uint32_t mask_size_for_pack = use_mask
+            ? (bf_num_masks > 0u ? bf_num_masks : (uint32_t)gpu_mask_total)
+            : 1u;
         params->num_salts            = mask_size_for_pack;
         /* Phase 2e.1: salt_start is the per-dispatch salt-page base
          * (was always 0 in Phase 2c when one dispatch covered the full

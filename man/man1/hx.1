@@ -2,8 +2,11 @@
 .\" NOTE: this is the man page for the hx COMMAND.  The hx LANGUAGE
 .\" specification is a separate mm-macro document of the same stem, kept in
 .\" a different directory.  Neither is derived from the other.
-.\" $Revision: 1.5 $
+.\" $Revision: 1.6 $
 .\" $Log: hx.1,v $
+.\" Revision 1.6  2026/09/25 16:23:16  dlr
+.\" Document how a candidate is presented. The page named the bound variables but never said what pass is bound TO, so the one thing a caller must know to use hx as an oracle was absent: that a candidate may arrive wrapped and that the wrapper is decoded. New subsection under EXPRESSION LANGUAGE covers $HEX[] and $TESTVEC[], states that both are read on -p and on stdin and mean the same to hashpipe under -X and in verify mode, gives the vector grammar, notes the 2 MB bound on a decoded vector, records that a string which does not parse as either is taken literally rather than rejected, and points at fromhex() for hex that is not wrapped. Written after hx.c 1.5 made $TESTVEC[] work in this command at all -- it had been hex-decoding the pattern and dropping the repeat count -- and hashpipe.c 1.208 made both wrappers native on -X, so the page now describes behaviour that is actually uniform across the channels it claims.
+.\"
 .\" Revision 1.5  2026/09/04 17:16:55  dlr
 .\" Wording in the revision notes.
 .\"
@@ -230,6 +233,47 @@ suffix yields raw bytes instead; and
 after a function name iterates it
 .I n
 times.
+.SS "How the candidate is presented"
+A candidate may be written wrapped, and
+.B pass
+is bound to the decoded bytes rather than to the wrapper text:
+.PP
+.RS
+.TP 30
+.BI $HEX[ hexdigits ]
+the bytes those hex digits spell
+.TP
+.BI $TESTVEC[ "HH x N" ]
+the byte pattern
+.I HH
+repeated
+.I N
+times
+.RE
+.PP
+Both forms are read on
+.B \-p
+and on standard input, and mean the same to
+.BR hashpipe (1)
+under
+.B \-X
+and in verify mode, so one string gives one digest on every channel.
+They exist because some passwords cannot be written literally: one holding a
+colon, a newline or a non-UTF-8 byte needs
+.BR $HEX[] ,
+and a repeated vector of megabytes does not fit on a line at all without
+.BR $TESTVEC[] .
+In a vector the pattern is hex, the count decimal, the separator any run of
+non-digits, and the closing bracket optional.
+A decoded vector is bounded at 2 MB.
+.PP
+A string that does not parse as either form \(em unbalanced, not hex, or a
+zero repeat count \(em is taken literally instead of rejected, so a password
+that merely resembles a wrapper still hashes as itself.
+Use
+.B fromhex()
+for hex that is not wrapped: it decodes an argument, where the wrappers
+describe how the candidate itself arrived.
 .PP
 .RS
 .TP 30
