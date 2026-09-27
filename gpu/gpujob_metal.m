@@ -200,6 +200,11 @@ extern int      gpu_mask_n_prepend;
 extern int      gpu_mask_n_append;
 extern uint64_t gpu_mask_total;
 extern uint8_t  gpu_mask_sizes[];
+/* 0 means 256 on the mask wire: the per-position size crosses as uint8_t and
+ * ?b has 256 members, so (uint8_t)256 is 0. See gpu/gpu_opencl.h. Reading a
+ * raw 0 here reconstructs the wrong plaintext for a hit, which is worse than
+ * missing it. */
+#define MASK_WIRE_SZ(v) ((v) ? (unsigned)(v) : 256u)
 /* Phase 1a sub-phase 1a.2 (2026-05-21): MaskTotal extern for A2 dispatch
  * arm in the chokepoint. Defined in mdxfind.c line 7482. */
 extern unsigned long long MaskTotal;
@@ -1560,10 +1565,16 @@ static void gpujob_metal_worker(void *arg) {
                 g->packed_buf, g->packed_pos,
                 g->word_offset, g->packed_count,
                 g->op, &nhits,
-                0 /* mask_start */,
-                0 /* mask_offset_per_word */,
-                0 /* bf_num_masks */,
-                0 /* inner_iter */,
+                /* The range travels for ANY chunked job, not only a BF one.
+                 * A -n/-N run split across threads sets these; passing 0
+                 * made the kernel run the whole mask per sub-job.  They are
+                 * 0 when unused, so an unchunked run is unchanged.  Mirrors
+                 * gpu/gpujob_opencl.c, which stopped gating these on
+                 * bf_chunk in mdxfind 1.597. */
+                g->bf_mask_start,
+                g->bf_offset_per_word,
+                g->bf_num_masks,
+                g->bf_inner_iter,
                 0 /* bf_fast_eligible */);
             }
 
@@ -1880,7 +1891,12 @@ static void gpujob_metal_worker(void *arg) {
                      && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 16
                      && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                      && gpu_mask_total > 0);
-                uint64_t b71_mask_size = b71_mask_active ? gpu_mask_total : 1u;
+                /* A chunked job's kernel packed combined_ridx against its
+                 * OWN slice size, so decode with that, not the full total. */
+                uint64_t b71_mask_size = b71_mask_active
+                    ? (g->bf_num_masks > 0u ? (uint64_t)g->bf_num_masks
+                                            : gpu_mask_total)
+                    : 1u;
 
                 /* Phase 2c: salt-axis decompose. is_salted_op gates the
                  * 3-axis divmod (salt_local, mask_idx, ridx) per
@@ -2229,13 +2245,22 @@ static void gpujob_metal_worker(void *arg) {
                         /* append_combos = product(sizes[npre..npre+napp)). */
                         uint64_t append_combos = 1u;
                         for (int j = 0; j < napp; j++) {
-                            int sz = gpu_mask_sizes[npre + j];
+                            int sz = MASK_WIRE_SZ(gpu_mask_sizes[npre + j]);
                             if (sz <= 0) sz = 1;
                             append_combos *= (uint64_t)sz;
                         }
                         if (append_combos == 0u) append_combos = 1u;
-                        /* Phase 2b: mask_idx_abs == mask_idx_local (no BF). */
-                        uint64_t mask_idx_abs = (uint64_t)mask_idx;
+                        /* Re-add the chunk base unconditionally.  The kernel
+                         * emits an index LOCAL to the range it was given and
+                         * builds the absolute one the same way
+                         * (metal_template.metal ~602).  Both terms are 0 on an
+                         * unchunked run, so that case is unchanged; on a
+                         * chunked one, leaving them off decoded the hit at the
+                         * wrong mask position and printed a plaintext that does
+                         * not produce the hash. */
+                        uint64_t mask_idx_abs = (uint64_t)g->bf_mask_start
+                            + (uint64_t)widx * (uint64_t)g->bf_offset_per_word
+                            + (uint64_t)mask_idx;
                         uint64_t prepend_idx  = mask_idx_abs / append_combos;
                         uint64_t append_idx   = mask_idx_abs % append_combos;
 
@@ -2247,7 +2272,7 @@ static void gpujob_metal_worker(void *arg) {
                             uint64_t remaining = prepend_idx;
                             for (int k = 0; k < npre; k++) {
                                 int i = npre - 1 - k;
-                                int sz = gpu_mask_sizes[i];
+                                int sz = MASK_WIRE_SZ(gpu_mask_sizes[i]);
                                 if (sz <= 0) sz = 1;
                                 int pidx = (int)(remaining % (uint64_t)sz);
                                 remaining /= (uint64_t)sz;
@@ -2260,7 +2285,7 @@ static void gpujob_metal_worker(void *arg) {
                             for (int k = 0; k < napp; k++) {
                                 int i = napp - 1 - k;
                                 int row = npre + i;
-                                int sz = gpu_mask_sizes[row];
+                                int sz = MASK_WIRE_SZ(gpu_mask_sizes[row]);
                                 if (sz <= 0) sz = 1;
                                 int pidx = (int)(remaining % (uint64_t)sz);
                                 remaining /= (uint64_t)sz;
@@ -2741,8 +2766,14 @@ static void gpujob_metal_worker(void *arg) {
              * actual rounds rather than salt count alone. For non-iterated
              * types the function returns nsalts_packed*1, bit-identical
              * to the prior accounting. */
+            /* A chunked job covers its own slice, so count that, not the
+             * whole keyspace once per chunk -- doing the latter multiplied
+             * Tothash, and therefore the reported rate and ETA, by the chunk
+             * count. Mirrors b71_mask_size_acct in the OpenCL twin. */
             uint64_t _mask_size_acct =
-                (gpu_mask_total > 1) ? gpu_mask_total : 1ull;
+                (g->bf_num_masks > 0u)
+                ? (uint64_t)g->bf_num_masks
+                : ((gpu_mask_total > 1) ? gpu_mask_total : 1ull);
             uint64_t _iter_sum_acct =
                 (nsalts_packed > 0)
                 ? gpu_compute_iter_sum(g->op, saltsnap, pack_map,

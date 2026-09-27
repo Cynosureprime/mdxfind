@@ -102,25 +102,53 @@ static inline void template_finalize(thread template_state &st,
     uint M[16];
     int pos = 0;
 
+    /* Word-at-a-time reads (2026-09-25).
+     *
+     * These loops assembled each 32-bit word from four separate DEVICE byte
+     * loads, so the kernel issued one device memory access per candidate
+     * byte.  Measured on an M2 Max by holding the candidate COUNT fixed and
+     * varying word length -- which keeps MD5 work constant at one block for
+     * lengths 4, 16 and 48 -- the rate fell 89.69 to 32.84 MH/s, a 2.7x drop
+     * with identical hashing.  Fitted, the cost was 7.56 ns fixed plus 0.435
+     * ns per candidate byte, an aggregate 2.30 GB/s on a part with roughly
+     * 400 GB/s.  The OpenCL twin reads a PRIVATE array and its per-byte term
+     * is 10 to 28 times smaller.
+     *
+     * MD5 assembles little-endian and Apple silicon is little-endian, so a
+     * native 32-bit load is byte-identical to the four shifted byte loads it
+     * replaces.
+     *
+     * PRECONDITION: `data` must be 4-byte aligned, and pos is always a
+     * multiple of HASH_BLOCK_BYTES so data+pos inherits that.  The sole
+     * caller of this overload is metal_template.metal:848, which passes buf,
+     * i.e. buf_scratch_pool + word_idx * RULE_BUF_MAX from a page-aligned
+     * MTLBuffer.  A prepend mask does NOT move that start: it shifts the word
+     * right inside buf and writes the prepend bytes at buf[0], so the
+     * candidate always begins at the slice base.  If a caller is ever added
+     * that passes an interior pointer, it needs the byte path back. */
+    device const uint *w32 = (device const uint *)data;
+
     /* Complete 64-byte blocks. */
     while (len - pos >= HASH_BLOCK_BYTES) {
-        for (int j = 0; j < 16; j++) {
-            int b = pos + j * 4;
-            M[j] = (uint)data[b]
-                 | ((uint)data[b + 1] << 8)
-                 | ((uint)data[b + 2] << 16)
-                 | ((uint)data[b + 3] << 24);
-        }
+        int wbase = pos >> 2;            /* pos is a multiple of 64 */
+        for (int j = 0; j < 16; j++)
+            M[j] = w32[wbase + j];
         md5_block(st.h[0], st.h[1], st.h[2], st.h[3], M);
         pos += HASH_BLOCK_BYTES;
     }
 
-    /* Final block(s): tail bytes + 0x80 marker + zeros + length. */
+    /* Final block(s): tail bytes + 0x80 marker + zeros + length.
+     *
+     * The tail is the hot path for ordinary wordlists: a candidate under 56
+     * bytes never enters the block loop above at all. */
     int rem = len - pos;  /* 0..63 */
 
     for (int j = 0; j < 16; j++) M[j] = 0u;
 
-    for (int i = 0; i < rem; i++) {
+    int i = 0;
+    for (; i + 4 <= rem; i += 4)
+        M[i >> 2] = w32[(pos + i) >> 2];
+    for (; i < rem; i++) {
         uint v = (uint)data[pos + i];
         M[i >> 2] |= v << ((i & 3) * 8);
     }

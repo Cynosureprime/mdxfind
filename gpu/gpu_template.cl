@@ -253,6 +253,25 @@
  * INPUT gate (GPU_RULES_MAX_INPUT_LEN's companion), not a property of the
  * output buffer, and the mixed kernel clamps the same way.
  * ---------------------------------------------------------------------- */
+/* A3: candidates per work item. COMPILE-TIME on both paths -- Phase 1.8's
+ * runtime-bounded `for (i < inner_iter)` cost 2.19x on Pascal because the
+ * whole-kernel allocator budgeted worst-case for every algorithm sharing this
+ * file. At TPL_INNER==1 the loop below has a known trip count of one and the
+ * compiler emits the Phase 1.7 shape. Only the BF_FAST_MD5 program, which is
+ * gated to unsalted append-only MD5 with no rules, gets a larger value. */
+#ifdef BF_FAST_MD5
+#ifndef BF_INNER
+/* Parked at 1: the loop keeps a known trip count of one and the compiler emits
+ * the Phase 1.7 shape. A value of 8 measured a 2.1x regression on Pascal, the
+ * same whole-kernel register-allocator effect that reverted Phase 1.8, so the
+ * default must not be raised without a per-architecture measurement. */
+#define BF_INNER 1
+#endif
+#define TPL_INNER BF_INNER
+#else
+#define TPL_INNER 1
+#endif
+
 #ifdef GPU_U32_WALKER_PRESENT
 #define TPL_BUF_BYTES  U32_OUT_BYTES
 #define TPL_BUF_LIMIT  (U32_OUT_BYTES - 15)
@@ -428,8 +447,11 @@ void template_phase0(
      * innermost so the existing (word, rule) lex-ordering is preserved
      * at mask_size==1. mask innermost also keeps the cursor protocol's
      * lex order (rule_idx, word_idx) monotonic across overflow re-issues. */
-    uint mask_idx_local = gid % mask_size;
-    uint gid_wr         = gid / mask_size;
+    /* A3: the mask axis is now blocks of TPL_INNER. At TPL_INNER==1
+     * mask_blocks == mask_size and this is the previous decomposition. */
+    uint mask_blocks    = (mask_size + (uint)TPL_INNER - 1u) / (uint)TPL_INNER;
+    uint mask_block     = gid % mask_blocks;
+    uint gid_wr         = gid / mask_blocks;
     uint word_idx       = gid_wr % n_words;
     /* BF chunk-as-job (2026-05-10 Phase 1.5): kernel emits LOCAL mask_idx
      * (within-chunk, fits uint32 since mspw < 4G) for hit emit; uses
@@ -448,9 +470,9 @@ void template_phase0(
      * back to Phase 1.7's single-pass shape. Host-side machinery
      * (params.inner_iter, adaptive_bf_chunk_size servo, jobg bf_inner_iter)
      * is left as dead-but-harmless; cleanup can happen separately. */
-    ulong mask_idx_abs_base = params.mask_start
+    ulong mask_idx_abs_block = params.mask_start
                        + (ulong)word_idx * (ulong)params.mask_offset_per_word
-                       + (ulong)mask_idx_local;
+                       + (ulong)mask_block * (ulong)TPL_INNER;
     uint gid_wrr  = gid_wr / n_words;
     uint rule_idx = gid_wrr % n_rules;
 #ifdef GPU_TEMPLATE_HAS_SALT
@@ -628,6 +650,15 @@ void template_phase0(
      * the same byte. Byte-exact backward-compatible.
      *
      * Bounds-checked against TPL_BUF_LIMIT for safety. */
+    /* A3 loop opens here: the word and any rule output are already in buf and
+     * are INVARIANT across the TPL_INNER candidates, so they are built once.
+     * Only the mask bytes and new_len change per iteration. */
+    int _tpl_base_len = new_len;
+    for (uint _tpl_j = 0u; _tpl_j < (uint)TPL_INNER; _tpl_j++) {
+    uint mask_idx_local = mask_block * (uint)TPL_INNER + _tpl_j;
+    if (mask_idx_local >= mask_size) break;
+    new_len = _tpl_base_len;
+
     uint npre = params.n_prepend;
     uint napp = params.n_append;
     if (npre > 16u) npre = 16u;
@@ -635,7 +666,7 @@ void template_phase0(
 
     /* BF Phase 1.8 inner_iter wrap REVERTED (2026-05-10): mask_idx_abs is
      * the base value computed above; no per-iter shift. */
-    ulong mask_idx_abs = mask_idx_abs_base;
+    ulong mask_idx_abs = mask_idx_abs_block + (ulong)_tpl_j;
 
     if (npre >= 1u || napp >= 1u) {
         /* Compute append_combos for the prepend/append split.
@@ -948,6 +979,7 @@ void template_phase0(
     /* Close the SALT_BATCH inner salt loop opened above the iter loop. */
     }
 #endif
+    }   /* A3: close the TPL_INNER candidate loop */
 }
 
 /* template_phase0_test: byte-exact harness twin of template_phase0.

@@ -39,6 +39,13 @@
  * alongside JOB_MD5MD5SALT. */
 #include "gpu_codegen_eligible.h"
 
+/* gpu_opencl.h cannot include gpujob.h, so the two constants are pinned here,
+ * where both are in scope. RULE_BUF_MAX_HOST sizes the validator record; the
+ * kernel is compiled with -D RULE_BUF_MAX = GPU_RULES_WALKER_BUF_ELEMS. They
+ * drifted 20x apart between 2026-09-12 and 2026-09-24. */
+_Static_assert(RULE_BUF_MAX_HOST == GPU_RULES_WALKER_BUF_ELEMS,
+               "RULE_BUF_MAX_HOST must equal GPU_RULES_WALKER_BUF_ELEMS");
+
 /* malloc_pinned() lives in mdxfind.c -- page-aligned + mlock helper for
  * GPU-upload host buffers. We don't pull in mdxfind.h (would drag the
  * whole world) so just forward-declare. Free-able with free() because the
@@ -5208,7 +5215,7 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
         memcpy(gpu_mask_desc + ntotal + i * 256, tables[i], 256);
     gpu_mask_total = 1;
     for (int i = 0; i < ntotal; i++)
-        gpu_mask_total *= sizes[i];
+        gpu_mask_total *= gpu_mask_wire_size(sizes[i]);   /* 0 means 256 */
     /* Upload mask descriptor to all devices */
     int bufsize = ntotal + ntotal * 256;
     for (int i = 0; i < num_gpu_devs; i++) {
@@ -5260,7 +5267,7 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
              * buffer one-to-one. */
             for (int i = 0; i < npre + napp; i++) {
                 memcpy(b7_charsets + i * 256, tables[i], 256);
-                b7_sizes[i] = (uint32_t)sizes[i];
+                b7_sizes[i] = gpu_mask_wire_size(sizes[i]); /* 0 means 256 */
             }
         }
         for (int i = 0; i < num_gpu_devs; i++) {
@@ -16690,6 +16697,26 @@ validator_skip:
                                                   : (size_t)b71_mask_size;
     size_t total = (size_t)num_words * (size_t)d->gpu_n_rules
                    * kernel_mask_size;
+    /* The kernels bound themselves with a 32-bit
+     * `total = n_words * n_rules * mask_size` while this computation is
+     * 64-bit.  When the two disagree the kernel retires every lane above the
+     * wrapped value, and because the host counters are 64-bit the run still
+     * reports the full keyspace and exits clean -- the defect fixed in the -n
+     * mask producer on 2026-09-23, which cost 22 of 23 matches on a
+     * production sweep and read as an honest negative.  Any producer that
+     * arrives here over-range has the same bug, so refuse rather than compute
+     * a fraction of the work and call it a completed run. */
+    if ((unsigned long long)total > 0xFFFFFFFFULL) {
+        fprintf(stderr,
+            "FATAL %s:%d: dispatch of %llu work-items (num_words=%llu "
+            "n_rules=%llu mask_size=%llu) exceeds the 32-bit lane bound the "
+            "kernel enforces; the producer must chunk this job.\n",
+            __FILE__, __LINE__, (unsigned long long)total,
+            (unsigned long long)num_words,
+            (unsigned long long)d->gpu_n_rules,
+            (unsigned long long)kernel_mask_size);
+        exit(1);
+    }
     size_t global = ((total + local - 1) / local) * local;
 
     /* B3 cursor-restart loop (Memo B §2). On a non-overflow dispatch the

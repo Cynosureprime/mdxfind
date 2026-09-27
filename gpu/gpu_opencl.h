@@ -33,8 +33,18 @@ extern "C" {
  * usable from call sites that haven't pulled gpujob.h. */
 struct jobg;
 
-/* Host-side mirror of RULE_BUF_MAX in gpu/gpu_md5_rules.cl. MUST match
- * the kernel-side #define exactly. Bumping requires updating BOTH files
+/* Host-side mirror of the kernel's RULE_BUF_MAX. MUST match it exactly.
+ *
+ * The kernel does not get its value from the #define in gpu/gpu_md5_rules.cl
+ * -- that is only an out-of-band fallback. The host INJECTS -D RULE_BUF_MAX
+ * from GPU_RULES_WALKER_BUF_ELEMS (gpujob.h), so THAT is the constant this
+ * has to track. It was 40960u here from 2026-05-02, when the buffer tracked
+ * CPU MAXLINE; on 2026-09-12 the walker buffer became 2 x the 1024-byte
+ * input-word gate and this was not updated with it, leaving the validator
+ * reading 4+40960 byte records where the kernel writes 4+2048 -- a 20x
+ * stride mismatch on an env-gated diagnostic path. gpu_opencl.c carries a
+ * _Static_assert against GPU_RULES_WALKER_BUF_ELEMS so it cannot drift
+ * silently again. Bumping requires updating BOTH files
  * (gpu_opencl.h and gpu/gpu_md5_rules.cl) in the same commit. The
  * validator path uses this for record-buffer sizing and stack/heap
  * allocations; mismatch would cause stride mismatch and corrupted reads.
@@ -44,7 +54,7 @@ struct jobg;
  *   slot[2..3] = outlen as uint16 little-endian
  *   slot[4..3+RULE_BUF_MAX_HOST] = post-rule buffer bytes
  * Total slot size = GPU_VALIDATE_RECORD_SZ_HOST = 4 + RULE_BUF_MAX_HOST. */
-#define RULE_BUF_MAX_HOST           40960u
+#define RULE_BUF_MAX_HOST           2048u
 #define GPU_VALIDATE_RECORD_SZ_HOST (4u + RULE_BUF_MAX_HOST)
 
 
@@ -270,6 +280,27 @@ void gpu_opencl_set_max_iter(int dev_idx, int max_iter);
 void gpu_opencl_set_op(int dev_idx, int op);
 int gpu_opencl_get_op(int dev_idx);
 int gpu_opencl_max_batch(int dev_idx);
+/*
+ * THE MASK WIRE ENCODES A 256-MEMBER CHARSET AS 0.
+ *
+ * Per-position charset sizes cross to the GPU as uint8_t, and 256 does not fit
+ * in a byte: ?b (all byte values, 0x00-0xff) is the only built-in class with
+ * 256 members, and (uint8_t)256 is 0. The kernel then saw a zero-width charset
+ * and enumerated ONE candidate per position instead of 256 -- so -n '?b?b?b'
+ * computed 16 hashes of 16,777,216, reported a normal completion and said
+ * "None found, sorry!". Measured on a GTX 1080: 253 -> 253, 254 -> 254,
+ * 255 -> 255, 256 -> 1. The CPU path was never affected; MaskClasses[].count
+ * is an int and -G none found the answer in one second.
+ *
+ * 0 is otherwise unreachable on this wire: the host rejects a class with
+ * count == 0 before upload, so it is free to mean 256. EVERY read of a wire
+ * size goes through this, on both the OpenCL and Metal paths.
+ */
+static inline unsigned gpu_mask_wire_size(unsigned char v)
+{
+    return v ? (unsigned)v : 256u;
+}
+
 int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
                         int npre, int napp);
 

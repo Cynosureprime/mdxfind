@@ -293,7 +293,7 @@ static int mask_decode(uint64_t mask_idx, int pos_offset, int npos, char *buf) {
     int n_total = gpu_mask_n_prepend + gpu_mask_n_append;
     for (int i = npos - 1; i >= 0; i--) {
         int pos = pos_offset + i;
-        int sz = gpu_mask_sizes[pos];
+        int sz = gpu_mask_wire_size(gpu_mask_sizes[pos]);
         int ci = (int)(idx % sz);
         idx /= sz;
         buf[i] = (char)gpu_mask_desc[n_total + pos * 256 + ci];
@@ -1387,10 +1387,15 @@ void gpujob(void *arg) {
                     g->packed_buf, g->packed_pos,
                     g->word_offset, g->packed_count,
                     g->op, &nhits,
-                    g->bf_chunk ? g->bf_mask_start : 0,
-                    g->bf_chunk ? g->bf_offset_per_word : 0,
-                    g->bf_chunk ? g->bf_num_masks : 0,
-                    g->bf_chunk ? g->bf_inner_iter : 0,
+                    /* The range travels for ANY chunked job, not only a BF
+                     * one. A -n/-N run split across threads sets these too;
+                     * gating them on bf_chunk sent 0 and the kernel then ran
+                     * the whole mask per sub-job. They are 0 when unused, so
+                     * an unchunked run is bit-identical to before. */
+                    g->bf_mask_start,
+                    g->bf_offset_per_word,
+                    g->bf_num_masks,
+                    g->bf_inner_iter,
                     /* Phase 1.9 A1 (2026-05-10): pass fast-path
                      * eligibility through to gpu_opencl.c, which
                      * swaps kern_template_phase0 ->
@@ -1496,7 +1501,7 @@ void gpujob(void *arg) {
                      * the hit-replay divmod base makes below, and for the same
                      * reason: this must equal the kernel-side mask_size the
                      * dispatch actually iterated. */
-                    b71_mask_size_acct = (g->bf_chunk && g->bf_num_masks > 0u)
+                    b71_mask_size_acct = (g->bf_num_masks > 0u)
                                        ? (uint64_t)g->bf_num_masks
                                        : gpu_mask_total;
                 }
@@ -1902,7 +1907,7 @@ void gpujob(void *arg) {
                          && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                          && gpu_mask_total > 0);
                     if (b71_mask_active) {
-                        b71_mask_size = (g->bf_chunk && g->bf_num_masks > 0u)
+                        b71_mask_size = (g->bf_num_masks > 0u)
                                       ? (uint64_t)g->bf_num_masks
                                       : gpu_mask_total;
                     }
@@ -2500,7 +2505,7 @@ void gpujob(void *arg) {
                              * kernel; ?d^10 = 1e10 > 2^32 wraps a uint32. */
                             uint64_t append_combos = 1u;
                             for (int j = 0; j < napp; j++) {
-                                int sz = gpu_mask_sizes[npre + j];
+                                int sz = gpu_mask_wire_size(gpu_mask_sizes[npre + j]);
                                 if (sz <= 0) sz = 1;
                                 append_combos *= (uint64_t)sz;
                             }
@@ -2525,7 +2530,27 @@ void gpujob(void *arg) {
                              * compensating absolute shift was wrong above
                              * 2^32 because of uint truncation. */
                             uint64_t mask_idx_abs = (uint64_t)mask_idx;
-                            if (g->bf_chunk) {
+                            /*
+                             * APPLIED UNCONDITIONALLY. The kernel emits a
+                             * mask index LOCAL to whatever range it was given,
+                             * and any chunked job has a non-zero start --
+                             * a -n/-N run split across threads, not only a
+                             * brute-force chunk. Gating this on bf_chunk left
+                             * the start off for those, so a hit decoded at the
+                             * wrong mask position and the tool printed a
+                             * plaintext that does not produce the hash:
+                             * $HEX[...973003037] where the answer is
+                             * $HEX[...973303037]. A wrong plaintext is worse
+                             * than the 16x waste this same change removes,
+                             * because it is not obviously wrong.
+                             *
+                             * When the job carries no range all four terms are
+                             * zero -- bf_num_masks == 0 kills the iter stride
+                             * whatever iter_idx_local holds -- so this reduces
+                             * to mask_idx_abs = mask_idx, bit-identical to the
+                             * unchunked path.
+                             */
+                            {
                                 /* BF Phase 1.8: add iter stride. For
                                  * inner_iter==1 (servo default or salted
                                  * guard) iter_idx_local is 0 and this
@@ -2553,7 +2578,7 @@ void gpujob(void *arg) {
                                 uint64_t remaining = prepend_idx;
                                 for (int k = 0; k < npre; k++) {
                                     int i = npre - 1 - k;
-                                    int sz = gpu_mask_sizes[i];
+                                    int sz = gpu_mask_wire_size(gpu_mask_sizes[i]);
                                     if (sz <= 0) sz = 1;
                                     int pidx = (int)(remaining % (uint64_t)sz);
                                     remaining /= (uint64_t)sz;
@@ -2568,7 +2593,7 @@ void gpujob(void *arg) {
                                 for (int k = 0; k < napp; k++) {
                                     int i = napp - 1 - k;
                                     int row = npre + i;
-                                    int sz = gpu_mask_sizes[row];
+                                    int sz = gpu_mask_wire_size(gpu_mask_sizes[row]);
                                     if (sz <= 0) sz = 1;
                                     int pidx = (int)(remaining % (uint64_t)sz);
                                     remaining /= (uint64_t)sz;
@@ -3317,9 +3342,9 @@ void gpujob(void *arg) {
                  * the reported total hashes-tested metric). When inner_iter
                  * is 0 or 1, the multiplier degenerates to 1 — bit-identical
                  * to the Phase 1 accounting. */
-                uint32_t _ii_acct = (g->bf_chunk && g->bf_inner_iter > 0u)
+                uint32_t _ii_acct = (g->bf_inner_iter > 0u)
                                   ? g->bf_inner_iter : 1u;
-                uint64_t _mask_size_for_acct = (g->bf_chunk && g->bf_num_masks > 0u)
+                uint64_t _mask_size_for_acct = (g->bf_num_masks > 0u)
                                              ? (uint64_t)g->bf_num_masks *
                                                  (uint64_t)_ii_acct
                                              : (uint64_t)b71_mask_size_acct;

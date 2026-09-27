@@ -379,12 +379,28 @@ kernel void template_phase0(
     /* Task #250: kernel restructure — one thread per word; rule × mask
      * axes fold into an inner double-loop. The OpenCL twin keeps all
      * three axes on the outer grid (OpenCL drivers spill thread-private
-     * arrays transparently to global so the 40 KB per-lane buf cost is
-     * paid once per-PE not once per-lane). Apple Metal does NOT spill —
-     * the only way to keep RULE_BUF_MAX at 40 KB is one device-buf slice
-     * per lane, and the cheapest "slice per lane" indexing is to make
-     * each lane own ONE word for its entire run. The inner double-loop
-     * mirrors hashcat's canonical per-word inner-loop model.
+     * arrays transparently to global so the per-lane buf cost is paid
+     * once per-PE not once per-lane). Apple Metal does NOT spill, so the
+     * buffer has to be one device-buf slice per lane, and the cheapest
+     * "slice per lane" indexing is to make each lane own ONE word for its
+     * entire run. The inner double-loop mirrors hashcat's canonical
+     * per-word inner-loop model.
+     *
+     * The NUMBERS this was decided on have since changed, and the comment
+     * is kept accurate rather than rewritten because the structure below
+     * still matches it. When Task #250 landed (2026-05-13) the walker
+     * buffer was 40,960 elements, which at METAL_U32_SLOT_BYTES (12 bytes
+     * per element) is 480 KB per lane -- at that price one lane per word
+     * was the only affordable shape. On 2026-09-12 the input-word gate
+     * became 1024 bytes with the walker buffer at twice that, so a lane
+     * now costs 2048 x 12 = 24 KB. That is a 20x cut, and it means the
+     * one-lane-per-word shape is no longer FORCED by the buffer budget --
+     * roughly 40,000 lanes now fit in a gigabyte of scratch. Whether to
+     * spend that on putting the rule or mask axis back on the grid is an
+     * open question and not a defect; the cost of NOT doing it is that a
+     * deep mask over few words runs at a handful of lanes. Measured on an
+     * M1: 400,000 words x ?l is 32 MH/s, 1 word x ?l^5 is 20 KH/s, for
+     * the same candidate count.
      *
      * Implications:
      *   - Outer grid = n_words (was n_words * n_rules * mask_size).
@@ -491,6 +507,30 @@ kernel void template_phase0(
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen_orig > RULE_BUF_LIMIT) wlen_orig = RULE_BUF_LIMIT;
 
+#ifdef GPU_TEMPLATE_HAS_MASK
+    /* Loop-invariant mask geometry, hoisted out of the rule x mask double
+     * loop.  These depend only on params and mask_sizes, neither of which
+     * changes for the life of the dispatch, yet the position clamps and an
+     * napp-long multiply chain for append_combos were recomputed for EVERY
+     * candidate.  mdig[] holds the per-position digits for the odometer in
+     * the mask block below; ushort because a class may have 256 members
+     * (?b), so a digit reaches 255 and the carry test needs 256 to be
+     * representable. */
+    uint  mask_npre_h = params.n_prepend;
+    uint  mask_napp_h = params.n_append;
+    if (mask_npre_h > 16u) mask_npre_h = 16u;
+    if (mask_napp_h > 16u) mask_napp_h = 16u;
+    ulong mask_append_combos_h = 1u;
+    for (uint j = 0u; j < mask_napp_h; j++) {
+        uint sz = mask_sizes[mask_npre_h + j];
+        if (sz == 0u) sz = 1u;
+        mask_append_combos_h *= (ulong)sz;
+    }
+    if (mask_append_combos_h == 0u) mask_append_combos_h = 1u;
+    ushort mdig[32];
+    for (uint i = 0u; i < 32u; i++) mdig[i] = 0u;
+#endif
+
     /* Inner double-loop: rule_idx (outer) × mask_idx_local (inner). The
      * structure is identical for all four PSO variants — collapsing axes
      * (mask_size==1 or rule_count==1) just makes the loop body run once
@@ -594,25 +634,52 @@ kernel void template_phase0(
              * per-position indices and modify buf in-place. Mirrors
              * gpu_template.cl lines 405-531. Steps 1-4 identical to
              * pre-task-#250 layout — only address space of `buf` changes. */
-            uint npre = params.n_prepend;
-            uint napp = params.n_append;
-            if (npre > 16u) npre = 16u;
-            if (napp > 16u) napp = 16u;
-
-            ulong mask_idx_abs = (ulong)params.mask_start
-                               + (ulong)word_idx * (ulong)params.mask_offset_per_word
-                               + (ulong)mask_idx_local;
+            uint npre = mask_npre_h;
+            uint napp = mask_napp_h;
 
             if (npre >= 1u || napp >= 1u) {
-                ulong append_combos = 1u;
-                for (uint j = 0u; j < napp; j++) {
-                    uint sz = mask_sizes[npre + j];
-                    if (sz == 0u) sz = 1u;
-                    append_combos *= (ulong)sz;
+                /* Mixed-radix odometer (2026-09-24).  This ran a 64-bit divmod
+                 * per mask POSITION for every candidate, plus recomputing
+                 * append_combos.  Measured on an M2 Max at 4096 words: 1.15 ns
+                 * per position from 2 to 4 positions, 3.09 ns from 4 to 6 --
+                 * about a third of kernel time at six positions, against a
+                 * Phase 1.5 estimate of 5 percent that assumed MD5 dominates.
+                 * Consecutive candidates differ by one, so decompose once when
+                 * the mask loop starts and carry thereafter.  Significance
+                 * order, least first, is the last append position through the
+                 * first and then the last prepend through the first -- i.e.
+                 * descending row order, which is exactly what the two
+                 * decompose loops here already produce. */
+                if (mask_idx_local == 0u) {
+                    ulong mask_idx_abs = (ulong)params.mask_start
+                                       + (ulong)word_idx
+                                         * (ulong)params.mask_offset_per_word;
+                    ulong prepend_idx = mask_idx_abs / mask_append_combos_h;
+                    ulong append_idx  = mask_idx_abs % mask_append_combos_h;
+                    ulong rem = append_idx;
+                    for (uint k = 0u; k < napp; k++) {
+                        uint row = npre + (napp - 1u - k);
+                        uint psz = mask_sizes[row];
+                        if (psz == 0u) psz = 1u;
+                        mdig[row] = (ushort)(rem % (ulong)psz);
+                        rem /= (ulong)psz;
+                    }
+                    rem = prepend_idx;
+                    for (uint k = 0u; k < npre; k++) {
+                        uint row = npre - 1u - k;
+                        uint psz = mask_sizes[row];
+                        if (psz == 0u) psz = 1u;
+                        mdig[row] = (ushort)(rem % (ulong)psz);
+                        rem /= (ulong)psz;
+                    }
+                } else {
+                    for (int r = (int)(npre + napp) - 1; r >= 0; r--) {
+                        uint psz = mask_sizes[r];
+                        if (psz == 0u) psz = 1u;
+                        if ((uint)(++mdig[r]) < psz) break;
+                        mdig[r] = 0u;
+                    }
                 }
-                if (append_combos == 0u) append_combos = 1u;
-                ulong prepend_idx = mask_idx_abs / append_combos;
-                ulong append_idx  = mask_idx_abs % append_combos;
 
                 /* Step 1: shift buf right by npre bytes, high to low to
                  * avoid clobber. */
@@ -631,15 +698,9 @@ kernel void template_phase0(
 
                 /* Step 2: write prepend chars at buf[0..npre). */
                 if (npre > 0u) {
-                    ulong remaining = prepend_idx;
-                    for (uint k = 0u; k < npre; k++) {
-                        uint i = npre - 1u - k;
-                        uint psize = mask_sizes[i];
-                        if (psize == 0u) psize = 1u;
-                        uint pidx = (uint)(remaining % (ulong)psize);
-                        remaining /= (ulong)psize;
+                    for (uint i = 0u; i < npre; i++) {
                         if (i < RULE_BUF_LIMIT) {
-                            buf[i] = mask_charsets[i * 256u + pidx];
+                            buf[i] = mask_charsets[i * 256u + (uint)mdig[i]];
                         }
                     }
                 }
@@ -647,17 +708,11 @@ kernel void template_phase0(
                 /* Step 3: write append chars. */
                 if (napp > 0u) {
                     uint append_base = (uint)new_len + npre;
-                    ulong remaining = append_idx;
-                    for (uint k = 0u; k < napp; k++) {
-                        uint i = napp - 1u - k;
+                    for (uint i = 0u; i < napp; i++) {
                         uint row = npre + i;
-                        uint psize = mask_sizes[row];
-                        if (psize == 0u) psize = 1u;
-                        uint pidx = (uint)(remaining % (ulong)psize);
-                        remaining /= (ulong)psize;
                         uint dst = append_base + i;
                         if (dst < RULE_BUF_LIMIT) {
-                            buf[dst] = mask_charsets[row * 256u + pidx];
+                            buf[dst] = mask_charsets[row * 256u + (uint)mdig[row]];
                         }
                     }
                 }
