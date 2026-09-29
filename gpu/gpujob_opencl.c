@@ -28,6 +28,7 @@
 #endif
 #include <iconv.h>
 #include "mdxfind.h"
+#include "ruleproc32.h"   /* RULE32_TLS_SCRATCH */
 #include "job_types.h"
 #include "gpujob.h"
 #include "gpu_opencl.h"
@@ -1856,8 +1857,11 @@ void gpujob(void *arg) {
                     }
 
                     /* Thread-local applyrule scratch space. */
-                    static __thread struct rule_workspace _ws;
-                    static __thread char _tpass[MAXLINE + 64];
+                    static __thread struct rule_workspace *_ws;
+                    static __thread char *_tpass;
+
+                    RULE32_TLS_SCRATCH(_ws, 1);
+                    RULE32_TLS_SCRATCH(_tpass, MAXLINE + 64);
 
                     int stored = nhits;
                     if (stored > GPU_PACKED_MAX_HITS) stored = GPU_PACKED_MAX_HITS;
@@ -2372,7 +2376,7 @@ void gpujob(void *arg) {
                                                                _tpass, MAXLINE);
                             if (new_len == GPU_U32_REPLAY_BYTE)
                                 new_len = applyrule(synthetic_job.line, _tpass,
-                                                    (int)plen, rule_bc, &_ws);
+                                                    (int)plen, rule_bc, _ws);
                             /* The dropped-hit PROBE that found the no-rule
                              * dedup bug lived here and is REMOVED: it read
                              * MDXFIND_GPU_U32_PROBE, and MDXFIND_CACHE is the

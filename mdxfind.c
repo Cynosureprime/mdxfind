@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.606 2026/09/27 06:16:49 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.608 2026/09/29 13:44:20 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.606 2026/09/27 06:16:49 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.608 2026/09/29 13:44:20 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.608  2026/09/29 13:44:20  dlr
+ * Add three hash types, e1051 through e1053. e1051 MD5MD5RAWMD5PASS is md5(md5_bin(md5(pass) . pass)) and e1052 MD5MD5RAWMD5 is md5(md5_bin(md5(pass))): the inner digest is consumed as HEX and the outer md5 is fed the RAW sixteen bytes, which is what separates them from the hex-chained forms already in the catalog. Named from the existing convention where a RAW component marks the bin step and a trailing PASS marks the concatenation, matching e243 MD5BASE64MD5RAWMD5 and e123 MD5MD5PASS. e1053 MD5SHA1SHA1MD5MD5 is md5(sha1(sha1(md5(md5(pass))))). It is exactly one inner md5 more than the existing JOB_MD5SHA1SHA1MD5, so the new case adds that md5 and falls through to the established tail rather than restating the whole chain; e299 and e300 were re-verified against independent computation afterwards to confirm the fall-through order was not disturbed. All three cleared the catalog dedup gate before a number was assigned. Every vector was supplied externally and reproduced with an independent implementation rather than by this code, and for e1053 all sixteen hex-versus-binary permutations of the four inner steps were computed to confirm the reading is unique. Types[] entries appended at 1051, 1052 and 1053 so the positional indices stay identical to hashpipe.c, verified on both sides.
+ *
+ * Revision 1.607  2026/09/28 11:37:41  dlr
+ * Add e1047 through e1050, and move the large thread-local rule scratch buffers out of static TLS. New types: e1047 MD5-1xMD5pMD5SHA1p, e1048 MD5-1xMD5pMD5SHA256p and e1049 MD5-1xMD5pMD5SHA512p are md5 of md5 of pass concatenated with md5 of H of pass, each hashing H of pass once and reusing its hex; e1050 MD5SHA1revMD5 is md5 of sha1 of the reversed 32 hex characters of md5 of pass, which is e465 SHA1revMD5 with one more md5 outside, so it uses prmd5REV and the shared MD_SHA_start tail. Types appended in order so the positional index matches hashpipe exactly, verified at 1050; dedup gate run before each addition and the catalog regenerated afterwards so the gate covers them. Second change, unrelated to the types: a static __thread array does not get a buffer off the thread stack, which is what the comment at applyrule_u32 believed. glibc carves the static TLS block out of the same allocation as the thread stack and copies it into every thread, including threads created inside a dlopen library, so mdxfind carried 6,881,648 bytes of .tbss and AMD fglrx 1573.4 clCreateCommandQueue hung forever on gp1, its helper thread unable to start above a threshold bisected to between 131,072 and 262,144 bytes. rl32, packed, inbuf and outbuf now hold thread-local pointers allocated once per thread through RULE32_TLS_SCRATCH; cached stays an array, being under the threshold and carrying sizeof uses. One trap worth naming: applyrule_u32 passed sizeof rl32 divided by sizeof rl32 element as a capacity, which evaluates to 2 once rl32 is a pointer and would have truncated every rule to two codepoints while still appearing to work, so it now passes MAXLINE plus 16 explicitly. Measured .tbss 6,881,648 to 41,256 on the Linux GPU build; mdxfind now initialises the Tahiti GPU in 2.0 seconds and cracks on it where every earlier build hung. procrule -8 against mdxfind -8 is 10,946 of 10,947 before and after, the one difference being the known Turkish dotless-i locale variant. bench_rates.h has no entries for e1047 through e1050, so -L cannot decline them; that is the permissive direction and needs a dev1 measurement before release.
+ *
  * Revision 1.606  2026/09/27 06:16:49  dlr
  * Add e1043 to e1046: md5(md5(H(pass)) . H(pass)) for H in sha1, sha256, sha512 and md5. Named with the existing -1x convention rather than a new one: the -1x marker says the outer hash is over a CONCATENATION and not a chain, and a trailing p closes a term ending in (pass). Without those markers a name like MD5MD5SHA1SHA1 reads as a four-deep chain, which is a different digest with no diagnostic. The four are the exact skeleton of e330 MD5-1xSHA1MD5pSHA1p with the inner two primitives swapped, and they sit beside e322, e323, e330 and e331 in the same family. Each computes H(pass) once and reuses its hex both as the inner md5 input and as the second term, so a candidate costs H plus two md5. Appended at the END of Types[]; twelve existing indices verified byte-identical, including the four -1x siblings. All four agree with the hx VM, crack the supplied vectors at password 1111, and the dedup gate returned NO MATCH before implementation and MATCH after.
  *
@@ -4837,11 +4843,16 @@ static int applyrule_u32(const char *plainrule, const char *in, int inlen,
 {
     static __thread char cached[MAXLINE + 16];
     static __thread int cached_ok = 0, cached_set = 0;
-    static __thread uint32_t rl32[MAXLINE + 16];
-    static __thread uint32_t packed[RULE32_MAXCP];
-    static __thread uint32_t inbuf[RULE32_MAXCP];
-    static __thread uint32_t outbuf[RULE32_MAXCP];
+    static __thread uint32_t *rl32;
+    static __thread uint32_t *packed;
+    static __thread uint32_t *inbuf;
+    static __thread uint32_t *outbuf;
     int rl, il, ol, bl;
+
+    RULE32_TLS_SCRATCH(rl32,   MAXLINE + 16);
+    RULE32_TLS_SCRATCH(packed, RULE32_MAXCP);
+    RULE32_TLS_SCRATCH(inbuf,  RULE32_MAXCP);
+    RULE32_TLS_SCRATCH(outbuf, RULE32_MAXCP);
 
     if (!cached_set || strcmp(plainrule, cached) != 0) {
         strncpy(cached, plainrule, sizeof(cached) - 1);
@@ -4849,7 +4860,9 @@ static int applyrule_u32(const char *plainrule, const char *in, int inlen,
         cached_set = 1;
         cached_ok = 0;
         rl = utf8_to_utf32((const unsigned char *)plainrule, (int)strlen(plainrule),
-                           rl32, (int)(sizeof rl32 / sizeof rl32[0]));
+                           rl32, MAXLINE + 16);   /* was sizeof rl32/sizeof rl32[0];
+                                                   * rl32 is now a pointer, so that
+                                                   * expression would evaluate to 2 */
         if (rl < 0) return -3;                  /* rule file not valid UTF-8 */
         if (packrule32(rl32, rl, packed, RULE32_MAXCP) < 0) return -3;
         cached_ok = 1;
@@ -7814,6 +7827,13 @@ char *Types[] = {
     "MD5-1xMD5SHA256pSHA256p",
     "MD5-1xMD5SHA512pSHA512p",
     "MD5-1xMD5MD5pMD5p",
+    "MD5-1xMD5pMD5SHA1p",
+    "MD5-1xMD5pMD5SHA256p",
+    "MD5-1xMD5pMD5SHA512p",
+    "MD5SHA1revMD5",
+    "MD5MD5RAWMD5PASS",
+    "MD5MD5RAWMD5",
+    "MD5SHA1SHA1MD5MD5",
 
 NULL
 
@@ -8895,6 +8915,13 @@ NULL
 #define JOB_MD5_xMD5SHA256pSHA256p 1044
 #define JOB_MD5_xMD5SHA512pSHA512p 1045
 #define JOB_MD5_xMD5MD5pMD5p 1046
+#define JOB_MD5_xMD5pMD5SHA1p 1047
+#define JOB_MD5_xMD5pMD5SHA256p 1048
+#define JOB_MD5_xMD5pMD5SHA512p 1049
+#define JOB_MD5SHA1revMD5 1050
+#define JOB_MD5MD5RAWMD5PASS 1051
+#define JOB_MD5MD5RAWMD5 1052
+#define JOB_MD5SHA1SHA1MD5MD5 1053
 
 #define JOB_DONE 2000
 
@@ -10039,6 +10066,13 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [1044] = TYPEOPT_NEEDSF,  /* MD5-1xMD5SHA256pSHA256p */
     [1045] = TYPEOPT_NEEDSF,  /* MD5-1xMD5SHA512pSHA512p */
     [1046] = TYPEOPT_NEEDSF,  /* MD5-1xMD5MD5pMD5p */
+    [1047] = TYPEOPT_NEEDSF,  /* MD5-1xMD5pMD5SHA1p */
+    [1048] = TYPEOPT_NEEDSF,  /* MD5-1xMD5pMD5SHA256p */
+    [1049] = TYPEOPT_NEEDSF,  /* MD5-1xMD5pMD5SHA512p */
+    [1050] = TYPEOPT_NEEDSF,  /* MD5SHA1revMD5 */
+    [1051] = TYPEOPT_NEEDSF,  /* MD5MD5RAWMD5PASS */
+    [1052] = TYPEOPT_NEEDSF,  /* MD5MD5RAWMD5 */
+    [1053] = TYPEOPT_NEEDSF,  /* MD5SHA1SHA1MD5MD5 */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -30400,6 +30434,13 @@ MD5WRL_start:
                 len = 40;
                 goto MD_SHAMD_start;
 
+              case JOB_MD5SHA1SHA1MD5MD5:            /* MD5SHA1SHA1MD5MD5 */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, mdbuf, 32);
+                len = 32;
+                /* FALLTHROUGH -- one more md5, then the shared
+                   sha1(sha1(...)) tail and the outer md5 */
+
               case JOB_MD5SHA1SHA1MD5:
                 mymd5(cur, len, curin.h);
                 cur = prmd5(curin.h, mdbuf, 32);
@@ -42914,6 +42955,91 @@ HAV256_5_start:
                 len = 64;
                 x = 1;
                 goto MDstart;
+
+              /* ----- e1047..e1049: md5(md5(pass) . md5(H(pass))) -----------------
+               * Same -1x family as e1043..e1046: the outer md5 is over a
+               * CONCATENATION, and each term carries a trailing p because it
+               * ends in (pass).  Term 1 needs that p as much as term 2 does --
+               * without it MD5-1xMD5MD5SHA1p would read as MD5MD5 plus SHA1p,
+               * a different construction.  Both terms are 32 hex wide whatever
+               * H is, since both are md5 outputs.
+               */
+              case JOB_MD5_xMD5pMD5SHA1p:              /* MD5-1xMD5pMD5SHA1p */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                mysha1(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 40);
+                mymd5(mdbuf, 40, curin.h);
+                prmd5(curin.h, linebuf + 32, 32);
+                cur = linebuf;
+                len = 64;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5_xMD5pMD5SHA256p:              /* MD5-1xMD5pMD5SHA256p */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                mysha256(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 64);
+                mymd5(mdbuf, 64, curin.h);
+                prmd5(curin.h, linebuf + 32, 32);
+                cur = linebuf;
+                len = 64;
+                x = 1;
+                goto MDstart;
+
+              case JOB_MD5_xMD5pMD5SHA512p:              /* MD5-1xMD5pMD5SHA512p */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                mysha512(cur, len, curin.h);
+                prmd5(curin.h, mdbuf, 128);
+                mymd5(mdbuf, 128, curin.h);
+                prmd5(curin.h, linebuf + 32, 32);
+                cur = linebuf;
+                len = 64;
+                x = 1;
+                goto MDstart;
+
+              /* ----- e1050: md5(sha1(rev(md5(pass)))) -----------------------
+               * The rev acts on the 32 hex CHARACTERS of the inner md5, not on
+               * the 16 raw bytes -- confirmed against the supplied vector.
+               * prmd5REV emits that reversed hex directly, as it does for e465
+               * SHA1revMD5, which is this chain without the outer md5.  The
+               * shared MD_SHA_start tail then does the sha1 and the final md5.
+               */
+              /* ----- e1051 / e1052: md5 of a RAW md5 -------------------------
+               * The inner md5 is consumed as its 32 HEX characters; md5_bin
+               * then yields 16 RAW bytes which the OUTER md5 consumes. Both
+               * confirmed against the supplied vectors -- feeding the inner
+               * digest raw instead of hex gives a different answer, which is
+               * the distinction that once swapped e572 and e241. Hashes into
+               * newbuf and back, the aliasing-safe form e33 MD5RAW uses.
+               */
+              case JOB_MD5MD5RAWMD5PASS:                 /* MD5MD5RAWMD5PASS */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                memmove(linebuf + 32, cur, len);
+                mymd5(linebuf, 32 + len, (unsigned char *)newbuf);
+                cur = newbuf; len = 16; x = 1;
+                goto MDstart;
+
+              case JOB_MD5MD5RAWMD5:                     /* MD5MD5RAWMD5 */
+                if (len > MAXLINE) break;
+                mymd5(cur, len, curin.h);
+                prmd5(curin.h, linebuf, 32);
+                mymd5(linebuf, 32, (unsigned char *)newbuf);
+                cur = newbuf; len = 16; x = 1;
+                goto MDstart;
+
+              case JOB_MD5SHA1revMD5:                    /* MD5SHA1revMD5 */
+                mymd5(cur, len, curin.h);
+                cur = prmd5REV(curin.h, linebuf, 32);
+                len = 32;
+                goto MD_SHA_start;
 
               default:
                 fprintf(stderr, "Unknown job type %d\n", job->op);

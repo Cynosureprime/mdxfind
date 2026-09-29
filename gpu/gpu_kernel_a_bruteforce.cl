@@ -324,12 +324,33 @@ static int mask_expand_run_into_gpu(
             outbuf[out_len] = 0; out_len++; n_vars++;
         } else break;
     }
+    uint gb_hi = (uint)(idx >> 32);
+    uint gb_lo = (uint)idx;
     for (int i = n_vars - 1; i >= 0; i--) {
         uint cid = (uint)var_classids[i];
         uint cc  = mask_class_counts[cid]; if (cc == 0u) cc = 1u;
-        outbuf[var_outpos[i]] = mask_charsets[cid * MASK_CHARSET_STRIDE
-                                              + (uint)(idx % (ulong)cc)];
-        idx /= (ulong)cc;
+        /* Limb division: base-2^16 long division of gb_hi:gb_lo by cc using
+         * 32-bit operations only, so no i64 reaches the address of the
+         * one-byte charset load -- the construct AMD fglrx 1573.4 rejects with
+         * `Cannot select: load <LD1 ...> anyext from i8`.  cc <=
+         * MASK_CHARSET_STRIDE = 256, so every intermediate is below 2^24 and
+         * each digit quotient below 2^16.  Full 2^64 index range retained. */
+        {
+            uint gb_qhi = gb_hi / cc;
+            uint gb_r   = gb_hi % cc;
+            uint gb_t1  = (gb_r << 16) | (gb_lo >> 16);
+            uint gb_q1  = gb_t1 / cc;
+            uint gb_t0;
+            uint gb_q0;
+            gb_r  = gb_t1 % cc;
+            gb_t0 = (gb_r << 16) | (gb_lo & 0xFFFFu);
+            gb_q0 = gb_t0 / cc;
+            gb_r  = gb_t0 % cc;
+            gb_hi = gb_qhi;
+            gb_lo = (gb_q1 << 16) | gb_q0;
+            outbuf[var_outpos[i]] =
+                mask_charsets[cid * MASK_CHARSET_STRIDE + gb_r];
+        }
     }
     return out_len;
 #endif  /* A4_PROFILE_VARIANT == 3 */
@@ -608,3 +629,4 @@ void cand_bruteforce_phase0(
      * before kernel B dispatches. No explicit fence; the queue boundary
      * provides the cross-kernel global-memory visibility. */
 }
+

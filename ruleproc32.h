@@ -1,6 +1,9 @@
-/* $Revision: 1.4 $
+/* $Revision: 1.5 $
  *
  * $Log: ruleproc32.h,v $
+ * Revision 1.5  2026/09/28 11:37:15  dlr
+ * Move the large thread-local rule scratch buffers from static TLS to the heap. A static __thread array does not get a buffer off the thread stack, which is what the comments at these sites believed: glibc carves the static TLS block out of the same allocation as the thread stack and replicates it into every thread, including threads created inside a dlopen library. mdxfind carried 6,881,648 bytes of .tbss, 95 percent of it eight uint32_t arrays of RULE32_MAXCP at 819,200 bytes each, and AMD fglrx 1573.4 clCreateCommandQueue hung forever on gp1 because its internal helper thread could not be created; a ballast harness bisects the threshold to between 131,072 and 262,144 bytes, and hashcat and the gbench harness ran on the same card minutes apart because their TLS is small or absent. Each buffer now keeps a thread-local pointer and allocates once per thread on first use through the new RULE32_TLS_SCRATCH in ruleproc32.h, using calloc so the zeroing matches .tbss semantics of zeroed once per thread rather than per call, never freed because worker threads live for the run exactly as the TLS block did, and a loud exit naming file and line on allocation failure. Measured .tbss falls from 6,881,648 to 41,256 bytes on the Linux GPU build and thread_bss from 5,120,216 to 41,152 on the non-GPU build; the residue is cached, deliberately left as an array because it is under the threshold and carries sizeof uses. mdxfind now initialises the Tahiti GPU in 2.0 seconds and cracks on it, including a two-digit mask matching the CPU exactly, where every earlier build hung. procrule -8 against mdxfind -8 gives 10,946 of 10,947 candidates both before and after, the one difference being the known Turkish dotless-i locale variant.
+ *
  * Revision 1.4  2026/09/05 01:10:04  dlr
  * Opcodes for the string forms of insert-every-N, toggle-after-separator and title-case-on-separator.
  *
@@ -32,6 +35,8 @@
 #define RULEPROC32_H
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 /* ---- buffer sizing ----
  *
@@ -138,6 +143,34 @@ int applyrule32(const uint32_t *rule, const uint32_t *in, int inlen,
  * 5x is not for the decode, it is headroom for rules that GROW the buffer:
  * d and Z duplicate, p repeats, reflect doubles. Operator's call, 2026-09-04. */
 #define RULE32_MAXCP    (5 * MAXLINE)
+
+/* Thread-local scratch that lives on the HEAP, not in the static TLS block.
+ *
+ * A `static __thread T x[N]` does NOT get the array off the thread stack, which
+ * is what the comments at these sites believed. glibc carves the static TLS
+ * block out of the SAME allocation as the thread stack, and replicates the whole
+ * PT_TLS into every thread -- including threads created inside dlopen'd
+ * libraries. mdxfind carried 6,881,648 bytes of .tbss this way, 95% of it eight
+ * uint32_t[RULE32_MAXCP] arrays, and fglrx 1573.4's clCreateCommandQueue
+ * deadlocked because its internal helper thread could not be created above a
+ * threshold measured between 128 KB and 256 KB (gp1, 2026-09-27).
+ *
+ * Keep the POINTER in TLS (8 bytes) and the storage on the heap. Allocated once
+ * per thread on first use and deliberately never freed: worker threads live for
+ * the run, exactly as the TLS block did, so the lifetime is unchanged. calloc
+ * also matches .tbss semantics -- zeroed once per thread, not per call. */
+#define RULE32_TLS_SCRATCH(ptr, nelem)                                         \
+    do {                                                                       \
+        if (__builtin_expect((ptr) == NULL, 0)) {                              \
+            (ptr) = calloc((size_t)(nelem), sizeof(*(ptr)));                    \
+            if ((ptr) == NULL) {                                               \
+                fprintf(stderr, "%s:%d: calloc of %zu bytes for " #ptr         \
+                        " failed\n", __FILE__, __LINE__,                       \
+                        (size_t)(nelem) * sizeof(*(ptr)));                     \
+                exit(1);                                                       \
+            }                                                                  \
+        }                                                                      \
+    } while (0)
 
 /* Byte buffer able to hold ANY encodable working buffer. A codepoint takes at
  * most 4 bytes in UTF-8, so this is 4x the codepoint capacity -- 800KB against

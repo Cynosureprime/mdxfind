@@ -228,135 +228,164 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
          * on average across HashMob.100k frequency mix vs the prior hoist
          * (which added 2 compares/branch on every fixed-size opcode).
          * Listed by frequency rank then by opcode value for readability. */
+        /* Opcode RANGE TREE (replaces one 74-arm switch).
+         *
+         * Mechanically derived, semantics-preserving: every case body
+         * is carried across verbatim and dispatch is by opcode value
+         * range, so each opcode reaches exactly the arm it reached
+         * before.  gb_ar_h carries "no arm matched" out to the single
+         * shared default body, which cannot be duplicated into every
+         * leaf.
+         *
+         * Why: AMD fglrx 1573.4 (Tahiti) cannot link a program that
+         * contains this function as ONE switch -- clLinkProgram dies,
+         * either in a non-terminating recursion or on a NULL deref.
+         * The range tree builds there with optimisation ON and costs
+         * nothing measurable.  NVIDIA and every other target are
+         * unaffected and byte-exact. */
+        int gb_ar_h = 1;
+        if (op >= 0xefu) {
         switch (op) {
-
-            /* ---- Variable-length affix ops (0xff / 0xfe) ---- */
-            case 0xff: {
-                /* Multi-char append: 2 + N bytes, N data bytes follow N-byte.
-                 * Wave F: cap-once-then-copy. Compute the actual usable
-                 * count once instead of branching on every byte. */
-                int N = (int)prog[k + 1];
-                int n_copy = N;
-                if (len + n_copy > RULE_BUF_LIMIT) n_copy = RULE_BUF_LIMIT - len;
-                if (n_copy < 0) n_copy = 0;
-                for (int j = 0; j < n_copy; j++) {
-                    buf[len + j] = prog[k + 2 + j];
+            case RULE_OP_TITLE_SP: {
+                int z = 0;
+                for (int j = 0; j < len; j++) {
+                    uchar c = buf[j];
+                    /* An already-uppercase letter at a word start IS the
+                     * capital: keep it and mark the word started.  The old
+                     * form left z at 0 so the NEXT lowercase letter was
+                     * capitalised -- Hello1 became hEllo1. */
+                    /* Word start is POSITIONAL: the first character after a
+                     * separator, or position 0, whether or not it is a letter.
+                     * The old form only consumed the word start when it SAW a
+                     * letter, so "!bang" gave "!Bang" where john and hashcat
+                     * both give "!bang".  Mirrors ruleproc.c. */
+                    if (c == ' ') { z = 0; continue; }
+                    if (z == 0) { z = 1; if (c >= 'a' && c <= 'z') buf[j] = c ^ case_flip_mask(c); }
+                    else { if (c >= 'A' && c <= 'Z') buf[j] = c ^ case_flip_mask(c); }
                 }
-                len += n_copy;
-                k += 2 + N;
+                k += 1;
                 break;
             }
-            case 0xfe: {
-                /* Multi-char prepend: shift right by N, then write N data
-                 * bytes at buf[0..N-1]. */
-                int N = (int)prog[k + 1];
-                int new_pre = N;
-                if (len + new_pre > RULE_BUF_LIMIT) new_pre = RULE_BUF_LIMIT - len;
-                if (new_pre < 0) new_pre = 0;
-                /* Shift right (work backward to avoid overwrite). */
-                for (int j = len - 1; j >= 0; j--) {
-                    int dst = j + new_pre;
-                    if (dst <= RULE_BUF_LIMIT) buf[dst] = buf[j];
+            case RULE_OP_TOGGLE: {
+                int j = 0;
+                int vbound = len & ~15;
+                for (; j < vbound; j += 16) {
+                    uchar16 v = vload16(0, buf + j);
+                    /* Vectorized case_flip_mask: alphabetic detection
+                     * via unsigned 8-bit subtract + compare. */
+                    uchar16 v_or = v | (uchar16)0x20;
+                    uchar16 v_d  = v_or - (uchar16)'a';
+                    char16 is_alpha = (v_d < (uchar16)26);
+                    uchar16 mask = as_uchar16(is_alpha) & (uchar16)0x20;
+                    vstore16(v ^ mask, 0, buf + j);
                 }
-                for (int j = 0; j < new_pre; j++) {
-                    buf[j] = prog[k + 2 + j];
+                for (; j < len; j++) {
+                    uchar c = buf[j];
+                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                        buf[j] = c ^ (uchar)0x20;
                 }
-                len += new_pre;
-                k += 2 + N;
-                break;
-            }
-
-            /* ---- Top-frequency: insert / overwrite / toggle ---- */
-            case RULE_OP_INSERT: {
-                /* iNX: insert byte arg2 at position arg1-1.
-                 * applyrule semantics: only fires when (clen > pos). */
-                int pos = (int)prog[k + 1] - 1;
-                uchar ch = prog[k + 2];
-                /* pos <= len: inserting at position == length is an APPEND,
-                 * which john and hashcat 6.2.5 both do. */
-                if (pos >= 0 && pos <= len && len < RULE_BUF_LIMIT) {
-                    for (int j = len; j > pos; j--) buf[j] = buf[j - 1];
-                    buf[pos] = ch;
-                    len++;
-                }
-                k += 3;
-                break;
-            }
-            case RULE_OP_OVERWRITE: {
-                int pos = (int)prog[k + 1] - 1;
-                uchar ch = prog[k + 2];
-                if (pos >= 0 && pos < len) buf[pos] = ch;
-                if (pos == 0 && len == 0) { buf[0] = ch; len++; }
-                k += 3;
-                break;
-            }
-            case RULE_OP_TOGGLE_AT: {
-                /* Branchless: case_flip_mask returns 0 for non-alphabetic
-                 * bytes, so XOR with 0 is identity — the inner alphabetic
-                 * test collapses into the helper. Bounds check on `pos`
-                 * stays — required to match applyrule semantics. */
-                int pos = (int)prog[k + 1] - 1;
-                if (pos >= 0 && pos < len) {
-                    buf[pos] ^= case_flip_mask(buf[pos]);
-                }
-                k += 2;
-                break;
-            }
-
-            /* ---- Per-position arithmetic (Wave E branchless) ----
-             *
-             * Pattern: clamp `pos` into a safe slot, mask the increment
-             * by the validity flag, unconditionally write. When `valid`
-             * is 0 we write `buf[0] + 0` — a no-op idempotent self-write.
-             * On NVIDIA / AMD this compiles to one selp/v_cndmask + one
-             * predicated add, eliminating the divergent branch. */
-            /* hashcat `BNX`: add the byte value of X to the byte at
-             * position N, wrapping.  No-op out of range, matching
-             * hashcat's mangle_chr_add() and ruleproc.c.  Branchless,
-             * in the style of RULE_OP_INC below. */
-            case RULE_OP_CHR_ADD: {
-                int pos = (int)prog[k + 1] - 1;
-                uchar add = prog[k + 2];
-                int valid = ((pos >= 0) & (pos < len));
-                int safe_pos = valid ? pos : 0;
-                buf[safe_pos] = (uchar)(buf[safe_pos] + (valid ? add : (uchar)0));
-                k += 3;
-                break;
-            }
-            case RULE_OP_INC: {
-                int pos = (int)prog[k + 1] - 1;
-                int valid = ((pos >= 0) & (pos < len));
-                int safe_pos = valid ? pos : 0;
-                buf[safe_pos] = (uchar)(buf[safe_pos] + (uchar)valid);
-                k += 2;
-                break;
-            }
-            case RULE_OP_DEC: {
-                int pos = (int)prog[k + 1] - 1;
-                int valid = ((pos >= 0) & (pos < len));
-                int safe_pos = valid ? pos : 0;
-                buf[safe_pos] = (uchar)(buf[safe_pos] - (uchar)valid);
-                k += 2;
-                break;
-            }
-
-            /* ---- Length-shrink (Wave E) ----
-             * NOTE: the original `if (pos < len) len = pos;` matches
-             * applyrule. Branchless version preserved as a ternary —
-             * equivalent code shape, no behavioral change. */
-            case RULE_OP_TRUNC: {
-                int pos = (int)prog[k + 1] - 1;
-                len = (pos < len) ? pos : len;
-                k += 2;
-                break;
-            }
-            case RULE_OP_DROP_LAST: {
-                len -= (len > 0);
                 k += 1;
                 break;
             }
 
-            /* ---- Substitute ---- */
+            /* ---- Title-case ---- */
+            case RULE_OP_REVERSE: {
+                int i = 0, j = len - 1;
+                while (i < j) {
+                    uchar t = buf[i];
+                    buf[i] = buf[j];
+                    buf[j] = t;
+                    i++;
+                    j--;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_CAP_INV: {
+                /* Anti-capitalize: uppercase all (vector), then lower-case
+                 * the first uppercase letter (scalar pass). */
+                int j = 0;
+                int vbound = len & ~15;
+                for (; j < vbound; j += 16) {
+                    uchar16 v = vload16(0, buf + j);
+                    char16 is_lower = (v >= (uchar16)'a') & (v <= (uchar16)'z');
+                    uchar16 mask = as_uchar16(is_lower) & (uchar16)0x20;
+                    vstore16(v ^ mask, 0, buf + j);
+                }
+                for (; j < len; j++) {
+                    uchar c = buf[j];
+                    if (c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
+                }
+                /* john and hashcat both act on POSITION 0, not on the
+                 * first alphabetic character: `c` on "!bang" gives "!bang"
+                 * in both, where the find-first form gave "!Bang".  Mirrors
+                 * ruleproc.c. */
+                if (len > 0) {
+                    uchar c = buf[0];
+                    if (c >= 'A' && c <= 'Z') buf[0] = c ^ (uchar)0x20;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_CAP: {
+                /* Capitalize: lowercase all (vector), then upper-case
+                 * the first lowercase letter (scalar pass — variable
+                 * exit, intrinsically scalar). Matches ruleproc.c SSE. */
+                int j = 0;
+                int vbound = len & ~15;
+                for (; j < vbound; j += 16) {
+                    uchar16 v = vload16(0, buf + j);
+                    char16 is_upper = (v >= (uchar16)'A') & (v <= (uchar16)'Z');
+                    uchar16 mask = as_uchar16(is_upper) & (uchar16)0x20;
+                    vstore16(v ^ mask, 0, buf + j);
+                }
+                for (; j < len; j++) {
+                    uchar c = buf[j];
+                    if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
+                }
+                /* john and hashcat both act on POSITION 0, not on the
+                 * first alphabetic character: `c` on "!bang" gives "!bang"
+                 * in both, where the find-first form gave "!Bang".  Mirrors
+                 * ruleproc.c. */
+                if (len > 0) {
+                    uchar c = buf[0];
+                    if (c >= 'a' && c <= 'z') buf[0] = c ^ (uchar)0x20;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_UPPER: {
+                int j = 0;
+                int vbound = len & ~15;
+                for (; j < vbound; j += 16) {
+                    uchar16 v = vload16(0, buf + j);
+                    char16 is_lower = (v >= (uchar16)'a') & (v <= (uchar16)'z');
+                    uchar16 mask = as_uchar16(is_lower) & (uchar16)0x20;
+                    vstore16(v ^ mask, 0, buf + j);
+                }
+                for (; j < len; j++) {
+                    uchar c = buf[j];
+                    if (c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_LOWER: {
+                int j = 0;
+                int vbound = len & ~15;
+                for (; j < vbound; j += 16) {
+                    uchar16 v = vload16(0, buf + j);
+                    char16 is_upper = (v >= (uchar16)'A') & (v <= (uchar16)'Z');
+                    uchar16 mask = as_uchar16(is_upper) & (uchar16)0x20;
+                    vstore16(v ^ mask, 0, buf + j);
+                }
+                for (; j < len; j++) {
+                    uchar c = buf[j];
+                    if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
+                }
+                k += 1;
+                break;
+            }
             case RULE_OP_SUB: {
                 /* Wave D SIMD: vector compare against c1, blend c2 into
                  * matched lanes, vstore. Length-preserving — past-len
@@ -401,142 +430,329 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
              *                              so equivalent to `m if v>='A'&&v<='Z'`)
              *     simpler: `mask = ((v >= 'A') & (v <= 'Z')) & 0x20`.
              */
-            case RULE_OP_LOWER: {
-                int j = 0;
-                int vbound = len & ~15;
-                for (; j < vbound; j += 16) {
-                    uchar16 v = vload16(0, buf + j);
-                    char16 is_upper = (v >= (uchar16)'A') & (v <= (uchar16)'Z');
-                    uchar16 mask = as_uchar16(is_upper) & (uchar16)0x20;
-                    vstore16(v ^ mask, 0, buf + j);
-                }
-                for (; j < len; j++) {
-                    uchar c = buf[j];
-                    if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
-                }
+            case RULE_OP_DROP_LAST: {
+                len -= (len > 0);
                 k += 1;
                 break;
             }
-            case RULE_OP_UPPER: {
-                int j = 0;
-                int vbound = len & ~15;
-                for (; j < vbound; j += 16) {
-                    uchar16 v = vload16(0, buf + j);
-                    char16 is_lower = (v >= (uchar16)'a') & (v <= (uchar16)'z');
-                    uchar16 mask = as_uchar16(is_lower) & (uchar16)0x20;
-                    vstore16(v ^ mask, 0, buf + j);
-                }
-                for (; j < len; j++) {
-                    uchar c = buf[j];
-                    if (c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
-                }
-                k += 1;
+
+            /* ---- Substitute ---- */
+            case RULE_OP_TRUNC: {
+                int pos = (int)prog[k + 1] - 1;
+                len = (pos < len) ? pos : len;
+                k += 2;
                 break;
             }
-            case RULE_OP_CAP: {
-                /* Capitalize: lowercase all (vector), then upper-case
-                 * the first lowercase letter (scalar pass — variable
-                 * exit, intrinsically scalar). Matches ruleproc.c SSE. */
-                int j = 0;
-                int vbound = len & ~15;
-                for (; j < vbound; j += 16) {
-                    uchar16 v = vload16(0, buf + j);
-                    char16 is_upper = (v >= (uchar16)'A') & (v <= (uchar16)'Z');
-                    uchar16 mask = as_uchar16(is_upper) & (uchar16)0x20;
-                    vstore16(v ^ mask, 0, buf + j);
+            case RULE_OP_DEC: {
+                int pos = (int)prog[k + 1] - 1;
+                int valid = ((pos >= 0) & (pos < len));
+                int safe_pos = valid ? pos : 0;
+                buf[safe_pos] = (uchar)(buf[safe_pos] - (uchar)valid);
+                k += 2;
+                break;
+            }
+
+            /* ---- Length-shrink (Wave E) ----
+             * NOTE: the original `if (pos < len) len = pos;` matches
+             * applyrule. Branchless version preserved as a ternary —
+             * equivalent code shape, no behavioral change. */
+            case RULE_OP_INC: {
+                int pos = (int)prog[k + 1] - 1;
+                int valid = ((pos >= 0) & (pos < len));
+                int safe_pos = valid ? pos : 0;
+                buf[safe_pos] = (uchar)(buf[safe_pos] + (uchar)valid);
+                k += 2;
+                break;
+            }
+            case RULE_OP_TOGGLE_AT: {
+                /* Branchless: case_flip_mask returns 0 for non-alphabetic
+                 * bytes, so XOR with 0 is identity — the inner alphabetic
+                 * test collapses into the helper. Bounds check on `pos`
+                 * stays — required to match applyrule semantics. */
+                int pos = (int)prog[k + 1] - 1;
+                if (pos >= 0 && pos < len) {
+                    buf[pos] ^= case_flip_mask(buf[pos]);
                 }
-                for (; j < len; j++) {
-                    uchar c = buf[j];
-                    if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
+                k += 2;
+                break;
+            }
+
+            /* ---- Per-position arithmetic (Wave E branchless) ----
+             *
+             * Pattern: clamp `pos` into a safe slot, mask the increment
+             * by the validity flag, unconditionally write. When `valid`
+             * is 0 we write `buf[0] + 0` — a no-op idempotent self-write.
+             * On NVIDIA / AMD this compiles to one selp/v_cndmask + one
+             * predicated add, eliminating the divergent branch. */
+            /* hashcat `BNX`: add the byte value of X to the byte at
+             * position N, wrapping.  No-op out of range, matching
+             * hashcat's mangle_chr_add() and ruleproc.c.  Branchless,
+             * in the style of RULE_OP_INC below. */
+            case RULE_OP_OVERWRITE: {
+                int pos = (int)prog[k + 1] - 1;
+                uchar ch = prog[k + 2];
+                if (pos >= 0 && pos < len) buf[pos] = ch;
+                if (pos == 0 && len == 0) { buf[0] = ch; len++; }
+                k += 3;
+                break;
+            }
+            case RULE_OP_INSERT: {
+                /* iNX: insert byte arg2 at position arg1-1.
+                 * applyrule semantics: only fires when (clen > pos). */
+                int pos = (int)prog[k + 1] - 1;
+                uchar ch = prog[k + 2];
+                /* pos <= len: inserting at position == length is an APPEND,
+                 * which john and hashcat 6.2.5 both do. */
+                if (pos >= 0 && pos <= len && len < RULE_BUF_LIMIT) {
+                    for (int j = len; j > pos; j--) buf[j] = buf[j - 1];
+                    buf[pos] = ch;
+                    len++;
                 }
-                /* john and hashcat both act on POSITION 0, not on the
-                 * first alphabetic character: `c` on "!bang" gives "!bang"
-                 * in both, where the find-first form gave "!Bang".  Mirrors
-                 * ruleproc.c. */
+                k += 3;
+                break;
+            }
+            case 0xfe: {
+                /* Multi-char prepend: shift right by N, then write N data
+                 * bytes at buf[0..N-1]. */
+                int N = (int)prog[k + 1];
+                int new_pre = N;
+                if (len + new_pre > RULE_BUF_LIMIT) new_pre = RULE_BUF_LIMIT - len;
+                if (new_pre < 0) new_pre = 0;
+                /* Shift right (work backward to avoid overwrite). */
+                for (int j = len - 1; j >= 0; j--) {
+                    int dst = j + new_pre;
+                    if (dst <= RULE_BUF_LIMIT) buf[dst] = buf[j];
+                }
+                for (int j = 0; j < new_pre; j++) {
+                    buf[j] = prog[k + 2 + j];
+                }
+                len += new_pre;
+                k += 2 + N;
+                break;
+            }
+
+            /* ---- Top-frequency: insert / overwrite / toggle ---- */
+            case 0xff: {
+                /* Multi-char append: 2 + N bytes, N data bytes follow N-byte.
+                 * Wave F: cap-once-then-copy. Compute the actual usable
+                 * count once instead of branching on every byte. */
+                int N = (int)prog[k + 1];
+                int n_copy = N;
+                if (len + n_copy > RULE_BUF_LIMIT) n_copy = RULE_BUF_LIMIT - len;
+                if (n_copy < 0) n_copy = 0;
+                for (int j = 0; j < n_copy; j++) {
+                    buf[len + j] = prog[k + 2 + j];
+                }
+                len += n_copy;
+                k += 2 + N;
+                break;
+            }
+            default: gb_ar_h = 0; break;
+        }
+        } else if (op >= 0xdcu) {
+        switch (op) {
+            case RULE_OP_DUP_FIRST: {
+                int n2 = (int)prog[k + 1] - 1;
+                if (len > 0 && n2 > 0 && len + n2 <= RULE_BUF_LIMIT) {
+                    uchar first = buf[0];
+                    /* Shift right by n2. */
+                    for (int j = len - 1; j > 0; j--) buf[j + n2] = buf[j];
+                    /* applyrule's loop is `for (x = clen - 1; x > 0; x--)
+                     *    cpass[x + y] = cpass[x];` then `for (x = 1; x <= y; x++)
+                     *    cpass[x] = cpass[0];` — buf[0] is preserved (it is
+                     * the source we copy from), buf[1..n2] are filled with
+                     * first. So buf[0] keeps its original value. */
+                    for (int j = 1; j <= n2; j++) buf[j] = first;
+                    len += n2;
+                }
+                k += 2;
+                break;
+            }
+            case RULE_OP_DUP_LAST: {
+                /* Wave F: broadcast vstore for the fill loop. */
+                int n2 = (int)prog[k + 1] - 1;
+                if (len > 0 && n2 > 0 && len + n2 <= RULE_BUF_LIMIT) {
+                    uchar last = buf[len - 1];
+                    int j = 0;
+                    int vbound = n2 & ~15;
+                    uchar16 v_last = (uchar16)last;
+                    for (; j < vbound; j += 16) {
+                        vstore16(v_last, 0, buf + len + j);
+                    }
+                    for (; j < n2; j++) buf[len + j] = last;
+                    len += n2;
+                }
+                k += 2;
+                break;
+            }
+            case RULE_OP_PURGE: {
+                uchar ch = prog[k + 1];
+                int w = 0;
+                for (int j = 0; j < len; j++) {
+                    if (buf[j] != ch) buf[w++] = buf[j];
+                }
+                len = w;
+                k += 2;
+                break;
+            }
+
+            /* ---- Last/first-char duplicators ---- */
+            case RULE_OP_REPL_PREV: {
+                int pos = (int)prog[k + 1] - 1;
+                if (pos > 0 && pos < len) buf[pos] = buf[pos - 1];
+                k += 2;
+                break;
+            }
+
+            /* ---- Purge ---- */
+            case RULE_OP_REPL_NEXT: {
+                int pos = (int)prog[k + 1] - 1;
+                if (pos >= 0 && pos < len) {
+                    /* NO-OP when pos+1 is out of range, matching hashcat and
+                     * ruleproc.c: `hashcat --stdout` on abcdefghij gives
+                     * abcdefghjj for `.8` and abcdefghij unchanged for `.9`.
+                     * This wrote (uchar)0 instead, embedding a NUL in the
+                     * candidate -- a third answer again, different from both
+                     * the CPU engine's one-past-the-end read and hashcat's
+                     * no-op, so CPU and GPU hit sets could disagree on any
+                     * rule using `.` at the last position. */
+                    if (pos + 1 < len) buf[pos] = buf[pos + 1];
+                }
+                k += 2;
+                break;
+            }
+            case RULE_OP_BIT_SHR: {
+                int pos = (int)prog[k + 1] - 1;
+                if (pos >= 0 && pos < len) buf[pos] = buf[pos] >> 1;
+                k += 2;
+                break;
+            }
+            case RULE_OP_BIT_SHL: {
+                int pos = (int)prog[k + 1] - 1;
+                if (pos >= 0 && pos < len) buf[pos] = buf[pos] << 1;
+                k += 2;
+                break;
+            }
+            case RULE_OP_DEL_AT: {
+                int pos = (int)prog[k + 1] - 1;
+                if (pos >= 0 && pos < len) {
+                    for (int j = pos; j < len - 1; j++) buf[j] = buf[j + 1];
+                    len--;
+                }
+                k += 2;
+                break;
+            }
+
+            /* ---- Per-position bit shifts / nearest-neighbor copy ---- */
+            case RULE_OP_PREPEND: {
+                uchar ch = prog[k + 1];
+                if (len < RULE_BUF_LIMIT) {
+                    for (int j = len; j > 0; j--) buf[j] = buf[j - 1];
+                    buf[0] = ch;
+                    len++;
+                }
+                k += 2;
+                break;
+            }
+
+            case RULE_OP_APPEND: {
+                uchar ch = prog[k + 1];
+                if (len < RULE_BUF_LIMIT) buf[len++] = ch;
+                k += 2;
+                break;
+            }
+            case RULE_OP_DROP_FIRST: {
                 if (len > 0) {
-                    uchar c = buf[0];
-                    if (c >= 'a' && c <= 'z') buf[0] = c ^ (uchar)0x20;
+                    for (int j = 0; j < len - 1; j++) buf[j] = buf[j + 1];
+                    len--;
                 }
                 k += 1;
                 break;
             }
-            case RULE_OP_CAP_INV: {
-                /* Anti-capitalize: uppercase all (vector), then lower-case
-                 * the first uppercase letter (scalar pass). */
-                int j = 0;
-                int vbound = len & ~15;
-                for (; j < vbound; j += 16) {
-                    uchar16 v = vload16(0, buf + j);
-                    char16 is_lower = (v >= (uchar16)'a') & (v <= (uchar16)'z');
-                    uchar16 mask = as_uchar16(is_lower) & (uchar16)0x20;
-                    vstore16(v ^ mask, 0, buf + j);
-                }
-                for (; j < len; j++) {
-                    uchar c = buf[j];
-                    if (c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
-                }
-                /* john and hashcat both act on POSITION 0, not on the
-                 * first alphabetic character: `c` on "!bang" gives "!bang"
-                 * in both, where the find-first form gave "!Bang".  Mirrors
-                 * ruleproc.c. */
-                if (len > 0) {
-                    uchar c = buf[0];
-                    if (c >= 'A' && c <= 'Z') buf[0] = c ^ (uchar)0x20;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_REVERSE: {
-                int i = 0, j = len - 1;
-                while (i < j) {
-                    uchar t = buf[i];
-                    buf[i] = buf[j];
-                    buf[j] = t;
-                    i++;
-                    j--;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_TOGGLE: {
-                int j = 0;
-                int vbound = len & ~15;
-                for (; j < vbound; j += 16) {
-                    uchar16 v = vload16(0, buf + j);
-                    /* Vectorized case_flip_mask: alphabetic detection
-                     * via unsigned 8-bit subtract + compare. */
-                    uchar16 v_or = v | (uchar16)0x20;
-                    uchar16 v_d  = v_or - (uchar16)'a';
-                    char16 is_alpha = (v_d < (uchar16)26);
-                    uchar16 mask = as_uchar16(is_alpha) & (uchar16)0x20;
-                    vstore16(v ^ mask, 0, buf + j);
-                }
-                for (; j < len; j++) {
-                    uchar c = buf[j];
-                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-                        buf[j] = c ^ (uchar)0x20;
+            case RULE_OP_SWAP_BACK: {
+                if (len > 1) {
+                    uchar t = buf[len - 2];
+                    buf[len - 2] = buf[len - 1];
+                    buf[len - 1] = t;
                 }
                 k += 1;
                 break;
             }
 
-            /* ---- Title-case ---- */
-            case RULE_OP_TITLE_SP: {
-                int z = 0;
-                for (int j = 0; j < len; j++) {
-                    uchar c = buf[j];
-                    /* An already-uppercase letter at a word start IS the
-                     * capital: keep it and mark the word started.  The old
-                     * form left z at 0 so the NEXT lowercase letter was
-                     * capitalised -- Hello1 became hEllo1. */
-                    /* Word start is POSITIONAL: the first character after a
-                     * separator, or position 0, whether or not it is a letter.
-                     * The old form only consumed the word start when it SAW a
-                     * letter, so "!bang" gave "!Bang" where john and hashcat
-                     * both give "!bang".  Mirrors ruleproc.c. */
-                    if (c == ' ') { z = 0; continue; }
-                    if (z == 0) { z = 1; if (c >= 'a' && c <= 'z') buf[j] = c ^ case_flip_mask(c); }
-                    else { if (c >= 'A' && c <= 'Z') buf[j] = c ^ case_flip_mask(c); }
+            /* ---- Drop first / append / prepend ---- */
+            case RULE_OP_SWAP_FRONT: {
+                if (len > 1) {
+                    uchar t = buf[0]; buf[0] = buf[1]; buf[1] = t;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_ROT_R: {
+                if (len > 0) {
+                    uchar last = buf[len - 1];
+                    for (int j = len - 1; j > 0; j--) buf[j] = buf[j - 1];
+                    buf[0] = last;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_ROT_L: {
+                /* Rotate left by 1: "abcd"->"bcda".
+                 * applyrule: while (*rule == '{' && y < clen) coalesces
+                 * consecutive {{; the new bytecode emits each as a separate
+                 * RULE_OP_ROT_L so we step once per opcode. Functionally
+                 * equivalent (chained single-step rotation == multi-step). */
+                if (len > 0) {
+                    uchar first = buf[0];
+                    for (int j = 0; j < len - 1; j++) buf[j] = buf[j + 1];
+                    buf[len - 1] = first;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_DUP_EACH: {
+                /* "abc" -> "aabbcc"; length doubles. Work from the end so
+                 * we don't overwrite source bytes still being read. */
+                int tlen = len;
+                if (tlen * 2 <= RULE_BUF_LIMIT && tlen > 0) {
+                    for (int j = tlen - 1; j >= 0; j--) {
+                        uchar c = buf[j];
+                        buf[j * 2]     = c;
+                        buf[j * 2 + 1] = c;
+                    }
+                    len = tlen * 2;
+                }
+                k += 1;
+                break;
+            }
+
+            /* ---- Rotation / swap ---- */
+            case RULE_OP_REFLECT: {
+                int tlen = len;
+                if (len + tlen <= RULE_BUF_LIMIT && tlen > 0) {
+                    for (int j = 0; j < tlen; j++)
+                        buf[len + tlen - 1 - j] = buf[j];
+                    len += tlen;
+                }
+                k += 1;
+                break;
+            }
+            case RULE_OP_DUP: {
+                /* Wave F: vector copy buf[0..tlen-1] -> buf[len..len+tlen-1].
+                 * Source/dest don't overlap (offset == tlen). Scalar tail
+                 * keeps writes within tlen — must NOT overshoot into the
+                 * uninitialized region past 2*tlen since this is a length-
+                 * grow op (output buf[0..2*tlen-1] is read downstream). */
+                int tlen = len;
+                if (len + tlen <= RULE_BUF_LIMIT && tlen > 0) {
+                    int j = 0;
+                    int vbound = tlen & ~15;
+                    for (; j < vbound; j += 16) {
+                        uchar16 v = vload16(0, buf + j);
+                        vstore16(v, 0, buf + len + j);
+                    }
+                    for (; j < tlen; j++) buf[len + j] = buf[j];
+                    len += tlen;
                 }
                 k += 1;
                 break;
@@ -560,207 +776,240 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
             }
 
             /* ---- Whole-buffer length-grow ops ---- */
-            case RULE_OP_DUP: {
-                /* Wave F: vector copy buf[0..tlen-1] -> buf[len..len+tlen-1].
-                 * Source/dest don't overlap (offset == tlen). Scalar tail
-                 * keeps writes within tlen — must NOT overshoot into the
-                 * uninitialized region past 2*tlen since this is a length-
-                 * grow op (output buf[0..2*tlen-1] is read downstream). */
-                int tlen = len;
-                if (len + tlen <= RULE_BUF_LIMIT && tlen > 0) {
-                    int j = 0;
-                    int vbound = tlen & ~15;
-                    for (; j < vbound; j += 16) {
-                        uchar16 v = vload16(0, buf + j);
-                        vstore16(v, 0, buf + len + j);
-                    }
-                    for (; j < tlen; j++) buf[len + j] = buf[j];
-                    len += tlen;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_REFLECT: {
-                int tlen = len;
-                if (len + tlen <= RULE_BUF_LIMIT && tlen > 0) {
-                    for (int j = 0; j < tlen; j++)
-                        buf[len + tlen - 1 - j] = buf[j];
-                    len += tlen;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_DUP_EACH: {
-                /* "abc" -> "aabbcc"; length doubles. Work from the end so
-                 * we don't overwrite source bytes still being read. */
-                int tlen = len;
-                if (tlen * 2 <= RULE_BUF_LIMIT && tlen > 0) {
-                    for (int j = tlen - 1; j >= 0; j--) {
-                        uchar c = buf[j];
-                        buf[j * 2]     = c;
-                        buf[j * 2 + 1] = c;
-                    }
-                    len = tlen * 2;
-                }
-                k += 1;
-                break;
-            }
-
-            /* ---- Rotation / swap ---- */
-            case RULE_OP_ROT_L: {
-                /* Rotate left by 1: "abcd"->"bcda".
-                 * applyrule: while (*rule == '{' && y < clen) coalesces
-                 * consecutive {{; the new bytecode emits each as a separate
-                 * RULE_OP_ROT_L so we step once per opcode. Functionally
-                 * equivalent (chained single-step rotation == multi-step). */
-                if (len > 0) {
-                    uchar first = buf[0];
-                    for (int j = 0; j < len - 1; j++) buf[j] = buf[j + 1];
-                    buf[len - 1] = first;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_ROT_R: {
-                if (len > 0) {
-                    uchar last = buf[len - 1];
-                    for (int j = len - 1; j > 0; j--) buf[j] = buf[j - 1];
-                    buf[0] = last;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_SWAP_FRONT: {
-                if (len > 1) {
-                    uchar t = buf[0]; buf[0] = buf[1]; buf[1] = t;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_SWAP_BACK: {
-                if (len > 1) {
-                    uchar t = buf[len - 2];
-                    buf[len - 2] = buf[len - 1];
-                    buf[len - 1] = t;
-                }
-                k += 1;
-                break;
-            }
-
-            /* ---- Drop first / append / prepend ---- */
-            case RULE_OP_DROP_FIRST: {
-                if (len > 0) {
-                    for (int j = 0; j < len - 1; j++) buf[j] = buf[j + 1];
-                    len--;
-                }
-                k += 1;
-                break;
-            }
-            case RULE_OP_APPEND: {
-                uchar ch = prog[k + 1];
-                if (len < RULE_BUF_LIMIT) buf[len++] = ch;
+            default: gb_ar_h = 0; break;
+        }
+        } else if (op >= 0xc7u) {
+        switch (op) {
+            case RULE_OP_REJ_FIRST: {
+                /* `( X`: reject if (clen > 0 && buf[0] != X). Empty buf
+                 * is accepted (matches applyrule clen-guard). */
+                uchar c = prog[k + 1];
+                if (len > 0 && buf[0] != c) return -1;
                 k += 2;
                 break;
             }
-            case RULE_OP_PREPEND: {
-                uchar ch = prog[k + 1];
-                if (len < RULE_BUF_LIMIT) {
-                    for (int j = len; j > 0; j--) buf[j] = buf[j - 1];
-                    buf[0] = ch;
-                    len++;
-                }
-                k += 2;
-                break;
-            }
-
-            case RULE_OP_DEL_AT: {
-                int pos = (int)prog[k + 1] - 1;
-                if (pos >= 0 && pos < len) {
-                    for (int j = pos; j < len - 1; j++) buf[j] = buf[j + 1];
-                    len--;
-                }
-                k += 2;
-                break;
-            }
-
-            /* ---- Per-position bit shifts / nearest-neighbor copy ---- */
-            case RULE_OP_BIT_SHL: {
-                int pos = (int)prog[k + 1] - 1;
-                if (pos >= 0 && pos < len) buf[pos] = buf[pos] << 1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_BIT_SHR: {
-                int pos = (int)prog[k + 1] - 1;
-                if (pos >= 0 && pos < len) buf[pos] = buf[pos] >> 1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_REPL_NEXT: {
-                int pos = (int)prog[k + 1] - 1;
-                if (pos >= 0 && pos < len) {
-                    /* NO-OP when pos+1 is out of range, matching hashcat and
-                     * ruleproc.c: `hashcat --stdout` on abcdefghij gives
-                     * abcdefghjj for `.8` and abcdefghij unchanged for `.9`.
-                     * This wrote (uchar)0 instead, embedding a NUL in the
-                     * candidate -- a third answer again, different from both
-                     * the CPU engine's one-past-the-end read and hashcat's
-                     * no-op, so CPU and GPU hit sets could disagree on any
-                     * rule using `.` at the last position. */
-                    if (pos + 1 < len) buf[pos] = buf[pos + 1];
-                }
-                k += 2;
-                break;
-            }
-            case RULE_OP_REPL_PREV: {
-                int pos = (int)prog[k + 1] - 1;
-                if (pos > 0 && pos < len) buf[pos] = buf[pos - 1];
-                k += 2;
-                break;
-            }
-
-            /* ---- Purge ---- */
-            case RULE_OP_PURGE: {
-                uchar ch = prog[k + 1];
-                int w = 0;
+            case RULE_OP_REJ_NHAS: {
+                /* `/ X`: reject if buf does NOT contain X. */
+                uchar c = prog[k + 1];
+                int found = 0;
                 for (int j = 0; j < len; j++) {
-                    if (buf[j] != ch) buf[w++] = buf[j];
+                    if (buf[j] == c) { found = 1; break; }
                 }
-                len = w;
+                if (!found) return -1;
                 k += 2;
                 break;
             }
-
-            /* ---- Last/first-char duplicators ---- */
-            case RULE_OP_DUP_LAST: {
-                /* Wave F: broadcast vstore for the fill loop. */
-                int n2 = (int)prog[k + 1] - 1;
-                if (len > 0 && n2 > 0 && len + n2 <= RULE_BUF_LIMIT) {
-                    uchar last = buf[len - 1];
-                    int j = 0;
-                    int vbound = n2 & ~15;
-                    uchar16 v_last = (uchar16)last;
-                    for (; j < vbound; j += 16) {
-                        vstore16(v_last, 0, buf + len + j);
+            case RULE_OP_REJ_HAS: {
+                /* `! X`: reject if buf contains X. */
+                uchar c = prog[k + 1];
+                for (int j = 0; j < len; j++) {
+                    if (buf[j] == c) return -1;
+                }
+                k += 2;
+                break;
+            }
+            case RULE_OP_REJ_LEN_LE: {
+                /* `> N`: reject if clen > (arg - 1). Macro name is
+                 * misleading — applyrule rejects on GREATER-THAN. */
+                /* john: ">N reject unless greater than N chars". */
+                int y = (int)prog[k + 1] - 1;
+                if (len <= y) return -1;
+                k += 2;
+                break;
+            }
+            case RULE_OP_REJ_LEN_GE: {
+                /* `< N`: reject if clen < (arg - 1). Macro name is
+                 * misleading — applyrule rejects on LESS-THAN, not GE. */
+                /* john: "<N reject unless less than N chars" -- reject when
+                 * len >= N.  This was the complement, matching ruleproc.c's
+                 * old behaviour; both fixed together so CPU and GPU agree. */
+                int y = (int)prog[k + 1] - 1;
+                if (len >= y) return -1;
+                k += 2;
+                break;
+            }
+            case RULE_OP_REJ_LEN_NE: {
+                /* `_ N`: reject if orig_len != (arg - 1). applyrule
+                 * tests the original input length, NOT the running clen. */
+                /* CURRENT length, not the original word's. */
+                int y = (int)prog[k + 1] - 1;
+                if (y != len) return -1;
+                k += 2;
+                break;
+            }
+            case RULE_OP_MEM_INSERT: {         /* X N M I */
+                /* Insert M chars of memory from OFFSET N at position I.
+                 * Out-of-range REJECTS, following hashcat's
+                 * mangle_insert_multi -- operator ruling 2026-09-11, and
+                 * identical to the CPU arm. */
+                int y    = (int)prog[k + 1] - 1;   /* offset within memory */
+                int tlen = (int)prog[k + 2] - 1;   /* count              */
+                int z    = (int)prog[k + 3] - 1;   /* insert position    */
+                if (memlen < 1 || tlen < 1 || z > len ||
+                    y > memlen || (y + tlen) > memlen) return -1;
+                if (len + tlen > RULE_BUF_LIMIT) tlen = RULE_BUF_LIMIT - len;
+                if (tlen > 0) {
+                    for (int j = len; j >= z; j--) buf[j + tlen] = buf[j];
+                    for (int j = 0; j < tlen; j++) buf[z + j] = mem[y + j];
+                    len += tlen;
+                }
+                k += 4; break;
+            }
+            case RULE_OP_MEM_REJ: {            /* Q -- reject if == memory */
+                if (memlen == len) {
+                    int same = 1;
+                    for (int j = 0; j < len; j++) {
+                        if (buf[j] != mem[j]) { same = 0; break; }
                     }
-                    for (; j < n2; j++) buf[len + j] = last;
+                    if (same) return -1;
+                }
+                k += 1; break;
+            }
+            case RULE_OP_MEM_PRE: {            /* 6 -- prepend memory */
+                int y = memlen;
+                if (len + y > RULE_BUF_LIMIT) y = RULE_BUF_LIMIT - len;
+                if (y < 0) y = 0;
+                if (y > 0) {
+                    for (int j = len - 1; j >= 0; j--) buf[j + y] = buf[j];
+                    for (int j = 0; j < y; j++) buf[j] = mem[j];
+                    len += y;
+                }
+                k += 1; break;
+            }
+            case RULE_OP_MEM_APP: {            /* 4 -- append memory */
+                int y = memlen;
+                if (len + y > RULE_BUF_LIMIT) y = RULE_BUF_LIMIT - len;
+                if (y < 0) y = 0;
+                if (y > 0) {
+                    for (int j = 0; j < y; j++) buf[len + j] = mem[j];
+                    len += y;
+                }
+                k += 1; break;
+            }
+            case RULE_OP_MEM_STORE: {          /* M -- store candidate */
+                for (int j = 0; j < len; j++) mem[j] = buf[j];
+                memlen = len;
+                k += 1; break;
+            }
+            case RULE_OP_NOOP:
+            case RULE_OP_NOOP_SP:
+            case RULE_OP_NOOP_TAB:
+                k += 1;
+                break;
+
+            /* ---- Special ops (still silent no-ops) ------------------- */
+            case RULE_OP_TOGGLE_SEP: {
+                int upos = (int)prog[k + 1] - 1;
+                uchar sep = prog[k + 2];
+                int toggle_next = 0;
+                int occurrence = 0;
+                for (int j = 0; j < len; j++) {
+                    uchar c = buf[j];
+                    if (c == sep) {
+                        if (occurrence == upos) toggle_next = 1;
+                        else occurrence++;
+                        continue;
+                    }
+                    if (toggle_next) {
+                        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+                            buf[j] = c ^ case_flip_mask(c);
+                        break;
+                    }
+                }
+                k += 3;
+                break;
+            }
+
+            /* ---- No-ops ---- */
+            case RULE_OP_OMIT: {
+                int pos = (int)prog[k + 1] - 1;
+                int count = (int)prog[k + 2] - 1;
+                if (pos >= 0 && pos < len && count > 0 && pos + count <= len) {
+                    /* applyrule: for (x = y; x < clen && (x + z) < clen; x++)
+                     *   cpass[x] = cpass[x + z]; clen = x;
+                     * The loop terminates when x + z == clen, so x = clen - z,
+                     * matching len - count. */
+                    for (int j = pos; j + count < len; j++) buf[j] = buf[j + count];
+                    len -= count;
+                }
+                k += 3;
+                break;
+            }
+            case RULE_OP_EXTRACT: {
+                /* xAB: extract B characters from position A.  Mirrors
+                 * ruleproc.c, which follows HASHCAT here (operator ruling
+                 * 2026-09-11, superseding an earlier ruling for john).
+                 * hashcat's mangle_extract() no-ops on BOTH out-of-range
+                 * conditions and never extracts a partial run:
+                 *     if (upos >= arr_len)         return arr_len;
+                 *     if ((upos + ulen) > arr_len) return arr_len;
+                 * On "abc": x22 and x23 are "abc" here and "c" in john;
+                 * x90 is "abc" here and a reject in john.  A zero count
+                 * with an in-range start yields an EMPTY candidate, which
+                 * is kept -- john's empty-word rejection was also ruled to
+                 * hashcat.  start==0 self-copies, as on the CPU. */
+                int start = (int)prog[k + 1] - 1;
+                int count = (int)prog[k + 2] - 1;
+                if (start >= 0 && start < len && (start + count) <= len) {
+                    for (int q = 0; q < count; q++) {
+                        buf[q] = buf[start + q];
+                    }
+                    len = count;
+                }
+                k += 3;
+                break;
+            }
+            case RULE_OP_SWAP_AT: {
+                int posA = (int)prog[k + 1] - 1;
+                int posB = (int)prog[k + 2] - 1;
+                if (posA >= 0 && posA < len && posB >= 0 && posB < len) {
+                    uchar t = buf[posA]; buf[posA] = buf[posB]; buf[posB] = t;
+                }
+                k += 3;
+                break;
+            }
+
+            /* ---- character classes (0x80-0x89) and =NX / %NX ----------
+             * Mirrors ruleproc.c's class arms exactly.  The 480-byte
+             * membership table and rule_class_match() live in the COMMON
+             * source, in the constant address space -- deliberately not a
+             * function-local array, which is what put the retired memory-op
+             * attempt over the per-thread private-memory budget.
+             *
+             * Promoting these off the CPU-only list is the point: every
+             * character-class rule used to force a mixed GPU/CPU partition,
+             * and a partitioned run has to union two result sets.
+             */
+            case RULE_OP_DUP_SUFFIX: {
+                /* Y N: duplicate last N chars at the end. */
+                int n2 = (int)prog[k + 1] - 1;
+                if (len > 0 && n2 > 0 && n2 <= len && len + n2 <= RULE_BUF_LIMIT) {
+                    /* memmove(cpass + clen, cpass + (clen - n), n) */
+                    for (int j = 0; j < n2; j++) buf[len + j] = buf[len - n2 + j];
                     len += n2;
                 }
                 k += 2;
                 break;
             }
-            case RULE_OP_DUP_FIRST: {
+
+            /* ---- Position-paired ops ---- */
+            case RULE_OP_DUP_PREFIX: {
+                /* y N: duplicate first N chars at the start.
+                 * applyrule: memmove(cpass + n, cpass, clen); for (x = 0;
+                 * x < n; x++) cpass[x] = cpass[x + n] is implicit in the
+                 * pre-move state (the leading n bytes equal the original
+                 * leading n bytes after the right-shift). Actually applyrule
+                 * uses memmove only; the prepended bytes are buf[0..n-1]
+                 * which are now the first n bytes of the original input. */
                 int n2 = (int)prog[k + 1] - 1;
-                if (len > 0 && n2 > 0 && len + n2 <= RULE_BUF_LIMIT) {
-                    uchar first = buf[0];
-                    /* Shift right by n2. */
-                    for (int j = len - 1; j > 0; j--) buf[j + n2] = buf[j];
-                    /* applyrule's loop is `for (x = clen - 1; x > 0; x--)
-                     *    cpass[x + y] = cpass[x];` then `for (x = 1; x <= y; x++)
-                     *    cpass[x] = cpass[0];` — buf[0] is preserved (it is
-                     * the source we copy from), buf[1..n2] are filled with
-                     * first. So buf[0] keeps its original value. */
-                    for (int j = 1; j <= n2; j++) buf[j] = first;
+                if (len > 0 && n2 > 0 && n2 <= len && len + n2 <= RULE_BUF_LIMIT) {
+                    /* memmove(cpass + n, cpass, clen) — shift right by n. */
+                    for (int j = len - 1; j >= 0; j--) buf[j + n2] = buf[j];
+                    /* The first n bytes of the buffer are now whatever was
+                     * shifted out — we want them to be the original first n
+                     * bytes. After the shift, buf[n..n+n-1] equals the
+                     * original buf[0..n-1]; we just need to copy those down. */
+                    for (int j = 0; j < n2; j++) buf[j] = buf[j + n2];
                     len += n2;
                 }
                 k += 2;
@@ -784,62 +1033,34 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
                 k += 2;
                 break;
             }
-            case RULE_OP_DUP_PREFIX: {
-                /* y N: duplicate first N chars at the start.
-                 * applyrule: memmove(cpass + n, cpass, clen); for (x = 0;
-                 * x < n; x++) cpass[x] = cpass[x + n] is implicit in the
-                 * pre-move state (the leading n bytes equal the original
-                 * leading n bytes after the right-shift). Actually applyrule
-                 * uses memmove only; the prepended bytes are buf[0..n-1]
-                 * which are now the first n bytes of the original input. */
-                int n2 = (int)prog[k + 1] - 1;
-                if (len > 0 && n2 > 0 && n2 <= len && len + n2 <= RULE_BUF_LIMIT) {
-                    /* memmove(cpass + n, cpass, clen) — shift right by n. */
-                    for (int j = len - 1; j >= 0; j--) buf[j + n2] = buf[j];
-                    /* The first n bytes of the buffer are now whatever was
-                     * shifted out — we want them to be the original first n
-                     * bytes. After the shift, buf[n..n+n-1] equals the
-                     * original buf[0..n-1]; we just need to copy those down. */
-                    for (int j = 0; j < n2; j++) buf[j] = buf[j + n2];
-                    len += n2;
-                }
-                k += 2;
-                break;
-            }
-            case RULE_OP_DUP_SUFFIX: {
-                /* Y N: duplicate last N chars at the end. */
-                int n2 = (int)prog[k + 1] - 1;
-                if (len > 0 && n2 > 0 && n2 <= len && len + n2 <= RULE_BUF_LIMIT) {
-                    /* memmove(cpass + clen, cpass + (clen - n), n) */
-                    for (int j = 0; j < n2; j++) buf[len + j] = buf[len - n2 + j];
-                    len += n2;
-                }
-                k += 2;
-                break;
+            default: gb_ar_h = 0; break;
+        }
+        } else {
+        switch (op) {
+            case RULE_OP_REJ_CNT_CHR: {
+                /* `%NX` reject unless X occurs at least N times. */
+                int   y = (int)prog[k + 1] - 1;
+                uchar c = prog[k + 2];
+                int cnt = 0;
+                for (int j = 0; j < len; j++) if (buf[j] == c) cnt++;
+                if (cnt < y) return -1;
+                k += 3; break;
             }
 
-            /* ---- Position-paired ops ---- */
-            case RULE_OP_SWAP_AT: {
-                int posA = (int)prog[k + 1] - 1;
-                int posB = (int)prog[k + 2] - 1;
-                if (posA >= 0 && posA < len && posB >= 0 && posB < len) {
-                    uchar t = buf[posA]; buf[posA] = buf[posB]; buf[posB] = t;
-                }
-                k += 3;
-                break;
+            /* ---- memory family, mirroring ruleproc.c's SLOW path ---------
+             * The CPU fast path escapes to slowrule on overflow; the slow
+             * path CLAMPS (y = MAXLINE - clen) rather than skipping, and that
+             * is the behaviour with a real limit, so it is what we mirror at
+             * RULE_BUF_LIMIT.  `6` prepends by memmove-right-then-copy
+             * because a GPU buffer has no headroom before index 0, where the
+             * CPU walks cpass backwards into its 512-byte slack. */
+            case RULE_OP_REJ_AT_CHR: {
+                /* `=NX` reject unless the character at position N is X. */
+                int   y = (int)prog[k + 1] - 1;
+                uchar c = prog[k + 2];
+                if (y >= len || buf[y] != c) return -1;
+                k += 3; break;
             }
-
-            /* ---- character classes (0x80-0x89) and =NX / %NX ----------
-             * Mirrors ruleproc.c's class arms exactly.  The 480-byte
-             * membership table and rule_class_match() live in the COMMON
-             * source, in the constant address space -- deliberately not a
-             * function-local array, which is what put the retired memory-op
-             * attempt over the per-thread private-memory budget.
-             *
-             * Promoting these off the CPU-only list is the point: every
-             * character-class rule used to force a mixed GPU/CPU partition,
-             * and a partitioned run has to union two result sets.
-             */
             case RULE_OP_SUB_CLASS: {
                 uchar cb = prog[k + 1];
                 uchar y  = prog[k + 2];
@@ -868,23 +1089,6 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
                     } else {
                         if (c >= 'A' && c <= 'Z') buf[j] = c ^ (uchar)0x20;
                     }
-                }
-                k += 2; break;
-            }
-            case RULE_OP_TITLE_CLASS_HC: {
-                /* hashcat's ~e?C is a DIFFERENT algorithm from john's e?C
-                 * above: it lowercases every position, uppercases position 0
-                 * and every position whose PREDECESSOR was in the class, and
-                 * case-normalises the separator itself.  The class test reads
-                 * the pre-modification byte. */
-                uchar cb = prog[k + 1];
-                int up = 1;
-                for (int j = 0; j < len; j++) {
-                    uchar c = buf[j];
-                    int this_up = up;
-                    up = rule_class_match(cb, c) ? 1 : 0;
-                    if (c >= 'A' && c <= 'Z') { c ^= (uchar)0x20; buf[j] = c; }
-                    if (this_up && c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
                 }
                 k += 2; break;
             }
@@ -927,154 +1131,32 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
                 if (cnt < y) return -1;
                 k += 3; break;
             }
-            case RULE_OP_REJ_AT_CHR: {
-                /* `=NX` reject unless the character at position N is X. */
-                int   y = (int)prog[k + 1] - 1;
-                uchar c = prog[k + 2];
-                if (y >= len || buf[y] != c) return -1;
-                k += 3; break;
-            }
-            case RULE_OP_REJ_CNT_CHR: {
-                /* `%NX` reject unless X occurs at least N times. */
-                int   y = (int)prog[k + 1] - 1;
-                uchar c = prog[k + 2];
-                int cnt = 0;
-                for (int j = 0; j < len; j++) if (buf[j] == c) cnt++;
-                if (cnt < y) return -1;
-                k += 3; break;
-            }
-
-            /* ---- memory family, mirroring ruleproc.c's SLOW path ---------
-             * The CPU fast path escapes to slowrule on overflow; the slow
-             * path CLAMPS (y = MAXLINE - clen) rather than skipping, and that
-             * is the behaviour with a real limit, so it is what we mirror at
-             * RULE_BUF_LIMIT.  `6` prepends by memmove-right-then-copy
-             * because a GPU buffer has no headroom before index 0, where the
-             * CPU walks cpass backwards into its 512-byte slack. */
-            case RULE_OP_MEM_STORE: {          /* M -- store candidate */
-                for (int j = 0; j < len; j++) mem[j] = buf[j];
-                memlen = len;
-                k += 1; break;
-            }
-            case RULE_OP_MEM_APP: {            /* 4 -- append memory */
-                int y = memlen;
-                if (len + y > RULE_BUF_LIMIT) y = RULE_BUF_LIMIT - len;
-                if (y < 0) y = 0;
-                if (y > 0) {
-                    for (int j = 0; j < y; j++) buf[len + j] = mem[j];
-                    len += y;
-                }
-                k += 1; break;
-            }
-            case RULE_OP_MEM_PRE: {            /* 6 -- prepend memory */
-                int y = memlen;
-                if (len + y > RULE_BUF_LIMIT) y = RULE_BUF_LIMIT - len;
-                if (y < 0) y = 0;
-                if (y > 0) {
-                    for (int j = len - 1; j >= 0; j--) buf[j + y] = buf[j];
-                    for (int j = 0; j < y; j++) buf[j] = mem[j];
-                    len += y;
-                }
-                k += 1; break;
-            }
-            case RULE_OP_MEM_REJ: {            /* Q -- reject if == memory */
-                if (memlen == len) {
-                    int same = 1;
-                    for (int j = 0; j < len; j++) {
-                        if (buf[j] != mem[j]) { same = 0; break; }
-                    }
-                    if (same) return -1;
-                }
-                k += 1; break;
-            }
-            case RULE_OP_MEM_INSERT: {         /* X N M I */
-                /* Insert M chars of memory from OFFSET N at position I.
-                 * Out-of-range REJECTS, following hashcat's
-                 * mangle_insert_multi -- operator ruling 2026-09-11, and
-                 * identical to the CPU arm. */
-                int y    = (int)prog[k + 1] - 1;   /* offset within memory */
-                int tlen = (int)prog[k + 2] - 1;   /* count              */
-                int z    = (int)prog[k + 3] - 1;   /* insert position    */
-                if (memlen < 1 || tlen < 1 || z > len ||
-                    y > memlen || (y + tlen) > memlen) return -1;
-                if (len + tlen > RULE_BUF_LIMIT) tlen = RULE_BUF_LIMIT - len;
-                if (tlen > 0) {
-                    for (int j = len; j >= z; j--) buf[j + tlen] = buf[j];
-                    for (int j = 0; j < tlen; j++) buf[z + j] = mem[y + j];
-                    len += tlen;
-                }
-                k += 4; break;
-            }
-            case RULE_OP_EXTRACT: {
-                /* xAB: extract B characters from position A.  Mirrors
-                 * ruleproc.c, which follows HASHCAT here (operator ruling
-                 * 2026-09-11, superseding an earlier ruling for john).
-                 * hashcat's mangle_extract() no-ops on BOTH out-of-range
-                 * conditions and never extracts a partial run:
-                 *     if (upos >= arr_len)         return arr_len;
-                 *     if ((upos + ulen) > arr_len) return arr_len;
-                 * On "abc": x22 and x23 are "abc" here and "c" in john;
-                 * x90 is "abc" here and a reject in john.  A zero count
-                 * with an in-range start yields an EMPTY candidate, which
-                 * is kept -- john's empty-word rejection was also ruled to
-                 * hashcat.  start==0 self-copies, as on the CPU. */
-                int start = (int)prog[k + 1] - 1;
-                int count = (int)prog[k + 2] - 1;
-                if (start >= 0 && start < len && (start + count) <= len) {
-                    for (int q = 0; q < count; q++) {
-                        buf[q] = buf[start + q];
-                    }
-                    len = count;
-                }
-                k += 3;
-                break;
-            }
-            case RULE_OP_OMIT: {
-                int pos = (int)prog[k + 1] - 1;
-                int count = (int)prog[k + 2] - 1;
-                if (pos >= 0 && pos < len && count > 0 && pos + count <= len) {
-                    /* applyrule: for (x = y; x < clen && (x + z) < clen; x++)
-                     *   cpass[x] = cpass[x + z]; clen = x;
-                     * The loop terminates when x + z == clen, so x = clen - z,
-                     * matching len - count. */
-                    for (int j = pos; j + count < len; j++) buf[j] = buf[j + count];
-                    len -= count;
-                }
-                k += 3;
-                break;
-            }
-            case RULE_OP_TOGGLE_SEP: {
-                int upos = (int)prog[k + 1] - 1;
-                uchar sep = prog[k + 2];
-                int toggle_next = 0;
-                int occurrence = 0;
+            case RULE_OP_TITLE_CLASS_HC: {
+                /* hashcat's ~e?C is a DIFFERENT algorithm from john's e?C
+                 * above: it lowercases every position, uppercases position 0
+                 * and every position whose PREDECESSOR was in the class, and
+                 * case-normalises the separator itself.  The class test reads
+                 * the pre-modification byte. */
+                uchar cb = prog[k + 1];
+                int up = 1;
                 for (int j = 0; j < len; j++) {
                     uchar c = buf[j];
-                    if (c == sep) {
-                        if (occurrence == upos) toggle_next = 1;
-                        else occurrence++;
-                        continue;
-                    }
-                    if (toggle_next) {
-                        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-                            buf[j] = c ^ case_flip_mask(c);
-                        break;
-                    }
+                    int this_up = up;
+                    up = rule_class_match(cb, c) ? 1 : 0;
+                    if (c >= 'A' && c <= 'Z') { c ^= (uchar)0x20; buf[j] = c; }
+                    if (this_up && c >= 'a' && c <= 'z') buf[j] = c ^ (uchar)0x20;
                 }
+                k += 2; break;
+            }
+            case RULE_OP_CHR_ADD: {
+                int pos = (int)prog[k + 1] - 1;
+                uchar add = prog[k + 2];
+                int valid = ((pos >= 0) & (pos < len));
+                int safe_pos = valid ? pos : 0;
+                buf[safe_pos] = (uchar)(buf[safe_pos] + (valid ? add : (uchar)0));
                 k += 3;
                 break;
             }
-
-            /* ---- No-ops ---- */
-            case RULE_OP_NOOP:
-            case RULE_OP_NOOP_SP:
-            case RULE_OP_NOOP_TAB:
-                k += 1;
-                break;
-
-            /* ---- Special ops (still silent no-ops) ------------------- */
-            case RULE_OP_S_SPECIAL:  k += 1; break;
-            case RULE_OP_HASH_EXIT:  k += 1; break;
             case RULE_OP_DIV_INSERT: k += 3; break;  /* op + count + char */
 
             /* ---- Rejection ops (rev 1.22) ----------------------------
@@ -1083,100 +1165,6 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
              * responsible for skipping MD5+probe / writing zero digests
              * / emitting the validate sentinel record. The argument
              * encoding is `arg - 1` per packrules positiontranslate. */
-            case RULE_OP_REJ_LEN_NE: {
-                /* `_ N`: reject if orig_len != (arg - 1). applyrule
-                 * tests the original input length, NOT the running clen. */
-                /* CURRENT length, not the original word's. */
-                int y = (int)prog[k + 1] - 1;
-                if (y != len) return -1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_REJ_LEN_GE: {
-                /* `< N`: reject if clen < (arg - 1). Macro name is
-                 * misleading — applyrule rejects on LESS-THAN, not GE. */
-                /* john: "<N reject unless less than N chars" -- reject when
-                 * len >= N.  This was the complement, matching ruleproc.c's
-                 * old behaviour; both fixed together so CPU and GPU agree. */
-                int y = (int)prog[k + 1] - 1;
-                if (len >= y) return -1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_REJ_LEN_LE: {
-                /* `> N`: reject if clen > (arg - 1). Macro name is
-                 * misleading — applyrule rejects on GREATER-THAN. */
-                /* john: ">N reject unless greater than N chars". */
-                int y = (int)prog[k + 1] - 1;
-                if (len <= y) return -1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_REJ_HAS: {
-                /* `! X`: reject if buf contains X. */
-                uchar c = prog[k + 1];
-                for (int j = 0; j < len; j++) {
-                    if (buf[j] == c) return -1;
-                }
-                k += 2;
-                break;
-            }
-            case RULE_OP_REJ_NHAS: {
-                /* `/ X`: reject if buf does NOT contain X. */
-                uchar c = prog[k + 1];
-                int found = 0;
-                for (int j = 0; j < len; j++) {
-                    if (buf[j] == c) { found = 1; break; }
-                }
-                if (!found) return -1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_REJ_FIRST: {
-                /* `( X`: reject if (clen > 0 && buf[0] != X). Empty buf
-                 * is accepted (matches applyrule clen-guard). */
-                uchar c = prog[k + 1];
-                if (len > 0 && buf[0] != c) return -1;
-                k += 2;
-                break;
-            }
-            case RULE_OP_REJ_LAST: {
-                /* `) X`: reject if (clen > 0 && buf[clen-1] != X). Empty
-                 * buf is accepted (matches applyrule clen-guard). */
-                uchar c = prog[k + 1];
-                if (len > 0 && buf[len - 1] != c) return -1;
-                k += 2;
-                break;
-            }
-
-            /* H/h hex emit: cases split into independent bodies (rev 1.27,
-             * 2026-05-04). The unified version at rev 1.25 used a ternary-
-             * selected `const uchar *d` pointing at one of two private-memory
-             * tables; AMD's ROCm comgr LLVM 21.1.8 bitcode linker rejected the
-             * resulting addrspace(5) ↔ generic pointer aliasing with
-             * "Invalid record" / "Linking bitcode failed" (gfx1201 RX 9070).
-             * NVIDIA PTX path was unaffected (no IR-level link). Bisect on
-             * ioblade pinned the regression to r25 vs r24. Splitting the
-             * cases removes the pointer alias — each branch references its
-             * own private-memory table directly, no addrspace cast. */
-            case RULE_OP_HEX_UPPER: {
-                const uchar uhex[16] = {
-                    '0','1','2','3','4','5','6','7',
-                    '8','9','A','B','C','D','E','F'
-                };
-                int x = len;
-                if (x + len > RULE_BUF_LIMIT) x = RULE_BUF_LIMIT - len;
-                if (x < 0) x = 0;
-                int new_len = len + x;
-                for (int i = x - 1; i >= 0; i--) {
-                    uchar c = buf[i];
-                    buf[i * 2]     = uhex[(c >> 4) & 0xf];
-                    buf[i * 2 + 1] = uhex[c & 0xf];
-                }
-                len = new_len;
-                k += 1;
-                break;
-            }
             case RULE_OP_HEX_LOWER: {
                 const uchar lhex[16] = {
                     '0','1','2','3','4','5','6','7',
@@ -1196,7 +1184,49 @@ static int apply_rule(__global const uchar *prog, uchar *buf, int len)
                 break;
             }
 
-            default:
+            case RULE_OP_HEX_UPPER: {
+                const uchar uhex[16] = {
+                    '0','1','2','3','4','5','6','7',
+                    '8','9','A','B','C','D','E','F'
+                };
+                int x = len;
+                if (x + len > RULE_BUF_LIMIT) x = RULE_BUF_LIMIT - len;
+                if (x < 0) x = 0;
+                int new_len = len + x;
+                for (int i = x - 1; i >= 0; i--) {
+                    uchar c = buf[i];
+                    buf[i * 2]     = uhex[(c >> 4) & 0xf];
+                    buf[i * 2 + 1] = uhex[c & 0xf];
+                }
+                len = new_len;
+                k += 1;
+                break;
+            }
+            case RULE_OP_HASH_EXIT:  k += 1; break;
+            case RULE_OP_S_SPECIAL:  k += 1; break;
+            case RULE_OP_REJ_LAST: {
+                /* `) X`: reject if (clen > 0 && buf[clen-1] != X). Empty
+                 * buf is accepted (matches applyrule clen-guard). */
+                uchar c = prog[k + 1];
+                if (len > 0 && buf[len - 1] != c) return -1;
+                k += 2;
+                break;
+            }
+
+            /* H/h hex emit: cases split into independent bodies (rev 1.27,
+             * 2026-05-04). The unified version at rev 1.25 used a ternary-
+             * selected `const uchar *d` pointing at one of two private-memory
+             * tables; AMD's ROCm comgr LLVM 21.1.8 bitcode linker rejected the
+             * resulting addrspace(5) ↔ generic pointer aliasing with
+             * "Invalid record" / "Linking bitcode failed" (gfx1201 RX 9070).
+             * NVIDIA PTX path was unaffected (no IR-level link). Bisect on
+             * ioblade pinned the regression to r25 vs r24. Splitting the
+             * cases removes the pointer alias — each branch references its
+             * own private-memory table directly, no addrspace cast. */
+            default: gb_ar_h = 0; break;
+        }
+        }
+        if (!gb_ar_h) {
                 /* Unknown opcode — bail to avoid runaway walk. */
                 return len;
         }
@@ -1638,3 +1668,4 @@ void md5_rules_phase0_test_iter(
         }
     }
 }
+

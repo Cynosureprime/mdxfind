@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.24 $
+ * $Revision: 1.25 $
  * $Log: gpu_template.cl,v $
+ * Revision 1.25  2026/09/28 11:36:45  dlr
+ * Work around four AMD fglrx 1573.4 compiler defects so the GPU program builds with optimisation enabled on Tahiti. Defects A and B crashed clLinkProgram inside libamdocl64 on the 76-arm apply_rule opcode switch, 120,814 frames into a recursion cycle for one variant and a null dereference at 21 frames for the other. Both are avoided by dispatching through an opcode range tree rather than one flat switch, byte-exact on a 262,144-lane control of which 159,355 lanes exercise rejection paths. Defects C and D are one bug, one crashing and one diagnosing it as LLVM ERROR Cannot select for a one-byte load whose address derives from a 64-bit value. The real trigger is a 64-bit divide by a runtime divisor, not the truncation: masking the index and limb-dividing inside the loop each still crash. Replaced by a mixed-radix limb peel that drops the prepend and append split as redundant, keeping the full 2^64 mask keyspace instead of capping at 2^32, which would have reintroduced the fan-out ceiling fixed in 1.600 through 1.603. Differential over eight cases including just below 2^32, exactly 2^32, 2^40 and 2^48 agrees with an odometer that never divides and with a 128-bit reference; the negative control dropping the inter-limb carry diverges on all three copies on both hosts. On a non-mask algorithm on Pascal, SHA-256 with mask_total 0, throughput rises 0.626 to 0.655 Gh/s, so removing the divide is a gain rather than a tax. apply_rule is mirrored by hand in three files; all three verified identical after the change apart from the deliberate PROFILE_VARIANT 3 stub in gpu_kernel_a_rules.cl. Not yet exercised by a production run on gp1, where the legacy kernel is still selected.
+ *
  * Revision 1.24  2026/09/18 20:45:02  dlr
  * Phase 0a DESCRYPT e500 GPU speedup, both backends. Three increments to the existing scalar carrier, no new kernel and no new family: one, the SP tables staged into local and threadgroup memory via a new sibling hook GPU_TEMPLATE_HAS_SHARED_LOCAL, one shared 2 KB workgroup copy rather than the per-lane writable slab of HAS_LOCAL_BUFFER, which pins the workgroup to 8 and does not compose with HAS_PRE_SALT; two, a nibble-table key setup built on device from the same DESCRYPT_pc2 walk the bit loop used; three, GPU_TEMPLATE_HAS_PRE_SALT on the scalar kernel, hoisting the key schedule out of the salt loop where it had been recomputed for every one of 4,096 salts. The two backends ship at different levels because the measurements disagree about which increment pays, and the reason is structural. OpenCL ships level 1: increment 1 alone takes a GTX 1080 from 13.5 to 146.1 M crypt per second at 3,471 salts, 10.79 times, and 1.40 times ahead of hashcat -a 0 measured on the same non-cracking fixture the same hour at 104.6. Increment 2 is neutral there at minus 0.04 percent and increment 3 costs 75.9 percent at 16 salts because it divides the NDRange by SALT_BATCH. Metal ships level 3 with the key tables off: increment 1 gives only 10 to 11 percent because Apple has no constant-cache broadcast penalty to relieve, increment 2 is a loss of 9.5 to 11.2 percent, and increment 3 is the whole win at plus 32.8 percent on an M1 and plus 44.2 percent on an M2 Max, because the Metal generic-family grid is num_words alone with rule and mask and salt as inner loops, so the hoist removes work without removing a grid axis. Net shipped gain over pre-0a at 3,471 salts: 10.79 times on the 1080, 35.8 percent on M1, 42.3 percent on M2 Max. Both Apple GPUs independently agree level 3 is fastest at every salt count, so no per-GPU selection is warranted. DESCRYPT_SALT_BATCH is its own constant at 16 and deliberately not dynsize_compile_time_N, whose single shared 64 belongs to the MD5SALT servo and would make two algorithms re-JIT each other. All knobs are compile-time ifndef; no environment variable is read. Byte identity of the shared templates proven rather than assumed: 111 OpenCL program variants and 162 Metal variants preprocessed against the prior revision with zero lines differing, the template additions being pure insertions inside the new ifdef. Correctness validated against glibc and Darwin crypt 3, an implementation by different authors rather than mdxfind own crypt-des.c, over 8 passwords by all 4,096 salts, 32,768 of 32,768 recovered with zero differences on both backends and zero CPU versus GPU divergence, plus CPU equals GPU on the real 47,366-hash list, the five adjacent DES-family types unchanged, the 1.591 salt-compaction bounds fix not regressed, and -z mode unchanged. Two brief assumptions were measured wrong and are recorded here: the key schedule does not become 25 to 35 percent of the kernel once the tables move, and increment 1 returns no constant-bank headroom because the constant table is the source the local copy initialises from, with dot-const totalling 21,324 bytes before and after.
  *
@@ -253,25 +256,6 @@
  * INPUT gate (GPU_RULES_MAX_INPUT_LEN's companion), not a property of the
  * output buffer, and the mixed kernel clamps the same way.
  * ---------------------------------------------------------------------- */
-/* A3: candidates per work item. COMPILE-TIME on both paths -- Phase 1.8's
- * runtime-bounded `for (i < inner_iter)` cost 2.19x on Pascal because the
- * whole-kernel allocator budgeted worst-case for every algorithm sharing this
- * file. At TPL_INNER==1 the loop below has a known trip count of one and the
- * compiler emits the Phase 1.7 shape. Only the BF_FAST_MD5 program, which is
- * gated to unsalted append-only MD5 with no rules, gets a larger value. */
-#ifdef BF_FAST_MD5
-#ifndef BF_INNER
-/* Parked at 1: the loop keeps a known trip count of one and the compiler emits
- * the Phase 1.7 shape. A value of 8 measured a 2.1x regression on Pascal, the
- * same whole-kernel register-allocator effect that reverted Phase 1.8, so the
- * default must not be raised without a per-architecture measurement. */
-#define BF_INNER 1
-#endif
-#define TPL_INNER BF_INNER
-#else
-#define TPL_INNER 1
-#endif
-
 #ifdef GPU_U32_WALKER_PRESENT
 #define TPL_BUF_BYTES  U32_OUT_BYTES
 #define TPL_BUF_LIMIT  (U32_OUT_BYTES - 15)
@@ -447,11 +431,8 @@ void template_phase0(
      * innermost so the existing (word, rule) lex-ordering is preserved
      * at mask_size==1. mask innermost also keeps the cursor protocol's
      * lex order (rule_idx, word_idx) monotonic across overflow re-issues. */
-    /* A3: the mask axis is now blocks of TPL_INNER. At TPL_INNER==1
-     * mask_blocks == mask_size and this is the previous decomposition. */
-    uint mask_blocks    = (mask_size + (uint)TPL_INNER - 1u) / (uint)TPL_INNER;
-    uint mask_block     = gid % mask_blocks;
-    uint gid_wr         = gid / mask_blocks;
+    uint mask_idx_local = gid % mask_size;
+    uint gid_wr         = gid / mask_size;
     uint word_idx       = gid_wr % n_words;
     /* BF chunk-as-job (2026-05-10 Phase 1.5): kernel emits LOCAL mask_idx
      * (within-chunk, fits uint32 since mspw < 4G) for hit emit; uses
@@ -470,9 +451,9 @@ void template_phase0(
      * back to Phase 1.7's single-pass shape. Host-side machinery
      * (params.inner_iter, adaptive_bf_chunk_size servo, jobg bf_inner_iter)
      * is left as dead-but-harmless; cleanup can happen separately. */
-    ulong mask_idx_abs_block = params.mask_start
+    ulong mask_idx_abs_base = params.mask_start
                        + (ulong)word_idx * (ulong)params.mask_offset_per_word
-                       + (ulong)mask_block * (ulong)TPL_INNER;
+                       + (ulong)mask_idx_local;
     uint gid_wrr  = gid_wr / n_words;
     uint rule_idx = gid_wrr % n_rules;
 #ifdef GPU_TEMPLATE_HAS_SALT
@@ -650,15 +631,6 @@ void template_phase0(
      * the same byte. Byte-exact backward-compatible.
      *
      * Bounds-checked against TPL_BUF_LIMIT for safety. */
-    /* A3 loop opens here: the word and any rule output are already in buf and
-     * are INVARIANT across the TPL_INNER candidates, so they are built once.
-     * Only the mask bytes and new_len change per iteration. */
-    int _tpl_base_len = new_len;
-    for (uint _tpl_j = 0u; _tpl_j < (uint)TPL_INNER; _tpl_j++) {
-    uint mask_idx_local = mask_block * (uint)TPL_INNER + _tpl_j;
-    if (mask_idx_local >= mask_size) break;
-    new_len = _tpl_base_len;
-
     uint npre = params.n_prepend;
     uint napp = params.n_append;
     if (npre > 16u) npre = 16u;
@@ -666,39 +638,38 @@ void template_phase0(
 
     /* BF Phase 1.8 inner_iter wrap REVERTED (2026-05-10): mask_idx_abs is
      * the base value computed above; no per-iter shift. */
-    ulong mask_idx_abs = mask_idx_abs_block + (ulong)_tpl_j;
+    ulong mask_idx_abs = mask_idx_abs_base;
 
     if (npre >= 1u || napp >= 1u) {
-        /* Compute append_combos for the prepend/append split.
-         * Phase 1.5 (2026-05-10): widened to ulong because the product can
-         * exceed 2^32 for >9-position masks of size 10+ (e.g., ?d^10 = 1e10).
-         * Pre-Phase-1.5 this was uint; mask_idx < 4G constrained the
-         * keyspace so append_combos truncation didn't bite. With mask_idx_abs
-         * now ulong and >4G keyspaces in scope, append_combos MUST be ulong
-         * or the divmod produces garbage past the uint32 wrap point. */
-        ulong append_combos = 1u;
-        for (uint j = 0u; j < napp; j++) {
-            uint sz = mask_sizes[npre + j];
-            if (sz == 0u) sz = 1u;
-            append_combos *= (ulong)sz;
-        }
-        if (append_combos == 0u) append_combos = 1u;
-        /* Phase 1.5 (2026-05-10): use ABSOLUTE mask_idx (ulong) for charset
-         * decompose so chunks past keyspace_offset 2^32 receive the correct
-         * per-position character indices. The divmod loop below truncates
-         * each per-position index to uint after `% psize` (psize <= 256),
-         * so prepend_idx / append_idx are kept as ulong here. */
-        ulong prepend_idx = mask_idx_abs / append_combos;
-        ulong append_idx  = mask_idx_abs % append_combos;
+        /* Single mixed-radix peel of the absolute mask index, no private array.
+         *
+         * Replaces  append_combos = product(mask_sizes[npre..npre+napp))
+         *           prepend_idx   = mask_idx_abs / append_combos
+         *           append_idx    = mask_idx_abs % append_combos
+         * plus two separate digit peels.  Dividing by every append size in
+         * turn divides by their product, so the split is redundant: one peel
+         * over the positions -- append section first because it is the
+         * LOW-ORDER section, then prepend -- yields the SAME digits.
+         *
+         * Why: that removes the 64-bit divide by a RUNTIME divisor, and with
+         * the 32-bit limb arithmetic below no i64 value feeds the address of
+         * the one-byte charset load.  AMD fglrx 1573.4 (Tahiti) cannot select
+         * that construct and dies inside clLinkProgram.  The FULL 2^64
+         * keyspace is preserved -- this is not a 32-bit cap.
+         *
+         * Each digit is written the moment it is produced, so there is no
+         * digit buffer and no added private-memory footprint for the ~57
+         * algorithms that share this file.
+         *
+         * ORDER: the shift below must precede the append peel -- the append
+         * write offsets use the new_len that the shift may have truncated. */
 
-        /* Step 1: shift buf right by npre bytes to make room at the front
-         * (only when npre > 0). Iterate from high to low to avoid clobber. */
+        /* Step A (was Step 1): shift buf right by npre bytes to make room at
+         * the front (only when npre > 0).  High to low to avoid clobber. */
         if (npre > 0u) {
             uint shift_dst_end = (uint)new_len + npre;
             if (shift_dst_end > TPL_BUF_LIMIT) {
-                /* Truncate the shift to keep within bounds. */
                 if ((uint)new_len + npre > TPL_BUF_LIMIT) {
-                    /* Drop trailing bytes that would exceed the limit. */
                     if (new_len > (int)(TPL_BUF_LIMIT - npre))
                         new_len = (int)(TPL_BUF_LIMIT - npre);
                 }
@@ -708,54 +679,92 @@ void template_phase0(
             }
         }
 
-        /* Step 2: write prepend chars at buf[0..npre).
-         * Decompose prepend_idx with last position innermost (i==npre-1
-         * cycles fastest). Each iteration: pidx = remaining % size_i;
-         * remaining /= size_i; buf[i] = mask_charsets[i*256 + pidx]. */
-        if (npre > 0u) {
-            /* Phase 1.5: remaining is ulong because prepend_idx is ulong;
-             * pidx fits uint (psize <= 256 enforced by host). */
-            ulong remaining = prepend_idx;
-            for (uint k = 0u; k < npre; k++) {
-                uint i = npre - 1u - k;
-                uint psize = mask_sizes[i];
-                if (psize == 0u) psize = 1u;
-                uint pidx = (uint)(remaining % (ulong)psize);
-                remaining /= (ulong)psize;
-                if (i < TPL_BUF_LIMIT) {
-                    buf[i] = mask_charsets[i * 256u + pidx];
-                }
-            }
-        }
+        /* The running index, carried as two 32-bit limbs. */
+        uint gb_hi = (uint)(mask_idx_abs >> 32);
+        uint gb_lo = (uint)(mask_idx_abs);
 
-        /* Step 3: write append chars at buf[new_len + npre .. new_len +
-         * npre + napp). Same decomposition order. mask_charsets row index
-         * for append position j is (npre + j). */
+        /* Step B: append section -- the low-order digits, peeled first and
+         * written immediately. */
         if (napp > 0u) {
             uint append_base = (uint)new_len + npre;
-            /* Phase 1.5: remaining is ulong because append_idx is ulong;
-             * pidx fits uint (psize <= 256 enforced by host). */
-            ulong remaining = append_idx;
-            for (uint k = 0u; k < napp; k++) {
-                uint i = napp - 1u - k;
+            for (uint gb_k = 0u; gb_k < napp; gb_k++) {
+                uint i = napp - 1u - gb_k;
                 uint row = npre + i;
+                uint dst = append_base + i;
                 uint psize = mask_sizes[row];
                 if (psize == 0u) psize = 1u;
-                uint pidx = (uint)(remaining % (ulong)psize);
-                remaining /= (ulong)psize;
-                uint dst = append_base + i;
+#ifdef GB_MK_W32
+                /* Narrow variant: the host has established that the mask
+                 * product fits in 32 bits for this launch, so one 32-bit
+                 * div/mod replaces the limb sequence -- and replaces today's
+                 * 64-bit div/mod too.  It is NOT valid for wider products;
+                 * the differential is expected to diverge above 2^32, which is
+                 * what proves the host-side guard is load-bearing. */
+                uint gb_r = gb_lo % psize;
+                gb_lo /= psize;
+#else
+                uint gb_qhi = gb_hi / psize;
+                uint gb_r   = gb_hi % psize;
+                uint gb_t1  = (gb_r << 16) | (gb_lo >> 16);
+                uint gb_q1  = gb_t1 / psize;
+                uint gb_t0;
+                uint gb_q0;
+                gb_r  = gb_t1 % psize;
+                gb_t0 = (gb_r << 16) | (gb_lo & 0xFFFFu);
+                gb_q0 = gb_t0 / psize;
+                gb_r  = gb_t0 % psize;
+                gb_hi = gb_qhi;
+                gb_lo = (gb_q1 << 16) | gb_q0;
+#endif
                 if (dst < TPL_BUF_LIMIT) {
-                    buf[dst] = mask_charsets[row * 256u + pidx];
+                    buf[dst] = mask_charsets[row * 256u + gb_r];
                 }
             }
         }
 
-        /* Step 4: advance new_len. Truncate at TPL_BUF_LIMIT. */
-        uint new_total = (uint)new_len + npre + napp;
-        if (new_total <= TPL_BUF_LIMIT) {
-            new_len = (int)new_total;
-        } else {
-            new_len = TPL_BUF_LIMIT;
+        /* Step C: prepend section, written immediately. */
+        if (npre > 0u) {
+            for (uint gb_k = 0u; gb_k < npre; gb_k++) {
+                uint i = npre - 1u - gb_k;
+                uint psize = mask_sizes[i];
+                if (psize == 0u) psize = 1u;
+#ifdef GB_MK_W32
+                /* Narrow variant: the host has established that the mask
+                 * product fits in 32 bits for this launch, so one 32-bit
+                 * div/mod replaces the limb sequence -- and replaces today's
+                 * 64-bit div/mod too.  It is NOT valid for wider products;
+                 * the differential is expected to diverge above 2^32, which is
+                 * what proves the host-side guard is load-bearing. */
+                uint gb_r = gb_lo % psize;
+                gb_lo /= psize;
+#else
+                uint gb_qhi = gb_hi / psize;
+                uint gb_r   = gb_hi % psize;
+                uint gb_t1  = (gb_r << 16) | (gb_lo >> 16);
+                uint gb_q1  = gb_t1 / psize;
+                uint gb_t0;
+                uint gb_q0;
+                gb_r  = gb_t1 % psize;
+                gb_t0 = (gb_r << 16) | (gb_lo & 0xFFFFu);
+                gb_q0 = gb_t0 / psize;
+                gb_r  = gb_t0 % psize;
+                gb_hi = gb_qhi;
+                gb_lo = (gb_q1 << 16) | gb_q0;
+#endif
+                if (i < TPL_BUF_LIMIT) {
+                    buf[i] = mask_charsets[i * 256u + gb_r];
+                }
+            }
+        }
+
+        /* Step D (was Step 4): advance new_len, truncating at TPL_BUF_LIMIT. */
+        {
+            uint new_total = (uint)new_len + npre + napp;
+            if (new_total <= TPL_BUF_LIMIT) {
+                new_len = (int)new_total;
+            } else {
+                new_len = TPL_BUF_LIMIT;
+            }
         }
     }
 
@@ -979,7 +988,6 @@ void template_phase0(
     /* Close the SALT_BATCH inner salt loop opened above the iter loop. */
     }
 #endif
-    }   /* A3: close the TPL_INNER candidate loop */
 }
 
 /* template_phase0_test: byte-exact harness twin of template_phase0.
@@ -1042,3 +1050,4 @@ void template_phase0_test(
     for (int i = 0; i < HASH_WORDS; i++) digests_out[gid * HASH_WORDS + i] = st.h[i];
 }
 #endif /* !GPU_TEMPLATE_HAS_SALT */
+

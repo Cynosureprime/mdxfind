@@ -14,6 +14,22 @@
  * extends template_phase0 with a GPU_TEMPLATE_HAS_RULES block that calls
  * apply_rule() from this TU.
  *
+ * DELIBERATE DIVERGENCE FROM THE OPENCL TWIN (2026-09-27, operator decision).
+ * gpu_md5_rules.cl now dispatches apply_rule through an opcode RANGE TREE instead
+ * of one flat 76-arm switch. This file KEEPS THE FLAT SWITCH on purpose. The range
+ * tree is a workaround for a defect in AMD's fglrx/Catalyst OpenCL compiler on
+ * Tahiti (gp1), where the single flat switch in this walker crashes clLinkProgram
+ * outright -- one variant recursing 120,814 frames inside libamdocl64 into the
+ * stack guard, another faulting at 21 frames. Apple's Metal compiler has no such
+ * defect, so porting the range tree here would buy no correctness and would risk
+ * a codegen change on a path that is currently correct and measured.
+ *
+ * Consequence for maintainers: the two walkers are NO LONGER line-for-line
+ * mirrors. Compare them by BEHAVIOUR -- opcode semantics, rejection semantics,
+ * arm count -- and not by diffing the dispatch structure. A future change to the
+ * rule semantics must still be made in BOTH, as it always had to; only the
+ * dispatch shape is allowed to differ, and only in this direction.
+ *
  * Phase 2a scope (memo §3 row 2):
  *   - Single-buffer in-place per-op semantics. apply_rule(prog, buf, len)
  *     walks the bytecode and mutates buf in place.

@@ -41,9 +41,12 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.46 2026/09/17 05:23:51 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.47 2026/09/29 13:44:07 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.47  2026/09/29 13:44:07  dlr
+ * Correct the attribution wording in the header comment.
+ *
  * Revision 1.46  2026/09/17 05:23:51  dlr
  * Drop the MDXFIND_RULE_VALIDATOR gate; the rule validator is never enabled. This file is shared with procrule, which was rebuilt and checked: both rule engines still behave, the byte engine reversing a non-ASCII word producing mojibake and the UTF-32 engine producing droewssap with correct Unicode case mapping.
  *

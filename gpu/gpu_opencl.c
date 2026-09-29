@@ -150,6 +150,8 @@ static int      dynsize_cache_load(const char *uuid, struct dynsize_entry *e);
 static int      dynsize_cache_store(const char *uuid, const struct dynsize_entry *e);
 static void     dynsize_ensure_loaded(struct gpu_device *d, int dev_idx);
 static uint32_t dynsize_compile_time_N(struct gpu_device *d, int dev_idx);
+static void tpl_kernel_report(cl_kernel k, cl_device_id dev, int dev_idx,
+                              const char *name);   /* occupancy diagnostic */
 
 struct gpu_device {
     cl_context       ctx;
@@ -6023,6 +6025,7 @@ static int gpu_opencl_template_md5_bf_kernel_lazy(struct gpu_device *d, int dev_
         d->kern_template_phase0_md5_bf = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md5_bf, d->dev, dev_idx, "md5_bf");
     return 0;
 }
 
@@ -6086,6 +6089,37 @@ static int gpu_opencl_template_compile_sha1(struct gpu_device *d, int dev_idx) {
  * Mirrors gpu_opencl_template_kernel_lazy (MD5) including the R2
  * private_mem_size probe. The probe value for SHA1 is logged with the
  * "SHA1" tag so cross-algorithm comparison is explicit in stderr. */
+
+/* Occupancy diagnostic, env MDXFIND_KERNEL_INFO=1 (added 2026-09-28).
+ * Restores the per-kernel reading deleted in rev 1.157. Private memory per
+ * work-item is the proxy for register pressure, which decides occupancy and
+ * therefore throughput -- the open question for a unified template kernel
+ * that carries rule and mask machinery even for algorithms using neither.
+ * Silent unless the env var is set, so no startup chatter returns. */
+static void tpl_kernel_report(cl_kernel k, cl_device_id dev, int dev_idx,
+                              const char *name)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("MDXFIND_KERNEL_INFO");
+        enabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (!enabled || !k) return;
+    size_t max_wg = 0, pref = 0;
+    cl_ulong privmem = 0, localmem = 0;
+    clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_WORK_GROUP_SIZE,
+                             sizeof(max_wg), &max_wg, NULL);
+    clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE,
+                             sizeof(pref), &pref, NULL);
+    clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_PRIVATE_MEM_SIZE,
+                             sizeof(privmem), &privmem, NULL);
+    clGetKernelWorkGroupInfo(k, dev, CL_KERNEL_LOCAL_MEM_SIZE,
+                             sizeof(localmem), &localmem, NULL);
+    fprintf(stderr, "KERNELINFO GPU[%d] %-26s max_wg=%-5zu pref_mult=%-4zu "
+            "priv=%-7llu local=%llu\n", dev_idx, name, max_wg, pref,
+            (unsigned long long)privmem, (unsigned long long)localmem);
+}
+
 static int gpu_opencl_template_kernel_lazy_sha1(struct gpu_device *d, int dev_idx) {
     if (d->kern_template_phase0_sha1) return 0;
     if (!d->prog_template_sha1) return -1;
@@ -6158,6 +6192,7 @@ static int gpu_opencl_template_compile_sha256(struct gpu_device *d, int dev_idx)
         d->prog_template_sha256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha1, d->dev, dev_idx, "sha1");
     return 0;
 }
 
@@ -6175,6 +6210,7 @@ static int gpu_opencl_template_kernel_lazy_sha256(struct gpu_device *d, int dev_
         d->kern_template_phase0_sha256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha256, d->dev, dev_idx, "sha256");
     return 0;
 }
 
@@ -6221,6 +6257,7 @@ static int gpu_opencl_template_kernel_lazy_sha224(struct gpu_device *d, int dev_
         d->kern_template_phase0_sha224 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha224, d->dev, dev_idx, "sha224");
     return 0;
 }
 
@@ -6267,6 +6304,7 @@ static int gpu_opencl_template_kernel_lazy_md4(struct gpu_device *d, int dev_idx
         d->kern_template_phase0_md4 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md4, d->dev, dev_idx, "md4");
     return 0;
 }
 
@@ -6335,6 +6373,7 @@ static int gpu_opencl_template_kernel_lazy_sha384(struct gpu_device *d, int dev_
         d->kern_template_phase0_sha384 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha384, d->dev, dev_idx, "sha384");
     return 0;
 }
 
@@ -6381,6 +6420,7 @@ static int gpu_opencl_template_kernel_lazy_sha512(struct gpu_device *d, int dev_
         d->kern_template_phase0_sha512 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha512, d->dev, dev_idx, "sha512");
     return 0;
 }
 
@@ -6449,6 +6489,7 @@ static int gpu_opencl_template_kernel_lazy_ripemd160(struct gpu_device *d, int d
         d->kern_template_phase0_ripemd160 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_ripemd160, d->dev, dev_idx, "ripemd160");
     return 0;
 }
 
@@ -6495,6 +6536,7 @@ static int gpu_opencl_template_kernel_lazy_ripemd320(struct gpu_device *d, int d
         d->kern_template_phase0_ripemd320 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_ripemd320, d->dev, dev_idx, "ripemd320");
     return 0;
 }
 
@@ -6551,6 +6593,7 @@ static int gpu_opencl_template_kernel_lazy_blake2s256(struct gpu_device *d, int 
         d->kern_template_phase0_blake2s256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_blake2s256, d->dev, dev_idx, "blake2s256");
     return 0;
 }
 
@@ -6596,6 +6639,7 @@ static int gpu_opencl_template_kernel_lazy_blake2b256(struct gpu_device *d, int 
         d->kern_template_phase0_blake2b256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_blake2b256, d->dev, dev_idx, "blake2b256");
     return 0;
 }
 
@@ -6641,6 +6685,7 @@ static int gpu_opencl_template_kernel_lazy_blake2b512(struct gpu_device *d, int 
         d->kern_template_phase0_blake2b512 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_blake2b512, d->dev, dev_idx, "blake2b512");
     return 0;
 }
 
@@ -6702,6 +6747,7 @@ static int gpu_opencl_template_kernel_lazy_keccak224(struct gpu_device *d, int d
         d->kern_template_phase0_keccak224 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_keccak224, d->dev, dev_idx, "keccak224");
     return 0;
 }
 
@@ -6742,6 +6788,7 @@ static int gpu_opencl_template_kernel_lazy_keccak256(struct gpu_device *d, int d
         d->kern_template_phase0_keccak256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_keccak256, d->dev, dev_idx, "keccak256");
     return 0;
 }
 
@@ -6782,6 +6829,7 @@ static int gpu_opencl_template_kernel_lazy_keccak384(struct gpu_device *d, int d
         d->kern_template_phase0_keccak384 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_keccak384, d->dev, dev_idx, "keccak384");
     return 0;
 }
 
@@ -6822,6 +6870,7 @@ static int gpu_opencl_template_kernel_lazy_keccak512(struct gpu_device *d, int d
         d->kern_template_phase0_keccak512 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_keccak512, d->dev, dev_idx, "keccak512");
     return 0;
 }
 
@@ -6862,6 +6911,7 @@ static int gpu_opencl_template_kernel_lazy_sha3_224(struct gpu_device *d, int de
         d->kern_template_phase0_sha3_224 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha3_224, d->dev, dev_idx, "sha3_224");
     return 0;
 }
 
@@ -6902,6 +6952,7 @@ static int gpu_opencl_template_kernel_lazy_sha3_256(struct gpu_device *d, int de
         d->kern_template_phase0_sha3_256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha3_256, d->dev, dev_idx, "sha3_256");
     return 0;
 }
 
@@ -6942,6 +6993,7 @@ static int gpu_opencl_template_kernel_lazy_sha3_384(struct gpu_device *d, int de
         d->kern_template_phase0_sha3_384 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha3_384, d->dev, dev_idx, "sha3_384");
     return 0;
 }
 
@@ -6982,6 +7034,7 @@ static int gpu_opencl_template_kernel_lazy_sha3_512(struct gpu_device *d, int de
         d->kern_template_phase0_sha3_512 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha3_512, d->dev, dev_idx, "sha3_512");
     return 0;
 }
 
@@ -7037,6 +7090,7 @@ static int gpu_opencl_template_kernel_lazy_sha384raw(struct gpu_device *d, int d
         d->kern_template_phase0_sha384raw = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha384raw, d->dev, dev_idx, "sha384raw");
     return 0;
 }
 
@@ -7078,6 +7132,7 @@ static int gpu_opencl_template_kernel_lazy_sha512raw(struct gpu_device *d, int d
         d->kern_template_phase0_sha512raw = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha512raw, d->dev, dev_idx, "sha512raw");
     return 0;
 }
 
@@ -7132,6 +7187,7 @@ static int gpu_opencl_template_kernel_lazy_md5raw(struct gpu_device *d, int dev_
         d->kern_template_phase0_md5raw = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md5raw, d->dev, dev_idx, "md5raw");
     return 0;
 }
 
@@ -7173,6 +7229,7 @@ static int gpu_opencl_template_kernel_lazy_sha1raw(struct gpu_device *d, int dev
         d->kern_template_phase0_sha1raw = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha1raw, d->dev, dev_idx, "sha1raw");
     return 0;
 }
 
@@ -7214,6 +7271,7 @@ static int gpu_opencl_template_kernel_lazy_sha256raw(struct gpu_device *d, int d
         d->kern_template_phase0_sha256raw = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha256raw, d->dev, dev_idx, "sha256raw");
     return 0;
 }
 
@@ -7265,6 +7323,7 @@ static int gpu_opencl_template_kernel_lazy_sql5(struct gpu_device *d, int dev_id
         d->kern_template_phase0_sql5 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sql5, d->dev, dev_idx, "sql5");
     return 0;
 }
 
@@ -7324,6 +7383,7 @@ static int gpu_opencl_template_kernel_lazy_sha1dru(struct gpu_device *d, int dev
         d->kern_template_phase0_sha1dru = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha1dru, d->dev, dev_idx, "sha1dru");
     return 0;
 }
 
@@ -7388,6 +7448,7 @@ static int gpu_opencl_template_kernel_lazy_md6256(struct gpu_device *d, int dev_
         d->kern_template_phase0_md6256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md6256, d->dev, dev_idx, "md6256");
     return 0;
 }
 
@@ -7442,6 +7503,7 @@ static int gpu_opencl_template_kernel_lazy_ntlmh(struct gpu_device *d, int dev_i
         d->kern_template_phase0_ntlmh = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_ntlmh, d->dev, dev_idx, "ntlmh");
     return 0;
 }
 
@@ -7497,6 +7559,7 @@ static int gpu_opencl_template_kernel_lazy_md4utf16(struct gpu_device *d, int de
         d->kern_template_phase0_md4utf16 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md4utf16, d->dev, dev_idx, "md4utf16");
     return 0;
 }
 
@@ -7554,6 +7617,7 @@ static int gpu_opencl_template_kernel_lazy_mysql3(struct gpu_device *d, int dev_
         d->kern_template_phase0_mysql3 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_mysql3, d->dev, dev_idx, "mysql3");
     return 0;
 }
 
@@ -7624,6 +7688,7 @@ static int gpu_opencl_template_kernel_lazy_wrl(struct gpu_device *d, int dev_idx
         d->kern_template_phase0_wrl = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_wrl, d->dev, dev_idx, "wrl");
     return 0;
 }
 
@@ -7670,19 +7735,62 @@ static int gpu_opencl_template_kernel_lazy_streebog256(struct gpu_device *d, int
         d->kern_template_phase0_streebog256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_streebog256, d->dev, dev_idx, "streebog256");
     return 0;
 }
 
 /* B5 sub-batch 5b retry: Streebog-512 template compile/lazy pair. Same as
  * streebog256 but HASH_WORDS=16. */
+
+/* Legacy AMD fglrx/Catalyst detection (2026-09-28).
+ * The 1573.x driver's OPTIMISER segfaults inside libamdocl64 while building
+ * the STREEBOG-512 program: 18 frames deep, no mdxfind frames, no CL error
+ * code -- the process dies rather than the build failing. Qualified on gp1
+ * (Tahiti, 1573.4 VM); gp2 reports the same 1573.4 driver. The 256-bit
+ * sibling, identical but for digest width, compiles fine, so this is the
+ * optimiser on one program rather than anything wrong with the source.
+ * Deliberately narrow: keyed on AMD vendor AND a 1573. driver string, so
+ * ROCm and RDNA parts are untouched -- disabling optimisation is not free
+ * (measured -33.7% on a GTX 1080) and must not apply where it is not needed. */
+static int gpu_is_legacy_fglrx(struct gpu_device *d)
+{
+    char vendor[128] = {0}, drv[128] = {0};
+    if (clGetDeviceInfo(d->dev, CL_DEVICE_VENDOR, sizeof(vendor) - 1,
+                        vendor, NULL) != CL_SUCCESS) return 0;
+    if (clGetDeviceInfo(d->dev, CL_DRIVER_VERSION, sizeof(drv) - 1,
+                        drv, NULL) != CL_SUCCESS) return 0;
+    return (strstr(vendor, "Advanced Micro Devices") != NULL)
+        && (strncmp(drv, "1573.", 5) == 0);
+}
+
 static int gpu_opencl_template_compile_streebog512(struct gpu_device *d, int dev_idx) {
     if (d->prog_template_streebog512) return 0;
     cl_int err = CL_SUCCESS;
     const char *sources[6];
     cl_uint nsrc = gpu_template_sources(sources, gpu_streebog512_core_str);
+    /* STREEBOG-512 ships -O0 for this program only (2026-09-28).
+     * REQUIRED on AMD fglrx 1573.4: the optimiser SIGSEGVs inside
+     * libamdocl64 during clBuildProgram, 18 frames deep with no mdxfind
+     * frames and no CL error -- e431 could not run on Tahiti at all, while
+     * the 256-bit sibling (identical but for digest width) compiles fine.
+     * Uses -cl-opt-disable, the STANDARD OpenCL option. NOTE: -O0 is NOT
+     * portable -- NVIDIA rejects it with CL_BUILD_PROGRAM_FAILURE (-11) and
+     * the template path silently goes unavailable, which reads as a clean
+     * run that simply finds nothing. Measured cost is recorded beside the
+     * check-in; the likely cause of the AMD crash is unrolling the Streebog
+     * permutation against its 16 KB __constant table until registers spill.
+     * The defines string carries the flag too so the kernel-cache key
+     * changes and no previously-cached optimised binary is replayed. */
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=64";
+    const char *bopts   = "-cl-std=CL1.2";
+    if (gpu_is_legacy_fglrx(d)) {
+        /* defines carries the marker too, so the kernel-cache key differs
+         * and an optimised binary cached elsewhere cannot be replayed. */
+        defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=64,OPTOFF=1";
+        bopts   = "-cl-std=CL1.2 -cl-opt-disable";
+    }
     d->prog_template_streebog512 = gpu_kernel_cache_build_program_ex(
-        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
+        d->ctx, d->dev, nsrc, sources, bopts, defines, &err);
     if (!d->prog_template_streebog512 || err != CL_SUCCESS) {
         char log[8192] = {0};
         if (d->prog_template_streebog512) {
@@ -7713,6 +7821,7 @@ static int gpu_opencl_template_kernel_lazy_streebog512(struct gpu_device *d, int
         d->kern_template_phase0_streebog512 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_streebog512, d->dev, dev_idx, "streebog512");
     return 0;
 }
 
@@ -7760,10 +7869,6 @@ static int gpu_opencl_template_compile_md5salt(struct gpu_device *d, int dev_idx
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1 "
         "-DGPU_TEMPLATE_HAS_PRE_SALT=1 -DSALT_BATCH=%d",
         salt_batch_env);
-    /* -DGPU_TEMPLATE_HAS_SALT=1 turns on the kernel-side salt-arg
-     * #ifdef blocks in gpu_template.cl. The token name MUST match the
-     * one in the .cl file; defines_str carries the SAME token plus the
-     * SALT_POSITION discriminator for cache-key purposes. */
     d->prog_template_md5salt = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources,
         build_opts_buf,
@@ -7799,6 +7904,7 @@ static int gpu_opencl_template_kernel_lazy_md5salt(struct gpu_device *d, int dev
         d->kern_template_phase0_md5salt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md5salt, d->dev, dev_idx, "md5salt");
     return 0;
 }
 
@@ -7847,6 +7953,7 @@ static int gpu_opencl_template_kernel_lazy_md5saltpass(struct gpu_device *d, int
         d->kern_template_phase0_md5saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md5saltpass, d->dev, dev_idx, "md5saltpass");
     return 0;
 }
 
@@ -7903,6 +8010,7 @@ static int gpu_opencl_template_kernel_lazy_sha1saltpass(struct gpu_device *d, in
         d->kern_template_phase0_sha1saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha1saltpass, d->dev, dev_idx, "sha1saltpass");
     return 0;
 }
 
@@ -7959,6 +8067,7 @@ static int gpu_opencl_template_kernel_lazy_sha256saltpass(struct gpu_device *d, 
         d->kern_template_phase0_sha256saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha256saltpass, d->dev, dev_idx, "sha256saltpass");
     return 0;
 }
 
@@ -8019,6 +8128,7 @@ static int gpu_opencl_template_kernel_lazy_sha224saltpass(struct gpu_device *d, 
         d->kern_template_phase0_sha224saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha224saltpass, d->dev, dev_idx, "sha224saltpass");
     return 0;
 }
 
@@ -8074,6 +8184,7 @@ static int gpu_opencl_template_kernel_lazy_md5passsalt(struct gpu_device *d, int
         d->kern_template_phase0_md5passsalt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md5passsalt, d->dev, dev_idx, "md5passsalt");
     return 0;
 }
 
@@ -8129,6 +8240,7 @@ static int gpu_opencl_template_kernel_lazy_sha1passsalt(struct gpu_device *d, in
         d->kern_template_phase0_sha1passsalt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha1passsalt, d->dev, dev_idx, "sha1passsalt");
     return 0;
 }
 
@@ -8187,6 +8299,7 @@ static int gpu_opencl_template_kernel_lazy_sha256passsalt(struct gpu_device *d, 
         d->kern_template_phase0_sha256passsalt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha256passsalt, d->dev, dev_idx, "sha256passsalt");
     return 0;
 }
 
@@ -8247,6 +8360,7 @@ static int gpu_opencl_template_kernel_lazy_sha512saltpass(struct gpu_device *d, 
         d->kern_template_phase0_sha512saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha512saltpass, d->dev, dev_idx, "sha512saltpass");
     return 0;
 }
 
@@ -8308,6 +8422,7 @@ static int gpu_opencl_template_kernel_lazy_sha512passsalt(struct gpu_device *d, 
         d->kern_template_phase0_sha512passsalt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha512passsalt, d->dev, dev_idx, "sha512passsalt");
     return 0;
 }
 
@@ -8370,6 +8485,7 @@ static int gpu_opencl_template_kernel_lazy_sha384saltpass(struct gpu_device *d, 
         d->kern_template_phase0_sha384saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha384saltpass, d->dev, dev_idx, "sha384saltpass");
     return 0;
 }
 
@@ -8435,6 +8551,7 @@ static int gpu_opencl_template_kernel_lazy_ripemd160saltpass(struct gpu_device *
         d->kern_template_phase0_ripemd160saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_ripemd160saltpass, d->dev, dev_idx, "ripemd160saltpass");
     return 0;
 }
 
@@ -8499,6 +8616,7 @@ static int gpu_opencl_template_kernel_lazy_ripemd320saltpass(struct gpu_device *
         d->kern_template_phase0_ripemd320saltpass = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_ripemd320saltpass, d->dev, dev_idx, "ripemd320saltpass");
     return 0;
 }
 
@@ -8565,6 +8683,7 @@ static int gpu_opencl_template_kernel_lazy_hmac_blake2s(struct gpu_device *d, in
         d->kern_template_phase0_hmac_blake2s = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_hmac_blake2s, d->dev, dev_idx, "hmac_blake2s");
     return 0;
 }
 
@@ -8636,6 +8755,7 @@ static int gpu_opencl_template_kernel_lazy_hmac_streebog256(struct gpu_device *d
         d->kern_template_phase0_hmac_streebog256 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_hmac_streebog256, d->dev, dev_idx, "hmac_streebog256");
     return 0;
 }
 
@@ -8704,6 +8824,7 @@ static int gpu_opencl_template_kernel_lazy_hmac_streebog512(struct gpu_device *d
         d->kern_template_phase0_hmac_streebog512 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_hmac_streebog512, d->dev, dev_idx, "hmac_streebog512");
     return 0;
 }
 
@@ -8769,6 +8890,7 @@ static int gpu_opencl_template_kernel_lazy_phpbb3(struct gpu_device *d, int dev_
         d->kern_template_phase0_phpbb3 = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_phpbb3, d->dev, dev_idx, "phpbb3");
     return 0;
 }
 
@@ -8834,6 +8956,7 @@ static int gpu_opencl_template_kernel_lazy_md5crypt(struct gpu_device *d, int de
         d->kern_template_phase0_md5crypt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_md5crypt, d->dev, dev_idx, "md5crypt");
     return 0;
 }
 
@@ -8898,6 +9021,7 @@ static int gpu_opencl_template_kernel_lazy_sha256crypt(struct gpu_device *d, int
         d->kern_template_phase0_sha256crypt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha256crypt, d->dev, dev_idx, "sha256crypt");
     return 0;
 }
 
@@ -8970,6 +9094,7 @@ static int gpu_opencl_template_kernel_lazy_sha512crypt(struct gpu_device *d, int
         d->kern_template_phase0_sha512crypt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_sha512crypt, d->dev, dev_idx, "sha512crypt");
     return 0;
 }
 
@@ -9130,6 +9255,7 @@ static int gpu_opencl_template_kernel_lazy_descrypt(struct gpu_device *d, int de
         d->kern_template_phase0_descrypt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_descrypt, d->dev, dev_idx, "descrypt");
     return 0;
 }
 
@@ -9212,6 +9338,7 @@ static int gpu_opencl_template_kernel_lazy_bcrypt(struct gpu_device *d, int dev_
         d->kern_template_phase0_bcrypt = NULL;
         return -1;
     }
+    tpl_kernel_report(d->kern_template_phase0_bcrypt, d->dev, dev_idx, "bcrypt");
     return 0;
 }
 
@@ -16685,6 +16812,24 @@ validator_skip:
      * Mali-T860 32 KB exactly. */
     if (kern == d->kern_template_phase0_bcrypt) {
         local = 8;  /* must match BCRYPT_WG_SIZE in gpu_common.cl */
+    } else {
+        /* Experiment 2026-09-28 (env MDXFIND_TPL_LOCAL): the template
+         * dispatch has always used a hardcoded work-group size of 64, while
+         * kern_register-ed kernels get an auto-tuned size through
+         * kern_get_local_size(). The md5salt kernel reports max_wg=256, so it
+         * has been running at a quarter of its permitted group size, untuned.
+         * Clamped to the kernel's own maximum so an over-large value cannot
+         * fail the enqueue. */
+        const char *e = getenv("MDXFIND_TPL_LOCAL");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 1024) {
+                size_t kmax = 0;
+                clGetKernelWorkGroupInfo(kern, d->dev, CL_KERNEL_WORK_GROUP_SIZE,
+                                         sizeof(kmax), &kmax, NULL);
+                if (kmax == 0 || (size_t)v <= kmax) local = (size_t)v;
+            }
+        }
     }
     /* BF chunk-as-job (2026-05-09 Tranche 3): when bf_num_masks > 0 the
      * kernel's mask axis is the chunk's per-word range (bf_num_masks),

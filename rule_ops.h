@@ -1,6 +1,9 @@
-/* $Revision: 1.3 $
+/* $Revision: 1.4 $
  *
  * $Log: rule_ops.h,v $
+ * Revision 1.4  2026/09/29 13:44:07  dlr
+ * Correct the attribution wording in the header comment.
+ *
  * Revision 1.3  2026/09/13 02:38:38  dlr
  * Make ruleproc32 agree with ruleproc, and give procrule the means to prove it.
  *

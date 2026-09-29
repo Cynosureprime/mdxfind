@@ -1,6 +1,9 @@
 /*
- * $Revision: 1.1 $
+ * $Revision: 1.2 $
  * $Log: gpu_u32_host.h,v $
+ * Revision 1.2  2026/09/28 11:37:15  dlr
+ * Move the large thread-local rule scratch buffers from static TLS to the heap. A static __thread array does not get a buffer off the thread stack, which is what the comments at these sites believed: glibc carves the static TLS block out of the same allocation as the thread stack and replicates it into every thread, including threads created inside a dlopen library. mdxfind carried 6,881,648 bytes of .tbss, 95 percent of it eight uint32_t arrays of RULE32_MAXCP at 819,200 bytes each, and AMD fglrx 1573.4 clCreateCommandQueue hung forever on gp1 because its internal helper thread could not be created; a ballast harness bisects the threshold to between 131,072 and 262,144 bytes, and hashcat and the gbench harness ran on the same card minutes apart because their TLS is small or absent. Each buffer now keeps a thread-local pointer and allocates once per thread on first use through the new RULE32_TLS_SCRATCH in ruleproc32.h, using calloc so the zeroing matches .tbss semantics of zeroed once per thread rather than per call, never freed because worker threads live for the run exactly as the TLS block did, and a loud exit naming file and line on allocation failure. Measured .tbss falls from 6,881,648 to 41,256 bytes on the Linux GPU build and thread_bss from 5,120,216 to 41,152 on the non-GPU build; the residue is cached, deliberately left as an array because it is under the threshold and carries sizeof uses. mdxfind now initialises the Tahiti GPU in 2.0 seconds and cracks on it, including a two-digit mask matching the CPU exactly, where every earlier build hung. procrule -8 against mdxfind -8 gives 10,946 of 10,947 candidates both before and after, the one difference being the known Turkish dotless-i locale variant.
+ *
  * Revision 1.1  2026/09/14 19:30:05  dlr
  * Initial revision.
  *
@@ -726,11 +729,14 @@ int                  gpu_u32_dev_nrules = 0;
 int gpu_u32_replay_apply(const char *word, int wlen, int ridx,
                                 char *out, int outmax)
 {
-    static __thread uint32_t in32[RULE32_MAXCP];
-    static __thread uint32_t out32[RULE32_MAXCP];
+    static __thread uint32_t *in32;
+    static __thread uint32_t *out32;
     uint32_t r32;
     unsigned enc;
     int u32_can, byte_can, wide, u32_must, il, ol, bl;
+
+    RULE32_TLS_SCRATCH(in32,  RULE32_MAXCP);
+    RULE32_TLS_SCRATCH(out32, RULE32_MAXCP);
 
     if (!gpu_u32_dev_offs || ridx < 0 || ridx >= gpu_u32_dev_nrules)
         return GPU_U32_REPLAY_BYTE;

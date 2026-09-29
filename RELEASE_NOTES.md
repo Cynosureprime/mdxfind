@@ -1,51 +1,48 @@
-# mdxfind v1.606: seventeen new hash types, and rules combined with a mask
+# mdxfind v1.608: seven new hash types, and AMD GPUs that never initialised
 
-Source: mdxfind.c 1.596 -> 1.606.
+Source: mdxfind.c 1.606 -> 1.608.
 
-## New hash types (e1030 - e1046)
+## New hash types (e1047 - e1053)
 
 | index | name | construction |
 |---|---|---|
-| e1030 | `MD5BASE64MD5SHA1` | `md5(base64(md5(sha1(pass))))` |
-| e1031 | `WRLSHA1` | `wrl(sha1(pass))` |
-| e1032 | `MD5sub8-24MD5sub8-24MD5MD5MD5` | `md5(cut(md5(cut(md5(md5(md5(pass))), 8, 16)), 8, 16))` |
-| e1033 | `MD5SHA1SHA1MD5SHA1MD5` | `md5(sha1(sha1(md5(sha1(md5(pass))))))` |
-| e1034 | `MD5SHA1SHA1SHA1` | `md5(sha1(sha1(sha1(pass))))` |
-| e1035 | `MD5SHA1MD5SHA1MD5SHA1` | `md5(sha1(md5(sha1(md5(sha1(pass))))))` |
-| e1036 | `MD5SHA512MD5` | `md5(sha512(md5(pass)))` |
-| e1037 | `MD5sub1-16MD5` | `md5(cut(md5(pass), 0, 16))` |
-| e1038 | `MD5sub1-28MD5` | `md5(cut(md5(pass), 0, 28))` |
-| e1039 | `MD5MD5sub1-30MD5` | `md5(md5(cut(md5(pass), 0, 30)))` |
-| e1040 | `APACHE-SHA-TRUNC16` | `"{SHA}" . base64(trunc(sha1_bin(pass), 16))` |
-| e1041 | `MD5SALTLAST16` | `cut(md5(md5(pass) . salt), -16)` |
-| e1042 | `MD5SALTMD5PASS-PASS` | `md5(salt . md5(pass) . ":" . pass)` |
-| e1043 | `MD5-1xMD5SHA1pSHA1p` | `md5(md5(sha1(pass)) . sha1(pass))` |
-| e1044 | `MD5-1xMD5SHA256pSHA256p` | `md5(md5(sha256(pass)) . sha256(pass))` |
-| e1045 | `MD5-1xMD5SHA512pSHA512p` | `md5(md5(sha512(pass)) . sha512(pass))` |
-| e1046 | `MD5-1xMD5MD5pMD5p` | `md5(md5(md5(pass)) . md5(pass))` |
+| e1047 | `MD5-1xMD5pMD5SHA1p` | `md5(md5(pass) . md5(sha1(pass)))` |
+| e1048 | `MD5-1xMD5pMD5SHA256p` | `md5(md5(pass) . md5(sha256(pass)))` |
+| e1049 | `MD5-1xMD5pMD5SHA512p` | `md5(md5(pass) . md5(sha512(pass)))` |
+| e1050 | `MD5SHA1revMD5` | `md5(sha1(rev(md5(pass))))` |
+| e1051 | `MD5MD5RAWMD5PASS` | `md5(md5_bin(md5(pass) . pass))` |
+| e1052 | `MD5MD5RAWMD5` | `md5(md5_bin(md5(pass)))` |
+| e1053 | `MD5SHA1SHA1MD5MD5` | `md5(sha1(sha1(md5(md5(pass)))))` |
 
-All seventeen are unsalted or single-salt constructions with no hashcat mode.
-Each is catalogued in `hx.8` and covered by the `hx_dedup_check` gate, and each
-was verified against an independently supplied hash before implementation.
+All seven are unsalted, catalogued in `hx.8`, and cleared the `hx_dedup_check`
+gate before a number was assigned. Every vector was supplied externally and
+reproduced with an independent implementation rather than by this code.
 
-Three carry a stored form: `APACHE-SHA-TRUNC16` is the RFC 2307 `{SHA}` scheme
-of e457 with a 16-byte payload instead of 20 and is distinguished from it by
-decoded payload length; `MD5SALTLAST16` stores only the last 16 hex of its
-digest, so it is single-depth and `-i` does not iterate it; `MD5SALTMD5PASS-PASS`
-carries its site prefix as the salt rather than a literal, so one type covers
-every installation.
+`e1051` and `e1052` consume the inner digest as hex and feed the outer `md5` the
+raw sixteen bytes, which is what separates them from the hex-chained forms
+already present. `e1050` reverses the thirty-two hex characters of the inner
+digest, not its bytes.
 
-## Rules combined with a mask lost candidates
+`bench_rates.h` gains measured throughputs for e1030 through e1046. The seven
+types above do not yet have one, so `-L` cannot decline them; that is the
+permissive direction, and a rate can only make them harder to select.
 
-`-r` together with `-n`/`-N` silently dropped work on large jobs. The mask
-fan-out sized the mask axis alone while the host computed in `size_t`, so a
-job whose product of words, rules and mask size exceeded 2^32 wrapped, and the
-chunking that avoided the overflow restarted the mask cursor at the wrong
-position on each rule advance. A production case went from 1 of 23 recovered to
-23 of 23, matching hashcat exactly on both digests and plaintexts.
+## AMD GPUs that hung at initialisation now work
 
-## Brute-force mask fixes
+On AMD fglrx 1573.4, `clCreateCommandQueue` hung forever and no GPU work ever
+started. The cause was not in the OpenCL path at all.
 
-`?b` generated one candidate per position instead of 256. Separately, the
-brute-force bootstrap could deadlock when the wait counted enumerated devices
-rather than dispatching ones.
+A `static __thread` array does not place a buffer on the thread stack. glibc
+carves the static TLS block out of the same allocation and copies it into every
+thread, including threads a `dlopen`ed driver creates for itself. mdxfind carried
+6,881,648 bytes of `.tbss`, and the driver's helper thread could not start above
+a threshold bisected to between 131,072 and 262,144 bytes.
+
+The large rule scratch buffers now hold thread-local pointers allocated once per
+thread. `.tbss` falls from 6,881,648 bytes to 41,256 on the Linux GPU build, and
+a card that hung on every earlier build now initialises in two seconds and
+cracks normally.
+
+Rule processing is unchanged: `procrule -8` against `mdxfind -8` gives 10,946 of
+10,947 before and after, the single difference being the known Turkish dotless-i
+locale variant.
