@@ -59,6 +59,12 @@ extern int oracle_compute_md5pass_family(int job_enum, const char *pass,
                                          int plen, unsigned char *out);
 
 extern int Printall, Maxiter;
+/* For opencl_rules_engine_preflight(): the armed flag is a shared global in
+ * mdxfind.c (gpujob_metal.m externs the same one), Dohash is the set of types
+ * the run selected, and Types[] names them for the report. */
+extern int      gpu_rules_engine_active;
+extern Pvoid_t  Dohash;
+extern char    *Types[];
 extern volatile int MDXpause, MDXpaused_count;
 extern int hybrid_check(const unsigned char *, int, int *, unsigned short **);
 extern void md5crypt_b64encode(const unsigned char *, char *);
@@ -1974,6 +1980,7 @@ void gpujob(void *arg) {
                           * already wired in gpu_hash_words below — only
                           * the salted-decompose path needs this entry. */
                          g->op == JOB_SHA512SALTPASS ||
+                         g->op == JOB_SHA384SALTPASS ||
                          /* B6.10 SHA512PASSSALT fan-out (2026-05-06):
                           * SHA512PASSSALT — second 64-bit-state salted
                           * variant; APPEND-shape sibling. FINAL B6
@@ -3510,8 +3517,80 @@ return_jobg:
     free(pack_map);
 }
 
+/* Disarm the OpenCL rules engine when the run contains an op that mdxfind's
+ * GPU activation set admits but gpu_opencl_dispatch_md5_rules will refuse.
+ *
+ * The OpenCL twin of metal_rules_engine_preflight() in gpujob_metal.m, which
+ * has guarded this class on Metal since 2026-05-13 while OpenCL had nothing.
+ *
+ * Why it is needed, concretely: e812 SHA384SALTPASS was admitted to the
+ * activation set on 2026-05-13 but never added to the dispatch allowlist. Every
+ * run dispatched it, the entry gate refused it with "unsupported op=812", and
+ * the words were never walked by the CPU either -- so the type returned zero on
+ * GPU and exit 0 for four months while the CPU alone found every hash. A zero
+ * indistinguishable from an honest negative.
+ *
+ * Two differences from the Metal version, both deliberate:
+ *
+ *   1. No hand-maintained unserved-ops table. Metal needs one because it has no
+ *      single allowlist to consult; OpenCL has exactly one, so this walks the
+ *      ops actually REQUESTED and asks gpu_opencl_op_supported() about each.
+ *      That makes the check exhaustive and impossible to leave stale -- adding
+ *      an op to the allowlist removes it from the veto with no edit here.
+ *   2. It therefore reports the op by catalog name from Types[], not from a
+ *      duplicated string.
+ *
+ * Called from gpujob_init(), after the hash list is loaded (so Dohash is
+ * populated) and before any procjob thread exists -- the only window where the
+ * decision can still be taken without having already lost words.
+ */
+static void opencl_rules_engine_preflight(void)
+{
+    if (!gpu_rules_engine_active) return;   /* engine not armed */
+    if (!Dohash) return;                    /* no types selected */
+
+    int nblock = 0;
+    Word_t op = 0;
+    int RC;
+
+    J1F(RC, Dohash, op);
+    while (RC) {
+        if (!gpu_opencl_op_supported((int)op)) {
+            if (nblock == 0)
+                fprintf(stderr, "OpenCL GPU admission: the OpenCL rules engine "
+                                "is DISABLED for this run.\n");
+            nblock++;
+            fprintf(stderr,
+                "OpenCL GPU admission:   e%d %s -- admitted by the mdxfind.c "
+                "activation set, not served by the dispatch allowlist\n",
+                (int)op,
+                (Types && Types[op]) ? Types[op] : "(unnamed)");
+        }
+        J1N(RC, Dohash, op);
+    }
+
+    if (nblock > 0) {
+        fprintf(stderr,
+            "OpenCL GPU admission: %d such type(s).  Those batches would have "
+            "been withheld from the CPU walk and then computed by nobody -- a "
+            "zero indistinguishable from an honest negative.  The whole run now "
+            "runs on the CPU, which recovers what the CPU recovers.  Run the "
+            "GPU-served types separately to get the GPU back for them.\n",
+            nblock);
+        gpu_rules_engine_active = 0;
+    }
+}
+
+
 int gpujob_init(int num_jobg) {
     if (!gpu_opencl_available()) return -1;
+
+    /* Correctness gate BEFORE anything else in init: an op the activation set
+     * admits but the dispatch allowlist refuses must not reach a procjob
+     * thread, because by then its words are withheld from the CPU walk. Same
+     * position and reasoning as metal_rules_engine_preflight() in
+     * gpujob_metal.m. */
+    opencl_rules_engine_preflight();
 
     /* Resolve pipeline-trace env var once. */
     gpu_pipe_trace_init();
@@ -4510,6 +4589,11 @@ int gpu_op_category(int op) {
      * (block_size, word_width, length-field-width) are not parameterized
      * into the SHA-256 template/fragment per the codegen-reconsideration
      * memo. */
+    /* e812 SHA384SALTPASS: template-routed like its SHA-512 siblings.
+     * Absent here it defaulted to GPU_CAT_NONE while mdxfind had already
+     * admitted it to the GPU activation set, so the job was dispatched
+     * and landed on no kernel: 1 hash counted, 0 hits, exit 0. */
+    case JOB_SHA384SALTPASS:
     case JOB_SHA512SALTPASS:
     /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT — second
      * 64-bit-state salted variant; APPEND-shape sibling of SHA512SALTPASS.
@@ -4723,6 +4807,7 @@ int gpu_op_family(int op) {
     case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
         return FAM_KECCAKUNSALTED;
     case JOB_SHA512PASSSALT: case JOB_SHA512SALTPASS:
+    case JOB_SHA384SALTPASS:
     case JOB_HMAC_SHA512: case JOB_HMAC_SHA512_KPASS:
     case JOB_HMAC_SHA384: case JOB_HMAC_SHA384_KPASS:
         return FAM_HMAC_SHA512;
@@ -4772,6 +4857,9 @@ int gpu_hash_words(int op) {
     /* 384-bit output = 12 words */
     case JOB_SHA384: case JOB_SHA384RAW:
     case JOB_HMAC_SHA384: case JOB_HMAC_SHA384_KPASS:
+    /* e812 SHA384SALTPASS: 48-byte digest = 12 uint32 words, NOT the
+     * 16 of its SHA-512 siblings. */
+    case JOB_SHA384SALTPASS:
     case JOB_KECCAK384: case JOB_SHA3_384:
         return 12;
     /* 256-bit output = 8 words */

@@ -170,6 +170,20 @@ int gpu_opencl_device_disabled(int dev_idx);
 int gpu_opencl_active_device_count(void);
 void gpu_opencl_finalize_active_count(void);
 
+/* Force the OpenCL path off for the remainder of the run (ocl_ready = 0, so
+ * gpu_opencl_available() returns false and mdxfind behaves as -G none). Use
+ * when a precondition the kernels depend on is absent even though the devices
+ * initialised -- e.g. no compact table because no hashes loaded. Idempotent and
+ * quiet if already disabled. `why` is logged; pass NULL for no reason text. */
+void gpu_opencl_disable(const char *why);
+
+/* Does the OpenCL rules-engine dispatch serve this op? 1 = yes, 0 = it will
+ * refuse. This is the allowlist from the top of gpu_opencl_dispatch_md5_rules,
+ * made callable so opencl_rules_engine_preflight() can ask the same question
+ * BEFORE any word is packed rather than discovering it per-dispatch, by which
+ * time the words have been withheld from the CPU walk and computed by nobody. */
+int gpu_opencl_op_supported(int op);
+
 /* Phase 1a sub-phase 1a.1 env-flag gate. Returns 1 when the operator has
  * opted into the kernel A production path via MDXFIND_KERNEL_A_PROTO=1
  * (with MDXFIND_KERNEL_A_VARIANT unset or set to a supported value).

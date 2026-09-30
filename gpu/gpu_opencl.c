@@ -2320,6 +2320,38 @@ static cl_mem dev_buf(struct gpu_device *d, size_t size, cl_mem_flags flags) {
  */
 #define MIN_BUFFER_BYTES 4096
 
+/* Zero a device buffer, tolerating drivers that reject clEnqueueFillBuffer.
+ *
+ * The symbol resolving does NOT mean the call works. NVIDIA's OpenCL 1.2 on
+ * Fermi (CUDA 9.0.368, Tesla M2070) returns CL_INVALID_OPERATION (-59) for a
+ * fill on a buffer that the same device accepts via a host-staged write. That
+ * is the case create_min_buf below has carried a fallback for since the
+ * 1.1-era drivers; the dispatch-path site did not, and it turned the failure
+ * into a SILENT wrong answer -- gp hashed 400,002 words, reported 0 hits and
+ * exited 0, where the same binary found both planted hashes on a GTX 1080.
+ *
+ * Fills with a 1-byte pattern, so there is no multiple-of-pattern-size
+ * constraint on the length. Returns CL_SUCCESS, or the last error if BOTH
+ * routes fail -- which callers must treat as fatal, never as "degrade".
+ */
+static cl_int gpu_zero_buffer(cl_command_queue q, cl_mem buf, size_t bytes)
+{
+    cl_int err = CL_INVALID_OPERATION;
+    if (p_clEnqueueFillBuffer) {
+        unsigned char zero8 = 0;
+        err = clEnqueueFillBuffer(q, buf, &zero8, sizeof(zero8),
+                                  0, bytes, 0, NULL, NULL);
+        if (err == CL_SUCCESS) return CL_SUCCESS;
+    }
+    {
+        unsigned char *z = (unsigned char *)calloc(1, bytes);
+        if (!z) return err;
+        err = clEnqueueWriteBuffer(q, buf, CL_TRUE, 0, bytes, z, 0, NULL, NULL);
+        free(z);
+    }
+    return err;
+}
+
 static cl_mem create_min_buf(cl_context ctx, cl_command_queue q,
                              cl_mem_flags flags, size_t actual_bytes,
                              const void *host_data, cl_int *err_out) {
@@ -3412,6 +3444,31 @@ void gpu_opencl_shutdown(void) {
 }
 
 int gpu_opencl_available(void) { return ocl_ready; }
+
+/* Force the OpenCL path off for the rest of the run.
+ *
+ * gpu_opencl_available() is the single gate the rest of mdxfind consults, so
+ * clearing ocl_ready is equivalent to -G none from here on. This existed only
+ * as a side effect of gpu_opencl_finalize_active_count(), which clears the flag
+ * ONLY when every device failed to register a compact table -- useless when the
+ * devices are healthy and it is the TABLE that is absent.
+ *
+ * That gap had teeth. With zero hashes loaded (an empty -f file, or a hash file
+ * whose lines none of the selected types can parse) mdxfind printed "GPU:
+ * compact table not ready, GPU disabled" and then dispatched anyway, because
+ * the message set nothing. The kernel indexed buffers sized from a zero-entry
+ * table and faulted; NVIDIA reports a kernel fault at the next synchronising
+ * call, so it surfaced as CL_OUT_OF_RESOURCES on a clEnqueueReadBuffer far from
+ * the cause. Reproduced on both a Tesla M2070 and a GTX 1080, on 1.610 and
+ * earlier, with `mdxfind -m e1 -G 0 -f /dev/null wordlist` dying where -G none
+ * completes cleanly.
+ */
+void gpu_opencl_disable(const char *why) {
+    if (!ocl_ready) return;              /* already off; stay quiet */
+    ocl_ready = 0;
+    tsfprintf(stderr, "OpenCL GPU: disabled for this run%s%s\n",
+              why ? " -- " : "", why ? why : "");
+}
 int gpu_opencl_num_devices(void) { return num_gpu_devs; }
 
 /* Per-device disable accessor — see gpu_opencl.h doc. */
@@ -4589,18 +4646,12 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
             if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexhashes (mask/unsalted seed) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
         }
         free(wbuf);
-    } else if (p_clEnqueueFillBuffer) {
-        unsigned char zb = 0;
-        cl_int _e = clEnqueueFillBuffer(d->queue, d->b_hexhashes, &zb, sizeof(zb), 0, words_size, 0, NULL, NULL);
-        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe fill b_hexhashes (salted seed) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
     } else {
-        unsigned char *zbuf = (unsigned char *)calloc(1, words_size);
-        if (!zbuf) GPU_FATAL("warm-probe zbuf calloc(%zu) failed dev=%d (1.1 fallback)", words_size, dev_idx);
-        {
-            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, zbuf, 0, NULL, NULL);
-            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexhashes (1.1 zero stage) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
-        }
-        free(zbuf);
+        /* Zero seed. gpu_zero_buffer tries the fill and falls back to a
+         * host-staged write: the two arms this replaces treated a fill
+         * rejection as fatal although the fallback was right there. */
+        cl_int _e = gpu_zero_buffer(d->queue, d->b_hexhashes, words_size);
+        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hexhashes (salted seed, fill and host stage) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
     }
     /* Each entry length = 32 (a valid hex hash slot). Build host-side. */
     {
@@ -4635,11 +4686,7 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
 
     uint32_t zero = 0;
     {
-        cl_int _e;
-        if (p_clEnqueueFillBuffer)
-            _e = clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero, sizeof(zero), 0, sizeof(zero), 0, NULL, NULL);
-        else
-            _e = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero), &zero, 0, NULL, NULL);
+        cl_int _e = gpu_zero_buffer(d->queue, d->b_hit_count, sizeof(zero));
         if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hit_count (pre-bind) dev=%d err=%d", dev_idx, _e);
         _e = clFinish(d->queue);
         if (_e != CL_SUCCESS) GPU_FATAL("warm-probe clFinish (pre-bind) dev=%d err=%d", dev_idx, _e);
@@ -4682,11 +4729,7 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
     for (int probe = 0; probe < 20; probe++) {
         uint32_t zero_hit = 0;
         {
-            cl_int _e;
-            if (p_clEnqueueFillBuffer)
-                _e = clEnqueueFillBuffer(d->queue, d->b_hit_count, &zero_hit, sizeof(zero_hit), 0, sizeof(zero_hit), 0, NULL, NULL);
-            else
-                _e = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zero_hit), &zero_hit, 0, NULL, NULL);
+            cl_int _e = gpu_zero_buffer(d->queue, d->b_hit_count, sizeof(zero_hit));
             if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hit_count (iter %d) dev=%d err=%d", probe, dev_idx, _e);
         }
 
@@ -4776,11 +4819,7 @@ void gpu_opencl_warm_probe(int dev_idx, int op) {
         if (reps > 1) {
             uint32_t zh = 0;
             {
-                cl_int _e;
-                if (p_clEnqueueFillBuffer)
-                    _e = clEnqueueFillBuffer(d->queue, d->b_hit_count, &zh, sizeof(zh), 0, sizeof(zh), 0, NULL, NULL);
-                else
-                    _e = clEnqueueWriteBuffer(d->queue, d->b_hit_count, CL_TRUE, 0, sizeof(zh), &zh, 0, NULL, NULL);
+                cl_int _e = gpu_zero_buffer(d->queue, d->b_hit_count, sizeof(zh));
                 if (_e != CL_SUCCESS) GPU_FATAL("warm-probe rescue zero b_hit_count dev=%d err=%d", dev_idx, _e);
             }
             /* Re-establish probe_global from last iteration's params. */
@@ -10114,6 +10153,11 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * mode-0 of this kernel is dead in production. Cache key is
          * disambiguated from SHA512SALTPASS / SHA512PASSSALT via HASH_WORDS=12
          * (vs 16) — same BASE_ALGO=sha512 + HASH_BLOCK_BYTES=128 axes. */
+        /* e812 SHA384SALTPASS reaches mode 0 of this same carrier: algo_mode
+         * defaults to 0 (params are memset before the chain), and the kernel's
+         * own header notes the SHA-384(salt||pass) body is "reachable only via
+         * algo_mode<5 which the host never sets". It is set now. */
+        case JOB_SHA384SALTPASS:
         case JOB_HMAC_SHA384:
         case JOB_HMAC_SHA384_KPASS:
             if (gpu_opencl_template_compile_sha384saltpass(d, dev_idx) == 0 &&
@@ -14394,52 +14438,25 @@ const char *gpu_opencl_kernelb_proto_plaintext(
  *
  * Returns hits in d->h_hits; sets *nhits_out to the kernel's atomic
  * hit_count (capped at GPU_PACKED_MAX_HITS for buffer safety). */
-uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out,
-    uint64_t mask_start, uint32_t mask_offset_per_word, uint32_t bf_num_masks,
-    uint32_t inner_iter,
-    int bf_fast_eligible)
+/* Does the OpenCL rules-engine dispatch actually serve this op?
+ *
+ * This is the allowlist that used to sit inline at the top of
+ * gpu_opencl_dispatch_md5_rules. It is the authoritative answer to "can the
+ * OpenCL backend compute this type", so it is now callable -- the dispatch
+ * still consults it, and opencl_rules_engine_preflight() in gpujob_opencl.c
+ * consults the SAME function before any word is packed.
+ *
+ * Why that matters: an op admitted to mdxfind's GPU activation set but absent
+ * here was dispatched, refused at this gate, and its words were never walked
+ * by the CPU either -- a zero indistinguishable from an honest negative. e812
+ * SHA384SALTPASS sat in exactly that state from 2026-05-13 until 2026-09-30.
+ * Metal has had a preflight for this class (metal_rules_engine_preflight);
+ * OpenCL had none, and had no callable notion of "supported" to build one on.
+ *
+ * Returns 1 when the dispatch will serve the op, 0 when it will refuse.
+ */
+int gpu_opencl_op_supported(int op)
 {
-    *nhits_out = 0;
-    if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
-    if (!packed_words || packed_size == 0 || !word_offset || num_words == 0) return NULL;
-    struct gpu_device *d = &gpu_devs[dev_idx];
-    /* Device-level disable. See d->device_disabled doc. The gpujob worker
-     * for this device is also not spawned (see gpujob_init), so this
-     * early-return is a defensive last line of defense rather than the
-     * primary gate — but we keep it so the function is safe in isolation. */
-    if (d->device_disabled) return NULL;
-    if (d->gpu_n_rules <= 0 || !d->prog_md5_rules) {
-        fprintf(stderr, "OpenCL GPU[%d]: dispatch_md5_rules called before "
-                "set_rules (prog=%p, n_rules=%d)\n",
-                dev_idx, (void *)d->prog_md5_rules, d->gpu_n_rules);
-        return NULL;
-    }
-    /* Lazy kernel creation. Deferred from set_rules to here so the kernel
-     * object only exists once we have args to bind to it — avoids the
-     * NVIDIA-driver CL_INVALID_KERNEL_ARGS at process finalize when the
-     * dispatch path is never reached in this session. */
-    if (gpu_opencl_rules_kernel_lazy(d, dev_idx) < 0) return NULL;
-    /* B5 chokepoint widening (2026-05-04 sub-batch 1; 2026-05-05 sub-batch 2):
-     * the gate at mdxfind.c (around the gpu_rules_engine_active condition)
-     * now permits {MD5, MD4, SHA1, SHA224, SHA256, SHA384, SHA512, RMD160,
-     * RMD320}. The dispatch path picks the right per-op template kernel
-     * via gpu_template_resolve_kernel() at the swap site below.
-     *   - SHA384/SHA512: B5 sub-batch 1 (first 64-bit-state algos)
-     *   - RMD160/RMD320: B5 sub-batch 2 (LE-per-uint32, 5/10-word state) */
-    /* B7.9 (2026-05-07): JOB_MD5UC added here. B7.7a (2026-05-07) wired
-     * MD5UC into the host-side rules-engine admit list (mdxfind.c:10287)
-     * and the template resolver (case JOB_MD5UC at ~line 7500 above), but
-     * missed adding JOB_MD5UC to THIS dispatch-side admit list. Pre-B7.9
-     * the chokepoint pack masked the gap (MD5UC iter==1 is byte-equivalent
-     * to MD5; the packed kernel's hard-coded LC hex is wrong only for
-     * iter>1 inter-iter rebuild). With the chokepoint pack retired, MD5UC
-     * MUST be in this admit list or it silently produces zero cracks.
-     * The template kernel handles UC via params.algo_mode=1 (set at the
-     * algo_mode setter ~line 8400 below) — md5_to_hex_uc fires inter-iter,
-     * matching the CPU MDstart at mdxfind.c:25386 (prmd5UC vs prmd5). */
     if (op != JOB_MD5 && op != JOB_MD5UC && op != JOB_MD4 &&
         op != JOB_SHA1 && op != JOB_SHA224 && op != JOB_SHA256 &&
         op != JOB_SHA384 && op != JOB_SHA512 &&
@@ -14506,6 +14523,13 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
          * 128-bit length field). Host-side wiring is identical to the
          * other salted templates. */
         op != JOB_SHA512SALTPASS &&
+        /* e812 SHA384SALTPASS: same dispatch geometry as SHA512SALTPASS;
+         * the kernel-internal width differs only in HASH_WORDS (12 vs 16).
+         * Without this entry the dispatch returns NULL at the entry gate
+         * with "unsupported op=812" BEFORE gpu_template_resolve_kernel is
+         * ever called -- so no template compile is attempted, no KERNELINFO
+         * line is printed, and the run reports 0 hits and exit 0. */
+        op != JOB_SHA384SALTPASS &&
         /* B6.10 SHA512PASSSALT fan-out (2026-05-06): SHA512PASSSALT —
          * second 64-bit-state salted variant; APPEND-shape sibling of
          * SHA512SALTPASS. FINAL B6 ladder step. Same dispatch geometry;
@@ -14665,7 +14689,60 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
          * are NOT admitted here -- they remain CPU-only via gpu_op_-
          * category default fall-through. Phase 6 of the slab-retirement
          * ladder (final major slab kernel). */
-        op != JOB_BCRYPT) {
+        op != JOB_BCRYPT)
+        return 0;
+    return 1;
+}
+
+uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
+    const char *packed_words, uint32_t packed_size,
+    const uint32_t *word_offset, uint32_t num_words,
+    int op, int *nhits_out,
+    uint64_t mask_start, uint32_t mask_offset_per_word, uint32_t bf_num_masks,
+    uint32_t inner_iter,
+    int bf_fast_eligible)
+{
+    *nhits_out = 0;
+    if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
+    if (!packed_words || packed_size == 0 || !word_offset || num_words == 0) return NULL;
+    struct gpu_device *d = &gpu_devs[dev_idx];
+    /* Device-level disable. See d->device_disabled doc. The gpujob worker
+     * for this device is also not spawned (see gpujob_init), so this
+     * early-return is a defensive last line of defense rather than the
+     * primary gate — but we keep it so the function is safe in isolation. */
+    if (d->device_disabled) return NULL;
+    if (d->gpu_n_rules <= 0 || !d->prog_md5_rules) {
+        fprintf(stderr, "OpenCL GPU[%d]: dispatch_md5_rules called before "
+                "set_rules (prog=%p, n_rules=%d)\n",
+                dev_idx, (void *)d->prog_md5_rules, d->gpu_n_rules);
+        return NULL;
+    }
+    /* Lazy kernel creation. Deferred from set_rules to here so the kernel
+     * object only exists once we have args to bind to it — avoids the
+     * NVIDIA-driver CL_INVALID_KERNEL_ARGS at process finalize when the
+     * dispatch path is never reached in this session. */
+    if (gpu_opencl_rules_kernel_lazy(d, dev_idx) < 0) return NULL;
+    /* B5 chokepoint widening (2026-05-04 sub-batch 1; 2026-05-05 sub-batch 2):
+     * the gate at mdxfind.c (around the gpu_rules_engine_active condition)
+     * now permits {MD5, MD4, SHA1, SHA224, SHA256, SHA384, SHA512, RMD160,
+     * RMD320}. The dispatch path picks the right per-op template kernel
+     * via gpu_template_resolve_kernel() at the swap site below.
+     *   - SHA384/SHA512: B5 sub-batch 1 (first 64-bit-state algos)
+     *   - RMD160/RMD320: B5 sub-batch 2 (LE-per-uint32, 5/10-word state) */
+    /* B7.9 (2026-05-07): JOB_MD5UC added here. B7.7a (2026-05-07) wired
+     * MD5UC into the host-side rules-engine admit list (mdxfind.c:10287)
+     * and the template resolver (case JOB_MD5UC at ~line 7500 above), but
+     * missed adding JOB_MD5UC to THIS dispatch-side admit list. Pre-B7.9
+     * the chokepoint pack masked the gap (MD5UC iter==1 is byte-equivalent
+     * to MD5; the packed kernel's hard-coded LC hex is wrong only for
+     * iter>1 inter-iter rebuild). With the chokepoint pack retired, MD5UC
+     * MUST be in this admit list or it silently produces zero cracks.
+     * The template kernel handles UC via params.algo_mode=1 (set at the
+     * algo_mode setter ~line 8400 below) — md5_to_hex_uc fires inter-iter,
+     * matching the CPU MDstart at mdxfind.c:25386 (prmd5UC vs prmd5). */
+    /* Allowlist moved to gpu_opencl_op_supported() so the preflight in
+     * gpujob_opencl.c can consult the same truth before any word is packed. */
+    if (!gpu_opencl_op_supported(op)) {
         fprintf(stderr, "OpenCL GPU[%d]: dispatch_md5_rules: unsupported op=%d\n",
                 dev_idx, op);
         return NULL;
@@ -15108,6 +15185,15 @@ validator_skip:
                            * salt-pack — only the salt buffer is read by
                            * the kernel's template_finalize. */
                           op == JOB_SHA512SALTPASS ||
+                          /* e812 SHA384SALTPASS: same salt-pack geometry as
+                           * SHA512SALTPASS (1024-salt page cap, num_salts_-
+                           * per_page derivation, salt_start advance). The
+                           * HASH_WORDS=12 width difference is invisible to
+                           * host salt-pack. Without this entry num_salts /
+                           * num_salts_per_page / salt_start are packed with
+                           * the UNSALTED geometry (num_salts_per_page = 0)
+                           * and the kernel never reads the salt. */
+                          op == JOB_SHA384SALTPASS ||
                           /* B6.10 SHA512PASSSALT fan-out (2026-05-06):
                            * SHA512PASSSALT — second 64-bit-state salted
                            * variant; APPEND-shape sibling. FINAL B6
@@ -16121,48 +16207,33 @@ validator_skip:
             d->b_hashes_shown = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE,
                                                alloc_bytes, NULL, &err);
             if (err != CL_SUCCESS || !d->b_hashes_shown) {
-                fprintf(stderr,
-                    "OpenCL GPU[%d]: hashes_shown alloc failed (err=%d, %zu slots, %zuMB) - "
-                    "on-GPU dedup disabled, host dedup still active\n",
-                    dev_idx, err, need_slots, bytes / (1024*1024));
-                d->b_hashes_shown = NULL;
-                d->hashes_shown_count = 0;
-                return NULL;
+                /* Same shape as the zero-init failure below: this warned about
+                 * a degradation it did not perform, then returned NULL, which
+                 * abandons the dispatch and yields a clean exit 0 with no hits. */
+                GPU_FATAL("hashes_shown alloc failed dev=%d slots=%zu bytes=%zu err=%d",
+                          dev_idx, need_slots, alloc_bytes, err);
             }
             /* Zero-initialize the FULL allocation (including any min-size
              * tail). The buffer persists across dispatches; this runs
              * exactly once per session (or on grow, which shouldn't happen
              * since hash_data_count + overflow_count is fixed at load
              * time). */
-            uint32_t zero32 = 0;
-            if (p_clEnqueueFillBuffer) {
-                err = clEnqueueFillBuffer(d->queue, d->b_hashes_shown,
-                    &zero32, sizeof(zero32), 0, alloc_bytes, 0, NULL, NULL);
-            } else {
-                /* OpenCL 1.1 fallback: stage a zero buffer on host. */
-                uint8_t *zero_host = (uint8_t *)calloc(1, alloc_bytes);
-                if (zero_host) {
-                    err = clEnqueueWriteBuffer(d->queue, d->b_hashes_shown,
-                        CL_TRUE, 0, alloc_bytes, zero_host, 0, NULL, NULL);
-                    free(zero_host);
-                } else {
-                    err = -1;
-                }
-            }
+            err = gpu_zero_buffer(d->queue, d->b_hashes_shown, alloc_bytes);
             {
                 cl_int _e = clFinish(d->queue);
                 if (_e != CL_SUCCESS) GPU_FATAL("hashes_shown zero-init clFinish dev=%d alloc=%zu err=%d", dev_idx, alloc_bytes, _e);
             }
             clock_gettime(CLOCK_MONOTONIC, &_hs_t1);
             if (err != CL_SUCCESS) {
-                fprintf(stderr,
-                    "OpenCL GPU[%d]: hashes_shown zero-init failed (err=%d) - "
-                    "on-GPU dedup disabled, host dedup still active\n",
-                    dev_idx, err);
-                clReleaseMemObject(d->b_hashes_shown);
-                d->b_hashes_shown = NULL;
-                d->hashes_shown_count = 0;
-                return NULL;
+                /* Both the fill and the host-staged write failed. The old
+                 * code warned "on-GPU dedup disabled, host dedup still
+                 * active" and returned NULL -- but returning NULL abandons
+                 * the DISPATCH, so the caller saw no hits at all. The message
+                 * described a graceful degradation that was never implemented,
+                 * and the run looked clean while computing nothing. A GPU
+                 * operation that fails has to be loud. */
+                GPU_FATAL("hashes_shown zero-init failed (fill and host stage) "
+                          "dev=%d alloc=%zu err=%d", dev_idx, alloc_bytes, err);
             }
             d->hashes_shown_count = need_slots;
             if (_ht_trace_cached) {

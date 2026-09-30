@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.608 2026/09/29 13:44:20 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.611 2026/09/30 02:52:16 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.608 2026/09/29 13:44:20 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.611 2026/09/30 02:52:16 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,15 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.611  2026/09/30 02:52:16  dlr
+ * Say it and do it: the compact-table arm now actually disables the GPU. It printed GPU: compact table not ready, GPU disabled and set nothing, so gpu_opencl_available stayed true, the dispatch ran against a compact table that was never built, the kernel indexed buffers sized from a zero-entry table and faulted. NVIDIA reports a kernel fault at the next synchronising call, so it surfaced as CL_OUT_OF_RESOURCES on a clEnqueueReadBuffer in dispatch_md5_rules, far from the cause, with the async callback confirming CL_OUT_OF_RESOURCES executing CL_COMMAND_READ_BUFFER. The sibling arm six lines above does it properly through gpu_opencl_finalize_active_count, but that clears ocl_ready only when EVERY device failed to register a table, which is no help when the devices are healthy and the table is absent; there was no primitive for that case, which is likely why the message was left inert. Now calls gpu_opencl_disable, gated to OPENCL_GPU. Reached whenever no hashes load for the selected types, which an empty -f file and a file none of the selected types can parse both produce; the latter is how it was found, feeding e214 a user:hash file it could not read. Pre-existing rather than new: reproduces on installed 1.610 on both a Tesla M2070 and a GTX 1080, where mdxfind -m e1 -G 0 -f /dev/null wordlist dies and -G none completes cleanly. Both now exit 0 with None found. Regression on gp confirms the disable does NOT over-fire, which was the real risk: e1 wordlist 2, brute force 2, -n 2 gives 2, e214 1, e812 40, every one with the GPU still engaged and the disable message quiet. NOT addressed and flagged for someone with a Metal host: this arm is shared with Metal builds and the call is guarded to OpenCL, so a Metal build with an unbuilt compact table still has the old behaviour.
+ *
+ * Revision 1.610  2026/09/29 18:44:07  dlr
+ * Honour the brute-force GPU mask ineligibility that was detected and then ignored. When the BF append mask cannot be uploaded, the check at the upload site printed BF job will run on CPU only and set a LOCAL named bf_ok whose only remaining use gated the upload itself. The decision was never recorded anywhere, and the dispatch gate forty lines later tested just gpujob_available and gpu_op_category. So the GPU received the job WITHOUT its mask tables, hashed the entire keyspace, matched nothing, and the CPU never re-ran it: a complete run, exit 0, None found. The message told the truth about the problem and a falsehood about the remedy. Reported by Waffle on fpga with a GTX 1080: echo bb0d2e115d8d286af63545277845b563 piped to mdxfind with mask d1d89ac209ece9cbc7c5d5680de051a4 followed by two ?b positions finds HEX 6431...164f under -G none and loses it with the GPU enabled, both runs reporting the same 65,536 hash calculations, which is the tell that the work happened once and on the wrong engine. New file-scope BfMaskGpuUsable, set from bf_ok and bf_napp at the upload site and required by the dispatch gate. Falling through then reaches the legacy single-job arm, which the source already documents as the CPU-only path with no GPU dispatch. It defaults to 1 and only the brute-force setup clears it, so wordlist and -n/-N runs, whose masks travel a different path, are untouched. NOT changed, and worth recording because it looks wrong and is not: the cap test compares MaskAppendLen, which counts literals as well as placeholders, against MAX_MASK_POS_GPU_SIDE of 16. That reads like a total measured against the placeholder budget, but this upload packs ONE table slot per position with literals as degenerate one-character tables, so bf_mask_sizes and bf_mask_tables bound the mask by their array size and a 34-position mask genuinely does not fit. The decoupled 224-byte literal budget belongs to the A2/A3 descriptor format, not to this path. Widening the cap toward the 32-slot array bound is a separate change needing kernel-side validation. Verified on fpga: the reported mask now returns the same plaintext and the same 65,536 count as -G none; a GPU-eligible short mask still dispatches to the GPU at 2 of 2 with the CPU oracle agreeing; -n 2 at 2, -N 2 at 1 and a plain wordlist at 2 are identical before and after.
+ *
+ * Revision 1.609  2026/09/29 18:06:29  dlr
+ * Record the silent GPU zero-hit failure at the OpenCL init site, and carry the revision for gpu_opencl.c 1.221. No functional change in this file. The fix itself is in gpu_opencl.c: NVIDIA OpenCL 1.2 on Fermi rejects clEnqueueFillBuffer with CL_INVALID_OPERATION although the symbol resolves, and the hashes_shown zero-init had no fallback when the call failed, so it warned about a degradation it did not perform and returned NULL, abandoning the dispatch. A Tesla M2070 on gp hashed 400,002 words, reported 0 hits and exited 0, where the same binary on an fpga GTX 1080 found both planted targets. create_min_buf had carried the host-stage fallback for this class since the 1.1-era drivers; the dispatch site did not. gpu_opencl.c 1.221 adds gpu_zero_buffer, which tries the fill and falls back to a host-staged write, and turns both silent NULL exits into GPU_FATAL. Verified after the fix on gp: wordlist 0 hits to 2 hits, and brute force, -n 2 and -N 2 each find their planted targets with no warnings; fpga is byte-identical before and after. The note added here points a future reader at the class rather than at the kernel arithmetic, which is where the suspicion naturally falls. Worth recording for host selection: on gp the card earns its keep for keyspace work only. A 26^6 mask runs 5.7 seconds on the GPU against 84.0 on the CPU at a 271 Mh/s kernel rate and 100 percent busy, because candidates are generated on device and nothing crosses PCIe, while the same card on a wordlist sits 82 percent idle and loses to the CPU by roughly four times. Kernel rate against the GTX 1080 on an identical keyspace is 0.258 against 1.687 Gh/s.
+ *
  * Revision 1.608  2026/09/29 13:44:20  dlr
  * Add three hash types, e1051 through e1053. e1051 MD5MD5RAWMD5PASS is md5(md5_bin(md5(pass) . pass)) and e1052 MD5MD5RAWMD5 is md5(md5_bin(md5(pass))): the inner digest is consumed as HEX and the outer md5 is fed the RAW sixteen bytes, which is what separates them from the hex-chained forms already in the catalog. Named from the existing convention where a RAW component marks the bin step and a trailing PASS marks the concatenation, matching e243 MD5BASE64MD5RAWMD5 and e123 MD5MD5PASS. e1053 MD5SHA1SHA1MD5MD5 is md5(sha1(sha1(md5(md5(pass))))). It is exactly one inner md5 more than the existing JOB_MD5SHA1SHA1MD5, so the new case adds that md5 and falls through to the established tail rather than restating the whole chain; e299 and e300 were re-verified against independent computation afterwards to confirm the fall-through order was not disturbed. All three cleared the catalog dedup gate before a number was assigned. Every vector was supplied externally and reproduced with an independent implementation rather than by this code, and for e1053 all sixteen hex-versus-binary permutations of the four inner steps were computed to confirm the reading is unique. Types[] entries appended at 1051, 1052 and 1053 so the positional indices stay identical to hashpipe.c, verified on both sides.
  *
@@ -10568,6 +10577,23 @@ _Atomic uint64_t bf_dev_chunk_total[BF_MAX_GPU_SLOTS];
  * dispatches. Cleared at op start alongside other servo state. */
 _Atomic int bf_dev_first_dispatch_done[BF_MAX_GPU_SLOTS];
 /* BF servo: per-op state, reset at each op start in main BF activation arm */
+/* Brute-force GPU mask eligibility. Cleared when the BF append mask cannot be
+ * uploaded: that upload packs ONE table slot per position -- literals become
+ * degenerate 1-char tables -- so bf_mask_sizes/bf_mask_tables bound the mask
+ * by their array size, not by the A2/A3 literal-byte budget.
+ *
+ * It exists because the check that detects this printed "BF job will run on
+ * CPU only" and then did NOT route to the CPU. The decision lived in a local
+ * gating only the upload, while the dispatch gate consulted just
+ * gpujob_available() and gpu_op_category(). The GPU ran the job WITHOUT its
+ * mask tables, hashed the whole keyspace, matched nothing, and the CPU never
+ * re-ran it: a complete run, exit 0, None found. Reported on fpga with a GTX
+ * 1080, mask d1d89ac209ece9cbc7c5d5680de051a4?b?b, which finds its answer
+ * under -G none and loses it with the GPU enabled.
+ *
+ * Defaults to 1; only the brute-force setup clears it, so wordlist and -n/-N
+ * mask runs, whose masks travel a different path, are unaffected. */
+static int BfMaskGpuUsable = 1;
 static uint64_t bf_rate_ema = 1000000000ull;   /* initial 1 GH/s seed */
 static uint32_t bf_chunks_produced = 0;
 static _Atomic int bf_first_feedback_seen = 0;
@@ -45667,6 +45693,17 @@ void build_compact_table(void) {
      * subsequent gpu_kernel_cache_* calls become no-ops, gpu_opencl_init()
      * proceeds to JIT every kernel from source as before. */
     gpu_kernel_cache_init(mdxfind_rev_string());
+    /* A device that enumerates and initialises is not thereby known to
+     * COMPUTE. NVIDIA's OpenCL 1.2 on Fermi rejects clEnqueueFillBuffer
+     * with CL_INVALID_OPERATION although the symbol resolves, and until
+     * gpu_opencl.c 1.221 that failure abandoned the dispatch and returned
+     * no hits at all: a full run over the wordlist, exit 0, None found.
+     * A Tesla M2070 hashed 400,002 words and reported 0 hits where the
+     * same binary on a GTX 1080 found both planted targets.
+     *
+     * So if a GPU path ever reports hashes computed but zero hits where
+     * -G none finds them, suspect a silently-failing device call before
+     * suspecting the kernel arithmetic. */
     gpu_ok = gpu_opencl_init();
 #endif
     if (gpu_ok == 0 && CompactFP && HashDataBuf && HashDataOff && HashDataLen && CompactSize > 0) {
@@ -45708,7 +45745,16 @@ void build_compact_table(void) {
       }
 #endif
     } else if (gpu_ok == 0) {
+      /* Say it AND do it. This arm printed "GPU disabled" and set nothing, so
+       * gpu_opencl_available() stayed true and the dispatch ran against a
+       * compact table that was never built -- the kernel faulted and NVIDIA
+       * surfaced it as CL_OUT_OF_RESOURCES on a later clEnqueueReadBuffer.
+       * Reached whenever no hashes load for the selected types, which an empty
+       * -f file or a wholly unparseable one both produce. */
       fprintf(stderr, "GPU: compact table not ready, GPU disabled\n");
+      #if defined(OPENCL_GPU)
+      gpu_opencl_disable("compact table not built (no hashes loaded for the selected types)");
+      #endif
     }
 #if defined(OPENCL_GPU)
     /* hx codegen sub-phase 2a.1 (2026-05-21): harness mode. When the
@@ -59601,6 +59647,7 @@ usage:
               bf_napp++;
             } else { bf_ok = 0; break; }
           }
+          BfMaskGpuUsable = (bf_ok && bf_napp > 0) ? 1 : 0;
           if (bf_ok && bf_napp > 0) {
 #if defined(OPENCL_GPU)
             gpu_opencl_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp);
@@ -59652,7 +59699,10 @@ usage:
               int use_bf_chunks = 0;
               int num_devs_v = 1;  /* restored: deleted in rev 1.477, re-added 1.481 */
 #if defined(OPENCL_GPU)
-              if (gpujob_available() &&
+              /* BfMaskGpuUsable: a BF mask the GPU could not be given must not be
+               * dispatched to it. Falling through to the legacy arm below is the
+               * documented CPU-only path. */
+              if (gpujob_available() && BfMaskGpuUsable &&
                   gpu_op_category(x) == GPU_CAT_MASK) {
                 num_devs_v = gpu_opencl_num_devices();
                 if (num_devs_v < 1) num_devs_v = 1;
