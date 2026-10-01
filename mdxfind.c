@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.611 2026/09/30 02:52:16 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.612 2026/10/01 10:18:48 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.611 2026/09/30 02:52:16 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.612 2026/10/01 10:18:48 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.612  2026/10/01 10:18:48  dlr
+ * Add three hash types from the Enzoic survey, all past the catalog dedup gate before a number was assigned. e1054 SHA256MD5PASSSALT is sha256(md5(pass . salt)) with the inner md5 consumed as 32 hex characters; the raw-byte inner is a different digest and would need its own type. e1055 WATTPAD is hmac_sha256(key, sha1(salt) . pass) with the fixed published key hardcoded, so the channel wire format hash:salt:pass verifies as posted with no external key. Two encodings the vendor documentation does not state, both measured against 15 real records: the key is the 64-character hex TEXT rather than the 32 bytes it spells, and sha1(salt) enters the message as 40-character hex TEXT rather than 20 raw bytes. Either read the other way gives a different digest. e1056 HMAC-SHA256-SHA1SALTPASS is the general form with the key supplied as salt2 instead of hardcoded; Typesalt holds salt:key and the record is hash:salt:key:pass, keeping the line self-contained so a site-wide key travels as a salt of cardinality one rather than as an out-of-band pepper. Every vector was reproduced against an independent oracle rather than against this code, and the Wattpad construction was confirmed on a real channel record as well as the synthetic vector. Negative controls reject a wrong password on all three.
+ *
  * Revision 1.611  2026/09/30 02:52:16  dlr
  * Say it and do it: the compact-table arm now actually disables the GPU. It printed GPU: compact table not ready, GPU disabled and set nothing, so gpu_opencl_available stayed true, the dispatch ran against a compact table that was never built, the kernel indexed buffers sized from a zero-entry table and faulted. NVIDIA reports a kernel fault at the next synchronising call, so it surfaced as CL_OUT_OF_RESOURCES on a clEnqueueReadBuffer in dispatch_md5_rules, far from the cause, with the async callback confirming CL_OUT_OF_RESOURCES executing CL_COMMAND_READ_BUFFER. The sibling arm six lines above does it properly through gpu_opencl_finalize_active_count, but that clears ocl_ready only when EVERY device failed to register a table, which is no help when the devices are healthy and the table is absent; there was no primitive for that case, which is likely why the message was left inert. Now calls gpu_opencl_disable, gated to OPENCL_GPU. Reached whenever no hashes load for the selected types, which an empty -f file and a file none of the selected types can parse both produce; the latter is how it was found, feeding e214 a user:hash file it could not read. Pre-existing rather than new: reproduces on installed 1.610 on both a Tesla M2070 and a GTX 1080, where mdxfind -m e1 -G 0 -f /dev/null wordlist dies and -G none completes cleanly. Both now exit 0 with None found. Regression on gp confirms the disable does NOT over-fire, which was the real risk: e1 wordlist 2, brute force 2, -n 2 gives 2, e214 1, e812 40, every one with the GPU still engaged and the disable message quiet. NOT addressed and flagged for someone with a Metal host: this arm is shared with Metal builds and the call is guarded to OpenCL, so a Metal build with an unbuilt compact table still has the old behaviour.
  *
@@ -7843,6 +7846,9 @@ char *Types[] = {
     "MD5MD5RAWMD5PASS",
     "MD5MD5RAWMD5",
     "MD5SHA1SHA1MD5MD5",
+    "SHA256MD5PASSSALT",
+    "WATTPAD",
+    "HMAC-SHA256-SHA1SALTPASS",
 
 NULL
 
@@ -8931,6 +8937,9 @@ NULL
 #define JOB_MD5MD5RAWMD5PASS 1051
 #define JOB_MD5MD5RAWMD5 1052
 #define JOB_MD5SHA1SHA1MD5MD5 1053
+#define JOB_SHA256MD5PASSSALT 1054
+#define JOB_WATTPAD 1055
+#define JOB_HMAC_SHA256_SHA1SALTPASS 1056
 
 #define JOB_DONE 2000
 
@@ -10082,6 +10091,9 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [1051] = TYPEOPT_NEEDSF,  /* MD5MD5RAWMD5PASS */
     [1052] = TYPEOPT_NEEDSF,  /* MD5MD5RAWMD5 */
     [1053] = TYPEOPT_NEEDSF,  /* MD5SHA1SHA1MD5MD5 */
+    [1054] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* SHA256MD5PASSSALT */
+    [1055] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* WATTPAD -- key hardcoded */
+    [1056] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* HMAC-SHA256-SHA1SALTPASS -- salt holds "salt:key" */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -34133,6 +34145,116 @@ sha1sha256:
                 }
                 break;
 
+
+              case JOB_SHA256MD5PASSSALT:
+                /* sha256(md5(pass . salt)) -- Enzoic 18.  The INNER md5 is 32 lowercase
+                 * HEX characters, not the 16 raw bytes it spells: a raw inner gives a
+                 * different digest and would have to be a separate type.  Verified
+                 * against an independent oracle rather than against this code. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                fastcopy(linebuf, cur, len);
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                  for (si = 0; si < nsalts_job; si++) {
+                    saltlen = saltsnap[si].saltlen;
+                    s1 = saltsnap[si].salt;
+                    memmove(linebuf + len, s1, saltlen);
+                    mymd5(linebuf, len + saltlen, curin.h);
+                    mysha256(prmd5(curin.h, mdbuf, 32), 32, curin.h);
+                    hashcnt++;
+                    checkhashsalt(&curin, 64, s1, saltlen, 1, job);
+                  }
+                }
+                break;
+
+              case JOB_WATTPAD:
+                /* hmac_sha256(KEY, sha1(salt) . pass) -- Enzoic 36, Wattpad.  TWO
+                 * encoding details the vendor documentation does not state, both
+                 * measured against 15 real records:
+                 *   - the KEY is the 64-character hex TEXT, not the 32 raw bytes;
+                 *   - sha1(salt) enters the message as 40-character hex TEXT, not
+                 *     20 raw bytes.
+                 * Either read the other way gives a different digest.  The key is a
+                 * fixed published global constant, so it is hardcoded and the channel
+                 * wire format <hash>:<salt>:<pass> verifies as posted with no external
+                 * key.  Where the key varies, use e1056. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                  static const char wp_key[] =
+                    "d2e1a4c569e7018cc142e9cce755a964bd9b193d2d31f02d80bb589c959afd7e";
+                  for (si = 0; si < nsalts_job; si++) {
+                    MHASH td;
+                    saltlen = saltsnap[si].saltlen;
+                    s1 = saltsnap[si].salt;
+                    mysha1(s1, saltlen, md5buf.h);
+                    prmd5(md5buf.h, linebuf, 40);
+                    fastcopy(linebuf + 40, cur, len);
+                    td = mhash_hmac_init(MHASH_SHA256, (void *)wp_key, sizeof(wp_key) - 1,
+                                         mhash_get_hash_pblock(MHASH_SHA256));
+                    mhash(td, linebuf, 40 + len);
+                    mhash_hmac_deinit(td, curin.h);
+                    hashcnt++;
+                    checkhashsalt(&curin, 64, s1, saltlen, 1, job);
+                  }
+                }
+                break;
+
+              case JOB_HMAC_SHA256_SHA1SALTPASS:
+                /* hmac_sha256(salt2, sha1(salt) . pass) -- the general form of e1055
+                 * with the key supplied rather than hardcoded.  Typesalt holds
+                 * "salt:key" and the record is written <hash>:<salt>:<key>:<pass>, so
+                 * the line stays self-contained and mdxfind | hashpipe works with no
+                 * out-of-band key.  Same two text encodings as e1055. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                  for (si = 0; si < nsalts_job; si++) {
+                    MHASH td;
+                    char *combined = saltsnap[si].salt;
+                    int combinedlen = saltsnap[si].saltlen;
+                    char *colon = memchr(combined, ':', combinedlen);
+                    if (!colon) {
+                      *saltsnap[si].PV = 0;
+                      saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      continue;
+                    }
+                    saltlen = colon - combined;
+                    peplen = combinedlen - saltlen - 1;
+                    p1 = colon + 1;
+                    mysha1(combined, saltlen, md5buf.h);
+                    prmd5(md5buf.h, linebuf, 40);
+                    fastcopy(linebuf + 40, cur, len);
+                    td = mhash_hmac_init(MHASH_SHA256, p1, peplen,
+                                         mhash_get_hash_pblock(MHASH_SHA256));
+                    mhash(td, linebuf, 40 + len);
+                    mhash_hmac_deinit(td, curin.h);
+                    hashcnt++;
+                    checkhashsalt2(&curin, 64, combined, saltlen, p1, peplen, 0, job);
+                  }
+                }
+                break;
 
               case JOB_SHA256PASSSALT:
               sha256passsalt_start:
