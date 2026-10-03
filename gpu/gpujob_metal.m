@@ -230,6 +230,8 @@ extern int checkhashsalt(union HashU *curin, int len, char *salt,
                          int saltlen, int x, struct job *job);
 extern int checkhashkey(union HashU *curin, int len, char *salt,
                         struct job *job);
+extern int checkhashkeylen(union HashU *curin, int len, char *key,
+    int keylen, struct job *job);
 /* Phase 2d.8a hit-replay externs:
  *   - checkhashbb: PHPBB3 (JOB_PHPBB3) -- bb-specific 32-hex output with
  *     phpitoa64-encoded 22-char hash + salt prefix. Mirrors
@@ -2340,8 +2342,8 @@ static void gpujob_metal_worker(void *arg) {
                     if (is_salted_op) {
                         int hit = 0;
                         if (g->op == JOB_MD5SALT && iter_num == 1) {
-                            hit = checkhashkey(&curin, hexlen,
-                                               salt_bytes,
+                            hit = checkhashkeylen(&curin, hexlen,
+                                               salt_bytes, salt_len_b,
                                                &synthetic_job);
                         } else if (g->op == JOB_HMAC_BLAKE2S ||
                                    g->op == JOB_HMAC_STREEBOG256_KSALT ||

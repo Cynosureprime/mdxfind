@@ -115,6 +115,8 @@ extern _Atomic uint64_t bf_dev_chunk_total[];
 extern _Atomic int bf_dev_first_dispatch_done[];
 extern int checkhash(union HashU *curin, int len, int x, struct job *job);
 extern int checkhashkey(union HashU *curin, int len, char *key, struct job *job);
+extern int checkhashkeylen(union HashU *curin, int len, char *key,
+    int keylen, struct job *job);
 extern int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job);
 extern int build_salt_snapshot(void *snap, char *pool,
                 void *judy, char *keybuf, int printall);
@@ -2675,8 +2677,8 @@ void gpujob(void *arg) {
                             if (g->op == JOB_MD5SALT && iter_num == 1) {
                                 /* iter==1 CPU path uses checkhashkey
                                  * (no iter suffix in label). */
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             /* Family A (2026-05-07): HMAC-MD5 routing.
                              *   KSALT (e214): mdxfind.c:29386 uses
@@ -2693,8 +2695,8 @@ void gpujob(void *arg) {
                              * convention exactly: KSALT -> checkhashkey;
                              * KPASS -> checkhashsalt with iter=0. */
                             } else if (g->op == JOB_HMAC_MD5) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_MD5_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2714,8 +2716,8 @@ void gpujob(void *arg) {
                              * max_iter forced to 1 host-side. Mirror
                              * Family A label-convention exactly. */
                             } else if (g->op == JOB_HMAC_SHA1) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_SHA1_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2737,8 +2739,8 @@ void gpujob(void *arg) {
                              * max_iter forced to 1 host-side. Mirrors
                              * Families A and B label-convention. */
                             } else if (g->op == JOB_HMAC_SHA224) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_SHA224_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2762,8 +2764,8 @@ void gpujob(void *arg) {
                              * family in the ladder; HMAC ladder COMPLETE
                              * 21/21 algos shipped. */
                             } else if (g->op == JOB_HMAC_SHA256) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_SHA256_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2785,8 +2787,8 @@ void gpujob(void *arg) {
                              * max_iter forced to 1 host-side. Mirrors
                              * Families A/B/C label-convention. */
                             } else if (g->op == JOB_HMAC_SHA384) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_SHA384_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2808,8 +2810,8 @@ void gpujob(void *arg) {
                              * max_iter forced to 1 host-side. Mirrors
                              * Families A/B/C/E label-convention. */
                             } else if (g->op == JOB_HMAC_SHA512) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_SHA512_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2831,8 +2833,8 @@ void gpujob(void *arg) {
                              * max_iter forced to 1 host-side. Mirrors
                              * Families A/B/C/E/F label-convention. */
                             } else if (g->op == JOB_HMAC_RMD160) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_RMD160_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,
@@ -2854,8 +2856,8 @@ void gpujob(void *arg) {
                              * max_iter forced to 1 host-side. Mirrors
                              * Families A/B/C/E/F/G label-convention. */
                             } else if (g->op == JOB_HMAC_RMD320) {
-                                hit = checkhashkey(&curin, hexlen,
-                                                   salt_bytes,
+                                hit = checkhashkeylen(&curin, hexlen,
+                                                   salt_bytes, salt_len_b,
                                                    &synthetic_job);
                             } else if (g->op == JOB_HMAC_RMD320_KPASS) {
                                 hit = checkhashsalt(&curin, hexlen,

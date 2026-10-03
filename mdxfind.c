@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.612 2026/10/01 10:18:48 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.614 2026/10/02 20:06:00 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.612 2026/10/01 10:18:48 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.614 2026/10/02 20:06:00 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.614  2026/10/02 20:06:00  dlr
+ * Add e1057 MD5SQL5MD5MD5 and e1058 MD5SQL5MD5MD5MD5, authored by Waffle and verified here before check-in. Both extend the existing e301 MD5SQL5MD5 cascade by one and two further inner md5 rounds, implemented as a deliberate fall-through into the shared JOB_MD5SQL5 tail so the construction is expressed once: each case takes one md5 and hands on its 32 hex characters, and the tail does sha1, sha1 of the raw digest, then the star and the uppercase forty hex characters that SQL5 is, before MDstart applies the outer md5. Reading outer to inner, e1057 is md5(sql5(md5(md5(pass)))) and e1058 is md5(sql5(md5(md5(md5(pass))))). Types[] appended in order so the positional indices are 1057 and 1058, confirmed by resolving both names from the binary; Typeopt carries TYPEOPT_NEEDSF as they are unsalted. Review notes: the change is strictly additive, no existing entry is touched, and both expressions passed the catalog dedup gate against 1054 entries before the numbers were used. Verified against an oracle written from hx.8 rather than from this code, with the oracle first validated on the existing e301 vector so a wrong oracle could not agree by construction: e1057 is f0a69a566cc9e96a6eedbf732064d193 and e1058 is 2a29278666f9e44b424c6ade970cc820 for password123, both crack here, both round-trip through hashpipe -c, and a wrong password matches neither.
+ *
+ * Revision 1.613  2026/10/02 06:01:29  dlr
+ * Stop truncating a NUL-bearing salt in the printed result line. The salt field was formatted by a C-string scan, for (j = 0; key[j]; j++), so a salt containing 0x00 was cut at the first one and a salt STARTING with 0x00 never entered the loop and printed as an empty field, emitting a salted record in a form that reads as unsalted. The hashing was always correct and the cracks were genuine; only the printed record was wrong, it did not round-trip through hashpipe, and nothing diagnosed it. Reported by Waffle on real vBulletin data, hashcat 2611, whose three-byte salts contain NULs: MD5SALT 0012b38417864db625c156a6108dc9f9::234paint, true salt 00 c7 37. New fmt_saltfield does the formatting once with an explicit length, scanning exactly klen bytes and copying klen bytes in the printable case rather than returning the caller buffer, since that buffer can hold bytes past the salt. The printable test itself needed no change: (signed char)(c+1) < 33 is already true for 0x00, for 0x7f and for every high byte, so only the bounds were wrong. checkhashkey is split into a C-string wrapper, kept for the callers whose key genuinely is one such as a hex digest or a userid, and checkhashkeylen which takes the length; checkhashwerkzeug gains the length directly as it has one caller. Sixteen call sites converted to pass the stored length: nine SSE batch sites paired with their existing slen, slen2 and slen4 arrays, and seven snapshot sites where saltlen already came from saltsnap and was already used for the hash. Verified on the five-salt reproduction with the NUL in every position: all five now print the salt they were given and all five round-trip through hashpipe -c, where previously three of five were wrong. No regression: printable and high-byte salts are byte-identical to 1.612, and e385 SHA1SALTPASS is unchanged because it routes through the length-aware checkhashsalt and was never affected. NOT fixed and deeper than the formatter, flagged for a follow-up: the MD5DSALT group assembles its output salt with strncpy into tsalt and then measures it with mystrlen, so the data is truncated before any emitter sees it, and that block carries no length array to pass. Twenty-two further length-less checkhashkey sites remain, whose keys are userids or hex digests and so are genuinely C strings; they are unchanged by design rather than overlooked.
+ *
  * Revision 1.612  2026/10/01 10:18:48  dlr
  * Add three hash types from the Enzoic survey, all past the catalog dedup gate before a number was assigned. e1054 SHA256MD5PASSSALT is sha256(md5(pass . salt)) with the inner md5 consumed as 32 hex characters; the raw-byte inner is a different digest and would need its own type. e1055 WATTPAD is hmac_sha256(key, sha1(salt) . pass) with the fixed published key hardcoded, so the channel wire format hash:salt:pass verifies as posted with no external key. Two encodings the vendor documentation does not state, both measured against 15 real records: the key is the 64-character hex TEXT rather than the 32 bytes it spells, and sha1(salt) enters the message as 40-character hex TEXT rather than 20 raw bytes. Either read the other way gives a different digest. e1056 HMAC-SHA256-SHA1SALTPASS is the general form with the key supplied as salt2 instead of hardcoded; Typesalt holds salt:key and the record is hash:salt:key:pass, keeping the line self-contained so a site-wide key travels as a salt of cardinality one rather than as an out-of-band pepper. Every vector was reproduced against an independent oracle rather than against this code, and the Wattpad construction was confirmed on a real channel record as well as the synthetic vector. Negative controls reject a wrong password on all three.
  *
@@ -7849,6 +7855,8 @@ char *Types[] = {
     "SHA256MD5PASSSALT",
     "WATTPAD",
     "HMAC-SHA256-SHA1SALTPASS",
+    "MD5SQL5MD5MD5",
+    "MD5SQL5MD5MD5MD5",
 
 NULL
 
@@ -8940,6 +8948,8 @@ NULL
 #define JOB_SHA256MD5PASSSALT 1054
 #define JOB_WATTPAD 1055
 #define JOB_HMAC_SHA256_SHA1SALTPASS 1056
+#define JOB_MD5SQL5MD5MD5 1057
+#define JOB_MD5SQL5MD5MD5MD5 1058
 
 #define JOB_DONE 2000
 
@@ -10094,6 +10104,8 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [1054] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* SHA256MD5PASSSALT */
     [1055] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* WATTPAD -- key hardcoded */
     [1056] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* HMAC-SHA256-SHA1SALTPASS -- salt holds "salt:key" */
+    [1057] = TYPEOPT_NEEDSF,  /* MD5SQL5MD5MD5 */
+    [1058] = TYPEOPT_NEEDSF,  /* MD5SQL5MD5MD5MD5 */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -11340,7 +11352,55 @@ int hybrid_check(const unsigned char *hashbytes, int len,
 }
 
 
+int checkhashkeylen(union HashU *curin, int len, char *key, int keylen, struct job *job);
+
+/* Format a salt/key into buf for the salt field of a result line: printable
+ * bytes verbatim, anything else $HEX[]-wrapped.
+ *
+ * Takes an explicit klen because a salt is BINARY DATA with a length, not a C
+ * string. The scan this replaced was `for (j = 0; key[j]; j++)`, which cuts a
+ * NUL-bearing salt at the first 0x00 and, when the salt STARTS with one, never
+ * enters the loop at all and emits an empty field -- so a salted record was
+ * printed in a form that reads as unsalted and no longer round-trips through
+ * hashpipe. The hashing was always correct; only the printed record was wrong,
+ * and nothing diagnosed it. Found on real vBulletin (hashcat 2611) data whose
+ * 3-byte salts contain NULs.
+ *
+ * The printable test itself was already right: (signed char)(c+1) < '!' is true
+ * for 0x00, for 0x7f and for every high byte, so only the bounds needed fixing.
+ * buf needs 5 + 2*klen + 2 bytes. */
+static char *fmt_saltfield(char *buf, const char *key, int klen)
+{
+  static const char lc[] = "0123456789abcdef";
+  int j, clean = 1;
+  if (klen < 0) klen = 0;
+  for (j = 0; j < klen; j++)
+    if ((signed char) (key[j] + 1) < '!') { clean = 0; break; }
+  if (clean) {
+    /* Copy exactly klen bytes rather than returning key: the caller's buffer
+     * may hold trailing bytes past the salt, and %s would print them. */
+    memcpy(buf, key, (size_t)klen);
+    buf[klen] = 0;
+    return buf;
+  }
+  memcpy(buf, "$HEX[", 5);
+  for (j = 0; j < klen; j++) {
+    buf[5 + 2 * j]     = lc[(key[j] >> 4) & 15];
+    buf[5 + 2 * j + 1] = lc[key[j] & 15];
+  }
+  buf[5 + 2 * klen]     = ']';
+  buf[5 + 2 * klen + 1] = 0;
+  return buf;
+}
+
+/* C-string wrapper, for callers whose key genuinely is one (a hex digest, a
+ * userid). A caller holding a BINARY salt must use checkhashkeylen and pass
+ * the stored length, or a NUL in the salt truncates the printed field. */
 int checkhashkey(union HashU *curin, int len, char *key, struct job *job) {
+  return checkhashkeylen(curin, len, key, mystrlen(key), job);
+}
+
+int checkhashkeylen(union HashU *curin, int len, char *key, int keylen, struct job *job) {
   unsigned char *t;
   int i, j, offset, rotval, dohex;
   char newbuf[513], rotbuf[513];
@@ -11383,17 +11443,7 @@ struct Hashchain found;
           if (hfound && *match_flags != (unsigned short)job->op) {
             hitcount++;
             *match_flags = job->op;
-            for (j = 0; key[j]; j++) {
-              if ((signed char) (key[j]+1) < '!') {
-                strcpy(keybuf, "$HEX[");
-                for (j = 0; key[j]; j++)
-                  sprintf(&keybuf[2 * j + 5], "%02x", key[j] & 0xff);
-                keybuf[2 * j + 5] = ']';
-                keybuf[2 * j + 6] = 0;
-                key = keybuf;
-                break;
-              }
-            }
+            key = fmt_saltfield(keybuf, key, keylen);
             job->pass[job->clen] = 0;
             for (dohex = j = 0; j < job->clen; j++) {
               if ((signed char) (job->pass[j]+1) < '!' || job->pass[j] ==':') {
@@ -11458,17 +11508,7 @@ release(FreeWaiting);
       if (hfound && *match_flags != (unsigned short)job->op) {
         hitcount++;
         *match_flags = job->op;
-        for (j = 0; key[j]; j++) {
-          if ((signed char) (key[j]+1) < '!') {
-            strcpy(keybuf, "$HEX[");
-            for (j = 0; key[j]; j++)
-              sprintf(&keybuf[2 * j + 5], "%02x", key[j] & 0xff);
-            keybuf[2 * j + 5] = ']';
-            keybuf[2 * j + 6] = 0;
-            key = keybuf;
-            break;
-          }
-        }
+        key = fmt_saltfield(keybuf, key, keylen);
         switch (job->op) {
           case JOB_APACHE_SHA:
           case JOB_APACHE_SHA_TRUNC16:
@@ -11527,7 +11567,8 @@ release(FreeWaiting);
 }
 
 /* checkhashwerkzeug: output as prefix$key$hexhash:pass (Werkzeug format) */
-int checkhashwerkzeug(union HashU *curin, int len, char *key, const char *prefix, struct job *job) {
+int checkhashwerkzeug(union HashU *curin, int len, char *key, int keylen,
+    const char *prefix, struct job *job) {
   int match_len, j, dohex;
   unsigned short *match_flags;
   char newbuf[513], keybuf[MAXLINE * 2];
@@ -11543,18 +11584,8 @@ int checkhashwerkzeug(union HashU *curin, int len, char *key, const char *prefix
   if (!hfound || *match_flags == (unsigned short)job->op)
     return 0;
   *match_flags = job->op;
-  /* hex-encode key if it contains unprintable chars */
-  for (j = 0; key[j]; j++) {
-    if ((signed char) (key[j]+1) < '!') {
-      strcpy(keybuf, "$HEX[");
-      for (j = 0; key[j]; j++)
-        sprintf(&keybuf[2 * j + 5], "%02x", key[j] & 0xff);
-      keybuf[2 * j + 5] = ']';
-      keybuf[2 * j + 6] = 0;
-      key = keybuf;
-      break;
-    }
-  }
+  /* Binary salt: scan keylen bytes, not to the first NUL. */
+  key = fmt_saltfield(keybuf, key, keylen);
   prmd5(curin->h, newbuf, match_len * 2);
   job->pass[job->clen] = 0;
   for (dohex = j = 0; j < job->clen; j++) {
@@ -19222,7 +19253,7 @@ sha512salt_s:
                     mysha1((char *)linebuf, saltlen + len + 50, curin.h);
                   }
                   hashcnt += 10;
-                  if (checkhashkey(&curin, 40, s1, job)) {
+                  if (checkhashkeylen(&curin, 40, s1, saltlen, job)) {
                     PV_DEC(saltsnap[si].PV);
                     if (!Printall && *saltsnap[si].PV == 0) {
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -20658,7 +20689,7 @@ md4utf16:
                 prmd5(mdcur[0].h, linebuf+32, 40);
                 mymd5(linebuf,40+32,curin.h);
                 hashcnt += Maxiter;
-                if (checkhashkey(&curin, 32, s1,job)) {
+                if (checkhashkeylen(&curin, 32, s1, saltlen,job)) {
                   PV_DEC(saltsnap[si].PV);
                   if (!Printall && *saltsnap[si].PV == 0) {
                     saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -28028,7 +28059,7 @@ sha11saltmd5:
                   fastcopy(d,s1,saltlen);
                   mymd5(mdbuf,len+saltlen,curin.h);
                   y = 32;
-                  if (checkhashkey(&curin, y, s1 ,job)) {
+                  if (checkhashkeylen(&curin, y, s1, saltlen ,job)) {
                     PV_DEC(saltsnap[si].PV);
                     if (!Printall && *saltsnap[si].PV == 0) {
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -28477,7 +28508,7 @@ MD5SALTstart:
                       curin.i[2] = R[2].words[i];
                       curin.i[3] = R[3].words[i];
                       if ((hash_exists(curin.h, 32) || Printall)
-                          && checkhashkey(&curin, 32, sbuf[i], job)) {
+                          && checkhashkeylen(&curin, 32, sbuf[i], slen4[i], job)) {
                         PV_DEC(pvbuf[i]);
                       }
                     }
@@ -28504,7 +28535,7 @@ MD5SALTstart:
                       curin.i[2] = f32[8 + i];
                       curin.i[3] = f32[12 + i];
                       if ((hash_exists(curin.h, 32) || Printall)
-                          && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                          && checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                         PV_DEC(pvbuf2[i]);
                       }
                     }
@@ -28525,7 +28556,7 @@ MD5SALTstart:
                     curin.i[2] = R[2].words[i];
                     curin.i[3] = R[3].words[i];
                     if ((hash_exists(curin.h, 32) || Printall)
-                        && checkhashkey(&curin, 32, sbuf[i], job)) {
+                        && checkhashkeylen(&curin, 32, sbuf[i], slen4[i], job)) {
                       PV_DEC(pvbuf[i]);
                     }
                   }
@@ -28541,7 +28572,7 @@ MD5SALTstart:
                     curin.i[2] = f32[8 + i];
                     curin.i[3] = f32[12 + i];
                     if ((hash_exists(curin.h, 32) || Printall)
-                        && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                        && checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                       PV_DEC(pvbuf2[i]);
                     }
                   }
@@ -28563,7 +28594,7 @@ MD5SALTstart:
                 mymd5(mdbuf, len + saltlen, curin.h);
                 y = 32;
                 hashcnt += Maxiter;
-                if (checkhashkey(&curin, y, s1, job)) {
+                if (checkhashkeylen(&curin, y, s1, saltlen, job)) {
                   PV_DEC(saltsnap[si].PV);
                   if (!Printall && *saltsnap[si].PV == 0) {
                     saltsnap[si] = saltsnap[--nsalts_job]; si--; continue;
@@ -28706,7 +28737,7 @@ MD5SALTstart:
                             curin.i[3] = R[3].words[i];
                             if (x == 1) {
                               if ((hash_exists(curin.h, 32) || Printall)
-                                  && checkhashkey(&curin, 32, sbuf[i], job)) {
+                                  && checkhashkeylen(&curin, 32, sbuf[i], slen[i], job)) {
                                 PV_DEC(pvbuf[i]);
                               }
                             } else {
@@ -28748,7 +28779,7 @@ MD5SALTstart:
                             curin.i[3] = f32[12 + i];
                             if (x == 1) {
                               if ((hash_exists(curin.h, 32) || Printall)
-                                  && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                                  && checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                                 PV_DEC(pvbuf2[i]);
                               }
                             } else {
@@ -28790,7 +28821,7 @@ MD5SALTstart:
                         curin.i[3] = R[3].words[i];
                         if (x == 1) {
                           if ((hash_exists(curin.h, 32) || Printall)
-                              && checkhashkey(&curin, 32, sbuf[i], job)) {
+                              && checkhashkeylen(&curin, 32, sbuf[i], slen[i], job)) {
                             PV_DEC(pvbuf[i]);
                           }
                         } else {
@@ -28814,7 +28845,7 @@ MD5SALTstart:
                         curin.i[3] = f32[12 + i];
                         if (x == 1) {
                           if ((hash_exists(curin.h, 32) || Printall)
-                              && checkhashkey(&curin, 32, sbuf2[i], job)) {
+                              && checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                             PV_DEC(pvbuf2[i]);
                           }
                         } else {
@@ -29423,7 +29454,7 @@ nextsalt1:
                   memmove(d, s1, saltlen);
                   mymd5(linebuf, len + saltlen, curin.h);
                   hashcnt++;
-                  if (checkhashkey(&curin, 32, s1, job)) {
+                  if (checkhashkeylen(&curin, 32, s1, saltlen, job)) {
                     PV_DEC(saltsnap[si].PV);
                     if (!Printall && *saltsnap[si].PV == 0) {
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -30187,6 +30218,16 @@ nextsalt1:
                 len = 40;
                 x = 1;
                 goto MDstart;
+
+              case JOB_MD5SQL5MD5MD5MD5:
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, mdbuf, 32);
+                len = 32;
+
+              case JOB_MD5SQL5MD5MD5:
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, mdbuf, 32);
+                len = 32;
 
               case JOB_MD5SQL5MD5:
                 mymd5(cur, len, curin.h);
@@ -31251,7 +31292,7 @@ md5sha256:
                   linebuf[40] = passsha1;
                   mysha1(linebuf,40+40,curin.h);
                   hashcnt += Maxiter;
-                  if (checkhashkey(&curin, 40, s1,job)) {
+                  if (checkhashkeylen(&curin, 40, s1, saltlen,job)) {
                     PV_DEC(saltsnap[si].PV);
                     if (!Printall && *saltsnap[si].PV == 0) {
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -31303,7 +31344,7 @@ md5sha256:
                   linebuf[40] = passmd5;
                   mymd5(linebuf,40+32,curin.h);
                   hashcnt += Maxiter;
-                  if (checkhashkey(&curin, 32, s1,job)) {
+                  if (checkhashkeylen(&curin, 32, s1, saltlen,job)) {
                     PV_DEC(saltsnap[si].PV);
                     if (!Printall && *saltsnap[si].PV == 0) {
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
@@ -31392,7 +31433,7 @@ md5sha256:
                           curin.i[2] = f32[8 + i];
                           curin.i[3] = f32[12 + i];
                           if (x == 1) {
-                            if (checkhashkey(&curin, 32, sbuf2[i], job)) {
+                            if (checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                               PV_DEC(pvbuf2[i]);
                             }
                           } else {
@@ -36226,7 +36267,8 @@ HAV256_5_start:
                     mhash(td, cur, len);
                     mhash_hmac_deinit(td, curin.h);
                     hashcnt++;
-                    checkhashwerkzeug(&curin, wz_len, saltsnap[si].salt, wz_prefix, job);
+                    checkhashwerkzeug(&curin, wz_len, saltsnap[si].salt,
+                                      saltsnap[si].saltlen, wz_prefix, job);
                   }
                   if (!nsalts_job) TYPEDONE(job->op) = 1;
                 }
