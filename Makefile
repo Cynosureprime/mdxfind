@@ -265,9 +265,13 @@ else
 endif
 endif
 
-# Auto-generated JOB_ type constants for GPU headers
-job_types.h: mdxfind.c
-	(echo '/* Auto-generated from mdxfind.c -- do not edit */'; echo '#ifndef NO_JOB_TYPES'; grep '^#define JOB_' mdxfind.c; echo '#endif') > job_types.h
+# job_types.h ships pre-generated and is NOT built here.  It is derived from the
+# JOB_ defines in mdxfind.c, but deriving it in THIS makefile made every build
+# rewrite a tracked file: a pull updates mdxfind.c, the next build regenerates
+# the header, and the pull after that refuses rather than overwrite the local
+# change.  That broke automated refresh-from-source for no gain, since the
+# header is a pure function of a source file we ship anyway.  It is generated
+# on the authoring side and committed.
 
 
 
