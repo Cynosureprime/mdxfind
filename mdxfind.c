@@ -276,10 +276,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.614 2026/10/02 20:06:00 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.615 2026/10/03 15:12:03 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.614 2026/10/02 20:06:00 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.615 2026/10/03 15:12:03 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +297,13 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.615  2026/10/03 15:12:03  dlr
+ * Two type-identity fixes, both found from a single mis-filed solution list.
+ *
+ * First, JOB_MD5CAP reports a depth only once some round has actually capitalized. mdbuf[0] is a hex nibble, so islower() is true only for a through f; for a digit the cap is a no-op and that round value is bit-identical to plain iterated MD5, which is 10 cases in 16. The depth was reported anyway, so a digest that MD5xNN already answers received a second label: of nine MD5x02 solutions taken from a hashmob list 848 split file, six were ALSO emitted as MD5CAPx02 -- exactly the six whose md5(pass) began with a digit -- and mdsplit then files those under the wrong type. Measured over 10,000 generated MD5x02 pairs, 6,276 were claimed by e353. The flag is sticky, because once a round has capped every deeper value really does diverge from plain MD5. Verified: 200 of 200 genuine MD5CAPx02 records, whose md5(pass) begins a through f, are still found; 0 of 200 no-op-cap records are now claimed by e353 and all 200 are still found by e1 as MD5x02; the registered vector still resolves, md5 of password1234 beginning with b, so its own cap was never a no-op. This MODIFIES an existing catalog entry, and roughly 62.5 percent of stored MD5CAPx02 results will stop verifying. That is acceptable only because mdxfind already emitted every one of those as MD5x02 as well, so no plaintext is lost and each record re-files under the correct type. The MD5CAPx lines in regress/testhash.orig need regenerating.
+ *
+ * Second, cppenc_append_key seeds clean from klen >= 0 rather than klen > 0, so a zero-length key emits as a bare empty field rather than as $HEX[]. mdxfind wraps only when a byte needs escaping, and a zero-length field is not such a reason -- its own empty PASSWORD field is emitted bare, as cracking md5 of the empty string from a blank wordlist line shows. The two call sites differ in their guards, which is why this was at first wrongly dismissed as unreachable: the record-then-sitekey site is protected by an explicit pl <= 0 continue, but the triple-emitting site passes the CANDIDATE length, bounded only from above by CPPENC_MAXPASS, and zero-length candidates are processed. Written as >= 0 and not as a plain 1, so a negative klen still takes the else arm and skips the loop rather than reaching memcpy with a cast negative length. Both CryptoPP types still decrypt and emit their triples unchanged.
+ *
  * Revision 1.614  2026/10/02 20:06:00  dlr
  * Add e1057 MD5SQL5MD5MD5 and e1058 MD5SQL5MD5MD5MD5, authored by Waffle and verified here before check-in. Both extend the existing e301 MD5SQL5MD5 cascade by one and two further inner md5 rounds, implemented as a deliberate fall-through into the shared JOB_MD5SQL5 tail so the construction is expressed once: each case takes one md5 and hands on its 32 hex characters, and the tail does sha1, sha1 of the raw digest, then the star and the uppercase forty hex characters that SQL5 is, before MDstart applies the outer md5. Reading outer to inner, e1057 is md5(sql5(md5(md5(pass)))) and e1058 is md5(sql5(md5(md5(md5(pass))))). Types[] appended in order so the positional indices are 1057 and 1058, confirmed by resolving both names from the binary; Typeopt carries TYPEOPT_NEEDSF as they are unsalted. Review notes: the change is strictly additive, no existing entry is touched, and both expressions passed the catalog dedup gate against 1054 entries before the numbers were used. Verified against an oracle written from hx.8 rather than from this code, with the oracle first validated on the existing e301 vector so a wrong oracle could not agree by construction: e1057 is f0a69a566cc9e96a6eedbf732064d193 and e1058 is 2a29278666f9e44b424c6ade970cc820 for password123, both crack here, both round-trip through hashpipe -c, and a wrong password matches neither.
  *
@@ -3602,7 +3609,22 @@ static void cppenc_tohex(const unsigned char *in, int n, char *out)
 static int cppenc_append_key(char *buf, int len, const unsigned char *k, int klen)
 {
   static const char lc[] = "0123456789abcdef";
-  int i, clean = (klen > 0);
+  /* klen >= 0, not klen > 0: a zero-length key must emit as a BARE empty field,
+     never as $HEX[].  mdxfind wraps only when a byte needs escaping, and a
+     zero-length field is not such a reason -- its own empty PASSWORD field is
+     emitted bare ("MD5x01 d41d8cd98f00b204e9800998ecf8427e:"), so the key field
+     must agree.  $HEX[] is a spelling mdxfind otherwise never generates, which
+     is exactly why a consumer is entitled to read it as a literal.
+     This also matches fmt_saltfield (clean = 1 after clamping a negative) and
+     cppenc_keyreport (printable = 1).  It is NOT written as a plain 1, because
+     a negative klen must still take the else arm and skip the loop rather than
+     reach memcpy with (size_t)klen.
+     Reachability, since the guards differ between the two call sites: the
+     <record>:<sitekey> site is protected by "if (pl <= 0) continue", but the
+     triple-emitting site passes the CANDIDATE length, which is bounded only
+     from above by CPPENC_MAXPASS -- and mdxfind does process zero-length
+     candidates, as cracking md5("") from a blank wordlist line shows. */
+  int i, clean = (klen >= 0);
   for (i = 0; i < klen; i++)
     if (k[i] < '!' || k[i] > '~' || k[i] == ':') { clean = 0; break; }
   buf[len++] = ':';
@@ -30831,14 +30853,30 @@ md5sha256:
                 goto MDstart;
 
               case JOB_MD5CAP:
-                mymd5(cur, len, curin.h);
-                for (x = 2; x <= Maxiter; x++) {
-                  prmd5(curin.h, mdbuf, 32);
-                  if (islower(mdbuf[0]))
-                    mdbuf[0] = toupper(mdbuf[0]);
-                  mymd5(mdbuf, 32, curin.h);
-                  hashcnt++;
-                  checkhash(&curin, 32, x, job);
+                /* The capitalization IS the type.  mdbuf[0] is a hex nibble, so
+                   islower() is true only for 'a'..'f'; for a digit the cap is a
+                   no-op and this round's value is bit-identical to plain
+                   iterated MD5.  Reporting it then adds a second label for a
+                   digest MD5xNN already answers -- which is what it did: of
+                   nine MD5x02 solutions, six were ALSO emitted as MD5CAPx02,
+                   exactly the six whose md5(pass) began with a digit, and
+                   mdsplit then files them under the wrong type.  So a depth is
+                   reported only once some round has actually capitalized; until
+                   then MD5CAP gives way to MD5. */
+                {
+                  int capped = 0;
+                  mymd5(cur, len, curin.h);
+                  for (x = 2; x <= Maxiter; x++) {
+                    prmd5(curin.h, mdbuf, 32);
+                    if (islower(mdbuf[0])) {
+                      mdbuf[0] = toupper(mdbuf[0]);
+                      capped = 1;
+                    }
+                    mymd5(mdbuf, 32, curin.h);
+                    hashcnt++;
+                    if (capped)
+                      checkhash(&curin, 32, x, job);
+                  }
                 }
                 break;
 
