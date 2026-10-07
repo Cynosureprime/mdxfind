@@ -16,24 +16,19 @@
 
 algo: md4utf16
 
-skip_line_ranges:
-  # template_emit_hit macro (4 lines: #define + 3 continuations).
-  # Mirrors md4.yaml. The Metal hand-port pattern keeps only the
-  # template_emit_hit_or_overflow form. NOTE: source line range
-  # differs from md4.yaml because gpu_md4utf16_core.cl lacks the
-  # 3-line comment header above the macro.
-  #
-  # MOVED 262-265 -> 373-376 (2026-09-15): md4_over_utf16le was added
-  # above this point when the UTF-16LE widening replaced the byte
-  # zero-extend, and 262-265 is now the TAIL of that helper.  Skipping
-  # the old range deleted `return nunits;` and a closing brace out of
-  # the middle of a function, which does not compile -- and the macro
-  # it was meant to skip would then have been emitted as well.  If this
-  # helper ever moves again, re-derive the range; do not adjust it by
-  # the delta.
-  - start: 373
-    end:   376
-    reason: "template_emit_hit macro -- replaced by template_emit_hit_or_overflow"
+# Text-anchored, so it cannot drift. The previous form was a positional
+# skip_line_ranges, which had already had to be re-aimed once (262-265 ->
+# 373-376 on 2026-09-15 when md4_over_utf16le was inserted above it) and had
+# drifted again by 2026-10-05: 373-376 had come to cover the whole body of
+# template_finalize plus its closing brace. Deleting that brace left the
+# function open, rewrite_functions bailed out and appended the remainder of
+# the file UNTRANSLATED, and cl2metal still exited 0.
+skip_macros:
+  # Replaced by template_emit_hit_or_overflow in the Metal port. Matching is
+  # on the macro name with a lookahead, so template_emit_hit_or_overflow is
+  # not caught by it, and a rename or removal in the .cl is a hard error
+  # rather than a silent miss.
+  - template_emit_hit
 
 arg_address_space:
   template_finalize:

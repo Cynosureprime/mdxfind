@@ -54,6 +54,15 @@ except ImportError:
     _HAVE_YAML = False
 
 
+def _die(msg: str):
+    """Fail loudly. A codegen tool that emits a structurally broken file while
+    exiting 0 is worse than one that stops: the breakage is discovered later,
+    by something else, as a wrong answer. Every exit path added here was
+    previously a silent `append the rest of the file and carry on`."""
+    sys.stderr.write("cl2metal: FATAL: " + msg + "\n")
+    sys.exit(2)
+
+
 def _parse_yaml_minimal(text: str) -> dict:
     """Minimal YAML reader: supports the overlay subset we need.
 
@@ -981,8 +990,15 @@ def rewrite_functions(code: str, overlay: dict,
         body_open = j
         body_close = _find_matching_brace(code, body_open)
         if body_close < 0:
-            out.append(code[pos:])
-            break
+            # Was: append the remainder UNPROCESSED and stop. That is how a
+            # stale skip range became a silently mistranslated kernel -- every
+            # construct past this point kept its OpenCL spelling, address
+            # spaces included, and the tool still exited 0.
+            _die("unbalanced braces in the body of %s(): no matching close "
+                 "brace, %s. A skip (skip_line_ranges/skip_macros) has very "
+                 "likely removed one. Everything after this point would have "
+                 "been emitted untranslated."
+                 % (m.group('name') or '<unknown>', "while rewriting function signatures"))
 
         fn_name = m.group('name')
         ret_type = m.group('ret').strip()
@@ -1075,8 +1091,15 @@ def apply_overlay_skip_functions(code: str, skip_names: list) -> str:
         body_open = j
         body_close = _find_matching_brace(code, body_open)
         if body_close < 0:
-            out.append(code[pos:])
-            break
+            # Was: append the remainder UNPROCESSED and stop. That is how a
+            # stale skip range became a silently mistranslated kernel -- every
+            # construct past this point kept its OpenCL spelling, address
+            # spaces included, and the tool still exited 0.
+            _die("unbalanced braces in the body of %s(): no matching close "
+                 "brace, %s. A skip (skip_line_ranges/skip_macros) has very "
+                 "likely removed one. Everything after this point would have "
+                 "been emitted untranslated."
+                 % (m.group('name') or '<unknown>', "while skipping functions named by the overlay"))
         fn_name = m.group('name')
         if fn_name in skip_names:
             # Skip this function. Preserve content before fn start, omit the
@@ -1219,8 +1242,15 @@ def apply_dual_addr_space_helpers(code: str, helpers: list) -> str:
         body_open = j
         body_close = _find_matching_brace(code, body_open)
         if body_close < 0:
-            out.append(code[pos:])
-            break
+            # Was: append the remainder UNPROCESSED and stop. That is how a
+            # stale skip range became a silently mistranslated kernel -- every
+            # construct past this point kept its OpenCL spelling, address
+            # spaces included, and the tool still exited 0.
+            _die("unbalanced braces in the body of %s(): no matching close "
+                 "brace, %s. A skip (skip_line_ranges/skip_macros) has very "
+                 "likely removed one. Everything after this point would have "
+                 "been emitted untranslated."
+                 % (m.group('name') or '<unknown>', "while emitting dual address-space overloads"))
         fn_name = m.group('name')
         match = next(((n, a) for (n, a) in normalized if n == fn_name), None)
         if match is None:
@@ -1266,6 +1296,47 @@ def apply_dual_addr_space_helpers(code: str, helpers: list) -> str:
     return ''.join(out)
 
 
+def apply_overlay_skip_macros(code: str, names: list) -> str:
+    """Remove `#define <name> ...` and all of its backslash-continuation lines.
+
+    Text-anchored replacement for using skip_line_ranges to drop a macro, which
+    is what 49 of 57 overlays were doing positionally. Matching on the name
+    cannot drift when the file above it changes.
+    """
+    if not names:
+        return code
+    lines = code.split('\n')
+    out = []
+    i = 0
+    found = {n: False for n in names}
+    while i < len(lines):
+        ln = lines[i]
+        hit = None
+        for n in names:
+            # `#define NAME(` or `#define NAME<space>` -- not a longer name that
+            # merely starts with NAME (template_emit_hit must not match
+            # template_emit_hit_or_overflow).
+            if re.match(r'^\s*#\s*define\s+' + re.escape(n) + r'(?=[\s(])', ln):
+                hit = n
+                break
+        if hit is None:
+            out.append(ln)
+            i += 1
+            continue
+        found[hit] = True
+        # swallow the #define and every continuation line
+        while i < len(lines) and lines[i].rstrip().endswith('\\'):
+            i += 1
+        i += 1          # the final, non-continued line
+    missing = [n for n, f in found.items() if not f]
+    if missing:
+        _die("skip_macros named macro(s) that are not in the source: %s. "
+             "Either the macro was renamed or removed, or the overlay is for a "
+             "different file; refusing rather than silently emitting it."
+             % ', '.join(missing))
+    return '\n'.join(out)
+
+
 def apply_overlay_skip_line_ranges(code: str, ranges: list) -> str:
     """Remove arbitrary line ranges from code (1-indexed). Used for content
     deletion within a function (e.g., dropping modes 1-6 from
@@ -1278,10 +1349,74 @@ def apply_overlay_skip_line_ranges(code: str, ranges: list) -> str:
         if isinstance(r, dict):
             s = int(r.get('start', 0))
             e = int(r.get('end', 0))
+            why = str(r.get('reason', '(no reason given)'))
         else:
             # tolerate "start-end" string
             parts = str(r).split('-')
             s = int(parts[0]); e = int(parts[1]) if len(parts) > 1 else s
+            why = '(no reason given)'
+
+        # A line range is a POSITIONAL anchor into a file that changes, and it
+        # goes stale the moment anything above it gains or loses a line. When it
+        # does, it silently cuts across a structure boundary instead of removing
+        # the block it names. That is not hypothetical: md4utf16.yaml's range
+        # drifted twice, and the second time it deleted the whole body AND the
+        # closing brace of template_finalize, which left a function with no body
+        # that swallowed the next one -- and the tool still exited 0.
+        #
+        # Removing a self-contained block cannot change brace or paren balance.
+        # If it does, the range is cutting a structure in half, so refuse. This
+        # guard is cheap, has no false positive on the legitimate case (a
+        # #define with its continuations is balanced), and protects every
+        # overlay that still uses a positional range -- 49 of 57 at the time of
+        # writing. It does NOT make the ranges correct, only loud when wrong.
+        first = (lines[s - 1].strip() if 0 < s <= len(lines) else '<out of range>')
+        last = (lines[e - 1].strip() if 0 < e <= len(lines) else '<out of range>')
+
+        # CONTENT ANCHOR. The balance check below cannot see a range that is
+        # brace-balanced but still mis-aimed -- and the commonest skip of all,
+        # stripping a bare #ifdef / #endif, is always balanced. shacrypt.yaml's
+        # four ranges had drifted +191 lines and were deleting a comment
+        # terminator and a live signature argument; nothing structural caught
+        # it. So a range may declare the text it expects to find, and a
+        # mismatch is fatal. Whitespace is normalised; the comparison is on
+        # content. Supply expect_first (and expect_last on a multi-line range)
+        # on every range you touch -- a range without one is warned about below.
+        for key, want, got, which in (('expect_first', r.get('expect_first') if isinstance(r, dict) else None, first, 'first'),
+                                      ('expect_last',  r.get('expect_last')  if isinstance(r, dict) else None, last,  'last')):
+            if want is None:
+                continue
+            if ' '.join(str(want).split()) != ' '.join(got.split()):
+                _die("skip_line_ranges %d-%d has DRIFTED: its %s line is not what "
+                     "the overlay expects.\n"
+                     "  reason given : %s\n"
+                     "  %-12s : %s\n"
+                     "  found        : %s\n"
+                     "Re-derive the range against the CURRENT source. Do NOT adjust "
+                     "it by a delta -- find the construct and read off its real line "
+                     "numbers, then update %s to match."
+                     % (s, e, which, why, key, want, got, key))
+        if isinstance(r, dict) and 'expect_first' not in r:
+            sys.stderr.write(
+                "cl2metal: WARNING: skip_line_ranges %d-%d has no expect_first "
+                "anchor, so a drift that happens to stay brace-balanced will not "
+                "be caught. Add expect_first: %r\n" % (s, e, first))
+
+        excerpt = '\n'.join(lines[max(0, s - 1):min(len(lines), e)])
+        db = excerpt.count('{') - excerpt.count('}')
+        dp = excerpt.count('(') - excerpt.count(')')
+        if db or dp:
+            _die("skip_line_ranges %d-%d is STALE or mis-aimed: removing it changes "
+                 "brace balance by %+d and paren balance by %+d, so it cuts across a "
+                 "structure boundary rather than removing a self-contained block.\n"
+                 "  reason given : %s\n"
+                 "  first line   : %s\n"
+                 "  last line    : %s\n"
+                 "Re-derive the range against the CURRENT source, or better, replace it "
+                 "with a text-anchored skip (skip_macros / skip_functions / skip_blocks), "
+                 "which cannot drift."
+                 % (s, e, db, dp, why, first, last))
+
         for i in range(max(1, s), min(len(lines), e) + 1):
             skip[i] = True
     out_lines = []
@@ -1409,11 +1544,31 @@ def lint_forbidden(code: str) -> List[Tuple[int, str]]:
 # Driver
 # -----------------------------------------------------------------------------
 
+def _assert_output_balanced(code: str, path: str):
+    """The emitted file must be brace- and paren-balanced.
+
+    Last line of defence against structural damage -- a skip that removed a
+    brace, a bail-out that truncated a rewrite. Cheap, and it fires before
+    anything is written."""
+    stripped = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    stripped = re.sub(r'//[^\n]*', '', stripped)
+    db = stripped.count('{') - stripped.count('}')
+    dp = stripped.count('(') - stripped.count(')')
+    if db or dp:
+        _die("generated %s is NOT balanced: brace %+d, paren %+d. Refusing to "
+             "emit a structurally broken kernel." % (path, db, dp))
+
+
 def translate(src_path: str, overlay_path: Optional[str] = None) -> str:
     with open(src_path, 'r') as f:
         src = f.read()
 
     overlay = load_overlay(overlay_path) if overlay_path else {}
+
+    # Pass 0-pre: TEXT-ANCHORED macro skips. Preferred over skip_line_ranges,
+    # which is positional and silently drifts as the .cl source is edited.
+    # An overlay converted to skip_macros needs no line range at all.
+    src = apply_overlay_skip_macros(src, overlay.get('skip_macros') or [])
 
     # Pass 0: line-range skips applied to RAW source (line numbers reference
     # the input file).
@@ -1491,7 +1646,14 @@ def translate(src_path: str, overlay_path: Optional[str] = None) -> str:
 
     code = rewrite_header(code, src_basename, dst_basename, src_path)
 
+    # Final gate. Every per-site guard above sees only its own window; this
+    # sees the whole emitted file. A kernel that is not brace/paren balanced
+    # must never reach a _str.h -- the OpenCL-side build will not catch it,
+    # only Metal PSO creation will, long after the fact.
+    _assert_output_balanced(code, dst_basename)
+
     return code
+
 
 
 def main(argv=None):

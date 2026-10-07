@@ -281,12 +281,46 @@ skip_functions:
   - salt_pack_uint
   - some_unused_helper
 
+# Drop a macro definition by NAME, with its backslash continuations.
+# PREFER THIS over skip_line_ranges. It is text-anchored, so it cannot
+# drift, and a macro named here that is NOT in the source is a FATAL
+# error rather than a silent miss. Matching is on the name with a
+# lookahead, so `template_emit_hit` does not also catch
+# `template_emit_hit_or_overflow`.
+skip_macros:
+  - template_emit_hit
+
 # Drop arbitrary line ranges from the SOURCE (line numbers refer to the
 # original .cl file). Useful for removing mode-switch branches or
 # legacy code blocks that don't translate cleanly.
+#
+# A LINE RANGE IS A POSITIONAL ANCHOR INTO A FILE THAT CHANGES. It goes
+# stale the moment anything above it gains or loses a line, and when it
+# does it cuts across a structure boundary instead of removing the block
+# it names. Two guards exist because this has bitten repeatedly:
+#
+#   1. expect_first / expect_last -- the exact text the range expects at
+#      its first (and, on a multi-line range, last) line. Whitespace is
+#      normalised; a mismatch is FATAL. Supply it on every range. On
+#      2026-10-05 five `*raw` overlays and shacrypt were found deleting
+#      live code -- SHA-512 IV words, a signature argument, a comment
+#      terminator -- while claiming to remove a macro. All six were
+#      brace-balanced, so only a content anchor could have caught them.
+#
+#   2. A brace/paren balance check on the removed excerpt. Removing a
+#      self-contained block cannot change balance; if it does, the range
+#      is cutting a structure in half and the run aborts. This caught
+#      md4utf16's range after it drifted onto the whole body of
+#      template_finalize plus its closing brace.
+#
+# A range with no expect_first still runs, but warns. If a range has
+# drifted, FIND the construct and read off its real line numbers -- do
+# not adjust the range by a delta.
 skip_line_ranges:
   - start: 200
     end:   250
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
+    expect_last:  "#endif"
     reason: "HMAC modes -- deferred to Phase 2d+"
 
 # Override the address-space inference for specific function args.
@@ -310,6 +344,10 @@ and `gpu/gpu_md5salt_core.cl`, then validates:
   - **Fidelity delta vs OpenCL source** (translator faithfulness: tight)
   - **Forbidden-token lint**: no `__global`, `__private`, `barrier(CLK_*)`,
     `__kernel`, `typedef struct`, `as_uint(`, `mul_hi(` surviving.
+  - **Output brace/paren balance**: the emitted file must be balanced.
+    A structural guard that fires before anything is written, so damage
+    cannot reach a `_str.h` and from there a GPU, where only Metal PSO
+    creation would catch it.
   - **State-array bounds lint**: `h[N]` accesses where N >= HASH_WORDS
     are flagged (per memo §6 closing paragraph).
   - **xcrun metal compile**: TU `metal_common.metal + <generated>` compiles

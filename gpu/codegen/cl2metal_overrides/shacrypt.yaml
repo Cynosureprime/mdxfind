@@ -54,39 +54,53 @@
 
 algo: shacrypt
 
+# RE-DERIVED 2026-10-05. The four ranges below had drifted +191 lines from the
+# source they name (401/405/408/695-718 -> 404/408/411/886-909). Nothing caught
+# it: three of them strip a bare #ifdef or #endif, which is always
+# brace-balanced, so the structural guard cannot see the drift. As they stood
+# they deleted a comment terminator (`*/`), a live signature argument
+# (`, __global const uchar *salt_bytes`) and an #endif, and cl2metal still
+# exited 0 and wrote an unbalanced file. Every range now carries an
+# expect_first/expect_last content anchor, which is fatal on mismatch.
+#
+# If this helper moves again, FIND the construct and read off its real line
+# numbers. Do not adjust these by a delta.
 skip_line_ranges:
   # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around the
-  # template_finalize signature (lines 401, 405). The Metal JIT always
-  # compiles this carrier with GPU_TEMPLATE_HAS_SALT defined; the bare
-  # `#ifdef`/`#endif` directives inside a function signature confuse the
-  # Metal preprocessor (translator output produces `#ifdef
-  # GPU_TEMPLATE_HAS_SALT,` which is parsed as a macro name with trailing
-  # comma -- extra-tokens warning then signature parse failure). After
-  # strip, the salt-arg lines become unconditional signature args, matching
-  # the metal signature shape of phpbb3 / md5crypt / hmac_blake2s. Mirrors
-  # phpbb3.yaml / md5crypt.yaml Phase 2d.8a pattern.
-  - start: 401
-    end:   401
+  # template_finalize signature. The Metal JIT always compiles this carrier
+  # with GPU_TEMPLATE_HAS_SALT defined; the bare directives inside a function
+  # signature confuse the Metal preprocessor (translator output produces
+  # `#ifdef GPU_TEMPLATE_HAS_SALT,`, parsed as a macro name with a trailing
+  # comma -- extra-tokens warning, then signature parse failure). After the
+  # strip the salt args become unconditional, matching the Metal signature
+  # shape of phpbb3 / md5crypt / hmac_blake2s. Mirrors phpbb3.yaml /
+  # md5crypt.yaml, the Phase 2d.8a pattern.
+  - start: 404
+    end:   404
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
-  - start: 405
-    end:   405
-    reason: "preproc guard around template_finalize salt args -- close"
-
-  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` at the body start (line 408).
-  # The salted chain body is always live on Metal.
   - start: 408
     end:   408
+    expect_first: "#endif"
+    reason: "preproc guard around template_finalize salt args -- close"
+
+  # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` at the body start. The salted
+  # chain body is always live on Metal.
+  - start: 411
+    end:   411
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around SHA-crypt body -- Metal always has HAS_SALT"
 
-  # Strip the defensive `#else..#endif` no-salt fallback (lines 695..718).
-  # SHA-crypt always needs salt; the no-salt path computes plain SHA-256/
-  # SHA-512 of the data as a placeholder and is structurally unreachable
-  # in production. We drop it entirely so the kernel keeps only the salted
-  # chain body. The outer `#endif` (line 718) closes the `#ifdef
-  # GPU_TEMPLATE_HAS_SALT` from line 408; with the `#ifdef` stripped, the
-  # closing `#endif` is also dropped to keep balance.
-  - start: 695
-    end:   718
+  # Strip the defensive `#else..#endif` no-salt fallback. SHA-crypt always
+  # needs a salt; the no-salt path computes a plain SHA-256/SHA-512 of the
+  # data as a placeholder and is structurally unreachable in production. It is
+  # dropped entirely so the kernel keeps only the salted chain body. The
+  # trailing `#endif` closes the `#ifdef GPU_TEMPLATE_HAS_SALT` stripped
+  # above; with that `#ifdef` gone the `#endif` must go too, to stay balanced.
+  - start: 886
+    end:   909
+    expect_first: "#else"
+    expect_last:  "#endif"
     reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"
 
 arg_address_space:

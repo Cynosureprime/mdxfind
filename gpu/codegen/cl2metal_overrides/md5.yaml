@@ -1,7 +1,10 @@
 # cl2metal overlay for md5 (gpu/gpu_md5_core.cl -> gpu/metal_md5_core.metal).
 #
-# $Revision: 1.1 $
+# $Revision: 1.2 $
 # $Log: md5.yaml,v $
+# Revision 1.2  2026/10/05 19:04:19  dlr
+# Replace the positional template_emit_hit skip_line_ranges entry with the text-anchored skip_macros added in cl2metal.py 1.11, and backfill expect_first/expect_last content anchors on the preprocessor-guard ranges that remain. Reason: a line range is a positional anchor into a file that changes. Audited all 57 overlays on 2026-10-05: of 73 positional ranges, 34 no longer pointed at the construct their reason field named. md4utf16 had drifted onto the body of template_finalize plus its closing brace; shacrypt had drifted 191 lines and was deleting a comment terminator and a live signature argument; md5raw, sha1raw, sha256raw, sha384raw and sha512raw were deleting hex-encoding statements, a signature argument and three SHA-512 IV words while claiming to remove a macro. All of those were brace-balanced, so no structural check could see them, and cl2metal exited 0 every time. 49 ranges are now gone entirely in favour of skip_macros and the remaining 24 all carry a content anchor, so zero positional ranges are unguarded. Verified: 53 of 53 overlays translate and 52 reproduce their committed metal core byte-for-byte after comment stripping; md5 is the exception and differs only by a hand-written w32 word-load fast path that predates this change.
+#
 # Revision 1.1  2026/05/15 16:26:09  dlr
 # Phase 2d.1 minimal md5 overlay. Skip template_emit_hit macro (lines 250-258) since hand-port keeps only template_emit_hit_or_overflow. No arg_address_space overrides needed for md5.
 #
@@ -23,12 +26,10 @@
 
 algo: md5
 
-skip_line_ranges:
-  # template_emit_hit macro (3 lines: comment + #define + continuation).
-  # OpenCL line 250-258: `template_emit_hit: emit a hit ...` comment +
-  # the macro definition. The Metal hand-port replaces this with only
-  # template_emit_hit_or_overflow (different macro arg shape uses
-  # st_ref instead of st as the state arg name).
-  - start: 250
-    end:   258
-    reason: "template_emit_hit macro -- replaced by template_emit_hit_or_overflow"
+# Text-anchored, so it cannot drift. This replaced a positional
+# skip_line_ranges entry on 2026-10-05. Matching is on the macro name
+# with a lookahead, so template_emit_hit_or_overflow (the form the
+# template actually calls) is NOT caught by it, and a rename or removal
+# of the macro in the .cl is a hard error rather than a silent miss.
+skip_macros:
+  - template_emit_hit

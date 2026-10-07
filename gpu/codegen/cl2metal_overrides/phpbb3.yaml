@@ -48,9 +48,11 @@ skip_line_ranges:
   # hmac_blake2s.yaml Phase 2d.7d.1 pattern.
   - start: 172
     end:   172
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
   - start: 176
     end:   176
+    expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close"
 
   # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#else` / `#endif` guards
@@ -62,20 +64,21 @@ skip_line_ranges:
   # only the salted chain body.
   - start: 179
     end:   179
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
   - start: 275
     end:   314
+    expect_first: "#else"
+    expect_last:  "#endif"
     reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"
 
-  # template_emit_hit (simple) macro definition + 2-line comment header.
-  # OpenCL source: lines 347-352 of gpu_phpbb3_core.cl. The Metal hand-port
-  # pattern keeps only template_emit_hit_or_overflow form (mirrors md5.yaml
-  # / md4.yaml / md5salt.yaml / hmac_blake2s.yaml). The unfilled
-  # `(st)->h[i]` auto-rewrite in the simple form ages poorly through the
-  # codegen pipeline; the dedup form is the production path.
-  - start: 347
-    end:   352
-    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+# Text-anchored, so it cannot drift. This replaced a positional
+# skip_line_ranges entry on 2026-10-05. Matching is on the macro name
+# with a lookahead, so template_emit_hit_or_overflow (the form the
+# template actually calls) is NOT caught by it, and a rename or removal
+# of the macro in the .cl is a hard error rather than a silent miss.
+skip_macros:
+  - template_emit_hit
 
 arg_address_space:
   template_finalize:

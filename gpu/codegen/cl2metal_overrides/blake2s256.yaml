@@ -32,12 +32,13 @@
 
 algo: blake2s256
 
-skip_line_ranges:
-  # template_emit_hit (simple) macro definition + 2-line comment header.
-  # OpenCL source: lines 296-301 of gpu_blake2s256_core.cl.
-  - start: 296
-    end:   301
-    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+# Text-anchored, so it cannot drift. This replaced a positional
+# skip_line_ranges entry on 2026-10-05. Matching is on the macro name
+# with a lookahead, so template_emit_hit_or_overflow (the form the
+# template actually calls) is NOT caught by it, and a rename or removal
+# of the macro in the .cl is a hard error rather than a silent miss.
+skip_macros:
+  - template_emit_hit
 
 arg_address_space:
   template_finalize:

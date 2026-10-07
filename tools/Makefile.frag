@@ -35,13 +35,18 @@
 # project-wide $(HX_OBJS) lacks -DHX_STANDALONE and so omits the
 # md5/sha/etc. entries the standalone build gates IN. Mirrors the
 # existing `hx:` target structure.
+# ruleproc32.c and classify_utf8.c are in this list because hx_func.c's
+# utf16le/utf16be/utf7/from_cp125x functions use the conversions defined there
+# rather than iconv -- the same ones mdxfind.c uses, so an hx expression and the
+# type it documents cannot disagree.  libiconv.a is correspondingly gone.
 tools/hx8_to_c: tools/hx8_to_c.c tools/hx_program_cmp.h hx_vm.h hx.c hx_ast.c \
-                hx_compile.c hx_vm.c hx_func.c hx.tab.c hx.lex.c myprogress.c
+                hx_compile.c hx_vm.c hx_func.c hx.tab.c hx.lex.c myprogress.c \
+                ruleproc32.c ruleproc32.h classify_utf8.c
 	cc -DHX_STANDALONE -DHX_NO_MAIN -O3 -I. -I/opt/local/include \
 	    -o tools/hx8_to_c \
 	    tools/hx8_to_c.c hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c \
-	    hx.tab.c hx.lex.c myprogress.c \
-	    -L/opt/local/lib -lssl -lcrypto /opt/local/lib/libiconv.a
+	    hx.tab.c hx.lex.c myprogress.c ruleproc32.c classify_utf8.c \
+	    -L/opt/local/lib -lssl -lcrypto
 
 # codegen/maphashcat_data.h -- AUTO-GENERATED build artifact (Tier 2
 # Feature 2). Extracts mdxfind.c's Maphashcat[] (hashcat-mode, mdxfind-eN)

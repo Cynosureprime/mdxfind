@@ -50,9 +50,11 @@ skip_line_ranges:
   # matching the metal signature shape of sha1passsalt et al.
   - start: 220
     end:   220
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
   - start: 224
     end:   224
+    expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close /opening"
 
   # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards inside the
@@ -62,16 +64,20 @@ skip_line_ranges:
   # in production but kept for parity).
   - start: 227
     end:   227
+    expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
   - start: 309
     end:   309
+    expect_first: "#endif"
     reason: "preproc guard around HMAC body -- close"
 
-  # template_emit_hit (simple) macro definition + 2-line comment header.
-  # OpenCL source: lines 392-396 of gpu_hmac_blake2s_core.cl.
-  - start: 392
-    end:   396
-    reason: "template_emit_hit (simple) macro -- replaced by template_emit_hit_or_overflow"
+# Text-anchored, so it cannot drift. This replaced a positional
+# skip_line_ranges entry on 2026-10-05. Matching is on the macro name
+# with a lookahead, so template_emit_hit_or_overflow (the form the
+# template actually calls) is NOT caught by it, and a rename or removal
+# of the macro in the .cl is a hard error rather than a silent miss.
+skip_macros:
+  - template_emit_hit
 
 arg_address_space:
   template_finalize:
