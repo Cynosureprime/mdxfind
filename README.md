@@ -800,7 +800,7 @@ mdxfind requires the following static libraries (all built automatically by `mak
 
 The Makefile detects the build platform automatically. Tested on:
 
-- macOS x86\_64 and arm64 (requires libiconv from MacPorts)
+- macOS x86\_64 and arm64
 - Linux x86\_64 (Ubuntu 18.04, 22.04)
 - Linux i386 (32-bit)
 - Linux ppc64le (PowerPC 8)

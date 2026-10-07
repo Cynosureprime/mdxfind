@@ -680,6 +680,18 @@ static int gpu_pack_salts_op(struct saltentry *saltsnap, int nsalts,
         /* For types that precompute MD5(salt), pack the hex hash instead of raw salt */
         char *s = (use_hashsalt && saltsnap[i].hashsalt) ? saltsnap[i].hashsalt : saltsnap[i].salt;
         int sl = (use_hashsalt && saltsnap[i].hashsalt) ? 32 : saltsnap[i].saltlen;
+        if ((uint64_t)gsp + (uint64_t)sl > (uint64_t)GPU_SALT_PACK_MAX) {
+            fprintf(stderr,
+                "FATAL: %s:%d gpu_pack_salts_op: packed salt bytes would exceed "
+                "GPU_SALT_PACK_MAX (%u). Salt %d of %d needs %d bytes at offset "
+                "%u. The offset array is uint32 and the same counter is the "
+                "memcpy destination, so continuing would overwrite already-packed "
+                "salts and index the wrong salt data -- silently, exit 0, every "
+                "affected digest wrong. packed=%d\n",
+                __FILE__, __LINE__, (unsigned)GPU_SALT_PACK_MAX,
+                i, nsalts, sl, (unsigned)gsp, packed);
+            exit(1);
+        }
         soff[packed] = gsp;
         slen[packed] = sl;
         pack_map[packed] = i;

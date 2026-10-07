@@ -39,7 +39,6 @@ endif
 # OS-specific flags
 ifeq ($(UNAME_S),Darwin)
   OSOPT = -DMACOSX
-  ICONV = /opt/local/lib/libiconv.a
   LDEXTRA =
   INCEXTRA = -I/opt/local/include
   # Metal GPU acceleration on macOS.
@@ -62,7 +61,6 @@ ifeq ($(UNAME_S),Darwin)
   endif
 else ifeq ($(UNAME_S),FreeBSD)
   OSOPT =
-  ICONV = /usr/local/lib/libiconv.a
   LDEXTRA = -Wl,--allow-multiple-definition -L/usr/local/lib
   INCEXTRA = -I/usr/local/include
   # OpenCL GPU acceleration on FreeBSD (requires: pkg install opencl ocl-icd)
@@ -75,7 +73,6 @@ else ifeq ($(UNAME_S),FreeBSD)
 else
   # Linux and others
   OSOPT =
-  ICONV =
   LDEXTRA = -ldl
   INCEXTRA = -I/usr/local/include
   # OpenCL GPU acceleration on Linux (requires: OpenCL headers + runtime or dynload)
@@ -100,7 +97,7 @@ LDFLAGS = -pthread -O3
 # Static libraries (expected in current directory or subdirectories)
 LIBS = libssl.a libcrypto.a libsph.a libmhash.a librhash.a md6.a \
        gosthash/gost2012/gost2012.a bcrypt-master/bcrypt.a \
-       argon2/argon2.a libJudy.a libpcre.a lm/lm.a liblzma.a libbz2.a libzstd.a $(ICONV)
+       argon2/argon2.a libJudy.a libpcre.a lm/lm.a liblzma.a libbz2.a libzstd.a
 
 # yescrypt (object files, not a .a archive)
 YESCRYPT_OBJS = yescrypt/yescrypt-common.o yescrypt/yescrypt-opt.o \

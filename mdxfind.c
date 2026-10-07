@@ -100,7 +100,6 @@
 #include <sph_whirlpool.h>
 
 #include <zlib.h>
-#include <iconv.h>
 #include <lzma.h>
 #include <bzlib.h>
 #include <zstd.h>
@@ -198,6 +197,20 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 #define GPU_ENABLED 1
 #endif
 
+/* Backends that carry a brute-force chunk-as-job producer: ones with the
+ * BF kernel, the chunk-base hit decode, AND the three device accessors
+ * behind the mdx_gpu_* shims below.
+ *
+ * Deliberately NOT GPU_ENABLED, which also covers CUDA_GPU. A CUDA build
+ * has no BF kernel and mdx_gpu_num_devices() answers 0 there, so reusing
+ * GPU_ENABLED would compile a producer that sizes chunks for a backend
+ * that cannot run them -- and the activation arm clamps a 0 device count
+ * up to 1, so it would look plausible rather than fail. No Makefile in
+ * the fleet defines CUDA_GPU today; this keeps it safe if one ever does. */
+#if defined(OPENCL_GPU) || (defined(__APPLE__) && defined(METAL_GPU))
+#define GPU_BF_CHUNK_PRODUCER 1
+#endif
+
 #ifdef GPU_ENABLED
 #if defined(__APPLE__) && defined(METAL_GPU)
 #include "gpu_metal.h"  /* Metal iter-axis dispatch budget: gpu_metal.m r1.133, gpu/metal_common.metal r1.34 */
@@ -247,6 +260,132 @@ static inline int mdx_kernel_a_proto_enabled(void)
     return 0;
 #endif
 }
+
+/* Backend-neutral device enumeration, same shim shape and for the same
+ * reason as mdx_kernel_a_proto_enabled above: calling a gpu_opencl_*
+ * symbol unguarded breaks the Metal build at link time (that is what
+ * rev 1.488 did).
+ *
+ * These three exist so the brute-force chunk-as-job producer can stop
+ * being OpenCL-only. The producer was never OpenCL-specific in its
+ * logic -- it had been gated on OPENCL_GPU because these were the only
+ * backend-bound calls inside it. The Metal kernel side
+ * (metal_kernel_a_bruteforce, mask_start / mask_offset_per_word /
+ * bf_num_masks / bf_inner_iter honoured in dispatch, chunk base re-added
+ * in the hit decode) was already complete and correct.
+ *
+ * Contracts, which both backends must keep:
+ *   num_devices          enumerated devices, >= 1 when a backend is up.
+ *   active_device_count  devices that will actually receive a dispatch.
+ *                        The BF bootstrap wait waits on THIS count; using
+ *                        the enumerated count instead is what stalled
+ *                        every multi-chunk BF run to the 180 s cap on a
+ *                        rig with one disabled device.
+ *   dev_uuid             stable per-device key for the BF rate sidecar,
+ *                        FNV-1a 64-bit as "%016llx", out_sz >= 17. A key
+ *                        that moved between runs would silently disable
+ *                        persistence rather than fail. */
+static inline int mdx_gpu_num_devices(void)
+{
+#if defined(__APPLE__) && defined(METAL_GPU)
+    return gpu_metal_num_devices();
+#elif defined(OPENCL_GPU)
+    return gpu_opencl_num_devices();
+#else
+    return 0;
+#endif
+}
+
+static inline int mdx_gpu_active_device_count(void)
+{
+#if defined(__APPLE__) && defined(METAL_GPU)
+    return gpu_metal_active_device_count();
+#elif defined(OPENCL_GPU)
+    return gpu_opencl_active_device_count();
+#else
+    return 0;
+#endif
+}
+
+/* Largest brute-force chunk, in candidates, that one dispatch may carry.
+ *
+ * This is a TIME limit wearing a work limit's clothing, and it exists because
+ * Apple kills a command buffer that keeps the GPU from servicing the display:
+ * kIOGPUCommandBufferCallbackErrorImpactingInteractivity, at roughly 2 s.
+ *
+ * The BF servo cannot be left to find this on its own. Its target ramps 1 s to
+ * 5 s and then sits at 5 s by design -- Phase 1.7 made chunks suit the FASTEST
+ * device and recorded the intent as "weak devices accept long single-chunk
+ * walls (5s on 4090 -> 50s on 1080 -> 500s on Mali)". That is correct on
+ * OpenCL, where nothing interrupts a long kernel, and impossible on Metal.
+ * Worse, bf_rate_ema seeds at 1 GH/s for every device, so the FIRST chunk is
+ * sized for a GPU that may not exist: measured 2026-10-05, that seed is 4.4 s
+ * on dev1 (Apple M1, 226 MH/s on e786) and 2.1 s on dev3 (M2 Max, 477 MH/s).
+ * Even the CHUNK_MIN floor of 2^28 is 1.19 s on the M1. Waffle's
+ * `?b?b?b?b?b` run on the M2 Max found its hash at 38 percent and then FATALed
+ * on the watchdog, and the M1 would have failed on chunk one.
+ *
+ * 2^27 keeps a dispatch near half a second on the slowest Mac measured and
+ * about 1.3 s on a hypothetical 100 MH/s part, so the servo's own feedback
+ * still has room to shrink further if a machine is busy. The cost is more
+ * dispatches -- about 8200 instead of 515 across a 5-position ?b keyspace --
+ * which at roughly a millisecond of launch overhead each is noise against a
+ * run of that size.
+ *
+ * NOT a knob, deliberately, for the reason gpu_metal.m gives at its own
+ * watchdog FATAL: the threshold depends on what else the machine is doing, so
+ * a hand-picked value is never validated, only lucky. This is a ceiling the
+ * measuring servo works underneath, not a replacement for it. */
+static inline uint64_t mdx_gpu_bf_chunk_ceiling(uint64_t opencl_default)
+{
+#if defined(__APPLE__) && defined(METAL_GPU)
+    (void)opencl_default;
+    return (uint64_t)1 << 27;
+#else
+    return opencl_default;
+#endif
+}
+
+/* Does this backend want a WIDE grid with a short per-lane inner loop?
+ *
+ * bf_chunk_geometry pins mask_size_per_word at 128K and derives num_words
+ * from it, which is right when the chunk is large: num_words lands at or near
+ * the 16384 batch cap and the grid is saturated. It inverts badly once the
+ * chunk is small. Bounding a Metal chunk to 2^27 for the watchdog left
+ * nwords=1024 mspw=131072 -- 1024 threads on an M1 -- and MEASURED 2026-10-05
+ * that halved throughput, 226 MH/s to 116, on a 4-position ?b run that went
+ * from 19 s to 37 s.
+ *
+ * The same work reshaped as nwords=16384 mspw=8192 is the identical candidate
+ * count in sixteen times the threads with a short inner loop. The chunk
+ * ceiling bounds TIME; this bounds OCCUPANCY; they are independent and both
+ * are needed, because a watchdog-safe chunk that under-occupies the GPU just
+ * trades a FATAL for half the throughput.
+ *
+ * OpenCL keeps the original preference. Its chunks are 2^31-sized, where
+ * num_words already pins to the cap, so the two orders agree there -- and the
+ * Phase 1.7 numbers on the 1080, 3080, 4070 Ti and gfx1201 were measured
+ * under the existing order. Nothing is gained by re-deriving them. */
+static inline int mdx_gpu_prefers_wide_grid(void)
+{
+#if defined(__APPLE__) && defined(METAL_GPU)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static inline void mdx_gpu_dev_uuid(int dev_idx, char *out, size_t out_sz)
+{
+#if defined(__APPLE__) && defined(METAL_GPU)
+    gpu_metal_dev_uuid(dev_idx, out, out_sz);
+#elif defined(OPENCL_GPU)
+    gpu_opencl_dev_uuid(dev_idx, out, out_sz);
+#else
+    (void)dev_idx;
+    if (out && out_sz) out[0] = 0;
+#endif
+}
 #endif
 
 
@@ -276,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.615 2026/10/03 15:12:03 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.622 2026/10/07 18:18:02 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.615 2026/10/03 15:12:03 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.622 2026/10/07 18:18:02 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -297,6 +436,45 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.622  2026/10/07 18:18:02  dlr
+ * Fold the -i iteration depth into the brute-force progress divisor. Tothash counts hash OPERATIONS and a chain N deep costs N of them per candidate-salt pair, so the divisor that recovers candidate position needs the depth alongside the per-type internal round count and the live salt count. Revision 1.593 built that divisor from the latter two and left the depth out; its log notes MD5 brute force was already correct, which was true only at the default -i 1. Reported by Waffle against a 7-position 68-character mask at -i 2: the display read 13.3T of a 6.7T keyspace, exactly 2.000000 times over, with the percentage reading 100 percent, the sample candidate stuck at the final mask value and the ETA saying done while 23 minutes of work remained. Three symptoms from one cause, the same three and the same cause as the DESCRYPT case 1.593 fixed, because all of them follow from progress exceeding the keyspace: the percentage hits the pct greater than 100 clamp, sample_idx clamps to BruteForceTotal minus 1, and remaining goes to zero once progress is no longer less than the total. Maxiter is global rather than per-type so it scales every term of the sum, and at -i 1 the multiplier is bit-identical to before, leaving the overwhelmingly common case untouched. The linear relation was measured rather than assumed: a 1000-candidate mask on .205 reports exactly 1,000 and 2,000 and 3,000 and 10,000 operations at -i 1 and 2 and 3 and 10. Verified by A-B on fpga GTX 1080, same host and GPU and mask and depth, pre-fix build against post-fix: a 36-to-the-7 mask of 78,364,164,096 candidates at -i 2 printed 55.6G of 78.4G at 71.0 percent with ETA 6s and then 115.7G of 78.4G at 100 percent with ETA done and the candidate clamped to zzzzzzz, while the fixed build printed 27.8G at 35.4 percent with ETA 27s and then 55.7G at 71.1 percent with ETA 12s and real sample candidates. The two runs report an identical 156,728,557,568 total hash calculations, so nothing computed changes and no stored result is affected: this is the progress display and the ETA only. Note for future work that the CPU mask path accrues Tothash in coarse chunks, so -G none cannot exercise this display and is not a valid verification vehicle; the iteration factor enters through the GPU accounting, as the comment at the site says, and a GPU host is required.
+ *
+ * Revision 1.621  2026/10/06 18:34:29  dlr
+ * Stop the fresh-scan line count reporting about 2x on large wordlists. Two writers shared one accumulator with incompatible meanings: linecount_thread ADDS each file authoritative count to AutoCountTotalLines, while the main read loop ETA self-correction CAS-SET the same global to a byte-ratio projection. AutoCountTotalLines starts at 0, so on a fresh scan the main loop very first chunk satisfied Fileline > 0, projected roughly the true total, and the background scan then added the real count on top. Reported against 1.615 at 82,000,000 lines counted as 164,000,491, with every derived figure inheriting it: a run 59.5 percent complete showing 29.8 percent and an ETA twice as long. The stored cache value was never wrong, which is why the next run over the same file read correctly and the defect survived. It was a race rather than a size bug -- the scan beat the main loop first chunk under roughly 290 MB and no projection ever fired. The projection now lives in its own ProjectedTotalLines and AutoCountTotalLines is single-writer again, belonging to the counter thread alone. ReportStats prefers the authoritative count once AutoCountDone and falls back to the projection only until then, with deliberately NO fallback to AutoCountTotalLines mid-accumulation because that is a partial multi-file sum and showing it as a total is the same category of error. ALSO FIXED, and missed by the original report: Fileline resets per file while AutoCountTotalLines spans every file, so the comparison mixed a file-local counter with a multi-file total; on file 1 of a set the projection landed in the global and the thread then added all N on top. The projection now adds the lines already completed in earlier files so both sides mean the same thing. The cache-expunge test is additionally gated on AutoCountDone, since mid-accumulation auto_now is a running sum and could expunge a good row; its remaining per-file-versus-global imprecision is documented in place rather than half-fixed, because correcting it needs the per-file cached value that loop does not have. Validated pre and post on x86-64: single 768 MB file 63,999,981 to 32,000,000; three files 127,999,981 to 96,000,000, where the pre-fix excess is exactly one file projection; a 240 MB file unchanged at 10,000,000; a 345 MB gzip at 32,000,000; and a 1.0 GB gzip of 9.2 GB raw at 384,000,000 with the post-scan percentage correct at 98.1. SEPARATE PRE-EXISTING DEFECT, NOT FIXED HERE and now visible because the projection is displayed on its own: the byte ratio mixes units. CurfileBytesTotal is sb.st_size, the COMPRESSED size on disk, while CurfileBytesRead accumulates creader_read lengths, which are DECOMPRESSED. On a compressed input fread exceeds fsize, the fread < fsize guard fails, projected degenerates to Fileline and the provisional percentage reads about 100 throughout -- measured 99.4 percent at 182,408,422 of 384,000,000, which is 47.5. Behaviour is unchanged from before this commit, where the same value was displayed through AutoCountTotalLines.
+ *
+ * Revision 1.620  2026/10/06 18:14:45  dlr
+ * Make the brute-force iteration ceiling discoverable instead of mysterious. Dividing the Metal chunk ceiling by per-candidate cost does not make iterated types unsuitable for brute force -- running them at any iteration level is one of the primary uses. What it does is bound the iteration level that FITS one dispatch: with a budget of B work units and I iterations per candidate a chunk holds B/I candidates, so the arithmetic runs out as I approaches B. At the Metal budget of 2^27 that boundary is about 1.34e8 iterations per candidate, which puts SHA1DRU two orders under it and a BCRYPT cost of 27 or more over it. Past that point even ONE candidate is more work than a single command buffer may hold and no host-side sizing can help, so the run now says so once, naming the iteration count, the budget and both remedies: re-factor the work, or take the CPU path with -G none. Waffle 2026-10-06: that limit is the operator to discover and work around, but only if they are told what they hit -- reaching the watchdog with no explanation reads as a tool defect rather than a budget. KNOWN LIMIT: bf_op_iter_estimate is static for BCRYPT and PHPBB3 because their real cost lives in the salt and the producer holds no salt snapshot, so for those two the warning will not fire at the true boundary and the watchdog FATAL remains the discovery path. Reading the real cost through TYPESALT(op) would let costs between the estimate and the boundary run on the GPU rather than failing, and is deliberately not done here: rev 1.2514 removed every JSLF on Typesalt from this path in favour of snapshots. Verified on an M2 Max: e404 at a one-candidate keyspace sizes to chunk_total=1, recovers the hit, and the warning correctly stays silent.
+ *
+ * Revision 1.619  2026/10/06 15:08:57  dlr
+ * Hard salt limit, and make the brute-force chunk ceiling bound WORK rather than candidate count. Two defects, both silent. (1) GPU_SALT_PACK_MAX, 2^32-10, now enforced at both salt-pack sites here and in both backend packers. gpu_pack_salts_op uses one uint32 counter as BOTH the recorded per-salt offset AND the memcpy destination, so wrapping it does not merely record wrong offsets, it writes later salts back over earlier ones inside the allocation with no fault and no diagnostic, and every digest computed against an overwritten salt is wrong while the run still exits 0. Not hypothetical at these volumes: Waffle notes hashcat mode 2811, which is e367 MD5-MD5SALTMD5PASS here, draws its salt from a 95-character set over 5 positions, so 95^5 equals 7,737,809,375 distinct salts exist. At 5 raw bytes each the counter wraps at 858,993,459 salts and for the types that pack the 32-byte MD5 of the salt it wraps at 134,217,728. The device limit is NOT the same thing and the faster machine is the more dangerous one: maxBufferLength measured 2026-10-06 is 4096 MB on an Apple M1 and 39813 MB on an M2 Max, so the M1 fails the allocation and dies loudly where the M2 Max allocates happily and runs into the silent wrap. (2) bf_op_iter_estimate divides the backend chunk ceiling by the op per-candidate iteration count. The 2^27 Metal ceiling added yesterday counted CANDIDATES with no term for the cost per candidate, which is precisely the error gpu_metal.m already records having made once, that a budget counting work items carries no term for the cost per item and any engine costing more per item goes straight through it. Measured on an M2 Max: e404 SHA1DRU under ?b?b?b?b took a 134,217,728-candidate chunk at 10^6 iterations each, roughly 10^14 operations in one command buffer, 0.0 percent and 0.00 h/s after two minutes and about three days for a single chunk. It does not FATAL, it wedges, which is worse than the watchdog kill the ceiling was meant to prevent. The table mirrors gpu_compute_iter_sum reduced to what depends on op alone; the salt-derived counts for BCRYPT and PHPBB3 use deliberately HIGH defaults because over-estimating shrinks the chunk, which is the safe direction. Post-fix e404 completes: exit 0, 490 batches, the hit recovered, zero FATAL lines, GPU at 99 percent utilisation. Validated: Metal maskhb 6 of 6 on both Macs and a 70-type brute-force differential at 59 PASS with zero mismatches; OpenCL unchanged by measurement, bfshape passing with the 2^31 ceiling and the grid at the word cap, maskhb 6 of 6, salted brute force matching, and e404 still choosing a 65,536-candidate chunk rather than 134, which is what proves the divisor is Metal-only.
+ *
+ * Revision 1.618  2026/10/06 04:58:33  dlr
+ * Metal brute force survives Apple ImpactingInteractivity, at full rate. Two backend-gated shims, both identity on OpenCL. (1) mdx_gpu_bf_chunk_ceiling bounds a chunk to 2^27 on Metal. The BF servo could never have found this itself: target_s ramps 1 to 5 seconds and then sits at 5 by design, Phase 1.7 having recorded the intent as weak devices accept long single-chunk walls, 5s on 4090 to 50s on 1080 to 500s on Mali. That is right where nothing interrupts a long kernel and impossible under a watchdog that kills a command buffer at roughly 2 seconds. Worse, bf_rate_ema seeds at 1 GH/s for every device whatever the device is: measured, that seed is 4.4 seconds on dev1 at 226 MH/s and 2.1 on dev3 at 477, and even the CHUNK_MIN floor of 2^28 is 1.19 seconds on the M1. Waffle ?b?b?b?b?b run on the M2 Max found its hash at 38 percent and then FATALed; the M1 would have failed on chunk one, which is what he predicted from the slower GPU. The ceiling is applied after the floor so it overrides that too, and it is deliberately not a knob, for the reason gpu_metal.m already gives at its own watchdog FATAL: the threshold depends on what else the machine is doing, so a hand-picked value is never validated, only lucky. (2) mdx_gpu_prefers_wide_grid inverts bf_chunk_geometry on Metal to derive mask_size_per_word from the 16384 word cap rather than pinning it at 128K and deriving num_words. Needed because the ceiling alone left nwords=1024, 1024 threads on an M1, and MEASURED cost half the throughput, 226 MH/s to 116 and 19 seconds to 37, with every correctness test still green and no diagnostic emitted. The same work as nwords=16384 mspw=8192 is 19 seconds and 226.59 MH/s again. The ceiling bounds time, the grid bounds occupancy, and a watchdog-safe chunk that under-occupies the GPU only trades a FATAL for half the rate. Validated end to end on the full 1,099,511,627,776 keyspace: dev3 M2 Max 2156 s at 510 MH/s and dev1 M1 4646 s at 237 MH/s, both exit 0, both recovering HEX 636166c3a9, zero FATAL lines on either. OpenCL verified unchanged by measurement rather than argument: same geometry chunk_total 2147483648 nwords 16384 mspw 131072, same hit, hit sets byte-identical against the pre-change binary on an RTX 4070 Ti SUPER.
+ *
+ * Revision 1.617  2026/10/05 22:18:48  dlr
+ * Brute force on Metal: widen the chunk-as-job producer off OPENCL_GPU, behind a backend-neutral device shim. The producer was never OpenCL-specific in its logic; it was gated on OPENCL_GPU because three device calls inside it had no Metal twin. The Metal kernel side was already complete and correct -- metal_kernel_a_bruteforce, mask_start and mask_offset_per_word and bf_num_masks and bf_inner_iter honoured in dispatch, chunk base re-added in the hit decode. Three shims, mdx_gpu_num_devices, mdx_gpu_active_device_count and mdx_gpu_dev_uuid, same shape and for the same reason as mdx_kernel_a_proto_enabled: an unguarded gpu_opencl_ call breaks the Metal build at link, which is what rev 1.488 did. active_device_count is deliberately distinct from num_devices because the BF bootstrap wait waits on the dispatching count, and waiting on an enumerated-but-disabled device is what stalled every multi-chunk run to the 180 second cap. dev_uuid is byte-compatible with the OpenCL one, FNV-1a 64-bit as %016llx, because the BF rate sidecar keys on it and a key that moved between runs would silently disable persistence rather than fail. Six regions widened to a new GPU_BF_CHUNK_PRODUCER rather than to GPU_ENABLED: GPU_ENABLED also covers CUDA_GPU, which has no BF kernel and answers 0 devices through the shim, and the activation arm clamps a 0 count up to 1, so reusing it would have compiled a producer that looks plausible and cannot run. The producer-loop servo call had to move with the activation arm: compiled out while use_bf_chunks is 1 leaves this_chunk at 0 and while (chunk_cursor < MaskTotal) never advances. Validated: Metal e1 and salted e31 brute force byte-exact against the CPU on dev1 M1 and dev3 M2 Max with the producer firing and the GPU summary carrying the hits; a 3e9-candidate mask produces 3 batches in 5 seconds, which is also the proof that the gpujob_metal telemetry added in gpu/gpujob_metal.m 1.55 is now live, since without feedback the bootstrap wait would have run to the 180 second cap. OpenCL regression on an RTX 4070 Ti SUPER: e1, salted e31, non-BF wordlist and a 3e9 multi-chunk run all byte-exact against -G none with the producer firing. mdxfind.c also compiles with no GPU macro at all, mdxfind_u8.o, and the BF servo symbols are correctly absent from that object -- the configuration that broke on this class of change at 1.533 and again on the Windows ARM64 cross-compile.
+ *
+ * Revision 1.616  2026/10/05 03:45:23  dlr
+ * Drop iconv entirely, and make NTLM read its code pages from tables.
+ *
+ * All 32 iconv call sites are gone, along with the include, the three iconv_open calls and the iconv_t declarations. The conversions live in ruleproc32.c 1.18 beside utf8_to_utf32, which already defined well-formed UTF-8 for the -8 rule engine, so there is now ONE answer to that question in the program instead of one per call site.
+ *
+ * The audit that motivated it: of the 32 sites, 8 tested "did any output appear" and so accepted a partial conversion, 3 computed a length straight from ic_outleft behind the same test, 11 tested the iconv return, and 2 tested the (size_t)-1 sentinel correctly. The 11 are the interesting group, because that test is correct on glibc and INEFFECTIVE on macOS libiconv: measured directly, for the bytes 61 81 62 glibc returns -1 with EILSEQ and macOS returns a non-negative count, both reporting the input fully consumed after silently deleting a byte. So roughly 22 of 32 sites carried a guard that was wrong, or right on one platform only -- one defect class replicated twenty-two times because //IGNORE made partial success the default and every site invented its own test for it. The replacements return a length or a negative, never a partial result, so the question does not arise.
+ *
+ * JOB_NTLM, e369. The two code-page readings now go through cp_to_utf16 rather than CP125x to UTF-8 to UTF-16LE through iconv, which could not express the six positions Windows defines and Unicode.org leaves undefined -- //IGNORE dropped them, strict conversion failed -- so a password containing one had NO reachable digest. The bytes 61 81 62 as CP1252 now give 1888bcbee9c6d4b8501c495d24314a9b, which is the real Windows NTLM and which this could not previously produce. Reporting is the UTF-8 form of the same codepoints, verified to validate in hashcat 6.2.5 and hashpipe. Coincident readings are now decided BEFORE any hashing, so a redundant MD4 is never performed rather than performed and discarded: all-ASCII means all three readings are the same bytes, and cp_tables_agree means the CP1252 reading would be identical to the CP1251 one. Nothing else can coincide, because any byte at or above 0x80 makes the UTF-8 reading SHORTER than 2*len while both table readings are exactly 2*len. An ASCII candidate costs 1 MD4 where it cost 3. hx.8 note [29] still says three emissions and needs correcting.
+ *
+ * JOB_NTLMH, e786, keeps BOTH readings. The zero-extend one matches neither Windows nor hashcat 6.2.5 -- measured on fpga.local, hashcat recovers a zero-extend digest 0 times out of 1 -- but it has RECORDED RESULTS and nothing else in the catalog computes it: six of the seventeen NTLMH pairs in the regression corpus are zero-extend digests, every one a high-bit candidate, and unlike a no-op MD5CAP they have no twin under another label. Removing the construction would invalidate them outright, which is the cost the add-only rule names. An all-ASCII candidate now costs 1 MD4 instead of 2, the readings being identical below 0x80.
+ *
+ * Both types stop crediting a candidate they did not hash. The corpus holds NTLMHx01 b3f4b4d05705228f87ed95e91e25bc70 with the plaintext c0ffeebabe, where that digest is really the digest of eebabe after iconv dropped c0 and ff -- and it holds the honest NTLM line for the same preimage. Two such lines stop being emitted and both hashes stay solvable from their true preimages.
+ *
+ * SHA1UTF7 loses the appended X, which existed only to force iconv to flush and which WROTE into the candidate buffer as a side effect. utf8_to_utf7 flushes because it is told to, and its length is exactly the old output-with-X minus one, so the guard is the same test.
+ *
+ * The one site with a deliberate zero-extend fallback keeps it, and becomes deterministic: its old test could not fire on macOS, so there the truncated conversion was hashed instead of the fallback.
+ *
+ * Regression. e369 recovers 23 of 23 of its own prior corpus results. e786 recovers 15 of 17, the two omissions being the dropped-byte artifacts above. The UTF-16, NTLM, LM, UTF-7 and MD4 family resolve 56 of 56 registered vectors. Astral input still correct through the surrogate pair, U+1F600 giving 4b58a10cc20a4e7d808d218e1f80aabc. The empty password now resolves to 31d6cfe0d16ae931b73c59d7e0c089c0, previously unreachable. False positives over the corpus hashes with wrong candidates: 0, against a 3 of 3 positive control.
+ *
+ * Recorded because it cost real time: a clean build is NOT evidence that a line-number splice landed where intended. A first attempt at this sweep applied absolute line assignments after earlier splices had shifted the file, putting one statement inside a loop body and another inside a comment block, and it compiled with zero errors because both were syntactically valid where they landed. Only reading the regions back caught it. The sweep was redone with every edit verifying its target content first, an overlap assertion across all ranges, and application in strictly descending order.
+ *
  * Revision 1.615  2026/10/03 15:12:03  dlr
  * Two type-identity fixes, both found from a single mis-filed solution list.
  *
@@ -10646,6 +10824,28 @@ static _Atomic int bf_first_feedback_seen = 0;
 /* ETA progress tracking for ReportStats */
 static unsigned long long EstimatedTotalLines = 0;  /* from -W <count> */
 static volatile unsigned long long AutoCountTotalLines = 0;  /* from -W auto */
+/* Byte-ratio PROJECTION of the total, kept apart from AutoCountTotalLines.
+ *
+ * These two quantities have incompatible meanings and used to share one
+ * accumulator: linecount_thread ADDS each file's authoritative count to it,
+ * while the main read loop's ETA self-correction CAS-SET it to a projection.
+ * AutoCountTotalLines starts at 0, so on a fresh scan the main loop's very
+ * first chunk satisfied `Fileline > 0`, projected roughly the true total, and
+ * the background scan then added the real count ON TOP -- reporting about 2x,
+ * with the remainder being the projection's rounding. The stored cache value
+ * was never wrong, so the next run over the same file read correctly, which is
+ * how it survived. Reported 2026-10-06 against 1.615 at 82,000,000 lines
+ * counted as 164,000,491; every derived figure inherited it, a run 59.5 percent
+ * complete reporting 29.8 percent with an ETA twice as long.
+ *
+ * It was a race, not a size bug: the scan beat the main loop's first chunk on
+ * inputs under roughly 290 MB and no projection ever fired.
+ *
+ * The projection is still wanted -- it is what gives an ETA before the count
+ * lands, which matters most on a compressed input where the scan is a full
+ * decompress -- so it is kept, in its own variable, and read only until
+ * AutoCountDone. */
+static volatile unsigned long long ProjectedTotalLines = 0;
 static volatile int AutoCountDone = 0;  /* 1 = background counter finished */
 static int AutoCountRequested = 0;  /* 1 = -W auto was requested */
 static char **LineCountArgv = NULL;  /* file list for background counter */
@@ -12588,7 +12788,7 @@ static inline void lm_des_key(const unsigned char *raw7, DES_key_schedule *ks)
  * retains the prior implementations (mdxfind.c rev 1.449). See
  * project_bf_chunk_as_job.md Phase 3. */
 
-#if defined(OPENCL_GPU)
+#if defined(GPU_BF_CHUNK_PRODUCER)
 extern int gpu_op_family(int op);
 
 /*
@@ -12623,7 +12823,16 @@ static void bf_chunk_geometry(uint64_t *chunk_total_io,
      * < default mspw, shrink mspw to match (single-word chunk fully covers
      * the keyspace; kernel runs exactly chunk_total lanes). */
     uint32_t mspw;
-    if (chunk_total < (1ULL << 17)) {
+    if (mdx_gpu_prefers_wide_grid()) {
+        /* Derive mspw FROM the word cap instead of the other way round, so
+         * the grid stays saturated at whatever chunk size the watchdog
+         * ceiling allows. Rounded DOWN to a power of two, because the kernel
+         * divmods on it. */
+        uint64_t per_word = chunk_total / (uint64_t)GPU_RULES_MAX_WORDS_PER_BATCH;
+        uint32_t m = 1u;
+        while ((uint64_t)m * 2u <= per_word && m < (1u << 28)) m *= 2u;
+        mspw = m;
+    } else if (chunk_total < (1ULL << 17)) {
         mspw = (uint32_t)chunk_total;
         if (mspw == 0u) mspw = 1u;
     } else {
@@ -12728,7 +12937,7 @@ static int bf_sidecar_path(int dev_idx, int op, char *out, size_t cap) {
     const char *home = getenv("HOME");
     if (!home || !*home) return -1;
     char uuid[32];
-    gpu_opencl_dev_uuid(dev_idx, uuid, sizeof(uuid));
+    mdx_gpu_dev_uuid(dev_idx, uuid, sizeof(uuid));
     if (uuid[0] == 0) return -1;
     /* Build lowercase op name. Types[] indexed by op (small, well-bounded;
      * fits in 32 chars for all 200+ entries). */
@@ -12850,6 +13059,44 @@ static int bf_sidecar_write_rate(const char *path, uint64_t rate) {
  *
  * Returns 0 on success, -1 on permanent failure (op has no GPU support).
  */
+/* Per-candidate iteration count, as a COST multiplier for the brute-force
+ * chunk ceiling. Mirrors the table gpu_compute_iter_sum() documents in
+ * gpu/gpujob_opencl.c, reduced to the part that depends on `op` alone --
+ * the producer has no salt snapshot to read, so the salt-derived counts use
+ * a deliberately HIGH default: over-estimating shrinks the chunk, which is
+ * the safe direction.
+ *
+ * Why this is needed at all: a backend chunk ceiling is a WORK budget, but
+ * it is expressed in CANDIDATES, and candidate cost spans six orders of
+ * magnitude across these types. That is the exact error gpu_metal.m already
+ * records having made once -- "the budget it enforces ... counts work ITEMS
+ * and carries no term for the cost PER item. Any engine that costs more per
+ * item goes straight through it." The 2^27 Metal ceiling added on 2026-10-05
+ * repeated it: MEASURED on an M2 Max, e404 SHA1DRU under ?b?b?b?b took a
+ * 134,217,728-candidate chunk at 10^6 iterations each, roughly 10^14 hash
+ * operations in ONE command buffer -- 0.0 percent and 0.00 h/s after two
+ * minutes, about three days for a single chunk. It does not even FATAL; it
+ * simply wedges, which is worse than the watchdog kill it was meant to stop.
+ *
+ * Dividing the ceiling by this keeps the WORK per dispatch constant, so an
+ * iterated type gets proportionally fewer candidates and the same wall. */
+static uint64_t bf_op_iter_estimate(int op)
+{
+    switch (op) {
+    case JOB_SHA1DRU:        return 1000000ULL;  /* fixed, Drupal 1M-iter   */
+    case JOB_SHA256CRYPT:                        /* rounds=N$, default 5000 */
+    case JOB_SHA512CRYPT:
+    case JOB_SHA512CRYPTMD5: return 5000ULL;
+    case JOB_MD5CRYPT:       return 1000ULL;     /* fixed, RFC 1321         */
+    case JOB_BCRYPT:         return 1ULL << 14;  /* salt-derived 1<<cost;   */
+                                                 /* 14 covers the common    */
+                                                 /* 10-12 with headroom     */
+    case JOB_PHPBB3:         return 1ULL << 15;  /* salt-derived; $H$ char  */
+    case JOB_DESCRYPT:       return 25ULL;       /* fixed, Unix crypt(3)    */
+    default:                 return 1ULL;
+    }
+}
+
 static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
                                   int num_devs, int op,
                                   uint64_t *out_chunk_total,
@@ -12943,12 +13190,13 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
      * no gpujob worker and never dispatches, so counting it here leaves the
      * wait below unsatisfiable and it runs to the safety cap. */
     int num_live;
-#if defined(OPENCL_GPU)
-    num_live = gpu_opencl_active_device_count();
+    /* Devices that will actually DISPATCH, not merely enumerate: the
+     * bootstrap wait below waits on this count, and waiting on an
+     * enumerated-but-disabled device is what stalled every multi-chunk BF
+     * run to the 180 s cap. Backend-neutral via the shim; Metal answers 1
+     * once init succeeded and 0 if it did not. */
+    num_live = mdx_gpu_active_device_count();
     if (num_live <= 0 || num_live > BF_MAX_GPU_SLOTS) num_live = 1;
-#else
-    num_live = 1;
-#endif
     if (!atomic_load_explicit(&bf_first_feedback_seen, memory_order_relaxed) &&
         bf_chunks_produced >= (uint32_t)(2 * num_live)) {
         /* Phase 1.7c (2026-05-09): wait for ALL live devices to post
@@ -13051,6 +13299,55 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
     double cands_d = (double)bf_rate_ema * target_s;
     if (cands_d < (double)CHUNK_MIN) cands_d = (double)CHUNK_MIN;
     if (cands_d > (double)CHUNK_HARD) cands_d = (double)CHUNK_HARD;
+    /* Backend ceiling LAST, so it also overrides the CHUNK_MIN floor. On
+     * Metal that floor is itself over a second on an M1 and the floor must
+     * not be the thing that trips Apple's watchdog. Identity on OpenCL. */
+    {
+        uint64_t _base  = mdx_gpu_bf_chunk_ceiling(CHUNK_HARD);
+        uint64_t _ceil  = _base;
+        if (_base != CHUNK_HARD) {
+            /* A backend ceiling is in force. It is a WORK budget written in
+             * candidates for a cost-1 type, so divide by this op's cost to
+             * bound work rather than candidate count. Identity for the types
+             * whose estimate is 1.
+             *
+             * This does NOT make iterated types unsuitable for brute force --
+             * running them at any iteration level is one of the primary uses.
+             * What it does is bound the iteration level that FITS one
+             * dispatch: with a budget of B work units and I iterations per
+             * candidate, a chunk holds B/I candidates, so the arithmetic runs
+             * out when I approaches B. At the Metal budget of 2^27 that is
+             * about 1.34e8 iterations per candidate -- SHA1DRU's 10^6 sits
+             * two orders under it, a BCRYPT cost of 27 or more sits over.
+             * Past that point even ONE candidate is more work than a single
+             * command buffer may hold, and no host-side sizing can help. */
+            uint64_t _it = bf_op_iter_estimate(op);
+            if (_it > 1) {
+                _ceil /= _it;
+                if (_ceil == 0) {
+                    _ceil = 1;
+                    /* Say so plainly and once, naming the remedy. The limit is
+                     * the operator's to work around -- refactor the keyspace,
+                     * or take the CPU path -- but only if they are told what
+                     * they have hit. Reaching the watchdog with no explanation
+                     * reads as a tool defect rather than a budget. */
+                    static int bf_iter_over_budget_warned = 0;
+                    if (!bf_iter_over_budget_warned) {
+                        bf_iter_over_budget_warned = 1;
+                        fprintf(stderr,
+    "WARNING: op=%d runs about %llu iterations per candidate, which is more "
+    "than the %llu work units one GPU dispatch may hold on this backend "
+    "before the host watchdog kills it. Even a single candidate per dispatch "
+    "is over budget, so this run is expected to hit that limit. Re-factor the "
+    "work into smaller pieces, or run it on the CPU with -G none.\n",
+                            op, (unsigned long long)_it,
+                            (unsigned long long)_base);
+                    }
+                }
+            }
+        }
+        if (cands_d > (double)_ceil) cands_d = (double)_ceil;
+    }
     uint64_t chunk_total = (uint64_t)cands_d;
 
     /* BF Phase 1.8 (2026-05-10): track salts_per_page early because both
@@ -13262,6 +13559,40 @@ static int adaptive_bf_chunk_size(uint64_t mask_total, uint64_t chunk_cursor,
 #pragma GCC diagnostic ignored "-Wstringop-truncation"
 #endif
 #pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+/* Is every byte below 0x80?  Then the UTF-8 reading and both code-page
+   readings are the SAME bytes -- table[b] == b below 0x80 in both, and UTF-8 is
+   the identity over ASCII -- so one conversion and one MD4 suffice where three
+   were being computed.  Not a conversion, so it stays here; the conversions
+   themselves live in ruleproc32.c beside utf8_to_utf32, which is what defines
+   "well-formed UTF-8" for this program. */
+/* The old iconv conversion idiom, which this file used thirty times, as one
+   call.
+   utf8_to_utf16 lives in ruleproc32.c beside utf8_to_utf32, so there is ONE
+   definition of well-formed UTF-8 for the whole program.  It returns a LENGTH
+   or a negative RULE32_ERR_*, never a partial result -- which is the point:
+   //IGNORE silently DROPPED what it could not convert, so every one of those
+   sites had to invent its own test for partial success, and the audit found 8
+   using "did any output appear" and 11 using a return code that is correct on
+   glibc and ineffective on macOS libiconv.  u32buf is procjob's per-thread
+   UTF-32 scratch. */
+#define U8TO16LE(src, slen, dst, cap) \
+  utf8_to_utf16((const unsigned char *)(src), (slen), (unsigned char *)(dst), \
+                (int)(cap), u32buf, MAXLINE + 16, UTF16_LE)
+
+/* Same conversion, big-endian: one byte-order flag in put16 rather than a
+   second iconv converter. */
+#define U8TO16BE(src, slen, dst, cap) \
+  utf8_to_utf16((const unsigned char *)(src), (slen), (unsigned char *)(dst), \
+                (int)(cap), u32buf, MAXLINE + 16, UTF16_BE)
+
+static int ntlm_all_ascii(const unsigned char *s, int len)
+{
+  int i;
+  for (i = 0; i < len; i++)
+    if (s[i] & 0x80) return 0;
+  return 1;
+}
+
 MDXALIGN void procjob(void *dummy) {
 struct job *job;
 char *d, *s1, *s2, *s, *csalt, *cur, *curkey, eofsalt;
@@ -13325,6 +13656,9 @@ char *linebuf, *linebuf2, *tsalt, *tline, *XMLline, *Origline;
 char *rule_base;       /* Phase 4: cached rule output for mid-mask-cycle restore */
 int rule_base_len = -1;
 wchar_t *wline, *wline1;
+/* UTF-32 scratch for the ruleproc32 conversions: they run per candidate, so a
+ * MAXLINE-sized local is not an option. */
+uint32_t *u32buf;
 char *mdbuf, *newbuf;
 struct saltentry *saltsnap;
 char *saltpool;
@@ -13342,23 +13676,21 @@ sph_sha512_context sha512ctx;
 void *cryptctx;
 char *icin, *icout;
 size_t ic_inleft, ic_outleft;
-iconv_t cd, cd1, cd2, cd_cp1251, cd_cp1252, cd_utf8;
+/* iconv is gone entirely.  Every conversion this file used to ask it for --
+   UTF-8 to UTF-16LE and BE, the CP1251 and CP1252 code pages, and UTF-7 -- now
+   lives in ruleproc32.c beside utf8_to_utf32, which already defined what
+   well-formed UTF-8 means for the -8 rule engine.  Three things went wrong with
+   asking iconv: //IGNORE silently DROPPED what it could not convert, so a
+   malformed candidate was shortened and hashed rather than refused; glibc and
+   macOS libiconv disagree about what //IGNORE returns, so the same candidate
+   was accepted on one platform and skipped on the other; and linking glibc's
+   iconv statically dlopens gconv modules, which segfaults on a host with a
+   different glibc while passing every test on the build host.  The replacements
+   were gated by differential testing against iconv itself: 4,131,588 inputs for
+   UTF-16 and 288,721 for UTF-7, zero mismatches, with every disagreement on
+   REFUSAL being iconv accepting something ill-formed that we now decline. */
 const char *memreason = "Procjob initialization";
 struct timespec ltime;
-
-cd = iconv_open("UTF-16LE//IGNORE","UTF-8");
-cd1= iconv_open("UTF-16BE//IGNORE","UTF-8");
-cd2= iconv_open("UTF-7//IGNORE","UTF-8");
-cd_cp1251 = iconv_open("UTF-8//IGNORE","CP1251");
-cd_cp1252 = iconv_open("UTF-8//IGNORE","CP1252");
-cd_utf8 = iconv_open("UTF-8","UTF-16LE");
-if (cd == (iconv_t)-1 || cd1 == (iconv_t)-1 || cd2 == (iconv_t)-1 ||
-    cd_cp1251 == (iconv_t)-1 || cd_cp1252 == (iconv_t)-1 ||
-    cd_utf8 == (iconv_t)-1) {
-    fprintf(stderr,"Cannot initialize iconv\n");
-    perror(memreason);
-    exit(1);
-}
 
 struct rule_workspace *rule_ws = malloc_lock(sizeof(struct rule_workspace), memreason);
 
@@ -13373,6 +13705,7 @@ XMLline = malloc_lock(MAXLINE + 16,memreason);
 Origline = malloc_lock(MAXLINE + 16,memreason);
 wline = malloc_lock((MAXLINE + 16) * sizeof(wchar_t),memreason);
 wline1= malloc_lock((MAXLINE + 16) * sizeof(wchar_t),memreason);
+u32buf = malloc_lock((MAXLINE + 16) * sizeof(uint32_t),memreason);
 mdbuf = malloc_lock(MAXLINE+16,memreason);
 newbuf = malloc_lock(MAXLINE+16,memreason);
 Outbuf = malloc_lock(OUTBUFSIZE+1024,memreason);
@@ -13465,7 +13798,7 @@ while (1) {
     __sync_fetch_and_sub(&MDXpaused_count, 1);
   }
 
-#if defined(OPENCL_GPU)
+#if defined(GPU_BF_CHUNK_PRODUCER)
   /* BF chunk-as-job (Tranche 3, 2026-05-09): main thread produces chunk
    * descriptors with JOBFLAG_BF_CHUNK; procjob short-circuits here to fill
    * a synthetic single-empty-plaintext rules-engine slot and submit
@@ -15544,14 +15877,10 @@ do {
     }
     if (Unicode) {
       FastRule = 0;
-      icin = cur; 
-      ic_inleft = len;
-      icout = (char *)wline1;
-      ic_outleft = MAXLINE*2;
-      j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-      if (ic_outleft != MAXLINE*2) {
+      j = U8TO16LE(cur, len, wline1, MAXLINE*2);
+      if (j > 0) {
 	cur = (char *) wline1;
-	len = (MAXLINE*2) - ic_outleft;
+	len = j;
 	job->pass = cur;
 	job->clen = len;
       }
@@ -19222,13 +19551,9 @@ sha512salt_s:
                     peplen = 0;
                   memmove(linebuf + MAXLINE - saltlen, s1, saltlen);
                   memmove(linebuf + MAXLINE + len, pepper, peplen);
-		  ic_inleft = len+saltlen+peplen;
-		  icin = linebuf+MAXLINE-saltlen;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE*2;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft != MAXLINE*2) {
-		  x = (MAXLINE*2)-ic_outleft;
+		  x = U8TO16LE(linebuf+MAXLINE-saltlen, len+saltlen+peplen,
+		               wline, MAXLINE*2);
+		  if (x > 0) {
                   mysha1((char *) wline, x, curin.h);
                   hashcnt++;
                   if (checkhashkey(&curin, 40, s1, job)) {
@@ -20034,14 +20359,9 @@ sha1saltpass:
 		if (Unicode) {
 		    MD4(cur, len, md5buf.h);
 		} else {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE*2;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft == MAXLINE*2) break;
-		  ic_outleft = (MAXLINE*2) - ic_outleft;
-		  MD4((char *) wline, ic_outleft, md5buf.h);
+		  x = U8TO16LE(cur, len, wline, MAXLINE*2);
+		  if (x <= 0) break;
+		  MD4((char *) wline, x, md5buf.h);
 		}
 
                 /* The 14-byte limit belongs to the LM half only.  Writing it back into
@@ -20068,14 +20388,9 @@ sha1saltpass:
                 if (len > MAXLINE)
                   break;
 		if (Unicode == 0) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE*2;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft == MAXLINE*2)
+		  len = U8TO16LE(cur, len, wline, MAXLINE*2);
+		  if (len <= 0)
   		    break;
-		  len = (MAXLINE*2) - ic_outleft;
 		  MD4((char *) wline, len, md5buf.h);
 		} else {
  		  MD4(cur,len,md5buf.h);
@@ -20093,15 +20408,11 @@ sha1saltpass:
                       d = newbuf;
                       i = saltlen = mystrlen(tsalt);
                       memcpy(newbuf, tsalt, i);
-		      ic_inleft = i;
-		      icin = newbuf;
-		      icout = (char *)wline;
-		      ic_outleft = MAXLINE*2;
-		      x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		      if (ic_outleft != MAXLINE*2) {
+		      x = U8TO16LE(newbuf, i, wline, MAXLINE*2);
+		      if (x > 0) {
 		        unsigned short *dest;
                         dest = (unsigned short *) wline;
- 		        i = (MAXLINE*2) - ic_outleft;
+ 		        i = x;
                         for (x = 0; x < i; x++) {
                           wchar_t ht;
                           ht = dest[x];
@@ -20315,14 +20626,9 @@ md4utf16:
 		if (Unicode) {
 		  MD4(cur,len,md5buf.h);
 		} else {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE*2;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft == MAXLINE*2)
+		  len = U8TO16LE(cur, len, wline, MAXLINE*2);
+		  if (len <= 0)
 		    break;
-		  len = (MAXLINE*2) - ic_outleft;
 		  MD4((char *) wline, len, md5buf.h);
 		}
 		hashcnt += Maxiter;
@@ -20344,14 +20650,9 @@ md4utf16:
 		if (Unicode) {
 		  MD4(cur,len,md5buf.h);
 		} else {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE*2;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft == MAXLINE*2)
+		  len = U8TO16LE(cur, len, wline, MAXLINE*2);
+		  if (len <= 0)
 		    break;
-		  len = (MAXLINE*2) - ic_outleft;
 		  MD4((char *) wline, len, md5buf.h);
 		}
 		hashcnt++;
@@ -20493,93 +20794,149 @@ md4utf16:
 		break;
 		   
               case JOB_NTLMH:
+                /* NTLMH keeps BOTH readings: the UTF-8 conversion, and the
+                   zero-extend that maps each byte b to (b, 0x00).
+
+                   The zero-extend reading is NOT dropped, though it matches
+                   neither Windows nor hashcat 6.2.5 -- measured on fpga.local,
+                   hashcat recovers a zero-extend digest 0 times out of 1.  It
+                   stays because it has RECORDED RESULTS and nothing else in the
+                   catalog computes it: six of the seventeen NTLMH pairs in the
+                   regression corpus are zero-extend digests, every one a
+                   high-bit candidate, and unlike a no-op MD5CAP they have no
+                   twin under another label.  Removing the construction would
+                   invalidate them outright, which is the cost the add-only rule
+                   names.  Reproducing a broken implementation is the point of
+                   having the type.
+
+                   Below 0x80 the two readings are the same bytes, so an
+                   all-ASCII candidate is converted and hashed ONCE, the saving
+                   taken before the MD4 rather than after.
+
+                   The UTF-8 reading now refuses ill-formed input instead of
+                   hashing a shortened copy of it: the corpus holds
+                   NTLMHx01 b3f4b4d0...:$HEX[c0ffeebabe] where b3f4b4d0 is really
+                   the digest of $HEX[eebabe] after iconv dropped c0 and ff, and
+                   it holds the honest NTLM line for that same preimage.  Such
+                   lines stop being emitted; the hashes stay solvable from their
+                   true preimages. */
                 if (len > MAXLINE)
                   break;
 		if (Unicode) {
 		  MD4(cur,len,md5buf.h);
 		  hashcnt++;
 		  checkhash(&md5buf, 32, 1, job);
+		} else if (ntlm_all_ascii((unsigned char *)cur, len)) {
+		  to_utf16le(cur, (char *)wline, len);
+		  MD4((char *) wline, len * 2, md5buf.h);
+		  hashcnt++;
+		  checkhash(&md5buf, 32, 1, job);
 		} else {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (x >= 0) {
-		    MD4((char *) wline, MAXLINE - ic_outleft, md5buf.h);
+		  int u16len = utf8_to_utf16((unsigned char *)cur, len,
+		                             (unsigned char *)wline, MAXLINE * 2,
+		                             u32buf, MAXLINE + 16, UTF16_LE);
+		  if (u16len >= 0) {
+		    MD4((char *) wline, u16len, md5buf.h);
 		    hashcnt++;
 		    checkhash(&md5buf, 32, 1, job);
 		  }
 		  to_utf16le(cur, (char *)wline, len);
-		  MD4((char *) wline, len*2, md5buf.h);
+		  MD4((char *) wline, len * 2, md5buf.h);
 		  hashcnt++;
 		  checkhash(&md5buf, 32, 1, job);
 		}
 		break;
 
-		  
               case JOB_NTLM:
+                /* Microsoft mapped the user's code page into UTF-16LE through
+                   the OS conversion tables; it did NOT zero-extend.  So the
+                   candidate is read three ways -- as UTF-8, as CP1251 and as
+                   CP1252 -- through the conversions in ruleproc32.c, which is
+                   where utf8_to_utf32 already defines what well-formed UTF-8
+                   means for this program.  iconv is not used: //IGNORE DROPPED
+                   what it could not convert, so a malformed candidate was
+                   shortened and hashed rather than refused, and the six
+                   positions Windows defines but Unicode.org leaves undefined
+                   were unreachable either way -- dropped under //IGNORE, fatal
+                   without it.
+
+                   Coincident readings are decided BEFORE any hashing, so a
+                   redundant MD4 is never performed rather than performed and
+                   discarded.  Two tests cover every case exactly: all-ASCII
+                   means all three readings are the same bytes, and
+                   cp_tables_agree means the CP1252 reading would be identical
+                   to the CP1251 one.  Nothing else can coincide, because any
+                   byte >= 0x80 makes the UTF-8 reading SHORTER than 2*len
+                   while both table readings are exactly 2*len.
+
+                   Note [29] in hx.8 still says three emissions, and needs
+                   correcting. */
                 if (len > MAXLINE)
                   break;
 		if (Unicode) {
 		  MD4(cur,len,md5buf.h);
 		  hashcnt++;
 		  checkhash(&md5buf, 32, 1, job);
-		} else {
-		  fastcopy(linebuf2,cur,len);
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft != MAXLINE) {
-		    x = MAXLINE - ic_outleft;
-		    MD4((char *) wline, x, md5buf.h);
-		    ic_inleft = x;
-		    icin = (char *)wline;
-		    icout = (char *)job->line;
-		    ic_outleft = MAXLINE;
-		    x = iconv(cd_utf8,&icin,&ic_inleft,&icout,&ic_outleft);
-		    job->clen = MAXLINE - ic_outleft;
+		} else if (ntlm_all_ascii((unsigned char *)cur, len)) {
+		  int u16len = utf8_to_utf16((unsigned char *)cur, len,
+		                             (unsigned char *)wline, MAXLINE * 2,
+		                             u32buf, MAXLINE + 16, UTF16_LE);
+		  if (u16len >= 0) {
+		    MD4((char *) wline, u16len, md5buf.h);
 		    hashcnt++;
-		    checkhash(&md5buf, 32, 1, job);
-		    fastcopy(job->line,cur,len);
+		    fastcopy(job->line, cur, len);
 		    job->clen = len;
-		  }
-		  ic_inleft = len;
-		  icin = linebuf2;
-		  icout = linebuf;
-		  ic_outleft = MAXLINE;
-		  x = iconv(cd_cp1251,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (x >= 0) {
-		    i = ic_inleft = MAXLINE - ic_outleft;
-		    icin = linebuf;
-		    icout = (char *)wline;
-		    ic_outleft = MAXLINE;
-		    x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		    MD4((char *) wline, MAXLINE-ic_outleft, md5buf.h);
-		    hashcnt++;
-		    fastcopy(job->line, linebuf, i);
-		    job->clen = i;
 		    checkhash(&md5buf, 32, 1, job);
 		  }
-		  ic_inleft = len;
-		  icin = linebuf2;
-		  icout = linebuf;
-		  ic_outleft = MAXLINE;
-		  x = iconv(cd_cp1252,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (x >= 0) {
-		    i = ic_inleft = MAXLINE - ic_outleft;
-		    icin = linebuf;
-		    icout = (char *)wline;
-		    ic_outleft = MAXLINE;
-		    x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		    MD4((char *) wline, MAXLINE-ic_outleft, md5buf.h);
+		} else {
+		  int nv, nvars, u16len, replen;
+
+		  /* Reading 1: as UTF-8.  A candidate that is not well-formed is
+		     REFUSED here, where it used to be silently shortened. */
+		  u16len = utf8_to_utf16((unsigned char *)cur, len,
+		                         (unsigned char *)wline, MAXLINE * 2,
+		                         u32buf, MAXLINE + 16, UTF16_LE);
+		  if (u16len >= 0) {
+		    MD4((char *) wline, u16len, md5buf.h);
 		    hashcnt++;
-		    fastcopy(job->line, linebuf, i);
-		    job->clen = i;
+		    fastcopy(job->line, cur, len);
+		    job->clen = len;
 		    checkhash(&md5buf, 32, 1, job);
 		  }
+
+		  /* Readings 2 and 3.  The candidate is copied aside and read
+		     from the copy: cur and linebuf share storage -- a dozen
+		     cases in this switch assign cur = linebuf -- so writing
+		     reading 2's report into linebuf would overwrite the
+		     candidate and reading 3 would convert the report instead of
+		     the password.  That is not hypothetical; it is what this
+		     code did before the copy was restored, and it presented as
+		     CP1251 matching while CP1252 silently did not. */
+		  if (linebuf2 != cur)
+		    fastcopy(linebuf2, cur, len);
+		  nvars = cp_tables_agree((unsigned char *)linebuf2, len,
+		                          CP_1251, CP_1252) ? 1 : 2;
+		  for (nv = 0; nv < nvars; nv++) {
+		    u16len = cp_to_utf16((unsigned char *)linebuf2, len,
+		                         (unsigned char *)wline, MAXLINE * 2,
+		                         nv ? CP_1252 : CP_1251, UTF16_LE);
+		    if (u16len < 0)
+		      continue;
+		    /* Report the UTF-8 form of the same codepoints, so the line
+		       validates against any NTLM engine that takes UTF-8. */
+		    replen = utf16_to_utf8((unsigned char *)wline, u16len,
+		                           (unsigned char *)linebuf, MAXLINE * 3,
+		                           u32buf, MAXLINE + 16, UTF16_LE);
+		    if (replen < 0)
+		      continue;
+		    MD4((char *) wline, u16len, md5buf.h);
+		    hashcnt++;
+		    fastcopy(job->line, linebuf, replen);
+		    job->clen = replen;
+		    checkhash(&md5buf, 32, 1, job);
+		  }
+		  fastcopy(job->line, cur, len);
+		  job->clen = len;
 		}
 		break;
 
@@ -20594,14 +20951,9 @@ md4utf16:
 		  MD4(cur,len,md5buf.h);
 		} else {
 
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (x<0)
+		  len = U8TO16LE(cur, len, wline, MAXLINE);
+		  if (len < 0)
 		    break;
-		  len = MAXLINE - ic_outleft;
 		  MD4((char *) wline, len, md5buf.h);
 		}
 		if (job->op == JOB_SHA1NTLMUC) {
@@ -23674,13 +24026,8 @@ sha11saltmd5:
                 if (len > MAXLINE)
                   break;
                 if (!Unicode) {
-                  ic_inleft = len;
-                  icin = cur;
-                  icout = (char *)wline;
-                  ic_outleft = MAXLINE;
-                  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-                  if (j < 0) break;
-                  len = MAXLINE - ic_outleft;
+                  len = U8TO16LE(cur, len, wline, MAXLINE);
+                  if (len < 0) break;
                   cur = (char *)wline;
                 }
                 mysha1(cur, len, curin.h);
@@ -23731,13 +24078,8 @@ sha11saltmd5:
                   break;
                 /* convert password to UTF-16LE */
                 if (!Unicode) {
-                  ic_inleft = len;
-                  icin = cur;
-                  icout = (char *)wline;
-                  ic_outleft = MAXLINE;
-                  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-                  if (j < 0) break;
-                  len = MAXLINE - ic_outleft;
+                  len = U8TO16LE(cur, len, wline, MAXLINE);
+                  if (len < 0) break;
                   cur = (char *)wline;
                 }
                 /* iterate unique salts from Typesalt Judy */
@@ -27397,12 +27739,9 @@ sha11saltmd5:
                   }
                   if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                   { int si, u16len;
-                    icin = cur; ic_inleft = len;
-                    icout = (char *)wline; ic_outleft = MAXLINE * sizeof(wchar_t);
-                    iconv(cd, NULL, NULL, NULL, NULL);
-                    x = iconv(cd, &icin, &ic_inleft, &icout, &ic_outleft);
-                    u16len = (MAXLINE * sizeof(wchar_t)) - ic_outleft;
-                    if (u16len <= 0) break;
+                    u16len = U8TO16LE(cur, len, wline,
+                                      MAXLINE * sizeof(wchar_t));
+                    if (u16len <= 0) break;   /* ill-formed, or nothing to hash */
                     for (si = 0; si < nsalts_job; si++) {
                       const char *grp = saltsnap[si].salt;
                       unsigned char sz_key[32], sz_salt[64];
@@ -29559,15 +29898,13 @@ nextsalt1:
 			  i = 40;
 			  break;
 		       case JOB_MD4UTF16DESCRYPT:
-			  ic_inleft = mystrlen(s);
-			  icin = s;
-			  icout = (char *)wline;
-			  ic_outleft = MAXLINE;
-			  if (iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft) == (size_t)-1) {
-			    fprintf(stderr,"Bad conversion in MD4UTF16DESCRYPT\n");
-			    exit(1);
+			  { int _n = U8TO16LE(s, mystrlen(s), wline, MAXLINE);
+			    if (_n < 0) {
+			      fprintf(stderr,"Bad conversion in MD4UTF16DESCRYPT\n");
+			      exit(1);
+			    }
+			    MD4((char *) wline, _n, curin.h);
 			  }
-			  MD4((char *) wline, MAXLINE-ic_outleft, curin.h);
 			  i = 32;
 			  break;
 		    }
@@ -33092,13 +33429,8 @@ sha1md5md5uc:
                 if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
                   break;
-                ic_inleft = len;
-                icin = cur;
-                icout = (char *)wline;
-                ic_outleft = MAXLINE;
-                j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-                if (j < 0) break;   /* iconv failed: skip candidate per D5a; pre-fix check was wrong variable (x) and always-true, hashing garbage on conversion failure */
-                len = MAXLINE - ic_outleft;
+                len = U8TO16LE(cur, len, wline, MAXLINE);
+                if (len < 0) break;   /* ill-formed UTF-8: skip the candidate per D5a */
                 cur = (char *)wline;
                 memmove(linebuf, cur, len);
                 /* iterate salts from Typesalt Judy */
@@ -33633,14 +33965,9 @@ sha1sha256:
                 if (len > MAXLINE)
                   break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
 		  wline[0] = 0;
-		  icout = (char *)wline+1;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (ic_outleft ==MAXLINE) break;
-		  len = MAXLINE - ic_outleft;
+		  len = U8TO16LE(cur, len, (char *)wline + 1, MAXLINE);
+		  if (len <= 0) break;
 		  cur = (char *)wline;len++;
 		}
 		x = 1;
@@ -33649,15 +33976,19 @@ sha1sha256:
 	      case JOB_SHA1UTF7:
                 if (len > MAXLINE || Unicode)
                   break;
-		cur[len++]='X';
-		ic_inleft = len;
-		icin = cur;
-		icout = (char *)wline;
-		ic_outleft = MAXLINE;
-		j = iconv(cd2,&icin,&ic_inleft,&icout,&ic_outleft);
-		if (j < 0 || len >= (MAXLINE - ic_outleft)) break;
-		len = MAXLINE - ic_outleft;
-		len--;
+		{ int _n = utf8_to_utf7((unsigned char *)cur, len, (char *)wline,
+		                        MAXLINE, u32buf, MAXLINE + 16);
+		  /* The appended 'X' is gone.  It existed only to force iconv to
+		     flush its shift state before a direct character, X being a
+		     base64 character so the terminator was always emitted; it also
+		     WROTE into the candidate buffer, which nothing wanted.
+		     utf8_to_utf7 flushes because it is told to, and its length is
+		     exactly the old outlen-with-X minus one, so the guard below is
+		     the same test: a candidate whose UTF-7 form is itself has
+		     nothing to encode and is skipped. */
+		  if (_n < 0 || _n <= len) break;
+		  len = _n;
+		}
 		cur = (char *)wline;
 		cur[len] = 0;
 		x = 1;
@@ -33668,13 +33999,8 @@ sha1sha256:
                 if (len > MAXLINE)
                   break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd1,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (j < 0) break;
-		  len = MAXLINE - ic_outleft;
+		  len = U8TO16BE(cur, len, wline, MAXLINE);
+		  if (len < 0) break;
 		  cur = (char *)wline;
 		  if (job->op == JOB_SHA1UTF16BEZ) cur[len++] = 0;
 		}
@@ -33706,13 +34032,8 @@ sha1sha256:
                 if (len > MAXLINE)
                   break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (j < 0) break;
-		  len = MAXLINE - ic_outleft;
+		  len = U8TO16LE(cur, len, wline, MAXLINE);
+		  if (len < 0) break;
 		  cur = (char *)wline;
 		}
 		switch (job->op) {
@@ -33758,13 +34079,8 @@ sha1sha256:
                 if (len > MAXLINE)
                   break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (j < 0) break;
-		  len = MAXLINE - ic_outleft;
+		  len = U8TO16LE(cur, len, wline, MAXLINE);
+		  if (len < 0) break;
 		  cur = (char *)wline;
 		}
 	      case JOB_SHA1:
@@ -36897,23 +37213,14 @@ HAV256_5_start:
 		    }
 		  }
 		  /* convert user to UTF16LE */
-		  ic_inleft = ulen;
-		  icin = ukeys;
-		  icout = (char *)linebuf;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd, &icin, &ic_inleft, &icout, &ic_outleft);
-		  if (j < 0) continue;
-		  y = MAXLINE - ic_outleft;
+		  y = U8TO16LE(ukeys, ulen, linebuf, MAXLINE);
+		  if (y < 0) continue;
 		  linebuf[y] = ':';
 		  y += 1;
 		  /* convert pass to UTF16LE */
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)linebuf + y;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd, &icin, &ic_inleft, &icout, &ic_outleft);
-		  if (j < 0) continue;
-		  y += MAXLINE - ic_outleft;
+		  { int _n = U8TO16LE(cur, len, linebuf + y, MAXLINE);
+		    if (_n < 0) continue;
+		    y += _n; }
 		  mysha1(linebuf, y, md5buf.h);
 		  hashcnt++;
 		  /* hex-decode salt to raw binary */
@@ -37954,13 +38261,8 @@ HAV256_5_start:
 		  break;
 		if (!TYPESALT(job->op)) break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (j < 0) break;
-		  y = MAXLINE - ic_outleft;
+		  y = U8TO16LE(cur, len, wline, MAXLINE);
+		  if (y < 0) break;
 		} else {
 		  fastcopy(wline, cur, len);
 		  y = len;
@@ -38049,13 +38351,8 @@ HAV256_5_start:
 		  break;
 		if (!TYPESALT(job->op)) break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (j < 0) break;
-		  y = MAXLINE - ic_outleft;
+		  y = U8TO16LE(cur, len, wline, MAXLINE);
+		  if (y < 0) break;
 		} else {
 		  fastcopy(wline, cur, len);
 		  y = len;
@@ -38097,13 +38394,8 @@ HAV256_5_start:
 		  break;
 		if (!TYPESALT(job->op)) break;
 		if (!Unicode) {
-		  ic_inleft = len;
-		  icin = cur;
-		  icout = (char *)wline;
-		  ic_outleft = MAXLINE;
-		  j = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
-		  if (j < 0) break;
-		  y = MAXLINE - ic_outleft;
+		  y = U8TO16LE(cur, len, wline, MAXLINE);
+		  if (y < 0) break;
 		} else {
 		  fastcopy(wline, cur, len);
 		  y = len;
@@ -38260,12 +38552,9 @@ HAV256_5_start:
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Convert password to UTF-16LE once */
-                  icin = cur; ic_inleft = len;
-                  icout = (char *)wline; ic_outleft = MAXLINE * sizeof(wchar_t);
-                  iconv(cd, NULL, NULL, NULL, NULL);
-                  x = iconv(cd, &icin, &ic_inleft, &icout, &ic_outleft);
-                  int u16len = (MAXLINE * sizeof(wchar_t)) - ic_outleft;
-                  if (u16len <= 0) break;
+                  int u16len = U8TO16LE(cur, len, wline,
+                                        MAXLINE * sizeof(wchar_t));
+                  if (u16len <= 0) break;   /* ill-formed, or nothing to hash */
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     saltlen = saltsnap[si].saltlen;
@@ -38311,12 +38600,9 @@ HAV256_5_start:
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 { int si;
                   /* Convert password to UTF-16LE once */
-                  icin = cur; ic_inleft = len;
-                  icout = (char *)wline; ic_outleft = MAXLINE * sizeof(wchar_t);
-                  iconv(cd, NULL, NULL, NULL, NULL);
-                  x = iconv(cd, &icin, &ic_inleft, &icout, &ic_outleft);
-                  int u16len = (MAXLINE * sizeof(wchar_t)) - ic_outleft;
-                  if (u16len <= 0) break;
+                  int u16len = U8TO16LE(cur, len, wline,
+                                        MAXLINE * sizeof(wchar_t));
+                  if (u16len <= 0) break;   /* ill-formed, or nothing to hash */
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     saltlen = saltsnap[si].saltlen;
@@ -40918,22 +41204,21 @@ HAV256_5_start:
                 if (TYPEDONE(job->op)) break;
                 { /* Convert password to UTF-16LE */
                   char *u16buf = (char *)wline;
-                  int u16len = 0;
-                  iconv(cd, NULL, NULL, NULL, NULL);
-                  char *inptr = cur;
-                  size_t inleft = len;
-                  char *outptr = u16buf;
-                  size_t outleft = (MAXLINE + 16) * sizeof(wchar_t);
-                  size_t icr = iconv(cd, &inptr, &inleft, &outptr, &outleft);
-                  if (icr == (size_t)-1 && inleft > 0) {
-                    /* Fallback: zero-extend */
+                  int u16len = U8TO16LE(cur, len, u16buf,
+                                        (MAXLINE + 16) * sizeof(wchar_t));
+                  if (u16len < 0) {
+                    /* Fallback: zero-extend.  Deliberate for this type -- an
+                       ill-formed candidate is still hashed, under the hashcat
+                       reading, rather than skipped.  The old test was
+                       "icr == -1 && inleft > 0", which never fired on macOS
+                       libiconv, so there the truncated conversion was hashed
+                       instead of the fallback; this now behaves the same on
+                       both platforms. */
                     for (x = 0; x < len; x++) {
                       u16buf[x*2] = cur[x];
                       u16buf[x*2+1] = 0;
                     }
                     u16len = len * 2;
-                  } else {
-                    u16len = outptr - u16buf;
                   }
                   /* HMAC-SHA1(key=utf16le, msg=utf16le) */
                   unsigned int hmaclen = 20;
@@ -42122,13 +42407,9 @@ HAV256_5_start:
                 { int si;
                   /* Convert pass to UTF16LE */
                   unsigned char *u16pass = (unsigned char *)wline;
-                  char *inbuf = cur;
-                  size_t inleft = len, outleft = (MAXLINE+16)*sizeof(wchar_t);
-                  char *outbuf = (char *)u16pass;
-                  iconv(cd, NULL, NULL, NULL, NULL);
-                  size_t icr = iconv(cd, &inbuf, &inleft, &outbuf, &outleft);
-                  int u16len = (icr == (size_t)-1) ? 0 : (int)(outbuf - (char *)u16pass);
-                  if (!u16len) break;
+                  int u16len = U8TO16LE(cur, len, u16pass,
+                                        (MAXLINE+16)*sizeof(wchar_t));
+                  if (u16len <= 0) break;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     int iter = atoi(ts);
@@ -44248,6 +44529,15 @@ static void hx_e347_validate_run_shared(int backend_id, char *hxsrc,
         for (size_t si = 0; si < n_salt; si++) {
             size_t L = strlen(salts[si]);
             memcpy(sbuf + pos, salts[si], L);
+            if ((uint64_t)pos + (uint64_t)L > (uint64_t)GPU_SALT_PACK_MAX) {
+                fprintf(stderr,
+                    "FATAL: %s:%d salt pack: offset %llu + %zu exceeds "
+                    "GPU_SALT_PACK_MAX (%u). soff[] is uint32 and truncating "
+                    "it here would index the wrong salt data silently.\n",
+                    __FILE__, __LINE__, (unsigned long long)pos, L,
+                    (unsigned)GPU_SALT_PACK_MAX);
+                exit(1);
+            }
             soff[si]  = (uint32_t)pos;
             slens[si] = (uint16_t)L;
             pos += L;
@@ -46271,6 +46561,15 @@ void build_compact_table(void) {
                 for (size_t si = 0; si < n_salt; si++) {
                     size_t L = strlen(salts[si]);
                     memcpy(sbuf + pos, salts[si], L);
+                    if ((uint64_t)pos + (uint64_t)L > (uint64_t)GPU_SALT_PACK_MAX) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d salt pack: offset %llu + %zu exceeds "
+                            "GPU_SALT_PACK_MAX (%u). soff[] is uint32 and truncating "
+                            "it here would index the wrong salt data silently.\n",
+                            __FILE__, __LINE__, (unsigned long long)pos, L,
+                            (unsigned)GPU_SALT_PACK_MAX);
+                        exit(1);
+                    }
                     soff[si]  = (uint32_t)pos;
                     slens[si] = (uint16_t)L;
                     pos += L;
@@ -47499,12 +47798,24 @@ MDXALIGN void ReportStats(void *dummy) {
        * than naming a wrong time -- see the iter_exact uses below. */
       int iter_exact = 1;
       { unsigned long long multiplier = 0;
+        /* -i N is the THIRD factor in Tothash and the one 1.593 left out.  A
+         * chain N deep costs N hash operations per candidate-salt pair and
+         * Tothash counts every one, so the divisor needs the depth as well as
+         * the per-type round count and the salt count.  Measured on .205, MD5
+         * over a 1000-candidate ?d?d?d mask: 1,000 / 2,000 / 3,000 / 10,000
+         * operations at -i 1 / 2 / 3 / 10 -- exactly linear.  Maxiter is global
+         * rather than per-type, so it scales every term, not one of them.
+         * Without it a -i 2 run reported 13.3T of a 6.7T keyspace: the
+         * percentage clamped to 100, the sample candidate clamped to the last
+         * mask value, and the ETA said done -- the same three symptoms, from
+         * the same cause, as the DESCRYPT case 1.593 fixed. */
+        unsigned long long depth = (Maxiter > 0) ? (unsigned long long)Maxiter : 1ULL;
         Word_t ti = 0; int trc;
         J1F(trc, Dohash, ti);
         while (trc) {
           unsigned int ns = LIVESALTS(ti);
           unsigned long long iter = bf_progress_iter_per_salt((int)ti, &iter_exact);
-          multiplier += ((ns > 0) ? (unsigned long long)ns : 1ULL) * iter;
+          multiplier += ((ns > 0) ? (unsigned long long)ns : 1ULL) * iter * depth;
           J1N(trc, Dohash, ti);
         }
         if (multiplier > 1) progress /= multiplier;
@@ -47534,8 +47845,17 @@ MDXALIGN void ReportStats(void *dummy) {
               Curfile, dprog, pmult, dtotal, tmult, pct, Totfound, hps, mult1, sample, eta);
     } else {
       { unsigned long long total_est = EstimatedTotalLines;
-        if (!total_est && AutoCountTotalLines > 0)
-          total_est = AutoCountTotalLines;
+        /* Authoritative count first, projection only until it lands. The '~'
+         * prefix below already marks the figure provisional while
+         * AutoCountRequested && !AutoCountDone. */
+        if (!total_est && AutoCountDone && AutoCountTotalLines > 0)
+          total_est = AutoCountTotalLines;     /* settled: authoritative  */
+        else if (!total_est && ProjectedTotalLines > 0)
+          total_est = ProjectedTotalLines;     /* provisional: marked '~' */
+        /* Deliberately NO fallback to AutoCountTotalLines while the count is
+         * still running: mid-accumulation it is a partial multi-file sum, and
+         * showing that as a total is the same category of error as the
+         * doubling this change removes. */
         if (total_est > 0 && TotLines > 0) {
           long wq = peek_lock(WorkWaiting);
           char eta[64];
@@ -59900,13 +60220,13 @@ usage:
                * through is_salted_pack pagination naturally. */
               int use_bf_chunks = 0;
               int num_devs_v = 1;  /* restored: deleted in rev 1.477, re-added 1.481 */
-#if defined(OPENCL_GPU)
+#if defined(GPU_BF_CHUNK_PRODUCER)
               /* BfMaskGpuUsable: a BF mask the GPU could not be given must not be
                * dispatched to it. Falling through to the legacy arm below is the
                * documented CPU-only path. */
               if (gpujob_available() && BfMaskGpuUsable &&
                   gpu_op_category(x) == GPU_CAT_MASK) {
-                num_devs_v = gpu_opencl_num_devices();
+                num_devs_v = mdx_gpu_num_devices();
                 if (num_devs_v < 1) num_devs_v = 1;
                 /* Per-op servo reset: rate-EMA seed + chunk counter so
                  * warmup ramp restarts. Different ops may have very
@@ -59977,7 +60297,7 @@ usage:
                   uint32_t this_nwords = 0;
                   uint32_t this_mspw   = 0;
                   uint32_t this_inner_iter = 1u;
-#if defined(OPENCL_GPU)
+#if defined(GPU_BF_CHUNK_PRODUCER)
                   if (adaptive_bf_chunk_size(MaskTotal, chunk_cursor,
                                              num_devs_v, x,
                                              &this_chunk,
@@ -60074,7 +60394,7 @@ usage:
 
                   chunk_cursor += this_chunk;
                 }
-#if defined(OPENCL_GPU)
+#if defined(GPU_BF_CHUNK_PRODUCER)
                 /* BF Phase 1.6 (2026-05-09): persist converged per-device
                  * rate to sidecar so the next run cold-starts with a real
                  * seed instead of the 1 GH/s default. Only write when the
@@ -60239,7 +60559,18 @@ usage:
        * position and bump the global so ReportStats's ETA stays sensible. */
       {
         unsigned long long auto_now = AutoCountTotalLines;
-        if (Fileline > auto_now) {
+        /* COMMENSURABLE COMPARISON. Fileline is reset per file at the top of
+         * this loop; AutoCountTotalLines accumulates across every file the
+         * counter thread has reached. Comparing them directly mixed a
+         * file-local counter with a multi-file total: on file 1 of a set, with
+         * the global still 0, file 1's projection landed in the global and the
+         * thread then added all N files on top; once the thread had finished,
+         * the test was false even where a projection was wanted. Project the
+         * CURRENT file and add the lines already completed in earlier files,
+         * which is the same quantity the counter is accumulating. */
+        unsigned long long prior_files = (Totallines >= Fileline)
+                                       ? (Totallines - Fileline) : 0ULL;
+        if (Fileline > 0) {
           unsigned long long fsize = atomic_load_explicit(&CurfileBytesTotal, memory_order_relaxed);
           unsigned long long fread = atomic_load_explicit(&CurfileBytesRead,  memory_order_relaxed);
           unsigned long long projected;
@@ -60247,11 +60578,13 @@ usage:
             projected = (unsigned long long)((double)Fileline * (double)fsize / (double)fread);
           else
             projected = Fileline;   /* no byte info — at minimum we know there are Fileline lines */
-          /* CAS-loop: grow AutoCountTotalLines monotonically to at least `projected` */
+          projected += prior_files;
+          /* Grow the PROJECTION monotonically. Never touches
+           * AutoCountTotalLines: that belongs to the counter thread alone. */
           while (1) {
-            unsigned long long old = AutoCountTotalLines;
+            unsigned long long old = ProjectedTotalLines;
             if (projected <= old) break;
-            if (__sync_bool_compare_and_swap(&AutoCountTotalLines, old, projected)) break;
+            if (__sync_bool_compare_and_swap(&ProjectedTotalLines, old, projected)) break;
           }
           /* Expunge the poisoned cache row so the next session re-counts
            * from scratch instead of reusing the stale value. Gated to fire
@@ -60262,7 +60595,15 @@ usage:
            * (b) the projection is materially larger (>= 2x) than the cached
            *     value — avoids fluttering on near-equality;
            * (c) Curfile is a real file path (not "stdin"). */
-          if (!cache_expunged && auto_now > 0 &&
+          /* AutoCountDone added 2026-10-06: auto_now is a RUNNING SUM while
+           * the counter thread works, so comparing a projection against it
+           * mid-accumulation could expunge a perfectly good cache row. Only
+           * judge a cached value once the count has settled.
+           * KNOWN LIMIT, not fixed here: auto_now is still the multi-file
+           * total while `projected` concerns one file, so on a multi-file run
+           * this test remains the wrong comparison. Making it right needs the
+           * per-file cached value in this loop, which it does not have. */
+          if (!cache_expunged && AutoCountDone && auto_now > 0 &&
               projected >= 2ULL * auto_now &&
               Curfile && strcmp(Curfile, "stdin") != 0) {
             char resolved[PATH_MAX];

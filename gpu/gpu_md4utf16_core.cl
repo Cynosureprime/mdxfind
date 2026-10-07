@@ -15,10 +15,67 @@
  * for the generic dispatch template (Memo B Phase B5 sub-batch 8).
  *
  * MD4UTF16 = MD4(UTF-16LE(input))  on iter == 1, where UTF-16LE is the
- *            real iconv("UTF-16LE//IGNORE","UTF-8") conversion
+ *            STRICT UTF-8 -> UTF-16LE conversion and an ill-formed input
+ *            produces NO DIGEST AT ALL
  *          = MD4(UTF-16LE-zero-extend(lowercase_hex(prev_digest)))  on iter > 1
  *            (the iter feed is 32 lowercase hex chars, so zero-extend and
- *            iconv are the same thing there)
+ *            the strict conversion are the same thing there)
+ *
+ * 2026-10-05 CORRECTNESS FIX, and it is the SECOND one in this file -- read
+ * the 2026-09-15 note below first, it fixed a different half of the same
+ * problem.  mdxfind.c 1.616 retired iconv.  CPU JOB_MD4UTF16 is now
+ *
+ *     len = U8TO16LE(cur, len, wline, MAXLINE*2);
+ *     if (len <= 0) break;                 <-- NO digest for this candidate
+ *     MD4((char *) wline, len, md5buf.h);
+ *
+ * where U8TO16LE is utf8_to_utf16() in ruleproc32.c, which returns a
+ * LENGTH or a negative RULE32_ERR_ and NEVER a partial result.  So the CPU
+ * now REFUSES an ill-formed candidate outright, where iconv("...//IGNORE")
+ * used to delete the offending bytes and hash whatever survived.  This
+ * kernel used to reproduce the //IGNORE behaviour faithfully; against
+ * 1.616 that made every ill-formed candidate a GPU-ONLY hit the CPU would
+ * never produce -- and because the GPU claims the batch, the CPU never
+ * redoes the work, so there was nothing to catch it.  Measured before the
+ * fix on a 1.616 binary, on TWO fixtures, both filtered to <= 27 bytes
+ * (this op's gpu_maxlen at the host chokepoint, so every candidate in them
+ * reached the GPU):
+ *
+ *   fixture                                      GPU      CPU   GPU-only
+ *   273,660-word slice of isw2012-md5.dic    273,317  155,942    117,375
+ *     (a real dirty wordlist, 91.8% of its
+ *      high-bit words are not valid UTF-8)
+ *   3,908 synthetic branch-coverage cands      3,564      450      3,114
+ *
+ * Every GPU-only hit was the retired //IGNORE partial reading.  Identical
+ * numbers on OpenCL (GTX 1080 / RTX 4070 Ti SUPER / GTX 960) and on Metal
+ * (M1 / M2 Max).  After the fix, GPU == CPU on both fixtures and all five
+ * devices.  Cite the fixture with the number: the 117,375 figure quoted in
+ * gpu_ntlmh_core.cl is the wordlist row, not the synthetic one.
+ *
+ * THE FIX IS `live`, NOT A SENTINEL DIGEST.  md4_over_utf16le now reports
+ * ill-formedness through a `dropped` out-parameter and template_finalize
+ * folds it into the state's `live` flag, which template_digest_compare
+ * already honours (`if (!st->live) return 0;`).  `live` was added in
+ * 2026-09 for the empty-conversion case and means exactly "the CPU would
+ * not have produced a digest at all for this candidate", which is exactly
+ * what `if (len <= 0) break;` says -- and `len <= 0` covers BOTH the
+ * ill-formed case and the empty one with one test, so the two reasons
+ * share the one flag by right rather than by coincidence.  Nothing in
+ * gpu_template.cl changed: a single-digest core has no second digest to
+ * suppress, so refusal has to be a gate on the probe, and the gate was
+ * already there.  A poisoned/unmatchable sentinel digest was rejected --
+ * no 128-bit value is provably absent from an arbitrary user hash file,
+ * and if one ever collided the kernel would emit it as a plaintext.
+ *
+ * Note nothing is LOST by refusing.  The //IGNORE reading existed as an
+ * ease-of-use convenience for mixed, unclean dictionary files; a dirty
+ * non-UTF-8 line is still recovered by e369 through its real CP1251 /
+ * CP1252 tables and by e786 through zero-extend.  Verified: the CP1252
+ * line $HEX[636166e9] yields the true Windows digest
+ * b1db12409c00d1fc586fc48ecadc36a1 under e369 and e786 while e496
+ * correctly yields nothing.  The convenience is served by reading the
+ * bytes under a REAL encoding, not by deleting the ones that do not fit.
  *
  * NO ALT_DIGEST HOOK HERE, and that asymmetry with NTLMH is deliberate.
  * gpu_ntlmh_core.cl declares GPU_TEMPLATE_HAS_ALT_DIGEST because its CPU
@@ -160,26 +217,32 @@ static inline void template_transform(template_state *st,
  *
  * h4 must already hold the MD4 IV (template_init does that).
  *
- * The decoder mirrors iconv_open("UTF-16LE//IGNORE", "UTF-8")
- * (mdxfind.c:12593), which is the converter CPU JOB_MD4UTF16 uses at
- * mdxfind.c:19074-19085, and matches glibc BYTE-FOR-BYTE including on
- * malformed input.  Proven, not asserted: a host transliteration of this
- * exact loop was run against glibc iconv on .205 over 18,802,400 inputs
- * (every 1-, 2- and 3-byte string exhaustively, a structured 4-byte
- * sweep, ASCII lengths 0..63, 2/3/4-byte characters at every block
- * alignment, and 1.5M pseudo-random strings) with ZERO differences.
+ * ILL-FORMED INPUT IS REFUSED, NOT PATCHED UP (2026-10-05).  At the three
+ * points where the decoder learns the input is not well-formed it sets
+ * *dropped and RETURNS.  It does NOT skip one byte and resynchronise the
+ * way glibc's "UTF-16LE//IGNORE" does, because CPU JOB_MD4UTF16 at
+ * mdxfind.c 1.616 no longer does either -- see the file header.  The
+ * partial state left in h4 by an early return is never padded, never
+ * probed and never emitted: template_finalize turns *dropped into
+ * live = 0, and template_digest_compare returns 0 without touching h4
+ * when live is 0, at EVERY iteration of the template's iter loop.
  *
- * Why //IGNORE falls out of the code rather than being special-cased:
- * glibc skips the bytes it validated and resynchronises, and a
- * continuation byte 0x80..0xBF is never a valid lead, so dropping ONE
- * byte and re-entering the loop reaches the same resynchronisation point
- * with the same output.  A sequence truncated by end-of-input produces no
- * output in either implementation.
+ * The acceptance predicate is utf8_to_utf32()'s, term for term
+ * (ruleproc32.c:240): lead classes C2-DF / E0-EF / F0-F4 only, so
+ * 0x80-0xBF, 0xC0/0xC1 and 0xF5-0xFF can never start a sequence; every
+ * continuation byte must be 10xxxxxx; the overlong minimum per length;
+ * no surrogate U+D800..U+DFFF; nothing above U+10FFFF; and a sequence
+ * truncated by end of input is ill-formed rather than ignored.  Astral
+ * codepoints become a correct surrogate PAIR.
  *
- * Rejected as glibc rejects them: 0xC0/0xC1 and any other overlong form,
- * the surrogate range U+D800..U+DFFF, and anything above U+10FFFF.
- * Astral codepoints become a correct surrogate PAIR -- the old
- * zero-extend produced four bytes there too, but the wrong four.
+ * HISTORICAL, and still true where it still applies: this loop's
+ * WELL-FORMED half was validated against glibc iconv on .205 over
+ * 18,802,400 inputs (every 1-, 2- and 3-byte string exhaustively, a
+ * structured 4-byte sweep, ASCII lengths 0..63, 2/3/4-byte characters at
+ * every block alignment, and 1.5M pseudo-random strings) with ZERO
+ * differences.  That study still holds for every input where no byte is
+ * dropped.  On an ill-formed input this function deliberately no longer
+ * computes glibc's //IGNORE output, because nothing consumes it.
  *
  * For an ALL-ASCII input this is byte-identical to the zero-extend form
  * it replaces, so every existing MD4UTF16 result on ASCII candidates is
@@ -191,13 +254,15 @@ static inline void template_transform(template_state *st,
  * wrong on that point: for e496 the GPU was computing a digest the CPU
  * never computes, at any input, so it could only ever miss.
  */
-static inline uint md4_over_utf16le(uint *h4, const uchar *data, int len)
+static inline uint md4_over_utf16le(uint *h4, const uchar *data, int len,
+                                   int *dropped)
 {
     uint M[16];
     for (int j = 0; j < 16; j++) M[j] = 0u;
 
     uint nunits = 0u;   /* UTF-16 code units emitted so far */
     int  i = 0;
+    *dropped = 0;
 
     while (i < len) {
         uint c = (uint)data[i];
@@ -217,8 +282,8 @@ static inline uint md4_over_utf16le(uint *h4, const uchar *data, int len)
                   ((uint)(data[i + 1] & 0x3Fu) << 6) |
                    (uint)(data[i + 2] & 0x3Fu);
             adv = 3;
-            /* overlong, or a lone surrogate -- glibc rejects both */
-            if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)) { i += 1; continue; }
+            /* overlong, or a lone surrogate */
+            if (cp < 0x800u || (cp >= 0xD800u && cp <= 0xDFFFu)) { *dropped = 1; return 0u; }
         } else if (c >= 0xF0u && c <= 0xF4u && i + 3 < len &&
                    (data[i + 1] & 0xC0u) == 0x80u &&
                    (data[i + 2] & 0xC0u) == 0x80u &&
@@ -228,10 +293,12 @@ static inline uint md4_over_utf16le(uint *h4, const uchar *data, int len)
                   ((uint)(data[i + 2] & 0x3Fu) << 6) |
                    (uint)(data[i + 3] & 0x3Fu);
             adv = 4;
-            if (cp < 0x10000u || cp > 0x10FFFFu) { i += 1; continue; }
+            if (cp < 0x10000u || cp > 0x10FFFFu) { *dropped = 1; return 0u; }
         } else {
-            i += 1;      /* //IGNORE: drop one byte and resynchronise */
-            continue;
+            /* 0x80-0xBF (continuation with no lead), 0xC0/0xC1 (only ever
+             * an overlong), 0xF5-0xFF (above U+10FFFF), a bad continuation
+             * byte, or a sequence truncated by end of input. */
+            *dropped = 1; return 0u;
         }
         i += adv;
 
@@ -280,35 +347,42 @@ static inline uint md4_over_utf16le(uint *h4, const uchar *data, int len)
 /* template_finalize: MD4UTF16 = MD4(iconv(UTF-8 -> UTF-16LE)(input)),
  * which is the ONLY variant CPU JOB_MD4UTF16 computes.
  *
- * THE EMPTY-CONVERSION CASE.  The CPU guard is
+ * THE NO-DIGEST CASES.  The CPU guard, mdxfind.c 1.616, is
  *
- *     x = iconv(cd,&icin,&ic_inleft,&icout,&ic_outleft);
- *     if (ic_outleft == MAXLINE*2)
+ *     len = U8TO16LE(cur, len, wline, MAXLINE*2);
+ *     if (len <= 0)
  *       break;                       -- no digest AT ALL for this candidate
  *
- * (mdxfind.c:19076-19082).  It ignores iconv's RETURN value and tests only
- * whether any output bytes were written, so a partially-ignored candidate
- * IS hashed (as its surviving bytes) while a candidate that converts to
- * nothing produces no hash and no probe.  Two inputs reach that break: the
- * empty candidate, and a candidate made entirely of bytes //IGNORE drops
- * (measured: 12 of 539 words in the volume fixture).
+ * and `len <= 0` is true for TWO reasons, both of which land on live = 0:
+ * the conversion FAILED (utf8_to_utf16() returned a negative RULE32_ERR_
+ * because the candidate is not well-formed UTF-8) or it produced NOTHING
+ * (the candidate was empty).  Before 1.616 the guard was iconv's
+ * `ic_outleft == MAXLINE*2`, which tested only the second; the shortened
+ * //IGNORE reading of an ill-formed candidate WAS hashed and probed.
  *
- * Getting this wrong is not a miss, it is a FALSE POSITIVE, and a
- * spectacularly likely one: both cases would otherwise hash to MD4 of the
- * empty string, 31d6cfe0d16ae931b73c59d7e0c089c0, which is the empty
- * password and is present in essentially every NTLM-family hash list.  The
- * kernel would have reported garbage bytes as the plaintext for it.  So
- * live = 0 suppresses the probe instead, which is exactly the CPU's break.
- * (The pre-2026-09-15 zero-extend core had the same hazard for the empty
- * candidate specifically -- it hashed zero bytes and probed.)
+ * Getting the empty case wrong is not a miss, it is a FALSE POSITIVE, and
+ * a spectacularly likely one: it would otherwise hash to MD4 of the empty
+ * string, 31d6cfe0d16ae931b73c59d7e0c089c0, which is the empty password
+ * and is present in essentially every NTLM-family hash list.  The kernel
+ * would have reported garbage bytes as the plaintext for it.  Getting the
+ * ill-formed case wrong is a false positive too, just a less uniform one:
+ * it reports the digest of a candidate with bytes deleted, labelled with
+ * the plaintext that was NOT hashed.
  *
  * live is NOT re-armed by template_iterate: the CPU's break leaves the
- * whole case, so iterations 2..Maxiter produce nothing either. */
+ * whole case, so iterations 2..Maxiter produce nothing either.  Tested
+ * directly at -i 3 (8 well-formed + 8 ill-formed candidates): CPU and GPU
+ * both emit 24 digests, 8 candidates x 3 iterations, and the 12 ladder
+ * digests reachable only from a //IGNORE partial are emitted by neither.
+ * The ladder itself is untouched by the refusal change -- template_iterate
+ * feeds 32 lowercase hex characters, which are ASCII, so there is nothing
+ * for a UTF-8 validator to reject past iteration 1. */
 static inline void template_finalize(template_state *st,
                                      const uchar *data, int len)
 {
-    uint nunits = md4_over_utf16le(st->h, data, len);
-    st->live = (nunits != 0u) ? 1u : 0u;
+    int dropped;
+    uint nunits = md4_over_utf16le(st->h, data, len, &dropped);
+    st->live = (!dropped && nunits != 0u) ? 1u : 0u;
 }
 
 /* template_iterate: -i loop step. CPU reference at mdxfind.c:15059-15066:

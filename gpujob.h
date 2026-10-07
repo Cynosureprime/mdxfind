@@ -316,6 +316,34 @@ int gpujob_free_count(void);
  * Safe to call after gpujob_shutdown(). */
 void gpujob_print_share_line(FILE *fp);
 
+/* Hard ceiling on PACKED SALT BYTES in a single snapshot upload.
+ *
+ * 2^32 - 10. The per-salt offset array handed to both backends is uint32_t,
+ * and gpu_pack_salts_op uses the same running counter BOTH as the recorded
+ * offset and as the memcpy destination:
+ *
+ *     soff[packed] = gsp;
+ *     memcpy(salts_packed + gsp, s, sl);
+ *     gsp += sl;
+ *
+ * so wrapping it does not merely record wrong offsets -- it writes later
+ * salts back over earlier ones, inside the allocation, with no fault and no
+ * diagnostic. Every digest computed against an overwritten salt is wrong and
+ * the run still exits 0.
+ *
+ * Reaching it is not hypothetical at the volumes these types imply. hashcat
+ * mode 2811 (e367 MD5-MD5SALTMD5PASS) draws its salt from a 95-character set
+ * over 5 positions, so 95^5 = 7,737,809,375 distinct salts exist. At 5 raw
+ * bytes each the counter wraps at 858,993,459 salts; for the types that pack
+ * the 32-byte MD5(salt) instead of the raw salt it wraps at 134,217,728.
+ *
+ * The limit is also NOT the same as what the device can hold, and the faster
+ * machine is the more dangerous one: measured 2026-10-06, maxBufferLength is
+ * 4096 MB on an Apple M1 and 39813 MB on an M2 Max. The M1 fails the
+ * allocation first and dies loudly; the M2 Max allocates happily and would
+ * run straight into the silent wrap. */
+#define GPU_SALT_PACK_MAX 4294967286u   /* 2^32 - 10 */
+
 #ifdef __cplusplus
 }
 #endif

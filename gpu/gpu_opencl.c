@@ -518,13 +518,19 @@ struct gpu_device {
      * MD4(UTF-16LE(p)) with an iter step for Maxiter > 1: each iter feeds
      * back the lowercase hex of the prior digest (32 ASCII chars)
      * zero-extended to UTF-16LE (64 bytes) and MD4'd.
-     * 2026-09-15: iter == 1 now uses the real iconv conversion. CPU
-     * JOB_MD4UTF16 (mdxfind.c:19070-19097) has NO zero-extend arm at all
-     * — unlike JOB_NTLMH, which has both — so the old zero-extend core
-     * computed a digest the CPU never computes, and e496 on the GPU could
-     * only ever miss on a non-ASCII candidate. The "same hashcat-compat
-     * gap as NTLMH" framing in the pre-2026-09-15 comments here and at
-     * mdxfind.c:13248 was wrong on exactly that point.
+     * 2026-09-15: iter == 1 now does the real UTF-8 -> UTF-16LE widening,
+     * not a zero-extend. CPU JOB_MD4UTF16 (mdxfind.c, `case JOB_MD4UTF16`)
+     * has NO zero-extend arm at all — unlike JOB_NTLMH, which has both —
+     * so the old zero-extend core computed a digest the CPU never computes,
+     * and e496 on the GPU could only ever miss on a non-ASCII candidate.
+     * The "same hashcat-compat gap as NTLMH" framing in the pre-2026-09-15
+     * comments here and at mdxfind.c:13248 was wrong on exactly that point.
+     * 2026-10-05: iconv is gone from mdxfind entirely — the CPU arm is
+     * U8TO16LE() over ruleproc32's strict decoder, and `len <= 0` on an
+     * ill-formed candidate means the CPU produces NO digest. The kernel
+     * mirrors that by clearing template_state.live, so the GPU refuses the
+     * same inputs rather than emitting a digest the CPU would never show.
+     * Do not re-describe this arm as an iconv conversion.
      * defines_str matches MD4 / NTLMH (HASH_WORDS=4,
      * HASH_BLOCK_BYTES=64). Distinct cache entry by source-text hash. */
     cl_program prog_template_md4utf16;

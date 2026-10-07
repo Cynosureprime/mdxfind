@@ -87,6 +87,34 @@ void gpu_metal_shutdown(void);
  * Mirrors gpu_opencl_available(). */
 int gpu_metal_available(void);
 
+/* Device enumeration, for the brute-force chunk producer. Reached from
+ * mdxfind.c only through the mdx_gpu_* shims. This backend is
+ * single-device: num_devices is 1, active is 1 once init succeeded.
+ * gpu_metal_dev_uuid is byte-compatible with gpu_opencl_dev_uuid
+ * (FNV-1a 64-bit, "%016llx", needs out_sz >= 17). */
+/* Per-position mask charset size, off the uint8_t wire.
+ *
+ * 0 ENCODES 256. ?b is the only built-in class with 256 members and the size
+ * crosses as uint8_t, so (uint8_t)256 is 0. The encoding is free because the
+ * host rejects an empty class before upload. gpu_mask_wire_size() in
+ * gpu/gpu_opencl.h is the convention of record; gpu/gpujob_metal.m carries
+ * MASK_WIRE_SZ for the hit-replay side.
+ *
+ * USE THIS RATHER THAN OPEN-CODING THE TEST. The convention was open-coded
+ * twice inside gpu_metal_set_mask and the two copies disagreed: the
+ * gpu_mask_total accounting read 0 as 256 while the kernel-side b7_sizes
+ * producer read it as 1. The kernel then enumerated ONE candidate per ?b
+ * position -- byte 0x00 -- while the host reported the full keyspace, so a
+ * -n ?b?b or a ?b?b?b?b?b brute force hashed a nominal 1.1 trillion
+ * candidates, found nothing, and exited 0. Caught 2026-10-05 on an M2 Max;
+ * the OpenCL side had the same defect fixed earlier and the Metal producer
+ * was listed as wired but was not. */
+#define METAL_MASK_WIRE_SZ(v) ((uint32_t)((v) ? (unsigned)(v) : 256u))
+
+int  gpu_metal_num_devices(void);
+int  gpu_metal_active_device_count(void);
+void gpu_metal_dev_uuid(int dev_idx, char *out, size_t out_sz);
+
 /* Per-device APIs. Phase 1 supports dev_idx == 0 only; any other value
  * returns -1 (mirrors gpu_opencl_set_compact_table's bounds check). The
  * dev_idx parameter is retained for signature parity with the OpenCL
@@ -358,7 +386,16 @@ int gpu_metal_template_pso_lazy_md5_salt_rules_presalt(void);
 struct gpu_metal_family {
     int op;                 /* JOB_MD5, JOB_MD5SALT, etc. */
     const char *name;       /* short name for stderr/logs ("md5", "md5salt") */
-    int op_category;        /* GPU_CAT_UNSALTED / GPU_CAT_MASK */
+    /* GPU_CAT_MASK for every template-routed family, which is all of
+     * them. This mirrors gpu/gpujob_opencl.c, where the unsalted ops were
+     * MOVED into GPU_CAT_MASK as each gained a template core; the Metal
+     * side had kept 35 of them on the older GPU_CAT_UNSALTED label and the
+     * two brute-force gates in mdxfind.c test for GPU_CAT_MASK, so BF
+     * silently stayed CPU-only on Metal while the kernel was complete.
+     * The label is not a salt claim: needs_salt_snapshot is
+     * (MASK && gpu_salt_judy(op) != NULL), and an unsalted op has no
+     * Typesalt entry, which is the same no-op OpenCL already relies on. */
+    int op_category;        /* GPU_CAT_MASK / GPU_CAT_SALTED / ... */
     uint8_t supported_variants;  /* bitmask of admissible variant_bits */
     void *(*pso_for_variant)(uint8_t variant_bits);
 

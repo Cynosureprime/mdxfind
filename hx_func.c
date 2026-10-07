@@ -3746,67 +3746,77 @@ static void fn_bcrypt_encode(hx_func_entry *self, hx_val *args,
 	result->len  = o;
 }
 
-/* ---- iconv-based encoding functions ---- */
+/* ---- encoding functions ---- */
 
-#include <iconv.h>
+#include "ruleproc32.h"
 
 /*
- * Generic iconv wrapper.  Converts args[0] from one encoding to
- * another using iconv.  Uses //IGNORE to silently drop characters
- * that cannot be represented in the target encoding.
+ * These used to call iconv -- an iconv_open per invocation -- with //IGNORE, and
+ * that was wrong in two measurable ways.
  *
- * If iconv_open fails (unsupported encoding on this platform),
- * the input is returned unchanged with a warning on first use.
+ * //IGNORE silently DROPPED anything unconvertible, so utf16le() returned the
+ * SAME bytes for "ab" and for a candidate containing a lone 0x81: 61006200 for
+ * both.  And the UTF-7 flush passed a NULL output buffer, which resets iconv's
+ * shift state without emitting anything, so a base64 run lost its final group
+ * AND its terminator: utf7() gave "caf+AO" where the correct encoding, and what
+ * mdxfind's SHA1UTF7 has always hashed, is "caf+AOk-".
+ *
+ * They now use the conversions in ruleproc32.c -- the same ones the C
+ * implementations use, built on the utf8_to_utf32 that already defines
+ * well-formed UTF-8 for the -8 rule engine.  An hx expression and the type it
+ * documents therefore agree, which matters because tools/hx_dedup_check
+ * compares compiled hx bytecode against the catalog: a conversion that drops
+ * where the implementation refuses makes the gate disagree with the thing it is
+ * checking.
+ *
+ * Ill-formed input yields an EMPTY result.  hx has no way for a function to
+ * signal failure, and the alternative -- returning a silently shortened string
+ * -- is the behaviour being removed, because it is indistinguishable from a
+ * valid conversion of some other input.
  */
-static void hx_iconv_convert(const char *from, const char *to,
-                              hx_val *args, hx_val *result,
-                              hx_arena *arena)
+static void hx_u16_convert(hx_val *args, hx_val *result, hx_arena *arena, int be)
 {
-	iconv_t cd;
-	char *inbuf, *outbuf, *out;
-	size_t inleft, outleft, outmax;
-
-	outmax = args[0].len * 4 + 4;  /* generous: UTF-8 → UTF-16 at most 2x */
-	out = hx_arena_alloc(arena, outmax);
-
-	cd = iconv_open(to, from);
-	if (cd == (iconv_t)-1) {
-		/* unsupported encoding: return input unchanged */
-		static int warned = 0;
-		if (!warned) {
-			fprintf(stderr, "hx: iconv_open(\"%s\",\"%s\") failed\n",
-			        to, from);
-			warned = 1;
-		}
-		memcpy(out, args[0].data, args[0].len);
-		result->data = out;
-		result->len  = args[0].len;
-		return;
-	}
-
-	inbuf = args[0].data;
-	inleft = args[0].len;
-	outbuf = out;
-	outleft = outmax;
-
-	iconv(cd, &inbuf, &inleft, &outbuf, &outleft);
-	iconv(cd, NULL, NULL, NULL, NULL);  /* flush */
-	iconv_close(cd);
-
+	int inlen = (int)args[0].len;
+	int cap   = inlen * 2 + 4;
+	char *out = hx_arena_alloc(arena, cap);
+	uint32_t *scr = (uint32_t *)hx_arena_alloc(arena, (inlen + 2) * sizeof(uint32_t));
+	int n = utf8_to_utf16((const unsigned char *)args[0].data, inlen,
+	                      (unsigned char *)out, cap, scr, inlen + 2, be);
 	result->data = out;
-	result->len  = outmax - outleft;
+	result->len  = n < 0 ? 0 : n;
+}
+
+/* CP125x -> UTF-8, by way of UTF-16.  Note this now converts the six positions
+ * Windows defines but Unicode.org leaves undefined -- CP1252 0x81 0x8d 0x8f
+ * 0x90 0x9d and CP1251 0x98 -- where iconv dropped them. */
+static void hx_from_cp_convert(hx_val *args, hx_val *result, hx_arena *arena,
+                               int codepage)
+{
+	int inlen  = (int)args[0].len;
+	int u16cap = inlen * 2 + 2;
+	int cap    = inlen * 3 + 4;
+	unsigned char *u16 = (unsigned char *)hx_arena_alloc(arena, u16cap);
+	char *out = hx_arena_alloc(arena, cap);
+	uint32_t *scr = (uint32_t *)hx_arena_alloc(arena, (inlen + 2) * sizeof(uint32_t));
+	int n16 = cp_to_utf16((const unsigned char *)args[0].data, inlen,
+	                      u16, u16cap, codepage, UTF16_LE);
+	int n = (n16 < 0) ? -1
+	      : utf16_to_utf8(u16, n16, (unsigned char *)out, cap,
+	                      scr, inlen + 2, UTF16_LE);
+	result->data = out;
+	result->len  = n < 0 ? 0 : n;
 }
 
 /*
- * utf16le(x) — UTF-8 to UTF-16LE via iconv.
- * Uses //IGNORE: invalid UTF-8 sequences are silently dropped.
- * This matches mdxfind's -b behavior exactly.
+ * utf16le(x) — UTF-8 to UTF-16LE.  Ill-formed input yields an empty result;
+ * it is NOT dropped and converted around, which is what the old //IGNORE did
+ * and what made this disagree with the C implementations.
  */
 static void fn_utf16le(hx_func_entry *self, hx_val *args, int nargs,
                        hx_val *result, hx_arena *arena, uint8_t role)
 {
 	(void)self; (void)nargs; (void)role;
-	hx_iconv_convert("UTF-8", "UTF-16LE//IGNORE", args, result, arena);
+	hx_u16_convert(args, result, arena, UTF16_LE);
 }
 
 /*
@@ -3816,17 +3826,25 @@ static void fn_utf16be(hx_func_entry *self, hx_val *args, int nargs,
                        hx_val *result, hx_arena *arena, uint8_t role)
 {
 	(void)self; (void)nargs; (void)role;
-	hx_iconv_convert("UTF-8", "UTF-16BE//IGNORE", args, result, arena);
+	hx_u16_convert(args, result, arena, UTF16_BE);
 }
 
 /*
- * utf7(x) — UTF-8 to UTF-7 via iconv.
+ * utf7(x) — UTF-8 to UTF-7 (RFC 2152), flushed.  Base64 runs are closed, which
+ * the iconv version failed to do.
  */
 static void fn_utf7(hx_func_entry *self, hx_val *args, int nargs,
                     hx_val *result, hx_arena *arena, uint8_t role)
 {
 	(void)self; (void)nargs; (void)role;
-	hx_iconv_convert("UTF-8", "UTF-7//IGNORE", args, result, arena);
+	{ int inlen = (int)args[0].len;
+	  int cap = inlen * 8 + 8;
+	  char *out = hx_arena_alloc(arena, cap);
+	  uint32_t *scr = (uint32_t *)hx_arena_alloc(arena, (inlen + 2) * sizeof(uint32_t));
+	  int n = utf8_to_utf7((const unsigned char *)args[0].data, inlen,
+	                       out, cap, scr, inlen + 2);
+	  result->data = out;
+	  result->len  = n < 0 ? 0 : n; }
 }
 
 /*
@@ -3861,14 +3879,14 @@ static void fn_from_cp1252(hx_func_entry *self, hx_val *args, int nargs,
                             hx_val *result, hx_arena *arena, uint8_t role)
 {
 	(void)self; (void)nargs; (void)role;
-	hx_iconv_convert("CP1252", "UTF-8//IGNORE", args, result, arena);
+	hx_from_cp_convert(args, result, arena, CP_1252);
 }
 
 static void fn_from_cp1251(hx_func_entry *self, hx_val *args, int nargs,
                             hx_val *result, hx_arena *arena, uint8_t role)
 {
 	(void)self; (void)nargs; (void)role;
-	hx_iconv_convert("CP1251", "UTF-8//IGNORE", args, result, arena);
+	hx_from_cp_convert(args, result, arena, CP_1251);
 }
 
 /* ---- length ---- */

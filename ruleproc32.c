@@ -1,6 +1,23 @@
-/* $Revision: 1.17 $
+/* $Revision: 1.18 $
  *
  * $Log: ruleproc32.c,v $
+ * Revision 1.18  2026/10/05 03:43:33  dlr
+ * Encoding conversions move here, replacing iconv for the whole program.
+ *
+ * New: utf8_to_utf16 and utf16_to_utf8 (either endianness, the BE case being one byte-order flag in put16), cp_to_utf16 with the CP1251 and CP1252 tables behind a codepage selector, cp_tables_agree, and utf8_to_utf7. Every one returns a LENGTH or a negative RULE32_ERR_, never a partial result, and the UTF-8 decode is utf8_to_utf32 verbatim so these agree with the -8 rule engine on every boundary condition by construction rather than by inspection.
+ *
+ * This is the right home because utf8_to_utf32 already defines what well-formed UTF-8 means for this program, and the callers were each inventing their own answer. Three things were wrong with asking iconv. //IGNORE silently DROPPED what it could not convert, so a malformed candidate was shortened and hashed rather than refused. glibc and macOS libiconv disagree about what //IGNORE returns -- measured directly: for the bytes 61 81 62 glibc gives -1 with EILSEQ while macOS returns a non-negative count, both reporting the input fully consumed after deleting a byte -- so the same candidate was accepted on one platform and skipped on the other. And linking glibc iconv statically dlopens gconv modules, which segfaults on a host with a different glibc while passing every test on the build host.
+ *
+ * The code pages are tables because iconv could not express them at all: CP1252 0x81 0x8d 0x8f 0x90 0x9d and CP1251 0x98 are undefined in Unicode.org mapping files but Windows NLS maps each to the matching C1 control, and //IGNORE drops them while strict conversion fails, so a password containing one had NO reachable digest. Every table entry is a non-surrogate BMP codepoint, so one byte is exactly one UTF-16 code unit, the output length is known as 2*len in advance, and there is no error path but NOROOM.
+ *
+ * cp_tables_agree answers "would the two code-page conversions compare equal" from the table entries alone, without performing the second one, so the redundant conversion and hash are never done rather than done and discarded. The tables agree on 159 of 256 byte values.
+ *
+ * utf8_to_utf7 reproduces byte for byte what SHA1UTF7 has always hashed. Three details of that are not free choices and were found by differential testing, not by reading RFC 2152: Set O is ENCODED rather than passed through; a base64 run is closed with an explicit terminator only when the next character could be read as more base64, or as the terminator itself; and a literal plus sign inside a run is encoded rather than written as plus-minus. The callers used to append or prepend an X purely to make iconv flush its shift state, X being a base64 character so the terminator was always emitted; this flushes because it is told to.
+ *
+ * Gates, with iconv itself as the oracle while it was still present. UTF-16: 4,131,588 inputs compared -- every 1- and 2-byte input exhaustively plus 2,000,000 3-byte, in both endiannesses, each round-tripped through the inverse -- 0 mismatches and 0 round-trip failures. UTF-7: 288,721 compared, 0 mismatches; of the disagreements on REFUSAL, all 556,608 are iconv accepting something ill-formed that is now declined and 0 are the reverse. The code-page tables were verified against the platform codecs at every position where those have an opinion, and the losslessness of reporting a CP125x password as UTF-8 was checked exhaustively over all 1- and 2-byte strings in each code page, 65,792 each, 0 mismatches.
+ *
+ * Measured faster than iconv despite decoding to UTF-32 on the way, because an iconv call carries per-call setup and a state machine: a 12-byte ASCII password goes 76.1ns to 22.4ns, 8 bytes 47.8 to 15.5, 24 bytes 142.6 to 46.3, e-acute 28.1 to 11.5, a six-letter Cyrillic word 46.8 to 22.6.
+ *
  * Revision 1.17  2026/09/28 11:37:15  dlr
  * Move the large thread-local rule scratch buffers from static TLS to the heap. A static __thread array does not get a buffer off the thread stack, which is what the comments at these sites believed: glibc carves the static TLS block out of the same allocation as the thread stack and replicates it into every thread, including threads created inside a dlopen library. mdxfind carried 6,881,648 bytes of .tbss, 95 percent of it eight uint32_t arrays of RULE32_MAXCP at 819,200 bytes each, and AMD fglrx 1573.4 clCreateCommandQueue hung forever on gp1 because its internal helper thread could not be created; a ballast harness bisects the threshold to between 131,072 and 262,144 bytes, and hashcat and the gbench harness ran on the same card minutes apart because their TLS is small or absent. Each buffer now keeps a thread-local pointer and allocates once per thread on first use through the new RULE32_TLS_SCRATCH in ruleproc32.h, using calloc so the zeroing matches .tbss semantics of zeroed once per thread rather than per call, never freed because worker threads live for the run exactly as the TLS block did, and a loud exit naming file and line on allocation failure. Measured .tbss falls from 6,881,648 to 41,256 bytes on the Linux GPU build and thread_bss from 5,120,216 to 41,152 on the non-GPU build; the residue is cached, deliberately left as an array because it is under the threshold and carries sizeof uses. mdxfind now initialises the Tahiti GPU in 2.0 seconds and cracks on it, including a two-digit mask matching the CPU exactly, where every earlier build hung. procrule -8 against mdxfind -8 gives 10,946 of 10,947 candidates both before and after, the one difference being the known Turkish dotless-i locale variant.
  *
@@ -2520,4 +2537,291 @@ rule_done:
     if (len > outmax) return RULE32_ERR_NOROOM;
     for (i = 0; i < len; i++) out[i] = buf[i];
     return len;
+}
+
+/* ---- Encoding conversions ----------------------------------------------
+ * See ruleproc32.h for why these exist rather than a call to iconv.
+ */
+
+/* CP1251 -> Unicode.  0x98 is undefined in Unicode.org's CP1251.TXT; Windows
+ * NLS maps it to U+0098 and that is what matters for reproducing a Windows
+ * digest, so that is what is used here.  Every entry is a non-surrogate BMP
+ * codepoint, so one byte is always exactly one UTF-16 code unit. */
+static const unsigned short cp1251_u16[256] = {
+    0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,   /* 0x00 */
+    0x0008, 0x0009, 0x000a, 0x000b, 0x000c, 0x000d, 0x000e, 0x000f,   /* 0x08 */
+    0x0010, 0x0011, 0x0012, 0x0013, 0x0014, 0x0015, 0x0016, 0x0017,   /* 0x10 */
+    0x0018, 0x0019, 0x001a, 0x001b, 0x001c, 0x001d, 0x001e, 0x001f,   /* 0x18 */
+    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,   /* 0x20 */
+    0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,   /* 0x28 */
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,   /* 0x30 */
+    0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,   /* 0x38 */
+    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,   /* 0x40 */
+    0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,   /* 0x48 */
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,   /* 0x50 */
+    0x0058, 0x0059, 0x005a, 0x005b, 0x005c, 0x005d, 0x005e, 0x005f,   /* 0x58 */
+    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,   /* 0x60 */
+    0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,   /* 0x68 */
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,   /* 0x70 */
+    0x0078, 0x0079, 0x007a, 0x007b, 0x007c, 0x007d, 0x007e, 0x007f,   /* 0x78 */
+    0x0402, 0x0403, 0x201a, 0x0453, 0x201e, 0x2026, 0x2020, 0x2021,   /* 0x80 */
+    0x20ac, 0x2030, 0x0409, 0x2039, 0x040a, 0x040c, 0x040b, 0x040f,   /* 0x88 */
+    0x0452, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,   /* 0x90 */
+    0x0098, 0x2122, 0x0459, 0x203a, 0x045a, 0x045c, 0x045b, 0x045f,   /* 0x98 */
+    0x00a0, 0x040e, 0x045e, 0x0408, 0x00a4, 0x0490, 0x00a6, 0x00a7,   /* 0xa0 */
+    0x0401, 0x00a9, 0x0404, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x0407,   /* 0xa8 */
+    0x00b0, 0x00b1, 0x0406, 0x0456, 0x0491, 0x00b5, 0x00b6, 0x00b7,   /* 0xb0 */
+    0x0451, 0x2116, 0x0454, 0x00bb, 0x0458, 0x0405, 0x0455, 0x0457,   /* 0xb8 */
+    0x0410, 0x0411, 0x0412, 0x0413, 0x0414, 0x0415, 0x0416, 0x0417,   /* 0xc0 */
+    0x0418, 0x0419, 0x041a, 0x041b, 0x041c, 0x041d, 0x041e, 0x041f,   /* 0xc8 */
+    0x0420, 0x0421, 0x0422, 0x0423, 0x0424, 0x0425, 0x0426, 0x0427,   /* 0xd0 */
+    0x0428, 0x0429, 0x042a, 0x042b, 0x042c, 0x042d, 0x042e, 0x042f,   /* 0xd8 */
+    0x0430, 0x0431, 0x0432, 0x0433, 0x0434, 0x0435, 0x0436, 0x0437,   /* 0xe0 */
+    0x0438, 0x0439, 0x043a, 0x043b, 0x043c, 0x043d, 0x043e, 0x043f,   /* 0xe8 */
+    0x0440, 0x0441, 0x0442, 0x0443, 0x0444, 0x0445, 0x0446, 0x0447,   /* 0xf0 */
+    0x0448, 0x0449, 0x044a, 0x044b, 0x044c, 0x044d, 0x044e, 0x044f,   /* 0xf8 */
+};
+
+/* CP1252 -> Unicode.  0x81 0x8d 0x8f 0x90 0x9d are undefined in Unicode.org's
+ * CP1252.TXT and are mapped here to the matching C1 control as Windows NLS
+ * does.  iconv could reach none of them: //IGNORE drops them and strict
+ * conversion fails, so a password containing one had no reachable digest. */
+static const unsigned short cp1252_u16[256] = {
+    0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007,   /* 0x00 */
+    0x0008, 0x0009, 0x000a, 0x000b, 0x000c, 0x000d, 0x000e, 0x000f,   /* 0x08 */
+    0x0010, 0x0011, 0x0012, 0x0013, 0x0014, 0x0015, 0x0016, 0x0017,   /* 0x10 */
+    0x0018, 0x0019, 0x001a, 0x001b, 0x001c, 0x001d, 0x001e, 0x001f,   /* 0x18 */
+    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,   /* 0x20 */
+    0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,   /* 0x28 */
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,   /* 0x30 */
+    0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,   /* 0x38 */
+    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,   /* 0x40 */
+    0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,   /* 0x48 */
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,   /* 0x50 */
+    0x0058, 0x0059, 0x005a, 0x005b, 0x005c, 0x005d, 0x005e, 0x005f,   /* 0x58 */
+    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,   /* 0x60 */
+    0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,   /* 0x68 */
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,   /* 0x70 */
+    0x0078, 0x0079, 0x007a, 0x007b, 0x007c, 0x007d, 0x007e, 0x007f,   /* 0x78 */
+    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,   /* 0x80 */
+    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,   /* 0x88 */
+    0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,   /* 0x90 */
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,   /* 0x98 */
+    0x00a0, 0x00a1, 0x00a2, 0x00a3, 0x00a4, 0x00a5, 0x00a6, 0x00a7,   /* 0xa0 */
+    0x00a8, 0x00a9, 0x00aa, 0x00ab, 0x00ac, 0x00ad, 0x00ae, 0x00af,   /* 0xa8 */
+    0x00b0, 0x00b1, 0x00b2, 0x00b3, 0x00b4, 0x00b5, 0x00b6, 0x00b7,   /* 0xb0 */
+    0x00b8, 0x00b9, 0x00ba, 0x00bb, 0x00bc, 0x00bd, 0x00be, 0x00bf,   /* 0xb8 */
+    0x00c0, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x00c7,   /* 0xc0 */
+    0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc, 0x00cd, 0x00ce, 0x00cf,   /* 0xc8 */
+    0x00d0, 0x00d1, 0x00d2, 0x00d3, 0x00d4, 0x00d5, 0x00d6, 0x00d7,   /* 0xd0 */
+    0x00d8, 0x00d9, 0x00da, 0x00db, 0x00dc, 0x00dd, 0x00de, 0x00df,   /* 0xd8 */
+    0x00e0, 0x00e1, 0x00e2, 0x00e3, 0x00e4, 0x00e5, 0x00e6, 0x00e7,   /* 0xe0 */
+    0x00e8, 0x00e9, 0x00ea, 0x00eb, 0x00ec, 0x00ed, 0x00ee, 0x00ef,   /* 0xe8 */
+    0x00f0, 0x00f1, 0x00f2, 0x00f3, 0x00f4, 0x00f5, 0x00f6, 0x00f7,   /* 0xf0 */
+    0x00f8, 0x00f9, 0x00fa, 0x00fb, 0x00fc, 0x00fd, 0x00fe, 0x00ff,   /* 0xf8 */
+};
+
+static const unsigned short *cp_table(int codepage)
+{
+    switch (codepage) {
+      case CP_1251: return cp1251_u16;
+      case CP_1252: return cp1252_u16;
+    }
+    return NULL;
+}
+
+static void put16(unsigned char *p, unsigned int u, int big_endian)
+{
+    if (big_endian) { p[0] = (unsigned char)(u >> 8); p[1] = (unsigned char)(u & 0xFFu); }
+    else            { p[0] = (unsigned char)(u & 0xFFu); p[1] = (unsigned char)(u >> 8); }
+}
+
+static unsigned int get16(const unsigned char *p, int big_endian)
+{
+    return big_endian ? (((unsigned int)p[0] << 8) | p[1])
+                      : (((unsigned int)p[1] << 8) | p[0]);
+}
+
+int utf8_to_utf16(const unsigned char *in, int inlen,
+                  unsigned char *out, int outmax,
+                  uint32_t *scratch, int scratchmax, int big_endian)
+{
+    int n, i, o = 0;
+
+    if (!out || outmax < 0) return RULE32_ERR_NOROOM;
+    n = utf8_to_utf32(in, inlen, scratch, scratchmax);
+    if (n < 0) return n;                       /* INVALID or NOROOM, unchanged */
+
+    for (i = 0; i < n; i++) {
+        uint32_t cp = scratch[i];
+        if (cp >= 0x10000u) {                  /* astral: surrogate pair */
+            uint32_t v = cp - 0x10000u;
+            if (o + 4 > outmax) return RULE32_ERR_NOROOM;
+            put16(out + o,     (unsigned int)(0xD800u | (v >> 10)),    big_endian);
+            put16(out + o + 2, (unsigned int)(0xDC00u | (v & 0x3FFu)), big_endian);
+            o += 4;
+        } else {
+            if (o + 2 > outmax) return RULE32_ERR_NOROOM;
+            put16(out + o, (unsigned int)cp, big_endian);
+            o += 2;
+        }
+    }
+    return o;
+}
+
+int utf16_to_utf8(const unsigned char *in, int inlen,
+                  unsigned char *out, int outmax,
+                  uint32_t *scratch, int scratchmax, int big_endian)
+{
+    int i, n = 0, dropped = 0, r;
+
+    if (inlen < 0 || (inlen & 1)) return RULE32_ERR_INVALID;   /* odd length */
+
+    for (i = 0; i + 1 < inlen; i += 2) {
+        unsigned int u = get16(in + i, big_endian);
+        uint32_t cp;
+        if (u >= 0xD800u && u <= 0xDBFFu) {                    /* high surrogate */
+            unsigned int lo;
+            if (i + 3 >= inlen) return RULE32_ERR_INVALID;     /* unpaired */
+            lo = get16(in + i + 2, big_endian);
+            if (lo < 0xDC00u || lo > 0xDFFFu) return RULE32_ERR_INVALID;
+            cp = 0x10000u + (((uint32_t)(u - 0xD800u)) << 10) + (lo - 0xDC00u);
+            i += 2;
+        } else if (u >= 0xDC00u && u <= 0xDFFFu) {
+            return RULE32_ERR_INVALID;                         /* lone low */
+        } else {
+            cp = u;
+        }
+        if (n >= scratchmax) return RULE32_ERR_NOROOM;
+        scratch[n++] = cp;
+    }
+
+    r = utf32_to_utf8(scratch, n, out, outmax, &dropped);
+    if (r < 0) return r;
+    /* utf32_to_utf8 drops an unencodable codepoint rather than failing.  Nothing
+     * reaching here can be unencodable -- the surrogate pairing above is the only
+     * source of a non-BMP value and it cannot produce one out of range -- so a
+     * drop would mean this function is wrong, and saying so beats shortening the
+     * answer the way //IGNORE did. */
+    if (dropped) return RULE32_ERR_INVALID;
+    return r;
+}
+
+int cp_to_utf16(const unsigned char *in, int inlen,
+                unsigned char *out, int outmax, int codepage, int big_endian)
+{
+    const unsigned short *t = cp_table(codepage);
+    int i;
+
+    if (!t) return RULE32_ERR_INVALID;
+    if (inlen < 0) return RULE32_ERR_INVALID;
+    if (2 * inlen > outmax) return RULE32_ERR_NOROOM;
+    for (i = 0; i < inlen; i++)
+        put16(out + 2 * i, t[in[i]], big_endian);
+    return 2 * inlen;
+}
+
+int cp_tables_agree(const unsigned char *in, int inlen, int cpa, int cpb)
+{
+    const unsigned short *ta = cp_table(cpa), *tb = cp_table(cpb);
+    int i;
+
+    if (!ta || !tb) return 0;
+    for (i = 0; i < inlen; i++)
+        if (ta[in[i]] != tb[in[i]]) return 0;
+    return 1;
+}
+
+/* RFC 2152 Set D: the characters UTF-7 may carry directly.  Alphanumerics plus
+ * ' ( ) , - . / : ? and the four whitespace characters.  Set O is deliberately
+ * NOT here -- see ruleproc32.h. */
+static int utf7_direct(uint32_t c)
+{
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+        return 1;
+    switch (c) {
+      case '\'': case '(': case ')': case ',': case '-':
+      case '.':  case '/': case ':': case '?':
+      case ' ':  case '\t': case '\r': case '\n':
+        return 1;
+    }
+    return 0;
+}
+
+static const char utf7_b64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* After a base64 run, an explicit '-' is needed only when the next character
+ * could otherwise be read as more base64 -- or as the terminator itself.  A run
+ * followed by a space or a tab needs nothing. */
+static int utf7_needs_terminator(uint32_t c)
+{
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))
+        return 1;
+    return c == '+' || c == '/' || c == '-';
+}
+
+int utf8_to_utf7(const unsigned char *in, int inlen, char *out, int outmax,
+                 uint32_t *scratch, int scratchmax)
+{
+    int n, i, o = 0, inrun = 0;
+    uint32_t bits = 0;
+    int nbits = 0;
+
+    n = utf8_to_utf32(in, inlen, scratch, scratchmax);
+    if (n < 0) return n;
+
+#define U7PUT(ch) do { if (o >= outmax) return RULE32_ERR_NOROOM; out[o++] = (char)(ch); } while (0)
+/* Close a run: emit any partial base64 group, then the terminator only if the
+ * following character demands one.  At end of input it is always emitted, which
+ * is what the old append-an-X pipeline produced, X being a base64 character. */
+#define U7CLOSE(needterm) do {                                                \
+        if (inrun) {                                                          \
+            if (nbits) { U7PUT(utf7_b64[(bits << (6 - nbits)) & 0x3F]); nbits = 0; bits = 0; } \
+            if (needterm) U7PUT('-');                                         \
+            inrun = 0;                                                        \
+        }                                                                     \
+    } while (0)
+
+    for (i = 0; i < n; i++) {
+        uint32_t cp = scratch[i];
+
+        /* A literal '+' is written "+-" only OUTSIDE a run; inside one it is
+         * just another codepoint to encode, which is what iconv does. */
+        if (utf7_direct(cp)) {
+            U7CLOSE(utf7_needs_terminator(cp));
+            U7PUT(cp);
+            continue;
+        }
+        if (cp == '+' && !inrun) {
+            U7PUT('+');
+            U7PUT('-');
+            continue;
+        }
+        if (!inrun) { U7PUT('+'); inrun = 1; bits = 0; nbits = 0; }
+        {
+            unsigned int units[2];
+            int nu = 1, k;
+            if (cp >= 0x10000u) {
+                uint32_t v = cp - 0x10000u;
+                units[0] = 0xD800u | (v >> 10);
+                units[1] = 0xDC00u | (v & 0x3FFu);
+                nu = 2;
+            } else {
+                units[0] = (unsigned int)cp;
+            }
+            for (k = 0; k < nu; k++) {
+                bits = (bits << 16) | units[k];
+                nbits += 16;
+                while (nbits >= 6) {
+                    nbits -= 6;
+                    U7PUT(utf7_b64[(bits >> nbits) & 0x3F]);
+                }
+            }
+        }
+    }
+    U7CLOSE(1);
+#undef U7PUT
+#undef U7CLOSE
+    return o;
 }

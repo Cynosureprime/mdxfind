@@ -1,6 +1,9 @@
-/* $Revision: 1.5 $
+/* $Revision: 1.6 $
  *
  * $Log: ruleproc32.h,v $
+ * Revision 1.6  2026/10/05 03:43:33  dlr
+ * Declare the encoding conversions added to ruleproc32.c, with the contract and the reasons in one place: a length or a negative RULE32_ERR_, never a partial result; the caller owns the UTF-32 scratch because these run per candidate and a MAXLINE local is not an option; and the three defects of asking iconv instead -- silent dropping under //IGNORE, a return value glibc and macOS libiconv disagree about, and a static link that dlopens gconv modules and segfaults on a host with a different glibc. Documents that utf16_to_utf8 refuses an unpaired surrogate rather than emitting CESU-8, and treats a dropped codepoint from utf32_to_utf8 as an error, since a drop there would mean the caller conversion was unsound.
+ *
  * Revision 1.5  2026/09/28 11:37:15  dlr
  * Move the large thread-local rule scratch buffers from static TLS to the heap. A static __thread array does not get a buffer off the thread stack, which is what the comments at these sites believed: glibc carves the static TLS block out of the same allocation as the thread stack and replicates it into every thread, including threads created inside a dlopen library. mdxfind carried 6,881,648 bytes of .tbss, 95 percent of it eight uint32_t arrays of RULE32_MAXCP at 819,200 bytes each, and AMD fglrx 1573.4 clCreateCommandQueue hung forever on gp1 because its internal helper thread could not be created; a ballast harness bisects the threshold to between 131,072 and 262,144 bytes, and hashcat and the gbench harness ran on the same card minutes apart because their TLS is small or absent. Each buffer now keeps a thread-local pointer and allocates once per thread on first use through the new RULE32_TLS_SCRATCH in ruleproc32.h, using calloc so the zeroing matches .tbss semantics of zeroed once per thread rather than per call, never freed because worker threads live for the run exactly as the TLS block did, and a loud exit naming file and line on allocation failure. Measured .tbss falls from 6,881,648 to 41,256 bytes on the Linux GPU build and thread_bss from 5,120,216 to 41,152 on the non-GPU build; the residue is cached, deliberately left as an array because it is under the threshold and carries sizeof uses. mdxfind now initialises the Tahiti GPU in 2.0 seconds and cracks on it, including a two-digit mask matching the CPU exactly, where every earlier build hung. procrule -8 against mdxfind -8 gives 10,946 of 10,947 candidates both before and after, the one difference being the known Turkish dotless-i locale variant.
  *
@@ -228,6 +231,80 @@ int utf8_to_utf32(const unsigned char *in, int inlen, uint32_t *out, int outmax)
  */
 int utf32_to_utf8(const uint32_t *in, int inlen, unsigned char *out, int outmax,
                   int *ndropped);
+
+/* ---- Encoding conversions ---------------------------------------------
+ *
+ * These exist so that nothing outside this file has to decide what
+ * "well-formed UTF-8" means.  mdxfind previously asked iconv, which was a
+ * mistake in three ways: //IGNORE silently DROPS what it cannot convert, so a
+ * malformed candidate was shortened and hashed rather than refused; glibc and
+ * macOS libiconv disagree about what //IGNORE returns, so the same candidate
+ * was accepted on one platform and skipped on the other; and linking glibc's
+ * iconv statically dlopens gconv modules, which segfaults on a host with a
+ * different glibc while passing every test on the build host.
+ *
+ * Every function here returns a LENGTH or a negative RULE32_ERR_*.  Never a
+ * partial result.  The decode is utf8_to_utf32() verbatim, so these agree with
+ * the -8 rule engine on every boundary condition by construction rather than
+ * by inspection: lone continuations, 0xC0/0xC1, 0xF5-0xFF, truncation,
+ * overlongs, surrogates and anything above U+10FFFF.
+ *
+ * The caller owns the uint32_t scratch: these run per candidate, so a
+ * MAXLINE-sized local is not an option.  It must hold at least as many entries
+ * as the input could yield codepoints.
+ */
+
+#define UTF16_LE 0
+#define UTF16_BE 1
+
+/* UTF-8 -> UTF-16.  Returns the byte count written (2 per BMP codepoint, 4 per
+ * astral one, which becomes a surrogate pair), RULE32_ERR_INVALID for
+ * ill-formed input, or RULE32_ERR_NOROOM. */
+int utf8_to_utf16(const unsigned char *in, int inlen,
+                  unsigned char *out, int outmax,
+                  uint32_t *scratch, int scratchmax, int big_endian);
+
+/* UTF-16 -> UTF-8.  Pairs surrogates; an unpaired one is RULE32_ERR_INVALID
+ * rather than CESU-8.  An odd input length is RULE32_ERR_INVALID.  Unlike
+ * utf32_to_utf8 this NEVER drops: a dropped codepoint here would mean the
+ * caller's own conversion was unsound, so it is reported. */
+int utf16_to_utf8(const unsigned char *in, int inlen,
+                  unsigned char *out, int outmax,
+                  uint32_t *scratch, int scratchmax, int big_endian);
+
+/* Single-byte code page -> UTF-16.  Every byte yields exactly one code unit,
+ * so the output is exactly 2*inlen bytes and there is no error but NOROOM.
+ * Windows mapped the user's code page into UTF-16LE through its own tables; it
+ * did NOT zero-extend, and the two agree only where the code points happen to
+ * equal the byte values. */
+#define CP_1251 1251
+#define CP_1252 1252
+int cp_to_utf16(const unsigned char *in, int inlen,
+                unsigned char *out, int outmax, int codepage, int big_endian);
+
+/* UTF-8 -> UTF-7 (RFC 2152), reproducing byte for byte what SHA1UTF7 has
+ * always hashed.  Two details of that are not free choices:
+ *
+ *  - Set O -- ! " # $ % & * ; < = > @ [ ] ^ _ ` { | } -- is ENCODED, not passed
+ *    through, which RFC 2152 permits either way.
+ *  - a base64 run is ALWAYS closed with '-'.  The caller used to append an 'X'
+ *    to force iconv to flush its shift state, and since X is itself a base64
+ *    character the terminator was always emitted into what got hashed.  The
+ *    'X' trick is no longer needed: this flushes because it is told to.
+ *
+ * Consecutive non-direct codepoints share one run, astral ones go in as a
+ * UTF-16 surrogate pair, and a literal '+' becomes "+-".
+ * Returns the byte count, or a negative RULE32_ERR_*.
+ */
+int utf8_to_utf7(const unsigned char *in, int inlen, char *out, int outmax,
+                 uint32_t *scratch, int scratchmax);
+
+/* Do two code pages map every byte of this buffer to the same codepoint?  The
+ * UTF-16 form is a pure per-byte map, so this is exactly the condition "the two
+ * conversions would compare equal" -- answered without performing the second
+ * one, so a redundant conversion and hash are never done rather than done and
+ * discarded.  CP1251 and CP1252 agree on 159 of 256 byte values. */
+int cp_tables_agree(const unsigned char *in, int inlen, int cpa, int cpb);
 
 /* True if cp is a value UTF-8 can represent: a scalar, not a surrogate. */
 #define UTF32_ENCODABLE(cp) ((cp) <= 0x10FFFFu && ((cp) < 0xD800u || (cp) > 0xDFFFu))

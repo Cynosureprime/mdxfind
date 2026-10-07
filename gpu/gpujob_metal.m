@@ -208,6 +208,21 @@ extern uint8_t  gpu_mask_sizes[];
 /* Phase 1a sub-phase 1a.2 (2026-05-21): MaskTotal extern for A2 dispatch
  * arm in the chokepoint. Defined in mdxfind.c line 7482. */
 extern unsigned long long MaskTotal;
+
+/* BF chunk-as-job servo feedback (mdxfind.c:10626-10644, defined
+ * unconditionally -- NOT inside an OPENCL_GPU gate, so a Metal-only build
+ * links them).  adaptive_bf_chunk_size() sizes the next brute-force chunk
+ * from these, and its bootstrap wait blocks until every live device has
+ * stored a wall: without a writer on this backend the wait cannot be
+ * satisfied and every multi-chunk BF op would stall to the 180 s safety
+ * cap.  The OpenCL twin writes them at gpu/gpujob_opencl.c:1437-1465.
+ *
+ * bf_dev_first_dispatch_done suppresses the FIRST dispatch per slot: on
+ * Metal that one carries the per-family PSO JIT, which is the same
+ * contamination the OpenCL side excludes for clBuildProgram. */
+extern _Atomic uint64_t bf_dev_wall_us[];
+extern _Atomic uint64_t bf_dev_chunk_total[];
+extern _Atomic int      bf_dev_first_dispatch_done[];
 /* Charset rows live in the MTLBuffer owned by gpu_metal.m; the host-side
  * descriptor for hit-replay reconstruction needs the actual character
  * tables, so gpujob_metal.m would need a pointer to them. Phase 2b
@@ -812,6 +827,18 @@ static int gpu_pack_salts_op(struct saltentry *saltsnap, int nsalts,
                   saltsnap[i].hashsalt : saltsnap[i].salt;
         int sl = (use_hashsalt && saltsnap[i].hashsalt) ?
                   32 : saltsnap[i].saltlen;
+        if ((uint64_t)gsp + (uint64_t)sl > (uint64_t)GPU_SALT_PACK_MAX) {
+            fprintf(stderr,
+                "FATAL: %s:%d gpu_pack_salts_op: packed salt bytes would exceed "
+                "GPU_SALT_PACK_MAX (%u). Salt %d of %d needs %d bytes at offset "
+                "%u. The offset array is uint32 and the same counter is the "
+                "memcpy destination, so continuing would overwrite already-packed "
+                "salts and index the wrong salt data -- silently, exit 0, every "
+                "affected digest wrong. packed=%d\n",
+                __FILE__, __LINE__, (unsigned)GPU_SALT_PACK_MAX,
+                i, nsalts, sl, (unsigned)gsp, packed);
+            exit(1);
+        }
         soff[packed]     = gsp;
         slen[packed]     = sl;
         pack_map[packed] = i;
@@ -1586,6 +1613,52 @@ static void gpujob_metal_worker(void *arg) {
             _gpu_busy_us    += (_disp_t1 - _disp_t0);
             _gpu_last_us     = _disp_t1;
 
+            /* BF chunk-as-job servo feedback, Metal arm.  Mirrors
+             * gpu/gpujob_opencl.c:1437-1465 exactly, including the
+             * first-dispatch suppression and the inner_iter factor.
+             *
+             * INERT UNTIL THE PRODUCER IS WIDENED.  g->bf_chunk is 0 on
+             * every Metal job today: the BF chunk producer and the procjob
+             * short-circuit that set it are both still
+             * `#if defined(OPENCL_GPU)` in mdxfind.c (the producer at the
+             * `use_bf_chunks` arm, the short-circuit at the procjob entry).
+             * This block is the PREREQUISITE for lifting those gates, not
+             * the lift: without a writer here the servo's bootstrap wait
+             * (`bf_chunks_produced >= 2 * num_live`) can never be satisfied
+             * on Metal and every multi-chunk brute-force op would stall to
+             * the 180 s safety cap -- which is the exact failure the
+             * OpenCL side has already been through twice (mdxfind.c 1.598
+             * and the num_live/active-count fix after it).
+             *
+             * Metal is single-device in this backend -- every dispatch
+             * goes to dev_idx 0 and gpujob_metal runs ONE worker thread --
+             * so slot 0 is the whole of it.  That is also why no
+             * gpu_metal_active_device_count() is needed to read these back:
+             * num_live is 1 by construction. */
+            if (g->bf_chunk) {
+                const int _bf_slot = 0;   /* single Metal device/worker */
+                if (!atomic_load_explicit(&bf_dev_first_dispatch_done[_bf_slot],
+                                          memory_order_relaxed)) {
+                    /* First dispatch on this slot carries the per-family
+                     * PSO JIT; storing its wall would poison the rate-EMA
+                     * bootstrap the same way clBuildProgram did. */
+                    atomic_store_explicit(&bf_dev_first_dispatch_done[_bf_slot], 1,
+                                          memory_order_relaxed);
+                } else {
+                    uint32_t _ii = (g->bf_inner_iter == 0u) ? 1u : g->bf_inner_iter;
+                    uint64_t _bf_chunk_cands =
+                        (uint64_t)g->packed_count *
+                        (uint64_t)g->bf_num_masks *
+                        (uint64_t)_ii;
+                    atomic_store_explicit(&bf_dev_chunk_total[_bf_slot],
+                                          _bf_chunk_cands,
+                                          memory_order_relaxed);
+                    atomic_store_explicit(&bf_dev_wall_us[_bf_slot],
+                                          (uint64_t)(_disp_t1 - _disp_t0),
+                                          memory_order_relaxed);
+                }
+            }
+
             /* Simulated candidate count (Totrules_gpu): packed_count *
              * (gpu_rule_count - 1) — minus 1 for the synthetic `:`
              * no-rule pass that mdxfind.c prepends; matches the OpenCL
@@ -1886,8 +1959,13 @@ static void gpujob_metal_worker(void *arg) {
                  * mask_idx_local. Host divmod recovers both axes; then the
                  * mask bytes are prepended/appended to synthetic_job.line
                  * BEFORE checkhash. Mirrors gpu/gpujob_opencl.c lines
-                 * 1066-1610 (WITHOUT BF terms — Metal has no BF in Phase 2b;
-                 * bf_mask_start / bf_offset_per_word read zero). */
+                 * 1066-1610.  The BF terms ARE carried here now: see the
+                 * mask_idx_abs computation below, which adds g->bf_mask_start
+                 * and widx * g->bf_offset_per_word.  They read zero on an
+                 * unchunked run, which is why that case is unaffected -- an
+                 * earlier version of this comment said Metal has no BF terms
+                 * at all, which stopped being true with the post-1.602
+                 * mask-range fix. */
                 int b71_mask_active =
                     (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 16
                      && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 16
@@ -2026,26 +2104,33 @@ static void gpujob_metal_worker(void *arg) {
                     is_salted_op ? (uint32_t)nsalts_packed : 1u;
                 if (nsalts_for_decode == 0u) nsalts_for_decode = 1u;
 
-                /* Phase 2b: BF chunk-as-job is OUT OF SCOPE on Metal. The
-                 * OpenCL twin's b71_mask_size = g->bf_num_masks branch
-                 * (gpujob_opencl.c:1073-1075) does NOT apply here. Guard
-                 * the BF chunk flag for symmetry with the OpenCL twin so
-                 * a stray Phase 2c+ enablement is caught early. */
-                if (g->bf_chunk) {
-                    /* UNREACHABLE in Phase 2b — production gate at the
-                     * chokepoint pack rejects BF for the Metal arm. If we
-                     * ever land a slot with bf_chunk=1 it's a Phase 2c+
-                     * regression; log once and proceed with mask_size=1
-                     * decode (safe fallback). */
-                    static int _bf_unexpected = 0;
-                    if (!_bf_unexpected) {
-                        _bf_unexpected = 1;
-                        fprintf(stderr, "Metal: gpujob_metal: bf_chunk=1 "
-                                "slot received but BF is out-of-scope in "
-                                "Phase 2b — falling back to mask_size=1 "
-                                "decode (no BF re-add to mask_idx_abs).\n");
-                    }
-                }
+                /* The text that used to sit here said BF chunk-as-job is
+                 * "OUT OF SCOPE on Metal", that the OpenCL twin's
+                 * `b71_mask_size = g->bf_num_masks` branch "does NOT apply
+                 * here", and that a bf_chunk=1 slot would fall back to a
+                 * mask_size=1 decode.  ALL THREE WERE STALE, and it printed
+                 * a warning asserting a defect that does not exist.
+                 *
+                 * The chunk-range decode landed with the mask-range fix
+                 * after mdxfind.c 1.602 and is live right here: b71_mask_size
+                 * above takes g->bf_num_masks when it is set, and the
+                 * mask_idx_abs computation below re-adds g->bf_mask_start and
+                 * widx * g->bf_offset_per_word unconditionally.  Both terms
+                 * are 0 on an unchunked run, so that case is unchanged.
+                 *
+                 * What is still missing on Metal is the PRODUCER, not the
+                 * decode: the `use_bf_chunks` arm and the procjob BF
+                 * short-circuit in mdxfind.c are both still
+                 * `#if defined(OPENCL_GPU)`, so g->bf_chunk is 0 on every
+                 * Metal job and pure brute force runs on the CPU.  Measured
+                 * on dev1 (M1) 2026-10-05: `-m e1 -f <hash> '?d?d?d?d'`
+                 * gives 10,000 candidates at 5.91 K H/s with NO
+                 * `Metal GPU[0]` summary line at all, while wordlist+mask
+                 * (`-n '?d?d'` with a wordlist) DOES dispatch -- 7 batches,
+                 * 20,001 words, 2,000,100 hashes, 1 hit -- and so does
+                 * rules+mask.  A warning here would therefore fire on the
+                 * first correct BF dispatch, so it is gone rather than
+                 * reworded. */
 
                 for (int h = 0; h < stored; h++) {
                     uint32_t *entry = hits + h * GPU_HIT_STRIDE;
@@ -2964,17 +3049,50 @@ static const struct metal_unserved_op metal_unserved_ops[] = {
     { JOB_MD6256,                0, "MD6256"            },  /* e29  */
     { JOB_SQL5,                  0, "SQL5"              },  /* e259 */
     { JOB_MYSQL3,                0, "MYSQL3"            },  /* e456 */
-    { JOB_NTLMH,                 0, "NTLMH"             },  /* e786 -- STILL
-        * UNSERVED and deliberately so. metal_ntlmh_core.metal exists and
-        * compiles (translated from the OpenCL twin, 4 digest words so the
-        * width helper's default is already right), but with a family
-        * registered the GPU returned 0 hits where the CPU found 1 -- in
-        * BYTE mode as well as under -8, so this is not the UTF-32 path.
-        * The translated core computes the wrong digest and needs kernel
-        * debugging, most likely in the UTF-8 -> UTF-16LE conversion that
-        * the OpenCL twin had to have fixed. Measured 2026-09-16 with
-        * tools/gputests/bigsweep.sh. Do not register a family for this op
-        * until that is fixed: doing so disarms this veto row. */
+    { JOB_NTLMH,                 0, "NTLMH"             },  /* e786 -- SERVED
+        * since 2026-09-16; this row stays armed per the note above.
+        *
+        * HISTORY, because the text that used to sit here sent two later
+        * sessions down the wrong road.  It said the translated
+        * metal_ntlmh_core.metal "computes the wrong digest", most likely in
+        * the UTF-8 -> UTF-16LE conversion.  THAT DIAGNOSIS WAS WRONG.  The
+        * Metal core computed BOTH digests correctly from its first
+        * revision; what was missing was the SECOND PROBE.  The core
+        * declares GPU_TEMPLATE_HAS_ALT_DIGEST and parks the UTF-8 reading
+        * in st.ha, but metal_template.metal contained no reference to that
+        * macro at all -- the OpenCL twin had the hook and the Metal
+        * template did not -- so only st.h (the zero-extend reading) was
+        * ever compared.  A non-ASCII candidate whose target is the UTF-8
+        * reading could not match in byte mode or under -8, and because the
+        * GPU claimed the batch the CPU never redid the work: 0 hits where
+        * the CPU found 1, which is what the 2026-09-16 bigsweep.sh run saw.
+        * Not a wrong digest -- a digest that was computed and never looked
+        * at.
+        *
+        * Both halves of the fix landed on 2026-09-16: metal_template.metal
+        * grew the #ifdef GPU_TEMPLATE_HAS_ALT_DIGEST probe/emit block, and
+        * gpu_metal.m registers metal_family_ntlmh with core_str +
+        * base_macros.  Only this comment was left stale.
+        *
+        * REVALIDATED 2026-10-05 against EXTERNAL vectors (RFC 1320 MD4 plus
+        * published NTLM digests), CPU reference mdxfind.c 1.616 /
+        * ruleproc32.c 1.18:
+        *   - 3,615-digest differential over 2,948 candidates (random bytes,
+        *     overlongs, lone surrogates, >U+10FFFF, truncated sequences,
+        *     astral, UTF-16 block-boundary lengths): Metal on M1, Metal on
+        *     M2 Max, OpenCL on GTX 960 and CPU all emit the SAME 3,615
+        *     lines, byte for byte, hash AND plaintext.
+        *   - 2,135 retired-semantics digests (the pre-1.616 iconv //IGNORE
+        *     readings, e.g. 79312f7ee81e59d4e76a15021e74b597 from
+        *     $HEX[618162]) were loaded as negative controls and NONE was
+        *     emitted by any arm.
+        *   - all-ASCII candidates emit ONE digest, not two (CPU hash
+        *     counter: 300,008 for 300,006 lines of which 3 were non-ASCII).
+        *   - astral U+1F600 gives 4b58a10cc20a4e7d808d218e1f80aabc, which
+        *     only a correct D83D/DE00 surrogate pair produces.
+        * The acceptance-bar fixture ($HEX[c384c396c39c53545241535345],
+        * i.e. A-O-U-umlaut + STRASSE, with rule `l`) also passes on
+        * both Macs and on OpenCL, in byte mode and under -8. */
     /* salted -- admitted only when the type has salts loaded */
     { JOB_HMAC_RMD160,           1, "HMAC-RMD160"       },  /* e211 */
     { JOB_HMAC_RMD320,           1, "HMAC-RMD320"       },  /* e213 */

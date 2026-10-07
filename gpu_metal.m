@@ -2043,8 +2043,7 @@ int gpu_metal_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
      * gpu_opencl.h; this is the Metal reader of the same convention. */
     uint64_t total = 1;
     for (int i = 0; i < ntotal; i++) {
-        uint32_t sz = sizes[i] ? sizes[i] : 256u;
-        total *= sz;
+        total *= METAL_MASK_WIRE_SZ(sizes[i]);
     }
     gpu_mask_total = total;
 
@@ -2056,7 +2055,7 @@ int gpu_metal_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
     for (int i = 0; i < METAL_MASK_TOTAL_CAP; i++) b7_sizes[i] = 1u;
     for (int i = 0; i < ntotal; i++) {
         memcpy(b7_charsets + i * 256, tables[i], 256);
-        b7_sizes[i] = (uint32_t)(sizes[i] ? sizes[i] : 1);
+        b7_sizes[i] = METAL_MASK_WIRE_SZ(sizes[i]);
     }
 
     @autoreleasepool {
@@ -2332,6 +2331,71 @@ void gpu_metal_shutdown(void)
 }
 
 int gpu_metal_available(void) { return metal_ready; }
+
+/* ------------------------------------------------------------------
+ * Device-enumeration accessors, Metal arm.
+ *
+ * Added for the brute-force chunk-as-job producer, which mdxfind.c had
+ * gated on OPENCL_GPU solely because these three calls had no Metal
+ * twin -- the kernel and the hit-replay side were already complete.
+ * mdxfind.c reaches them through the mdx_gpu_* shims, never directly,
+ * so a future second Metal device changes these and nothing upstream.
+ *
+ * This backend is single-device by construction: one `mtl_device`,
+ * resolved once in gpu_metal_init, and gpujob_metal runs ONE worker.
+ * So "enumerated" is 1 and "active" is 1 once init has succeeded. Do
+ * not read these as placeholders to be filled in later; they are the
+ * correct answers for this backend's shape.
+ * ------------------------------------------------------------------ */
+
+/* Enumerated devices. Mirrors gpu_opencl_num_devices(). */
+int gpu_metal_num_devices(void) { return 1; }
+
+/* Devices that will actually receive a dispatch. Mirrors
+ * gpu_opencl_active_device_count(), whose contract is "non-disabled",
+ * i.e. the count the BF servo's bootstrap wait may wait ON. Returning
+ * the enumerated count here instead of 0-when-unavailable would hang
+ * that wait to its 180 s safety cap on a host where Metal init failed,
+ * which is the exact failure mode mdxfind.c 1.598 and its follow-up
+ * fix were both about. */
+int gpu_metal_active_device_count(void) { return metal_ready ? 1 : 0; }
+
+/* Stable per-device key for the BF rate sidecar
+ * (~/.mdxfind/dynsize/<uuid>/bf_<op>.txt).
+ *
+ * Byte-compatible with gpu_opencl_dev_uuid: FNV-1a 64-bit over three
+ * '|'-terminated fields, rendered "%016llx", and the same >= 17 byte
+ * output requirement. The fields differ because Metal exposes no
+ * driver-version string: name, the literal "Metal", and the
+ * registryID, which is stable for the life of the hardware and unique
+ * per device. A UUID that changed between runs would silently disable
+ * the sidecar -- every run would re-seed from the 1 GH/s default and
+ * read as "persistence does not work" rather than as an error. */
+void gpu_metal_dev_uuid(int dev_idx, char *out, size_t out_sz)
+{
+    if (!out || out_sz < 17) { if (out && out_sz) out[0] = 0; return; }
+    out[0] = 0;
+    if (dev_idx != 0) return;          /* single-device backend */
+
+    char devname[256] = {0};
+    char regid[64]    = {0};
+    if (mtl_device) {
+        const char *n = [[mtl_device name] UTF8String];
+        if (n) snprintf(devname, sizeof(devname), "%s", n);
+        snprintf(regid, sizeof(regid), "%llu",
+                 (unsigned long long)[mtl_device registryID]);
+    }
+
+    uint64_t h = 0xCBF29CE484222325ULL;
+    const uint64_t prime = 0x100000001B3ULL;
+    const char *bufs[3] = { devname, "Metal", regid };
+    for (int i = 0; i < 3; i++) {
+        const char *q = bufs[i];
+        while (*q) { h ^= (uint8_t)*q++; h *= prime; }
+        h ^= (uint8_t)'|'; h *= prime;
+    }
+    snprintf(out, out_sz, "%016llx", (unsigned long long)h);
+}
 
 int gpu_metal_set_compact_table(int dev_idx,
     uint32_t *compact_fp, uint32_t *compact_idx,
@@ -2882,7 +2946,7 @@ static void *md5salt_pso_for_variant_v2(struct gpu_metal_family *fam,
 static struct gpu_metal_family metal_family_md5 = {
     .op                 = JOB_MD5,
     .name               = "md5",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -2933,7 +2997,7 @@ static void *md5uc_pso_for_variant_v2(struct gpu_metal_family *fam,
 static struct gpu_metal_family metal_family_md5uc = {
     .op                 = JOB_MD5UC,
     .name               = "md5uc",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -2966,7 +3030,7 @@ static struct gpu_metal_family metal_family_md5salt = {
 static struct gpu_metal_family metal_family_md4 = {
     .op                 = JOB_MD4,
     .name               = "md4",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -2981,7 +3045,7 @@ static struct gpu_metal_family metal_family_md4 = {
 static struct gpu_metal_family metal_family_md4utf16 = {
     .op                 = JOB_MD4UTF16,
     .name               = "md4utf16",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3002,7 +3066,7 @@ static struct gpu_metal_family metal_family_md4utf16 = {
 static struct gpu_metal_family metal_family_sql5 = {
     .op                 = JOB_SQL5,
     .name               = "sql5",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3021,7 +3085,7 @@ static struct gpu_metal_family metal_family_sql5 = {
 static struct gpu_metal_family metal_family_ntlmh = {
     .op                 = JOB_NTLMH,
     .name               = "ntlmh",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3112,7 +3176,7 @@ static void *md5salt_sibling_pso_for_variant_v2(
 static struct gpu_metal_family metal_family_wrl = {
     .op                 = JOB_WRL,
     .name               = "wrl",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3127,7 +3191,7 @@ static struct gpu_metal_family metal_family_wrl = {
 static struct gpu_metal_family metal_family_md6256 = {
     .op                 = JOB_MD6256,
     .name               = "md6256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3142,7 +3206,7 @@ static struct gpu_metal_family metal_family_md6256 = {
 static struct gpu_metal_family metal_family_mysql3 = {
     .op                 = JOB_MYSQL3,
     .name               = "mysql3",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3155,7 +3219,7 @@ static struct gpu_metal_family metal_family_mysql3 = {
 static struct gpu_metal_family metal_family_md5raw = {
     .op                 = JOB_MD5RAW,
     .name               = "md5raw",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3194,7 +3258,7 @@ static struct gpu_metal_family metal_family_md5saltpass = {
 static struct gpu_metal_family metal_family_sha1 = {
     .op                 = JOB_SHA1,
     .name               = "sha1",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3207,7 +3271,7 @@ static struct gpu_metal_family metal_family_sha1 = {
 static struct gpu_metal_family metal_family_sha1raw = {
     .op                 = JOB_SHA1RAW,
     .name               = "sha1raw",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3220,7 +3284,7 @@ static struct gpu_metal_family metal_family_sha1raw = {
 static struct gpu_metal_family metal_family_sha1dru = {
     .op                 = JOB_SHA1DRU,
     .name               = "sha1dru",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3259,7 +3323,7 @@ static struct gpu_metal_family metal_family_sha1saltpass = {
 static struct gpu_metal_family metal_family_sha256 = {
     .op                 = JOB_SHA256,
     .name               = "sha256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3272,7 +3336,7 @@ static struct gpu_metal_family metal_family_sha256 = {
 static struct gpu_metal_family metal_family_sha256raw = {
     .op                 = JOB_SHA256RAW,
     .name               = "sha256raw",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3285,7 +3349,7 @@ static struct gpu_metal_family metal_family_sha256raw = {
 static struct gpu_metal_family metal_family_sha224 = {
     .op                 = JOB_SHA224,
     .name               = "sha224",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3337,7 +3401,7 @@ static struct gpu_metal_family metal_family_sha224saltpass = {
 static struct gpu_metal_family metal_family_sha512 = {
     .op                 = JOB_SHA512,
     .name               = "sha512",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3350,7 +3414,7 @@ static struct gpu_metal_family metal_family_sha512 = {
 static struct gpu_metal_family metal_family_sha512raw = {
     .op                 = JOB_SHA512RAW,
     .name               = "sha512raw",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3363,7 +3427,7 @@ static struct gpu_metal_family metal_family_sha512raw = {
 static struct gpu_metal_family metal_family_sha384 = {
     .op                 = JOB_SHA384,
     .name               = "sha384",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3376,7 +3440,7 @@ static struct gpu_metal_family metal_family_sha384 = {
 static struct gpu_metal_family metal_family_sha384raw = {
     .op                 = JOB_SHA384RAW,
     .name               = "sha384raw",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3428,7 +3492,7 @@ static struct gpu_metal_family metal_family_sha384saltpass = {
 static struct gpu_metal_family metal_family_ripemd160 = {
     .op                 = JOB_RMD160,
     .name               = "ripemd160",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3441,7 +3505,7 @@ static struct gpu_metal_family metal_family_ripemd160 = {
 static struct gpu_metal_family metal_family_ripemd320 = {
     .op                 = JOB_RMD320,
     .name               = "ripemd320",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3454,7 +3518,7 @@ static struct gpu_metal_family metal_family_ripemd320 = {
 static struct gpu_metal_family metal_family_blake2s256 = {
     .op                 = JOB_BLAKE2S256,
     .name               = "blake2s256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3467,7 +3531,7 @@ static struct gpu_metal_family metal_family_blake2s256 = {
 static struct gpu_metal_family metal_family_blake2b256 = {
     .op                 = JOB_BLAKE2B256,
     .name               = "blake2b256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3480,7 +3544,7 @@ static struct gpu_metal_family metal_family_blake2b256 = {
 static struct gpu_metal_family metal_family_blake2b512 = {
     .op                 = JOB_BLAKE2B512,
     .name               = "blake2b512",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3493,7 +3557,7 @@ static struct gpu_metal_family metal_family_blake2b512 = {
 static struct gpu_metal_family metal_family_keccak256 = {
     .op                 = JOB_KECCAK256,
     .name               = "keccak256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3505,7 +3569,7 @@ static struct gpu_metal_family metal_family_keccak256 = {
 static struct gpu_metal_family metal_family_keccak224 = {
     .op                 = JOB_KECCAK224,
     .name               = "keccak224",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3518,7 +3582,7 @@ static struct gpu_metal_family metal_family_keccak224 = {
 static struct gpu_metal_family metal_family_keccak384 = {
     .op                 = JOB_KECCAK384,
     .name               = "keccak384",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3531,7 +3595,7 @@ static struct gpu_metal_family metal_family_keccak384 = {
 static struct gpu_metal_family metal_family_keccak512 = {
     .op                 = JOB_KECCAK512,
     .name               = "keccak512",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3544,7 +3608,7 @@ static struct gpu_metal_family metal_family_keccak512 = {
 static struct gpu_metal_family metal_family_sha3_224 = {
     .op                 = JOB_SHA3_224,
     .name               = "sha3_224",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3557,7 +3621,7 @@ static struct gpu_metal_family metal_family_sha3_224 = {
 static struct gpu_metal_family metal_family_sha3_256 = {
     .op                 = JOB_SHA3_256,
     .name               = "sha3_256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3570,7 +3634,7 @@ static struct gpu_metal_family metal_family_sha3_256 = {
 static struct gpu_metal_family metal_family_sha3_384 = {
     .op                 = JOB_SHA3_384,
     .name               = "sha3_384",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3583,7 +3647,7 @@ static struct gpu_metal_family metal_family_sha3_384 = {
 static struct gpu_metal_family metal_family_sha3_512 = {
     .op                 = JOB_SHA3_512,
     .name               = "sha3_512",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3597,7 +3661,7 @@ static struct gpu_metal_family metal_family_sha3_512 = {
 static struct gpu_metal_family metal_family_streebog256 = {
     .op                 = JOB_STREEBOG_32,
     .name               = "streebog256",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -3611,7 +3675,7 @@ static struct gpu_metal_family metal_family_streebog256 = {
 static struct gpu_metal_family metal_family_streebog512 = {
     .op                 = JOB_STREEBOG_64,
     .name               = "streebog512",
-    .op_category        = GPU_CAT_UNSALTED,
+    .op_category        = GPU_CAT_MASK,
     .supported_variants = (uint8_t)(
                             VBIT(V_NONE)
                           | VBIT(V_R)
@@ -8631,14 +8695,28 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                          && gpu_rule_offsets != NULL
                          && gpu_rule_program_len > 0);
 
-        /* Phase 2b row 4: mask mode is selected when gpu_metal_set_mask
-         * has been called AND the resulting combinatorial space is > 1
-         * (i.e., at least one position has size > 1). When gpu_mask_total
-         * == 1 the kernel collapses to the (word, rule) shape and binding
-         * the mask buffers would still work, but selecting the cheaper
-         * non-mask PSO avoids the JIT-compile cost when no real mask
-         * is active. */
-        int use_mask = (gpu_mask_total > 1
+        /* Mask mode is selected whenever a mask has POSITIONS and its
+         * buffers are bound -- not when its combinatorial space exceeds 1.
+         *
+         * The gate used to read gpu_mask_total > 1, on the stated grounds
+         * that "when gpu_mask_total == 1 the kernel collapses to the
+         * (word, rule) shape" so the cheaper non-mask PSO could be used and
+         * a JIT compile avoided. That premise is FALSE. A total of 1 means
+         * one FIXED mask combination, not the absence of a mask: every
+         * position still contributes its single byte, so the candidate is
+         * word + "xy", not word. Selecting the non-mask PSO hashed the bare
+         * word, so `-n ?[x]?[y]` found nothing on the GPU while the CPU
+         * found the answer -- a silent miss, exit 0. The OpenCL twin has
+         * never had this gate and handles the same mask correctly, so this
+         * was also a backend parity break. Caught 2026-10-05 by
+         * tools/gputests/maskhb.sh.
+         *
+         * "No mask at all" is already covered without the total test: an
+         * unused mask leaves gpu_mask_n_prepend + gpu_mask_n_append at 0
+         * and the position test below rejects it. The only behaviour this
+         * adds is the degenerate single-combination mask, which now pays a
+         * mask-variant JIT and returns the right answer. */
+        int use_mask = (gpu_mask_total > 0
                         && buf_mask_charsets != nil
                         && buf_mask_sizes    != nil
                         && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1);
