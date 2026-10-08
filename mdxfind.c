@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.622 2026/10/07 18:18:02 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.623 2026/10/08 11:12:33 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.622 2026/10/07 18:18:02 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.623 2026/10/08 11:12:33 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.623  2026/10/08 11:12:33  dlr
+ * Let a bare-hex salted type take its salt from -s or -S, for SIMPLACMS and SYMFONY256. Both are stored as a hex digest with the salt alongside, and both advertise the f and s channels in the type table, but neither honoured either: only a combined record through -F could load them, and every other invocation reported an ordinary zero-cracked run. Waffle, 2026-10-08, stating the rule these violated: salts must always be loadable via -s or -S separately from the hash, to the extent possible and in particular for hex-based hashes; and the diagnosis that settled the design, that a bare-hex form belongs in the compact hash table and not in Judy. Three sites per type conspired to produce one silent failure. The loader carried a special case that claimed the line, put the digest in the per-type Judy array and continued, so the digest never reached the compact table. The compute path matched only by JSLG against that array. And a bootstrap gate counted the array and, finding it empty, removed the type from Dohash with J1U, so the type was disabled before a single candidate was hashed. Only the special-case loader ever populated that array, which is why the three combined to make -F the sole working channel while the table advertised otherwise. All three are gone for both types. The stored form IS hex followed by a separator and the salt, which the generic hex loader already consumes, putting the digest in the compact table and the remainder in Typesalt, so the special case was not merely redundant but actively harmful. The compute paths now call checkhashsalt with the digest length in hex characters, 32 for SIMPLACMS and 64 for SYMFONY256, which is the same call the other 183 compliant hex-form salted types make. Reformatting types such as Werkzeug MD5 reach that same loader by rewriting themselves into the hex-colon-salt shape and falling through, which is the pattern these two should always have used. Audited rather than guessed: all 337 types carrying TYPEOPT_NEEDSALT were tested on both channels, generating each vector from the type own -z output rather than from an assumption about its construction. 183 hex-form types already complied. Exactly three carried the defect, identifiable by the signature of a combined record loading while a bare digest with a separate salt did not, and all three had identical flags of NEEDSF with NEEDSALT with SALTJUDY. The third, PWSAFE3, is left alone deliberately: its stored form begins 50575333, the Password Safe version 3 container magic, so its salt and iteration count live inside the blob and supplying one externally is not meaningful. Verified for both fixed types across every channel: -z with no salt still uses the default salt and emits the same conforming digest as before, -z with -s conforms, a bare digest with -s or with -S now matches, and the combined form through -F is unchanged. Regression over fifteen neighbouring types including MD5, MD5SALT, MD5-MULTISALT, MD5MD5SALT, MD5UCSALT and MD5-MD5SALTMD5PASS shows no change. Separately recorded because it misled the investigation: rule one, that every type must produce a conforming hash under -z with minimum flags, was already satisfied everywhere. Static analysis suggested first 115 and then 14 violations; all 14 were tested and all emitted, because a third mechanism of per-type hardcoded defaults exists alongside default_salts and gen_salts. The static metric was wrong and the empirical test was the authority.
+ *
  * Revision 1.622  2026/10/07 18:18:02  dlr
  * Fold the -i iteration depth into the brute-force progress divisor. Tothash counts hash OPERATIONS and a chain N deep costs N of them per candidate-salt pair, so the divisor that recovers candidate position needs the depth alongside the per-type internal round count and the live salt count. Revision 1.593 built that divisor from the latter two and left the depth out; its log notes MD5 brute force was already correct, which was true only at the default -i 1. Reported by Waffle against a 7-position 68-character mask at -i 2: the display read 13.3T of a 6.7T keyspace, exactly 2.000000 times over, with the percentage reading 100 percent, the sample candidate stuck at the final mask value and the ETA saying done while 23 minutes of work remained. Three symptoms from one cause, the same three and the same cause as the DESCRYPT case 1.593 fixed, because all of them follow from progress exceeding the keyspace: the percentage hits the pct greater than 100 clamp, sample_idx clamps to BruteForceTotal minus 1, and remaining goes to zero once progress is no longer less than the total. Maxiter is global rather than per-type so it scales every term of the sum, and at -i 1 the multiplier is bit-identical to before, leaving the overwhelmingly common case untouched. The linear relation was measured rather than assumed: a 1000-candidate mask on .205 reports exactly 1,000 and 2,000 and 3,000 and 10,000 operations at -i 1 and 2 and 3 and 10. Verified by A-B on fpga GTX 1080, same host and GPU and mask and depth, pre-fix build against post-fix: a 36-to-the-7 mask of 78,364,164,096 candidates at -i 2 printed 55.6G of 78.4G at 71.0 percent with ETA 6s and then 115.7G of 78.4G at 100 percent with ETA done and the candidate clamped to zzzzzzz, while the fixed build printed 27.8G at 35.4 percent with ETA 27s and then 55.7G at 71.1 percent with ETA 12s and real sample candidates. The two runs report an identical 156,728,557,568 total hash calculations, so nothing computed changes and no stored result is affected: this is the progress display and the ETA only. Note for future work that the CPU mask path accrues Tothash in coarse chunks, so -G none cannot exercise this display and is not a valid verification vehicle; the iteration factor enters through the GPU accounting, as the comment at the site says, and a GPU host is required.
  *
@@ -40168,20 +40171,15 @@ HAV256_5_start:
                     }
                     /* Final SHA256(hex128) */
                     mysha256(linebuf, 128, md5buf.h);
-                    prmd5(md5buf.h, newbuf, 64);
-                    hashcnt += 10000;   /* 1 initial SHA512 + 9999 loop + 1 SHA256 */
-                    Word_t *PV2;
-                    JSLG(PV2, JUDYJ(JOB_SYMFONY256), (unsigned char *)newbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
-                      snprintf(linebuf2, MAXLINE, "%s:%s", newbuf, salt_str);
-                      if (!Printall) {
-                        *PV2 = 1;
-                        PV_DEC(saltsnap[si].PV);
-                        if (*saltsnap[si].PV == 0) {
-                          saltsnap[si] = saltsnap[--nsalts_job]; si--;
-                        }
+                    /* Compact table, not JudyJ: a bare 64-hex stored form
+                     * belongs there, and that is what lets the salt arrive
+                     * separately via -s/-S. checkhashsalt takes the digest
+                     * length in HEX characters. */
+                    if (checkhashsalt(&md5buf, 64, (char *)salt_str, salt_len, 1, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
                       }
-                      prfound(job, linebuf2);
                     }
                   }
                   if (!nsalts_job) TYPEDONE(job->op) = 1;
@@ -40670,16 +40668,20 @@ HAV256_5_start:
 
               case JOB_SIMPLACMS:
                 /* SIMPLACMS (22800): md5($salt.$pass.md5($pass))
+                 * Bare-hex stored form, so the digest is matched through the
+                 * COMPACT table via checkhashsalt(), exactly as every other
+                 * bare-hex salted type does. That is what lets the salt arrive
+                 * separately from the hash via -s or -S, and what lets a default
+                 * salt serve a -z run.
                  * Typesalt = salt string
-                 * JudyJ key = 32-char lowercase hex MD5
                  * Buffer layout:
                  *   md5buf.h[0..15]  inner md5(pass) (16 bytes)
-                 *   mdbuf[0..63]     inner hex (32 chars)
+                 *   mdbuf[0..31]     inner hex (32 chars)
                  *   linebuf[0..N]    salt + pass + hex(md5(pass))
                  *   curin.h[0..15]   outer MD5 (16 bytes)
-                 *   newbuf[0..63]    outer hex (32 chars)
                  */
                 if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
                 if (!snap_valid) {
                   nsalts_job = build_salt_snapshot(saltsnap, saltpool,
                                   TYPESALT(job->op), tsalt, Printall);
@@ -40689,31 +40691,24 @@ HAV256_5_start:
                 if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
                 /* Compute md5(pass) once, hex-encode */
                 mymd5(cur, len, md5buf.h);
-                prmd5(md5buf.h, mdbuf, 32); /* 16 bytes → 32 hex */
+                prmd5(md5buf.h, mdbuf, 32); /* 16 bytes -> 32 hex */
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
-                    const char *salt = saltsnap[si].salt;
                     saltlen = saltsnap[si].saltlen;
+                    s1 = saltsnap[si].salt;
+                    if (saltlen + len + 32 > MAXLINE) continue;
                     /* Build: salt + pass + hex(md5(pass)) */
-                    memcpy(linebuf, salt, saltlen);
+                    memcpy(linebuf, s1, saltlen);
                     memcpy(linebuf + saltlen, cur, len);
                     memcpy(linebuf + saltlen + len, mdbuf, 32);
                     mymd5(linebuf, saltlen + len + 32, curin.h);
                     hashcnt++;
-                    prmd5(curin.h, newbuf, 32);
-                    newbuf[32] = 0;
-                    Word_t *PV2;
-                    JSLG(PV2, JUDYJ(JOB_SIMPLACMS), (unsigned char *)newbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
-                      snprintf(linebuf2, MAXLINE, "%s:%s", newbuf, salt);
-                      if (!Printall) {
-                        *PV2 = 1;
-                        PV_DEC(saltsnap[si].PV);
-                        if (*saltsnap[si].PV == 0) {
-                          saltsnap[si] = saltsnap[--nsalts_job]; si--;
-                        }
+                    /* checkhashsalt takes the digest length in HEX characters. */
+                    if (checkhashsalt(&curin, 32, s1, saltlen, 1, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
                       }
-                      prfound(job, linebuf2);
                     }
                   }
                   if (!nsalts_job) TYPEDONE(job->op) = 1;
@@ -49814,25 +49809,14 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         }
       }
     }
-    /* SIMPLACMS (22800): md5($salt.$pass.md5($pass)) — 32hex:salt */
-    if (lf[JOB_SIMPLACMS] && len >= 33) {
-      char *sep = memchr(line, ':', len);
-      if (sep && (sep - line) == 32) {
-        char *salt = sep + 1;
-        int saltlen = mystrlen(salt);
-        if (saltlen > 0 && saltlen <= 255) {
-          /* JudyJ key = lowercase hex hash */
-          char hexkey[33];
-          memcpy(hexkey, line, 32);
-          hexkey[32] = 0;
-          { char *hp; for (hp = hexkey; *hp; hp++) *hp = tolower(*hp); }
-          JSLI(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)hexkey);
-          Saltloaded[JOB_SIMPLACMS] += store_typesalt(JOB_SIMPLACMS, salt, saltlen);
-          Foundcnt[JOB_SIMPLACMS]++;
-          continue;
-        }
-      }
-    }
+    /* SIMPLACMS (22800): md5($salt.$pass.md5($pass)) -- stored form 32hex:salt.
+     * No special case here, deliberately: the stored form IS <hex>:<salt>, which
+     * the generic hex loader already consumes -- digest into the compact table,
+     * remainder into Typesalt. The branch that used to sit here claimed the line,
+     * put the digest in the per-type Judy array and continued, so the type was
+     * loadable ONLY as a combined record through -F. Reformatting types such as
+     * Werkzeug MD5 reach that same generic loader by rewriting themselves into
+     * <hex>:<salt> and falling through, which is the pattern this type needs. */
     /* APPLE-KEYCHAIN (23100): $keychain$*SALT40hex*IV16hex*DATA96hex */
     if (lf[JOB_APPLE_KEYCHAIN] && len > 60 && strncmp(line, "$keychain$*", 11) == 0) {
       char *f1 = line + 11; /* salt */
@@ -52052,22 +52036,11 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         }
       }
     }
-    /* SYMFONY256 (35800): 64hex:SALT — Symfony Legacy SHA256
-     * Algorithm: SHA512(pass) → hex128 → 10000x SHA512(hex[+salt]) → SHA256(hex)
-     * JudyJ key = 64-hex lowercase, Typesalt = salt string */
-    if (lf[JOB_SYMFONY256] && len > 65 && line[64] == ':' && inhashbuf) {
-      int sfok = 1; for (x = 0; x < 64; x++) if (!isxdigit((unsigned char)line[x])) { sfok = 0; break; }
-      if (sfok) {
-        char judykey[65];
-        for (x = 0; x < 64; x++) judykey[x] = tolower(line[x]);
-        judykey[64] = 0;
-        JSLI(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)judykey);
-        int sf_slen = len - 65;
-        Saltloaded[JOB_SYMFONY256] += store_typesalt(JOB_SYMFONY256, line + 65, sf_slen);
-        Foundcnt[JOB_SYMFONY256]++;
-        continue;
-      }
-    }
+      /* SYMFONY256 (35800): 64hex:SALT -- Symfony Legacy SHA256.
+       * No special case: <hex>:<salt> is exactly what the generic hex loader
+       * consumes, putting the digest in the compact table and the remainder
+       * in Typesalt. Claiming the line here and diverting it to JudyJ made
+       * the type loadable only as a combined record through -F. */
     /* WPBCRYPT (35500): $wp$2y$NN$SALT22HASH31 — WordPress bcrypt(hmac-sha384)
      * Format: $wp$ + 2y$NN$salt22hash31 (59 chars after $wp$, 63 total)
      * JudyJ key = "$2y$NN$salt22hash31" (60 chars, standard bcrypt)
@@ -57355,20 +57328,14 @@ usage:
         }
       }
     }
-    /* SIMPLACMS: count entries or disable */
-    { long cnt = 0;
-      line[0] = 0;
-      JSLF(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)line); }
-      if (cnt) {
-        fprintf(stderr, "Searching through %ld unique SIMPLACMS hashes\n", cnt);
-      } else {
-        J1T(RC, Dohash, JOB_SIMPLACMS);
-        if (RC && Printall) {
-          JSLI(PV, JUDYJ(JOB_SIMPLACMS), (unsigned char *)"00000000000000000000000000000000");
-        } else { J1U(RC, Dohash, JOB_SIMPLACMS); }
-      }
-    }
+    /* SIMPLACMS: no per-type gate. This type matches through the compact table,
+     * so its hashes are counted there like every other bare-hex type and there
+     * is nothing type-specific to count or disable here. The block that used to
+     * sit here counted the per-type Judy array and, finding it empty, removed
+     * the type from Dohash with J1U -- which is what made a bare 32-hex hash
+     * plus -s/-S fail silently: only the old special-case loader ever populated
+     * that array, so any other channel disabled the type outright before a
+     * single candidate was hashed. */
     /* APPLE-KEYCHAIN: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
@@ -58636,20 +58603,10 @@ usage:
       }
     }
     /* MD5SALT1SALT2 uses compact table + checkhashsalt2, no bootstrap needed */
-    /* SYMFONY256: count entries or disable */
-    { long cnt = 0;
-      line[0] = 0;
-      JSLF(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)line);
-      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)line); }
-      if (cnt) {
-        fprintf(stderr, "Searching through %ld unique SYMFONY256 hashes\n", cnt);
-      } else {
-        J1T(RC, Dohash, JOB_SYMFONY256);
-        if (RC && Printall) {
-          JSLI(PV, JUDYJ(JOB_SYMFONY256), (unsigned char *)"0000000000000000000000000000000000000000000000000000000000000000");
-        } else { J1U(RC, Dohash, JOB_SYMFONY256); }
-      }
-    }
+    /* SYMFONY256: no per-type gate -- matches through the compact table, so
+     * its hashes are counted there like any other bare-hex type. The block
+     * here used to remove the type from Dohash when its per-type Judy array
+     * was empty, which only the old special-case loader ever filled. */
     /* WPBCRYPT: count entries or disable */
     { long cnt = 0;
       line[0] = 0;
