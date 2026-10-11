@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.623 2026/10/08 11:12:33 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.625 2026/10/11 13:59:59 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.623 2026/10/08 11:12:33 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.625 2026/10/11 13:59:59 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.625  2026/10/11 13:59:59  dlr
+ * Make -S count its salts so they retire correctly, per Waffle today. -S read its salt file into a Judy array, which deduplicates, and then stamped one increment per DISTINCT salt. The count therefore bore no relation to the number of hashes the salt serves, so the first solve took it to zero, build_salt_snapshot dropped the salt from the per-thread snapshot, and every other hash using that salt was abandoned with no diagnostic: correct load counts, no error, a plausible number of cracks. The rule that produced is exact rather than probabilistic and has nothing to do with thread scheduling, which was my first and wrong guess: -M with -S recovered ONE hash per DISTINCT salt and never more. Measured on e386 SHA512PASSSALT with 200 hashes sharing one salt among 40 candidates, 1 of 200, identical at -t 1, 2, 4, 8 and default; and on a six-hash fixture over three salts, 3 of 6. regress/regress.sh has carried a comment describing the same arithmetic since 2026-09-05, reporting MD5SALT at 25 of 275, and works around it by routing each salt through -F attached to its own hash rather than through -S. Two changes. The handler now counts occurrences and ACCUMULATES rather than stamping, which is an exact mirror of the -U handler and carries the same two properties: a salt supplied N times accounts for N hashes, and the byte-exact count the hash file itself builds through store_typesalt, one increment per hash line, survives a -S in the same run instead of being written over. And a new floor pass in main() raises each -S-supplied salt to at least the number of hashes that could use it times the -i depth. The depth factor is the correction the e918 -U work recorded the hard way, since -i makes one hash hittable once per depth and each hit decrements the salt; over-counting only delays retirement while under-counting loses hits silently, so the estimate is deliberately generous. The hash count is the larger of the type's own JudyJ entry count, which is right for a structured type, and Insize, the compact table, which is right for a plain-hex one. The floor cannot live in the handler: -F loads hashes inside getopt in option order and -S is documented to come before -F, so at -S time the population is not known yet. It is applied only to the salts -S actually supplied, tracked in a new per-op DashSSalt array that is freed once the pass is done, so a salt that arrived attached to a hash record keeps its exact count and is never raised. Gated on TYPEOPT_NEEDSALT, because -S inserts into Typesalt for every type the preceding -M named whether or not that type reads a salt, and without the gate a run like -M e1 -S salts.txt announced that MD5's salt reference counts had been raised for salts MD5 never consults. -s is deliberately untouched: its 1000000 exists precisely so a pooled salt never retires early, which Waffle confirms is the intent, and the man page now says so out loud under both options. Results: 1 of 200 becomes 200 of 200, 3 of 6 becomes 6 of 6, and 1 of 4 becomes 4 of 4 at -i 1, 2, 3 and 5 with the floor scaling 4, 8, 12 and 20. Cost is nil where it matters: a run that solves nothing does identical work, 8,000 hash calculations either way, because nothing retires in either build; the run that solves everything goes from 7,801 to 8,000, so 2.6 percent more work recovers 199 hashes. The global -S path, which is -S with no preceding -M and goes to SaltArray, is byte-identical, as is -s. Regression: regress/test-F-salted.sh reports 29 passed 0 failed 0 skipped and is byte-identical to the released binary apart from the binary path line; per-type regress.sh over 22 types matches the released binary on 21, with e439 MSCACHE at 90 of 110 and e786 NTLMH at 15 of 17 reproducing unchanged there and so pre-existing. e918 DCC2 first looked like a regression and is not: it is intermittent in BOTH builds, 3 of 8 passes released against 5 of 8 here, which is why a single run inverted the verdict. e1059 still recovers 3 of 3 on every channel and the registered e450, e451, e452, e577 and e967 vectors are byte-identical. Noted while measuring and NOT addressed here: mixing -f hex input with a later -F structured load across two -M selections reports zero unique hex hashes and loses the hex file entirely, identically in both binaries.
+ *
+ * Revision 1.624  2026/10/11 13:19:34  dlr
+ * Add e1059 BCRYPTMD5PASSSALT, bcrypt of the md5 of the password concatenated with a site salt. Requested by Waffle from live vendor data; the vendor reasoning was that bcrypt with an embedded salt is already strong, so a site-wide extra salt was added as a confounder, and it is carried per hash rather than per site so it is free to vary. tools/hx_dedup_check reported NO MATCH over 1056 catalog entries for the exact expression now in hx.8 before the number was used. Two salts are in play and they come from different places, which is the whole design. The bcrypt salt, the version prefix and the COST live inside the stored MCF, and each stored MCF is handed to crypt_rn as its own setting, so a cost-8 and a cost-12 record in the same file each compute at their own cost with no special handling and no separate cost parse. The SITE salt is a separate per-record field and is what the salt snapshot iterates, so -s and -S feed it like any other salted type. Stored form is the 60-character MCF, a colon, then the site salt; emitted form is that plus the password, so a solved line round-trips. Nine sites: Types[] appended in order so the positional index is 1058 and the designator is e1059, confirmed by resolving the name from the binary; the JOB_ define; Typeopt NEEDSJ with NEEDSALT with SALTJUDY, NEEDSJ rather than NEEDSF for the reason e451 and e452 were moved, the plain-hex fast path steals a structured form, and because NEEDSJ also keeps the type out of gen_salts, which would otherwise hand it about 900k generated salts to run bcrypt against; a default_salts entry so rule one holds under -z with minimum flags; the loader; the compute arm; and a count-or-disable bootstrap gate of its own, since the type keeps its own JudyJ of MCFs rather than joining the shared JudyJ[JOB_BCRYPT], which has nowhere to put a site salt. No Maphashcat entry: no hashcat mode implements this. Two things were found while building it and are fixed here. Adding the type to the shared bcrypt loader branch condition made an e1059-only run file every record under BCRYPT as well, reporting the hashes twice and announcing a type the invocation had not selected; the family inserts are now scoped to the five types that actually share that array, which restores the exact prior output when e1059 is not selected. And the first version of the compute arm decremented the site salt refcount on a solve, as POMELO and BC_Start do. That is wrong for this type: a salt refcount means a different thing on each channel, -F counts the lines carrying it, -s stores 1000000 and -S stores 1 however many hashes share it, so under -S the first solve retired the salt and silently abandoned every other hash using it, measured at 2 of 3 records recovered. The type is now retired as a whole when every MCF is solved and no individual salt is ever retired, which costs nothing because the solved MCFs are already skipped by the found gate. Verified against vendor data confirmed with the python bcrypt module rather than with either tool: the supplied cost-8 record cracks, a cost-12 and a second cost-8 record built independently crack, all three on every channel, 3 of 3 through -F, 3 of 3 bare with -s and 3 of 3 bare with -S. -z with minimum flags emits a conforming line whose digest is byte-identical to the python computation. A site salt with high bytes emits as a HEX wrapper, verifies in hashpipe and reloads and re-cracks in mdxfind unchanged. Zero false positives on a wrong password and on a right password with a wrong site salt. No collateral: the registered e450, e451, e452, e577 and e967 vectors still crack with output byte-identical to the released binary, a plain bcrypt record whose password contains a colon still resolves as BCRYPT rather than being claimed by this type, and -M e450 -F followed by -M e451 -F is byte-identical between the two binaries. Corrected while there, because it misled the investigation: an earlier reading that bcrypt -z was timing out was a measurement artifact, contention from a stray -z run of my own left on all 16 cores; every bcrypt -z returns in under a second.
+ *
  * Revision 1.623  2026/10/08 11:12:33  dlr
  * Let a bare-hex salted type take its salt from -s or -S, for SIMPLACMS and SYMFONY256. Both are stored as a hex digest with the salt alongside, and both advertise the f and s channels in the type table, but neither honoured either: only a combined record through -F could load them, and every other invocation reported an ordinary zero-cracked run. Waffle, 2026-10-08, stating the rule these violated: salts must always be loadable via -s or -S separately from the hash, to the extent possible and in particular for hex-based hashes; and the diagnosis that settled the design, that a bare-hex form belongs in the compact hash table and not in Judy. Three sites per type conspired to produce one silent failure. The loader carried a special case that claimed the line, put the digest in the per-type Judy array and continued, so the digest never reached the compact table. The compute path matched only by JSLG against that array. And a bootstrap gate counted the array and, finding it empty, removed the type from Dohash with J1U, so the type was disabled before a single candidate was hashed. Only the special-case loader ever populated that array, which is why the three combined to make -F the sole working channel while the table advertised otherwise. All three are gone for both types. The stored form IS hex followed by a separator and the salt, which the generic hex loader already consumes, putting the digest in the compact table and the remainder in Typesalt, so the special case was not merely redundant but actively harmful. The compute paths now call checkhashsalt with the digest length in hex characters, 32 for SIMPLACMS and 64 for SYMFONY256, which is the same call the other 183 compliant hex-form salted types make. Reformatting types such as Werkzeug MD5 reach that same loader by rewriting themselves into the hex-colon-salt shape and falling through, which is the pattern these two should always have used. Audited rather than guessed: all 337 types carrying TYPEOPT_NEEDSALT were tested on both channels, generating each vector from the type own -z output rather than from an assumption about its construction. 183 hex-form types already complied. Exactly three carried the defect, identifiable by the signature of a combined record loading while a bare digest with a separate salt did not, and all three had identical flags of NEEDSF with NEEDSALT with SALTJUDY. The third, PWSAFE3, is left alone deliberately: its stored form begins 50575333, the Password Safe version 3 container magic, so its salt and iteration count live inside the blob and supplying one externally is not meaningful. Verified for both fixed types across every channel: -z with no salt still uses the default salt and emits the same conforming digest as before, -z with -s conforms, a bare digest with -s or with -S now matches, and the combined form through -F is unchanged. Regression over fifteen neighbouring types including MD5, MD5SALT, MD5-MULTISALT, MD5MD5SALT, MD5UCSALT and MD5-MD5SALTMD5PASS shows no change. Separately recorded because it misled the investigation: rule one, that every type must produce a conforming hash under -z with minimum flags, was already satisfied everywhere. Static analysis suggested first 115 and then 14 violations; all 14 were tested and all emitted, because a third mechanism of per-type hardcoded defaults exists alongside default_salts and gen_salts. The static metric was wrong and the empirical test was the authority.
  *
@@ -4866,6 +4872,13 @@ char *MD5_user;
 char *combo_pepper;
 Pvoid_t *Typesalt;
 Pvoid_t *UserTypesalt;
+/* Salts that arrived through -S, per op, with their occurrence counts.  Built
+ * in the -S handler and consumed by the reference-count floor pass in main()
+ * once the hash files are loaded, which is the earliest point the hash count
+ * is known; freed there.  Kept separate from Typesalt so the floor can leave
+ * alone any salt that came in attached to a hash record and therefore already
+ * carries store_typesalt's byte-exact count. */
+Pvoid_t *DashSSalt;
 
 /* ---- Phase B per-op accessor -------------------------------------------
  * All access to this per-op array goes through this reference function.
@@ -8060,6 +8073,7 @@ char *Types[] = {
     "HMAC-SHA256-SHA1SALTPASS",
     "MD5SQL5MD5MD5",
     "MD5SQL5MD5MD5MD5",
+    "BCRYPTMD5PASSSALT",
 
 NULL
 
@@ -9153,6 +9167,7 @@ NULL
 #define JOB_HMAC_SHA256_SHA1SALTPASS 1056
 #define JOB_MD5SQL5MD5MD5 1057
 #define JOB_MD5SQL5MD5MD5MD5 1058
+#define JOB_BCRYPTMD5PASSSALT 1059
 
 #define JOB_DONE 2000
 
@@ -10309,6 +10324,13 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [1056] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* HMAC-SHA256-SHA1SALTPASS -- salt holds "salt:key" */
     [1057] = TYPEOPT_NEEDSF,  /* MD5SQL5MD5MD5 */
     [1058] = TYPEOPT_NEEDSF,  /* MD5SQL5MD5MD5MD5 */
+    /* BCRYPTMD5PASSSALT -- NEEDSJ, not NEEDSF: the stored form is a crypt(3)
+     * MCF followed by the site salt, which the plain-hex fast path would
+     * steal, the same reason e451/e452 were moved off NEEDSF.  NEEDSJ also
+     * keeps the type out of gen_salts(), which would otherwise hand it ~900k
+     * generated salts to run bcrypt against.  NEEDSALT|SALTJUDY so a bare MCF
+     * can take its site salt from -s or -S. */
+    [1059] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BCRYPTMD5PASSSALT */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -11432,6 +11454,8 @@ static const struct { int job; const char *salt; } default_salts[] = {
    * ~7 seconds per password, which makes it useless for generating vectors.
    * The parameters are visible in the emitted string, so there is no ambiguity. */
   { JOB_CMIYC, "$cmiyc$2026$1$10$AAAAAAAAAAAAAAAAAAAAAA$" },
+  /* site salt only -- the bcrypt salt and cost come from the stored MCF */
+  { JOB_BCRYPTMD5PASSSALT, "rndSa1t" },
   { 0, NULL }
 };
 static const struct { int job; const char *user; } default_users[] = {
@@ -19315,6 +19339,110 @@ BC_Start:
                 }
                 break;
 
+
+              case JOB_BCRYPTMD5PASSSALT:
+                /* bcrypt(md5(pass . sitesalt)) with the bcrypt salt, the version
+                 * prefix and the COST all taken from the stored MCF.  The stored
+                 * form is <60-char MCF>:<site salt> and the emitted form is the
+                 * same plus the password, so a solved line round-trips.
+                 *
+                 * Two salts are in play and they come from different places.  The
+                 * bcrypt salt is inside the MCF and is never iterated: each stored
+                 * MCF is handed to crypt_rn as its own setting, which is why a
+                 * cost-8 and a cost-12 record in the same file each compute at
+                 * their own cost with no special handling.  The site salt is the
+                 * separate per-record field, and THAT is what the salt snapshot
+                 * iterates, so -s and -S feed it like any other salted type.
+                 *
+                 * The MCF list is walked from this type's own JudyJ and each key
+                 * serves as its own crypt(3) setting.  That is deliberate: it keeps
+                 * the number of bcrypt calls at one per loaded hash per site salt
+                 * instead of cross-producting a separate setting table against the
+                 * hash table.  In the real case the site salt is fixed per site, so
+                 * the snapshot holds one entry and the cost is one bcrypt per hash
+                 * per candidate -- the same shape as plain BCRYPT.
+                 *
+                 * No stack buffers: linebuf holds the md5 preimage, mdbuf its hex,
+                 * linebuf2[0..63] the JudyJ iteration key, newbuf the crypt_rn
+                 * output, and linebuf2 + MAXLINE the emitted composite.  linebuf2
+                 * is MAXLINE*3, so the composite has MAXLINE*2 to work in, which
+                 * bounds the site salt at MAXLINE/2 once $HEX[] doubling is
+                 * allowed for -- past any real salt by four orders of magnitude. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si, outstanding = 0;
+                  char *bcomp = linebuf2 + MAXLINE;
+                  cur[len] = 0;
+                  for (si = 0; si < nsalts_job; si++) {
+                    saltlen = saltsnap[si].saltlen;
+                    s1 = saltsnap[si].salt;
+                    if (saltlen >= MAXLINE / 2) continue;
+                    memmove(linebuf, cur, len);
+                    memmove(linebuf + len, s1, saltlen);
+                    mymd5(linebuf, len + saltlen, curin.h);
+                    prmd5(curin.h, mdbuf, 32);
+                    mdbuf[32] = 0;
+                    linebuf2[0] = 0;
+                    JSLF(PV, JUDYJ(job->op), (unsigned char *)linebuf2);
+                    while (PV) {
+                      /* crypt_rn does not know the $2k$ prefix and answers with its
+                       * error marker "*0", which BC_Start learned the hard way was
+                       * then emitted as though it were a hash.  Skip those here for
+                       * the same reason. */
+                      if ((Printall || *PV == 0) && linebuf2[2] != 'k') {
+                        outstanding++;
+                        hashcnt++;
+                        if (crypt_rn(mdbuf, linebuf2, newbuf, BCRYPT_HASHSIZE) &&
+                            (Printall || strcmp(newbuf, linebuf2) == 0)) {
+                          int bl, j;
+                          /* Emit <MCF>:<site salt> as prfound's hash argument, so
+                           * the line it writes is TYPE <MCF>:<salt>:<password> and
+                           * carries everything needed to verify it again.  The salt
+                           * is $HEX[]-wrapped on the same predicate checkhashsalt
+                           * uses, so the two agree on what needs wrapping. */
+                          bl = (int)strlen(newbuf);
+                          memcpy(bcomp, newbuf, bl);
+                          bcomp[bl++] = ':';
+                          for (j = 0; j < saltlen; j++)
+                            if ((signed char)(s1[j] + 1) < '!') break;
+                          if (j < saltlen) {
+                            memcpy(bcomp + bl, "$HEX[", 5); bl += 5;
+                            for (j = 0; j < saltlen; j++) {
+                              sprintf(bcomp + bl, "%02x", s1[j] & 0xff);
+                              bl += 2;
+                            }
+                            bcomp[bl++] = ']';
+                          } else {
+                            memcpy(bcomp + bl, s1, saltlen);
+                            bl += saltlen;
+                          }
+                          bcomp[bl] = 0;
+                          if (!Printall) *PV = 1;
+                          prfound(job, bcomp);
+                        }
+                      }
+                      JSLN(PV, JUDYJ(job->op), (unsigned char *)linebuf2);
+                    }
+                  }
+                  /* Retire the TYPE when every MCF is solved, never an individual
+                   * site salt.  A salt's refcount means a different thing on each
+                   * channel -- -F counts the lines that carry it, -s stores
+                   * 1000000, and -S stores 1 however many hashes share it -- so
+                   * decrementing it here would, under -S, retire a salt on the
+                   * first solve and silently abandon every other hash using it.
+                   * Measured: 2 of 3 records recovered.  Retirement buys nothing
+                   * for this type anyway: the solved MCFs are skipped by the
+                   * *PV == 0 gate above, so the bcrypt calls disappear with or
+                   * without it, and the snapshot holds one entry per site. */
+                  if (!Printall && !outstanding) TYPEDONE(job->op) = 1;
+                }
+                break;
 
               case JOB_PARALLEL:
                 hashcnt += Maxiter;
@@ -50259,33 +50387,81 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
       }
     }
     /* bcrypt: $2a$, $2b$, $2y$, $2x$, $2k$ */
-    if ((lf[JOB_BCRYPT] || lf[JOB_BCRYPT256] || lf[JOB_BCRYPTMD5] || lf[JOB_BCRYPTSHA1] || lf[JOB_BCRYPTSHA512]) &&
+    if ((lf[JOB_BCRYPT] || lf[JOB_BCRYPT256] || lf[JOB_BCRYPTMD5] || lf[JOB_BCRYPTSHA1] || lf[JOB_BCRYPTSHA512] ||
+         lf[JOB_BCRYPTMD5PASSSALT]) &&
         len >= 58 && line[0] == '$' && line[1] == '2' &&
         (line[2] == 'a' || line[2] == 'b' || line[2] == 'y' ||
          line[2] == 'x' || line[2] == 'k') && line[3] == '$') {
-      if (len > 60) line[60] = 0;
-      JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
-      /* extract salt prefix into Typesalt[job->op] */
-      /* $2k$ has 21-char salt (28 prefix), others have 22 (29 prefix) */
-      { char bc_salt[30];
-        int pfx = (line[2] == 'k') ? 28 : 29;
-        memcpy(bc_salt, line, pfx);
-        bc_salt[pfx] = 0;
-        /* Populate Typesalt for each selected BCRYPT type that uses $2a$ salts */
-        static const int bc_types[] = { JOB_BCRYPT, JOB_BCRYPT256,
-            JOB_BCRYPTMD5, JOB_BCRYPTSHA1, JOB_BCRYPTSHA512, -1 };
-        for (int ci = 0; bc_types[ci] >= 0; ci++) {
-          int bj = bc_types[ci];
-          if (!lf[bj]) continue;
-          JSLI(PV, TYPESALT(bj), (unsigned char *)bc_salt);
-          if (PV) { if ((*PV)++ == 0) {
-            Saltloaded[bj]++;
-            Typesaltcnt[bj]++;
-            Typesaltbytes[bj] += pfx + 1;
-          } }
+      /* e1059 BCRYPTMD5PASSSALT stores a SITE salt after the MCF:
+       *   <60-char MCF>:<site salt>
+       * It has to be captured HERE, before the line[60] = 0 below throws
+       * the remainder away.  The bcrypt salt and the cost still come out of
+       * the MCF -- crypt_rn is handed the stored string as its setting -- so
+       * what this salt adds is the separate per-record site value folded
+       * into the md5 preimage.  It gets its OWN Judy array rather than the
+       * family's shared JudyJ[JOB_BCRYPT]: a found MCF here is only
+       * meaningful paired with a site salt, and the shared array has nowhere
+       * to put one.  The salt text is stored VERBATIM including any $HEX[]
+       * wrapper, because build_salt_snapshot already decodes that form; a
+       * line this type emitted for a salt with high or control bytes thus
+       * reloads without a second decoder here.
+       *
+       * A bare MCF with no trailing salt still loads -- that is the -s / -S
+       * channel, where the pairing is unknown and the site salt comes from
+       * the salt pool.  Typesalt stays empty in that case, which is exactly
+       * what lets the SaltArray copy in main() fill it. */
+      if (lf[JOB_BCRYPTMD5PASSSALT]) {
+        int mcflen = (line[2] == 'k') ? 59 : 60;
+        char bc_mcf[64];
+        if (len >= mcflen) {
+          if (len > mcflen + 1 && line[mcflen] == ':') {
+            char *sp = line + mcflen + 1;
+            int splen = len - mcflen - 1;
+            if (splen > 0 && splen < MAXLINE) {
+              JSLI(PV, TYPESALT(JOB_BCRYPTMD5PASSSALT), (unsigned char *)sp);
+              if (PV) { if ((*PV)++ == 0) {
+                Saltloaded[JOB_BCRYPTMD5PASSSALT]++;
+                Typesaltcnt[JOB_BCRYPTMD5PASSSALT]++;
+                Typesaltbytes[JOB_BCRYPTMD5PASSSALT] += splen + 1;
+              } }
+            }
+          }
+          memcpy(bc_mcf, line, mcflen);
+          bc_mcf[mcflen] = 0;
+          JSLI(PV, JUDYJ(JOB_BCRYPTMD5PASSSALT), (unsigned char *)bc_mcf);
+          Foundcnt[JOB_BCRYPTMD5PASSSALT]++;
         }
       }
-      Foundcnt[JOB_BCRYPT]++;
+      /* Scoped to the five types that share JudyJ[JOB_BCRYPT].  Without this
+       * guard, adding e1059 to the branch condition above made an e1059-only
+       * run file every record under BCRYPT as well -- which reported the hashes
+       * twice and announced a type the invocation had not selected. */
+      if (lf[JOB_BCRYPT] || lf[JOB_BCRYPT256] || lf[JOB_BCRYPTMD5] ||
+          lf[JOB_BCRYPTSHA1] || lf[JOB_BCRYPTSHA512]) {
+        if (len > 60) line[60] = 0;
+        JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
+        /* extract salt prefix into Typesalt[job->op] */
+        /* $2k$ has 21-char salt (28 prefix), others have 22 (29 prefix) */
+        { char bc_salt[30];
+          int pfx = (line[2] == 'k') ? 28 : 29;
+          memcpy(bc_salt, line, pfx);
+          bc_salt[pfx] = 0;
+          /* Populate Typesalt for each selected BCRYPT type that uses $2a$ salts */
+          static const int bc_types[] = { JOB_BCRYPT, JOB_BCRYPT256,
+              JOB_BCRYPTMD5, JOB_BCRYPTSHA1, JOB_BCRYPTSHA512, -1 };
+          for (int ci = 0; bc_types[ci] >= 0; ci++) {
+            int bj = bc_types[ci];
+            if (!lf[bj]) continue;
+            JSLI(PV, TYPESALT(bj), (unsigned char *)bc_salt);
+            if (PV) { if ((*PV)++ == 0) {
+              Saltloaded[bj]++;
+              Typesaltcnt[bj]++;
+              Typesaltbytes[bj] += pfx + 1;
+            } }
+          }
+        }
+        Foundcnt[JOB_BCRYPT]++;
+      }
       continue;
     }
     /* BCRYPTHMACSHA256 (30601): $bcrypt-sha256$v=2,t=2b,r=NN$SALT22$HASH31 */
@@ -53714,6 +53890,7 @@ union HashU curin;
     }
   }
   Typesalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "Typesalt");
+  DashSSalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "DashSSalt");
   UserTypesalt = (Pvoid_t *)malloc_lock(USERDEF_MAX * sizeof(Pvoid_t), "UserTypesalt");
   Typehashsalt = (Pvoid_t *)malloc_lock(JOB_DONE * sizeof(Pvoid_t), "Typehashsalt");
   Typesaltcnt = (int *)malloc_lock(JOB_DONE * sizeof(int), "Typesaltcnt");
@@ -54957,7 +55134,14 @@ badrule:
           while (fgets(line, MAXLINE, sf)) {
             cur = strchr(line, 13); if (cur) *cur = 0;
             cur = strchr(line, 10); if (cur) *cur = 0;
+            /* Count occurrences: a salt supplied N times is a salt that accounts
+             * for N hashes, and that count becomes part of its reference count
+             * below, so it retires once those hashes are solved.  JSLI
+             * initialises a new value to 0, so ++ yields 1 on first sight.
+             * Mirrors the -U handler.  Before this the file was only deduped and
+             * every distinct salt got exactly 1 regardless. */
             JSLI(PV, TmpSalt, (unsigned char *)line);
+            if (PV) (*PV)++;
             scnt++;
           }
           if (sf != stdin) fclose(sf);
@@ -54971,8 +55155,19 @@ badrule:
                 tline[0] = 0;
                 JSLF(PV, TmpSalt, (unsigned char *)tline);
                 while (PV) {
+                  /* Accumulate, never stamp: the hash file's own byte-exact
+                   * count -- store_typesalt, one increment per hash line -- has
+                   * to survive a -S in the same run.  Same reasoning as -U, and
+                   * the same reason -U stopped writing 1000000 over it. */
                   JSLI(TPV, TYPESALT(ti), (unsigned char *)tline);
-                  if (TPV) (*TPV)++;
+                  if (TPV) *TPV += *PV;
+                  /* Remember that THIS salt came from -S so the floor pass in
+                   * main() can raise it, and only it. */
+                  if (ti < JOB_DONE) {
+                    Word_t *DPV;
+                    JSLI(DPV, DashSSalt[ti], (unsigned char *)tline);
+                    if (DPV) *DPV += *PV;
+                  }
                   JSLN(PV, TmpSalt, (unsigned char *)tline);
                 }
               }
@@ -58621,6 +58816,26 @@ usage:
         } else { J1U(RC, Dohash, JOB_WPBCRYPT); }
       }
     }
+    /* BCRYPTMD5PASSSALT: count entries or disable.  The type keeps its own
+     * JudyJ of MCFs rather than joining the family's shared JudyJ[JOB_BCRYPT],
+     * so it needs its own gate -- without one, a run that loaded no e1059
+     * record would walk an empty array for every candidate.  Under -z the seed
+     * is a cost-05 MCF so generating a vector stays cheap; the site salt comes
+     * from default_salts[] via init_default_salts(), which has already run. */
+    { long cnt = 0;
+      line[0] = 0;
+      JSLF(PV, JUDYJ(JOB_BCRYPTMD5PASSSALT), (unsigned char *)line);
+      while (PV) { cnt++; JSLN(PV, JUDYJ(JOB_BCRYPTMD5PASSSALT), (unsigned char *)line); }
+      if (cnt) {
+        fprintf(stderr, "Searching through %ld unique BCRYPTMD5PASSSALT hashes\n", cnt);
+      } else {
+        J1T(RC, Dohash, JOB_BCRYPTMD5PASSSALT);
+        if (RC && Printall) {
+          JSLI(PV, JUDYJ(JOB_BCRYPTMD5PASSSALT),
+               (unsigned char *)"$2a$05$RndSa1tRndSa1tRndSa1tuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        } else { J1U(RC, Dohash, JOB_BCRYPTMD5PASSSALT); }
+      }
+    }
         /* SUNMD5: copy JudyJ to Typesalt, free JudyJ */
         { long smcnt = 0;
           line[0] = 0;
@@ -59318,6 +59533,91 @@ usage:
       }
     }
     JSLFA(RC, SaltArray);
+  }
+  /* -S reference-count floor.  A -S salt carries no pairing information: the
+   * hash file is loaded separately, so ANY loaded hash could be the one that
+   * uses this salt.  Its occurrence count in the file is a lower bound, not the
+   * answer, and the (*TPV)++ this replaced was not even that -- every distinct
+   * salt got 1 however many hashes shared it, so the first solve took the count
+   * to zero, build_salt_snapshot dropped the salt, and every other hash using
+   * it was silently abandoned.  The rule that produced is exact rather than
+   * probabilistic and has nothing to do with thread scheduling, which was the
+   * first and wrong guess: -M with -S recovered ONE hash per DISTINCT salt and
+   * never more.  Measured 2026-10-11 on e386 SHA512PASSSALT with 200 hashes
+   * sharing one salt among 40 candidates, 1 of 200 before and 200 of 200 after,
+   * identical at -t 1, 2, 4, 8 and default; and on a six-hash fixture over
+   * three salts, 3 of 6 before and 6 of 6 after.  regress/regress.sh has
+   * carried a comment describing the same arithmetic since 2026-09-05 and works
+   * around it by routing each salt through -F attached to its own hash.
+   *
+   * Cost of the floor, measured on the same fixture: a run that solves nothing
+   * does identical work, 8,000 hash calculations either way, because nothing
+   * retires in either build.  The run that solves everything goes from 7,801 to
+   * 8,000, so 2.6 percent more work recovers 199 hashes.
+   *
+   * The floor is the number of hashes that could use the salt times the search
+   * depth, because -i makes a single hash hittable once per depth and each hit
+   * decrements the salt.  That depth factor is the correction the e918 -U work
+   * recorded the hard way: under-counting loses hits silently, over-counting
+   * only delays retirement, so the estimate is deliberately generous.
+   *
+   * The hash count comes from the type's OWN JudyJ for a structured type and
+   * from Insize, the compact table, for a plain-hex one; the larger of the two
+   * is used because a type can be fed through either channel and over-counting
+   * is the safe direction.  This cannot be done in the -S handler: -F loads
+   * hashes inside getopt in option order, so at -S time the population is not
+   * known yet, and -S is documented to come before -F.
+   *
+   * Applied only to the salts -S actually supplied, which is what DashSSalt is
+   * for: a salt that arrived attached to a hash record keeps the exact count
+   * store_typesalt built for it.  -s is deliberately untouched -- its 1000000
+   * exists precisely so a pooled salt never retires early. */
+  if (DashSSalt) {
+    Word_t ti = 0;
+    J1F(RC, Dohash, ti);
+    while (RC) {
+      /* Only types that actually consult a salt.  -S inserts into Typesalt for
+       * every type the preceding -M named, salted or not, so without this a
+       * run like -M e1 -S salts.txt printed a receipt announcing that MD5's
+       * salt reference counts had been raised -- for salts MD5 never reads. */
+      if (ti < JOB_DONE && DashSSalt[ti] && (TYPEOPTS(ti) & TYPEOPT_NEEDSALT)) {
+        unsigned long long nh = 0, floorcnt;
+        int depth = (Maxiter > 0) ? Maxiter : 1;
+        long nraised = 0;
+        line[0] = 0;
+        JSLF(PV, JUDYJ(ti), (unsigned char *)line);
+        while (PV) { nh++; JSLN(PV, JUDYJ(ti), (unsigned char *)line); }
+        if (Insize > nh) nh = Insize;
+        floorcnt = nh * (unsigned long long)depth;
+        line[0] = 0;
+        JSLF(PV, DashSSalt[ti], (unsigned char *)line);
+        while (PV) {
+          Word_t *TPV;
+          JSLG(TPV, TYPESALT(ti), (unsigned char *)line);
+          if (TPV && (unsigned long long)*TPV < floorcnt) {
+            *TPV = (Word_t)floorcnt;
+            nraised++;
+          }
+          JSLN(PV, DashSSalt[ti], (unsigned char *)line);
+        }
+        if (nraised)
+          fprintf(stderr,
+                  "-S: %s: %ld salt reference count(s) raised to %llu "
+                  "(%llu hash(es) x %d depth(s))\n",
+                  TYPENAME(ti), nraised, floorcnt, nh, depth);
+      }
+      J1N(RC, Dohash, ti);
+    }
+    /* Release every set, not just the ones the loop above acted on: a type -M
+     * named but that reads no salt is skipped by the NEEDSALT gate, and a type
+     * a count-or-disable gate removed from Dohash is never visited at all.
+     * Judy allocates outside malloc_lock, so neither would show up in the
+     * memory accounting -- the array's only job was to carry the -S salts to
+     * this point and it is dead afterwards either way. */
+    { int di; Word_t frc;
+      for (di = 0; di < JOB_DONE; di++)
+        if (DashSSalt[di]) JSLFA(frc, DashSSalt[di]);
+    }
   }
   /* Count salts per type; precompute MD5(salt) for Typehashsalt types */
   {

@@ -1,8 +1,11 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.11 $
+.\" $Revision: 1.12 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.12  2026/10/11 14:00:11  dlr
+.\" Document the reference count a -S salt carries, and say out loud why -s does not. -S previously stamped one increment per distinct salt, so the count bore no relation to the hashes the salt served and the first solve retired it, abandoning the rest silently; mdxfind.c 1.625 makes the count the number of occurrences in the file raised to at least the loaded hash count times the -i depth. The -S entry now states that, states why the floor is generous rather than exact, that a salt supplied this way is not paired with any particular hash so any loaded hash could be the one that uses it, that -i makes a single hash hittable once per depth, and that a salt arriving attached to a hash record keeps its own exact count instead. The -s entry now states that its salts are given a deliberately huge reference count so they never retire early, which was always the intent but was nowhere written down, and points at -S for the case where salts should retire as their hashes are solved. Renders clean under groff -man with no warnings.
+.\"
 .\" Revision 1.11  2026/09/27 15:36:20  dlr
 .\" TH to the current build: covers the seventeen hash types e1030 to e1046 added in mdxfind.c 1.604 to 1.606 and hashpipe.c 1.211 to 1.213. The type table itself lives in hx.8, which carries all seventeen; these pages are unchanged apart from the version line.
 .\"
@@ -366,6 +369,11 @@ run that loaded them and cracked none.
 .TP
 .BI \-s " file"
 Load salts into the global salt array, one per line.
+Salts loaded this way are given a deliberately huge reference count so that
+they never retire early, because nothing here says how many hashes any of
+them accounts for.  Use
+.B \-S
+instead when the salts should retire as their hashes are solved.
 .TP
 .BI \-u " file"
 Load userids into the global userid array, one per line.  Empty lines are
@@ -407,6 +415,19 @@ global otherwise.  The filename
 or
 .B \-
 reads standard input.
+.IP
+Each salt carries a reference count, being the number of hits it is expected
+to account for, and retires once that many have been scored against it.  The
+count is the number of times the salt appears in the file, raised to at least
+the number of loaded hashes multiplied by the
+.B \-i
+depth: a salt supplied this way is not paired with any particular hash, so any
+loaded hash could be the one that uses it, and
+.B \-i
+makes a single hash hittable once per depth.  Over-counting only delays
+retirement while under-counting loses hits with no diagnostic, so the floor is
+deliberately generous.  A salt that arrives attached to a hash record instead
+keeps the exact count built from the hash file and is not raised.
 .TP
 .BI \-U " file"
 Load userids for the types named by the preceding
