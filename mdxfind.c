@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.627 2026/10/14 17:37:47 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.628 2026/10/14 18:22:00 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.627 2026/10/14 17:37:47 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.628 2026/10/14 18:22:00 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.628  2026/10/14 18:22:00  dlr
+ * Give SMF a default username, and stop the default_users table from masking -u. e414 SMF is sha1 of the lowercased username concatenated with the password, so with no username there is nothing to compute, and the type had no default_users entry: mdxfind -f /dev/null -m 121 -z stdin produced no output at all, not a diagnostic and not a zero-cracked receipt. Administrator is traditional for the type and is now one line in the existing table beside the two entries that already default to administrator, rather than the bespoke bootstrap block I first wrote, because the declarative mechanism already existed and init_default_salts walks both tables. The compute arm lowercases for hashing and reports the name as stored, so the line reads Administrator over a digest of administrator, which is what the algorithm specifies, verified byte-exact against an independent sha1 of administratorfoo. The audit that found it also found twelve more types with the identical gap, each emitting nothing with no username and emitting correctly as soon as one is supplied: e230 e263 e308 e372 e423 e432 e433 e439 e444 e540 e680 and e857. They are deliberately NOT given defaults here, because the existing entries carry type-appropriate names and inventing twelve usernames would bake a wrong one into released output; Waffle picks them. Recorded because it misleads: a static scan of which compute arms read a user judy OVER-reports, since five such types already emit through a per-type hardcoded default, a third mechanism alongside default_salts and gen_salts, so the twelve above are the empirically tested set and not the grep. Fixing SMF then exposed a second fault in the same mechanism which is PRE-EXISTING and affects every entry in the table. The salt half of init_default_salts has always skipped its default when -s supplied salts; the user half never carried the equivalent guard, and the omission did not merely duplicate the supplied list, it MASKED it. -u fills UserArray, which main folds into UseridJudy BEFORE this function is called, and every compute arm reads TYPEUSER first and only falls back to UseridJudy, so a default written into TYPEUSER was preferred over the names the user passed. Measured on the released binary: e855 POSTGRESQL, e856 JUNIPERSSG and e1005 SHA1UCUSERPASS each emitted a byte-identical digest with and without -u, so for a cracking run the supplied usernames were silently discarded and those hashes could not be found. All three now honour -u. -U was never affected because it writes TYPEUSER directly and the existing TYPEUSER test already honoured it, and an -F record carrying its own username is likewise untouched. No collateral: the five types that already emitted through their own hardcoded defaults are unchanged at 39996, 39996, 19998, 19998 and 19998 lines, and e1060 still emits its 4096.
+ *
  * Revision 1.627  2026/10/14 17:37:47  dlr
  * e542 MD5sub8-24SALT: the single-block test is now relative to len. The literal salt-under-24 encoded len+saltlen under 56 for len==32 only, and every type sharing the MD5SALTstart arm has len 32 except e542, whose inner value is the 16-byte hex slice 8 to 24. Salts of 24 to 39 bytes were therefore sent down the two-block path although they fit one block, and were computed wrong - the CPU silently missed every such hash that the GPU found. Now len+saltlen under 56, bit-identical for len==32. Fixed in both the INTEL and the NEON arms. Measured on a 1 to 60 byte salt sweep: 480 of 480 CPU and GPU, byte-identical, on both NVIDIA and AMD.
  *
@@ -11480,6 +11483,12 @@ static const struct { int job; const char *user; } default_users[] = {
   { JOB_JUNIPERSSG, "netscreen" },
   { JOB_SHA1UCUSERPASS, "administrator" },
   { JOB_SHA1USERCOLONPASS, "administrator" },
+  /* SMF is sha1(strtolower(user) . pass), so with no username there is nothing
+   * to compute and the type emitted nothing at all under -z.  Administrator is
+   * traditional for it.  The compute arm lowercases for hashing and reports the
+   * name as stored, so the line reads Administrator over a digest of
+   * administrator, which is what the algorithm specifies. */
+  { JOB_SMF, "Administrator" },
   { 0, NULL }
 };
 static void init_default_salts(void) {
@@ -11504,6 +11513,18 @@ static void init_default_salts(void) {
   for (i = 0; default_users[i].user; i++) {
     int j = default_users[i].job;
     if (TYPEUSER(j)) continue;
+    /* Don't insert a default when -u supplied userids (2026-10-14).  The salt
+     * loop above has carried the equivalent SaltArray guard all along; the user
+     * loop never did, and the omission MASKED -u rather than merely duplicating
+     * it: UserArray is folded into UseridJudy earlier in main() than this
+     * function is called, every compute arm reads TYPEUSER first and only falls
+     * back to UseridJudy, so a default written here is preferred over the list
+     * the user actually supplied.  Measured before the fix: e855 POSTGRESQL,
+     * e856 JUNIPERSSG and e1005 SHA1UCUSERPASS each emitted a byte-identical
+     * digest with and without -u, i.e. the supplied names were silently ignored.
+     * -U is unaffected either way because it fills TYPEUSER, which the test
+     * above already honours. */
+    if (UseridJudy || UserArray) continue;
     J1T(RC, Dohash, j);
     if (RC) {
       JSLI(PV, TYPEUSER(j), (unsigned char *)default_users[i].user);

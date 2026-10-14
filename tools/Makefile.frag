@@ -99,12 +99,14 @@ codegen/maphashcat_data.h: mdxfind.c tools/gen_maphashcat.awk
 tools/hx_dedup_check: tools/hx_dedup_check.c tools/hx_program_cmp.h hx_vm.h \
                 hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c hx.tab.c \
                 hx.lex.c myprogress.c codegen/hx_specs_data.c \
-                codegen/hx_spec_entry.h codegen/maphashcat_data.h
+                codegen/hx_spec_entry.h codegen/maphashcat_data.h \
+                ruleproc32.c ruleproc32.h classify_utf8.c
 	cc -DHX_STANDALONE -DHX_NO_MAIN -O3 -I. -I/opt/local/include \
 	    -o tools/hx_dedup_check \
 	    tools/hx_dedup_check.c hx.c hx_ast.c hx_compile.c hx_vm.c hx_func.c \
 	    hx.tab.c hx.lex.c myprogress.c codegen/hx_specs_data.c \
-	    -L/opt/local/lib -lssl -lcrypto /opt/local/lib/libiconv.a
+	    ruleproc32.c classify_utf8.c \
+	    -L/opt/local/lib -lssl -lcrypto
 
 # Regenerate codegen/hx_specs_data.c from hx.8 via the build-time tool.
 # Path to hx.8 is via HX8_PATH; defaults to ~/Documents/troff/mdxfind/hx.8
