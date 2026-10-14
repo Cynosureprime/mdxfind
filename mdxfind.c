@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.625 2026/10/11 13:59:59 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.627 2026/10/14 17:37:47 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.625 2026/10/11 13:59:59 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.627 2026/10/14 17:37:47 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.627  2026/10/14 17:37:47  dlr
+ * e542 MD5sub8-24SALT: the single-block test is now relative to len. The literal salt-under-24 encoded len+saltlen under 56 for len==32 only, and every type sharing the MD5SALTstart arm has len 32 except e542, whose inner value is the 16-byte hex slice 8 to 24. Salts of 24 to 39 bytes were therefore sent down the two-block path although they fit one block, and were computed wrong - the CPU silently missed every such hash that the GPU found. Now len+saltlen under 56, bit-identical for len==32. Fixed in both the INTEL and the NEON arms. Measured on a 1 to 60 byte salt sweep: 480 of 480 CPU and GPU, byte-identical, on both NVIDIA and AMD.
+ *
+ * Revision 1.626  2026/10/13 18:14:37  dlr
+ * Add e1060 MD5USERDESCRYPT, md5 of a username concatenated with a DES crypt string: md5(user . descrypt(pass, salt)). Live user data from Waffle; the construction was settled against the supplied vector before anything was written rather than inferred from the shape. The descrypt output is consumed WHOLE, all 13 characters including the two salt characters, which is what distinguishes it: md5 of Riederer with DX1HFRwVm6AP. is the stored digest and md5 over the 11-character checksum alone is not, nor is either ordering reversed. tools/hx_dedup_check returned NO MATCH over the full 1057-entry catalog, after the gate itself was repaired in tools/Makefile.frag 1.6 because its binary predated the iconv retirement and had silently stopped covering e1059. Record shape is hash:salt:user, so Typesalt entries arrive as salt:user combined and are split on the first colon, the idiom e1011 MD5USERMD5PASSSALT and SOCIALENGINE already use, and checkhashsalt2 reports hash:salt:user:password so input and output are the same shape. An entry with no colon is a bare two-character salt, from -s, -S or the generated range, and its user then comes from the user judy. Two defaults per the specification, in a bootstrap block deliberately NOT gated on Printall, which is the whole point: the existing 4096-salt generation fires only under -z and -m with a plain hex file had to work too. With no salts supplied the standard 4096 two-character DES range is generated; with no users supplied the user defaults to root. Either is skipped when the channel already supplied the data, so an -F record carrying its own salt and user is never overridden, and both are announced because 4096 salts means 4096 descrypt operations per candidate. Loop order is load-bearing and is commented as such: descrypt does not depend on the user and is the expensive half, so it runs once per salt with the user loop inside, which keeps the default range at 4096 descrypt calls per candidate rather than 4096 times the user count. The reported plaintext is truncated to eight bytes as e501 does, because descrypt uses only the first eight characters of the key and reporting the whole word would be a false precision; measured, a fifteen-character password reports its first eight. Two defects were found by testing and are fixed here rather than shipped. Reporting first went through checkhashsalt2 with a zero iteration index, which emits a bare label that can never match past the first round -- the same defect 1.546 fixed for e1005, e1006 and e1011 -- and both report sites now loop to Maxiter with a real index, re-hashing the lowercase hex of the previous digest. And the type emitted a line it could not read back: checkhashsalt2 wraps the user field in $HEX[] whenever the name carries a high or control byte, while build_salt_snapshot decodes only an entry that is wholly wrapped, so a non-ASCII user cracked once, emitted $HEX[636166c3a9] and found nothing when fed back. Both user sites now decode an inline wrapper, and a raw-byte user and a wrapped user converge on the same emitted line which reloads and re-cracks. Verified on every channel: 4 of 4 through -F, 4 of 4 from bare digests with -u, 2 of 2 from bare digests with no users at all through the generated salts and the default root, 4 of 4 with -S supplied salts and no generation, -z emits 4096 conforming lines whose digests are byte-identical to an independent python computation, output round-trips through -F and through hashpipe, and zero hits on wrong passwords. No collateral: e500, e501, e502 and e573 are byte-identical to the released binary despite both DES salt arrays being touched, and the -F salted suite reports 29 passed 0 failed.
+ *
  * Revision 1.625  2026/10/11 13:59:59  dlr
  * Make -S count its salts so they retire correctly, per Waffle today. -S read its salt file into a Judy array, which deduplicates, and then stamped one increment per DISTINCT salt. The count therefore bore no relation to the number of hashes the salt serves, so the first solve took it to zero, build_salt_snapshot dropped the salt from the per-thread snapshot, and every other hash using that salt was abandoned with no diagnostic: correct load counts, no error, a plausible number of cracks. The rule that produced is exact rather than probabilistic and has nothing to do with thread scheduling, which was my first and wrong guess: -M with -S recovered ONE hash per DISTINCT salt and never more. Measured on e386 SHA512PASSSALT with 200 hashes sharing one salt among 40 candidates, 1 of 200, identical at -t 1, 2, 4, 8 and default; and on a six-hash fixture over three salts, 3 of 6. regress/regress.sh has carried a comment describing the same arithmetic since 2026-09-05, reporting MD5SALT at 25 of 275, and works around it by routing each salt through -F attached to its own hash rather than through -S. Two changes. The handler now counts occurrences and ACCUMULATES rather than stamping, which is an exact mirror of the -U handler and carries the same two properties: a salt supplied N times accounts for N hashes, and the byte-exact count the hash file itself builds through store_typesalt, one increment per hash line, survives a -S in the same run instead of being written over. And a new floor pass in main() raises each -S-supplied salt to at least the number of hashes that could use it times the -i depth. The depth factor is the correction the e918 -U work recorded the hard way, since -i makes one hash hittable once per depth and each hit decrements the salt; over-counting only delays retirement while under-counting loses hits silently, so the estimate is deliberately generous. The hash count is the larger of the type's own JudyJ entry count, which is right for a structured type, and Insize, the compact table, which is right for a plain-hex one. The floor cannot live in the handler: -F loads hashes inside getopt in option order and -S is documented to come before -F, so at -S time the population is not known yet. It is applied only to the salts -S actually supplied, tracked in a new per-op DashSSalt array that is freed once the pass is done, so a salt that arrived attached to a hash record keeps its exact count and is never raised. Gated on TYPEOPT_NEEDSALT, because -S inserts into Typesalt for every type the preceding -M named whether or not that type reads a salt, and without the gate a run like -M e1 -S salts.txt announced that MD5's salt reference counts had been raised for salts MD5 never consults. -s is deliberately untouched: its 1000000 exists precisely so a pooled salt never retires early, which Waffle confirms is the intent, and the man page now says so out loud under both options. Results: 1 of 200 becomes 200 of 200, 3 of 6 becomes 6 of 6, and 1 of 4 becomes 4 of 4 at -i 1, 2, 3 and 5 with the floor scaling 4, 8, 12 and 20. Cost is nil where it matters: a run that solves nothing does identical work, 8,000 hash calculations either way, because nothing retires in either build; the run that solves everything goes from 7,801 to 8,000, so 2.6 percent more work recovers 199 hashes. The global -S path, which is -S with no preceding -M and goes to SaltArray, is byte-identical, as is -s. Regression: regress/test-F-salted.sh reports 29 passed 0 failed 0 skipped and is byte-identical to the released binary apart from the binary path line; per-type regress.sh over 22 types matches the released binary on 21, with e439 MSCACHE at 90 of 110 and e786 NTLMH at 15 of 17 reproducing unchanged there and so pre-existing. e918 DCC2 first looked like a regression and is not: it is intermittent in BOTH builds, 3 of 8 passes released against 5 of 8 here, which is why a single run inverted the verdict. e1059 still recovers 3 of 3 on every channel and the registered e450, e451, e452, e577 and e967 vectors are byte-identical. Noted while measuring and NOT addressed here: mixing -f hex input with a later -F structured load across two -M selections reports zero unique hex hashes and loses the hex file entirely, identically in both binaries.
  *
@@ -8074,6 +8080,7 @@ char *Types[] = {
     "MD5SQL5MD5MD5",
     "MD5SQL5MD5MD5MD5",
     "BCRYPTMD5PASSSALT",
+    "MD5USERDESCRYPT",
 
 NULL
 
@@ -9168,6 +9175,7 @@ NULL
 #define JOB_MD5SQL5MD5MD5 1057
 #define JOB_MD5SQL5MD5MD5MD5 1058
 #define JOB_BCRYPTMD5PASSSALT 1059
+#define JOB_MD5USERDESCRYPT 1060
 
 #define JOB_DONE 2000
 
@@ -10331,6 +10339,12 @@ static unsigned short TypeOpts[JOB_DONE] = {
      * generated salts to run bcrypt against.  NEEDSALT|SALTJUDY so a bare MCF
      * can take its site salt from -s or -S. */
     [1059] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BCRYPTMD5PASSSALT */
+    /* MD5USERDESCRYPT -- NEEDSF because the stored digest is plain 32-hex, and
+     * NEEDUSER as well as NEEDSALT: an -F record carries salt AND user, while a
+     * bare digest through -f takes its salt from the generated DES range and its
+     * user from -u / -U, defaulting to root.  Same flag set as e918 DCC2, the
+     * other type reached through both channels. */
+    [1060] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY | TYPEOPT_NEEDUSER,  /* MD5USERDESCRYPT */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -28931,7 +28945,9 @@ MD5SALTstart:
                   if (saltsnap[si].saltlen > 80) continue;
                   i = saltsnap[si].saltlen;
                   s1 = saltsnap[si].salt;
-                  if (i < 24) {
+                  /* len-relative single-block test -- see the INTEL arm below
+                   * for why the literal 24 was wrong for e542. */
+                  if ((len + i) < 56) {
                     /* Short salt: pack into SSEBUF lanes */
                     X[14].words[pcnt] = (len + i) << 3;
                     s1[i] = 0x80;
@@ -29160,7 +29176,19 @@ MD5SALTstart:
                     dd32 = &d32[(len/4) * 4];
                     i = saltsnap[si].saltlen;
                     s1 = saltsnap[si].salt;
-                    if (i < 24) {
+                    /* Single-block test must follow `len`, not assume 32 (2026-10-14).
+                       * The message is len + saltlen, plus the 0x80 marker and
+                       * the 8 length bytes, so it fits one 64-byte block while
+                       * len + saltlen < 56.  The literal `i < 24` encoded that
+                       * for len == 32 only, and every type sharing this arm has
+                       * len == 32 EXCEPT e542 MD5sub8_24SALT, whose inner value
+                       * is the 16-byte slice [8:24].  So for e542 any salt of
+                       * 24..39 bytes was sent down the two-block path although
+                       * it fits in one block, and was computed wrong: the CPU
+                       * silently missed all 16 vectors carrying a 32-byte salt
+                       * that the GPU found.  Equivalent to the old literal when
+                       * len == 32 (32 + 23 < 56, 32 + 24 is not). */
+                      if ((len + i) < 56) {
                       X[14].words[pcnt] = (len + i) << 3;
                       s1[i] = 0x80;
                       sbuf[pcnt] = saltsnap[si].salt;
@@ -30130,6 +30158,169 @@ nextsalt1:
                   }
                 }
                 if (!nsalts_job) TYPEDONE(job->op) = 1;
+                }
+                break;
+
+              case JOB_MD5USERDESCRYPT:
+                /* e1060: md5(user . descrypt(pass, salt))
+                 *
+                 * The descrypt output is consumed WHOLE -- all 13 characters,
+                 * salt prefix included -- which the live vector settles:
+                 * md5("Riederer" . "DX1HFRwVm6AP.") is the stored digest, while
+                 * md5 over the 11-character checksum alone is not.
+                 *
+                 * Record shape is hash:salt:user, so Typesalt entries arrive as
+                 * "salt:user" combined and are split on the FIRST colon -- the
+                 * idiom JOB_MD5USERMD5PASSSALT and JOB_SOCIALENGINE already use --
+                 * and checkhashsalt2 reports hash:salt:user:password, so input and
+                 * -z output are the same shape and round-trip.
+                 *
+                 * An entry with NO colon is a bare 2-char salt, from -s, -S or the
+                 * generated 4096 range, and its user then comes from the user judy,
+                 * which main() defaults to root.  That is the difference from
+                 * e1011: this type is also reachable with a plain hex digest that
+                 * carries neither field.
+                 *
+                 * LOOP ORDER IS LOAD-BEARING.  descrypt does not depend on the user
+                 * and is the expensive half, so it runs once per salt with the user
+                 * loop inside.  The other order turns nsalts descrypt calls into
+                 * nsalts*nusers -- on the default range, 4096 into 4096*N.
+                 *
+                 * Reports through checkhashsalt2 with a real iteration index and
+                 * loops to Maxiter, re-hashing the lowercase hex of the previous
+                 * digest.  Passing 0 there instead emits a bare label that can
+                 * never match past the first round, which is the defect 1.546
+                 * fixed for e1005, e1006 and e1011.
+                 *
+                 * Like e501 the reported plaintext is truncated to 8 bytes, because
+                 * descrypt uses only the first 8 characters of the key: any longer
+                 * password sharing those 8 produces this digest, so reporting the
+                 * whole word would be a false precision.
+                 *
+                 * Buffers: linebuf[0..) the md5 preimage, linebuf+MAXLINE*2 the
+                 * truncated plaintext, linebuf2 the descrypt output, XMLline the
+                 * user key.  NOT tline -- that holds the rule input for the word
+                 * being processed and writing it corrupts rule output. */
+                if (TYPEDONE(job->op)) break;
+                if (len > MAXLINE) break;
+                if (!TYPESALT(job->op)) break;
+                if (!desblock) {
+                  desblock = malloc_lock(102400, "desblock");
+                }
+                for (x = 0; x < len; x++)
+                  if (cur[x] == 0)
+                    len = x;
+                if (!snap_valid) {
+                  nsalts_job = build_salt_snapshot(saltsnap, saltpool,
+                                  TYPESALT(job->op), tsalt, Printall);
+                  snap_valid = 1;
+                }
+                if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
+                { int si;
+                  char dsalt[4];
+                  Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  for (si = 0; si < nsalts_job; si++) {
+                    char *comb = saltsnap[si].salt;
+                    int comblen = saltsnap[si].saltlen;
+                    char *ucolon = memchr(comb, ':', comblen);
+                    int dlen, slen, iul = 0;
+                    char *iu = NULL;
+                    if (ucolon) {
+                      slen = (int)(ucolon - comb);
+                      iu = ucolon + 1;
+                      iul = comblen - slen - 1;
+                    } else {
+                      slen = comblen;
+                    }
+                    /* The same 2-character filter e501 carries, for the same
+                     * reason: a hex:suffix salt is filed into every NEEDSALT type
+                     * unchecked, and this loop is the filter.  No si-- here -- the
+                     * swapped-in entry is retested at the same index, and
+                     * si < nsalts_job bounds the last-entry case. */
+                    if (slen != 2) {
+                      *saltsnap[si].PV = 0;
+                      saltsnap[si] = saltsnap[--nsalts_job];
+                      si--;
+                      continue;
+                    }
+                    dsalt[0] = comb[0]; dsalt[1] = comb[1]; dsalt[2] = 0;
+                    s = bsd_crypt_des(cur, dsalt, linebuf2, desblock);
+                    if (!s) continue;
+                    hashcnt++;
+                    dlen = mystrlen(s);
+                    i = len;
+                    if (i > 8) i = 8;
+                    memmove(linebuf + MAXLINE * 2, cur, i);
+                    linebuf[MAXLINE * 2 + i] = 0;
+                    job->pass = linebuf + MAXLINE * 2;
+                    job->clen = i;
+                    if (iu) {
+                      /* The user field arrives as written on the line.  This type
+                       * EMITS a $HEX[] user whenever the name carries a high or
+                       * control byte -- checkhashsalt2 wraps salt2 on that
+                       * predicate -- so without decoding here it would produce a
+                       * line it cannot read back, and a non-ASCII user would crack
+                       * once and never reload.  Measured: a raw UTF-8 user cracked
+                       * and emitted $HEX[636166c3a9], and feeding that back found
+                       * nothing. build_salt_snapshot decodes an entry that is
+                       * WHOLLY wrapped; here only the user half is. */
+                      if (iul > 5 && memcmp(iu, "$HEX[", 5) == 0 &&
+                          iu[iul - 1] == ']') {
+                        int dl = get32(iu + 5, (unsigned char *)mdbuf, iul - 6);
+                        if (dl > 0) { iu = mdbuf; iul = dl; }
+                      }
+                      if (iul > 0 && iul + dlen < MAXLINE) {
+                        memmove(linebuf, iu, iul);
+                        memmove(linebuf + iul, s, dlen);
+                        mymd5(linebuf, iul + dlen, curin.h);
+                        for (x = 1; x <= Maxiter; x++) {
+                          hashcnt++;
+                          if (checkhashsalt2(&curin, 32, dsalt, 2, iu, iul, x, job))
+                            PV_DEC(saltsnap[si].PV);
+                          if (x < Maxiter) {
+                            prmd5(curin.h, newbuf, 32);
+                            mymd5(newbuf, 32, curin.h);
+                          }
+                        }
+                      }
+                    } else if (ujudy) {
+                      Word_t *UPV;
+                      XMLline[0] = 0;
+                      JSLF(UPV, ujudy, (unsigned char *)XMLline);
+                      while (UPV) {
+                        if (Printall || *UPV > 0) {
+                          int ulen = mystrlen(XMLline);
+                          char *uu = XMLline;
+                          /* Same decode for the pooled users: a -u / -U file may
+                           * carry $HEX[] names for the same reason. */
+                          if (ulen > 5 && memcmp(uu, "$HEX[", 5) == 0 &&
+                              uu[ulen - 1] == ']') {
+                            int dl = get32(uu + 5, (unsigned char *)mdbuf, ulen - 6);
+                            if (dl > 0) { uu = mdbuf; ulen = dl; }
+                          }
+                          if (ulen > 0 && ulen + dlen < MAXLINE) {
+                            memmove(linebuf, uu, ulen);
+                            memmove(linebuf + ulen, s, dlen);
+                            mymd5(linebuf, ulen + dlen, curin.h);
+                            for (x = 1; x <= Maxiter; x++) {
+                              hashcnt++;
+                              if (checkhashsalt2(&curin, 32, dsalt, 2,
+                                                 uu, ulen, x, job)) {
+                                PV_DEC(UPV);
+                                PV_DEC(saltsnap[si].PV);
+                              }
+                              if (x < Maxiter) {
+                                prmd5(curin.h, newbuf, 32);
+                                mymd5(newbuf, 32, curin.h);
+                              }
+                            }
+                          }
+                        }
+                        JSLN(UPV, ujudy, (unsigned char *)XMLline);
+                      }
+                    }
+                  }
                 }
                 break;
 
@@ -56396,7 +56587,8 @@ usage:
     if (DEScryptcnt) {
       /* Standard descrypt only: all entries are 13-char/2-char-salt */
       int des_types[] = { JOB_DESCRYPT, JOB_MD5DESCRYPT, JOB_MD4DESCRYPT,
-                          JOB_SHA1DESCRYPT, JOB_MD4UTF16DESCRYPT, 0 };
+                          JOB_SHA1DESCRYPT, JOB_MD4UTF16DESCRYPT,
+                          JOB_MD5USERDESCRYPT, 0 };
       int dt;
       Pvoid_t salt_counts = NULL;
       Word_t *SPV;
@@ -56430,7 +56622,8 @@ usage:
     } else if (Printall) {
       /* -z mode: generate 4096 standard 2-char DES salts */
       int des_types[] = { JOB_DESCRYPT, JOB_MD5DESCRYPT, JOB_MD4DESCRYPT,
-                          JOB_SHA1DESCRYPT, JOB_MD4UTF16DESCRYPT, 0 };
+                          JOB_SHA1DESCRYPT, JOB_MD4UTF16DESCRYPT,
+                          JOB_MD5USERDESCRYPT, 0 };
       int dt;
       char dsalt[4];
       for (dt = 0; des_types[dt]; dt++) {
@@ -56446,6 +56639,48 @@ usage:
           }
           Numsalts += 4096;
           fprintf(stderr, "Generated 4096 standard DES salts for %s\n", Types[des_types[dt]]);
+        }
+      }
+    }
+
+    /* MD5USERDESCRYPT (e1060) defaults.  The DES block above seeds 2-char salts
+     * for every selected DES-family type, but only from salts it can see: the
+     * prefixes of loaded DESCRYPT records, or the generated 4096 under -z.  This
+     * type is normally reached with a plain 32-hex digest and NO descrypt record
+     * anywhere in the input, so neither source fires and it would run with an
+     * empty salt table and find nothing.  Waffle's specification: with no salts
+     * supplied, generate the default DESCRYPT range; with no users supplied,
+     * default to root.
+     *
+     * Deliberately NOT gated on Printall, which is the difference from the block
+     * above -- -m e1060 with a plain hex file has to work, not just -z.  The cost
+     * is visible in the receipt because 4096 salts means 4096 descrypt operations
+     * per candidate, and descrypt is the expensive half of this construction.
+     *
+     * Both defaults are skipped when the channel already supplied the data, so an
+     * -F record carrying its own salt and user is never overridden. */
+    { J1T(RC, Dohash, JOB_MD5USERDESCRYPT);
+      if (RC) {
+        if (!TYPESALT(JOB_MD5USERDESCRYPT)) {
+          char dsalt[4];
+          Word_t *TPV;
+          for (x = 0; x < 64; x++) {
+            for (y = 0; y < 64; y++) {
+              dsalt[0] = phpitoa64[x]; dsalt[1] = phpitoa64[y]; dsalt[2] = 0;
+              JSLI(TPV, TYPESALT(JOB_MD5USERDESCRYPT), (unsigned char *)dsalt);
+              if (TPV) *TPV = 1000000;
+            }
+          }
+          Numsalts += 4096;
+          fprintf(stderr, "Generated 4096 standard DES salts for %s\n",
+                  TYPENAME(JOB_MD5USERDESCRYPT));
+        }
+        if (!TYPEUSER(JOB_MD5USERDESCRYPT) && !UseridJudy) {
+          Word_t *UPV;
+          JSLI(UPV, TYPEUSER(JOB_MD5USERDESCRYPT), (unsigned char *)"root");
+          if (UPV) *UPV = 1000000;
+          fprintf(stderr, "Using default user 'root' for %s\n",
+                  TYPENAME(JOB_MD5USERDESCRYPT));
         }
       }
     }

@@ -2686,9 +2686,31 @@ void gpujob(void *arg) {
                          * what we need to mirror. */
                         if (is_salted_op) {
                             int hit = 0;
-                            if (g->op == JOB_MD5SALT && iter_num == 1) {
+                            if ((g->op == JOB_MD5SALT ||
+                                 g->op == JOB_MD5UCSALT ||
+                                 g->op == JOB_MD5revMD5SALT ||
+                                 g->op == JOB_MD5sub8_24SALT) && iter_num == 1) {
                                 /* iter==1 CPU path uses checkhashkey
-                                 * (no iter suffix in label). */
+                                 * (no iter suffix in label).
+                                 *
+                                 * 2026-10-14: the family members e350 / e541 /
+                                 * e542 were MISSING from this test although
+                                 * they share both the kernel (algo_mode 1/2/3)
+                                 * and the CPU round-1 convention -- their CPU
+                                 * arm is the same shared MD5SALTstart block,
+                                 * which reports x==1 through checkhashkeylen.
+                                 * Falling through to the generic arm below
+                                 * reported them via checkhashsalt with
+                                 * iter_num==1, so the GPU emitted
+                                 * "MD5UCSALTx01" where the CPU emitted
+                                 * "MD5UCSALT" -- a CPU-vs-GPU output mismatch
+                                 * in a project that validates byte-exactness
+                                 * between the two, and a split in the type
+                                 * designator that mdsplit routes on.  Bare is
+                                 * the correct form: v1.271.res carries bare
+                                 * "MD5SALT" on all 50,000 lines (the
+                                 * "MD5SALTx01" in its stderr is the summary
+                                 * COUNTER label, not the per-line one). */
                                 hit = checkhashkeylen(&curin, hexlen,
                                                    salt_bytes, salt_len_b,
                                                    &synthetic_job);

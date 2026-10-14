@@ -1163,9 +1163,26 @@ static int _dynsize_atexit_registered = 0;
  * stay as functions because the invariant is worth stating at each caller. */
 static int dynsize_is_enabled(void) { return 1; }
 
-static int dynsize_spp_pinned(void) { return 0; }
+/* MDXFIND_SPP pins salts_per_page and takes the servo's feedback out of the
+ * loop for the md5salt template, which is how an spp sweep runs without a
+ * rebuild per value.  Restored 2026-10-14 while chasing the e31 regression:
+ * the priority comment at the spp_default selection still documents this as
+ * source 1, but the reader had been reduced to a stub, so there was no way to
+ * measure the optimum on a given device. */
+static int dynsize_spp_pinned(void) {
+    const char *e = getenv("MDXFIND_SPP");
+    return (e && *e && atoi(e) > 0);
+}
 
-static int dynsize_verbose(void) { return 0; }
+/* MDXFIND_DYNSIZE_VERBOSE=1 prints the servo's per-dispatch decision
+ * (action, spp, wall, observed vs EMA).  Restored 2026-10-14: the reader was
+ * stubbed to 0, so the one diagnostic that explains WHY the servo settles
+ * where it does could not be turned on, and a servo stuck an order of
+ * magnitude below the device looked exactly like a converged one. */
+static int dynsize_verbose(void) {
+    const char *e = getenv("MDXFIND_DYNSIZE_VERBOSE");
+    return (e && *e && *e != '0');
+}
 
 /* FNV-1a 64-bit over (CL_DEVICE_NAME|CL_DRIVER_VERSION|CL_DEVICE_VENDOR).
  * 16 hex chars output. Stable identifier for per-device cache file. */
@@ -1246,7 +1263,22 @@ static int dynsize_cache_load(const char *uuid, struct dynsize_entry *e) {
         if (sscanf(line, " %63[^=]= %lf", key, &dval) == 2) {
             if      (!strcmp(key, "current_N"))         e->current_N         = (uint32_t)dval;
             else if (!strcmp(key, "current_spp"))       e->current_spp       = (uint32_t)dval;
-            else if (!strcmp(key, "spp_cap_observed"))  e->spp_cap_observed  = (uint32_t)dval;
+            /* spp_cap_observed is deliberately NOT loaded (2026-10-14).  The
+             * struct documents it as "learned per-session", and that is the
+             * only reading under which it is safe: it is the value observed
+             * JUST BEFORE a throughput cliff, which is a property of the
+             * WORKLOAD, not of the device.  Persisting it welded the cliff
+             * guard shut -- growth is clamped to the cap, so once a run had
+             * halved its way down (pre-rev-1.181 death spiral) the cap was
+             * locked at the bottom and EVERY later run on that device was
+             * pinned there, with no way back up.  Observed in the field:
+             * fpga.local held current_spp=64 cap=128, and mmt held
+             * current_spp=64 cap=85 with ema_mhz=159.2 on an RTX 4070 Ti
+             * SUPER -- a 25x shortfall that looked exactly like a clean run.
+             * The rev 1.181 guard stops NEW spirals but cannot repair a
+             * cache already poisoned.  The default above (DYNSIZE_SPP_MAX)
+             * restores the headroom; the cap is still learned, and still
+             * clamps, within the session that observes the cliff. */
             else if (!strcmp(key, "ema_mhz"))           e->ema_mhz           = dval;
             else if (!strcmp(key, "loop_weight"))       e->loop_weight       = dval;
             else if (!strcmp(key, "convergence_count")) e->convergence_count = (uint32_t)dval;
@@ -1286,12 +1318,11 @@ static int dynsize_cache_store(const char *uuid, const struct dynsize_entry *e) 
         "schema=1\n"
         "current_N=%u\n"
         "current_spp=%u\n"
-        "spp_cap_observed=%u\n"
         "ema_mhz=%.4f\n"
         "convergence_count=%u\n"
         "loop_weight=%.6f\n"
         "last_update_ts_unix=%lld\n",
-        e->current_N, e->current_spp, e->spp_cap_observed,
+        e->current_N, e->current_spp,
         e->ema_mhz, e->convergence_count, e->loop_weight,
         (long long)time(NULL));
     fclose(fp);
@@ -1392,6 +1423,18 @@ static void dynsize_ensure_loaded(struct gpu_device *d, int dev_idx) {
  * optimum per gpu_md5salt_core.cl rev 1.5 + 2026-05-11 fpga 1080
  * measurement: N=64 → 2.03 GH/s vs N=16 → 0.52 GH/s on e31). */
 static uint32_t dynsize_compile_time_N(struct gpu_device *d, int dev_idx) {
+    /* MDXFIND_SALT_BATCH override, restored 2026-10-14 for the e31 sweep.
+     * N is SALT_BATCH: it is both baked into the kernel as -DSALT_BATCH=N
+     * (site ~7915) and used to derive salt_axis at dispatch (site ~17135),
+     * and those two MUST agree -- so the override belongs here, at the single
+     * point both consumers read, rather than at either call site. */
+    {
+        const char *e = getenv("MDXFIND_SALT_BATCH");
+        if (e && *e) {
+            int v = atoi(e);
+            if (v >= 1 && v <= 256) return (uint32_t)v;
+        }
+    }
     if (dynsize_is_enabled()) {
         dynsize_ensure_loaded(d, dev_idx);
         if (d->dynsize_md5salt.initialized) {
@@ -15529,8 +15572,13 @@ validator_skip:
          * optimum from gpu_md5salt_core.cl rev 1.5. */
         uint32_t spp_default = 8192u;
         {
-            /* MDXFIND_SPP used to pin spp_default here. */
-            if (dynsize_is_enabled() &&
+            const char *sppenv = getenv("MDXFIND_SPP");
+            if (sppenv && *sppenv && atoi(sppenv) > 0) {
+                uint32_t v = (uint32_t)atoi(sppenv);
+                if (v < DYNSIZE_SPP_MIN) v = DYNSIZE_SPP_MIN;
+                if (v > DYNSIZE_SPP_MAX) v = DYNSIZE_SPP_MAX;
+                spp_default = v;
+            } else if (dynsize_is_enabled() &&
                        (op == JOB_MD5SALT || op == JOB_MD5UCSALT ||
                         op == JOB_MD5revMD5SALT || op == JOB_MD5sub8_24SALT)) {
                 /* Dynsize gate at salts_per_page derivation:
@@ -17415,6 +17463,22 @@ validator_skip:
             (uint64_t)(t_dispatch_end.tv_nsec - t_dispatch_start.tv_nsec);
         if (wall_ns < 1) wall_ns = 1; /* paranoia */
 
+        /* Per-PAGE wall (2026-10-14).  wall_ns spans the WHOLE salt_page
+         * loop, but salts_per_page only decides how the dispatch's fixed
+         * total work (num_words x total_salts) is CHUNKED -- n_pages is
+         * ceil(total_salts / salts_per_page), so shrinking spp does not
+         * shrink wall_ns, it ENLARGES it by adding kernel launches.  The
+         * 500 ms / 2 s thresholds below describe one launch, so comparing
+         * them against the whole-loop wall inverted the control loop: a
+         * dispatch over the 2 s ceiling halved spp, which raised the wall,
+         * which halved again -- the death spiral that pinned fpga.local and
+         * mmt at DYNSIZE_SPP_MIN.  The per-page wall IS proportional to spp,
+         * so the actuator now moves the quantity it is judged on.
+         * observed_mhz keeps using the TOTAL wall: `pairs` counts all pages,
+         * so that ratio is already the correct throughput. */
+        uint64_t wall_ns_page = wall_ns / (n_pages ? (uint64_t)n_pages : 1ULL);
+        if (wall_ns_page < 1) wall_ns_page = 1;
+
         struct dynsize_entry *e = &d->dynsize_md5salt;
 
         /* "pairs" = candidates explored on the GPU this call.
@@ -17458,7 +17522,7 @@ validator_skip:
         const char *action = "hold";
         if (salt_retiring) {
             action = "salt_retire_hold";
-        } else if (wall_ns > DYNSIZE_HARD_WALL_NS &&
+        } else if (wall_ns_page > DYNSIZE_HARD_WALL_NS &&
                    e->current_spp > DYNSIZE_SPP_MIN &&
                    e->convergence_count > 0 &&
                    e->halves_this_session < DYNSIZE_MAX_HALVES_PER_SESSION) {
@@ -17513,9 +17577,9 @@ validator_skip:
              *   - We still grow on positive slope (room to scale up). */
             double diff = observed_mhz - e->ema_mhz;
             double thresh = DYNSIZE_PLATEAU_RATIO * e->ema_mhz;
-            int wall_under_target = (wall_ns < DYNSIZE_TARGET_WALL_NS);
-            int wall_in_band      = (wall_ns >= DYNSIZE_TARGET_WALL_NS &&
-                                     wall_ns < DYNSIZE_HARD_WALL_NS);
+            int wall_under_target = (wall_ns_page < DYNSIZE_TARGET_WALL_NS);
+            int wall_in_band      = (wall_ns_page >= DYNSIZE_TARGET_WALL_NS &&
+                                     wall_ns_page < DYNSIZE_HARD_WALL_NS);
 
             if (diff > thresh && e->current_spp < e->spp_cap_observed &&
                 wall_under_target) {
@@ -17554,10 +17618,35 @@ validator_skip:
                  * streak; decay weight when settled. */
                 e->plateau_streak++;
                 if (e->plateau_streak > DYNSIZE_PLATEAU_SETTLE) {
-                    e->loop_weight = e->loop_weight * 0.95;
-                    if (e->loop_weight < DYNSIZE_LOOP_WEIGHT_FLOOR)
-                        e->loop_weight = DYNSIZE_LOOP_WEIGHT_FLOOR;
-                    action = "plateau_decay";
+                    /* Upward probe (2026-10-14).  The grow branch above fires
+                     * only on a POSITIVE slope, and a positive slope is what
+                     * growing produces -- so without this, any operating
+                     * point whose throughput is merely steady is a stable
+                     * fixed point and the servo has no way to explore.  That
+                     * is how spp=64 survived: the EMA agreed with the
+                     * measurement, diff was ~0, and "settled" was reported
+                     * for a configuration running an order of magnitude below
+                     * the device.  A settled plateau with wall headroom is
+                     * exactly when probing costs least, and the cliff and
+                     * cautious-shrink branches already undo a bad probe. */
+                    if (wall_under_target && e->current_spp < e->spp_cap_observed) {
+                        uint32_t new_spp = (uint32_t)((double)e->current_spp *
+                                                      DYNSIZE_SPP_GROW_FACTOR);
+                        if (new_spp > e->spp_cap_observed) new_spp = e->spp_cap_observed;
+                        if (new_spp > DYNSIZE_SPP_MAX)     new_spp = DYNSIZE_SPP_MAX;
+                        if (new_spp != e->current_spp) {
+                            e->current_spp = new_spp;
+                            e->plateau_streak = 0;
+                            action = "plateau_probe_up";
+                        } else {
+                            action = "at_cap";
+                        }
+                    } else {
+                        e->loop_weight = e->loop_weight * 0.95;
+                        if (e->loop_weight < DYNSIZE_LOOP_WEIGHT_FLOOR)
+                            e->loop_weight = DYNSIZE_LOOP_WEIGHT_FLOOR;
+                        action = "plateau_decay";
+                    }
                 } else {
                     action = "plateau";
                 }
@@ -17575,11 +17664,14 @@ validator_skip:
             GPU_DEBUG_FPRINTF(stderr,
                 "[dynsize] dev=%d kern=md5salt N=%u spp=%u spp_cap=%u "
                 "obs_mhz=%.1f ema=%.1f weight=%.3f conv=%u "
-                "plateau=%u wall_ms=%llu pairs=%llu action=%s\n",
+                "plateau=%u wall_ms=%llu wall_pg_ms=%llu pages=%u "
+                "pairs=%llu action=%s\n",
                 dev_idx, e->current_N, e->current_spp, e->spp_cap_observed,
                 observed_mhz, e->ema_mhz, e->loop_weight,
                 e->convergence_count, e->plateau_streak,
                 (unsigned long long)(wall_ns / 1000000ULL),
+                (unsigned long long)(wall_ns_page / 1000000ULL),
+                n_pages,
                 (unsigned long long)pairs, action);
         }
     }

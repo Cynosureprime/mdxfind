@@ -882,6 +882,67 @@ __attribute__((noinline)) void md5_block(uint *h0, uint *h1, uint *h2, uint *h3,
  * the minimal kernel (gpu_md5salt_minimal.cl) reducing baseline register
  * pressure 2.4x, post-inline reg pressure dropped occupancy enough to
  * outweigh function-call savings. DO NOT REMOVE without re-testing. */
+/* md5_block_from8_s: flat-scalar twin of md5_block_from8 (2026-10-14, e31
+ * parity).  Identical arithmetic; the 16 message words arrive as SCALARS
+ * instead of behind a `uint *M`, which is the whole point.  A pointer to a
+ * private array passed into a noinline callee forces that array into local
+ * (stack) memory, so the per-salt M[16] in template_finalize_post was being
+ * written to and re-read from memory once per salt -- on the hot loop that
+ * runs SALT_BATCH times per candidate.  Passing scalars keeps the message
+ * words in registers across the call.
+ *
+ * This is the same technique the SHA-512 body already uses here ("16 scalar
+ * w0_t..wf_t instead of W[80], eliminating local-mem spill on Pascal", $Log
+ * Phase 1 Step A).  noinline is PRESERVED deliberately: removing it
+ * regressed e31 780 -> 745 Mh/s on this exact GPU (2026-05-18, see
+ * md5_block_from8 above).  The win here is the calling convention, not
+ * inlining.
+ *
+ * Kept as a separate symbol rather than a rewrite of md5_block_from8 so the
+ * array-based callers (the two-block slow path, modes 1-6) are untouched and
+ * byte-identical. */
+__attribute__((noinline)) void md5_block_from8_s(uint *h0, uint *h1, uint *h2, uint *h3,
+                                                  uint a8, uint b8, uint c8, uint d8,
+                                                  uint m0,  uint m1,  uint m2,  uint m3,
+                                                  uint m4,  uint m5,  uint m6,  uint m7,
+                                                  uint m8,  uint m9,  uint m10, uint m11,
+                                                  uint m12, uint m13, uint m14, uint m15) {
+    uint a = a8, b = b8, c = c8, d = d8;
+    /* Rounds 9-16 (FF, uses m8..m15) */
+    FF(a,b,c,d,m8,(uint)7,0x698098d8u);   FF(d,a,b,c,m9,(uint)12,0x8b44f7afu);
+    FF(c,d,a,b,m10,(uint)17,0xffff5bb1u); FF(b,c,d,a,m11,(uint)22,0x895cd7beu);
+    FF(a,b,c,d,m12,(uint)7,0x6b901122u);  FF(d,a,b,c,m13,(uint)12,0xfd987193u);
+    FF(c,d,a,b,m14,(uint)17,0xa679438eu); FF(b,c,d,a,m15,(uint)22,0x49b40821u);
+    /* Rounds 17-32 (GG) */
+    GG(a,b,c,d,m1,(uint)5,0xf61e2562u);   GG(d,a,b,c,m6,(uint)9,0xc040b340u);
+    GG(c,d,a,b,m11,(uint)14,0x265e5a51u); GG(b,c,d,a,m0,(uint)20,0xe9b6c7aau);
+    GG(a,b,c,d,m5,(uint)5,0xd62f105du);   GG(d,a,b,c,m10,(uint)9,0x02441453u);
+    GG(c,d,a,b,m15,(uint)14,0xd8a1e681u); GG(b,c,d,a,m4,(uint)20,0xe7d3fbc8u);
+    GG(a,b,c,d,m9,(uint)5,0x21e1cde6u);   GG(d,a,b,c,m14,(uint)9,0xc33707d6u);
+    GG(c,d,a,b,m3,(uint)14,0xf4d50d87u);  GG(b,c,d,a,m8,(uint)20,0x455a14edu);
+    GG(a,b,c,d,m13,(uint)5,0xa9e3e905u);  GG(d,a,b,c,m2,(uint)9,0xfcefa3f8u);
+    GG(c,d,a,b,m7,(uint)14,0x676f02d9u);  GG(b,c,d,a,m12,(uint)20,0x8d2a4c8au);
+    /* Rounds 33-48 (HH) */
+    HH(a,b,c,d,m5,(uint)4,0xfffa3942u);   HH(d,a,b,c,m8,(uint)11,0x8771f681u);
+    HH(c,d,a,b,m11,(uint)16,0x6d9d6122u); HH(b,c,d,a,m14,(uint)23,0xfde5380cu);
+    HH(a,b,c,d,m1,(uint)4,0xa4beea44u);   HH(d,a,b,c,m4,(uint)11,0x4bdecfa9u);
+    HH(c,d,a,b,m7,(uint)16,0xf6bb4b60u);  HH(b,c,d,a,m10,(uint)23,0xbebfbc70u);
+    HH(a,b,c,d,m13,(uint)4,0x289b7ec6u);  HH(d,a,b,c,m0,(uint)11,0xeaa127fau);
+    HH(c,d,a,b,m3,(uint)16,0xd4ef3085u);  HH(b,c,d,a,m6,(uint)23,0x04881d05u);
+    HH(a,b,c,d,m9,(uint)4,0xd9d4d039u);   HH(d,a,b,c,m12,(uint)11,0xe6db99e5u);
+    HH(c,d,a,b,m15,(uint)16,0x1fa27cf8u); HH(b,c,d,a,m2,(uint)23,0xc4ac5665u);
+    /* Rounds 49-64 (II) */
+    II(a,b,c,d,m0,(uint)6,0xf4292244u);   II(d,a,b,c,m7,(uint)10,0x432aff97u);
+    II(c,d,a,b,m14,(uint)15,0xab9423a7u); II(b,c,d,a,m5,(uint)21,0xfc93a039u);
+    II(a,b,c,d,m12,(uint)6,0x655b59c3u);  II(d,a,b,c,m3,(uint)10,0x8f0ccc92u);
+    II(c,d,a,b,m10,(uint)15,0xffeff47du); II(b,c,d,a,m1,(uint)21,0x85845dd1u);
+    II(a,b,c,d,m8,(uint)6,0x6fa87e4fu);   II(d,a,b,c,m15,(uint)10,0xfe2ce6e0u);
+    II(c,d,a,b,m6,(uint)15,0xa3014314u);  II(b,c,d,a,m13,(uint)21,0x4e0811a1u);
+    II(a,b,c,d,m4,(uint)6,0xf7537e82u);   II(d,a,b,c,m11,(uint)10,0xbd3af235u);
+    II(c,d,a,b,m2,(uint)15,0x2ad7d2bbu);  II(b,c,d,a,m9,(uint)21,0xeb86d391u);
+    *h0 += a; *h1 += b; *h2 += c; *h3 += d;
+}
+
 __attribute__((noinline)) void md5_block_from8(uint *h0, uint *h1, uint *h2, uint *h3,
                                                 uint a8, uint b8, uint c8, uint d8,
                                                 uint *M) {
