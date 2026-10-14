@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.628 2026/10/14 18:22:00 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.629 2026/10/14 19:14:25 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.628 2026/10/14 18:22:00 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.629 2026/10/14 19:14:25 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.629  2026/10/14 19:14:25  dlr
+ * Give the remaining twelve user-bearing types a default username, per Waffle: administrator. 1.628 added the SMF default and fixed the guard that had let a default_users entry MASK -u; it deliberately left the other twelve types alone pending a decision on what their defaults should be, and this is that decision applied. The twelve are e230 HMAC-SNE256, e263 MD5USERnulPASS, e308 SHA1MD5USER, e372 MD5USERPASS, e423 MD5-MD5puSHA1MD5pup, e432 MD5AM, e433 MD5AM2, e439 MSCACHE, e444 LEET, e540 MANGOS, e680 SHA1-HMAC-MD5 and e857 SKYPE, each of which emitted NOTHING at all with no username supplied and emitted correctly the moment one was. Stored lowercase, matching the two older administrator entries: the types that case-fold a username do it internally, so pre-folding it in the table would be wrong. The order of these two revisions matters and is the reason they are separate: without the 1.628 guard, adding twelve defaults would have masked -u for twelve more types rather than fixing them, turning a type that found nothing into a type that silently ignored the usernames it was given, which is worse. Verified on all thirteen types including SMF: each emits with no user supplied and each still honours -u, 13 of 13 with zero failures. No collateral: the five types that already emitted through a per-type hardcoded default are byte-count identical at 39996, 39996, 19998, 19998 and 19998, e1060 still emits its 4096, and all five pre-existing default_users entries tested, e855 POSTGRESQL, e856 JUNIPERSSG, e1005 SHA1UCUSERPASS, e474 SHA1USERSQL3 and e510 SHA512SHA512RAWUSER, now take one line by default and three under -u where before the default masked the supplied list.
+ *
  * Revision 1.628  2026/10/14 18:22:00  dlr
  * Give SMF a default username, and stop the default_users table from masking -u. e414 SMF is sha1 of the lowercased username concatenated with the password, so with no username there is nothing to compute, and the type had no default_users entry: mdxfind -f /dev/null -m 121 -z stdin produced no output at all, not a diagnostic and not a zero-cracked receipt. Administrator is traditional for the type and is now one line in the existing table beside the two entries that already default to administrator, rather than the bespoke bootstrap block I first wrote, because the declarative mechanism already existed and init_default_salts walks both tables. The compute arm lowercases for hashing and reports the name as stored, so the line reads Administrator over a digest of administrator, which is what the algorithm specifies, verified byte-exact against an independent sha1 of administratorfoo. The audit that found it also found twelve more types with the identical gap, each emitting nothing with no username and emitting correctly as soon as one is supplied: e230 e263 e308 e372 e423 e432 e433 e439 e444 e540 e680 and e857. They are deliberately NOT given defaults here, because the existing entries carry type-appropriate names and inventing twelve usernames would bake a wrong one into released output; Waffle picks them. Recorded because it misleads: a static scan of which compute arms read a user judy OVER-reports, since five such types already emit through a per-type hardcoded default, a third mechanism alongside default_salts and gen_salts, so the twelve above are the empirically tested set and not the grep. Fixing SMF then exposed a second fault in the same mechanism which is PRE-EXISTING and affects every entry in the table. The salt half of init_default_salts has always skipped its default when -s supplied salts; the user half never carried the equivalent guard, and the omission did not merely duplicate the supplied list, it MASKED it. -u fills UserArray, which main folds into UseridJudy BEFORE this function is called, and every compute arm reads TYPEUSER first and only falls back to UseridJudy, so a default written into TYPEUSER was preferred over the names the user passed. Measured on the released binary: e855 POSTGRESQL, e856 JUNIPERSSG and e1005 SHA1UCUSERPASS each emitted a byte-identical digest with and without -u, so for a cracking run the supplied usernames were silently discarded and those hashes could not be found. All three now honour -u. -U was never affected because it writes TYPEUSER directly and the existing TYPEUSER test already honoured it, and an -F record carrying its own username is likewise untouched. No collateral: the five types that already emitted through their own hardcoded defaults are unchanged at 39996, 39996, 19998, 19998 and 19998 lines, and e1060 still emits its 4096.
  *
@@ -11489,6 +11492,24 @@ static const struct { int job; const char *user; } default_users[] = {
    * name as stored, so the line reads Administrator over a digest of
    * administrator, which is what the algorithm specifies. */
   { JOB_SMF, "Administrator" },
+  /* The remaining user-consuming types that had no default and so emitted
+   * NOTHING with no username supplied -- found by testing every type whose
+   * compute arm reads a user judy, then confirming the cause by re-running each
+   * with -u.  administrator per Waffle, 2026-10-14.  Types that case-fold the
+   * name do so internally, so the stored form is lowercase here exactly as the
+   * two older administrator entries above are. */
+  { JOB_HMAC_SNE256, "administrator" },
+  { JOB_MD5USERnulPASS, "administrator" },
+  { JOB_SHA1MD5USER, "administrator" },
+  { JOB_MD5USERPASS, "administrator" },
+  { JOB_MD5_MD5puSHA1MD5pup, "administrator" },
+  { JOB_MD5AM, "administrator" },
+  { JOB_MD5AM2, "administrator" },
+  { JOB_MSCACHE, "administrator" },
+  { JOB_LEET, "administrator" },
+  { JOB_MANGOS, "administrator" },
+  { JOB_SHA1_HMAC_MD5, "administrator" },
+  { JOB_SKYPE, "administrator" },
   { 0, NULL }
 };
 static void init_default_salts(void) {
