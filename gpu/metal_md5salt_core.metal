@@ -749,6 +749,32 @@ static inline void template_finalize_post(thread template_state &st,
      * M[9..13],M[15] when md5_block_from8 is inlined (it's noinline by
      * default for Pascal register safety — see gpu_common.cl — so 2h-B
      * folding bonus only fires when the JIT chooses to inline). */
+    /* Small-salt scalar fast path (mirror of gpu_md5salt_core.cl 1.9).
+     * For inner_len==32 and slen<=7 the whole outer block is known in 16
+     * scalars, so M[16] is never declared on this path and its address is
+     * never taken. total_len = 32+slen <= 39 < 56, so it is always a single
+     * block, and the salt lands entirely in words 8-9 (byte offset 32). */
+    uint inner_len_s = pre.inner_len;
+    if (slen <= 7u && inner_len_s == 32u) {
+        uint s0 = 0u, s1 = 0u;
+        for (uint i = 0u; i < 7u; i++) {   /* literal trip count: unrolls */
+            uint b = (i < slen) ? (uint)salt_buf[i] : 0u;
+            if (i < 4u) s0 |= b << (i * 8u);
+            else        s1 |= b << ((i - 4u) * 8u);
+        }
+        if (slen < 4u) s0 |= 0x80u << ((slen & 3u) * 8u);
+        else           s1 |= 0x80u << ((slen & 3u) * 8u);
+        st.h[0] = 0x67452301u; st.h[1] = 0xEFCDAB89u;
+        st.h[2] = 0x98BADCFEu; st.h[3] = 0x10325476u;
+        md5_block_from8_s(&st.h[0], &st.h[1], &st.h[2], &st.h[3],
+                          pre.a8, pre.b8, pre.c8, pre.d8,
+                          pre.M[0], pre.M[1], pre.M[2], pre.M[3],
+                          pre.M[4], pre.M[5], pre.M[6], pre.M[7],
+                          s0, s1, 0u, 0u, 0u, 0u,
+                          (inner_len_s + slen) * 8u, 0u);
+        return;
+    }
+
     uint M[16];
     M[0] = pre.M[0]; M[1] = pre.M[1]; M[2] = pre.M[2]; M[3] = pre.M[3];
     M[4] = pre.M[4]; M[5] = pre.M[5]; M[6] = pre.M[6]; M[7] = pre.M[7];

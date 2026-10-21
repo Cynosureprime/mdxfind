@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.629 2026/10/14 19:14:25 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.637 2026/10/21 14:20:44 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.629 2026/10/14 19:14:25 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.637 2026/10/21 14:20:44 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,30 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.637  2026/10/21 14:20:44  dlr
+ * Two defects found by chasing the last two entries of the -z sweep exclusion list, and they are unrelated to each other. First, BCRYPT256 e577 took its HMAC BLOCK SIZE from a leaked variable. The dollar 2k arm calls mhash_hmac_init with a hard coded MHASH_SHA256 algorithm, which was always right, and with mhash_get_hash_pblock(hmac_type) for the block size, which was not: hmac_type is a procjob local that the HMAC star arms assign and nothing ever resets, so this HMAC used the block size of whichever HMAC type last ran on that thread for that word. That is the whole of the two valued variation this type showed in a catalog sweep and in no narrower configuration, and bimodal rather than random was the tell, since arbitrary residue does not take exactly two values. Measured from one salt and one password: -m e577 alone, -m e214 with e577 and -m e217 with e577 all agree, because MD5 and SHA256 and the zero initial value all give a 64 byte block, while -m e218 with e577, HMAC-SHA512 at 128, produces a different digest. The uncontaminated value is the correct one, confirmed by hashpipe verifying the sibling e989 construction, so no result from a narrow run is invalidated and this removes the contaminated case only. Both call sites are corrected; the second is the else arm that 1.560 made unreachable when it taught the loop to skip any salt that is not dollar 2k, and it is fixed rather than left as a trap for whoever revives it. Second, MURMUR3 e972 read the seed in the WRONG BYTE ORDER and now agrees with hashcat. The four sscanf calls replaced in 1.636 assembled the seed little endian, byte j of the hex string shifted left j times 8; hashcat mode 27800 reads it big endian. The two agree only when the seed is byte symmetric and every published vector is, which is why years of testing missed it: hashcat's own example hash is 23e93f65 colon 00000000, hx.8 line 3459 carries only the zero seed case, and the other seed in local use was ffffffff. Settled against hashcat 6.2.5 on fpga rather than by argument, by handing it BOTH candidate digests for three asymmetric seeds and seeing which it cracked. It cracked the big endian one every time: deadbeef with secret1 is 64a71363 and not 29d3492c, 0f1e2d3c with hunter2 is 9cf5dd66 and not 198fce5d, 01020304 with password is 09714f1f and not 94dd7944. A python MurmurHash3_x86_32 written from the algorithm reproduces hashcat's published 23e93f65 exactly, so the core was right in every implementation and only the seed parse differed. hashpipe needed no change: its verify_murmur3 was already big endian and already correct, which means mdxfind's own output had been failing to verify in hashpipe for every seed that was not a palindrome, measured at 1 of 3 lines before and 3 of 3 after. mdxfind now cracks hashcat's own example hash and all three asymmetric vectors, its output verifies in hashpipe, and the previously emitted wrong digests are correctly refused. The -z line is unchanged because this type's default_salts seed is zero. MURMUR64A e829 was checked while there and is already big endian and correct. The sweep floor is now five types and every one is accounted for as by design: PHPBB3 and PHPBB3MD5 random salt, KRB5PA23 random confounder, JUNIPERIVE an explicit arc4random_buf IV carried in the blob, and MD5DSALT which is a deliberate algorithm taking a 3 byte salt on each side, so the 2 byte salts a sweep feeds it are not valid input for it. Catalog sweep 157,053 lines, unchanged from 1.636, with BCRYPT256 the only type differing beyond the floor.
+ *
+ * Revision 1.636  2026/10/21 14:06:51  dlr
+ * SOLARWINDS2 e950 and MURMUR3 e972 both computed from uninitialised memory when the salt was not the width they require, the same fault TELEGRAM-SHA256 e947 had in 1.635 and with the same fix: filter the salt snapshot, dropping any entry whose length is wrong or which does not decode to the full width, before the decode is used. The length test alone does not do, since the right number of non-hex characters passes it and still decodes short, and both sites test the decode count as well. This is what the JOB_DESCRYPT arm does with a salt whose length cannot be a DES salt, and for the reason stated there: NEEDSALT hands every type the -s, -S and gen_salts salts unchecked and the compute arm is the filter. e950 was the worse of the two and not only for the digest. The destination was sw_salt, an UNINITIALISED STACK buffer, sw_saltlen was set to 16 whatever get32 had actually produced, and the residue went into the PBKDF2 AND was base64 encoded into the emitted line. So the type printed sixteen bytes of its own stack: of five lines from one catalog sweep four decoded to a live 0x00007f pointer with a constant tail, and the fifth decoded to the ASCII text 3x NUL crypt dollar star 1 star 1046, a fragment of another type's buffer. A shared result file was an ASLR disclosure as well as a wrong hash. The v1 arm JOB_SOLARWINDS is sound, it fills all eight bytes of its username salt explicitly, and the fix is scoped to the v2 branch it sits in. e972 had two faults in four sscanf calls. sscanf writes nothing and returns 0 when the field does not match and the return was unchecked, so a non-hex salt left v, an uninitialised automatic, as the murmur seed; and the loop indexed ts+4 and ts+6 unconditionally, reading past a short salt's terminator into the neighbouring bytes of the salt pool. get32 is this file's own hex decoder, it returns the count of bytes produced and stops at the first non-hex pair, so one call and its count replace all four calls and the out of bounds read with them. Byte order is unchanged and was checked rather than assumed: sscanf took byte j from ts+j*2 and shifted it left j*8, which is sb[j] with the same shift, and the seed deadbeef still produces b26f37f9 exactly as before. Verified against INDEPENDENT oracles rather than against the code under test. A python MurmurHash3_x86_32 written from the algorithm matches both measured seeds; a python pbkdf2_hmac sha1 of 1000 rounds to 1024 bytes followed by sha512 matches both measured solarwinds digests, and the emitted base64 salt decodes back to the hex salt supplied, so the line round trips in content as well as form. Three externally built real hashes for each type, three salts and three passwords, recover 3 of 3 through -F both with the type alone and under a dirty multi type selection. Both still generate under -z with minimum flags from their own default_salts entries, 8 hex for e972 and 32 hex for e950, and are identical over five runs. The invalid salts now yield no line where they used to yield wrong ones, which is also what removes the duplicate pair e950 emitted: two different short salts both decoded to nothing and produced one identical line twice. Catalog sweep 157,053 lines against 157,057, the four dropped being exactly those. Across five runs of this binary both types have left the nondeterministic floor, which is now six types: BCRYPT256, JUNIPERIVE, KRB5PA23, MD5DSALT, PHPBB3 and PHPBB3MD5. Of those PHPBB3, PHPBB3MD5 and KRB5PA23 are by design, their random salt or confounder is recorded in the line and the line round trips. MD5DSALT is NOT a defect: Waffle confirms the algorithm is deliberate and takes a 3 byte salt on each side, so the 2 byte salts a catalog sweep feeds it are not valid input for it. JUNIPERIVE and BCRYPT256 remain open and under analysis.
+ *
+ * Revision 1.635  2026/10/21 13:32:48  dlr
+ * TELEGRAM-SHA256 e947 computed its digest from uninitialised memory whenever the salt was not 32 hex characters, and emitted a line that could not be read back. The arm decodes the stored salt with get32 into a 16 byte destination and discarded the return value. get32 stops at the first non-hex pair and leaves the rest of its destination untouched, and the destination is tsalt, the one shared JudySL index buffer, so the discarded count was not a cosmetic omission: it was the difference between hashing this salt and hashing whatever the last Judy walk had left in that buffer. A two character -s salt decoded ZERO bytes, so the digest came entirely from residue. Measured on 1.632 and 1.634: three runs of one unchanged binary returned four distinct digests for the type, and two different salts in one run produced one identical hash, which is the proof that the salt was reaching nothing. The emitted line could not round-trip either, because the loader accepts only a 32 character salt field, so feeding the generated line back with -F read it as 0 hashes. Both faults have the one cause and the one fix: the salt snapshot is now filtered, and any entry that is not 32 characters or does not decode to a full 16 bytes is retired and compacted out before the decode is used. The length test alone would not do, since 32 non-hex characters pass it and still decode short; that case is tested and dropped. This is what the JOB_DESCRYPT arm does with a salt whose length cannot be a DES salt, and for the same stated reason, that NEEDSALT hands every type the -s, -S and gen_salts salts unchecked and the compute arm is the filter. The si-- is in the for body where the increment restores it before any saltsnap read, not inside a while condition, which is the shape that dereferenced saltsnap minus one in DESCRYPT, KRB5PA23 and IPMI2. No stored hash is affected: a $ salt is 32 hex by construction and the loader already refuses anything else, so the fault was unreachable through -F and confined to synthetic salts. Verified: 3 of 3 real hashes built independently in python still crack through -F, including two hashes sharing one salt, which is what proves the retire and compact does not strand a live salt; -z with minimum flags still generates from the 32 digit default_salts entry, is identical over three runs, and its line reloads through -F and cracks; a valid 32 hex -s salt is identical over five runs and byte exact against an independent python sha256 of salt plus pass plus salt; the two character and the 32 non-hex salts now yield no line at all where they used to yield unloadable ones. Catalog sweep, 157,057 lines against 157,059 before, the two dropped lines being exactly those: BCRYPT is the only type that differs beyond the control floor, and across FIVE runs of this binary TELEGRAM-SHA256 and SHA512-CUSTOM1 have both left that floor, leaving the eight genuinely random-salt-per-run types. Note for whoever reads that list next: TELEGRAM-SHA256 was on it as by-design randomness and was in fact this defect, so the remaining eight have never been audited and at least some may be the same shape.
+ *
+ * Revision 1.634  2026/10/21 12:31:20  dlr
+ * BCRYPT e450 now hard-cuts the emitted word at 72 bytes, at all three emit sites: the CPU BC_Start arm here, and the GPU hit replay in gpu/gpujob_opencl.c and gpu/gpujob_metal.m. This reverses the Q1 no-clamp decision of 2026-05-08, which both sides recorded in comments as deliberate. The reason to clamp is the same fact those comments cited as the reason not to: the truncation is inside BF_set_key, so bytes 73 and beyond never reached the digest. Emitting them claimed a verification that had not happened, and it made the result file depend on wordlist order. Measured on 1.633: one stored hash is solved by a 72 byte word and by an 80 byte word sharing its first 72 bytes, and the emitted line carried whichever word the list happened to list first, because the found gate retires the hash on the first hit. Both orders now emit the same 72 byte line, byte for byte. DESCRYPT already clamps its display to 8 bytes at the matching site and for the matching reason, so the family is now consistent rather than split. Gated on JOB_BCRYPT alone. Five compound siblings reach BC_Start by goto or fall through and share this emit, and every one of them hands crypt_rn a derived hex digest rather than the password, so their job pass is the real password at its real length and must not be touched. Measured under -z with a 100 byte password: e450 emits 72 bytes while e451 BCRYPTMD5, e452 BCRYPTSHA1, e967 BCRYPTSHA512, e577 BCRYPT256, e989 BCRYPTHMACSHA256 and e1059 BCRYPTMD5PASSSALT all still emit 100. The hex decision now runs over the clamped length as well, so a colon or a non-printable past byte 72 no longer forces a HEX wrapper onto a line whose content stops at 72; a word of 72 A characters followed by a colon and more text emits plain, and a word whose colon sits at byte 72 emits a HEX payload of exactly 144 characters, which is 72 bytes. Verified: all shapes verify in hashpipe, and a full catalog -z sweep of 157,059 lines run with a 100 byte password shows BCRYPT as the only type whose output changes. One note for whoever reads that sweep next. TELEGRAM-SHA256 e947 is NOT a regression and must stay on the exclusion list: it decodes its salt with get32 into the shared tsalt Judy index buffer and reads 16 bytes back unconditionally, so when the salt is not 32 hex characters the tail of those 16 bytes is whatever the last Judy walk left there, and its digest then varies run to run on one binary. Five runs of one unchanged binary returned four distinct digests. With a real 32 hex character salt it is deterministic over five runs and byte exact against an independent python sha256 of salt plus pass plus salt, so the defect is confined to synthetic short salts and is pre-existing.
+ *
+ * Revision 1.633  2026/10/21 02:17:48  dlr
+ * SHA512-CUSTOM1 e448: terminate the salt literal, so the printed salt field stops reading past its end. csalt was filled by strncpy of a 29-byte literal with a count of 29, and strncpy NUL-pads only when the source is shorter than the count, so with the two equal it copied every byte and wrote no terminator. checkhashkey then measured the field with mystrlen and ran on into whatever the previously dispatched type had left in linebuf2, emitting a record whose salt carried a tail of foreign hex and which therefore did not round-trip. The hashing was never involved: the sha512 digest is byte-identical before and after. It needed a large type selection to appear, since e448 alone leaves linebuf2 untouched, and in practice showed only on Linux because the Darwin heap handed back zeroed pages that hid it. Found by diffing a full catalog -z sweep of 157,070 lines between the Darwin and Linux builds of 1.632 and running down the one type that differed for a reason no control run explained. Fixed with strcpy, matching the two literal copies in the same arm. Swept the file for the same shape: the only other strncpy whose count equals its literal length is the five-byte MD5 prefix in SHA1BASE64CUSTBASE64MD5, which is a buffer assembled with explicit lengths and never measured with a string function, so it is correct as written and is unchanged. Verified on Linux x86_64, where the defect reproduces: the reproducer -m e1-e200,e448 and the full catalog sweep are both clean, a repeat sweep differs from its predecessor in ten random-salt types with SHA512-CUSTOM1 not among them, and the digest is unchanged on Darwin and Linux alike.
+ *
+ * Revision 1.632  2026/10/21 01:43:27  dlr
+ * MD5AM e432 and MD5AM2 e433: stop printing the wrong userid in the salt field. The four-lane SSE batch stored sbuf[ljobi] = tsalt, the single JudySL index buffer the walk reuses, so all four lanes in a batch aliased one string and JSLN had already advanced it by the time the batch was reported. Every line then carried whichever userid the walk had reached at flush time, which is NOT the last userid loaded but the first of the next batch: with eight users the three hits in batch one all printed zz2, the fifth of eight, so the wrong name varies by batch rather than being a constant that would have been noticed. Hashing was never affected, since it reads acthash[], a genuine per-lane copy, so every crack was correct and only the label was wrong. The record did not round-trip: on a three-user reproduction hashpipe -c verified 1 of 3 before and 3 of 3 after, the one that passed being right by position. This is the same class as the salt copies the MD5SALT batch sites already make into sbufcopy at the three sites above, and the fix is that idiom, backed by wline rather than the stack because a userid is bounded by MAXLINE and four of those will not fit a Darwin thread stack. It is the only call site of its kind: every other sbuf and sbuf2 assignment in the file stores a saltsnap salt, a per-lane slice of linebuf2, or an sbufcopy. The whole JudySL key is copied, not the first field, because MD5AM2 needs both fields in the printed record to verify and e432 ignores the trailing field on re-feed. Reported by Waffle against a list 405 residue where eight sound recoveries read as cross-account matches and were nearly discarded. Verified: full catalog -z sweep of 157,070 lines against 1.631 differs in 16 lines, all MD5AM and MD5AM2, all in the salt field with the digests byte-identical; a new-against-new control run accounts for the seven random-salt types that also move. The scalar path at actlen 56 and above is fixed along with the SSE path, as both report through sbuf.
+ *
+ * Revision 1.631  2026/10/17 23:06:08  dlr
+ * -F reads mdxfind own output back for the self-delimiting formats, requested by Waffle today. A founds file is "<stored form>:<plaintext>" and feeding it to -F failed for most structured types, in two different and equally quiet ways. phpBB3, md5crypt, WBB4, SSHA1BASE64 and their like MEASURE the hash and reject the longer line, so nothing loads and the run reports No final hash type found; APR1, Drupal7, SSPR, the krb5 wrappers and the rest of the dollar-name family accept it and file a Judy key with colon password welded on, which is a hash that can never match, loaded with a clean count and no complaint. The ambiguity Waffle named is real and is NOT addressed: the -F form of a salted hash is hash colon salt and nothing in the line distinguishes a salt from a recovered plaintext, so bc53abf8154e5967bef8da502fc93025 colon tilde brace colon colon password has salt tilde-brace-colon and only the operator knows it. Those lines still go to the recognizers whole. What IS decidable is a hash whose own grammar excludes the colon, and for those the first colon cannot be part of the hash whatever follows it. New Colonfree table of 60 prefixes plus stored_form_len, consulted once at the top of the slow path before any recognizer runs, cutting the line at the first colon. Placed there rather than in each recognizer because it fixes both failure shapes at once and because the recognizers that reject and the recognizers that mis-claim would otherwise need different edits. Membership is a property of the FORMAT and the test for it is exact: run the type through -z and look at whether the stored form it prints contains a colon. Two classes are deliberately out, and both are silent failures if admitted. A form that legitimately carries a trailing field: dollar BLAKE2 dollar hex takes colon salt for the six BLAKE2 PASSSALT and SALTPASS types, and e1059 BCRYPTMD5PASSSALT stores the 60-character MCF then colon then a site salt, which is why bcrypt is admitted only when e1059 is not in the selection. And a form whose grammar USES the colon: sha256 colon iterations colon salt colon digest, SCRYPT, 7-Zip, NETNTLM, MURMUR3, IPMI2, CISCOASA, SAP, and the plain hex colon salt channel itself. The gate is a single isxdigit on the first character, which throws out every plain hex line, the bulk case and the one that must not be touched, together with the hex-bodied wrappers and bare base64 and itoa64 tokens that are self-delimiting but indistinguishable from a digest at this point: MSSQL, Sybase, Oracle, NetScaler, CiscoISE, DESCRYPT, BSDICRYPT, CISCOPIX, PROGRESSENCODE, UMBRACO, PEOPLESOFT, JWT. Those belong in their own recognizers where lf says the type was actually asked for, and are left for a separate change. Also fixed, found while measuring: the shared bcrypt loader cut every MCF at 60 characters, but a dollar 2k dollar record is 59, the same split the e1059 arm already makes with mcflen, so e577 BCRYPT256 was left with a trailing colon welded to its key. Known limit, stated in the code: a stored form that embeds a USERNAME is cut at the first colon like any other, so a username containing a colon loses its tail; such a line is already ambiguous to every reader of a founds file including hashpipe. Measured by sweeping every type: generate with -z, strip the type designator, feed the line straight back through -F and require the type to recover it. 949 types produce a -z line; 660 round-tripped before, 741 after, 82 types fixed and no type broken. Separately verified that the three shapes which must KEEP their trailing field are byte-identical to the released binary: e842 BLAKE2B512PASSSALT, e1059, and a plain e31 MD5SALT hash colon salt line. regress/test-F-salted.sh reports 29 passed 0 failed 0 skipped on both binaries, and per-type regress.sh over 32 types spanning every channel is identical on both, including the pre-existing e439 MSCACHE 90 of 110 and e786 NTLMH 15 of 17. Noted while measuring and NOT addressed here: e459 YAF-SHA1 round-trips intermittently, 4 of 25 runs failing on the released binary and 6 of 25 here, on a line this change cannot reach since its first character is a hex digit.
+ *
+ * Revision 1.630  2026/10/15 12:40:09  dlr
+ * Add e1061 MD5CRYPTMD5: md5crypt(md5(pass), salt). Same stored form as e511 MD5CRYPT, so the $1$ loader admits either member through a new Md5cryptFamily[] list walked per selected type, which is the shape the phpBB3 pair already uses after filing under one member and copying later was found to invent the wrong count. The compute arm derives the 32-char hex of md5(pass) and falls through to the e511 body, as e537 does into e455. The hex is staged at linebuf+MAXLINE and not at linebuf, because that body uses linebuf as scratch from byte 0 and rewrites it on every salt and all 1000 rounds; this is the e538 defect fixed in 1.482, where only the first lex-sorted salt computed correctly, so a one-salt test passes and a real list silently loses hashes. Typeopt mirrors 538. Live vector 1$kKwJaW3X$DccD8UxNJ2wwKmsmNEUDU1 resolves to 20100718193554, whose md5 is what e511 reports as its plaintext. Verified against 35 references built by openssl passwd -1 over 7 salts x 5 passwords, all 35 recovered and every one re-verified independently; per-salt accounting 5 of 5 on each salt, which is what the aliasing bug would have broken. e511 output byte-identical to the released binary on the same fixture; both types selected together give 70 of 70; no type index shifted. Dedup gate run before implementation and reported NO MATCH over 1057 entries; hx.8 and the catalog regenerated afterwards so the gate now resolves it to e1061 and keeps e511 separate.
+ *
  * Revision 1.629  2026/10/14 19:14:25  dlr
  * Give the remaining twelve user-bearing types a default username, per Waffle: administrator. 1.628 added the SMF default and fixed the guard that had let a default_users entry MASK -u; it deliberately left the other twelve types alone pending a decision on what their defaults should be, and this is that decision applied. The twelve are e230 HMAC-SNE256, e263 MD5USERnulPASS, e308 SHA1MD5USER, e372 MD5USERPASS, e423 MD5-MD5puSHA1MD5pup, e432 MD5AM, e433 MD5AM2, e439 MSCACHE, e444 LEET, e540 MANGOS, e680 SHA1-HMAC-MD5 and e857 SKYPE, each of which emitted NOTHING at all with no username supplied and emitted correctly the moment one was. Stored lowercase, matching the two older administrator entries: the types that case-fold a username do it internally, so pre-folding it in the table would be wrong. The order of these two revisions matters and is the reason they are separate: without the 1.628 guard, adding twelve defaults would have masked -u for twelve more types rather than fixing them, turning a type that found nothing into a type that silently ignored the usernames it was given, which is worse. Verified on all thirteen types including SMF: each emits with no user supplied and each still honours -u, 13 of 13 with zero failures. No collateral: the five types that already emitted through a per-type hardcoded default are byte-count identical at 39996, 39996, 19998, 19998 and 19998, e1060 still emits its 4096, and all five pre-existing default_users entries tested, e855 POSTGRESQL, e856 JUNIPERSSG, e1005 SHA1UCUSERPASS, e474 SHA1USERSQL3 and e510 SHA512SHA512RAWUSER, now take one line by default and three under -u where before the default masked the supplied list.
  *
@@ -8087,6 +8111,7 @@ char *Types[] = {
     "MD5SQL5MD5MD5MD5",
     "BCRYPTMD5PASSSALT",
     "MD5USERDESCRYPT",
+    "MD5CRYPTMD5",
 
 NULL
 
@@ -9182,6 +9207,7 @@ NULL
 #define JOB_MD5SQL5MD5MD5MD5 1058
 #define JOB_BCRYPTMD5PASSSALT 1059
 #define JOB_MD5USERDESCRYPT 1060
+#define JOB_MD5CRYPTMD5 1061
 
 #define JOB_DONE 2000
 
@@ -10351,6 +10377,9 @@ static unsigned short TypeOpts[JOB_DONE] = {
      * user from -u / -U, defaulting to root.  Same flag set as e918 DCC2, the
      * other type reached through both channels. */
     [1060] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY | TYPEOPT_NEEDUSER,  /* MD5USERDESCRYPT */
+    /* e1061 MD5CRYPTMD5: md5crypt(md5(pass), salt).  Same flag set as
+     * [538] SHA512CRYPTMD5 -- identical construction, one crypt over. */
+    [1061] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5CRYPTMD5 */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -13170,7 +13199,8 @@ static uint64_t bf_op_iter_estimate(int op)
     case JOB_SHA256CRYPT:                        /* rounds=N$, default 5000 */
     case JOB_SHA512CRYPT:
     case JOB_SHA512CRYPTMD5: return 5000ULL;
-    case JOB_MD5CRYPT:       return 1000ULL;     /* fixed, RFC 1321         */
+    case JOB_MD5CRYPT:
+    case JOB_MD5CRYPTMD5:    return 1000ULL;     /* fixed, RFC 1321         */
     case JOB_BCRYPT:         return 1ULL << 14;  /* salt-derived 1<<cost;   */
                                                  /* 14 covers the common    */
                                                  /* 10-12 with headroom     */
@@ -18300,6 +18330,24 @@ release(FreeWaiting);
                 i = 3; /* magic length for $1$ */
                 goto crypt_all;
 
+              case JOB_MD5CRYPTMD5:
+                /* e1061: md5crypt(md5(pass), salt).  The KEY is the 32-char
+                 * lowercase hex of MD5(password), exactly as e537 PHPBB3MD5
+                 * and e538 SHA512CRYPTMD5 derive theirs.
+                 *
+                 * Stage the hex at linebuf+MAXLINE, NOT at linebuf: the e511
+                 * body below uses linebuf[] as scratch from byte 0 and
+                 * rewrites it on every salt and every one of the 1000 rounds,
+                 * so a KEY left at linebuf[0] is destroyed after the first
+                 * salt.  That is the e538 bug fixed in 1.482 -- it miscomputed
+                 * only from the second lex-sorted salt onward, so a one-salt
+                 * test passes and a real list silently loses hashes. */
+                mymd5(cur, len, curin.h);
+                cur = prmd5(curin.h, linebuf + MAXLINE, 32);
+                len = 32;
+                /* FALLTHROUGH to JOB_MD5CRYPT: job->op stays JOB_MD5CRYPTMD5,
+                 * so TYPESALT/TYPEDONE and the emitted label are this type's. */
+
               case JOB_MD5CRYPT:
                 if (TYPEDONE(job->op)) break;
                 if (len > MAXLINE)
@@ -19091,7 +19139,23 @@ nextbb:
 			     * explicit length of 22 and was fine, but crypt_rn
 			     * takes the salt as a C string and read past the end. */
 			    linebuf2[MAXLINE+7+21+1] = 0;
-			    td = mhash_hmac_init(MHASH_SHA256, &linebuf2[MAXLINE+7],22, mhash_get_hash_pblock(hmac_type));
+			    /* pblock from MHASH_SHA256, not from hmac_type.  The
+			     * algorithm argument beside it is hard-coded SHA256
+			     * and always was; the BLOCK SIZE was read from
+			     * hmac_type, a procjob local that the HMAC-* arms
+			     * assign and nothing resets, so this HMAC used the
+			     * block size of whichever HMAC type last ran on this
+			     * thread for this word.  Measured: -m e577, e214 and
+			     * e217 all agree, because MD5 and SHA256 and the
+			     * zero initial value all give 64, while -m e218
+			     * (HMAC-SHA512, 128) produces a different digest from
+			     * the same salt and password.  That is the whole of
+			     * the two-valued variation this type showed in a
+			     * catalog sweep and nowhere else.  The default is
+			     * correct -- hashpipe verifies the uncontaminated
+			     * output -- so no narrow-run result is invalidated;
+			     * this removes the contaminated case only. */
+			    td = mhash_hmac_init(MHASH_SHA256, &linebuf2[MAXLINE+7],22, mhash_get_hash_pblock(MHASH_SHA256));
 			    mhash(td,cur,len);
 			    mhash_hmac_deinit(td, hmac_buf);
 			    b64_encode(hmac_buf,lmac,32);
@@ -19171,7 +19235,11 @@ nextbb:
 			    }
 			}
 		    } else {
-			td = mhash_hmac_init(MHASH_SHA256, &linebuf[7],22, mhash_get_hash_pblock(hmac_type));
+			/* Same hmac_type leak as the site above.  This else arm is
+			 * unreachable since 1.560 made the loop skip any salt that
+			 * is not $2k$, but it is corrected rather than left as a
+			 * trap for whoever revives it. */
+			td = mhash_hmac_init(MHASH_SHA256, &linebuf[7],22, mhash_get_hash_pblock(MHASH_SHA256));
 			mhash(td,cur,len);
 			mhash_hmac_deinit(td, hmac_buf);
 			b64_encode(hmac_buf,lmac,32);
@@ -19375,19 +19443,31 @@ BC_Start:
 			job->outlen = 0;
 		      }
 		      { int dohex = 0;
-			for (y = 0; y < job->clen; y++) {
+			/* Hard-cut the emitted word at the 72 bytes bcrypt actually
+			 * consumed.  BF_set_key stops there, so bytes 73 and beyond
+			 * were never verified, and two candidates differing only past
+			 * byte 72 solve the same hash -- emitting the whole candidate
+			 * made the result file depend on wordlist order and claimed a
+			 * verification that had not happened.  DESCRYPT clamps its own
+			 * display to 8 bytes at the matching site for the same reason.
+			 * JOB_BCRYPT only: every other type that reaches BC_Start feeds
+			 * crypt_rn a derived hex digest, so its job->pass is the real
+			 * password at its real length and must not be touched. */
+			int plen = job->clen;
+			if (job->op == JOB_BCRYPT && plen > 72) plen = 72;
+			for (y = 0; y < plen; y++) {
 			  if ((signed char)(job->pass[y]+1) < '!' || job->pass[y] == ':') {
 			    dohex = 1; break;
 			  }
 			}
 			if (dohex) {
 			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:$HEX[", TYPENAME(job->op), linebuf2);
-			  prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
-			  job->outlen += job->clen*2;
+			  prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], plen*2);
+			  job->outlen += plen*2;
 			  job->outbuf[job->outlen++] = ']';
 			  job->outbuf[job->outlen++] = '\n';
 			} else
-			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), linebuf2, job->pass);
+			  job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%.*s\n", TYPENAME(job->op), linebuf2, plen, job->pass);
 		      }
                     }
                   }
@@ -19536,7 +19616,11 @@ BC_Start:
                 if (len > MAXLINE)
                   break;
 		csalt = linebuf2;
-		strncpy(csalt,"$3dfhgjhgG65- 23ewdfwGh5RG65?",29);
+		/* strcpy, not strncpy: the literal is exactly 29 bytes, so an
+		 * n of 29 copied every byte and wrote no terminator, and the
+		 * emitter measures this salt with mystrlen. The field then ran
+		 * on into whatever the previous type had left in linebuf2. */
+		strcpy(csalt,"$3dfhgjhgG65- 23ewdfwGh5RG65?");
                 saltlen = 13 + 15 + 1;
                 strcpy(linebuf, "$3dfhgjhgG65-");
                 d = linebuf + 13;
@@ -31869,6 +31953,14 @@ md5sha256:
                   break;
                 { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
                   Word_t *pvbuf_am[4];
+                  /* Per-lane salt copies. tsalt is the one JudySL index buffer
+                   * and JSLN overwrites it before the batch of four is reported,
+                   * so handing sbuf[] the pointer made all four lanes print
+                   * whichever key the walk had reached at flush time. Backed by
+                   * wline, as the MD5SALT batch sites do: 4*MAXLINE fits it and
+                   * a stack array that size would not, and no MD5AM path reads
+                   * wline for its own purpose. */
+                  char *sbufcopy = (char *)wline;
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   for (x = 0; x < 4; x++) {
@@ -31898,7 +31990,12 @@ md5sha256:
                   while (PV) {
                     if (Printall || *PV > 0) {
                       s = tsalt;
-                      sbuf[ljobi] = tsalt;
+                      { int kl = mystrlen(tsalt);
+                        if (kl > MAXLINE - 1) kl = MAXLINE - 1;
+                        memcpy(sbufcopy + ljobi * MAXLINE, tsalt, kl);
+                        sbufcopy[ljobi * MAXLINE + kl] = 0;
+                        sbuf[ljobi] = sbufcopy + ljobi * MAXLINE;
+                      }
                       pvbuf_am[ljobi] = PV;
                       d = ljob[ljobi].pass - 2;
                       i = 0;
@@ -40871,8 +40968,40 @@ HAV256_5_start:
                   unsigned char *tg_salt = (unsigned char *)tsalt;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
-                    /* Decode 32-char hex salt to 16 binary bytes */
-                    get32((char *)ts, tg_salt, 16);
+                    /* Decode the 32-char hex salt to 16 binary bytes, and DROP
+                     * any salt that is not exactly that.  get32 stops at the
+                     * first non-hex pair and leaves the rest of its destination
+                     * untouched, and the destination here is tsalt, the one
+                     * shared JudySL index buffer -- so its return value was not
+                     * merely unchecked, it was the difference between hashing
+                     * this salt and hashing whatever the last Judy walk had
+                     * left in that buffer.  A 2-character -s salt decoded ZERO
+                     * bytes, so the digest came entirely from residue: it
+                     * varied run to run on one unchanged binary (three runs,
+                     * four distinct digests) and did not depend on the salt at
+                     * all, two different salts yielding one identical hash.
+                     * The line it emitted could not round-trip either, because
+                     * the loader takes only a 32-character salt field, so -F
+                     * read it back as 0 hashes.  Dropping is what the
+                     * JOB_DESCRYPT arm does with a salt whose length cannot be
+                     * a DES salt, and for the same reason: NEEDSALT hands every
+                     * type the -s, -S and gen_salts salts unchecked, and this
+                     * is the filter.  No stored hash is affected, a $telegram$
+                     * salt being 32 hex by construction, and -z with minimum
+                     * flags still generates because this type's default_salts
+                     * entry is 32 characters and all digits.  The length test
+                     * alone is not enough: 32 non-hex characters would pass it
+                     * and still decode short.  si-- is safe in the for body,
+                     * where the increment restores it before any saltsnap[]
+                     * read; see the note in JOB_DESCRYPT for the si-- that was
+                     * NOT safe inside a while condition. */
+                    if (saltsnap[si].saltlen != 32 ||
+                        get32((char *)ts, tg_salt, 16) != 16) {
+                      *saltsnap[si].PV = 0;
+                      saltsnap[si] = saltsnap[--nsalts_job];
+                      si--;
+                      continue;
+                    }
                     /* Build: salt(16) + pass + salt(16) */
                     memcpy(linebuf, tg_salt, 16);
                     memcpy(linebuf + 16, cur, len);
@@ -40986,8 +41115,37 @@ HAV256_5_start:
                         sw_salt[ci] = swpad[ci - ulen];
                       sw_saltlen = 8;
                     } else {
-                      /* v2: decode 32-char hex to 16 binary bytes */
-                      get32((char *)ts, sw_salt, 16);
+                      /* v2: decode 32-char hex to 16 binary bytes, and DROP any
+                       * salt that is not exactly that.  get32 stops at the first
+                       * non-hex pair and leaves the rest of its destination
+                       * untouched, so discarding its count left sw_salt, an
+                       * UNINITIALISED STACK buffer, partly or wholly as residue
+                       * while sw_saltlen said 16 regardless.  That residue went
+                       * into the PBKDF2 AND was base64-encoded into the emitted
+                       * line, so this type printed 16 bytes of its own stack: of
+                       * five lines from one catalog sweep, four decoded to a live
+                       * 0x00007f.. pointer with a constant tail and the fifth to
+                       * the ASCII 3x NUL crypt dollar star 1 star 1046, a
+                       * fragment of another type's buffer.  A result file was
+                       * therefore an ASLR disclosure as well as a wrong digest.
+                       * Same fault and same fix as TELEGRAM-SHA256 e947 in 1.635,
+                       * and the same reason as the JOB_DESCRYPT saltlen filter:
+                       * NEEDSALT hands every type the -s, -S and gen_salts salts
+                       * unchecked and the compute arm is the filter.  The length
+                       * test alone is not enough, since 32 non-hex characters
+                       * pass it and still decode short.  v1 above is sound, it
+                       * fills all 8 bytes explicitly, so this is scoped to
+                       * JOB_SOLARWINDS2 by the branch it sits in.  No stored hash
+                       * is affected: the loader takes only a 32-hex salt, and -z
+                       * still generates from this type's 32-hex default_salts
+                       * entry. */
+                      if (saltsnap[si].saltlen != 32 ||
+                          get32((char *)ts, sw_salt, 16) != 16) {
+                        *saltsnap[si].PV = 0;
+                        saltsnap[si] = saltsnap[--nsalts_job];
+                        si--;
+                        continue;
+                      }
                       sw_saltlen = 16;
                     }
                     /* PBKDF2-HMAC-SHA1(pass, salt, 1000, 1024) */
@@ -42388,13 +42546,52 @@ HAV256_5_start:
                 { int si;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
-                    /* Decode 4-byte seed from hex */
-                    unsigned int seed = 0;
-                    { int j; unsigned int v;
-                      for (j = 0; j < 4; j++) {
-                        sscanf(ts + j * 2, "%02x", &v);
-                        seed |= (v << (j * 8));
+                    /* Decode the 8-char hex seed to 4 bytes, and DROP any salt
+                     * that is not exactly that.  The previous four sscanf calls
+                     * had two faults.  sscanf writes nothing and returns 0 when
+                     * the field does not match, and the return was unchecked, so
+                     * a non-hex salt left v -- an uninitialised automatic -- as
+                     * the seed; measured on a 2-character salt, one seed gave
+                     * five distinct digests across five catalog sweeps.  And the
+                     * loop indexed ts+4 and ts+6 unconditionally, reading past a
+                     * short salt's terminator into the neighbouring bytes of the
+                     * salt pool.  get32 is the file's own hex decoder, returns
+                     * the count of bytes it produced, and stops at the first
+                     * non-hex pair, so one call plus its count replaces all four
+                     * and the out-of-bounds read with them.  Byte order is
+                     * NOT preserved, and that is the point of 1.637: the four
+                     * sscanf calls assembled the seed LITTLE-endian, byte j of
+                     * the hex string shifted left j*8, and hashcat mode 27800
+                     * reads it BIG-endian.  The two agree only when the seed is
+                     * byte-symmetric, and every published vector is -- hashcat's
+                     * own example is 23e93f65 colon 00000000, hx.8 gives only the
+                     * zero-seed case and the other local test seed was ffffffff --
+                     * so nothing ever caught it.  Settled by hashcat 6.2.5 on
+                     * fpga, given BOTH candidate digests for three asymmetric
+                     * seeds and cracking only the big-endian one each time:
+                     * deadbeef/secret1 64a71363 not 29d3492c, 0f1e2d3c/hunter2
+                     * 9cf5dd66 not 198fce5d, 01020304/password 09714f1f not
+                     * 94dd7944.  hashpipe's verify_murmur3 was already big-endian
+                     * and already correct, so this also ends a silent
+                     * disagreement in which mdxfind's own output failed to verify
+                     * in hashpipe for every seed that was not a palindrome.  Same
+                     * uninitialised-decode fault and same snapshot-filter fix as
+                     * TELEGRAM-SHA256 e947 in 1.635; -z still generates from this
+                     * type's 8-hex default_salts entry, whose seed is zero and so
+                     * is unchanged by the byte order. */
+                    unsigned int seed;
+                    { unsigned char sb[4];
+                      if (saltsnap[si].saltlen != 8 ||
+                          get32((char *)ts, sb, 4) != 4) {
+                        *saltsnap[si].PV = 0;
+                        saltsnap[si] = saltsnap[--nsalts_job];
+                        si--;
+                        continue;
                       }
+                      seed = ((unsigned int)sb[0] << 24) |
+                             ((unsigned int)sb[1] << 16) |
+                             ((unsigned int)sb[2] << 8) |
+                             (unsigned int)sb[3];
                     }
                     /* MurmurHash3_x86_32 */
                     { const unsigned char *data = (const unsigned char *)cur;
@@ -47915,7 +48112,8 @@ static void format_eta(double seconds, char *buf, size_t bufsz) {
 static unsigned long long bf_progress_iter_per_salt(int op, int *exact) {
   switch (op) {
     case JOB_DESCRYPT:       return 25ULL;
-    case JOB_MD5CRYPT:       return 1000ULL;
+    case JOB_MD5CRYPT:
+    case JOB_MD5CRYPTMD5:    return 1000ULL;
     case JOB_SHA1DRU:        return 1000000ULL;
     case JOB_BCRYPT:
     case JOB_PHPBB3:
@@ -48572,6 +48770,131 @@ static int store_typesalt(int job, const char *src, int slen) {
 static const int Phpbb3Family[] = { JOB_PHPBB3, JOB_PHPBB3MD5 };
 #define PHPBB3FAMILY_N ((int)(sizeof(Phpbb3Family) / sizeof(Phpbb3Family[0])))
 
+/* $1$ md5crypt family.  e511 MD5CRYPT and e1061 MD5CRYPTMD5 consume the
+ * identical stored format, and the e1061 compute arm falls through to the
+ * e511 arm, exactly as e537 does into e455.  Filing the salt under one
+ * member and copying it later is what invented the wrong count for the
+ * phpBB3 pair, so this list is walked at load time and each SELECTED
+ * member is counted on its own. */
+static const int Md5cryptFamily[] = { JOB_MD5CRYPT, JOB_MD5CRYPTMD5 };
+#define MD5CRYPTFAMILY_N ((int)(sizeof(Md5cryptFamily) / sizeof(Md5cryptFamily[0])))
+
+/* Stored forms whose own grammar cannot contain a ':'.
+ *
+ * A -F file is very often mdxfind's OWN output fed back in -- the
+ * "<stored form>:<plaintext>" of a founds file -- and for most types that
+ * cannot be read back, because the -F form of a salted hash is
+ * "<hash>:<salt>" and NOTHING in the line distinguishes a salt from a
+ * recovered plaintext.  In "bc53abf8154e5967bef8da502fc93025:~}::password"
+ * the salt is "~}:" and only the operator knows it.  That ambiguity is why
+ * the -F parser takes the whole line, and it is not solvable here; those
+ * lines are still handed to the recognizers untouched.
+ *
+ * It IS solvable for a hash that is self-delimiting -- phpBB3, the crypt(3)
+ * families, the "{...}" and "$name$..." wrappers -- because their alphabets
+ * and separators exclude the colon outright.  For those the first colon
+ * cannot be part of the hash whatever follows it, so the line is cut there
+ * and the recognizers see the shape they measure.  Requested by Waffle
+ * 2026-10-17 after "$H$9Pno.ZQTcecz9lrMxdq6X9cLAWz4SX1:password" was refused
+ * by -F while hashpipe read the identical line without difficulty.
+ *
+ * Membership is a property of the FORMAT, and the test for it is exact: run
+ * the type through -z and look at what it emits.  If the stored form it
+ * prints contains no colon, the prefix belongs here.  Two kinds must stay
+ * OUT, and both are silent failures if admitted:
+ *
+ *   - a form that legitimately carries a trailing field.  "$BLAKE2$<hex>"
+ *     takes ":<salt>" for the six BLAKE2 PASSSALT/SALTPASS types, and
+ *     e1059 BCRYPTMD5PASSSALT stores "<60-char MCF>:<site salt>".  Cutting
+ *     would throw the salt away before its recognizer ever saw it, which is
+ *     why bcrypt is admitted only when e1059 is not in the selection.
+ *   - a form whose grammar USES the colon: "sha256:1000:<salt>:<digest>",
+ *     "SCRYPT:...", "$7z$...:KEY=...", NETNTLM, MURMUR3, IPMI2, CISCOASA,
+ *     the QNX "@m,N@hash@salt" shapes' siblings, SAP, and the plain
+ *     "<hex>:<salt>" channel itself.
+ *
+ * Known limit: a stored form that embeds a USERNAME ($krb5pa$, $as400$,
+ * $mongodb$, $racf$ ...) is cut at the first colon like any other, so a
+ * username containing a colon loses its tail.  Such a line is already
+ * ambiguous to every reader of a founds file, including hashpipe.
+ *
+ * Adding a format is one line in this table.
+ */
+static const char * const Colonfree[] = {
+  "$1$",              /* md5crypt, MD5CRYPTMD5                            */
+  "$3$", "$4$",       /* DragonFly BSD 3 and 4, 32- and 64-bit            */
+  "$B$",              /* MediaWiki                                        */
+  "$H$", "$P$",       /* phpass: phpBB3, PHPBB3MD5, WordPress             */
+  "$S$",              /* Drupal 7                                         */
+  "$h$",              /* H3C                                              */
+  "$y$", "$gy$",      /* yescrypt, gost-yescrypt                          */
+  "$md5$",            /* SUNMD5                                           */
+  "$sha1$",           /* SHA1CRYPT                                        */
+  "$apr1$",           /* Apache apr1                                      */
+  "$wp$",             /* WPBCRYPT                                         */
+  "$ASN$",            /* Apple Secure Notes                               */
+  "$DCC2$",           /* MS Domain Cached Credentials 2                   */
+  "$vbk$", "$vmx$",   /* Veeam backup, VMware VMX                         */
+  "$as400$",          /* AS/400 DES and SSHA1                             */
+  "$cmiyc$",          /* CMIYC                                            */
+  "$fvde$",           /* FileVault / APFS                                 */
+  "$iwork$",          /* Apple iWork                                      */
+  "$keychain$",       /* Apple keychain                                   */
+  "$krb5pa$", "$krb5tgs$", "$krb5db$",
+  "$mysql$", "$mysqlna$", "$postgres$",
+  "$mongodb$", "$mongodb-scram$",
+  "$racf$", "$racf-kdfaes$",
+  "$sspr$", "$sntp-ms$",
+  "$ansible$", "$argon2",
+  "$axcrypt$", "$axcrypt_sha1$",
+  "$bitwarden$", "$ecryptfs$", "$episerver$",
+  "$gost94hash$", "$gost12256hash$", "$gost12512hash$",
+  "$solarwinds$", "$tacacs-plus$", "$telegram$",
+  "$AWS-Sig-v4$", "$MSONLINEACCOUNT$",
+  "{CRAM-MD5}", "{PBKDF2_SHA256}", "{PKCS5S2}",
+  "{SSHA}", "{SSHA256}", "{SSHA512}",
+  "{smd5}", "{ssha1}", "{ssha256}", "{ssha512}",
+  "(",                /* Lotus Domino 6 and 8, "(Gxxx)" / "(Hxxx)"        */
+  "@m,", "@s,", "@S,",/* QNX md5, sha256, sha512                          */
+  "SQLCIPHER*",       /* SQLCipher                                        */
+  "pbkdf2(",          /* web2py                                           */
+  "v1;PPH1_",         /* Azure AD Connect sync                            */
+  NULL
+};
+
+/* Where does the stored form at the start of this line end?  0 means "not a
+ * form whose end can be found", which is the normal answer and leaves the
+ * line alone.  See Colonfree[] above for what qualifies and why. */
+static int stored_form_len(const char *s, int len, const char *lf)
+{
+  const char * const *pp;
+  const char *c;
+
+  /* One test throws out every plain-hex line, which is the bulk case and the
+   * one that must not be touched: "<hex>:<salt>" is the ordinary salted -F
+   * form.  It also throws out the hex-bodied wrappers -- MSSQL and Sybase
+   * "0x...", Oracle, NetScaler, CiscoISE -- which are self-delimiting but
+   * indistinguishable from a digest here, so they belong in their own
+   * recognizers where lf[] already says the type was asked for.  The same
+   * goes for the bare base64 and itoa64 tokens: DESCRYPT, BSDICRYPT,
+   * CISCOPIX, PROGRESSENCODE, UMBRACO, PEOPLESOFT, JWT and the rest. */
+  if (isxdigit((unsigned char)s[0])) return 0;
+
+  if (s[0] == '$' && s[1] == '2') {
+    /* bcrypt and the types that share its MCF.  e1059 BCRYPTMD5PASSSALT
+     * reads a site salt out of the field AFTER the MCF, so when it is in
+     * the selection this line's tail is data, not a plaintext. */
+    if (lf[JOB_BCRYPTMD5PASSSALT]) return 0;
+  } else {
+    for (pp = Colonfree; *pp; pp++)
+      if (strncmp(s, *pp, strlen(*pp)) == 0) break;
+    if (*pp == NULL) return 0;
+  }
+
+  c = memchr(s, ':', (size_t)len);
+  return c ? (int)(c - s) : 0;
+}
+
 static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
                            int hex_only) {
   char line[MAXLINE + 16], *cur, *s;
@@ -48725,6 +49048,23 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         _hx++;
       if (_hx < len) { line[_hx] = 0; len = _hx; }
       if (len == 0) continue;
+    }
+    /* mdxfind's own output read back: "<stored form>:<plaintext>".  Where the
+     * format's grammar excludes the colon, cut at the first one so the
+     * recognizers below see the shape they measure.  -f is exempt: it has
+     * already truncated at the first non-hex character above.
+     *
+     * Done HERE rather than inside each recognizer because the two ways this
+     * fails are different and both are silent.  phpBB3, md5crypt and WBB4
+     * MEASURE the hash and reject the longer line, so nothing loads at all,
+     * while APR1, Drupal7 and the "$name$..." wrappers accept it and file a
+     * key with ":password" welded on -- a hash that can never match, loaded
+     * with a clean count and no complaint.  One cut above all of them covers
+     * both shapes, and a line whose format is not in the table is passed on
+     * untouched.  See Colonfree[] and stored_form_len().  */
+    if (!hex_only) {
+      int sf = stored_form_len(line, len, lf);
+      if (sf > 0) { line[sf] = 0; len = sf; }
     }
     /* AIX {smd5}salt$hash (6-char prefix + salt + $ + 22 encoded) */
     if (lf[JOB_AIXMD5] && len > 6 && strncmp(line, "{smd5}", 6) == 0) {
@@ -50671,7 +51011,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
        * twice and announced a type the invocation had not selected. */
       if (lf[JOB_BCRYPT] || lf[JOB_BCRYPT256] || lf[JOB_BCRYPTMD5] ||
           lf[JOB_BCRYPTSHA1] || lf[JOB_BCRYPTSHA512]) {
-        if (len > 60) line[60] = 0;
+        /* $2k$ is 59 characters, every other variant 60 -- the same split
+         * the e1059 arm above already makes with mcflen.  A flat 60 left a
+         * trailing ':' welded to the key of any $2k$ record that carried a
+         * tail, so e577 BCRYPT256 loaded a hash that could never match. */
+        { int bclen = (line[2] == 'k') ? 59 : 60;
+          if (len > bclen) line[bclen] = 0; }
         JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
         /* extract salt prefix into Typesalt[job->op] */
         /* $2k$ has 21-char salt (28 prefix), others have 22 (29 prefix) */
@@ -51225,8 +51570,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         }
       }
     }
-    /* $1$ md5crypt — decode base64 hash into compact table, salt into Typesalt */
-    if (lf[JOB_MD5CRYPT] && line[0] == '$' && line[1] == '1' && line[2] == '$') {
+    /* $1$ md5crypt — decode base64 hash into compact table, salt into Typesalt.
+       Admits either JOB_MD5CRYPT (e511) or JOB_MD5CRYPTMD5 (e1061); gating on
+       e511 alone silently dropped an e1061-only load, the same defect the
+       phpBB3 pair had above. */
+    if ((lf[JOB_MD5CRYPT] || lf[JOB_MD5CRYPTMD5]) &&
+        line[0] == '$' && line[1] == '1' && line[2] == '$') {
       /* Find salt: between $1$ and next $ */
       char *salt_start = line + 3;
       char *hash_start = NULL;
@@ -51240,11 +51589,18 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
           /* Store binary hash in compact table */
           memcpy(inhashbuf + 2, hashbin, 16);
           commit_compact(16);
-          /* Store salt prefix "$1$salt$" in Typesalt */
+          /* Store salt prefix "$1$salt$" in the Typesalt of each SELECTED
+           * family member, counting per member (see Md5cryptFamily). */
           int prefixlen = (int)(hash_start - line);
-          Saltloaded[JOB_MD5CRYPT] += store_typesalt(JOB_MD5CRYPT, line, prefixlen);
-          Foundcnt[JOB_MD5CRYPT]++;
-          continue;
+          int fi, filed = 0;
+          for (fi = 0; fi < MD5CRYPTFAMILY_N; fi++) {
+            int fop = Md5cryptFamily[fi];
+            if (!lf[fop]) continue;
+            Saltloaded[fop] += store_typesalt(fop, line, prefixlen);
+            Foundcnt[fop]++;
+            filed = 1;
+          }
+          if (filed) continue;
         }
       }
     }
@@ -59487,6 +59843,30 @@ usage:
           Numsalts++;
         } else {
           J1U(RC, Dohash, JOB_MD5CRYPT);
+        }
+      }
+    }
+    /* MD5CRYPTMD5: same stored format as MD5CRYPT, so the loader above has
+     * already filled Typesalt[JOB_MD5CRYPTMD5] for every selected line.  This
+     * mirrors the MD5CRYPT block for the -z / no-hash case. */
+    { long md5cryptmd5cnt = 0;
+      line[0] = 0;
+      JSLF(PV, TYPESALT(JOB_MD5CRYPTMD5), (unsigned char *)line);
+      while (PV) { md5cryptmd5cnt++; JSLN(PV, TYPESALT(JOB_MD5CRYPTMD5), (unsigned char *)line); }
+      Numsalts += md5cryptmd5cnt;
+      if (md5cryptmd5cnt) {
+        if (Bcryptcnt == 0)
+          Bcryptcnt = md5cryptmd5cnt;
+        fprintf(stderr, "%ld unique salts for MD5CRYPTMD5\n", md5cryptmd5cnt);
+      } else {
+        J1T(RC, Dohash, JOB_MD5CRYPTMD5);
+        if (RC && Printall) {
+          Word_t *SPV;
+          JSLI(SPV, TYPESALT(JOB_MD5CRYPTMD5), (unsigned char *)"$1$rndSa1t$");
+          if (SPV) *SPV = 1000000;
+          Numsalts++;
+        } else {
+          J1U(RC, Dohash, JOB_MD5CRYPTMD5);
         }
       }
     }

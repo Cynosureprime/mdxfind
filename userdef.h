@@ -1,8 +1,11 @@
 /*
  * userdef.h - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.8 $
+ * $Revision: 1.9 $
  * $Log: userdef.h,v $
+ * Revision 1.9  2026/10/20 12:12:01  dlr
+ * Declare userdef_load_file, the explicit-path entry point behind mdindex -C.
+ *
  * Revision 1.8  2026/08/31 02:07:28  dlr
  * Add an optional stored-form declaration to userdef.txt, and the split and build routines that consume it. A user-defined type's hx expression says how the digest is COMPUTED and nothing about how it is STORED, and the two differ often enough to matter: KoreLogic's bwtdt stores an 8-hex salt immediately followed by its 32-hex digest in one 40-character field, so the salt never reached the salt slot and the type could not verify its own hashes however it was selected. The new form key reuses hx's concatenation notation so the two read alike, for example salt(8) . digest(32), and supports quoted literals for leading characters, trailing characters and separators, plus optional widths so a field may be variable. At most one variable-width field is allowed per form, because with two the boundary is not determined by the text; the loader refuses rather than guessing. A malformed form is a hard skip rather than a silent ignore, since the type would otherwise load and then fail to read its own hashes, which is the quiet failure this declaration exists to remove. The parsed form is printed in the load report, because a form that parsed but was never mentioned is indistinguishable from one that was dropped. userdef_form_build is the inverse of the split and exists because a form governs OUTPUT as well as input: a found line must come back in the shape it was read, or the emitting tool's output is not accepted by the consuming one. Expect the grammar to grow.
  *
@@ -159,6 +162,15 @@ struct userdef_type {
  * its own (a missing file is fine — user types are optional).
  */
 int userdef_load(const char *cache_env);
+
+/*
+ * Load an explicitly named stanza file, bypassing MDXFIND_CACHE entirely.
+ * mdindex(1) -C uses this: the file decides what an index MEANS, so it is
+ * named outright and never searched for.  named != 0 returns -1 when the
+ * file cannot be opened, rather than treating absence as "no user types".
+ * Returns the number of types loaded, or -1 (named, unopenable).
+ */
+int userdef_load_file(const char *path, int named);
 
 /* Exact string-keyed lookup by the user-supplied id. Returns op, or -1. */
 int userdef_lookup_by_id(const char *idstr);

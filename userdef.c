@@ -1,8 +1,11 @@
 /*
  * userdef.c - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.11 $
+ * $Revision: 1.12 $
  * $Log: userdef.c,v $
+ * Revision 1.12  2026/10/20 12:12:01  dlr
+ * Split an explicit-path entry point out of userdef_load. userdef_load_file takes the path outright and userdef_load keeps its MDXFIND_CACHE derivation by calling it, so mdxfind and hashpipe are unchanged. mdindex -C needs this: a search path for a file that decides what an index means is the wrong shape, and a second parser in mdindex would be a second behaviour over the same file format. The named argument distinguishes a file the operator asked for, where failing to open it returns -1 and the caller can refuse, from the derived path, where absence still means no user types and is not an error. Verified: mdxfind -z -m u47 and hashpipe both still load and compute from MDXFIND_CACHE userdef.txt after the split.
+ *
  * Revision 1.11  2026/08/31 02:54:53  dlr
  * An unknown key in userdef.txt is now a WARNING, not an error. It was counted in userdef_errors, which gates the refusal to run, so the moment a newer key appeared in a shared userdef.txt an older binary printed unknown key ignored (forward-compat) and then refused to run and exited 1, processing NOTHING at all rather than skipping the affected type. The two halves of that message contradict each other. The practical effect is that every future key addition becomes a fleet-wide outage that arrives with CONFIG propagation rather than with the deploy, which is exactly backwards: the config is the easy thing to distribute. Found by the contest session when the new form key reached a host still running 1.116, and confirmed here against mdxfind 1.549 and hashpipe 1.116, both of which refuse every input whenever MDXFIND_CACHE points at a file carrying the key. Unknown keys are now tallied separately and reported at the end of the load so they stay visible without being fatal. This does not repair binaries built before it; those must still be updated ahead of any config that uses a new key.
  *
@@ -908,21 +911,27 @@ static void finalize_stanza(const char *name, const char *idstr,
 #endif
 }
 
-int userdef_load(const char *cache_env)
+/*
+ * Load an explicitly named stanza file.  mdindex(1) reaches the loader
+ * this way: its -C names the file outright rather than deriving one, so
+ * no search path decides what a database means.
+ *
+ * named != 0 reports a missing file as -1 instead of "no user types".
+ * A file the operator named and that is not there is a typo, and
+ * silently indexing nothing under a type the caller asked for is the
+ * failure this distinction exists to prevent.
+ */
+int userdef_load_file(const char *path, int named)
 {
-	char path[1200];
 	FILE *fp;
 	char line[2200];
 	char name[128] = {0}, idstr[128] = {0}, hx[2048] = {0};
 	char form[512] = {0};
 	int lineno = 0, stanza_line = 0;
 
-	if (derive_userdef_path(cache_env, path, sizeof(path)) != 0)
-		return 0;   /* MDXFIND_CACHE unset; user types optional */
-
 	fp = fopen(path, "r");
 	if (!fp)
-		return 0;   /* no file is fine; user types are optional */
+		return named ? -1 : 0;  /* unnamed: no file is fine */
 
 	while (fgets(line, sizeof(line), fp)) {
 		char *s, *eq;
@@ -1051,4 +1060,13 @@ int userdef_load(const char *cache_env)
 		        "from %s\n", Userdef_count, path);
 
 	return Userdef_count;
+}
+
+int userdef_load(const char *cache_env)
+{
+	char path[1200];
+
+	if (derive_userdef_path(cache_env, path, sizeof(path)) != 0)
+		return 0;   /* MDXFIND_CACHE unset; user types optional */
+	return userdef_load_file(path, 0);
 }

@@ -2426,7 +2426,25 @@ static void gpujob_metal_worker(void *arg) {
                      * counter so subsequent dispatches skip it. */
                     if (is_salted_op) {
                         int hit = 0;
-                        if (g->op == JOB_MD5SALT && iter_num == 1) {
+                        if ((g->op == JOB_MD5SALT ||
+                             g->op == JOB_MD5UCSALT ||
+                             g->op == JOB_MD5revMD5SALT ||
+                             g->op == JOB_MD5sub8_24SALT) && iter_num == 1) {
+                            /* 2026-10-14: mirrors gpujob_opencl.c 1.172.
+                             * e350 / e541 / e542 were missing from this test
+                             * although they share both the kernel (algo_mode
+                             * 1/2/3) and the CPU round-1 convention -- their
+                             * CPU arm is the same shared MD5SALTstart block,
+                             * reporting x==1 through checkhashkeylen. Falling
+                             * through to the generic arm reported them via
+                             * checkhashsalt with iter_num==1, so Metal emitted
+                             * "MD5UCSALTx01" where the CPU emitted
+                             * "MD5UCSALT". Bare is the correct form, and the
+                             * designator is what mdsplit routes on. Measured
+                             * on dev3 (M2 Max) before the fix: hash and
+                             * plaintext already identical, label alone split.
+                             * Left alone deliberately: e347 JOB_MD5MD5SALT,
+                             * whose CPU arm really does emit the xNN form. */
                             hit = checkhashkeylen(&curin, hexlen,
                                                salt_bytes, salt_len_b,
                                                &synthetic_job);
@@ -2720,13 +2738,16 @@ static void gpujob_metal_worker(void *arg) {
                                      (unsigned char *)fullhash);
                                 if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
-                                    /* Q1 (2026-05-08): NO display clamp
-                                     * (DIFFERENT from DESCRYPT's
-                                     * 8-byte cap). Render full post-
-                                     * rule plaintext as-is; clen is
-                                     * already out_len. */
-                                    synthetic_job.line[out_len] = 0;
-                                    synthetic_job.clen = out_len;
+                                    /* Clamp the display password to the
+                                     * 72 bytes BF_set_key read, for CPU
+                                     * parity (mdxfind.c BC_Start emit)
+                                     * and matching the OpenCL twin at
+                                     * gpu/gpujob_opencl.c. Reverses the
+                                     * 2026-05-08 Q1 no-clamp decision;
+                                     * 2026-10-21. */
+                                    int cplen = (out_len > 72) ? 72 : out_len;
+                                    synthetic_job.line[cplen] = 0;
+                                    synthetic_job.clen = cplen;
                                     prfound(&synthetic_job, fullhash);
                                 }
                             }

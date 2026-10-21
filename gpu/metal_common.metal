@@ -661,6 +661,72 @@ static inline void md5_block_from8(thread uint *h0, thread uint *h1,
 }
 
 
+/* md5_block_from8_s -- flat-scalar twin of md5_block_from8 above.
+ *
+ * Identical arithmetic; the only difference is that the 16 message words
+ * arrive as 16 SCALARS instead of through a `thread const uint *M`.
+ *
+ * Why it exists (OpenCL first, gpu_common.cl 1.39, mirrored here for
+ * parity per the "a change to one is incomplete until the other matches"
+ * rule): a private array whose ADDRESS escapes into a callee cannot live
+ * in registers, so the NVIDIA JIT demoted the caller's M[16] to local
+ * memory -- `priv=4352` with zero spills, i.e. arrays, not spill. Passing
+ * the words by value removes the address-taken, and e31 went 38.02s ->
+ * 31.02s on a GTX 1080 (parity with v1.271).
+ *
+ * On Metal the pressure is NOT known to be the same: the OpenCL twin is
+ * `noinline` (a Pascal register-pressure guard) while this one, like its
+ * array sibling, is `static inline` per Pattern 3, so the Metal compiler
+ * may already promote the caller's array. It is carried anyway so the two
+ * backends stay structurally identical; see the measurement note at the
+ * call site in metal_md5salt_core.metal.
+ *
+ * Derived mechanically from md5_block_from8 (M[n] -> mn); do not hand-edit
+ * one without the other. */
+static inline void md5_block_from8_s(thread uint *h0, thread uint *h1,
+                                     thread uint *h2, thread uint *h3,
+                                     uint a8, uint b8, uint c8, uint d8,
+                                     uint m0,  uint m1,  uint m2,  uint m3,
+                                     uint m4,  uint m5,  uint m6,  uint m7,
+                                     uint m8,  uint m9,  uint m10, uint m11,
+                                     uint m12, uint m13, uint m14, uint m15) {
+    uint a = a8, b = b8, c = c8, d = d8;
+    /* Rounds 9-16 (FF, uses M[8..15]) */
+    MTL_MD5_FF(a,b,c,d,m8,(uint)7,0x698098d8u);   MTL_MD5_FF(d,a,b,c,m9,(uint)12,0x8b44f7afu);
+    MTL_MD5_FF(c,d,a,b,m10,(uint)17,0xffff5bb1u); MTL_MD5_FF(b,c,d,a,m11,(uint)22,0x895cd7beu);
+    MTL_MD5_FF(a,b,c,d,m12,(uint)7,0x6b901122u);  MTL_MD5_FF(d,a,b,c,m13,(uint)12,0xfd987193u);
+    MTL_MD5_FF(c,d,a,b,m14,(uint)17,0xa679438eu); MTL_MD5_FF(b,c,d,a,m15,(uint)22,0x49b40821u);
+    /* Rounds 17-32 (GG) */
+    MTL_MD5_GG(a,b,c,d,m1,(uint)5,0xf61e2562u);   MTL_MD5_GG(d,a,b,c,m6,(uint)9,0xc040b340u);
+    MTL_MD5_GG(c,d,a,b,m11,(uint)14,0x265e5a51u); MTL_MD5_GG(b,c,d,a,m0,(uint)20,0xe9b6c7aau);
+    MTL_MD5_GG(a,b,c,d,m5,(uint)5,0xd62f105du);   MTL_MD5_GG(d,a,b,c,m10,(uint)9,0x02441453u);
+    MTL_MD5_GG(c,d,a,b,m15,(uint)14,0xd8a1e681u); MTL_MD5_GG(b,c,d,a,m4,(uint)20,0xe7d3fbc8u);
+    MTL_MD5_GG(a,b,c,d,m9,(uint)5,0x21e1cde6u);   MTL_MD5_GG(d,a,b,c,m14,(uint)9,0xc33707d6u);
+    MTL_MD5_GG(c,d,a,b,m3,(uint)14,0xf4d50d87u);  MTL_MD5_GG(b,c,d,a,m8,(uint)20,0x455a14edu);
+    MTL_MD5_GG(a,b,c,d,m13,(uint)5,0xa9e3e905u);  MTL_MD5_GG(d,a,b,c,m2,(uint)9,0xfcefa3f8u);
+    MTL_MD5_GG(c,d,a,b,m7,(uint)14,0x676f02d9u);  MTL_MD5_GG(b,c,d,a,m12,(uint)20,0x8d2a4c8au);
+    /* Rounds 33-48 (HH) */
+    MTL_MD5_HH(a,b,c,d,m5,(uint)4,0xfffa3942u);   MTL_MD5_HH(d,a,b,c,m8,(uint)11,0x8771f681u);
+    MTL_MD5_HH(c,d,a,b,m11,(uint)16,0x6d9d6122u); MTL_MD5_HH(b,c,d,a,m14,(uint)23,0xfde5380cu);
+    MTL_MD5_HH(a,b,c,d,m1,(uint)4,0xa4beea44u);   MTL_MD5_HH(d,a,b,c,m4,(uint)11,0x4bdecfa9u);
+    MTL_MD5_HH(c,d,a,b,m7,(uint)16,0xf6bb4b60u);  MTL_MD5_HH(b,c,d,a,m10,(uint)23,0xbebfbc70u);
+    MTL_MD5_HH(a,b,c,d,m13,(uint)4,0x289b7ec6u);  MTL_MD5_HH(d,a,b,c,m0,(uint)11,0xeaa127fau);
+    MTL_MD5_HH(c,d,a,b,m3,(uint)16,0xd4ef3085u);  MTL_MD5_HH(b,c,d,a,m6,(uint)23,0x04881d05u);
+    MTL_MD5_HH(a,b,c,d,m9,(uint)4,0xd9d4d039u);   MTL_MD5_HH(d,a,b,c,m12,(uint)11,0xe6db99e5u);
+    MTL_MD5_HH(c,d,a,b,m15,(uint)16,0x1fa27cf8u); MTL_MD5_HH(b,c,d,a,m2,(uint)23,0xc4ac5665u);
+    /* Rounds 49-64 (II) */
+    MTL_MD5_II(a,b,c,d,m0,(uint)6,0xf4292244u);   MTL_MD5_II(d,a,b,c,m7,(uint)10,0x432aff97u);
+    MTL_MD5_II(c,d,a,b,m14,(uint)15,0xab9423a7u); MTL_MD5_II(b,c,d,a,m5,(uint)21,0xfc93a039u);
+    MTL_MD5_II(a,b,c,d,m12,(uint)6,0x655b59c3u);  MTL_MD5_II(d,a,b,c,m3,(uint)10,0x8f0ccc92u);
+    MTL_MD5_II(c,d,a,b,m10,(uint)15,0xffeff47du); MTL_MD5_II(b,c,d,a,m1,(uint)21,0x85845dd1u);
+    MTL_MD5_II(a,b,c,d,m8,(uint)6,0x6fa87e4fu);   MTL_MD5_II(d,a,b,c,m15,(uint)10,0xfe2ce6e0u);
+    MTL_MD5_II(c,d,a,b,m6,(uint)15,0xa3014314u);  MTL_MD5_II(b,c,d,a,m13,(uint)21,0x4e0811a1u);
+    MTL_MD5_II(a,b,c,d,m4,(uint)6,0xf7537e82u);   MTL_MD5_II(d,a,b,c,m11,(uint)10,0xbd3af235u);
+    MTL_MD5_II(c,d,a,b,m2,(uint)15,0x2ad7d2bbu);  MTL_MD5_II(b,c,d,a,m9,(uint)21,0xeb86d391u);
+    *h0 += a; *h1 += b; *h2 += c; *h3 += d;
+}
+
+
 /* --- bswap32: 32-bit byte swap (mirrors gpu_common.cl line 755).
  *
  * Used by SHA-family digest_compare to convert big-endian state words to

@@ -108,9 +108,10 @@
  * Hit replay: host calls bf_encode_23 (NEW helper in gpujob_opencl.c,
  * authored by B2) to reconstruct the 60-char $2b$ crypt hash, probes
  * JudyJ[JOB_BCRYPT] for the line, applies CAS dedup, and emits via
- * prfound. Display password is FULL post-rule plaintext (CPU does NOT
- * clamp display for BCRYPT -- the truncation is INSIDE BF_set_key,
- * not at display). Q1 user decision 2026-05-08.
+ * prfound. Display password is CLAMPED TO 72 BYTES, matching the CPU
+ * arm. The truncation being inside BF_set_key is the reason to clamp:
+ * bytes 73+ never reached the digest. Reverses the 2026-05-08 Q1
+ * no-clamp decision; 2026-10-21.
  *
  * R1 mitigation (AMD ROCm comgr addrspace fragility): all S-box reads
  * use the BF_ROUND/BF_ENCRYPT macros parameterized over __local

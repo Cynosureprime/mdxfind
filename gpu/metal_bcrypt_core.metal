@@ -74,9 +74,9 @@
  * discipline since the OpenCL helper is `static` and TU-local) to
  * reconstruct the 60-char $2b$ crypt hash, probes JudyJ[JOB_BCRYPT] for
  * the line, applies CAS dedup, and emits via prfound. Display password
- * is FULL post-rule plaintext (CPU does NOT clamp display for BCRYPT --
- * the truncation is INSIDE BF_set_key, not at display). Q1 user
- * decision 2026-05-08.
+ * is CLAMPED TO 72 BYTES, matching the CPU arm. The truncation being
+ * inside BF_set_key is the reason to clamp: bytes 73+ never reached the
+ * digest. Reverses the 2026-05-08 Q1 no-clamp decision; 2026-10-21.
  *
  * algo_mode: BCRYPT family uses algo_mode=8 (reserved range 8-15 for
  * future BCRYPT-family variants). All FOUR ops (BCRYPT/BCRYPTMD5/

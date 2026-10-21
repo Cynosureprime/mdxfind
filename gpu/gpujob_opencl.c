@@ -3277,19 +3277,26 @@ void gpujob(void *arg) {
                              * salt_len_b per feedback_rules_engine_hit_-
                              * replay_vars.md (rules-engine context, NOT
                              * slab `sidx` like the deleted slab arm).
-                             * Display password is FULL post-rule
-                             * plaintext per Q1 user decision 2026-05-08
-                             * (DIFFERENT from DESCRYPT's 8-byte clamp;
-                             * BCRYPT does NOT clamp display -- the 72-
-                             * byte truncation is INSIDE BF_set_key, not
-                             * at display). The post-rule plaintext lives
-                             * in synthetic_job.line at length out_len
-                             * (already populated above by either the
-                             * synthetic-`:` arm or the applyrule replay
-                             * arm + optional mask prepend/append); we
-                             * re-emit it AS-IS with synthetic_job.clen
-                             * = out_len. Phase 6 of the slab-retirement
-                             * ladder (final major slab kernel). */
+                             * Display password is CLAMPED TO 72
+                             * BYTES, matching the CPU arm and DESCRYPT's
+                             * 8-byte clamp. The 2026-05-08 Q1 decision
+                             * was the opposite and both sides emitted the
+                             * whole candidate; reversed 2026-10-21. The
+                             * truncation IS inside BF_set_key, which is
+                             * the reason to clamp rather than not to:
+                             * bytes 73+ never reached the digest, so
+                             * emitting them claimed a verification that
+                             * did not happen and made the result file
+                             * depend on wordlist order. The post-rule
+                             * plaintext lives in synthetic_job.line at
+                             * length out_len (already populated above by
+                             * either the synthetic-`:` arm or the apply-
+                             * rule replay arm + optional mask prepend/
+                             * append); we re-emit it truncated via
+                             * synthetic_job.clen, which prfound and every
+                             * downstream printer honor. Phase 6 of the
+                             * slab-retirement ladder (final major slab
+                             * kernel). */
                             } else if (g->op == JOB_BCRYPT) {
                                 hit = 0;
                                 if (salt_snap_entry) {
@@ -3337,19 +3344,17 @@ void gpujob(void *arg) {
                                          (unsigned char *)fullhash);
                                     if (HPV && __sync_bool_compare_and_swap(HPV, 0, 1)) {
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
-                                        /* Q1 (2026-05-08): NO display
-                                         * clamp. Render full post-rule
-                                         * plaintext (CPU does NOT clamp
-                                         * display for BCRYPT -- the 72-
-                                         * byte truncation is INSIDE
-                                         * BF_set_key, not at display).
-                                         * DIFFERENT from DESCRYPT's
-                                         * 8-byte clamp. The post-rule
-                                         * plaintext at synthetic_job.line
-                                         * is already at length out_len;
-                                         * just set clen accordingly. */
-                                        synthetic_job.line[out_len] = 0;
-                                        synthetic_job.clen = out_len;
+                                        /* Clamp the display password to
+                                         * the 72 bytes BF_set_key read,
+                                         * for CPU parity (mdxfind.c
+                                         * BC_Start emit) and by the same
+                                         * argument as DESCRYPT's 8-byte
+                                         * clamp directly below. Reverses
+                                         * the 2026-05-08 Q1 no-clamp
+                                         * decision; 2026-10-21. */
+                                        int cplen = (out_len > 72) ? 72 : out_len;
+                                        synthetic_job.line[cplen] = 0;
+                                        synthetic_job.clen = cplen;
                                         prfound(&synthetic_job, fullhash);
                                     }
                                 }

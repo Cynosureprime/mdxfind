@@ -1,8 +1,14 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.12 $
+.\" $Revision: 1.14 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.14  2026/10/17 23:50:18  dlr
+.\" Drop the claim that procrule(1) spells the UTF-32 switch -8. It did not when the paragraph was written against a deployed procrule 1.30, where the switch is -u; procrule 1.31 renamed it and 1.36 now accepts both, so the sentence was telling the reader to type something the binary in /usr/local/bin rejects. Removed at Waffle request rather than corrected, in both places it appeared: the paragraph in the -8 entry, which also carried the inverted reasoning that -8 is "the one letter that can carry this meaning in both tools", and the cross-tool half of the CAVEATS bullet. What is kept is the part that is about mdxfind and is a genuine caveat for a reader arriving from procrule: -8 is the UTF-32 rule switch and -u loads a userid file. The -L cross-reference further down is untouched and was always correct, since -L genuinely is the same letter in both. Renders clean under groff -mandoc.
+.\"
+.\" Revision 1.13  2026/10/17 23:34:00  dlr
+.\" mdxfind 1.631. Document that a founds file reads back through -F. mdxfind prints type hash colon plain, and where the hash own grammar cannot contain a colon -- phpass, the crypt(3) families, bcrypt, and the brace-name and dollar-name wrappers -- the trailing colon plain is now cut off and the hash loads, so re-processing a founds file needs no preparation for those types. 82 types gained this; 741 of 949 now round-trip their own -z output against 660 before. The new paragraphs also state what is deliberately NOT cut, since every one of these is a silent failure if a reader assumes otherwise. A salted type is read whole because its -F form is hash colon salt and nothing in the line distinguishes a salt from a recovered plaintext, with the bc53abf8154e5967bef8da502fc93025 example whose salt is tilde-brace-colon; strip the plaintext column with cut or rling for those. Two shapes carry a trailing FIELD rather than a plaintext and are read whole for that reason, dollar BLAKE2 dollar hex colon salt for the BLAKE2 PASSSALT and SALTPASS types, and the bcrypt MCF when e1059 BCRYPTMD5PASSSALT is in the selection and takes a site salt from there. And a hash that is self-delimiting but indistinguishable from a bare digest is read whole as well, DESCRYPT, BSDICRYPT, CISCOPIX, the 0x MSSQL and Sybase forms, Oracle and NetScaler, because cutting those would break the ordinary hash colon salt line. Placed in the -F entry rather than the -f one: -f already documents that it keeps the hex and discards the rest, and that behaviour is unchanged.
+.\"
 .\" Revision 1.12  2026/10/11 14:00:11  dlr
 .\" Document the reference count a -S salt carries, and say out loud why -s does not. -S previously stamped one increment per distinct salt, so the count bore no relation to the hashes the salt served and the first solve retired it, abandoning the rest silently; mdxfind.c 1.625 makes the count the number of occurrences in the file raised to at least the loaded hash count times the -i depth. The -S entry now states that, states why the floor is generous rather than exact, that a salt supplied this way is not paired with any particular hash so any loaded hash could be the one that uses it, that -i makes a single hash hittable once per depth, and that a salt arriving attached to a hash record keeps its own exact count instead. The -s entry now states that its salts are given a deliberately huge reference count so they never retire early, which was always the intent but was nowhere written down, and points at -S for the case where salts should retire as their hashes are solved. Renders clean under groff -man with no warnings.
 .\"
@@ -336,6 +342,49 @@ appear before
 .BR \-F .  The filename
 .B stdin
 reads from standard input.
+.IP
+A founds file reads back.  mdxfind prints
+.BI type " " hash : plain \fR,
+and where the hash's own grammar cannot contain a colon \(em phpass, the
+.BR crypt (3)
+families, bcrypt, and the
+.BI { name } \fR...
+and
+.BI $ name $ \fR...
+wrappers \(em the trailing
+.BI : plain
+is cut off and the hash loads.  Re-processing a founds file therefore needs
+no preparation for those types.
+.IP
+This does not, and cannot, extend to a salted type.  Its
+.B \-F
+form is
+.BI hash : salt \fR,
+and nothing in the line distinguishes a salt from a recovered plaintext:
+.B bc53abf8154e5967bef8da502fc93025:~}::password
+has the salt
+.BR ~}: \fR,
+which only the operator knows.  Such lines are read whole, exactly as
+before; strip the plaintext column yourself, with
+.BR cut (1)
+or
+.BR rling (1).
+Two further cases are read whole for the same reason \(em the field after
+the hash is data, not a plaintext:
+.B $BLAKE2$\fIhex\fB:\fIsalt
+for the BLAKE2 PASSSALT and SALTPASS types, and the bcrypt MCF when
+.B e1059
+BCRYPTMD5PASSSALT is in the selection, which takes a site salt from there.
+A hash that is self-delimiting but indistinguishable from a bare digest
+.RB ( DESCRYPT ,
+.BR BSDICRYPT ,
+.BR CISCOPIX ,
+the
+.B 0x
+MSSQL and Sybase forms, Oracle, NetScaler)
+is also read whole, since cutting it would break the ordinary
+.BI hash : salt
+line.
 .TP
 .BI \-J " file"
 As
@@ -512,16 +561,6 @@ pair \(em see
 .B "THE TWO RULE ENGINES"
 below, because an all\-ASCII word is run by the byte engine either way.
 .IP
-The UTF\-32 switch is
-.BR \-8 ,
-not
-.BR \-u .
-.B \-u
-loads a userid file, which is why
-.BR procrule (1)
-spells the same option
-.B \-8
-as well: it is the one letter that can carry this meaning in both tools.
 See
 .B \-L
 below to pin the locale of an ambiguous case mapping.
@@ -1245,11 +1284,9 @@ at load.  See
 .BR "RULES AND CANDIDATE MUTATION" .
 .IP \(bu 3
 .B \-8
-is the UTF\-32 rule switch.
+is the UTF\-32 rule switch;
 .B \-u
-is a userid file, which is why the UTF\-32 switch is
-.B \-8
-in both tools.
+loads a userid file.
 See
 .BR "THE TWO RULE ENGINES" .
 .IP \(bu 3
