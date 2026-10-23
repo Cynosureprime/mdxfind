@@ -748,6 +748,57 @@ static id<MTLDevice> metal_resolve_device(void)
  *   The MDXFIND_METAL_JIT=1 source-compile alternative was removed
  *            2026-09-16; only the metallib load remains.
  * Returns a strong ref (nil on failure; caller's __strong static binds). */
+/* tsfprintf() lives in mdxfind.c -- "[T+ S.SSSs] " prefix, stderr serialized
+ * across threads.  Forward-declared here as gpu/gpu_opencl.c does.
+ *
+ * extern "C" is REQUIRED here and not in gpu_opencl.c: this translation unit
+ * is built with -x objective-c++, so a bare declaration gets C++ mangling and
+ * the link fails with tsfprintf(__sFILE*, char const*, ...) undefined while
+ * _tsfprintf sits in mdxfind.o. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern void tsfprintf(FILE *fp, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+#ifdef __cplusplus
+}
+#endif
+
+/* Announce a Metal source compile and its completion.  The OpenCL twin lives
+ * in gpu/gpu_kernel_cache.c, where ONE funnel covers every program; this file
+ * deliberately has nine independent library sites (see the options note just
+ * below for why), so this is attached to the two that concatenate
+ * metal_u32_walker_str -- the large ones, and the only ones whose compile time
+ * is worth a line.
+ *
+ * Metal is far cheaper here than OpenCL: the phase-2 UTF-32 walker measured
+ * 1.42 s on an M1 and 0.97 s on an M2 Max, against 62.87 s on a GTX 1080.  The
+ * message is for parity and for attributing the pause, not because Apple's
+ * compiler reads as a hang.
+ *
+ * Duration is the difference of the two [T+ ] stamps; no clock call is made.
+ *
+ * Takes the NSString, NOT the char* it was built from: every site here frees
+ * that buffer immediately after stringWithUTF8String: and before the compile,
+ * so measuring the source at this point has to use the object that is still
+ * alive. */
+static void metal_announce_compile(const char *label, NSString *nsrc)
+{
+    NSUInteger n = nsrc ? [nsrc lengthOfBytesUsingEncoding:NSUTF8StringEncoding]
+                        : (NSUInteger)0;
+    tsfprintf(stderr,
+        "GPU kernel: compiling Metal library %s, %llu KB -- this can take a moment\n",
+        label ? label : "(unnamed)",
+        (unsigned long long)((n + 1023) / 1024));
+}
+
+static void metal_announce_compiled(const char *label, id<MTLLibrary> lib)
+{
+    tsfprintf(stderr, "GPU kernel: Metal library %s %s\n",
+              label ? label : "(unnamed)",
+              lib != nil ? "compiled" : "FAILED to compile");
+}
+
 /* ---- single injection point for Metal compile options ------------------
  *
  * Every newLibraryWithSource site in this file builds its MTLCompileOptions
@@ -1238,9 +1289,11 @@ static id<MTLLibrary> metal_load_library_kernel_a_rules(id<MTLDevice> device)
     }
     MTLCompileOptions *opts = metal_compile_opts(_macros);
     NSError *err = nil;
+    metal_announce_compile("kernel A1 (rules)", nsrc);
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
                                                 error:&err];
+    metal_announce_compiled("kernel A1 (rules)", lib);
     if (lib == nil) {
         fprintf(stderr, "Metal: kernel A1 JIT compile failed: %s\n",
                 err ? [[err localizedDescription] UTF8String] : "(no error)");
@@ -2734,9 +2787,11 @@ static id<MTLLibrary> metal_load_library_generic(id<MTLDevice> device,
     MTLCompileOptions *opts = metal_compile_opts(macros);
 
     NSError *err = nil;
+    metal_announce_compile(fam->name ? fam->name : "generic template", nsrc);
     id<MTLLibrary> lib = [device newLibraryWithSource:nsrc
                                               options:opts
                                                 error:&err];
+    metal_announce_compiled(fam->name ? fam->name : "generic template", lib);
     if (lib == nil) {
         fprintf(stderr,
                 "Metal: %s vbits=0x%x generic library JIT-compile failed: %s\n",

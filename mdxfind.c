@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.637 2026/10/21 14:20:44 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.638 2026/10/23 13:16:20 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.637 2026/10/21 14:20:44 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.638 2026/10/23 13:16:20 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.638  2026/10/23 13:16:20  dlr
+ * Silence the byte compiler under -8 when its refusal is the expected answer, and give its diagnostic an intact line to echo. Under -8 both compilers run for every rule, and a rule carrying a quoted or multi-codepoint operand is one the BYTE compiler MUST refuse: that refusal IS the UTF-32-REQUIRED tag. Printing a parse error for it told the user their rule file was broken when it was not, and a 15-line hand-authored file produced 14 errors while still loading every rule. The fix is ordering: ask validrule_u32 FIRST, then gate packrules_len on the answer, which is what procrule has done since 1.34. Still audible when BOTH compilers refuse, so a genuinely bad rule keeps its caret. In byte mode Utf32Rules is 0 and the && short circuits, so nothing changes and nothing extra is spent. Also sets Ruleecho so the echo shows the authored text rather than the in-place-compiled buffer. Named Ruleecho because this file already has an unrelated Rulesrc, the packed rule-source slab. Measured on fpga: 12 errors to 0, hits unchanged at 601 of 601.
+ *
  * Revision 1.637  2026/10/21 14:20:44  dlr
  * Two defects found by chasing the last two entries of the -z sweep exclusion list, and they are unrelated to each other. First, BCRYPT256 e577 took its HMAC BLOCK SIZE from a leaked variable. The dollar 2k arm calls mhash_hmac_init with a hard coded MHASH_SHA256 algorithm, which was always right, and with mhash_get_hash_pblock(hmac_type) for the block size, which was not: hmac_type is a procjob local that the HMAC star arms assign and nothing ever resets, so this HMAC used the block size of whichever HMAC type last ran on that thread for that word. That is the whole of the two valued variation this type showed in a catalog sweep and in no narrower configuration, and bimodal rather than random was the tell, since arbitrary residue does not take exactly two values. Measured from one salt and one password: -m e577 alone, -m e214 with e577 and -m e217 with e577 all agree, because MD5 and SHA256 and the zero initial value all give a 64 byte block, while -m e218 with e577, HMAC-SHA512 at 128, produces a different digest. The uncontaminated value is the correct one, confirmed by hashpipe verifying the sibling e989 construction, so no result from a narrow run is invalidated and this removes the contaminated case only. Both call sites are corrected; the second is the else arm that 1.560 made unreachable when it taught the loop to skip any salt that is not dollar 2k, and it is fixed rather than left as a trap for whoever revives it. Second, MURMUR3 e972 read the seed in the WRONG BYTE ORDER and now agrees with hashcat. The four sscanf calls replaced in 1.636 assembled the seed little endian, byte j of the hex string shifted left j times 8; hashcat mode 27800 reads it big endian. The two agree only when the seed is byte symmetric and every published vector is, which is why years of testing missed it: hashcat's own example hash is 23e93f65 colon 00000000, hx.8 line 3459 carries only the zero seed case, and the other seed in local use was ffffffff. Settled against hashcat 6.2.5 on fpga rather than by argument, by handing it BOTH candidate digests for three asymmetric seeds and seeing which it cracked. It cracked the big endian one every time: deadbeef with secret1 is 64a71363 and not 29d3492c, 0f1e2d3c with hunter2 is 9cf5dd66 and not 198fce5d, 01020304 with password is 09714f1f and not 94dd7944. A python MurmurHash3_x86_32 written from the algorithm reproduces hashcat's published 23e93f65 exactly, so the core was right in every implementation and only the seed parse differed. hashpipe needed no change: its verify_murmur3 was already big endian and already correct, which means mdxfind's own output had been failing to verify in hashpipe for every seed that was not a palindrome, measured at 1 of 3 lines before and 3 of 3 after. mdxfind now cracks hashcat's own example hash and all three asymmetric vectors, its output verifies in hashpipe, and the previously emitted wrong digests are correctly refused. The -z line is unchanged because this type's default_salts seed is zero. MURMUR64A e829 was checked while there and is already big endian and correct. The sweep floor is now five types and every one is accounted for as by design: PHPBB3 and PHPBB3MD5 random salt, KRB5PA23 random confounder, JUNIPERIVE an explicit arc4random_buf IV carried in the blob, and MD5DSALT which is a deliberate algorithm taking a 3 byte salt on each side, so the 2 byte salts a sweep feeds it are not valid input for it. Catalog sweep 157,053 lines, unchanged from 1.636, with BCRYPT256 the only type differing beyond the floor.
  *
@@ -4394,6 +4397,15 @@ extern void procsaltbb(vector unsigned int *SSEBUF, struct job *job, int pcnt, c
 #endif
 
 extern int packrules(char *line);
+/* Both live in ruleproc.c.  Rulequiet silences the byte COMPILER's diagnostics
+ * while a caller is deliberately probing whether a rule compiles; Ruleecho
+ * gives that compiler's diagnostic an intact copy of the line to echo, since it
+ * compiles in place and has destroyed its own buffer by then.  (Named Ruleecho,
+ * not Rulesrc: this file already has a Rulesrc, the packed rule-source slab,
+ * which is a different thing entirely.)  See the rule load loop for why -8
+ * needs both. */
+extern int Rulequiet;
+extern const char *Ruleecho;
 extern int applyrule(char *line, char *pass, int len, char *rule,
                      struct rule_workspace *ws);
 extern void getcpuinfo();
@@ -55081,6 +55093,7 @@ union HashU curin;
                * leaving applyrule to read the missing operand out of the next
                * entry's length prefix. */
               int packedlen = 0;
+              int packfail = 0;
               int u32_placeholder = 0;
               /* Block-static, not stack: MAXLINE is 40 KB and rule loading is
                * single-threaded at startup. */
@@ -55097,7 +55110,35 @@ union HashU curin;
               memcpy(srcline, line, (size_t)srclen);
               srcline[srclen] = 0;
               u32_placeholder = 0;
-              if (packrules_len(line, &packedlen)) {
+              /* Ask the UTF-32 compiler FIRST, so the byte compiler can be run
+               * quietly when its refusal is the expected answer rather than a
+               * fault.  Under -8 both compilers run for every rule -- dispatch
+               * is per (word, rule) and either engine may be chosen for the
+               * same rule -- and a rule carrying a quoted or multi-codepoint
+               * operand is one the BYTE compiler must refuse: that refusal IS
+               * the UTF-32-REQUIRED tag.  Printing a parse error for it told
+               * the user their rule file was broken when it was not; a 15-line
+               * hand-authored file produced 14 errors and still loaded every
+               * rule.  procrule has done this since 1.34 (procrule.c, the
+               * Rulequiet assignment); mdxfind asked the two questions in the
+               * opposite order and so had no answer to gate on yet.
+               *
+               * Still AUDIBLE when both compilers refuse: Rulequiet is only
+               * set when the UTF-32 compiler accepted the line, so a genuinely
+               * bad rule keeps its caret diagnostic, which is the only thing
+               * that says why.  In byte mode Utf32Rules is 0 and && short
+               * circuits before validrule_u32 is reached, so nothing changes
+               * and nothing extra is spent.
+               *
+               * Cost under -8 is one validrule_u32 per rule at LOAD, never per
+               * (word, rule) -- the same order as the per-rule call the Rules[]
+               * pass below already makes. */
+              Rulequiet = Utf32Rules && (validrule_u32(srcline) == 0);
+              Ruleecho = srcline;
+              packfail = packrules_len(line, &packedlen);
+              Rulequiet = 0;
+              Ruleecho = NULL;
+              if (packfail) {
 badrule:
                 /* Reached from BOTH byte-compiler refusals: packrules_len
                  * failing, and the test-apply returning -3.  Either way the

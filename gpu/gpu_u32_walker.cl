@@ -317,14 +317,28 @@ CL_CONSTANT uint u32_expand[510] = {
  *
  * ---- WHAT THIS WALKER IS NOT -------------------------------------------
  *
- * 1. It does NOT implement the twelve RULE32_OP_*_STR string-operand opcodes
- *    (0x1002..0x100C).  MEASURED reason, not a preference: across 338,310
- *    real rule lines (HashMob.100k.rule, all_gj.rule, game.rule) exactly FOUR
- *    use one.  They appear only in hand-authored UTF-32 rules.  Excluding
- *    them removes every variable-length operand from the device stream except
- *    the two collapsed affix runs, which keeps the operand skip a constant.
- *    A rule using one is marked "no UTF-32 form" host-side and its pairs are
- *    walked on the CPU, so correctness is preserved by construction.
+ * 1. NOTHING in the opcode space is unimplemented any more.  All twelve
+ *    RULE32_OP_*_STR string-operand opcodes (0x1002..0x100C) are here, and
+ *    with them went the host-side refusal block that used to mark such a rule
+ *    "no UTF-32 form" -- so `default:` is now unreachable from any stream
+ *    packrule32 produces and means only "corrupt or truncated".
+ *
+ *    The reason they were ever out is worth keeping, because it is a measured
+ *    coverage figure and not a guess: across 338,310 real rule lines
+ *    (HashMob.100k.rule, all_gj.rule, game.rule) exactly FOUR use one.  They
+ *    appear almost only in HAND-AUTHORED UTF-32 rules -- and a hand-authored
+ *    file is ALL of them.  `s"@" "X@"` x 68 lines, crossed with itself, put
+ *    4,624 rules on the CPU with the GPU at 0% utilisation, which is what
+ *    paid for the work.
+ *
+ *    The one design note that is NOT a transliteration: SUB_STR at a general
+ *    needle length.  The CPU oracle builds the result forwards into a THIRD
+ *    scratch buffer (mem2, ruleproc32.c:1480) because the result can be
+ *    longer or shorter than the input.  That buffer would be ~8 KB per lane
+ *    on top of this walker's ~24 KB and is the exact shape Metal rejects at
+ *    PSO create ("Compute function exceeds available temporary registers",
+ *    task #250).  So this walker does it in place in three passes -- see the
+ *    arm, which carries the cursor-ordering proof.
  *
  * 2. It computes VARIANT 0 ONLY.  applyrule32 can have two right answers for
  *    one (word, rule) when a Turkish/Azeri dotted-i mapping is reached, but
@@ -450,6 +464,42 @@ CL_CONSTANT uint u32_expand[510] = {
  * above the byte engine's 0xc0..0xfd range on purpose. */
 #define RULE32_OP_APPEND_MULTI   0x1000u
 #define RULE32_OP_PREPEND_MULTI  0x1001u
+
+/* The twelve string-operand opcodes, all implemented below.  ruleproc32.h
+ * defines them too and the host twin tests include both, so whichever arrives
+ * first wins. */
+#ifndef RULE32_OP_SUB_STR
+#define RULE32_OP_SUB_STR        0x1002u
+#define RULE32_OP_PURGE_STR      0x1003u
+#define RULE32_OP_INSERT_STR     0x1004u
+#define RULE32_OP_OVERW_STR      0x1005u
+#define RULE32_OP_REJ_HAS_STR    0x1006u
+#define RULE32_OP_REJ_NHAS_STR   0x1007u
+#define RULE32_OP_REJ_FIRST_STR  0x1008u
+#define RULE32_OP_REJ_LAST_STR   0x1009u
+#define RULE32_OP_DIV_INS_STR    0x100Au
+#define RULE32_OP_TOGGLE_SEP_STR 0x100Bu
+#define RULE32_OP_TITLE_SEP_STR  0x100Cu
+#endif
+
+/* read_operand()'s bufmax (ruleproc32.c:728, :886).  No operand the host can
+ * pack is longer, so a count above it means a truncated or corrupt stream and
+ * the only safe response is to fail the pair.  Unlike APPEND_MULTI -- whose
+ * count is bounded for free because U32_ROOM(len+cnt) runs BEFORE prog[k+m] is
+ * read -- a needle/replacement length is used as an index with no natural
+ * bound, so the check has to be written out.
+ *
+ * The LOWER bound is the other half of the same check, and it is not
+ * cosmetic: four of these arms advance by the needle length on a match
+ * (`i += fn`), so a zero-length needle matches at every position and never
+ * advances -- a lane spinning forever with no diagnostic.  packrule32 refuses
+ * an empty needle on every one of the twelve (`if (on <= 0) return
+ * RULE32_ERR_INVALID`, and `fn == 0` explicitly at ruleproc32.c:1252), so the
+ * guard can only fire on a corrupt or truncated stream and never changes the
+ * answer for a rule the host actually packed.  The one count that is
+ * legitimately zero is SUB_STR's `tn` -- `s"abc" ""` is a deletion -- and it
+ * gets the upper bound only. */
+#define U32_OPERAND_MAX  512
 
 /* Named codepoints, from ruleproc32.c. */
 #define U32_ZWJ          0x200Du
@@ -1269,6 +1319,325 @@ U32_SI int apply_rule32(U32_GLOBAL const uint *prog,
                 for (i = 0; i < len; i++) if (buf[i] == from) buf[i] = to;
                 break; }
 
+            /* `s"F" "TTT"` -- STRING substitute.  Left to right,
+             * non-overlapping (`i += fn` on a match), and it does NOT rescan
+             * what it wrote, so a replacement containing its own needle cannot
+             * loop -- ruleproc32.c:1696.  Both arms below honour that: every
+             * match is read from the ORIGINAL content by the read cursor and
+             * the replacement is copied in verbatim.
+             *
+             * NEITHER arm uses a scratch buffer, and that is the whole reason
+             * they are shaped the way they are.  The oracle builds the result
+             * forwards into mem2 (a THIRD RULE32_MAXCP buffer) because the
+             * result can grow or shrink.  Here the delta is computed first, so
+             * the rewrite can be done in the one buffer.
+             *
+             * fn == 1 -- the common hand-authored shape -- keeps its own
+             * cheaper path: no needle compare loop and no pre-shift, just a
+             * count and one backwards pass.
+             *
+             * `tn == 1 && fn == 1` cannot reach here (packrule32 emits
+             * RULE_OP_SUB, ruleproc32.c:1251) but is correct anyway, so
+             * nothing is special-cased out.  `tn == 0` (`s"abc" ""`) is a
+             * legitimate deletion.  `fn == 0` cannot: packrule32 refuses an
+             * empty needle at :1252, and the guard below would spin forever
+             * without it. */
+            case RULE32_OP_SUB_STR: {
+                int fn = (int)prog[k++];
+                int fp, tn, tp, m, w, r, o, d, rend;
+
+                if (fn < 1 || fn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                fp = k;                        /* the needle codepoints */
+                k += fn;
+                tn = (int)prog[k++];
+                if (tn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                tp = k;                        /* the replacement codepoints */
+                k += tn;
+
+                if (fn == 1) {
+                    uint from = prog[fp];
+                    m = 0;
+                    for (i = 0; i < len; i++) if (buf[i] == from) m++;
+                    if (m == 0) break;
+
+                    if (tn == 0) {             /* pure deletion, compact fwd */
+                        w = 0;
+                        for (i = 0; i < len; i++) if (buf[i] != from) buf[w++] = buf[i];
+                        len = w;
+                        break;
+                    }
+                    /* w - r starts at m*(tn-1) >= 0, is unchanged by a
+                     * non-match and falls by (tn-1) at each match, so it is
+                     * >= 0 at every write: the writer never reaches unread
+                     * input. */
+                    w = len + m * (tn - 1);
+                    U32_ROOM(w);
+                    r = len;
+                    len = w;
+                    while (r > 0) {
+                        uint c = buf[--r];
+                        if (c == from) { for (j = tn - 1; j >= 0; j--) buf[--w] = prog[tp + j]; }
+                        else buf[--w] = c;
+                    }
+                    break;
+                }
+
+                /* ---- general needle, three passes, IN PLACE -------------
+                 *
+                 * 1. count the non-overlapping matches, left to right, giving
+                 *    m and delta = m*(tn-fn);
+                 * 2. if delta > 0, make room and shift the WHOLE content right
+                 *    by delta (backwards copy), so the read cursor starts at
+                 *    delta and the write cursor at 0.  A uniform shift moves
+                 *    every match by delta and changes nothing else, so pass 3
+                 *    re-finds exactly the m matches pass 1 counted;
+                 * 3. walk forward, copying non-matches and writing the
+                 *    replacement at each match.
+                 *
+                 * WHY THE WRITER NEVER OVERTAKES UNREAD INPUT.  Each non-match
+                 * advances both cursors, so r - o is unchanged; each match
+                 * advances r by fn and o by tn, so r - o falls by (tn - fn).
+                 *
+                 *   tn > fn: r - o starts at delta = m*(tn-fn), so after j
+                 *     matches it is (m-j)*(tn-fn).  At the start of any match
+                 *     j <= m-1, hence r - o >= tn - fn, i.e. o + tn <= r + fn.
+                 *     The replacement write can at worst reach exactly the end
+                 *     of the needle it is consuming -- and that needle was
+                 *     fully compared before the write.  It is tight at the
+                 *     LAST match and correct there.
+                 *   tn < fn: no shift, r = o = 0, and r - o only GROWS, by
+                 *     (fn - tn) per match.  So o <= r always and o + tn <=
+                 *     r + fn follows from tn <= fn.
+                 *   tn == fn: o == r throughout.  Pure in-place.
+                 *
+                 * Do NOT "simplify" this into a forward pass with a scratch
+                 * buffer to make the ordering argument unnecessary.  The
+                 * scratch buffer is the thing that cannot be afforded; the
+                 * argument above is what buys its absence. */
+                m = 0;
+                for (i = 0; i + fn <= len; ) {
+                    for (j = 0; j < fn && buf[i + j] == prog[fp + j]; j++) ;
+                    if (j == fn) { m++; i += fn; } else i++;
+                }
+                if (m == 0) break;
+
+                d = m * (tn - fn);
+                if (d > 0) {
+                    U32_ROOM(len + d);
+                    for (i = len - 1; i >= 0; i--) buf[i + d] = buf[i];
+                    r = d;
+                } else r = 0;
+                rend = r + len;
+                o = 0;
+                while (r < rend) {
+                    j = 0;
+                    if (r + fn <= rend)
+                        for (; j < fn && buf[r + j] == prog[fp + j]; j++) ;
+                    if (j == fn) {
+                        for (j = 0; j < tn; j++) buf[o++] = prog[tp + j];
+                        r += fn;
+                    } else buf[o++] = buf[r++];
+                }
+                len = o;
+                break;
+            }
+
+            /* ---- the other ten string-operand opcodes ---------------
+             *
+             * Straight transliterations of ruleproc32.c, which is the ONLY
+             * authority.  Each is annotated only where the oracle's shape is
+             * surprising; everything else is deliberately unclever and the
+             * line order is the oracle's.  Three places where "improving" one
+             * of these silently changes the answer, all of them real:
+             *
+             *  - INSERT_STR's guard is `>= kk`, so inserting AT the cluster
+             *    count APPENDS.  ruleproc32.c:1754 carries the note: it was
+             *    the last arm in either engine on the pre-fix `>` spelling,
+             *    which made `i2"XY"` on `ab` a silent no-op while `i2X`
+             *    appended.
+             *  - DIV_INS_STR builds BACKWARDS from `total` and reads
+             *    u32_cl_start() with the ORIGINAL len while writing above it.
+             *  - TOGGLE_SEP_STR's `occurrence` is 0-BASED and advances ONLY
+             *    when it does not match y, and the separator is skipped with
+             *    `continue` so it cannot itself be the codepoint toggled.
+             *
+             * TITLE_SEP_STR is NOT the same shape as RULE_OP_TITLE_SEP a few
+             * arms below.  The single-codepoint arm keeps an already-uppercase
+             * letter at a word start (the Hello1 fix); the STR arm as the
+             * oracle writes it lowercases it and capitalises the next cased
+             * codepoint instead.  That difference is the ORACLE's and this is
+             * a twin, not a correction -- fix ruleproc32.c first if it is to
+             * change, or the host twin stops being an oracle. */
+            case RULE32_OP_PURGE_STR: {
+                int fn = (int)prog[k++];
+                int fp, w = 0;
+                if (fn < 1 || fn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                fp = k; k += fn;
+                /* Forward compaction: w <= i at every write, so no room call
+                 * and no scratch. */
+                for (i = 0; i < len; ) {
+                    if (i + fn <= len) {
+                        for (j = 0; j < fn && buf[i + j] == prog[fp + j]; j++) ;
+                        if (j == fn) { i += fn; continue; }
+                    }
+                    buf[w++] = buf[i++];
+                }
+                len = w; break;
+            }
+
+            /* `!"ab"` / `/"ab"` / `("ab"` / `)"ab"` -- one arm, read-only, no
+             * growth.  HAS rejects on a hit, the other three reject on a
+             * MISS. */
+            case RULE32_OP_REJ_HAS_STR:
+            case RULE32_OP_REJ_NHAS_STR:
+            case RULE32_OP_REJ_FIRST_STR:
+            case RULE32_OP_REJ_LAST_STR: {
+                int fn = (int)prog[k++];
+                int fp, hit = 0, start;
+                if (fn < 1 || fn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                fp = k; k += fn;
+                if (op == RULE32_OP_REJ_FIRST_STR) {
+                    if (fn <= len) {
+                        for (j = 0; j < fn && buf[j] == prog[fp + j]; j++) ;
+                        hit = (j == fn);
+                    }
+                } else if (op == RULE32_OP_REJ_LAST_STR) {
+                    if (fn <= len) {
+                        start = len - fn;
+                        for (j = 0; j < fn && buf[start + j] == prog[fp + j]; j++) ;
+                        hit = (j == fn);
+                    }
+                } else {
+                    for (i = 0; i + fn <= len && !hit; i++) {
+                        for (j = 0; j < fn && buf[i + j] == prog[fp + j]; j++) ;
+                        if (j == fn) hit = 1;
+                    }
+                }
+                if (op == RULE32_OP_REJ_NHAS_STR || op == RULE32_OP_REJ_FIRST_STR ||
+                    op == RULE32_OP_REJ_LAST_STR) {
+                    if (!hit) return U32_REJECTED;
+                } else if (hit) return U32_REJECTED;
+                break;
+            }
+
+            /* `iN"S"` -- insert S at cluster position N.  `>= kk`: see above. */
+            case RULE32_OP_INSERT_STR: {
+                int kk = (int)prog[k++], sn = (int)prog[k++];
+                int sp, at, w;
+                if (sn < 1 || sn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                sp = k; k += sn;
+                at = u32_cl_start(buf, len, kk);
+                if (u32_cl_count(buf, len) >= kk) {
+                    U32_ROOM(len + sn);
+                    for (w = len - 1; w >= at; w--) buf[w + sn] = buf[w];
+                    for (w = 0; w < sn; w++) buf[at + w] = prog[sp + w];
+                    len += sn;
+                }
+                break;
+            }
+
+            /* `oN"S"` -- replace the whole CLUSTER at N with S.  `d` is the
+             * length change and can be NEGATIVE, which inverts the shift
+             * direction: grow shifts the tail right from the top down, shrink
+             * shifts it left from the bottom up.  Unlike RULE_OP_OVERWRITE
+             * there is NO empty-buffer append special case here -- the oracle
+             * does not have one, so neither does this. */
+            case RULE32_OP_OVERW_STR: {
+                int kk = (int)prog[k++], sn = (int)prog[k++];
+                int sp, a, b2, w, d;
+                if (sn < 1 || sn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                sp = k; k += sn;
+                if (kk < u32_cl_count(buf, len)) {
+                    a = u32_cl_start(buf, len, kk);
+                    b2 = u32_cl_start(buf, len, kk + 1);
+                    d = sn - (b2 - a);
+                    U32_ROOM(len + (d > 0 ? d : 0));
+                    if (d > 0) for (w = len - 1; w >= b2; w--) buf[w + d] = buf[w];
+                    else if (d < 0) for (w = b2; w < len; w++) buf[w + d] = buf[w];
+                    for (w = 0; w < sn; w++) buf[a + w] = prog[sp + w];
+                    len += d;
+                }
+                break;
+            }
+
+            /* `vN"S"` -- insert S after every N clusters.  Built BACKWARDS
+             * from `total`, and u32_cl_start() is called with the ORIGINAL len
+             * throughout while the write cursor runs down from above it.  Keep
+             * that exact shape: a forward build would need the scratch buffer
+             * this walker does not have. */
+            case RULE32_OP_DIV_INS_STR: {
+                int x = (int)prog[k++], sn = (int)prog[k++];
+                int sp, nc, total, w, c2, a, b2;
+                if (sn < 1 || sn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                sp = k; k += sn;
+                if (x <= 0) return U32_ERR_INVALID;
+                nc = u32_cl_count(buf, len);
+                if (nc < x) break;
+                total = len + (nc / x) * sn;
+                U32_ROOM(total);
+                w = total;
+                for (c2 = nc - 1; c2 >= 0; c2--) {
+                    if (((c2 + 1) % x) == 0)
+                        for (j = sn - 1; j >= 0; j--) buf[--w] = prog[sp + j];
+                    a = u32_cl_start(buf, len, c2);
+                    b2 = u32_cl_start(buf, len, c2 + 1);
+                    for (j = b2 - 1; j >= a; j--) buf[--w] = buf[j];
+                }
+                len = total;
+                break;
+            }
+
+            /* `3N"S"` -- toggle the first cased codepoint after the Nth S.
+             * N is 0-BASED out of packrule32 and `occurrence` advances ONLY
+             * when it does not equal N, exactly as the oracle writes it. */
+            case RULE32_OP_TOGGLE_SEP_STR: {
+                int y = (int)prog[k++], sn = (int)prog[k++];
+                int sp, toggle_next = 0, occurrence = 0;
+                if (sn < 1 || sn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                sp = k; k += sn;
+                for (i = 0; i < len; ) {
+                    if (i + sn <= len) {
+                        for (j = 0; j < sn && buf[i + j] == prog[sp + j]; j++) ;
+                        if (j == sn) {
+                            if (occurrence == y) toggle_next = 1;
+                            else occurrence++;
+                            i += sn; continue;
+                        }
+                    }
+                    if (toggle_next) {
+                        uint u = u32_upper(buf[i], turkish, ct);
+                        buf[i] = (u != buf[i]) ? u : u32_lower(buf[i], turkish, ct);
+                        break;
+                    }
+                    i++;
+                }
+                break;
+            }
+
+            /* `e"S"` -- title case with a STRING separator.  See the note
+             * above: this is NOT RULE_OP_TITLE_SEP's shape, and the
+             * difference is the oracle's, not a defect introduced here. */
+            case RULE32_OP_TITLE_SEP_STR: {
+                int sn = (int)prog[k++];
+                int sp, z = 0;
+                if (sn < 1 || sn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                sp = k; k += sn;
+                for (i = 0; i < len; ) {
+                    if (i + sn <= len) {
+                        for (j = 0; j < sn && buf[i + j] == prog[sp + j]; j++) ;
+                        if (j == sn) { z = 0; i += sn; continue; }
+                    }
+                    {   uint ch = buf[i];
+                        if (z == 0 && u32_upper(ch, turkish, ct) != ch) {
+                            z = 1; buf[i] = u32_upper(ch, turkish, ct);
+                        } else if (u32_lower(ch, turkish, ct) != ch) {
+                            buf[i] = u32_lower(ch, turkish, ct);
+                        } }
+                    i++;
+                }
+                break;
+            }
+
             /* ---- whole-word case ------------------------------------
              * The sigma pass is skipped unless a medial sigma was actually
              * produced; folding the test into the mapping loop costs one
@@ -1755,12 +2124,14 @@ U32_SI int apply_rule32(U32_GLOBAL const uint *prog,
                 if (cnt < y) return U32_REJECTED; break;
             }
 
-            /* An opcode this walker does not implement -- the string-operand
-             * family, 0x1002..0x100C.  A rule containing one must never have
-             * been routed here: it is marked "no UTF-32 form" host-side and
-             * walked on the CPU.  Reaching this is a WIRING bug, not a data
-             * condition, so it fails the pair loudly rather than emitting a
-             * half-applied candidate. */
+            /* UNREACHABLE from any stream packrule32 produces.  Every opcode
+             * it emits -- including all twelve of the string-operand family,
+             * 0x1002..0x100C -- has an arm above, and the host-side refusal
+             * block that used to divert the ones that did not is gone.  So
+             * arriving here means the stream is corrupt or truncated, or an
+             * opcode was added to ruleproc32.c without a twin here.  Either is
+             * a WIRING bug rather than a data condition, so it fails the pair
+             * loudly instead of emitting a half-applied candidate. */
             default:
                 return U32_ERR_INVALID;
         }

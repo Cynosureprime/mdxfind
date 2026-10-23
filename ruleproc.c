@@ -41,9 +41,12 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.47 2026/09/29 13:44:07 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.48 2026/10/23 13:16:06 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.48  2026/10/23 13:16:06  dlr
+ * Add Ruleecho: an intact copy of the source line for the compiler diagnostic ECHO. packrules_len compiles its buffer IN PLACE, so by the time rule_error fires the leading bytes hold packed opcodes rather than source text: s"ab" "X" echoed with its first byte destroyed and the message named command b, so the echo contradicted the authored line and the caret pointed into rubble. The caret OFFSET needs no adjustment because the in-place compile never shifts a byte. NULL means echo the compile buffer, which is what every caller did before, so an unconverted caller is unaffected.
+ *
  * Revision 1.47  2026/09/29 13:44:07  dlr
  * Correct the attribution wording in the header comment.
  *
@@ -668,20 +671,36 @@ void print128(char *s,__m128i v)
  * diagnostics, which report a different class of problem. */
 int Rulequiet = 0;
 
+/* The intact source of the line being compiled, for the diagnostic ECHO only.
+ * packrules_len compiles its buffer IN PLACE (s = d = line), so by the time a
+ * diagnostic fires the leading bytes of that buffer hold packed opcodes rather
+ * than source text: `s"ab" "X"` echoed as `\x??"ab" "X"` and the message named
+ * command 'b' -- the byte compiler had read `s"a` as a two-operand substitute
+ * and choked on the next character -- so the echo contradicted the line the
+ * user wrote and the caret pointed into rubble.
+ *
+ * The CARET offset needs no adjustment: the in-place compile never shifts a
+ * byte, so the read offset the caller passes IS the offset in the source.
+ *
+ * NULL means "echo the compile buffer", which is what every caller did before
+ * this existed, so an unconverted caller is unaffected. */
+const char *Ruleecho = NULL;
+
 static void rule_error(const char *msg, const char *orule,
                        const char *rule)
 {
+	const char *echo = Ruleecho ? Ruleecho : orule;
 	int pos = (int)(rule - orule);
-	int len = (int)strlen(orule);
+	int len = (int)strlen(echo);
 	int i;
 
 	if (Rulequiet) return;
 
 	/* trim trailing newline for display */
-	if (len > 0 && (orule[len-1] == '\n' || orule[len-1] == '\r'))
+	if (len > 0 && (echo[len-1] == '\n' || echo[len-1] == '\r'))
 		len--;
 
-	fprintf(stderr, "  Rule: %.*s\n", len, orule);
+	fprintf(stderr, "  Rule: %.*s\n", len, echo);
 	fprintf(stderr, "        ");
 	for (i = 0; i < pos && i < len; i++)
 		fputc(' ', stderr);

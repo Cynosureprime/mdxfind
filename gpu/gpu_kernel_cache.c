@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.10 2026/09/14 19:28:43 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.11 2026/10/23 13:15:38 dlr Exp dlr $
  *
  * Implementation. See gpu_kernel_cache.h for the design overview.
  */
@@ -663,6 +663,61 @@ static void store_entry(const char *key, cl_program prog, cl_device_id dev,
  * Public: build (or load from cache) a program
  * ============================================================ */
 
+/* tsfprintf() lives in mdxfind.c -- it prefixes "[T+ S.SSSs] " and serializes
+ * stderr across threads.  Forward-declared here, as gpu_opencl.c does, rather
+ * than pulling in mdxfind.h. */
+extern void tsfprintf(FILE *fp, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/* Announce a SOURCE compile, and its completion.
+ *
+ * A cold JIT is slow and, until now, completely silent.  Measured on this
+ * fixture with the phase-2 UTF-32 walker: 62.87 s on a GTX 1080 under OpenCL,
+ * against 1.42 s (Apple M1) and 0.97 s (M2 Max) under Metal.  On the OpenCL
+ * host it also lands INSIDE the dispatch's own busy= accounting, so the run
+ * shows no output, no progress and a GPU pegged at 100% busy -- which reads as
+ * a hang.  It has twice been chased as one.
+ *
+ * Only the source-compile paths call this.  A cache HIT returns from try_load()
+ * without coming through here, so these lines appearing at all is itself the
+ * signal that there was no usable cached binary -- normally because
+ * MDXFIND_CACHE is unset, or because the key changed (a new kernel, driver or
+ * revision).
+ *
+ * Duration is the difference of the two [T+ ] stamps.  No clock call is made
+ * here on purpose: this file carries _WIN32 branches for the cross-build and
+ * clock_gettime is not uniformly available across them, whereas tsfprintf
+ * already works everywhere this file compiles. */
+static void get_str_info(cl_device_id dev, cl_device_info what,
+                         char *out, size_t outlen);
+
+static void announce_compile(cl_uint n_sources, const char *const *sources,
+                             cl_device_id dev)
+{
+    char dname[256] = "";
+    size_t bytes = 0;
+    cl_uint i;
+
+    for (i = 0; i < n_sources; i++)
+        if (sources[i]) bytes += strlen(sources[i]);
+    get_str_info(dev, CL_DEVICE_NAME, dname, sizeof dname);
+
+    tsfprintf(stderr,
+        "GPU kernel: compiling %u source segment%s, %zu KB%s%s "
+        "-- no cached binary, this can take a minute\n",
+        (unsigned)n_sources, n_sources == 1 ? "" : "s",
+        (bytes + 1023) / 1024,
+        dname[0] ? " for " : "", dname[0] ? dname : "");
+}
+
+static void announce_compiled(cl_int err)
+{
+    if (err == CL_SUCCESS)
+        tsfprintf(stderr, "GPU kernel: compile finished\n");
+    else
+        tsfprintf(stderr, "GPU kernel: compile FAILED (err=%d)\n", (int)err);
+}
+
 static void get_str_info(cl_device_id dev, cl_device_info what, char *out, size_t outlen) {
     out[0] = 0;
     clGetDeviceInfo(dev, what, outlen, out, NULL);
@@ -776,7 +831,9 @@ cl_program gpu_kernel_cache_build_program_ex(
     if (!gpu_kernel_cache_enabled()) {
         prog = clCreateProgramWithSource(ctx, n_sources, sources, NULL, &err);
         if (!prog) { if (err_out) *err_out = err; return NULL; }
+        announce_compile(n_sources, sources, dev);
         err = clBuildProgram(prog, 1, &dev, build_opts ? build_opts : "", NULL, NULL);
+        announce_compiled(err);
         if (err_out) *err_out = err;
         return prog;
     }
@@ -818,7 +875,9 @@ cl_program gpu_kernel_cache_build_program_ex(
             lockp);
         prog = clCreateProgramWithSource(ctx, n_sources, sources, NULL, &err);
         if (!prog) { if (err_out) *err_out = err; return NULL; }
+        announce_compile(n_sources, sources, dev);
         err = clBuildProgram(prog, 1, &dev, build_opts ? build_opts : "", NULL, NULL);
+        announce_compiled(err);
         if (err_out) *err_out = err;
         return prog;
     }
@@ -839,7 +898,9 @@ cl_program gpu_kernel_cache_build_program_ex(
         if (err_out) *err_out = err;
         return NULL;
     }
+    announce_compile(n_sources, sources, dev);
     err = clBuildProgram(prog, 1, &dev, build_opts ? build_opts : "", NULL, NULL);
+    announce_compiled(err);
     if (err == CL_SUCCESS) {
         /* Concatenate all source segments for the .cl debug dump. */
         size_t total_src_len = 0;

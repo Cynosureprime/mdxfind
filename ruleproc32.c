@@ -1,6 +1,9 @@
-/* $Revision: 1.18 $
+/* $Revision: 1.19 $
  *
  * $Log: ruleproc32.c,v $
+ * Revision 1.19  2026/10/23 13:16:06  dlr
+ * INSERT_STR guard corrected from > to >=: inserting at a position equal to the cluster count is an APPEND, matching RULE_OP_INSERT here and RULE_OP_INSERT in the byte engine, both of which cite john and hashcat 6.2.5. This arm was the last holdout on the pre-fix spelling, so on the two-cluster word ab, i2X appended to give abX while i2"XY" silently did nothing. A position beyond the length stays a no-op. Found while planning the device twin: transliterating the arm as it stood would have baked the divergence into the GPU walker.
+ *
  * Revision 1.18  2026/10/05 03:43:33  dlr
  * Encoding conversions move here, replacing iconv for the whole program.
  *
@@ -1757,7 +1760,17 @@ int applyrule32(const uint32_t *rule, const uint32_t *in, int inlen,
                 int at, w;
                 rule += sn;
                 at = cl_start(buf, len, k);
-                if (cl_count(buf, len) > k) {
+                /* `>=`, not `>`: inserting at position == cluster count is an
+                 * APPEND, exactly as in RULE_OP_INSERT above and in the byte
+                 * engine's RULE_OP_INSERT, both of which cite john and
+                 * hashcat 6.2.5.  This arm was the last holdout on the
+                 * pre-fix spelling, so on the two-cluster word `ab`, `i2X`
+                 * appended to give abX while `i2"XY"` silently did nothing.
+                 * Position BEYOND the length stays a no-op, matching the
+                 * other two.  Found while planning the device twin of this
+                 * opcode: transliterating it as it stood would have baked the
+                 * divergence into the GPU walker. */
+                if (cl_count(buf, len) >= k) {
                     ROOM(len + sn);
                     for (w = len - 1; w >= at; w--) buf[w + sn] = buf[w];
                     for (w = 0; w < sn; w++) buf[at + w] = sp[w];
