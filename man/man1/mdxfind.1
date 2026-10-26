@@ -1,8 +1,14 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.14 $
+.\" $Revision: 1.16 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.16  2026/10/26 13:21:44  dlr
+.\" Drop the paragraph narrating what -m 4510 -s saltfile did before 1.640. A man page states current behaviour; the surrounding paragraphs already say what the four dual-channel modes do now, and the removed text documented only what was. Waffle, 2026-10-26: we document what is, not what was.
+.\"
+.\" Revision 1.15  2026/10/26 13:17:04  dlr
+.\" Document the dual-channel hashcat modes, new in mdxfind 1.640. hashcat has one trailing operand, calls it a salt, and has no userid concept at all; mdxfind has both channels, and four modes have a catalog member on each, with an identical digest either way. New paragraph in the -m entry with a table of the four pairs: 3610 e356 and e347, 4510 e310 and e579, 4711 e308 and e471, 32420 e510 and none. States the both-channels and neither-channel rules, that the chosen member is named on stderr, that 32420 has no salt member because its operand follows the raw sha512 digest rather than the hex one, what -m 4510 -s saltfile used to do, and that -M with -F is deliberately unchanged because the structured loader makes the two members of a pair indistinguishable on both the input and the output line. Also a closing paragraph in OPTION ORDER MATTERS recording the one exception the feature introduces: the four channel flags are located by a scan of the command line before parsing begins, so their position does not affect which type -m picks, while everything else about them still happens when getopt reaches them and they continue to belong after their -M. Renders clean under groff -mandoc -t.
+.\"
 .\" Revision 1.14  2026/10/17 23:50:18  dlr
 .\" Drop the claim that procrule(1) spells the UTF-32 switch -8. It did not when the paragraph was written against a deployed procrule 1.30, where the switch is -u; procrule 1.31 renamed it and 1.36 now accepts both, so the sentence was telling the reader to type something the binary in /usr/local/bin rejects. Removed at Waffle request rather than corrected, in both places it appeared: the paragraph in the -8 entry, which also carried the inverted reasoning that -8 is "the one letter that can carry this meaning in both tools", and the cross-tool half of the CAVEATS bullet. What is kept is the part that is about mdxfind and is a genuine caveat for a reader arriving from procrule: -8 is the UTF-32 rule switch and -u loads a userid file. The -L cross-reference further down is untouched and was always correct, since -L genuinely is the same letter in both. Renders clean under groff -mandoc.
 .\"
@@ -157,6 +163,30 @@ per group of
 options.
 .B "\-M RESET"
 clears the load set without selecting anything.
+.PP
+There is one exception, added in 1.640.  The salt and userid channel flags
+.RB ( \-s ,
+.BR \-S ,
+.B \-u
+and
+.BR \-U )
+are located by a scan of the command line
+.I before
+parsing begins, because
+.B \-m
+needs them to resolve the dual-channel
+.BR hashcat (1)
+modes described under
+.B \-m
+below.  For that purpose alone their position does not matter, so
+.B "\-s salts \-m 4510"
+and
+.B "\-m 4510 \-s salts"
+select the same type.  Everything else about those options, including which
+types they load into, still happens when
+.BR getopt (3)
+reaches them, so they continue to belong after their
+.BR \-M .
 .SH "SELECTING HASH TYPES"
 Until the first
 .BR \-m ,
@@ -197,6 +227,59 @@ matched as an exact string, never as a regex.
 Selecting certain hashcat modes raises the minimum iteration count
 automatically: modes 4500, 2600, 2630, 34400, 21000 and 21400 force at least
 2; mode 3500 forces at least 3; mode 14400 forces at least 10.
+.IP
+.BR "Dual-channel modes" .
+.BR hashcat (1)
+has a single trailing operand, calls it
+.BR $salt ,
+and has no userid concept at all.
+.B mdxfind
+has both a salt channel
+.RB ( \-s / \-S )
+and a userid channel
+.RB ( \-u / \-U ),
+and for four constructions the type catalog carries the same expression twice,
+once reading that operand from each channel.  The digest is identical either
+way; only the channel the operator feeds differs.  A hashcat mode can name
+only one member of each pair, so since 1.640
+.B \-m
+resolves these four from the channel actually supplied:
+.RS
+.TS
+l l l.
+mode	\-u/\-U member	\-s/\-S member
+_
+3610	e356 MD5MD5MD5USER	e347 MD5MD5SALT
+4510	e310 SHA1SHA1USER	e579 SHA1SHA1PASSSALT
+4711	e308 SHA1MD5USER	e471 SHA1MD5PASS\-SALT
+32420	e510 SHA512SHA512RAWUSER	none
+.TE
+.RE
+.IP
+Supply both channels and both members are selected.  Supply neither and the
+userid member is selected, which is the behaviour these modes have always had.
+The member chosen is named on standard error whenever a channel flag decided
+it.  Mode 32420 appends its operand to the
+.I raw
+SHA\-512 digest rather than the hex one, so e387 SHA512SHA512SALT is not an
+equivalent and there is no salt-channel member; supplying
+.B \-s
+with that mode reports so rather than failing quietly.
+.IP
+.B \-M
+is deliberately
+.I not
+routed through this table.
+.B \-M
+goes with
+.BR \-F ,
+whose loader lifts the trailing field off the hash line into whichever channel
+the selected type owns, so the input and the output lines are identical for
+either member of a pair and there is nothing to disambiguate.
+.B "\-M 4510 \-F"
+reads hashcat's own
+.I hash:salt
+format and is unchanged.
 .TP
 .BI \-h " regex"
 Select types whose

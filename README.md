@@ -243,6 +243,52 @@ mdxfind -m e1-e12 -f hashes.txt wordlist.txt
 mdxfind -m 0,e369,3200 -f hashes.txt wordlist.txt
 ```
 
+#### Dual-channel hashcat modes
+
+hashcat has a single trailing operand, calls it `$salt`, and has no userid
+concept at all. mdxfind has both a salt channel (`-s`/`-S`) and a userid
+channel (`-u`/`-U`), and for four constructions the catalog carries the same
+expression twice — once reading that operand from each channel. The digest is
+identical either way; only the channel you feed differs.
+
+A hashcat mode can name only one member of each pair, so `-m` resolves these
+four modes from the channel you actually supplied:
+
+| hashcat mode | `-u`/`-U` member | `-s`/`-S` member |
+|---|---|---|
+| 3610 | e356 MD5MD5MD5USER | e347 MD5MD5SALT |
+| 4510 | e310 SHA1SHA1USER | e579 SHA1SHA1PASSSALT |
+| 4711 | e308 SHA1MD5USER | e471 SHA1MD5PASS-SALT |
+| 32420 | e510 SHA512SHA512RAWUSER | *(none)* |
+
+```bash
+# salt channel -> e579
+mdxfind -m 4510 -s salts.txt -f hashes.txt wordlist.txt
+  -m 4510: -s/-S supplied, selecting e579 SHA1SHA1PASSSALT
+
+# userid channel -> e310
+mdxfind -m 4510 -u users.txt -f hashes.txt wordlist.txt
+  -m 4510: -u/-U supplied, selecting e310 SHA1SHA1USER
+
+# both channels -> both members
+mdxfind -m 4510 -s salts.txt -u users.txt -f hashes.txt wordlist.txt
+```
+
+Supply neither channel and the userid member is selected. Mode 32420 appends its operand to the *raw* SHA-512
+digest rather than the hex one, so e387 SHA512SHA512SALT is not an equivalent
+and there is no salt-channel member; `-s` with that mode says so rather than
+failing quietly.
+
+The channel flags may appear anywhere on the command line — they are located
+before option parsing begins, so `-s salts -m 4510` and `-m 4510 -s salts`
+behave identically.
+
+`-M` is deliberately **not** routed through this table. `-M` goes with `-F`,
+whose structured loader lifts the trailing field off the hash line into
+whichever channel the selected type owns, so the input and output lines are
+identical for either member of a pair and there is nothing to disambiguate.
+`-M 4510 -F` reads hashcat's own `hash:salt` format directly.
+
 ### Input Format
 
 Hash files contain one hash per line:

@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.638 2026/10/23 13:16:20 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.640 2026/10/26 13:10:56 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.638 2026/10/23 13:16:20 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.640 2026/10/26 13:10:56 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.640  2026/10/26 13:10:56  dlr
+ * Channel-aware dispatch for the four dual-channel hashcat modes. Idea from osh. hashcat has one trailing operand, calls it a salt, and has no userid concept at all. mdxfind has both channels, and for four constructions the catalog carries the same expression twice, once reading that operand from -u or -U and once from -s or -S, with an identical digest either way. Maphashcat can name only one member of each pair, so -m 4510 -s saltfile selected the userid member e310, discarded the salt file, generated a userid pool of its own and reported a clean run that found nothing. Measured before the change: 19,998 hash calculations and None found, sorry, against a hash that -m e579 -s recovers on the first word. New table Mapdualchannel holds mode, userid member, salt member for 3610 e356 and e347, 4510 e310 and e579, 4711 e308 and e471, and 32420 e510 with no salt member. -m now selects the member matching the channel actually supplied, both members when both channels are supplied, and the userid member when neither is, which is the prior behaviour. The member chosen is printed on stderr whenever a channel flag decided it. 4711 has three identical salt-side entries, e471 and e578 and e587; e471 is dispatched to because that is what tools/hx_dedup_check reports, and the other two are left alone as the historical duplicates they are. 32420 appends its operand to the raw sha512 digest rather than the hex one, so e387 is not an equivalent and no salt member exists; supplying -s there now says so rather than silently selecting a type the salt cannot feed. -M is deliberately not routed through the table. -M goes with -F, whose structured loader lifts the trailing field off the hash line into whichever channel the selected type owns, so the input and output lines are byte-identical for either member of a pair, verified both ways on hashcat 4510 stock data, and there is nothing to disambiguate. The decision cannot be made inside case m: getopt reports options strictly left to right, so a test there would see only the flags preceding -m and -s salts -m 4510 would select a different type from -m 4510 -s salts, and it cannot be deferred past the loop either because -F is handled inside it and needs Dohash already populated. argv is therefore pre-scanned for the channel flags before getopt runs, stepping over option arguments exactly as getopt does so that a file named -u is not mistaken for the flag; verified that -r -s leaves the salt channel unset. Verified on all four modes against digests computed independently in python: salt side, userid side, both channels, neither channel, flags in either order, -S and -U as well as -s and -u, clustered flags, and -M 4510 -F unchanged. No digest changes and no behaviour change for any mode outside the table, confirmed with -m 0 and -m 4500, the latter with -s present to prove it is not rerouted.
+ *
+ * Revision 1.639  2026/10/25 00:04:11  dlr
+ * Correct the TypeOpts entries for e841 BLAKE2B512 and e845 BLAKE2B256: both carried TYPEOPT_NEEDSALT and TYPEOPT_SALTJUDY although neither is salted. Their procjob cases are the unsalted ones, commented as such, calling blake2b_hash on the candidate alone with no salt reference, and both agree byte-for-byte with a reference BLAKE2b of the password, so the flags described a salt the arithmetic never used. The consequence was not a wrong digest but wasted and misleading machinery: gen_salts manufactured a one- and two-character salt pool for them whenever a run supplied no -s, the loader put them in Dosalt and set LoadSalt so a -s file was ingested on their behalf, and the per-type option hint advertised s. It also made both types read as salted to anything deriving eligibility from this table, which is how mdindex excludes them from an index they belong in. BLAKE2 does carry salt and personalisation fields in its parameter block, but mdxfind passes no key and leaves the block at its default, so these two are plain unsalted digests. e844 BLAKE2S256 was already correct. Verified on the Linux build host: e841 and e845 recover their hash with no -s at all, in two hash calculations, digests matching hashlib for both; the genuinely salted siblings e842 e843 e846 e847 are untouched and still recover with -s. Strictly a flag correction, no code path altered.
+ *
  * Revision 1.638  2026/10/23 13:16:20  dlr
  * Silence the byte compiler under -8 when its refusal is the expected answer, and give its diagnostic an intact line to echo. Under -8 both compilers run for every rule, and a rule carrying a quoted or multi-codepoint operand is one the BYTE compiler MUST refuse: that refusal IS the UTF-32-REQUIRED tag. Printing a parse error for it told the user their rule file was broken when it was not, and a 15-line hand-authored file produced 14 errors while still loading every rule. The fix is ordering: ask validrule_u32 FIRST, then gate packrules_len on the answer, which is what procrule has done since 1.34. Still audible when BOTH compilers refuse, so a genuinely bad rule keeps its caret. In byte mode Utf32Rules is 0 and the && short circuits, so nothing changes and nothing extra is spent. Also sets Ruleecho so the echo shows the authored text rather than the in-place-compiled buffer. Named Ruleecho because this file already has an unrelated Rulesrc, the packed rule-source slab. Measured on fpga: 12 errors to 0, hits unchanged at 601 of 601.
  *
@@ -7600,6 +7606,48 @@ struct MapHashcat {
     {67000, 995},  /* 67000 | yescrypt */
     {65535, 65535}}; /*EOF */
 
+/*
+ * Dual-channel hashcat modes.
+ *
+ * hashcat has one trailing operand, calls it $salt, and has no userid concept
+ * at all.  mdxfind has both channels, and for these four constructions the
+ * catalog carries the SAME expression twice -- once reading the trailing
+ * operand from -u/-U, once from -s/-S.  The digest is identical either way;
+ * only the channel the operator feeds differs.  Maphashcat can name just one
+ * of each pair, so `-m <mode> -s saltfile` used to select the userid member,
+ * discard the salt file, invent a userid pool, and report a clean run that
+ * found nothing.
+ *
+ * -m now picks the member matching the channel actually supplied.  -M is
+ * deliberately NOT routed through this table: -M goes with -F, the structured
+ * loader lifts the trailing field off the hash line into whichever channel the
+ * selected type owns, and the input and output lines are then identical for
+ * either member -- there is nothing to disambiguate, so the long-standing
+ * mapping is the right one to keep.
+ *
+ * Idea: @osh.
+ */
+static const struct {
+  unsigned int   hc;    /* hashcat mode                                      */
+  unsigned short user;  /* member reading the operand from -u/-U             */
+  unsigned short salt;  /* member reading it from -s/-S; 0 if none exists    */
+} Mapdualchannel[] = {
+    { 3610, 356, 347},  /* md5(md5(md5(pass)) . X)                           */
+    { 4510, 310, 579},  /* sha1(sha1(pass) . X)                              */
+    { 4711, 308, 471},  /* Huawei sha1(md5(pass) . X).  e578 and e587 are
+                         * historical duplicates of e471; hx_dedup_check
+                         * reports e471, so that is the one dispatched to.    */
+    {32420, 510,   0},  /* sha512(sha512_bin(pass) . X) -- the operand is
+                         * appended to the RAW digest.  e387 appends to the
+                         * HEX one, so it is not a twin and there is no
+                         * salt-channel member to dispatch to.                */
+    {0, 0, 0}};
+
+/* Set by the argv pre-scan in main(), before getopt runs; see the comment
+ * there for why the test cannot live inside case 'm'. */
+static int Arg_have_salt = 0;
+static int Arg_have_user = 0;
+
 char *Types[] = {
     /*   0    1       2      3     4    5      6       7       8       9 */
     "none", "MD5", "MD5UC", "MD4", "MD2", "WRL", "HAV128", "SHA0", "SHA1", "SHA224",
@@ -10118,11 +10166,11 @@ static unsigned short TypeOpts[JOB_DONE] = {
     [838] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* HMAC-STREEBOG256 */
     [839] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* HMAC-STREEBOG512-KPASS */
     [840] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* HMAC-STREEBOG512 */
-    [841] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BLAKE2B512 */
+    [841] = TYPEOPT_NEEDSF,  /* BLAKE2B512 */
     [842] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BLAKE2B512PASSSALT */
     [843] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BLAKE2B512SALTPASS */
     [844] = TYPEOPT_NEEDSF,  /* BLAKE2S256 */
-    [845] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BLAKE2B256 */
+    [845] = TYPEOPT_NEEDSF,  /* BLAKE2B256 */
     [846] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BLAKE2B256PASSSALT */
     [847] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* BLAKE2B256SALTPASS */
     [848] = TYPEOPT_NEEDSF | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* DESENCRYPT */
@@ -54709,6 +54757,42 @@ union HashU curin;
     }
   }
 
+  /*
+   * Which channel flags appear ANYWHERE in argv.
+   *
+   * The dual-channel dispatch in case 'm' has to know whether -s/-S or -u/-U
+   * was supplied, and getopt reports options strictly left to right, so a test
+   * written inside case 'm' would see only the flags that happened to precede
+   * -m on the command line: `-s salts -m 4510` and `-m 4510 -s salts` would
+   * then select different types, which is a silent wrong-type run either way
+   * round.  Deferring the decision until after the loop is not available
+   * either -- -F is handled inside it and needs Dohash already populated,
+   * which is why the man page requires the selection to precede -F.
+   *
+   * So scan argv first.  Option ARGUMENTS are stepped over exactly as getopt
+   * steps over them, so a salt file that happens to be named -u is not
+   * mistaken for the flag.
+   */
+  {
+    static const char takesarg[] = "GfghijkmnqrstuwxFJLNRMSUPWX";
+    const char *p;
+    int ai;
+    for (ai = 1; ai < argc; ai++) {
+      if (argv[ai][0] != '-' || argv[ai][1] == 0)
+        continue;
+      if (argv[ai][1] == '-' && argv[ai][2] == 0)
+        break;                          /* -- ends the options */
+      for (p = argv[ai] + 1; *p; p++) {
+        if (!strchr(takesarg, *p))
+          continue;                     /* flag letter, no argument */
+        if (*p == 's' || *p == 'S') Arg_have_salt = 1;
+        if (*p == 'u' || *p == 'U') Arg_have_user = 1;
+        if (p[1] == 0) ai++;            /* argument is the next argv entry */
+        break;                          /* rest of this token is the argument */
+      }
+    }
+  }
+
   while ((ch = getopt(argc, argv, "?8abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:L:N:R:M:S:U:P:W:X:")) != -1) {
     switch (ch) {
       case 'X':
@@ -54866,6 +54950,35 @@ union HashU curin;
             if (y == 14400 && Maxiter < 10)
               Maxiter = 10;
             /* Default salts for modes 24/124/125 deferred to post-load */
+            /* Dual-channel modes: pick the member matching the channel the
+             * operator actually fed.  See Mapdualchannel[] above. */
+            { int d;
+              for (d = 0; Mapdualchannel[d].hc; d++)
+                if (Mapdualchannel[d].hc == (unsigned int)y)
+                  break;
+              if (Mapdualchannel[d].hc) {
+                int got = 0;
+                if (Arg_have_salt && Mapdualchannel[d].salt) {
+                  J1S(RC, Dohash, Mapdualchannel[d].salt);
+                  fprintf(stderr, "-m %d: -s/-S supplied, selecting e%d %s\n",
+                          y, Mapdualchannel[d].salt,
+                          Types[Mapdualchannel[d].salt]);
+                  got = 1;
+                }
+                if (Arg_have_salt && !Mapdualchannel[d].salt)
+                  fprintf(stderr, "-m %d: this mode's operand is read from the "
+                          "userid channel (-u/-U); it has no salt-channel "
+                          "type, so -s/-S does not feed it\n", y);
+                if (Arg_have_user || !got) {
+                  J1S(RC, Dohash, Mapdualchannel[d].user);
+                  if (Arg_have_user)
+                    fprintf(stderr, "-m %d: -u/-U supplied, selecting e%d %s\n",
+                            y, Mapdualchannel[d].user,
+                            Types[Mapdualchannel[d].user]);
+                }
+                continue;
+              }
+            }
             y = Maphashcat[x].mdx;
             J1S(RC, Dohash, y);
           }
