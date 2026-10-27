@@ -1967,8 +1967,8 @@ static void gpujob_metal_worker(void *arg) {
                  * at all, which stopped being true with the post-1.602
                  * mask-range fix. */
                 int b71_mask_active =
-                    (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 16
-                     && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 16
+                    (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 32
+                     && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 32
                      && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                      && gpu_mask_total > 0);
                 /* A chunked job's kernel packed combined_ridx against its
@@ -2327,8 +2327,8 @@ static void gpujob_metal_worker(void *arg) {
                     if (b71_mask_active) {
                         int npre = gpu_mask_n_prepend;
                         int napp = gpu_mask_n_append;
-                        if (npre > 16) npre = 16;
-                        if (napp > 16) napp = 16;
+                        if (npre > 32) npre = 32;
+                        if (napp > 32) napp = 32;
                         /* append_combos = product(sizes[npre..npre+napp)). */
                         uint64_t append_combos = 1u;
                         for (int j = 0; j < napp; j++) {
@@ -2351,8 +2351,8 @@ static void gpujob_metal_worker(void *arg) {
                         uint64_t prepend_idx  = mask_idx_abs / append_combos;
                         uint64_t append_idx   = mask_idx_abs % append_combos;
 
-                        char prepend_chars[16];
-                        char append_chars[16];
+                        char prepend_chars[32];
+                        char append_chars[32];
                         /* Decode prepend chars (positions [0..npre) in
                          * mask_charsets layout). Last position innermost. */
                         {

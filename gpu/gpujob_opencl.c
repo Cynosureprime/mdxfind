@@ -1512,8 +1512,8 @@ void gpujob(void *arg) {
                  * downstream (line ~2290) already widened to uint64 with
                  * the BF-aware bf_num_masks substitution. */
                 b71_mask_size_acct = 1; /* reset inside !_proto_fired (declared above) */
-                if (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 16
-                    && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 16
+                if (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 32
+                    && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 32
                     && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                     && gpu_mask_total > 0) {
                     /* BF chunks cover only bf_num_masks of the keyspace per
@@ -1926,8 +1926,8 @@ void gpujob(void *arg) {
                      * See OCLParams.num_salts pack at gpu_opencl.c:~10420. */
                     uint64_t b71_mask_size = 1;
                     int b71_mask_active =
-                        (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 16
-                         && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 16
+                        (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 32
+                         && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 32
                          && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                          && gpu_mask_total > 0);
                     if (b71_mask_active) {
@@ -2522,8 +2522,8 @@ void gpujob(void *arg) {
                         if (b71_mask_active) {
                             int npre = gpu_mask_n_prepend;
                             int napp = gpu_mask_n_append;
-                            if (npre > 16) npre = 16;
-                            if (napp > 16) napp = 16;
+                            if (npre > 32) npre = 32;
+                            if (napp > 32) napp = 32;
                             int n_total = npre + napp;
                             /* Compute append_combos from sizes[npre..npre+napp).
                              * Phase 1.5 (2026-05-10): widened to uint64 to mirror
@@ -2595,8 +2595,8 @@ void gpujob(void *arg) {
                             uint64_t prepend_idx = mask_idx_abs / (uint64_t)append_combos;
                             uint64_t append_idx  = mask_idx_abs % (uint64_t)append_combos;
 
-                            char prepend_chars[16];
-                            char append_chars[16];
+                            char prepend_chars[32];
+                            char append_chars[32];
                             /* Decode prepend chars (positions [0..npre) in
                              * mask_charsets layout). */
                             {

@@ -518,8 +518,8 @@ kernel void template_phase0(
      * representable. */
     uint  mask_npre_h = params.n_prepend;
     uint  mask_napp_h = params.n_append;
-    if (mask_npre_h > 16u) mask_npre_h = 16u;
-    if (mask_napp_h > 16u) mask_napp_h = 16u;
+    if (mask_npre_h > 32u) mask_npre_h = 32u;
+    if (mask_napp_h > 32u) mask_napp_h = 32u;
     ulong mask_append_combos_h = 1u;
     for (uint j = 0u; j < mask_napp_h; j++) {
         uint sz = mask_sizes[mask_npre_h + j];

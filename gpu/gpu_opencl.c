@@ -5285,7 +5285,7 @@ int gpu_opencl_get_op(int dev_idx) {
  * tables[i] = 256-byte character table for position i
  * Kernel indexes: ch = mask_desc[n_total + i*256 + (idx % mask_desc[i])] */
 #ifndef MAX_MASK_POS
-#define MAX_MASK_POS 16
+#define MAX_MASK_POS 32
 #endif
 uint8_t gpu_mask_desc[MAX_MASK_POS + MAX_MASK_POS * 256];
 uint8_t gpu_mask_sizes[MAX_MASK_POS];  /* for hit reconstruction */
@@ -5343,7 +5343,7 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
      * (which had no prepend section). B7.8 keeps the same row layout
      * for npre/napp <= 8, just allows larger configurations. */
     {
-        enum { MASK_POS_CAP = 16, MASK_TOTAL_CAP = MASK_POS_CAP * 2 };
+        enum { MASK_POS_CAP = 32, MASK_TOTAL_CAP = MASK_POS_CAP * 2 };
         uint8_t  b7_charsets[MASK_TOTAL_CAP * 256];
         uint32_t b7_sizes[MASK_TOTAL_CAP];
         memset(b7_charsets, 0, sizeof(b7_charsets));
@@ -15168,7 +15168,7 @@ validator_skip:
      * count. */
     uint32_t b71_mask_size = 1;
     int b7_mask_eligible =
-        (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 16 &&
+        (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 32 &&
          gpu_mask_n_append  >= 0 && gpu_mask_n_append  <= 16 &&
          (gpu_mask_n_prepend + gpu_mask_n_append) >= 1 &&
          gpu_mask_total > 0 && gpu_mask_total <= 0xFFFFFFFFu);

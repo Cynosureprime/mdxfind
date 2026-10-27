@@ -569,10 +569,16 @@ static id<MTLBuffer> buf_hashes_shown     = nil;   /* on-GPU dedup (lazy) */
  *
  *   mtl_audit_hits_delivered -- running total of hit-slot reservations
  *       handed back to the host across every batch of the run.
- *   mtl_audit_shown_bytes    -- size of the one-time hashes_shown
- *       allocation, so shutdown can popcount exactly that many bytes;
- *       it doubles as the bound for the under-size guard at the
- *       dispatch site.
+ *   mtl_buf_kernelb_hashes_shown_cap (declared above) -- size of the
+ *       hashes_shown allocation, so shutdown can popcount exactly that
+ *       many bytes; it doubles as the bound for the under-size guard at
+ *       the dispatch site.  2026-10-27: this used to be a SECOND tracker
+ *       private to the legacy carrier, mtl_audit_shown_bytes.  Both
+ *       described the one shared buf_hashes_shown, and each path updated
+ *       only its own, so a run mixing a codegen type with a legacy-carrier
+ *       type aborted with "hashes_shown buffer too small (allocated 0
+ *       bytes)" even though the buffer was exactly the right size.  One
+ *       buffer, one tracker.
  *
  * At shutdown, popcount(hashes_shown) counts the claims that were NOT
  * rolled back by the overflow arm, and must equal
@@ -580,7 +586,6 @@ static id<MTLBuffer> buf_hashes_shown     = nil;   /* on-GPU dedup (lazy) */
  * never reached the host. Reported loudly when they disagree, per
  * feedback_external_failures_are_fatal.md (never silently under-report). */
 static uint64_t mtl_audit_hits_delivered = 0ull;
-static size_t   mtl_audit_shown_bytes    = 0;
 
 /* Phase 2a row 6: rule_program + rule_offset MTLBuffers. Uploaded lazily
  * on first rules dispatch from the gpu_rule_program / gpu_rule_offsets
@@ -605,7 +610,7 @@ static int                  cached_rule_count    = 0;
  * rows are filled and the rest is zero-padded sentinel + size=1 so any
  * stray divmod in the kernel terminates safely. */
 #ifndef METAL_MASK_POS_CAP
-#define METAL_MASK_POS_CAP 16
+#define METAL_MASK_POS_CAP 32
 #endif
 #ifndef METAL_MASK_TOTAL_CAP
 #define METAL_MASK_TOTAL_CAP (METAL_MASK_POS_CAP * 2)
@@ -2257,9 +2262,9 @@ void gpu_metal_shutdown(void)
      * record total. A shortfall means a claimed (hash, iter) never
      * reached the host and that crack was silently suppressed -- exactly
      * the failure class this audit exists to make loud. */
-    if (buf_hashes_shown != nil && mtl_audit_shown_bytes > 0) {
+    if (buf_hashes_shown != nil && mtl_buf_kernelb_hashes_shown_cap > 0) {
         const uint32_t *hs = (const uint32_t *)[buf_hashes_shown contents];
-        size_t nwords = mtl_audit_shown_bytes / sizeof(uint32_t);
+        size_t nwords = mtl_buf_kernelb_hashes_shown_cap / sizeof(uint32_t);
         uint64_t bits = 0ull;
         for (size_t i = 0; i < nwords; i++) bits += (uint64_t)__builtin_popcount(hs[i]);
         /* Audited only on a real mismatch; MDXFIND_METAL_EMIT_AUDIT used to
@@ -2276,7 +2281,6 @@ void gpu_metal_shutdown(void)
         }
     }
     mtl_audit_hits_delivered = 0ull;
-    mtl_audit_shown_bytes    = 0;
     buf_hashes_shown     = nil;
     buf_rule_program     = nil;
     buf_rule_offset      = nil;
@@ -9329,7 +9333,9 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         if (need_slots == 0) need_slots = 1;
         size_t hs_bytes = need_slots * sizeof(uint32_t);
         if (hs_bytes < METAL_MIN_BUFFER_BYTES) hs_bytes = METAL_MIN_BUFFER_BYTES;
-        if (buf_hashes_shown == nil) {
+        if (buf_hashes_shown == nil
+            || hs_bytes > mtl_buf_kernelb_hashes_shown_cap) {
+            buf_hashes_shown = nil;  /* ARC drop old before realloc */
             buf_hashes_shown =
                 [mtl_device newBufferWithLength:hs_bytes
                                         options:MTLResourceStorageModeShared];
@@ -9339,14 +9345,15 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                           hs_bytes, op, need_slots);
             }
             memset([buf_hashes_shown contents], 0, hs_bytes);
-            /* 2026-08-30: remember what was actually allocated. This
-             * buffer is allocated ONCE and deliberately never resized --
-             * it carries dedup state across every batch of the run, so
-             * reallocating it would silently re-report already-emitted
-             * cracks. The codegen sibling at the top of this file does
-             * grow its copy, because there the buffer is re-zeroed per
-             * dispatch anyway. */
-            mtl_audit_shown_bytes = hs_bytes;
+            /* 2026-10-27: record the allocation in the SAME tracker the
+             * codegen paths use -- one buffer, one size.  A grow restarts
+             * dedup from empty rather than copying the old bits forward:
+             * the buffer is indexed by hash-table index, so once the table
+             * has grown those bits no longer name the same hashes.
+             * Carrying them would SUPPRESS a crack; dropping them can at
+             * worst re-emit one.  The codegen siblings re-zero on every
+             * dispatch for the same reason. */
+            mtl_buf_kernelb_hashes_shown_cap = hs_bytes;
         }
         /* If a later dispatch needs more dedup slots than the one-time
          * allocation holds, the kernel would index hashes_shown[] past
@@ -9355,13 +9362,12 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * detect that, and the visible symptom would be corrupted or
          * missing cracks -- the exact failure class this dispatch path
          * was just audited for. Refuse to run it. */
-        if (hs_bytes > mtl_audit_shown_bytes) {
+        if (hs_bytes > mtl_buf_kernelb_hashes_shown_cap) {
             GPU_FATAL("Metal: hashes_shown buffer too small for this dispatch "
                       "(allocated %zu bytes, need %zu; op=%d need_slots=%zu "
-                      "hash_data_count=%d overflow_count=%d). The legacy "
-                      "carrier sizes this dedup buffer once per GPU session "
-                      "and cannot grow it without discarding dedup state.",
-                      mtl_audit_shown_bytes, hs_bytes, op, need_slots,
+                      "hash_data_count=%d overflow_count=%d). The alloc-or-grow "
+                      "arm immediately above should have made this unreachable.",
+                      mtl_buf_kernelb_hashes_shown_cap, hs_bytes, op, need_slots,
                       cache_hash_data_count, cache_overflow_count);
         }
 

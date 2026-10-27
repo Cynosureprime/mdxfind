@@ -633,8 +633,8 @@ void template_phase0(
      * Bounds-checked against TPL_BUF_LIMIT for safety. */
     uint npre = params.n_prepend;
     uint napp = params.n_append;
-    if (npre > 16u) npre = 16u;
-    if (napp > 16u) napp = 16u;
+    if (npre > 32u) npre = 32u;
+    if (napp > 32u) napp = 32u;
 
     /* BF Phase 1.8 inner_iter wrap REVERTED (2026-05-10): mask_idx_abs is
      * the base value computed above; no per-iter shift. */

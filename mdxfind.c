@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.640 2026/10/26 13:10:56 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.641 2026/10/27 12:31:05 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.640 2026/10/26 13:10:56 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.641 2026/10/27 12:31:05 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.641  2026/10/27 12:31:05  dlr
+ * Brute force fans out across cores, and the template mask-slot cap goes 16 -> 32. Two user-reported problems, one release. (1) A CPU-only brute force ran on ONE core and reported nothing while it ran. The legacy arm submitted a single job of MaskTotal, and one job is one procjob thread: a 22-position mask over 1e9 candidates took 215s at 4.65 MH/s on fpga with fifteen of sixteen cores idle. It was also silent -- procjobs only per-second checkpoint sits at the top of the per-line loop, a brute-force job carries numline == 1, so the body runs once with the counters still zero and the whole mask is walked in the inner do/while, which has no checkpoint. Tothash, Totfound, TotLines and job->outbuf were all held to job end, so the display read 0.0/1.0G at 0.00 h/s with Found=0 and an ETA of done for the entire run, and a hash recovered at mask index 500 was not printed for 215 seconds. The keyspace is now fanned out into bounded chunks, which fixes both: every chunk completion flushes all four through the job-exit accounting, with no change to the hot loop. Chunk jobs past the first carry JOBFLAG_MASK_SUBCHUNK so the single seed line is retired once. Fan-out is gated to the three routes where no mask-iterating GPU dispatch can follow -- no gpujob, BfMaskGpuUsable clear, or GPU_CAT_NONE -- because the Metal mask path ignores the chunk range and uses the full gpu_mask_total, so chunking into it would multiply the work rather than divide it. Measured: fpga 215.07s -> 18.03s on 1e9 (11.9x), dev1 152.54 -> 29.06s, dev3 134.10 -> 14.91s, exact keyspace and both planted boundary candidates recovered every time. (2) The template mask-slot cap per side is raised 16 -> 32 (new GPU_MASK_SLOT_CAP, distinct from the private-scratch-backed GPU_MASK_VAR_CAP, which stays 16). One slot per mask POSITION with literals as degenerate one-character tables, so a fixed-suffix mask needs far more slots than it has placeholders -- ?a?a?a?a?a?a@gmail10p.com is 19 -- and such masks were refused to the CPU. With the lift that mask runs on the fpga GPU at 1.09 GH/s against 60.91 MH/s on CPU: 735,092,015,104 candidates in 677 seconds, 3.4 hours down to 11 minutes, both planted digests recovered. The decline message now names the unit and the path instead of reporting a raw MaskAppendLen against a cap the reader cannot relate to it. Also records, at the gate, why brute force cannot simply move to the A2/A3/A4 descriptor wire: BF chunks submit through the rules-engine slot, whose kernel reads the per-position tables, so clearing the gate hands the GPU a job it cannot execute -- measured on dev1 M1, all 81,453,056 candidates hashed and 0 hits while -G none found all three planted answers.
+ *
  * Revision 1.640  2026/10/26 13:10:56  dlr
  * Channel-aware dispatch for the four dual-channel hashcat modes. Idea from osh. hashcat has one trailing operand, calls it a salt, and has no userid concept at all. mdxfind has both channels, and for four constructions the catalog carries the same expression twice, once reading that operand from -u or -U and once from -s or -S, with an identical digest either way. Maphashcat can name only one member of each pair, so -m 4510 -s saltfile selected the userid member e310, discarded the salt file, generated a userid pool of its own and reported a clean run that found nothing. Measured before the change: 19,998 hash calculations and None found, sorry, against a hash that -m e579 -s recovers on the first word. New table Mapdualchannel holds mode, userid member, salt member for 3610 e356 and e347, 4510 e310 and e579, 4711 e308 and e471, and 32420 e510 with no salt member. -m now selects the member matching the channel actually supplied, both members when both channels are supplied, and the userid member when neither is, which is the prior behaviour. The member chosen is printed on stderr whenever a channel flag decided it. 4711 has three identical salt-side entries, e471 and e578 and e587; e471 is dispatched to because that is what tools/hx_dedup_check reports, and the other two are left alone as the historical duplicates they are. 32420 appends its operand to the raw sha512 digest rather than the hex one, so e387 is not an equivalent and no salt member exists; supplying -s there now says so rather than silently selecting a type the salt cannot feed. -M is deliberately not routed through the table. -M goes with -F, whose structured loader lifts the trailing field off the hash line into whichever channel the selected type owns, so the input and output lines are byte-identical for either member of a pair, verified both ways on hashcat 4510 stock data, and there is nothing to disambiguate. The decision cannot be made inside case m: getopt reports options strictly left to right, so a test there would see only the flags preceding -m and -s salts -m 4510 would select a different type from -m 4510 -s salts, and it cannot be deferred past the loop either because -F is handled inside it and needs Dohash already populated. argv is therefore pre-scanned for the channel flags before getopt runs, stepping over option arguments exactly as getopt does so that a file named -u is not mistaken for the flag; verified that -r -s leaves the salt channel unset. Verified on all four modes against digests computed independently in python: salt side, userid side, both channels, neither channel, flags in either order, -S and -U as well as -s and -u, clustered flags, and -M 4510 -F unchanged. No digest changes and no behaviour change for any mode outside the table, confirmed with -m 0 and -m 4500, the latter with -s present to prove it is not rerouted.
  *
@@ -10527,6 +10530,17 @@ unsigned long Iter_Count[] = {0, 10, 10, 100, 100, 1000, 1000, 1000, 1000, 10000
 #define MAX_MASK_POS 256
 #define MAX_MASK_POS_GPU_SIDE 16        /* deprecated alias for GPU_MASK_VAR_CAP */
 #define GPU_MASK_VAR_CAP        16      /* placeholder positions per side */
+/* Template / rules-engine mask SLOT cap per side (B7.9, 2026-10-26: 16 -> 32).
+ * Distinct from GPU_MASK_VAR_CAP above, which bounds the kernel-A descriptor
+ * walker's PLACEHOLDER count and is backed by per-thread private scratch.
+ * This one bounds the template path's per-position charset rows, which live in
+ * a shared __global buffer (gpu_template.cl mask_charsets), so widening it
+ * costs global memory and divmod iterations rather than registers. Literals
+ * occupy a row each here -- that is why "?a?a?a?a?a?a@gmail10p.com" needs 19.
+ * Must move together with: gpu_opencl.c MAX_MASK_POS + MASK_POS_CAP,
+ * gpu_metal.m METAL_MASK_POS_CAP, gpujob_metal.m prepend_chars/append_chars,
+ * and the 32u clamps in gpu_template.cl + metal_template.metal. */
+#define GPU_MASK_SLOT_CAP       32      /* template-path positions per side */
 #define GPU_MASK_LIT_BYTES_CAP  224     /* literal bytes per side */
 #define GPU_MASK_DESC_BYTES_CAP 320     /* run-descriptor stream cap per side */
 #define GPU_MASK_DESC_TAG_LIT   0x00u
@@ -14466,8 +14480,8 @@ while (1) {
      * prepend+append (?[abc] / ?[123]) custom-class fixtures. */
     int mask_b71_eligible =
         !job->MaskCount ||
-        (MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
-         MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
+        (MaskPrependLen >= 0 && MaskPrependLen <= 32 &&
+         MaskAppendLen  >= 0 && MaskAppendLen  <= 32 &&
          (MaskPrependLen + MaskAppendLen) >= 1);
     /* v1.529: the OpenCL rules dispatch caps its per-page salt count so the
        1-D global work size (words x rules x mask x salt-axis) stays under the
@@ -15612,8 +15626,8 @@ while (1) {
          * For mixed GPU+CPU rules (gpu_legacy_slot_unused == 0), the
          * CPU walker still needs to iterate masks for the CPU rules. */
         if (gpu_legacy_slot_unused && job->MaskCount &&
-            MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
-            MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
+            MaskPrependLen >= 0 && MaskPrependLen <= 32 &&
+            MaskAppendLen  >= 0 && MaskAppendLen  <= 32 &&
             (MaskPrependLen + MaskAppendLen) >= 1) {
           number_iter = (unsigned long long)job->MaskCount;  /* loop bottom: !(number_iter < MaskCount) */
         }
@@ -15757,8 +15771,8 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
        * (rule, word) so CPU re-walk would double-fire. */
       int b71_mask_skip_ok =
           !job->MaskCount ||
-          (MaskPrependLen >= 0 && MaskPrependLen <= 16 &&
-           MaskAppendLen  >= 0 && MaskAppendLen  <= 16 &&
+          (MaskPrependLen >= 0 && MaskPrependLen <= 32 &&
+           MaskAppendLen  >= 0 && MaskAppendLen  <= 32 &&
            (MaskPrependLen + MaskAppendLen) >= 1);
       /* C2.3 tested `my_jobg_rules` -- the THREAD's slot pointer, which
        * persists across words -- where it must test the PER-WORD flag.  The
@@ -15852,7 +15866,7 @@ if (job->flags & JOBFLAG_NUMBERS) {
      * salted ops). All GPU_CAT_MASK ops now route exclusively through
      * the unified template / rules-engine path (chokepoint at line ~10299,
      * gpu_rules_engine_active gate). Mask configurations within
-     * MaskPrependLen <= 16 + MaskAppendLen <= 16 (B7.8 cap) AND admitted
+     * MaskPrependLen <= 32 + MaskAppendLen <= 32 (B7.9 cap) AND admitted
      * to the rules-engine OR-chain are GPU-handled there; configurations
      * outside that scope CPU-fall-back per architect §11 (B9 row).
      * RCS history retains the prior block (mdxfind.c rev 1.420). */
@@ -61209,19 +61223,69 @@ usage:
          * 2026-05-26: per-side cap enforced. If the brute-force append
          * mask exceeds MAX_MASK_POS_GPU_SIDE, skip the upload entirely
          * and route via CPU. The CPU iterator handles up to
-         * MAX_MASK_POS=256 per pattern. */
+         * MAX_MASK_POS=256 per pattern.
+         *
+         * Why brute force does not get the 2026-05-30 long-mask amendment
+         * (investigated 2026-10-26, do not re-derive): that amendment
+         * decoupled the budgets into 16 placeholders + 224 literal bytes
+         * and both BF kernels have carried uchar appbuf[240] and the
+         * descriptor walker since.  "?a?a?a?a?a@gmail10p.com" is 5 vars +
+         * 13 literal bytes and IS accepted under -n / -N, which prints
+         * "app vars=5 lit=13".  Two things keep BF off it, and only the
+         * first looks fixable from here:
+         *
+         *   1. The gate and pack serving -n / -N sit at the gpu_avail init
+         *      path under "if (MaskPrependLen > 0 || MaskAppendLen > 0)",
+         *      which runs BEFORE a brute-force mask exists -- a BF mask is
+         *      the bare argv[0], parsed in this block, so MaskAppendLen is
+         *      still 0 up there and the whole gate is skipped.
+         *   2. The decisive one: the BF chunk short-circuit submits through
+         *      the RULES-ENGINE slot (gpujob_get_free_rules), and that
+         *      kernel reads the per-position tables below, not a descriptor.
+         *      Packing a descriptor here and opening the gate therefore
+         *      hands the GPU a job it cannot execute.  Measured on dev1 M1,
+         *      2026-10-26: all 81,453,056 candidates of a 4-var/13-lit mask
+         *      hashed, 0 hits, while -G none found all three planted
+         *      answers -- the same shape of silent GPU-ate-the-keyspace
+         *      failure that BfMaskGpuUsable exists to prevent.
+         *
+         * Lifting this needs BF chunks dispatched to the A4 kernel
+         * (cand_bruteforce_phase0) rather than the rules-engine kernel, on
+         * both backends.  That is a dispatcher change, not a host gate. */
 #ifdef GPU_ENABLED
         if (gpujob_available()) {
-          static uint8_t bf_mask_sizes[MAX_MASK_POS_GPU_SIDE * 2];
-          static uint8_t bf_mask_tables[MAX_MASK_POS_GPU_SIDE * 2][256];
+          static uint8_t bf_mask_sizes[GPU_MASK_SLOT_CAP * 2];
+          static uint8_t bf_mask_tables[GPU_MASK_SLOT_CAP * 2][256];
           int bf_napp = 0;
           int bf_ok = 1;
-          if (MaskAppendLen > MAX_MASK_POS_GPU_SIDE) {
+          if (MaskAppendLen > GPU_MASK_SLOT_CAP) {
+            /* Name the path and the unit. The count is POSITIONS, literals
+             * included, because the brute-force GPU wire packs one table
+             * slot per position with literals as degenerate one-character
+             * tables -- so "?a?a?a?a?a@gmail10p.com" is 18, not the 5
+             * placeholders a reader counts, and shortening the variable
+             * part will not help.
+             *
+             * This is NOT the A2/A3/A4 descriptor wire, which does decouple
+             * the two budgets (16 placeholders + 224 literal bytes) and
+             * which accepts this very mask under -n / -N. Brute force
+             * cannot reach it: the BF chunk short-circuit submits through
+             * the RULES-ENGINE slot (gpujob_get_free_rules), and the
+             * rules-engine kernel reads the per-position tables uploaded
+             * by gpu_opencl_set_mask / gpu_metal_set_mask. Packing a
+             * descriptor here and clearing this gate is not sufficient and
+             * is actively dangerous -- measured on dev1 M1, 2026-10-26:
+             * the GPU accepted the job, hashed all 81,453,056 candidates
+             * of a 4-var/13-lit mask and returned 0 hits while the CPU
+             * found all three planted answers. Moving BF onto the
+             * descriptor wire means dispatching BF chunks to the A4 kernel
+             * (cand_bruteforce_phase0) instead of the rules-engine kernel,
+             * on both backends. Until then this gate stands. */
             fprintf(stderr,
-              "Brute-force mask exceeds GPU per-side cap "
-              "(MaskAppendLen=%d, GPU per-side cap=%d). BF job will run "
-              "on CPU only.\n",
-              MaskAppendLen, MAX_MASK_POS_GPU_SIDE);
+              "Brute-force mask exceeds the brute-force GPU mask-slot cap "
+              "(%d slots needed, one per position incl. literals; cap %d). "
+              "BF runs on CPU, across all cores.\n",
+              MaskAppendLen, GPU_MASK_SLOT_CAP);
             bf_ok = 0;
           }
           if (bf_ok) for (int mi = 0; mi < MaskAppendLen; mi++) {
@@ -61505,50 +61569,122 @@ usage:
                 }
 #endif
               } else {
-                /* Legacy per-op single-job activation (non-GPU ops,
-                 * or sizing failure). Post-Phase-2 (2026-05-10) salted
+                /* Legacy per-op CPU activation (non-GPU ops, or sizing
+                 * failure). Post-Phase-2 (2026-05-10) salted
                  * GPU_CAT_MASK ops use the chunk producer above; this
                  * arm now only fires when gpujob is unavailable, the
                  * op has GPU_CAT_NONE, or adaptive_bf_chunk_size
-                 * failed. CPU procjob handles iteration. */
-                possess(FreeWaiting);
-                wait_for(FreeWaiting, NOT_TO_BE, 0);
-                job = FreeHead;
-                if (!job) { fprintf(stderr, "Job null on freehead!\n"); exit(1); }
-                FreeHead = job->next;
-                job->next = NULL;
-                if (FreeHead == NULL) FreeTail = &FreeHead;
-                twist(FreeWaiting, BY, -1);
+                 * failed. CPU procjob handles iteration.
+                 *
+                 * Fan the keyspace out over chunk jobs rather than
+                 * submitting one job of MaskTotal.  One job is one
+                 * procjob thread, so a CPU-only brute force ran on a
+                 * single core -- a 22-position mask over 1e9 candidates
+                 * took 215s at 4.65 MH/s on fpga with fifteen of its
+                 * sixteen cores idle.  It also reported nothing while it
+                 * ran: procjob's only per-second checkpoint sits at the
+                 * top of the per-line loop and a brute-force job carries
+                 * numline == 1, so the body runs once with the counters
+                 * still zero and the whole mask is walked inside the
+                 * inner do/while, which has no checkpoint of its own.
+                 * Tothash, Totfound, TotLines and job->outbuf were
+                 * therefore all held until the job ended: the display
+                 * read 0.0/1.0G at 0.00 h/s with Found=0 and an ETA of
+                 * done for the entire run, and a hash recovered at mask
+                 * index 500 was not printed for 215 seconds.  Chunking
+                 * fixes both, because every chunk completion flushes all
+                 * four through the job-exit accounting -- no change to
+                 * the hot loop, which is why the chunk size is bounded
+                 * in candidates rather than left proportional.
+                 *
+                 * The worker already supports this shape: mask_base
+                 * captures job->MaskIndex once per job and the three
+                 * rule-advance sites restart there, so a chunk owns
+                 * [MaskIndex, MaskIndex + MaskCount) under rules too.
+                 * The wordlist+mask path fans out the same way and the
+                 * GPU arm above does it per device.
+                 *
+                 * Fan out ONLY where no mask-iterating GPU dispatch can
+                 * follow, which is the question the FRAGILE block at the
+                 * wordlist fan-out insists on asking: can this op reach a
+                 * GPU kernel?  Three of this arm's routes answer no, and
+                 * they are the whole of the reported problem:
+                 *   - no gpujob at all, so nothing can be dispatched;
+                 *   - BfMaskGpuUsable clear, which means the mask passed
+                 *     MAX_MASK_POS_GPU_SIDE and therefore also fails
+                 *     mask_b71_eligible's MaskAppendLen <= 16, so no GPU
+                 *     mask path will take it either (the reported case);
+                 *   - GPU_CAT_NONE, documented in gpujob.h as "not GPU-
+                 *     capable", the FRAGILE block's fan-out case.
+                 * A GPU-capable non-MASK category reaching this arm with a
+                 * short mask keeps the single job, so its behaviour is
+                 * unchanged: on Metal the mask-iterating path ignores the
+                 * chunk range and uses the full gpu_mask_total, which is
+                 * why 1.600 confined the NDRange cap to OPENCL_GPU, and
+                 * chunking into it would multiply the work by the chunk
+                 * count instead of dividing it.  Widening to that case
+                 * needs a Metal host to validate on, not an argument. */
+                int bf_fanout_ok = 1;
+#if defined(GPU_BF_CHUNK_PRODUCER)
+                bf_fanout_ok = (!gpujob_available() || !BfMaskGpuUsable ||
+                                gpu_op_category(x) == GPU_CAT_NONE);
+#endif
+                unsigned long long bf_chunk, bf_start;
+                /* Enough chunks per core to balance the tail and to keep
+                 * the per-completion flush frequent, capped so the
+                 * reporting interval does not grow with the keyspace. */
+                bf_chunk = MaskTotal / ((unsigned long long)maxt * 32ULL);
+                if (bf_chunk == 0ULL) bf_chunk = 1ULL;
+                if (bf_chunk > (1ULL << 22)) bf_chunk = 1ULL << 22;
+                if (!bf_fanout_ok) bf_chunk = MaskTotal;  /* 1.640 behaviour */
+                for (bf_start = 0ULL; bf_start < MaskTotal;
+                     bf_start += bf_chunk) {
+                  unsigned long long bf_size = MaskTotal - bf_start;
+                  if (bf_size > bf_chunk) bf_size = bf_chunk;
 
-                job->op = x;
-                job->flags = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE;
-                job->Numbers = 0;
-                job->digits = Dodigits;
-                job->MaskIndex = 0;
-                job->MaskCount = MaskTotal;
-                job->bf_offset_per_word = 0;
-                job->bf_num_masks       = 0;
-                /* Phase 1.9 Tranche A1: legacy single-job arm (GPU
-                 * unavailable / sizing failed). CPU-only path; no GPU
-                 * dispatch happens here, so the flag is informational
-                 * only — kept zero for defensive consistency. */
-                job->bf_fast_eligible   = 0;
-                job->doneprint = &doneprint;
-                job->filename = argv[0];
-                job->startline = 0;
-                job->numline = 1;
-                job->readbuf = Readbuf;
-                job->readindex = Readindex;
-                possess(ReadBuf0);
-                twist(ReadBuf0, BY, +1);
-                if (ThreadCount < maxt) {
-                  launch(procjob, NULL);
-                  ThreadCount++;
+                  possess(FreeWaiting);
+                  wait_for(FreeWaiting, NOT_TO_BE, 0);
+                  job = FreeHead;
+                  if (!job) { fprintf(stderr, "Job null on freehead!\n"); exit(1); }
+                  FreeHead = job->next;
+                  job->next = NULL;
+                  if (FreeHead == NULL) FreeTail = &FreeHead;
+                  twist(FreeWaiting, BY, -1);
+
+                  job->op = x;
+                  job->flags = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE;
+                  /* Chunk 0 owns the single seed line; the rest must not
+                   * re-retire it, or TotLines reports the chunk count
+                   * instead of 1. */
+                  if (bf_start > 0ULL)
+                    job->flags |= JOBFLAG_MASK_SUBCHUNK;
+                  job->Numbers = 0;
+                  job->digits = Dodigits;
+                  job->MaskIndex = bf_start;
+                  job->MaskCount = bf_size;
+                  job->bf_offset_per_word = 0;
+                  job->bf_num_masks       = 0;
+                  /* Phase 1.9 Tranche A1: CPU-only path; no GPU dispatch
+                   * happens here, so the flag is informational only --
+                   * kept zero for defensive consistency. */
+                  job->bf_fast_eligible   = 0;
+                  job->doneprint = &doneprint;
+                  job->filename = argv[0];
+                  job->startline = 0;
+                  job->numline = 1;
+                  job->readbuf = Readbuf;
+                  job->readindex = Readindex;
+                  possess(ReadBuf0);
+                  twist(ReadBuf0, BY, +1);
+                  if (ThreadCount < maxt) {
+                    launch(procjob, NULL);
+                    ThreadCount++;
+                  }
+                  possess(WorkWaiting);
+                  *WorkTail = job;
+                  WorkTail = &(job->next);
+                  twist(WorkWaiting, BY, +1);
                 }
-                possess(WorkWaiting);
-                *WorkTail = job;
-                WorkTail = &(job->next);
-                twist(WorkWaiting, BY, +1);
               }
             }
             J1N(RC, Dohash, NextX);
