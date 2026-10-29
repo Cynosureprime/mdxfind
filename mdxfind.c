@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.641 2026/10/27 12:31:05 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.642 2026/10/29 00:01:19 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.641 2026/10/27 12:31:05 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.642 2026/10/29 00:01:19 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.642  2026/10/29 00:01:19  dlr
+ * Add e1062 SHA256BASE64, sha256 of the base64 of the password, the SHA-256 sibling of e232 MD5BASE64. tools/hx_dedup_check reported NO MATCH over 1059 catalog entries before a number was assigned. Four touch points, every one additive: JOB_SHA256BASE64 1062, the Types[] entry APPENDED at the end so no existing index moves, Typeopt[1062] of TYPEOPT_NEEDSF matching the unsalted plain-hex sibling, and a procjob feeder that base64 encodes into linebuf and hands off to the shared SHA256_start body, so iteration follows the standard hex convention without a new loop and no existing fall-through is disturbed. Verified against an INDEPENDENT python oracle rather than against this code, on three passwords, with mdxfind procjob, the hx VM and the hashpipe compute function all agreeing; the control that the same base64 of the same input reproduces the existing e232 vector confirms the padded standard-alphabet convention is the one the family already uses. Two external vectors supplied by Waffle reproduce exactly, 126536bbd11c96f16581e558a2cb11df for MD5BASE64 and 7e0060617a7404dacc6eb337c40cb735879552e2ff29db72d43be828845becee for this type, both of test@example.com. -z generates, -F cracks it back, and x02 and x03 equal sha256 of the hex of the previous round as computed independently.
+ *
  * Revision 1.641  2026/10/27 12:31:05  dlr
  * Brute force fans out across cores, and the template mask-slot cap goes 16 -> 32. Two user-reported problems, one release. (1) A CPU-only brute force ran on ONE core and reported nothing while it ran. The legacy arm submitted a single job of MaskTotal, and one job is one procjob thread: a 22-position mask over 1e9 candidates took 215s at 4.65 MH/s on fpga with fifteen of sixteen cores idle. It was also silent -- procjobs only per-second checkpoint sits at the top of the per-line loop, a brute-force job carries numline == 1, so the body runs once with the counters still zero and the whole mask is walked in the inner do/while, which has no checkpoint. Tothash, Totfound, TotLines and job->outbuf were all held to job end, so the display read 0.0/1.0G at 0.00 h/s with Found=0 and an ETA of done for the entire run, and a hash recovered at mask index 500 was not printed for 215 seconds. The keyspace is now fanned out into bounded chunks, which fixes both: every chunk completion flushes all four through the job-exit accounting, with no change to the hot loop. Chunk jobs past the first carry JOBFLAG_MASK_SUBCHUNK so the single seed line is retired once. Fan-out is gated to the three routes where no mask-iterating GPU dispatch can follow -- no gpujob, BfMaskGpuUsable clear, or GPU_CAT_NONE -- because the Metal mask path ignores the chunk range and uses the full gpu_mask_total, so chunking into it would multiply the work rather than divide it. Measured: fpga 215.07s -> 18.03s on 1e9 (11.9x), dev1 152.54 -> 29.06s, dev3 134.10 -> 14.91s, exact keyspace and both planted boundary candidates recovered every time. (2) The template mask-slot cap per side is raised 16 -> 32 (new GPU_MASK_SLOT_CAP, distinct from the private-scratch-backed GPU_MASK_VAR_CAP, which stays 16). One slot per mask POSITION with literals as degenerate one-character tables, so a fixed-suffix mask needs far more slots than it has placeholders -- ?a?a?a?a?a?a@gmail10p.com is 19 -- and such masks were refused to the CPU. With the lift that mask runs on the fpga GPU at 1.09 GH/s against 60.91 MH/s on CPU: 735,092,015,104 candidates in 677 seconds, 3.4 hours down to 11 minutes, both planted digests recovered. The decline message now names the unit and the path instead of reporting a raw MaskAppendLen against a cap the reader cannot relate to it. Also records, at the gate, why brute force cannot simply move to the A2/A3/A4 descriptor wire: BF chunks submit through the rules-engine slot, whose kernel reads the per-position tables, so clearing the gate hands the GPU a job it cannot execute -- measured on dev1 M1, all 81,453,056 candidates hashed and 0 hits while -G none found all three planted answers.
  *
@@ -8175,6 +8178,7 @@ char *Types[] = {
     "BCRYPTMD5PASSSALT",
     "MD5USERDESCRYPT",
     "MD5CRYPTMD5",
+    "SHA256BASE64",
 
 NULL
 
@@ -9271,6 +9275,7 @@ NULL
 #define JOB_BCRYPTMD5PASSSALT 1059
 #define JOB_MD5USERDESCRYPT 1060
 #define JOB_MD5CRYPTMD5 1061
+#define JOB_SHA256BASE64 1062
 
 #define JOB_DONE 2000
 
@@ -10443,6 +10448,7 @@ static unsigned short TypeOpts[JOB_DONE] = {
     /* e1061 MD5CRYPTMD5: md5crypt(md5(pass), salt).  Same flag set as
      * [538] SHA512CRYPTMD5 -- identical construction, one crypt over. */
     [1061] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5CRYPTMD5 */
+    [1062] = TYPEOPT_NEEDSF,  /* SHA256BASE64 */
 };
 static unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -35027,6 +35033,13 @@ sha1sha256:
                 mymd5(cur, len, curin.h);
                 cur = prmd5(curin.h, mdbuf, 32);
                 len = 32;
+                goto SHA256_start;
+
+              case JOB_SHA256BASE64:
+                if (len > MAXLINE)
+                  break;
+                len = b64_encode((char *)cur, linebuf, len);
+                cur = linebuf;
                 goto SHA256_start;
 
               case JOB_SHA256RAW:
