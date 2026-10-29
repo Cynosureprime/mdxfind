@@ -35691,6 +35691,38 @@ static const hx_program _hx_program_1058 = {
     .has_emit  = 0,
 };
 
+/* eidx=1059 e1062 SHA256BASE64 : `sha256(base64(pass))` (hx.8 line 1187) */
+static const char *_hx_callnames_1059[] = {
+    [0] = NULL,
+    [1] = "base64",
+    [2] = "sha256",
+    [3] = NULL,
+};
+static const hx_inst _hx_code_1059[4] = {
+    [0] = { .op = 0, .u.slot = 0 },
+    [1] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="base64" */ },
+    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="sha256" */ },
+    [3] = { .op = 6 },
+};
+static const char *_hx_varnames_1059[5] = {
+    [0] = "pass",
+    [1] = "salt",
+    [2] = "salt2",
+    [3] = "pepper",
+    [4] = "user",
+};
+static const hx_program _hx_program_1059 = {
+    .code      = (hx_inst *)_hx_code_1059,
+    .ncode     = 4,
+    .strings   = NULL,
+    .strlens   = NULL,
+    .nstrings  = 0,
+    .varnames  = (char **)_hx_varnames_1059,
+    .nvars     = 5,
+    .max_stack = 9,
+    .has_emit  = 0,
+};
+
 const struct hx_spec_entry hx_specs_data[] = {
     { .job_enum = 1, .name = "MD5", .expression = "md5(pass)", .hx8_line = 11, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_0, .call_names = _hx_callnames_0, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 2, .name = "MD5UC", .expression = "md5_uc(pass)", .hx8_line = 12, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1, .call_names = _hx_callnames_1, .emit_class = 0, .note_ref = 0 },
@@ -36751,8 +36783,9 @@ const struct hx_spec_entry hx_specs_data[] = {
     { .job_enum = 1059, .name = "BCRYPTMD5PASSSALT", .expression = "bcrypt(md5(pass . salt2), salt, cost)", .hx8_line = 1184, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1056, .call_names = _hx_callnames_1056, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 1060, .name = "MD5USERDESCRYPT", .expression = "md5(user . descrypt(pass, salt))", .hx8_line = 1185, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1057, .call_names = _hx_callnames_1057, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 1061, .name = "MD5CRYPTMD5", .expression = "md5crypt(md5(pass), salt)", .hx8_line = 1186, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1058, .call_names = _hx_callnames_1058, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1062, .name = "SHA256BASE64", .expression = "sha256(base64(pass))", .hx8_line = 1187, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1059, .call_names = _hx_callnames_1059, .emit_class = 0, .note_ref = 0 },
 };
-const int hx_specs_count = 1059;
+const int hx_specs_count = 1060;
 
 const struct hx_spec_entry *hx_specs_lookup(int job_enum) {
     for (int i = 0; i < hx_specs_count; i++)
