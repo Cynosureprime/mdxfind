@@ -206,6 +206,46 @@ void gpujob_overflow_preload_all(void);
 #define GPU_RULES_MAX_WORDS_PER_BATCH 16384
 #define GPUBATCH_RULES_PACKED_SIZE   (GPU_RULES_MAX_WORDS_PER_BATCH * 256)
 
+/* PER-DISPATCH ROUND BUDGET (A1131, 2026-10-30).
+ *
+ * The full-slot packing above is a WORD count, and every measurement behind
+ * it was taken at -i 1, where one dispatch costs num_words * n_rules. But
+ * gpu_md5_rules.cl md5_rules_phase0 runs the iteration loop INSIDE each work
+ * item ("for (iter = 1; iter <= max_iter; iter++)"), so the real cost is
+ *
+ *     num_words * n_rules * max_iter
+ *
+ * and the iteration multiplier was never folded into the batch size. At
+ * 16384 words x 25000 rules x -i 9999 that is 4.1e12 hash rounds in ONE
+ * dispatch: minutes long on a 3060 Ti, with no progress line and no point at
+ * which the run can be interrupted or reported on.
+ *
+ * Shrinking the word axis here does NOT reintroduce the host-side overhead
+ * that the 16384 removed. That overhead (~670us per dispatch) matters only
+ * when a dispatch is MILLISECONDS; a large max_iter makes it seconds whatever
+ * the word count, so there is nothing left for a big batch to amortise. The
+ * budget therefore serves the intent of the full-slot change rather than
+ * reverting it -- it binds only where that change was never measured.
+ *
+ * The budget is set ABOVE the largest dispatch any tuned configuration
+ * produces today (16384 x 100K rules at -i 1 = 1.638e9 rounds), so no
+ * measured workload changes shape: every -i 1 run, and every run whose
+ * rules x iter product stays under the budget, still packs to 16384. Only
+ * the pathological product moves.
+ *
+ * The floor exists ONLY so the division can never yield a zero-word batch.
+ * It is deliberately 1 and not some "worth a dispatch" figure: when
+ * n_rules * max_iter alone exceeds the budget, a single word already carries
+ * a full budget of work, so any larger floor just multiplies a dispatch that
+ * was already too big. A 32-word floor let 100K rules at -i 9999 through at
+ * 3.2e10 rounds, 4x over budget, for no benefit. Occupancy is not the reason
+ * to raise it either -- the budget keeps the grid wide whenever the rule count
+ * is what is large, and the existing "below lane target" warning already
+ * covers a genuinely narrow grid.
+ */
+#define GPU_RULES_DISPATCH_ROUND_BUDGET  8000000000LL
+#define GPU_RULES_MIN_WORDS_PER_BATCH    1
+
 /* RULE-AXIS CHUNKING (Option A, 2026-05-29) — codegen two-kernel proto path
  * candidate-buffer cap. The codegen pipeline (gpu_opencl_kernelb_dispatch_proto)
  * materializes post-rule candidates in a global buffer sized

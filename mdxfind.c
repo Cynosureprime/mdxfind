@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.642 2026/10/29 00:01:19 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.643 2026/10/30 18:23:12 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.642 2026/10/29 00:01:19 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.643 2026/10/30 18:23:12 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.643  2026/10/30 18:23:12  dlr
+ * Fold the iteration multiplier into rules-engine batch sizing, and stop reporting an unknown ETA as done. Both from A1131s report of 2026-10-30. First, the rules-engine pack site bounds a batch by GPU_RULES_DISPATCH_ROUND_BUDGET as well as by word_offset_entries, because the kernel runs its iteration loop inside each work item and a dispatch therefore costs num_words times n_rules times max_iter. See gpujob.h 1.52 for the full reasoning, the three independent reasons the reporters VRAM diagnosis does not hold, and why a smaller word axis does not undo the host overhead amortisation that the 16384 was chosen for. Maxiter is used deliberately as a conservative UPPER BOUND rather than the exact per-op value: several ops force params.max_iter to 1 at the dispatch site, SHA1DRU running its million rounds internally and the HMAC and crypt families emitting one digest per word and salt pair, so for those this over-estimates cost and packs smaller batches than it strictly must. That is harmless because every one of them is expensive enough per candidate that host overhead is already negligible, and it is the safe direction, since an upper bound can only be conservative whereas a second copy of that per-op predicate could disagree with the first, which is the failure mode gpu CLAUDE.md records for the word-offset class tag. Second, the bootstrap ETA branch no longer prints done when it has no estimate. remaining was left at 0 whenever the 0.001 progress floor was not cleared, and format_eta of 0 prints done, so the display asserted completion at exactly the moment it had least information: the reporters run showed ETA done for a job with sixteen days left, because expected_total was 6.3e16 and the fraction was 5e-6. The floor itself is right, an estimate off the first fraction of a percent is worthless, so the fix is to say unknown instead of printing the one answer that is certainly wrong. This needed three states rather than two and the first attempt got it wrong: remaining equal to 0 was overloaded to mean BOTH no estimate and nothing left, with the wq greater than zero test turning the second into finishing, so introducing minus one for the first without pinning the second to 0 reported a COMPLETE run as unknown. Caught by scratchpad eta_check.c before it shipped, which reproduces the old done on the reporters numbers and asserts the new behaviour on four cases. Also verified no regression on the healthy path: patched and released binaries give the same progress line shape and ETA on a 2M word local run, and a known-answer crack still resolves. The pack site change is compiled out of the plain macOS build, so it was syntax-checked separately under OPENCL_GPU.
+ *
  * Revision 1.642  2026/10/29 00:01:19  dlr
  * Add e1062 SHA256BASE64, sha256 of the base64 of the password, the SHA-256 sibling of e232 MD5BASE64. tools/hx_dedup_check reported NO MATCH over 1059 catalog entries before a number was assigned. Four touch points, every one additive: JOB_SHA256BASE64 1062, the Types[] entry APPENDED at the end so no existing index moves, Typeopt[1062] of TYPEOPT_NEEDSF matching the unsalted plain-hex sibling, and a procjob feeder that base64 encodes into linebuf and hands off to the shared SHA256_start body, so iteration follows the standard hex convention without a new loop and no existing fall-through is disturbed. Verified against an INDEPENDENT python oracle rather than against this code, on three passwords, with mdxfind procjob, the hx VM and the hashpipe compute function all agreeing; the control that the same base64 of the same input reproduces the existing e232 vector confirms the padded standard-alphabet convention is the one the family already uses. Two external vectors supplied by Waffle reproduce exactly, 126536bbd11c96f16581e558a2cb11df for MD5BASE64 and 7e0060617a7404dacc6eb337c40cb735879552e2ff29db72d43be828845becee for this type, both of test@example.com. -z generates, -F cracks it back, and x02 and x03 equal sha256 of the hex of the previous round as computed independently.
  *
@@ -15475,6 +15478,33 @@ while (1) {
          * hit cap, gpu_opencl.c warns on stderr at >=90% (approach) and
          * >=100% (overflow with lost count) — see rev 1.65 of that file. */
         int max_words_lanes = (int)my_jobg_rules->word_offset_entries;
+        /* ...but bound the dispatch by the ROUND budget, not just the word
+         * count. The kernel runs the iteration loop inside each work item, so
+         * a dispatch costs num_words * n_rules * max_iter; the full-slot
+         * packing above was measured at -i 1 and never folded max_iter in.
+         * See GPU_RULES_DISPATCH_ROUND_BUDGET in gpujob.h for the full
+         * reasoning and for why shrinking the word axis here does not undo
+         * the host-overhead amortisation the 16384 was chosen for.
+         *
+         * Maxiter is used deliberately as a conservative UPPER BOUND rather
+         * than the exact per-op value. Several ops force params.max_iter=1 at
+         * the dispatch site (SHA1DRU runs its 1M rounds internally, the HMAC
+         * and crypt families emit one digest per (word, salt)), so for those
+         * this over-estimates the cost and packs smaller batches than it
+         * strictly must. That is harmless -- every one of them is expensive
+         * enough per candidate that host overhead is already negligible -- and
+         * it is the safe direction: an upper bound can only be conservative,
+         * whereas a SECOND copy of that per-op predicate could disagree with
+         * the first, which is the failure mode gpu/CLAUDE.md records for the
+         * word-offset class tag. */
+        if (gpu_rule_count > 0 && Maxiter > 1) {
+          long long per_word = (long long)gpu_rule_count * (long long)Maxiter;
+          long long wbudget  = GPU_RULES_DISPATCH_ROUND_BUDGET / per_word;
+          if (wbudget < GPU_RULES_MIN_WORDS_PER_BATCH)
+            wbudget = GPU_RULES_MIN_WORDS_PER_BATCH;
+          if (wbudget < (long long)max_words_lanes)
+            max_words_lanes = (int)wbudget;
+        }
         if ((int)my_jobg_rules->packed_count >= max_words_lanes ||
             my_jobg_rules->packed_pos + 2 + len > my_jobg_rules->packed_buf_size) {
           gpujob_submit(my_jobg_rules);
@@ -48538,16 +48568,36 @@ MDXALIGN void ReportStats(void *dummy) {
             if (Numrules > 1) expected_total *= Numrules;
             if (Maxiter > 1) expected_total *= Maxiter;
             if (MaskTotal > 1) expected_total *= MaskTotal;
+            /* -1 = NO ESTIMATE YET, which is NOT the same as zero remaining.
+             * format_eta(0) prints "done", so leaving remaining at 0 when the
+             * estimate could not be made asserted that a run had finished at
+             * exactly the moment the code had least information about it. An
+             * -i 9999 run over 25,000 rules reported "ETA~done" for a job with
+             * 16 days left, because expected_total was 6.3e16 and the 0.001
+             * progress floor below was never cleared (A1131, 2026-10-30). The
+             * floor itself is right -- an estimate off the first fraction of a
+             * percent is worthless -- so the fix is to say so instead of
+             * printing the one answer that is certainly wrong. */
+            remaining = -1;
             if (expected_total > 0 && Tothash > 0) {
               progress_frac = (double)Tothash / (double)expected_total;
               if (progress_frac > 1.0) progress_frac = 1.0;
               double hps_raw = (double)Tothash / wtime;
-              if (progress_frac > 0.001 && progress_frac < 1.0 && hps_raw > 0)
+              /* Three states, not two. remaining was overloaded: 0 meant BOTH
+               * "no estimate" and "nothing left", and the wq>0 test below
+               * turned the second into "finishing". Introducing -1 for the
+               * first without pinning the second to 0 reported a COMPLETE run
+               * as "unknown" -- caught by eta_check.c before it shipped. */
+              if (progress_frac >= 1.0)
+                remaining = 0;                    /* complete: nothing left */
+              else if (progress_frac > 0.001 && hps_raw > 0)
                 remaining = (double)(expected_total - Tothash) / hps_raw;
             } else {
               progress_frac = 0;
             }
-            if (remaining <= 0 && wq > 0)
+            if (remaining < 0)
+              snprintf(eta, sizeof(eta), "unknown");
+            else if (remaining <= 0 && wq > 0)
               snprintf(eta, sizeof(eta), "finishing");
             else
               format_eta(remaining, eta, sizeof(eta));
