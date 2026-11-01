@@ -152,7 +152,7 @@ else
   ARGON2_FILL_OBJ = ref.o
 endif
 
-all: mdxfind mdsplit getpass mdxpause
+all: mdxfind mdsplit getpass mdxpause emailprep
 
 mdxfind.o: mdxfind.c mdxfind.h job_types.h gpujob.h sqlite3.h
 	$(CC) $(CFLAGS) -c mdxfind.c
@@ -413,8 +413,16 @@ getpass: getpass.o
 mdxpause: mdxpause.c
 	$(CC) -O3 -o mdxpause mdxpause.c
 
+# emailprep prepares an address list for -E / -a: it strips the dots from each
+# local part, deduplicates the collapse that follows, and orders by dotless
+# local-part length, which is the key -a batches GPU work by.  libJudy.a is
+# linked statically, as mdsplit does, so the binary runs without a Judy shared
+# library installed.  -lm is for powl in the keyspace histogram.
+emailprep: emailprep.c
+	$(CC) $(CFLAGS) -o emailprep emailprep.c libJudy.a -lm
+
 clean:
-	rm -f mdxfind mdsplit $(MDXFIND_OBJS) $(MDSPLIT_OBJS)
+	rm -f mdxfind mdsplit getpass mdxpause emailprep $(MDXFIND_OBJS) $(MDSPLIT_OBJS)
 	rm -f argon2/*.o argon2/argon2.a
 	rm -f lm/*.o lm/lm.a
 	rm -f gosthash/*.o

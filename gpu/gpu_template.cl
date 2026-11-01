@@ -388,7 +388,15 @@ void template_phase0(
      *       in the upload, no kernel change.
      * B7.8: cap lifted from 8 to 16 per side (32 total rows). Same
      *       divmod loop, just larger bound. */
-    uint mask_active = ((params.n_prepend >= 1u) || (params.n_append >= 1u)) ? 1u : 0u;
+    /* mask_active is derived from the mask axis SIZE, not from the presence of
+     * prepend/append positions.  The -a dot axis multiplies 2^N into the same
+     * axis (plan section 15) and has no positions of its own, so a
+     * positions-only test would collapse mask_size to 1 and the dot sweep would
+     * never iterate.  Deriving it from the size is self-consistent -- the axis
+     * is active exactly when it has more than one coordinate -- and is neutral
+     * for every existing run, because the host sets b71_mask_size to 1 when no
+     * mask is configured (gpu_opencl.c:15191). */
+    uint mask_active = 1u;   /* refined below, once mask_size is known */
 #ifdef GPU_TEMPLATE_HAS_SALT
     /* B6 salt-axis (2026-05-06): num_salts is overloaded as
      *   num_salts = mask_size * num_salts_per_page
@@ -399,10 +407,9 @@ void template_phase0(
      * the math collapses to the pre-B6 layout. */
     uint num_salts_per_page = (uint)params.num_salts_per_page;
     if (num_salts_per_page == 0u) num_salts_per_page = 1u;
-    uint mask_size = mask_active
-        ? (params.num_salts / num_salts_per_page)
-        : 1u;
+    uint mask_size = params.num_salts / num_salts_per_page;
     if (mask_size == 0u) mask_size = 1u;
+    mask_active = (mask_size > 1u) ? 1u : 0u;
 #ifdef GPU_TEMPLATE_HAS_PRE_SALT
     /* Lane-level salt batching (2026-05-09 experiment): salt axis is
      * replaced by salt_chunk axis of size ceil(num_salts_per_page /
@@ -419,8 +426,9 @@ void template_phase0(
     uint total = n_words * n_rules * mask_size * num_salts_per_page;
 #endif
 #else
-    uint mask_size = mask_active ? params.num_salts : 1u;
+    uint mask_size = params.num_salts;   /* unsalted: num_salts IS mask_size */
     if (mask_size == 0u) mask_size = 1u;
+    mask_active = (mask_size > 1u) ? 1u : 0u;
     uint total = n_words * n_rules * mask_size;
 #endif
 
@@ -545,6 +553,17 @@ void template_phase0(
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
+    /* -E / -a: the mangled part is the LOCAL PART and the domain is appended
+     * unchanged after the mask block.  head_len rides word_offset bits 22-29
+     * biased by one, so WOFF_HEAD returns wlen when the entry is untagged and
+     * every run that is not -E behaves exactly as before.  Derived AFTER the
+     * RULE_BUF_LIMIT clamp, because that clamp can cut below head_len and a
+     * head longer than the staged word would read past it.  The domain needs
+     * no buffer of its own: it is still in `words` at wpos + hlen, which is
+     * where the append after the mask block reads it from. */
+    int hlen = WOFF_HEAD(raw, wlen);
+    if (hlen > wlen) hlen = wlen;
+    int tlen = wlen - hlen;
 
     /* rule_offset is TWO halves under `-8`: [rule_idx] is the byte stream,
      * untagged and unchanged; [n_rules + rule_idx] carries the UTF-32 stream
@@ -561,7 +580,7 @@ void template_phase0(
     __attribute__((aligned(16))) uint u32mem[U32_BUF_ELEMS];
 
     int engine = 0;
-    int new_len = u32_run_pair(words, wpos, wlen, rule_program,
+    int new_len = u32_run_pair(words, wpos, hlen, rule_program,
                               rpos, u32_rpos, wcls,
                               buf, u32buf, u32mem,
                               buf, TPL_BUF_BYTES, case_tab, &engine);
@@ -570,11 +589,23 @@ void template_phase0(
      * pair emits nothing, exactly as the CPU bridge does for a negative. */
     if (new_len < 0) return;
 #else
-    uint wpos = word_offset[word_idx];
+    uint raw = word_offset[word_idx];
+    uint wpos = WOFF_OFF(raw);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
-    for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
+    /* -E / -a: the mangled part is the LOCAL PART and the domain is appended
+     * unchanged after the mask block.  head_len rides word_offset bits 22-29
+     * biased by one, so WOFF_HEAD returns wlen when the entry is untagged and
+     * every run that is not -E behaves exactly as before.  Derived AFTER the
+     * RULE_BUF_LIMIT clamp, because that clamp can cut below head_len and a
+     * head longer than the staged word would read past it.  The domain needs
+     * no buffer of its own: it is still in `words` at wpos + hlen, which is
+     * where the append after the mask block reads it from. */
+    int hlen = WOFF_HEAD(raw, wlen);
+    if (hlen > wlen) hlen = wlen;
+    int tlen = wlen - hlen;
+    for (int i = 0; i < hlen; i++) buf[i] = words[wpos + i];
 
     uint rpos = rule_offset[rule_idx];
 
@@ -582,7 +613,7 @@ void template_phase0(
      * semantics; mirrors gpu_md5_rules.cl rev 1.28). The first byte being
      * NUL means k==0 at apply_rule entry == the synthetic ":" pass. */
     int is_no_rule = (rule_program[rpos] == 0);
-    int new_len = apply_rule(rule_program + rpos, buf, wlen);
+    int new_len = apply_rule(rule_program + rpos, buf, hlen);
 
     /* Rejection sentinel: apply_rule fired a `_ < > ! / ( )` op. */
     if (new_len < 0) return;
@@ -595,12 +626,102 @@ void template_phase0(
      * AND each rule iterate every mask, so the same (word, mask_idx)
      * coordinate is already covered by the synthetic ":" pass at this
      * mask_idx — the skip remains correct. */
-    if (!is_no_rule && new_len == wlen) {
+    /* -E: hlen, not wlen -- the question is whether the rule changed the part
+     * it was GIVEN.  Comparing against the whole word length would make this
+     * test false for every tagged word, so the no-op skip would never fire. */
+    if (!is_no_rule && new_len == hlen) {
         int changed = 0;
-        for (int i = 0; i < wlen; i++) {
+        for (int i = 0; i < hlen; i++) {
             if (buf[i] != words[wpos + i]) { changed = 1; break; }
         }
         if (!changed) return;
+    }
+
+    /* -a dot axis (plan sections 5 and 15).  The dot sweep is the OUTERMOST
+     * digit of the mask axis, which is what lets it ride that axis with no new
+     * params field, no new flag and no width crossing to the device: divide the
+     * LOCAL mask index by the product of the prepend/append position sizes and
+     * what remains IS the dot bitmask.  The peel below is untouched -- it
+     * already discards digits above the position product.
+     *
+     * SELF-GATING.  When the host has not multiplied a dot radix into the mask
+     * axis, mask_size equals mask_combos, dot_bits is 0, popcount is 0 and the
+     * loop below inserts nothing -- so a run without -a is bit-identical and
+     * needs no test.
+     *
+     * Bit x inserts a dot AFTER character x, matching the CPU (mdxfind.c).
+     * Inserted IN PLACE, walking backwards: reads come from low indices and
+     * writes go to higher ones, so no scratch buffer is needed -- which matters
+     * because the byte-mode arm has none to spare.
+     *
+     * new_len here is the LOCAL PART: the rule has run, the domain is appended
+     * only after the mask block, so the dots land inside the local exactly as
+     * the -E split requires. */
+    {
+        uint _dnpre = params.n_prepend, _dnapp = params.n_append;
+        if (_dnpre > 32u) _dnpre = 32u;
+        if (_dnapp > 32u) _dnapp = 32u;
+        ulong _mcombos = 1UL;
+        for (uint _i = 0u; _i < _dnpre + _dnapp; _i++) {
+            uint _ps = mask_sizes[_i];
+            if (_ps == 0u) _ps = 1u;
+            _mcombos *= (ulong)_ps;
+        }
+        /* The dot digit comes from the LOCAL mask coordinate, not from the
+         * absolute index, and nothing here mutates the absolute index.
+         *
+         * This was wrong in the first cut and it broke EVERY GPU mask run --
+         * `-n` and `-N`, with and without rules -- while leaving rules-only
+         * correct, so the suite that was run did not see it.  Measured on fpga:
+         * 200 of 200 known answers before, 0 after, CPU unaffected, and 200
+         * again with this block disabled.
+         *
+         * Two mistakes, one line each.  `mask_idx_abs_base` is
+         * `mask_start + word_idx * mask_offset_per_word + mask_idx_local`, so
+         * for a chunked or fanned-out mask run it carries a base that belongs
+         * to the POSITION digits; dividing it by the position product mixed
+         * that base into the dot bitmask and dotted candidates that should
+         * have had no dots.  And `%=` mutated the value the peel below reads,
+         * which the peel never needed -- it consumes exactly npre+napp digits
+         * by divmod and discards everything above them on its own.
+         *
+         * The host multiplies the dot radix into `mask_size`, which is the
+         * size of the LOCAL axis (`mask_idx_local = gid % mask_size`).  So the
+         * local coordinate decomposes as `dot * mask_combos + position_index`,
+         * and the dot digit is exactly `mask_idx_local / mask_combos`.
+         *
+         * SELF-GATING, now provably: with no dot radix, mask_size equals
+         * mask_combos, so mask_idx_local < mask_combos and the quotient is 0
+         * for every lane.  A run without -a is bit-identical and the peel sees
+         * precisely the value it saw before this block existed. */
+        /* NO guard on _mcombos.  It is an empty product of 1 when there are no
+         * mask positions, which is exactly the -a-with-no--n case, so a
+         * `_mcombos > 1` test zeroed the dot digit for the only configuration
+         * that needs it -- the second time this block has been wrong by
+         * over-guarding.  _mcombos starts at 1 and is only ever multiplied by
+         * values forced to >= 1, so it can never be 0 and the divide is safe.
+         * With no dot radix, mask_size == _mcombos and mask_idx_local is below
+         * it, so the quotient is 0 and the block stays inert. */
+        ulong _dot = (ulong)mask_idx_local / _mcombos;
+        if (_dot != 0UL && new_len > 0) {
+            /* Bit scan bounded by WOFF_DOT_WIDTH_MAX: new_len reaches 40960 and
+             * a 1UL shift past 63 is undefined.  The cap equals the CPU's
+             * EMAIL_DOT_WIDTH_MAX, so the device sweeps the same positions the
+             * CPU does -- which is the whole content of GPU == CPU here. */
+            int _dw = new_len;
+            if (_dw > (int)WOFF_DOT_WIDTH_MAX) _dw = (int)WOFF_DOT_WIDTH_MAX;
+            int _nd = 0;
+            for (int i = 0; i < _dw; i++)
+                if (_dot & (1UL << (uint)i)) _nd++;
+            if (_nd > 0 && (uint)(new_len + _nd) <= TPL_BUF_LIMIT) {
+                int j = new_len + _nd - 1;
+                for (int i = new_len - 1; i >= 0; i--) {
+                    if (i < _dw && (_dot & (1UL << (uint)i))) buf[j--] = '.';
+                    buf[j--] = buf[i];
+                }
+                new_len += _nd;
+            }
+        }
     }
 
     /* B7.1-B7.5 mask: decompose mask_idx into prepend+append per-position
@@ -765,6 +886,29 @@ void template_phase0(
             } else {
                 new_len = TPL_BUF_LIMIT;
             }
+        }
+    }
+
+    /* -E / -a: rejoin the domain.  This is the LAST step before the hash, and
+     * it has to be: the rule, the no-op test and the mask block have all acted
+     * on the local part alone, exactly as the CPU path does between its split
+     * and its rejoin at the key-axis seam.
+     *
+     * The bytes come straight out of `words` -- the packed word still holds the
+     * whole address, and only the staging above was narrowed to hlen -- so the
+     * domain never needed a params field, a second buffer or a kernel argument.
+     *
+     * tlen is 0 for every untagged word, which is every run that is not -E, so
+     * this is one code path and not two.  Bounds-checked against TPL_BUF_LIMIT
+     * like the mask block above: a truncated candidate is wrong, but a write
+     * past the buffer is worse, and the host reserves for this in the rule
+     * engine's outmax so the clamp is not expected to fire. */
+    if (tlen > 0) {
+        uint tail_end = (uint)new_len + (uint)tlen;
+        if (tail_end <= TPL_BUF_LIMIT) {
+            for (int i = 0; i < tlen; i++)
+                buf[new_len + i] = words[wpos + hlen + i];
+            new_len = (int)tail_end;
         }
     }
 
@@ -1027,7 +1171,7 @@ void template_phase0_test(
     uint rule_idx = gid / n_words;
 
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;

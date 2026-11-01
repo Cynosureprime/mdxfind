@@ -186,6 +186,8 @@ extern unsigned char *gpu_rule_program;
 extern uint32_t      *gpu_rule_offsets;
 extern int           *gpu_rule_slot;
 extern int            gpu_rule_count;
+extern int            Email;
+extern int            EmailLocal;
 extern char          *Rules;
 extern unsigned int   Numrules;
 
@@ -196,6 +198,8 @@ extern unsigned int   Numrules;
  * hit's mask_idx_local. Stays at zero when no mask has been uploaded
  * (gpu_metal_set_mask not called) — the gate gpu_mask_total > 1 below
  * skips the decode entirely in that case. */
+/* -a: the dot-axis replay below needs it, same as the OpenCL twin. */
+extern int      Email;
 extern int      gpu_mask_n_prepend;
 extern int      gpu_mask_n_append;
 extern uint64_t gpu_mask_total;
@@ -1971,12 +1975,18 @@ static void gpujob_metal_worker(void *arg) {
                      && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 32
                      && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                      && gpu_mask_total > 0);
-                /* A chunked job's kernel packed combined_ridx against its
-                 * OWN slice size, so decode with that, not the full total. */
-                uint64_t b71_mask_size = b71_mask_active
-                    ? (g->bf_num_masks > 0u ? (uint64_t)g->bf_num_masks
-                                            : gpu_mask_total)
-                    : 1u;
+                /* The divmod base is PUBLISHED BY THE DISPATCH (gpujob.h),
+                 * not derived a second time here.  The old expression was
+                 * gated on b71_mask_active, i.e. on the mask POSITION count,
+                 * so a `-a` run with no `-n` decoded every hit at mask_idx 0
+                 * and the dot replay below inserted nothing -- printing the
+                 * undotted seed beside the digest of the dotted string.  It
+                 * also already carried the chunk slice, which the published
+                 * value carries too, so non-`-a` runs are unchanged.  Metal is
+                 * single-device, hence slot 0. */
+                uint64_t b71_mask_size =
+                    (gpu_dispatch_mask_size[0] > 0)
+                    ? gpu_dispatch_mask_size[0] : 1u;
 
                 /* Phase 2c: salt-axis decompose. is_salted_op gates the
                  * 3-axis divmod (salt_local, mask_idx, ridx) per
@@ -2214,7 +2224,15 @@ static void gpujob_metal_worker(void *arg) {
                     }
 
                     /* Recover original word from packed_buf. */
-                    uint32_t pos = g->word_offset[widx];
+                    /* The slot's word_offset array is NO LONGER guaranteed
+                     * untagged.  The -k pack site writes head_len into bits
+                     * 22-29 of the entry it emits (plan row 6), because a key
+                     * suffix has no marker byte for the replay to scan for the
+                     * way '@' serves -E.  So mask here, exactly as every device
+                     * reader does.  Masking is a no-op on an untagged entry, so
+                     * every existing path is unchanged. */
+                    uint32_t raw_woff = g->word_offset[widx];
+                    uint32_t pos = raw_woff & WOFF_H_OFF_MASK;
                     if (pos >= g->packed_pos) continue;
                     /* 2-byte little-endian length header; see the pack site in
                      * mdxfind.c.  plen must be wider than uint8_t now. */
@@ -2223,6 +2241,33 @@ static void gpujob_metal_worker(void *arg) {
                     if (pos + 2 + plen > g->packed_pos) continue;
                     char *pword = g->packed_buf + pos + 2;
 
+                    /* -E / -a: split at the first '@', exactly as the host
+                     * tagger and the kernel do.  Recomputed rather than read
+                     * back from word_offset BY DESIGN: this reads the JOBG
+                     * SLOT's array, which is deliberately left untagged -- only
+                     * the payload copy carries head_len -- and all three agree
+                     * by construction, scanning the same bytes for the same
+                     * byte.  OpenCL twin gpujob_opencl.c. */
+                    /* Prefer the head_len TAG the -k pack site wrote (plan
+                     * row 6); fall back to the '@' scan when there is none,
+                     * which is every -E/-a run.  With -E AND -k the tag is
+                     * deliberately absent and the scan is right: head is the
+                     * local part, tail is domain+key.  OpenCL twin is
+                     * identical. */
+                    int el_h = (int)plen, el_t = 0;
+                    uint32_t head_raw = (raw_woff >> WOFF_H_HEAD_SHIFT)
+                                        & WOFF_H_HEAD_MASK;
+                    if (head_raw) {
+                        el_h = (int)head_raw - 1;        /* stored biased by 1 */
+                        if (el_h > (int)plen) el_h = (int)plen;
+                        el_t = (int)plen - el_h;
+                    } else if (EmailLocal || Email) {
+                        for (uint32_t _i = 0; _i < plen; _i++) {
+                            if (pword[_i] == '@') { el_h = (int)_i; break; }
+                        }
+                        el_t = (int)plen - el_h;
+                    }
+
                     /* Map GPU rule index -> original Rules[] index.
                      * slot 0 = synthetic `:` no-rule pass: skip the applyrule
                      * replay and use the word directly.  0 is already the correct
@@ -2230,15 +2275,17 @@ static void gpujob_metal_worker(void *arg) {
                     int rslot = gpu_rule_slot[ridx];   /* 1-BASED RuleCnt[] index; 0 = no-rule pass */
                     int out_len;
                     if (rslot == 0) {
-                        memcpy(synthetic_job.line, pword, plen);
-                        synthetic_job.line[plen] = 0;
-                        out_len = (int)plen;
+                        /* -E: the LOCAL PART here; the domain is appended after
+                         * the mask block so the order matches the kernel. */
+                        memcpy(synthetic_job.line, pword, (size_t)el_h);
+                        synthetic_job.line[el_h] = 0;
+                        out_len = el_h;
                         synthetic_job.Ruleindex = 0;
                     } else {
                         if (rslot < 1 || rslot > (int)Numrules) continue;
 
-                        memcpy(synthetic_job.line, pword, plen);
-                        synthetic_job.line[plen] = 0;
+                        memcpy(synthetic_job.line, pword, (size_t)el_h);
+                        synthetic_job.line[el_h] = 0;
 
                         char *rule_bc = (_rule_ptr_cache && _rule_ptr_nrules == (int)Numrules)
                                         ? _rule_ptr_cache[rslot - 1]
@@ -2260,10 +2307,10 @@ static void gpujob_metal_worker(void *arg) {
                         int new_len = GPU_U32_REPLAY_BYTE;
                         if (gpu_u32_active())
                             new_len = gpu_u32_replay_apply(synthetic_job.line,
-                                                           (int)plen, ridx,
+                                                           el_h      , ridx,
                                                            _tpass, MAXLINE);
                         if (new_len == GPU_U32_REPLAY_BYTE)
-                            new_len = applyrule(synthetic_job.line, _tpass, (int)plen,
+                            new_len = applyrule(synthetic_job.line, _tpass, el_h,
                                                 rule_bc, &_ws);
                         /* ---- THE NO-OP RE-ATTRIBUTION, BOTH ARMS ----------
                          *
@@ -2297,9 +2344,13 @@ static void gpujob_metal_worker(void *arg) {
                          * visibility depends on chunk size is one to fix, not
                          * to characterise. */
                         if (new_len == -2) {
-                            memcpy(synthetic_job.line, pword, plen);
-                            synthetic_job.line[plen] = 0;
-                            out_len = (int)plen;
+                            /* -E: the LOCAL part -- the mask block and the domain
+                             * rejoin both still run below, so the full address here
+                             * would mask around the domain and then append it a
+                             * second time.  OpenCL twin gpujob_opencl.c. */
+                            memcpy(synthetic_job.line, pword, (size_t)el_h);
+                            synthetic_job.line[el_h] = 0;
+                            out_len = el_h;
                             synthetic_job.Ruleindex = 0;   /* No rule */
                             goto u32_noop_reattributed;
                         }
@@ -2318,6 +2369,52 @@ static void gpujob_metal_worker(void *arg) {
                         synthetic_job.Ruleindex = rslot;
                     }
                     u32_noop_reattributed: ;
+
+                    /* -a dot axis: reproduce the DEVICE's dot insertion,
+                     * between the rule and the mask, exactly as the kernel
+                     * orders it.  The dot bitmask is the OUTERMOST digit of
+                     * mask_idx, so dividing out the position product recovers
+                     * it -- the same arithmetic the kernel does, from the same
+                     * inputs, so there is no second opinion about which dotting
+                     * ran.  Metal twin of gpu/gpujob_opencl.c.
+                     *
+                     * Getting this wrong does not lose a hit: it emits a
+                     * CORRECT digest with a plaintext that does not hash to it.
+                     *
+                     * Gated on Email, NOT on b71_mask_active: the dot axis has
+                     * no mask positions of its own, which is the whole reason
+                     * the position test was the wrong gate here. */
+                    if (Email && out_len > 0) {
+                        uint64_t _mc = 1ULL;
+                        int _np = gpu_mask_n_prepend, _na = gpu_mask_n_append;
+                        int _k;
+                        if (_np > 32) _np = 32;
+                        if (_na > 32) _na = 32;
+                        for (_k = 0; _k < _np + _na; _k++) {
+                            int _ps = MASK_WIRE_SZ(gpu_mask_sizes[_k]);
+                            if (_ps <= 0) _ps = 1;
+                            _mc *= (uint64_t)_ps;
+                        }
+                        uint64_t _dot = (_mc > 1ULL)
+                            ? ((uint64_t)mask_idx / _mc) : (uint64_t)mask_idx;
+                        if (_dot != 0ULL) {
+                            int _dw = out_len;
+                            int _nd = 0, i, j;
+                            if (_dw > 24) _dw = 24;   /* EMAIL_DOT_WIDTH_MAX */
+                            for (i = 0; i < _dw; i++)
+                                if (_dot & (1ULL << i)) _nd++;
+                            if (_nd > 0 && out_len + _nd < MAXLINE) {
+                                j = out_len + _nd - 1;
+                                for (i = out_len - 1; i >= 0; i--) {
+                                    if (i < _dw && (_dot & (1ULL << i)))
+                                        synthetic_job.line[j--] = '.';
+                                    synthetic_job.line[j--] = synthetic_job.line[i];
+                                }
+                                out_len += _nd;
+                                synthetic_job.line[out_len] = 0;
+                            }
+                        }
+                    }
 
                     /* Phase 2b row 5: prepend+append the mask characters to
                      * the candidate plaintext. Mirrors gpu/gpujob_opencl.c
@@ -2401,6 +2498,14 @@ static void gpujob_metal_worker(void *arg) {
                         }
                     }
 
+                    /* -E / -a: rejoin the domain -- LAST, after the mask block,
+                     * mirroring the kernel and the CPU path.  el_t is 0 for every
+                     * run that is not -E, so this is one path.  OpenCL twin. */
+                    if (el_t > 0 && out_len + el_t < MAXLINE) {
+                        memcpy(synthetic_job.line + out_len, pword + el_h, (size_t)el_t);
+                        out_len += el_t;
+                        synthetic_job.line[out_len] = 0;
+                    }
                     synthetic_job.clen = out_len;
                     synthetic_job.pass = synthetic_job.line;
 
@@ -2878,10 +2983,24 @@ static void gpujob_metal_worker(void *arg) {
              * whole keyspace once per chunk -- doing the latter multiplied
              * Tothash, and therefore the reported rate and ETA, by the chunk
              * count. Mirrors b71_mask_size_acct in the OpenCL twin. */
+            /* Read the size the dispatch ACTUALLY iterated from where it
+             * published it (gpujob.h), not rebuilt from gpu_mask_total, which
+             * is 1 for a `-a` run with no `-n` and so omitted the dot radix --
+             * the 2^N candidates per word that are the whole run.  Same defect
+             * the OpenCL twin had; see the note at b71_mask_size_acct there.
+             *
+             * NOTE the shapes still differ by one candidate per word: this
+             * counts packed_count * gpu_rule_count * mask, while OpenCL counts
+             * what the dispatch did BEYOND the one-per-line Totallines already
+             * holds.  Left alone deliberately -- correcting it would move every
+             * existing Metal rate by 1/(rules*mask), which is not the reported
+             * bug and would make two numbers move for one fix. */
             uint64_t _mask_size_acct =
-                (g->bf_num_masks > 0u)
-                ? (uint64_t)g->bf_num_masks
-                : ((gpu_mask_total > 1) ? gpu_mask_total : 1ull);
+                (gpu_dispatch_mask_size[0] > 0)
+                ? gpu_dispatch_mask_size[0]
+                : ((g->bf_num_masks > 0u)
+                   ? (uint64_t)g->bf_num_masks
+                   : ((gpu_mask_total > 1) ? gpu_mask_total : 1ull));
             uint64_t _iter_sum_acct =
                 (nsalts_packed > 0)
                 ? gpu_compute_iter_sum(g->op, saltsnap, pack_map,

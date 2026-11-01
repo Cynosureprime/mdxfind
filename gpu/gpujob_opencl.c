@@ -239,6 +239,10 @@ extern unsigned char *gpu_rule_program;   /* packed bytecodes, NUL-separated */
 extern uint32_t      *gpu_rule_offsets;   /* byte offset of each GPU rule in program */
 extern int           *gpu_rule_slot;    /* 1-BASED RuleCnt[]/Ruleindex slot; 0 = no-rule */
 extern int            gpu_rule_count;     /* number of GPU-eligible rules uploaded */
+/* -E / -a: the replay has to reproduce the DEVICE's split, or a correct digest
+ * is reported with a plaintext that does not hash to it. */
+extern int            Email;
+extern int            EmailLocal;
 extern char          *Rules;              /* length-prefixed rule buffer (mdxfind.c) */
 extern unsigned int   Numrules;           /* total rules loaded */
 extern atomic_ullong  Totrules_gpu;       /* GPU-side simulated (word×rule) candidate count */
@@ -1522,20 +1526,42 @@ void gpujob(void *arg) {
                      * the hit-replay divmod base makes below, and for the same
                      * reason: this must equal the kernel-side mask_size the
                      * dispatch actually iterated. */
-                    b71_mask_size_acct = (g->bf_num_masks > 0u)
-                                       ? (uint64_t)g->bf_num_masks
-                                       : gpu_mask_total;
+                    /* The mask size the dispatch ACTUALLY iterated, read from
+                     * where the dispatch published it (gpujob.h) rather than
+                     * rebuilt from gpu_mask_total.  This was the THIRD copy of
+                     * that expression and the last one still missing the -a dot
+                     * radix: with `-a` and no `-n`, gpu_mask_total is 1 and
+                     * bf_num_masks is 0, so the dot sweep -- 2^N candidates per
+                     * word, the whole point of the run -- contributed NOTHING to
+                     * the hash accounting.  Reported by Waffle on mmt against a
+                     * 7.4M-hash list: the progress line read 15-40 h/s on a run
+                     * doing billions, which reads as a catastrophic regression
+                     * rather than a counter bug. */
+                    b71_mask_size_acct =
+                        (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
+                         && gpu_dispatch_mask_size[my_slot] > 0)
+                        ? gpu_dispatch_mask_size[my_slot]
+                        : ((g->bf_num_masks > 0u) ? (uint64_t)g->bf_num_masks
+                                                  : gpu_mask_total);
                 }
                 /* gpu_rule_count includes the synthetic NUL no-op pass that
                  * the host always prepends to the rule program (mdxfind.c
-                 * ~44644). The NUL is a convenience to make the kernel
-                 * produce the implicit no-rule pass; it is not a real rule
-                 * and is already accounted for by Totallines. Subtract 1
-                 * so Totrules_gpu reflects only real rule applications. */
+                 * ~44644).  Totallines already counts ONE candidate per word --
+                 * the no-rule, no-mask case -- so what this has to add is
+                 * everything the dispatch computed BEYOND that:
+                 *
+                 *     packed_count * (gpu_rule_count * mask_size - 1)
+                 *
+                 * The old form was packed_count * (gpu_rule_count - 1) *
+                 * mask_size, which drops the synthetic pass's own mask_size
+                 * candidates.  Those two agree exactly when mask_size is 1,
+                 * which is every run without a mask or a dot axis -- which is
+                 * why it stood until -a put 2^N on that axis and the counter
+                 * under-reported by that whole factor. */
                 atomic_fetch_add(&Totrules_gpu,
                     (unsigned long long)g->packed_count *
-                    (unsigned long long)(gpu_rule_count - 1) *
-                    (unsigned long long)b71_mask_size_acct);
+                    ((unsigned long long)gpu_rule_count
+                       * (unsigned long long)b71_mask_size_acct - 1ULL));
 
                 } /* !_proto_fired */
 
@@ -1924,17 +1950,30 @@ void gpujob(void *arg) {
                      * kernel-side mask_size — which is bf_num_masks for BF
                      * chunks (per-word range) and gpu_mask_total otherwise.
                      * See OCLParams.num_salts pack at gpu_opencl.c:~10420. */
-                    uint64_t b71_mask_size = 1;
+                    /* The divmod base is PUBLISHED BY THE DISPATCH (gpujob.h),
+                     * not derived a second time here.  It used to be recomputed
+                     * from the position count, which made it 1 for a `-a` run
+                     * with no `-n` -- positions are 0 there, so the old gate was
+                     * false, mask_idx decoded as 0 for every hit and the dot
+                     * replay below inserted nothing.  A GPU hit then printed the
+                     * UNDOTTED seed beside the digest of the dotted string.
+                     *
+                     * For every non-`-a` dispatch the published value equals the
+                     * old expression exactly (gpu_opencl.c, where it is set), so
+                     * this is `-a`-only in effect. */
+                    uint64_t b71_mask_size =
+                        (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
+                         && gpu_dispatch_mask_size[my_slot] > 0)
+                        ? gpu_dispatch_mask_size[my_slot] : 1u;
+                    /* Whether the mask has POSITIONS is a different question
+                     * from whether the axis has coordinates, and conflating the
+                     * two is what hid the dot-only case.  This one stays the
+                     * position test, because it gates the position decode. */
                     int b71_mask_active =
                         (gpu_mask_n_prepend >= 0 && gpu_mask_n_prepend <= 32
                          && gpu_mask_n_append >= 0 && gpu_mask_n_append <= 32
                          && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
                          && gpu_mask_total > 0);
-                    if (b71_mask_active) {
-                        b71_mask_size = (g->bf_num_masks > 0u)
-                                      ? (uint64_t)g->bf_num_masks
-                                      : gpu_mask_total;
-                    }
 
                     /* B6 salt-axis: derive is_salted_op + nsalts_for_decode
                      * for the unified-format combined_ridx decompose. For
@@ -2343,7 +2382,15 @@ void gpujob(void *arg) {
                         }
 
                         /* Recover original word from packed_buf. */
-                        uint32_t pos = g->word_offset[widx];
+                        /* The slot's word_offset array is NO LONGER guaranteed
+                         * untagged.  The -k pack site writes head_len into bits
+                         * 22-29 of the entry it emits (plan row 6), because a key
+                         * suffix has no marker byte for the replay to scan for the
+                         * way '@' serves -E.  So mask here, exactly as every device
+                         * reader does.  Masking is a no-op on an untagged entry, so
+                         * every existing path is unchanged. */
+                        uint32_t raw_woff = g->word_offset[widx];
+                        uint32_t pos = raw_woff & WOFF_H_OFF_MASK;
                         if (pos >= g->packed_pos) continue;
                         /* 2-byte little-endian length header; see the pack site in
                          * mdxfind.c.  plen must be wider than uint8_t now. */
@@ -2351,6 +2398,36 @@ void gpujob(void *arg) {
                                      | ((uint32_t)(uint8_t)g->packed_buf[pos + 1] << 8);
                         if (pos + 2 + plen > g->packed_pos) continue;
                         char *pword = g->packed_buf + pos + 2;
+
+                        /* -E / -a: split at the first '@', exactly as the host
+                         * tagger and the kernel do.  Recomputed here rather
+                         * than read back from word_offset BY DESIGN: this reads
+                         * the JOBG SLOT's array, which is deliberately left
+                         * untagged -- only the payload copy carries head_len --
+                         * and the three agree by construction because all three
+                         * scan the same bytes for the same byte.  See the
+                         * warning at gpu_u32_tag_word_offsets. */
+                        /* Head/tail split.  Prefer the TAG the pack site wrote --
+                         * one value, written where it is known -- and fall back to
+                         * the '@' scan only when there is no tag, which is every
+                         * -E/-a run (there the dispatch tags the staging copy, not
+                         * this one).  With -E AND -k together the tag is
+                         * deliberately absent and the scan is what you want: head
+                         * is the local part and the tail is domain+key, which is
+                         * the order the CPU produces. */
+                        int el_h = (int)plen, el_t = 0;
+                        uint32_t head_raw = (raw_woff >> WOFF_H_HEAD_SHIFT)
+                                            & WOFF_H_HEAD_MASK;
+                        if (head_raw) {
+                            el_h = (int)head_raw - 1;        /* stored biased by 1 */
+                            if (el_h > (int)plen) el_h = (int)plen;
+                            el_t = (int)plen - el_h;
+                        } else if (EmailLocal || Email) {
+                            for (uint32_t _i = 0; _i < plen; _i++) {
+                                if (pword[_i] == '@') { el_h = (int)_i; break; }
+                            }
+                            el_t = (int)plen - el_h;
+                        }
 
                         /* Map GPU rule index -> original Rules[] index.
                          * gpu_rule_slot[] is 1-BASED: it is the job->Ruleindex /
@@ -2362,17 +2439,22 @@ void gpujob(void *arg) {
                         int rslot = gpu_rule_slot[ridx];   /* 1-BASED RuleCnt[] index; 0 = no-rule pass */
                         int out_len;
                         if (rslot == 0) {
-                            /* Synthetic `:` — plaintext IS the original word. */
-                            memcpy(synthetic_job.line, pword, plen);
-                            synthetic_job.line[plen] = 0;
-                            out_len = (int)plen;
+                            /* Synthetic `:` — plaintext IS the original word.
+                             * Under -E that is the LOCAL PART here; the domain
+                             * is appended after the mask block, which is what
+                             * makes [prepend]local[append]domain come out in
+                             * the kernel's order rather than around the whole
+                             * address. */
+                            memcpy(synthetic_job.line, pword, (size_t)el_h);
+                            synthetic_job.line[el_h] = 0;
+                            out_len = el_h;
                             synthetic_job.Ruleindex = 0;  /* no rule applied */
                         } else {
                             if (rslot < 1 || rslot > (int)Numrules) continue;
 
                             /* Replay applyrule() to reconstruct the transformed plaintext. */
-                            memcpy(synthetic_job.line, pword, plen);
-                            synthetic_job.line[plen] = 0;
+                            memcpy(synthetic_job.line, pword, (size_t)el_h);
+                            synthetic_job.line[el_h] = 0;
 
                             char *rule_bc = (_rule_ptr_cache && _rule_ptr_nrules == (int)Numrules)
                                             ? _rule_ptr_cache[rslot - 1]
@@ -2393,11 +2475,11 @@ void gpujob(void *arg) {
                             int new_len = GPU_U32_REPLAY_BYTE;
                             if (gpu_u32_active())
                                 new_len = gpu_u32_replay_apply(synthetic_job.line,
-                                                               (int)plen, ridx,
+                                                               el_h, ridx,
                                                                _tpass, MAXLINE);
                             if (new_len == GPU_U32_REPLAY_BYTE)
                                 new_len = applyrule(synthetic_job.line, _tpass,
-                                                    (int)plen, rule_bc, _ws);
+                                                    el_h, rule_bc, _ws);
                             /* The dropped-hit PROBE that found the no-rule
                              * dedup bug lived here and is REMOVED: it read
                              * MDXFIND_GPU_U32_PROBE, and MDXFIND_CACHE is the
@@ -2467,9 +2549,14 @@ void gpujob(void *arg) {
                              * below prepends/appends to it, exactly as the
                              * non-re-attributed path does. */
                             if (new_len == -2) {
-                                memcpy(synthetic_job.line, pword, plen);
-                                synthetic_job.line[plen] = 0;
-                                out_len = (int)plen;
+                                /* -E: the LOCAL part, not the whole word --
+                                 * the mask block and the domain rejoin both
+                                 * still run below, so writing the full address
+                                 * here would mask around the domain and then
+                                 * append it a second time. */
+                                memcpy(synthetic_job.line, pword, (size_t)el_h);
+                                synthetic_job.line[el_h] = 0;
+                                out_len = el_h;
                                 synthetic_job.Ruleindex = 0;   /* No rule */
                                 goto u32_noop_reattributed;
                             }
@@ -2495,6 +2582,54 @@ void gpujob(void *arg) {
                             synthetic_job.Ruleindex = rslot;
                         }
                         u32_noop_reattributed: ;
+
+                        /* -a dot axis: reproduce the DEVICE's dot insertion,
+                         * between the rule and the mask, exactly as the kernel
+                         * orders it.  The dot bitmask is the OUTERMOST digit of
+                         * mask_idx, so dividing out the prepend/append position
+                         * product recovers it -- the same arithmetic the kernel
+                         * does, from the same two inputs, so there is no second
+                         * opinion about which dotting ran.
+                         *
+                         * Getting this wrong does not lose a hit: it emits a
+                         * CORRECT digest with a plaintext that does not hash to
+                         * it, which is the failure this whole plan is about.
+                         *
+                         * Self-gating: with no dot radix multiplied in, mask_idx
+                         * is below the position product, _dot is 0 and nothing
+                         * is inserted. */
+                        if (Email && out_len > 0) {
+                            unsigned long long _mc = 1ULL;
+                            int _np = gpu_mask_n_prepend, _na = gpu_mask_n_append;
+                            int _k;
+                            if (_np > 32) _np = 32;
+                            if (_na > 32) _na = 32;
+                            for (_k = 0; _k < _np + _na; _k++) {
+                                unsigned _ps = gpu_mask_wire_size(gpu_mask_sizes[_k]);
+                                if (_ps == 0u) _ps = 1u;
+                                _mc *= (unsigned long long)_ps;
+                            }
+                            unsigned long long _dot =
+                                (_mc > 1ULL) ? ((unsigned long long)mask_idx / _mc)
+                                             : (unsigned long long)mask_idx;
+                            if (_dot != 0ULL) {
+                                int _dw = out_len;
+                                int _nd = 0, i, j;
+                                if (_dw > 24) _dw = 24;   /* EMAIL_DOT_WIDTH_MAX */
+                                for (i = 0; i < _dw; i++)
+                                    if (_dot & (1ULL << i)) _nd++;
+                                if (_nd > 0 && out_len + _nd < MAXLINE) {
+                                    j = out_len + _nd - 1;
+                                    for (i = out_len - 1; i >= 0; i--) {
+                                        if (i < _dw && (_dot & (1ULL << i)))
+                                            synthetic_job.line[j--] = '.';
+                                        synthetic_job.line[j--] = synthetic_job.line[i];
+                                    }
+                                    out_len += _nd;
+                                    synthetic_job.line[out_len] = 0;
+                                }
+                            }
+                        }
 
                         /* B7.1-B7.5: prepend+append the mask characters to
                          * the candidate plaintext. The kernel did the same
@@ -2647,6 +2782,16 @@ void gpujob(void *arg) {
                                 out_len += npre + napp;
                                 synthetic_job.line[out_len] = 0;
                             }
+                        }
+                        /* -E / -a: rejoin the domain -- LAST, after the mask
+                         * block, mirroring the kernel and the CPU path.  el_t
+                         * is 0 for every run that is not -E, so this is one
+                         * path and not two. */
+                        if (el_t > 0 && out_len + el_t < MAXLINE) {
+                            memcpy(synthetic_job.line + out_len,
+                                   pword + el_h, (size_t)el_t);
+                            out_len += el_t;
+                            synthetic_job.line[out_len] = 0;
                         }
                         synthetic_job.clen       = out_len;
                         synthetic_job.pass       = synthetic_job.line;
@@ -3396,10 +3541,29 @@ void gpujob(void *arg) {
                  * to the Phase 1 accounting. */
                 uint32_t _ii_acct = (g->bf_inner_iter > 0u)
                                   ? g->bf_inner_iter : 1u;
-                uint64_t _mask_size_for_acct = (g->bf_num_masks > 0u)
-                                             ? (uint64_t)g->bf_num_masks *
-                                                 (uint64_t)_ii_acct
-                                             : (uint64_t)b71_mask_size_acct;
+                /* Tothash is what the progress line's h/s divides, so THIS is
+                 * the mask size an operator actually sees.  Read it from where
+                 * the dispatch published it (gpujob.h).
+                 *
+                 * The old fallback was b71_mask_size_acct, which is assigned
+                 * only inside the !_proto_fired branch a few thousand lines up;
+                 * on the rules-engine path -- the one -a takes -- it keeps its
+                 * initialiser of 1, so the dot radix never reached Tothash and
+                 * the displayed rate was the CPU's residual work alone.  That
+                 * is what Waffle saw on mmt: 15 to 40 h/s on a run doing
+                 * billions, against 159 Mh/s for the same list on CPU.
+                 *
+                 * This is the FOURTH copy of this expression found in one day
+                 * -- dispatch, NDRange, Totrules_gpu, Tothash -- which is the
+                 * argument for the published value being the only one anybody
+                 * derives from. */
+                uint64_t _mask_size_for_acct =
+                    (g->bf_num_masks > 0u)
+                    ? (uint64_t)g->bf_num_masks * (uint64_t)_ii_acct
+                    : ((my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
+                        && gpu_dispatch_mask_size[my_slot] > 0)
+                       ? gpu_dispatch_mask_size[my_slot]
+                       : (uint64_t)b71_mask_size_acct);
                 /* Internal-iter accounting (2026-05-19): for iterated GPU
                  * types (BCRYPT/PHPBB3/DESCRYPT/MD5CRYPT/SHACRYPT/SHA1DRU)
                  * the kernel runs N internal rounds per candidate, so

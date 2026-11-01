@@ -319,7 +319,7 @@ static const char gpu_kernel_a_masks_str[] =
     "    uint pkt_off = 132u + (n_words * 4u);\n"
     "    __global const uchar  *words = payload + pkt_off;\n"
     "\n"
-    "    uint wpos = word_offset[word_idx];\n"
+    "    uint wpos = WOFF_OFF(word_offset[word_idx]);\n"
     "    uint wlen = (uint)words[wpos++];\n"
     "\n"
     "    /* Final candidate length: [prebuf][word][appbuf]. */\n"

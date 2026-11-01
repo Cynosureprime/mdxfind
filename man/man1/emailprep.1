@@ -1,0 +1,269 @@
+.\" emailprep(1) -- man-macro reference page
+.\" $Revision: 1.5 $
+.\" $Log: emailprep.1,v $
+.\" Revision 1.5  2026/11/01 05:46:42  dlr
+.\" Bring the .TH version field up to emailprep.c 1.5, which added the Windows getline replacement. The field carries the tool version, and this page ships in the mdxfind distribution from v1.654.
+.\"
+.\" Revision 1.4  2026/11/01 05:46:08  dlr
+.\" Add the AUTHOR section. Every other page in the set ends with one naming Waffle; this page had none, and it is about to be published in the mdxfind distribution for the first time, where the omission would be visible beside its siblings.
+.\"
+.\" Revision 1.3  2026/10/31 14:48:06  dlr
+.\" Sync the .TH version field to emailprep.c 1.3.
+.\"
+.\" Revision 1.2  2026/10/31 14:47:31  dlr
+.\" Document native $HEX[] handling and the corrected CR behaviour. New $HEX[] ENCODING section: the decode happens first so the @ scan, -d match, normalization, dedup key and length key all see the real bytes; the wrapper is ASCII with no literal @, so a wrapped address measured as written has no domain and buckets at the width of the wrapper. Records that the decoder matches rehex -u exactly, that a wrapped address therefore dedups against its raw twin, and that output preserves the representation while changing only the content, with the NUL-or-newline override stated as a safety rule rather than a style choice. The CR paragraph is inverted: a trailing CR is now stripped, matching rehex -u and rling, rather than preserved. groff and mandoc both clean.
+.\"
+.\" Revision 1.1  2026/10/31 14:32:28  dlr
+.\" Initial revision: emailprep(1) man page. Documents the three ordered steps and why the order cannot be rearranged, the four options, the stderr histogram as the way to size a run before launching it, and the distinction between that predicted cost and the waste mdxfind reports as measured at the end of a run. Records the three deliberate non-behaviours -- no lowercasing, no CR stripping, no $HEX[] decoding -- each with the reason, which in every case is that the hash is computed over the bytes as typed. Notes that unlike rling it does accept - for stdin and stdout, since rling creates a file of that name, and that gmail.com and googlemail.com must be run as separate files because their suffixes differ by five bytes and the domain cannot be rewritten to match. States the shared first-@ invariant with mdxfind -E and names the regression target that checks it. Cross-references splitlen(1) as the right tool when the whole line is what is being measured. mandoc -Tlint clean.
+.\"
+.TH EMAILPREP 1 "2026-10-31" "emailprep 1.5" "Password Recovery"
+.SH NAME
+emailprep \- normalize, deduplicate and order email addresses by sweep cost
+.SH SYNOPSIS
+.B emailprep
+.RB [ \-d
+.IR domain ]...
+.RB [ \-N ]
+.RB [ \-u ]
+.RB [ \-q ]
+.I input output
+.SH DESCRIPTION
+.B emailprep
+prepares a list of email addresses for an
+.B mdxfind \-E
+or
+.B mdxfind \-a
+run.  It reads
+.IR input ,
+writes
+.IR output ,
+and does three things in an order that cannot be rearranged:
+.TP 3n
+1.
+.B Normalize
+\(em remove
+.B .
+from the local part, the text before the first
+.BR @ .
+Gmail and googlemail ignore dots there, so
+.B f.r.esh@gmail.com
+and
+.B fresh@gmail.com
+are one account, and the dotless spelling is the seed that
+.B mdxfind \-a
+sweeps back out to every dotting.
+.TP 3n
+2.
+.B Deduplicate
+\(em which must follow normalization, because that is where the collapse
+happens.  In one measured corpus of 10.2 million plaintexts, 27,179 distinct
+spellings of a single local part normalize to one seed.  Undeduplicated, each
+of those spellings sweeps its own 2^23 candidates.
+.TP 3n
+3.
+.B Order by local-part length,
+shortest first \(em which must follow deduplication.  A local part of length
+.I L
+costs 2^\fIL\fP candidates, so cost per input line spans eight orders of
+magnitude inside one unsorted file.  Shortest-first spends the early budget
+where candidates-per-find is lowest, which is what matters on a run that is
+stopped rather than finished.
+.PP
+Either filename may be
+.B \-
+for standard input or standard output.  Note that
+.BR rling (1)
+does
+.I not
+accept
+.B \-
+this way and will create a file of that name;
+.B emailprep
+differs from it deliberately.
+.PP
+Ordering is stable: lines of equal local-part length keep their input order, so
+two runs over the same input produce byte-identical output.
+.SH OPTIONS
+.TP
+.BI \-d " domain"
+Keep only addresses whose domain is
+.IR domain .
+The comparison ignores case, so
+.B @Gmail.com
+is kept by
+.BR "\-d gmail.com" ,
+but the bytes are preserved unchanged \(em the hash is over what was stored.
+May be given up to 64 times.  A line with no
+.B @
+has no domain and is excluded whenever
+.B \-d
+is given.
+.TP
+.B \-N
+Do not normalize.  Deduplicate and order only, measuring the local part as
+written.
+.TP
+.B \-u
+Do not deduplicate.  Normalize and order only.
+.TP
+.B \-q
+Suppress the histogram on standard error.
+.SH HISTOGRAM
+Unless
+.B \-q
+is given,
+.B emailprep
+reports its dispositions and then one row per local-part length with the
+.RI 2^ len
+sweep that length implies, and the total:
+.PP
+.RS
+.nf
+  local len      lines        2^len sweep
+          2          1                  4
+         14          1           1.64e+04
+         30          1           1.07e+09
+  total sweep at full width: 1.07e+09 candidates
+.fi
+.RE
+.PP
+This is the cost of the run
+.I before
+it is launched.
+.B mdxfind
+reports the width it actually used per word at the end of a run, which is the
+waste that was
+.IR paid ;
+the two are different numbers and neither substitutes for the other.
+.SH WHAT IT DOES NOT DO
+.B emailprep
+does not lowercase its input.  That is right for a frequency table and wrong for
+a candidate producer: the hash is computed over the bytes as typed.  Rule
+.B l
+covers it when lowercasing is wanted.
+.PP
+It
+.I does
+strip a trailing carriage return, matching
+.BR "rehex \-u"
+and
+.BR rling (1).
+The count is reported so a CRLF input is still visible.
+.PP
+It is not a replacement for
+.BR rling (1).
+Set subtraction, intersection and the
+.B \-q
+statistics all still belong there.
+.B emailprep
+does the one job
+.B rling
+cannot express \(em ordering by a key that is not the whole line \(em and
+nothing else.
+.SH $HEX[] ENCODING
+.B $HEX[]
+input is decoded natively, as in every other tool of the suite, and the decode
+happens
+.I first
+\(em so the
+.B @
+scan, the
+.B \-d
+match, normalization, the deduplication key and the length key all operate on
+the bytes the address actually consists of.  This is not a convenience: the
+wrapper is ASCII and carries no literal
+.BR @ ,
+so a wrapped address measured as written has no domain at all and buckets at the
+width of the wrapper rather than of the local part.
+.PP
+The decoder matches
+.BR "rehex \-u"
+exactly: the prefix test is a literal, case-sensitive
+.BR $HEX[ ,
+and decoding stops at the first byte pair that is not hexadecimal, which is the
+closing
+.BR ] .
+.PP
+A wrapped address therefore deduplicates against its raw twin \(em
+.B $HEX[]
+of
+.B j.o.h.n@gmail.com
+and a plain
+.B john@gmail.com
+are one record.
+.PP
+On output the representation is preserved and only the content changes: a line
+that arrived wrapped leaves wrapped, re-encoded from the normalized bytes, and a
+line that arrived raw leaves raw.  The single override is a safety rule rather
+than a stylistic one \(em a decoded payload can hold a NUL or a newline, which
+no raw line can carry, so such a record is always emitted wrapped.
+.SH SHARED INVARIANT
+.B emailprep
+splits on the
+.B first
+.BR @ ,
+exactly as
+.B mdxfind \-E
+does.  If the two ever disagree, the ordering this tool produces is no longer
+the ordering
+.BR mdxfind 's
+sweep cost follows, and running it stops buying anything.
+.B make regress-email
+checks the two against one fixture.
+.SH EXAMPLES
+Prepare the gmail portion of a leak and run the dot sweep against it:
+.PP
+.RS
+.nf
+$ emailprep \-d gmail.com leak.txt gmail\-ordered.txt
+$ mdxfind \-a \-m 0 \-f hashes.txt gmail\-ordered.txt
+.fi
+.RE
+.PP
+Run
+.B gmail.com
+and
+.B googlemail.com
+as separate files.  Their suffixes differ by five bytes, and the domain cannot
+be rewritten to match because the hash is over the stored bytes:
+.PP
+.RS
+.nf
+$ emailprep \-d gmail.com       leak.txt g1.txt
+$ emailprep \-d googlemail.com  leak.txt g2.txt
+.fi
+.RE
+.PP
+Subtract a wordlist already tried, after preparing:
+.PP
+.RS
+.nf
+$ emailprep \-d gmail.com leak.txt ordered.txt
+$ rling ordered.txt todo.txt already\-tried.txt
+.fi
+.RE
+.PP
+Size a run without writing the list:
+.PP
+.RS
+.nf
+$ emailprep \-d gmail.com leak.txt /dev/null
+.fi
+.RE
+.SH EXIT STATUS
+0 on success, 1 on a usage error, an unreadable input, or an allocation
+failure.
+.SH SEE ALSO
+.BR mdxfind (1),
+.BR rling (1),
+.BR splitlen (1),
+.BR procrule (1),
+.BR rehex (1)
+.PP
+.BR splitlen (1)
+also orders by length, but by
+.I line
+length and without normalization or deduplication; it is the right tool when
+the whole line is the thing being measured.
+.SH AUTHOR
+Waffle.

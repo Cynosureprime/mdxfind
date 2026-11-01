@@ -6,7 +6,7 @@
 
 Multi-threaded, multi-algorithm hash search engine. Searches wordlists against large hash collections across 1001 hash types simultaneously, using Judy arrays for memory-efficient hash storage and SIMD acceleration on supported platforms. Includes **mdsplit**, a companion tool that separates solved hashes by type into organized output files.
 
-See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons. See [docs/SEVENZIP.md](docs/SEVENZIP.md) for 7-Zip (`-m e1000`) archive recovery, including the silent false negatives that affect other tools. See [docs/SALTS_AND_USERS.md](docs/SALTS_AND_USERS.md) for how salts and usernames reach mdxfind (`-F` alongside the hash, `-S`/`-U` per-type lists, `-s`/`-u` global pools) and how their reference counts decide whether a run silently under-reports.
+See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons. See [docs/SEVENZIP.md](docs/SEVENZIP.md) for 7-Zip (`-m e1000`) archive recovery, including the silent false negatives that affect other tools. See [docs/EMAIL.md](docs/EMAIL.md) for email-address plaintexts (`-E` local-part rules, `-a` dot sweeps, and why `emailprep` ordering is a correctness precondition rather than a tuning step). See [docs/SALTS_AND_USERS.md](docs/SALTS_AND_USERS.md) for how salts and usernames reach mdxfind (`-F` alongside the hash, `-S`/`-U` per-type lists, `-s`/`-u` global pools) and how their reference counts decide whether a run silently under-reports.
 
 Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://judy.sourceforge.net/) for compressed hash lookup, and [hashpipe](https://github.com/Cynosureprime/hashpipe) for hash verification.
 
@@ -134,7 +134,7 @@ mdxfind -f hashfile [options] [wordlist ...]
 | `-s FILE` | Read salts from file (one per line) |
 | `-u FILE` | Read usernames from file |
 | `-j FILE` | Read peppers (prefixes) from file |
-| `-k FILE` | Read suffixes from file |
+| `-k FILE` | Read suffixes from file, one per line, each appended to every candidate. Over email local parts, a file of `@domain` lines makes the domain an axis |
 | `-i N` | Iteration count — GPU-accelerated for MD5, SHA1, SHA224, SHA256, SHA384, SHA512, MD4, RMD160, BLAKE2S256, Whirlpool, MD6-256, Keccak/SHA3, Streebog. Composable with `-n`/`-N` masks |
 
 **Password manipulation:**
@@ -145,7 +145,8 @@ mdxfind -f hashfile [options] [wordlist ...]
 | `-R FILE` | Apply rules (dot-product form) |
 | `-n SPEC` | Append mask/digits: `-n 2` (2 digits), `-n 3x` (3 hex), `-n '?l?d'` (letter+digit), `-n '?[0-9a-f]?[0-9a-f]'` |
 | `-N SPEC` | Prepend mask/digits (same syntax as `-n`) |
-| `-a` | Email address munging (try local part, domain, variations) |
+| `-a` | Email addresses: sweep every dotting of the local part (Gmail ignores dots there, so one account has many spellings). Costs 2^L candidates for a local part of L characters |
+| `-E` | Email addresses: apply `-r`, `-n`, `-N` and `-k` to the **local part only**, rejoining the domain onto every candidate. A word with no `@` is unaffected |
 | `-b` | Expand each word to Unicode (UTF-16LE), best effort |
 | `-c` | Replace special chars (`<>&`, etc.) with XML equivalents |
 | `-d` | Deduplicate wordlists, best effort |
@@ -346,6 +347,40 @@ mdxfind -m e1 -f hashes.txt 'pass?d?d?d?d'
 ```
 
 See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for the full activation rules, mask syntax, multi-GPU dispatch, scaling benchmarks, and the `-G` device-selection flag.
+
+### Email addresses
+
+Three options target address-shaped plaintexts. `-E` restricts rules and masks to
+the local part and puts the domain back afterwards, so `^A` on
+`fred@gmail.com` gives `Afred@gmail.com` and not `Afred@gmail.comA`. `-a`
+sweeps the dots instead: Gmail and googlemail ignore `.` in the local part, so
+`f.r.ed@gmail.com` and `fred@gmail.com` are one account, and `-a` generates
+every dotting of the dotless seed.
+
+`-k` covers the third case, a list of local parts with no domains at all,
+whether ordinary words or the stripped left hand side of an address list.
+Give it a file of domains each written with its leading `@` and every local
+part is tried against every domain, which is how to explore a set of new or
+previously unused domains. Rules and masks still land on the local part,
+because the key is appended after they run, so `-E` is not needed. The GPU
+serves key lists of 1 to 16; a longer list is correct but runs on the CPU.
+
+**Prepare the list with `emailprep` first.** This
+is not an optimisation. `-a` batches work by the **dotless** local-part length,
+so a list ordered any other way (including sorted by whole-line length, which
+looks right) changes that key every few words and dispatches a new GPU batch
+each time. Measured on a GTX 1080, 4 million words of the same two widths:
+ordered, 246 batches and 2.3 s; interleaved, 2,000,719 batches and 130 s. Same
+work, **44x** apart. `emailprep` strips the dots, deduplicates the collapse that
+follows, and sorts on the length that actually keys the batches.
+
+mdxfind says so when it sees it: the first dotted local part reaching the GPU
+and the first decrease in local-part length each produce one warning naming
+`emailprep`, rather than leaving you to infer it from the rate.
+
+See [docs/EMAIL.md](docs/EMAIL.md) for the cost arithmetic, the 24-position
+sweep cap, both uses of `-k`, what `-E` does under `-8` and with masks, and
+worked recipes.
 
 ### Output Format
 

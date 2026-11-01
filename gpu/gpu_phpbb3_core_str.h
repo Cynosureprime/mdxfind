@@ -1,10 +1,10 @@
 /* Auto-generated from gpu_phpbb3_core.cl -- do not edit */
 static const char gpu_phpbb3_core_str[] =
     "/*\n"
-    " * $Revision: 1.2 $\n"
-    " * $Log: gpu_phpbb3_core.cl,v $\n"
+    " * $Revisio" "n: 1.2 $\n"
+    " * $Lo" "g: gpu_phpbb3_core.cl,v $\n"
     " * Revision 1.2  2026/05/11 05:22:01  dlr\n"
-    " * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.\n"
+    " * Backfill $Revisio" "n/$Lo" "g RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revisio" "n/$Lo" "g keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.\n"
     " *\n"
     " */\n"
     "/* gpu_phpbb3_core.cl -- PHPBB3 / phpass (e455) algorithm extension\n"

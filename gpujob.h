@@ -246,6 +246,141 @@ void gpujob_overflow_preload_all(void);
 #define GPU_RULES_DISPATCH_ROUND_BUDGET  8000000000LL
 #define GPU_RULES_MIN_WORDS_PER_BATCH    1
 
+/* The 1-D NDRange ceiling, 2 GiW.  Moved here from mdxfind.c so the host-side
+ * dot-width clamp in gpu/gpu_opencl.c reads the SAME number the mask fan-out
+ * producer enforces -- two copies of a grid ceiling is how a dispatch gets
+ * admitted that the kernel's own 32-bit arithmetic cannot represent, which is
+ * the silent-wrong-plaintext failure plan section 6 is about. */
+#ifndef MDX_NDRANGE_HARD
+#define MDX_NDRANGE_HARD ((unsigned long long)1 << 31)
+#endif
+
+/* ---- word_offset bit layout, HOST side ------------------------------------
+ *
+ * These MUST equal the device definitions in gpu/gpu_common.cl and
+ * gpu/metal_common.metal.  They cannot be shared by #include -- a .cl is not
+ * a C translation unit -- so the layout is described in two places and the
+ * regress suite asserts the two agree (regress/regress-email.sh).  Do not
+ * change one without the other.
+ *
+ *   bits  0-21  offset into the packed-words region (2^22 = 16384 x 256)
+ *   bits 22-29  head_len + 1, or 0 when untagged
+ *   bits 30-31  UTF-32 word class
+ */
+#define WOFF_H_OFF_MASK    0x003fffffu
+#define WOFF_H_HEAD_SHIFT  22u
+#define WOFF_H_HEAD_MASK   0xffu
+#define WOFF_H_CLASS_SHIFT 30u
+/* The head_len field, kept as-is -- for a write-back that must not disturb it. */
+#define WOFF_H_HEAD_FIELD  (WOFF_H_HEAD_MASK << WOFF_H_HEAD_SHIFT)
+
+/* ---- -a: normalize an address, and measure its sweep width ----------------
+ *
+ * ONE definition, two callers: procjob's -a setup and the chokepoint pack site.
+ * They must agree, and they did not have to before -a reached the GPU -- the
+ * chokepoint packs at mdxfind.c ~15846 while the -a setup normalizes at ~15979,
+ * so the device would otherwise be handed the RAW word and would sweep dots
+ * onto an already-dotted local.  That is exactly the defect phase 2 fixed on
+ * the CPU side (a reversed fastcopy discarding the normalization), and it is
+ * not a bug worth having twice.
+ *
+ * Writes the dotless local part followed by the domain verbatim, returns the
+ * NORMALIZED total length, and reports the local length through *head.  dst
+ * needs room for srclen bytes; normalizing only shrinks. */
+static inline int gpu_email_normalize(const char *src, int srclen,
+                                      char *dst, int *head)
+{
+    int i, n = 0, at = srclen;
+    for (i = 0; i < srclen; i++) {
+        if (src[i] == '@') { at = i; break; }
+        if (src[i] == '.') continue;
+        dst[n++] = src[i];
+    }
+    if (head) *head = n;
+    for (; i < srclen; i++) dst[n++] = src[i];   /* '@' and the domain, verbatim */
+    return n;
+}
+
+/* The dot-sweep width a word needs: its normalized local length, capped.  The
+ * cap matches EMAIL_DOT_WIDTH_MAX in mdxfind.c and WOFF_DOT_WIDTH_MAX in the
+ * two device commons; the regress suite asserts they agree. */
+#ifndef GPU_EMAIL_DOT_WIDTH_MAX
+#define GPU_EMAIL_DOT_WIDTH_MAX 24
+
+/* The mask-axis size the LAST dispatch on a device actually used -- including
+ * the -a dot radix and AFTER the grid clamp.  Indexed by device slot.
+ *
+ * The hit replay has to decode combined_ridx against the same base the kernel
+ * packed it with, and it cannot re-derive that base: the dot width comes from
+ * the widest local part in the batch and is then clamped against the grid, so
+ * repeating both steps in the replay would be a second opinion about which
+ * dotting ran -- and when the two opinions differ the run emits a CORRECT
+ * digest beside a plaintext that does not hash to it.  Written once where it is
+ * computed, read once where it is needed.
+ *
+ * Defined in mdxfind.c, which is in every build, rather than in a backend: the
+ * two replays and the two dispatches are four translation units and only
+ * mdxfind.c is common to all of them. */
+#define GPUJOB_MAX_DEVS 64
+extern uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
+#endif
+static inline int gpu_email_dot_width(const char *src, int srclen)
+{
+    int i, n = 0;
+    for (i = 0; i < srclen; i++) {
+        if (src[i] == '@') break;
+        if (src[i] != '.') n++;
+    }
+    return n > GPU_EMAIL_DOT_WIDTH_MAX ? GPU_EMAIL_DOT_WIDTH_MAX : n;
+}
+
+/* ---- -E / -a: tag each word's local-part length into word_offset ----------
+ *
+ * The device needs to know, per word, how much of it mangling may touch: under
+ * -E and -a the rules, the mask and the dot axis act on the LOCAL PART and the
+ * domain is appended unchanged.  That length rides word_offset bits 22-29.
+ * The full layout, and the reason every reader must mask, is documented once
+ * in gpu/gpu_common.cl and mirrored in gpu/metal_common.metal.
+ *
+ * STORED BIASED BY ONE.  0 means untagged, so an untouched array reads as
+ * "the whole word is the head" and a non-email run needs no test at all.  The
+ * bias is load-bearing rather than tidy: an address beginning with '@' has a
+ * genuine head_len of ZERO, so an unbiased field could not tell "the local
+ * part is empty" from "there is no tag", and would hand the kernel the whole
+ * address as the head for every such word.
+ *
+ * CALL IT ON THE PAYLOAD COPY, NEVER ON THE JOBG SLOT'S ARRAY.  The slot's
+ * word_offset[] is reused across dispatches and is read back by the host hit
+ * replay, which masks nothing; tagging it in place would corrupt the plaintext
+ * of every emitted crack.  gpu_u32_tag_word_offsets carries the same warning
+ * for the class tag and is the pattern to follow -- tag the staging buffer at
+ * staging + 132, which is where both callers already point.
+ *
+ * `packed` is the packed-words region: each word a 2-byte little-endian length
+ * followed by its bytes, exactly as the pack site writes it.
+ *
+ * Byte 0x40 cannot occur inside a multi-byte UTF-8 sequence -- lead bytes are
+ * 0xC2 and above, continuations 0x80 to 0xBF -- so scanning bytes for '@' is
+ * exactly as correct as scanning codepoints, and -8 needs no variant. */
+static inline void gpu_tag_head_lens(uint32_t *woff, uint32_t n_words,
+                                     const unsigned char *packed)
+{
+    uint32_t i;
+    for (i = 0; i < n_words; i++) {
+        uint32_t raw  = woff[i];
+        uint32_t off  = raw & WOFF_H_OFF_MASK;
+        uint32_t wlen = (uint32_t)packed[off] | ((uint32_t)packed[off + 1] << 8);
+        const unsigned char *w = packed + off + 2;
+        uint32_t j, head = wlen;
+        for (j = 0; j < wlen; j++) {
+            if (w[j] == '@') { head = j; break; }
+        }
+        if (head == wlen) continue;      /* no '@': leave the field 0 */
+        if (head > 254u) continue;       /* 8 bits biased: 0..254 only */
+        woff[i] = (raw & ~WOFF_H_HEAD_FIELD) | ((head + 1u) << WOFF_H_HEAD_SHIFT);
+    }
+}
+
 /* RULE-AXIS CHUNKING (Option A, 2026-05-29) — codegen two-kernel proto path
  * candidate-buffer cap. The codegen pipeline (gpu_opencl_kernelb_dispatch_proto)
  * materializes post-rule candidates in a global buffer sized

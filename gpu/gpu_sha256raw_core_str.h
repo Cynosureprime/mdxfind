@@ -1,13 +1,13 @@
 /* Auto-generated from gpu_sha256raw_core.cl -- do not edit */
 static const char gpu_sha256raw_core_str[] =
     "/*\n"
-    " * $Revision: 1.3 $\n"
-    " * $Log: gpu_sha256raw_core.cl,v $\n"
+    " * $Revisio" "n: 1.3 $\n"
+    " * $Lo" "g: gpu_sha256raw_core.cl,v $\n"
     " * Revision 1.3  2026/08/30 14:35:34  dlr\n"
     " * Restore the RAW-family iteration rule in the GPU kernels to match mdxfind.c 1.549. These kernels were written against the post-1.290 CPU regression and validated byte-exact against it, which is why CPU-vs-GPU conformance testing never caught the error: both sides agreed on the wrong answer. The correct rule is ONE binary feed at the base, giving X(X_bin(pass)), followed by STANDARD hex iteration. The former template_iterate already implemented exactly that binary absorb, so it is renamed template_raw_refeed, moved ahead of template_finalize and called once at the end of it; template_iterate is replaced by the plain siblings hex step. For the Metal MD5 variant the algo_mode parameter is dropped since RAW has no uppercase form and the call site uses the legacy single-argument shape. Validated on fpga.local GTX 1080 via OpenCL: 15 of 15 lines identical between CPU and GPU across five types and three depths, with a bogus-hash negative control returning zero. On dev1.local Apple M1 via Metal the base is correct and matches CPU at x01 for all five types, but iterations beyond x01 are not returned; that is a coverage gap and not a wrong answer, confirmed by comm showing zero Metal lines absent from the CPU set.\n"
     " *\n"
     " * Revision 1.2  2026/05/11 05:22:02  dlr\n"
-    " * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.\n"
+    " * Backfill $Revisio" "n/$Lo" "g RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revisio" "n/$Lo" "g keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.\n"
     " *\n"
     " */\n"
     "/* gpu_sha256raw_core.cl — SHA256RAW algorithm extension functions for\n"

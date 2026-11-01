@@ -1336,7 +1336,7 @@ static const char gpu_kernel_a_rules_masks_str[] =
     "     * into the packed output buffer. */\n"
     "    __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];\n"
     "\n"
-    "    uint wpos = word_offset[word_idx];\n"
+    "    uint wpos = WOFF_OFF(word_offset[word_idx]);\n"
     "    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);\n"
     "    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */\n"
     "    if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;\n"

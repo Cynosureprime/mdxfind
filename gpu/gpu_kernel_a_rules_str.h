@@ -1330,7 +1330,7 @@ static const char gpu_kernel_a_rules_str[] =
     "        wpos += 2;   /* 2-byte little-endian length: see gpujob.h */\n"
     "        if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;\n"
     "#else\n"
-    "        wpos = word_offset[word_idx];\n"
+    "        wpos = WOFF_OFF(word_offset[word_idx]);\n"
     "        int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);\n"
     "        wpos += 2;   /* 2-byte little-endian length: see gpujob.h */\n"
     "        if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;\n"

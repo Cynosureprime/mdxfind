@@ -1403,7 +1403,7 @@ void md5_rules_phase0(
      * op fast-paths (current walker is scalar in-place). */
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
 
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
@@ -1497,7 +1497,7 @@ void md5_rules_phase0_test(
     uint rule_idx = gid / n_words;
 
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
@@ -1557,7 +1557,7 @@ void md5_rules_phase0_validate(
     uint rule_idx = gid / n_words;
 
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
@@ -1620,7 +1620,7 @@ void md5_rules_phase0_test_iter(
     uint rule_idx = gid / n_words;
 
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;

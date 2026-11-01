@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.643 2026/10/30 18:23:12 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.654 2026/11/01 04:43:39 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.643 2026/10/30 18:23:12 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.654 2026/11/01 04:43:39 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,95 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.654  2026/11/01 04:43:39  dlr
+ * The -a GPU cut-over drops to 5, and two one-shot alerts name the real hazard. The threshold at 14 tuned the wrong variable. Measured on fpga with UNIFORM-width synthetic lists, the device holds about 1.0e9 candidates per second flat from width 6 through 13 -- 8.4e8 at 6, 1.03e9 at 9, 9.8e8 at 11, 9.2e8 at 13 -- against a CPU doing about 5.8e7, so the device is roughly 17 times faster at EVERY width and there is no crossover to find. The two seconds of idle in those runs is fixed start-up, the same in all of them, not per-dispatch overhead. What destroys -a throughput is the batch KEY changing. Same four million words, same width range, same card: uniform width 6 ran 2.30s wall and 0.31s busy in 246 batches, while widths 5 or 6 at random ran 130.06s wall and 87.00s busy in 2,000,719 batches. Forty-four times slower, one batch per two words. That is the section 15.1 fragmentation case, and the cure is ordering by DOTLESS local length, which is what utils/emailprep produces. Waffles live run looked like a width problem because w1 was sorted by LINE length while 21.6 percent of its locals carry a dot: sampling one line-length band found dotless widths of 12, 11, 10, 9 and 8 interleaved, so the key changed about every fourth word. Re-prepared dotless, the same run now processes at 1 Gh per second. So: floor of 5 only as insurance against a pathological micro-sweep; a one-shot WARNING the first time a dotted local reaches the device, naming emailprep; and a one-shot per DIRECTION on a change of batch key while packing. The direction split is deliberate and was found by testing: a single flag fired on the first change, and with widths 10, 11, 10 that was the 10 to 11 INCREASE, reported as normal, so the 11 to 10 decrease -- the one that proves the list is misordered -- was never announced. An increase is normal at a length boundary; a decrease cannot happen in a correctly ordered list. The temporary MDXFIND_EMAIL_MIN_DOT_W environment knob added for the sweep is REMOVED, restoring the no-environment-knob rule; MDXFIND_CACHE is again the only environment input. Validated: regress-email-gpu 15 of 15 on fpga GTX 1080 and dev1 M1, regress-email 32 of 32 local, all three alert cases checked independently, source byte-identical on all three build hosts.
+ *
+ * Revision 1.653  2026/11/01 02:04:19  dlr
+ * Keep narrow -a sweeps on the CPU, and get the dot radix into the hash accounting. Both from Waffles mmt report: mdxfind -f /tmp/g8.txt -a w1 on a 7.4M-hash list showed 15 to 40 h/s and 7,500 to 12,700 lines/s with the work queue backed up, against 30,000 lines/s and an EMPTY queue for the same list under -G none. Two separate faults. One, the GPU really was slower. The word axis is capped at 2 to the 30 over 2 to the N lanes, so from N=16 up a dispatch carries a constant 1e9 candidates and host overhead is noise, but BELOW that the dispatch shrinks with the sweep: at N=5 it is 16,384 times 32 equals half a million candidates, about 50 microseconds of GPU against a host overhead of hundreds. The device paid full dispatch cost to do less work than the CPU does in the same interval, and an emailprep-ordered list opens on exactly those short locals. New EMAIL_GPU_MIN_DOT_W of 14 keeps such a word on the CPU, which is demonstrably good there, and the count is reported at the end so the handover is visible. The -a loop-exit interlock now also requires that the word was actually packed, or a declined word would have its dot walk skipped on both engines. Measured on fpga, 5M words of 5 to 6 character locals: 30,120 lines per second before, 833,333 after, against 1,000,000 for CPU-only; and on 100k words of 17 character locals the device stays 23 times faster than the CPU, 5,263 against 228. Two, the displayed rate was meaningless. Tothash is what the progress lines h/s divides, and its mask factor fell back to b71_mask_size_acct, which is assigned only inside the proto branch and keeps its initialiser of 1 on the rules-engine path that -a takes. So the dot radix never reached it. Now read from the per-device value the dispatch publishes. Same substitution in the Totrules_gpu accounting, whose multiplier also dropped the synthetic passs own mask_size candidates, and in the Metal twin. That makes four copies of one expression found in a day, dispatch and NDRange and Totrules_gpu and Tothash, which is the argument for everyone deriving from the published value. Verified exact: 20,000 words at N equals 17 now report 2,621,571,071 candidates against 2,621,440,000 expected plus CPU residual, at 651.57 Mh per second; the Metal twin reports 655,491,071 against 655,360,000. regress-email-gpu 15 of 15 on fpga GTX 1080 and dev1 M1, regress-email 32 of 32 local.
+ *
+ * Revision 1.652  2026/11/01 00:50:57  dlr
+ * Row 6: -k on the GPU. The key axis rides the WORD axis -- one packed entry per (word, key) pair with head_len tagged into word_offset bits 22-29 -- so the device mangles only the word and appends the key afterwards. That is the same head/tail path the -E domain rejoin already uses, so this needs NO kernel change at all. The shape was settled by measurement rather than by section 7s assumption of the salt axis: rule u on password with key ab gives PASSWORDab, so the rule does not touch the key, and -k with -n ?d gives password5ab, so the mask lands before it. CPU order is therefore mask_pre + rule(word) + mask_app + key, which is exactly the order the kernel produces. Admitted when the key list is 1 to 16 and -E/-a are off, and per word only when the word is at most 254 bytes, which is what the 8-bit biased head_len field holds; a word that cannot be tagged is NOT packed at all rather than packed without its key, which would have the device hash the bare word and emit a plaintext -k never asked for. The CPUs duplicate key walk is suppressed by pointing curkey at the key lists terminator so the walkers own break fires before it appends or hashes anything -- NULL would instead hash the bare word. Suppression requires that every rule for the word also reached the device, since CPU-only rules still need their keys. New Keys_end, Keycount and Keymaxlen carry the terminator, the count and the longest key, the last so the pack site can reserve a whole key set in ONE flush test and never split one words keys across two dispatches. Validated 15 of 15 by regress-email-gpu.sh on fpga GTX 1080 OpenCL and dev1 M1 Metal, including the three -k correctness checks, the word-axis assertion that the device receives words times keys entries, and the non-email mask baseline; regress-email 32 of 32 local; source byte-identical on all three hosts.
+ *
+ * Revision 1.651  2026/10/31 23:11:04  dlr
+ * Three defects found after rows 4 and 5 landed, two of them mine from the same session. One, the NDRange kept a SECOND COPY of the effective_mask_size expression: the enqueue recomputed bf_num_masks greater than 0 ? bf_num_masks : b71_mask_size for itself, which was the same value until the -a dot radix had to move onto effective_mask_size to survive the bf_num_masks override. Then one copy carried the radix and the other did not, the grid lost its mask factor, every lane resolved to word 0, and each width-keyed batch recovered exactly its FIRST word -- 10 of 10 known answers before, 5 after, one per batch, with the DEVICE reporting 5 hits so it was the grid and not the replay. Fixed in gpu_opencl.c; there is now one copy. Two, -a with -r and -n returned 0 on the device and 10 on the CPU because that same override discarded the radix whenever a mask was configured, which mdxfind.c sets for every -n and -N run and not only for brute force. Both cross products are now checks in regress-email-gpu.sh, verified against the pre-fix binary. Three, gpu_dot_width_used and gpu_dot_width_asked are now owned here, written by both backends and reported, closing a gap where four sites wrote them and nothing read them; the message states what is true, which is that the clamp costs SPEED and never coverage. The dispatch clamps only when a single word will not fit the grid, the interlock that lets the CPU skip the dot axis is gated on the same inequality, so whenever one engages the other stands down and the CPU sweeps those words in full. An earlier draft of that message said the run was incomplete, which is false and worse than silent. Validated: regress-email 32 of 32 local, regress-email-gpu 11 of 11 on fpga GTX 1080 OpenCL and dev1 M1 Metal, source byte-identical on all three hosts.
+ *
+ * Revision 1.650  2026/10/31 22:02:34  dlr
+ * Rows 4 and 5 of the email dot axis: -a is served on both GPU backends, and three host-side defects that kept it from paying. One, the loop-exit interlock was gated on job->MaskCount, which is 0 for -a with no -n, so the CPU re-walked every dotting the kernel had already covered -- measured identical candidate counts with and without the GPU (24,768 both ways), meaning the device was pure cost and the 10 of 10 recoveries were CPU work. The jump value and the loop bottom are now one expression, MASK_AXIS_ITERS, because they were two copies that disagreed exactly in the dot-only case, and the jump reads this word s width rather than emailpow, which is recomputed per word BELOW the chokepoint and so still held the previous word s value. Two, numline was forced to 1 for every -a run: right on the CPU where one address IS 2^N candidates, ruinous on the GPU where the end-of-job flush then dispatches ONE WORD per batch -- 50,000 batches for 50,000 words at about 5 Mh/s on a card that does MD5 in GH/s, with sorted and shuffled input indistinguishable because no batch ever held two words to order. Now bounded by GPU_RULES_MAX_WORDS_PER_BATCH when the op can reach a GPU, guarded by GPU_ENABLED since gpujob.h is behind the backend test and naming the constant unguarded broke the plain macOS target while the OpenCL build stayed green. Three, a coverage guard: once the CPU stops sweeping dots, a clamped dot width means candidates nobody computed, so the word axis is bounded per width at the pack site and the interlock only fires when the kernel can cover the word s full width. gpujob.h gains gpu_dispatch_mask_size, the per-device mask size the dispatch actually used, so the hit replay decodes against the same base rather than re-deriving it. Measured on fpga after: CPU candidates 307 with the GPU against 24,768 without, 10 of 10 recovered, 7 batches for 50,000 sorted words at 0.07s busy against 37,640 batches and 1.47s shuffled. regress-email 32 of 32; regress-email-gpu 9 of 9 on fpga OpenCL and dev1 Metal.
+ *
+ * Revision 1.649  2026/10/31 19:22:38  dlr
+ * Serve -E on the GPU: drop !EmailLocal from the two admission gates. The device now learns each words local-part length from word_offset bits 22-29, mangles only that and appends the domain before hashing, and the host hit replay reproduces the same split -- so the reason the gate existed is gone. -a stays CPU-only and keeps !Email on both gates: its dot axis is a per-word 2^L keyspace that needs the interleave mask section, a later phase. Validated on BOTH backends before the gate dropped, which is the whole point of having landed every earlier step inert: OpenCL on fpga.local GTX 1080 recovered 15 of 15 planted answers with GPU == CPU identical and all 15 plaintexts exact, device line showing 2000 words 4000 hashes 15 hits, and a nine-cell GPU-vs-CPU matrix green including -E -n ?d, -E -N ?d, -E -8, e8 -E and a no-E regression cell; Metal on dev1.local the same 15 of 15 with its own device line and a seven-cell matrix green. See gpu/gpu_template.cl 1.29 and gpu/metal_template.metal 1.18 for the kernel side.
+ *
+ * Revision 1.648  2026/10/31 16:42:23  dlr
+ * Exclude -E from the two GPU admission gates. Found by preparing the .205 integration, not by any test here: this host has no GPU, so nothing in the local suite could reach the code path.
+ *
+ * Under -E the word in job->line is the LOCAL PART and the domain is rejoined on the CPU at the key-axis seam. The rules kernel knows nothing of that split, so an admitted -E word would be hashed, and its hits replayed, WITHOUT the domain -- every candidate a well-formed string that is not the address being guessed. Nothing warns: the run finds nothing and looks clean, which is the failure signature this whole plan exists to avoid. -a has carried !Email at both gates all along; -E needed the same and did not have it in 1.644 through 1.647.
+ *
+ * Two gates now carry !EmailLocal: the rules-engine admit at the chokepoint, and the C2.3 rule-skip, which hands a rule to the kernel and advances past it on the CPU -- so under -E the rule would be applied to a local part with no domain and the CPU would never apply it at all.
+ *
+ * The do_pack_gpu admit deliberately does NOT gain EmailLocal, and says so at the site. Its one surviving effect is `if (do_pack_gpu) FastRule = 0`, and -E works WITH the SIMD walker as of 1.644; adding it there would silently throw that away on every GPU host, which is the opposite of what phase 1 built.
+ *
+ * This is the gate that makes -E correct-by-declining on a GPU host until the interleave section lands (plan phase 4). Syntax-clean under -DOPENCL_GPU=1. It cannot be exercised on the iMac; the .205 build and an fpga.local run are what will show it.
+ *
+ * Revision 1.647  2026/10/31 16:17:45  dlr
+ * Phase 3.5: the salt-axis uint32 ceiling, declined to CPU at GPU admission.
+ *
+ * Checking the code narrowed the plan section 6 analysis considerably. Of the three uint32 ceilings it names, two are already covered and the third is not where the plan put it.
+ *
+ * The GRID ceiling, numline times rules times masks, is covered by MDX_NDRANGE_HARD at 2^31 at the mask fan-out producer, added after the plan was written. Its failure had been exactly the silent one section 6 predicts: the kernels bound themselves with a 32-bit product that WRAPPED and retired most of the dispatch while the 64-bit host counters still reported the full keyspace, so the run reconciled exactly and exited clean. Nine lines of a five-position ?a mask found 0 of 2 planted answers where eight lines found 2 of 2.
+ *
+ * The per-dispatch WORK SIZE fails loudly at enqueue with CL_INVALID_GLOBAL_WORK_SIZE, which is survivable and needs nothing.
+ *
+ * The SALT axis is the one still exposed, and MDX_NDRANGE_HARD does not help because _lanes_per_mask carries numline and the rule count but no salt factor at all. gpu_opencl.c packs num_salts = effective_mask_size times this_page_salts into a uint32 FIELD and the kernel recovers mask_size by dividing it back out; the hit encoding multiplies the same two by the rule count into one uint32 combined_ridx. Neither product is checked anywhere. So the exposure is salted ops with a mask, which is exactly what section 6 concluded, and it is a hazard in the shipped tool today rather than only after the interleave section lands.
+ *
+ * The check goes at the admission gate beside mask_b71_eligible rather than at the pack site, because a false eligibility there already means the long-standing well-tested CPU path, while declining at the pack site needs a status the caller must honour. It is conservative on purpose: nsalts_job is the whole snapshot while one dispatch sees at most one salt page, so it declines some runs that would have fit. Declining costs throughput; admitting a run whose encoding cannot represent its own answers costs correct output, and those are not comparable. The message names the mask size, the salt count, the rule states, the slots needed and the mask width that WOULD fit, because a decline with no number is a dead end for whoever reads it.
+ *
+ * STATUS: syntax-clean under -DOPENCL_GPU=1 and provably absent from the plain build -- the preprocessor shows three occurrences with OPENCL_GPU=1 and zero without -- so the local build and its results are untouched by construction, and make regress-email is 27 passed 0 failed 0 skipped with regress e=1 green. NOT YET EXERCISED: the gate only exists in a GPU build, so whether it fires at the right boundary and whether the CPU fallback is clean both need a run on fpga.local or .205. The phase table in the plan marked 3.5 as an iMac phase on the assumption it would be a startup check in mdxfind.c; it is host code inside a GPU-only block, so that marking was wrong and the plan now says so.
+ *
+ * Revision 1.646  2026/10/31 16:12:15  dlr
+ * Phase 3: retire what phase 2 left behind in the -a dot axis. Behaviour-neutral cleanup, byte-identical to 1.645 across eight invocations covering -a alone, -a with rules, -a with a mask, -a -E, -E alone, rules alone, a prepend mask with rules, and the UTF-32 engine.
+ *
+ * Most of the phase was already absorbed by 1.645: the Origline rebuild and the (Email && emailcur < emailpow) loop condition both went with the interleave rewrite. What remained was real but small.
+ *
+ * emailcur stops being a carried file-scope counter and becomes a block-local derived from the iteration counter, where it belongs. A counter advanced inside the dot block is precisely what made the axes run in lockstep instead of forming a cross product; nothing needs the value to survive the iteration now, so nothing may be able to.
+ *
+ * EMAIL_DOTS replaces three separate copies of the per-word dot-axis size expression, read by the rule-advance gate, the mask-index gate and the loop-bottom bound. Those three have to agree, and the gate comment has warned since Phase 4 that its bound and the loop bottom are already two copies of one expression; a fourth was not going to end well.
+ *
+ * Revision 1.645  2026/10/31 15:52:33  dlr
+ * Phase 2: the -a dot axis becomes an inner axis of the rule-and-mask cross product, and a long-standing -a correctness bug is fixed.
+ *
+ * THE BUG, which is the larger half of this. fastcopy is (dest, src) -- mdxfind.c:5510 -- and the -a setup read fastcopy(cur, job->line, len) with cur already pointing at Origline. That copies job->line INTO Origline, so the normalized dotless address the block had just built was overwritten by the ORIGINAL word, every single time. -a therefore never swept the dotless seed it computed: it dotted an ALREADY-DOTTED local and emitted the adjacent-dot forms that plan section 2 measures as unreachable by the model, 284 cases in 2.4M. Measured on j.o.h.n.smith@gmail.com: 512 candidates emitted of which only 162 were distinct, 510 carried a doubled dot, and every one had its domain truncated from @gmail.com to @gmail because the tail was copied with the wrong length. After the fix the same word gives 512 emitted, 512 distinct, zero doubled dots and 512 with the domain intact. The planted known-answer vector for j.o.h.n@gmail.com could not have been found before this; it is found now.
+ *
+ * THE CROSS PRODUCT. -a adopts the -E split: Origline holds the normalized whole address, job->line the normalized local part, and the one -E rejoin at the key-axis seam restores the domain. The dot axis now rides the same iteration machinery as the mask axis rather than being a separate outer loop. email_dots is per word, 2^L of the local part, so it cannot multiply a global MaskCount the way a mask section can; it multiplies the per-word loop bound instead, and the mask index advances once per completed dot cycle, which makes dots the innermost axis. Verified: ab@c with one rule gives 8 candidates, 4 dottings times two rule states, where the old code gave 2 and one of those was corrupt; with -n ?d it gives 40, four dottings times ten mask values.
+ *
+ * The dot insertion reads rule_base, the stable base for this (rule, mask) pair, not job->line. Reading job->line meant reading the PREVIOUS dot iteration output, and the gate restores it only on the else-if-currule path, so with no -r nothing restored it at all and the dots accumulated: local ab produced ab, a.b, then a.. and a... as each pass re-dotted its own output.
+ *
+ * The insertion scratch is a dedicated per-thread buffer, email_buf. The first attempt borrowed tline, which is the RULE ENGINE INPUT, filled once per word and re-read by every apply, so the dotted output fed straight back into the next rule and -a -r $1 on ab@c produced a...1@c. Every other per-thread buffer in procjob has an owner too.
+ *
+ * -a and -E can now be combined and -a -E equals -a, so the refusal added in 1.644 is gone. The -E split block is gated on !Email because -a does its own split after normalizing; running -E first would truncate at the @ and leave -a a local with no @ to find, losing the domain. -a keeps the SIMD walker off as it always has: the walker drains every rule from job->line in one pass, which cannot interleave with a per-iteration dot rewrite and the rule_base accounting it depends on.
+ *
+ * The 24-character sweep clamp is now the named EMAIL_DOT_WIDTH_MAX and the end-of-run summary reports how many words it bit, per plan section 9 decision 9 -- a sweep that covered 24 of a 30-character local otherwise looks exactly like one that covered all of it. Raising it is decision 3 and still open.
+ *
+ * Every expression added collapses to its previous value when -a and -E are both off: email_dots is 1, iter_active is JOBFLAG_NUMBERS and loop_bound is unchanged. Verified byte-identical to 1.644 for -m 0, -m 0 -r, -m e8 -r, -m 0 -n, -m 0 -N -r and -m 0 -8 -r over the fixture file. regress e=1, e=8, e=31 and e=260 pass. make regress-email is 27 passed, 0 failed, 0 skipped.
+ *
+ * Revision 1.644  2026/10/31 15:26:09  dlr
+ * Add -E: rules, masks and the key axis apply to the email local part only. The word is split at the FIRST @ once per word, every mangling stage sees the local part alone, and the domain is rejoined immediately before the key axis. procrule gains the same flag in the same revision, since it is the oracle these candidates are diffed against and a phase that shipped one without the other would have no way to check itself. Plan sections 4.1 through 4.4.
+ *
+ * No new storage. Origline already holds the untouched whole address on the -a path, is per-thread and is written once per word and read nowhere else per candidate, so it is the rejoin source. tline is NOT usable: it is filled only inside if (currule), so on the no-rule pass it still holds the previous word-and-rule text and would splice a stale domain onto a live local. tline does hold the whole address on the rule path, which is why passing orig_len -- set by the split to the local length -- hands the engine exactly the local part with no copy and no second buffer.
+ *
+ * The rejoin has to be the LAST mangling step and is: rule_base caches job->line for the mid-mask-cycle restore and job->prefix saves it for the prepend-mask restore, so a rejoin upstream of either would cache a line already carrying a domain and the next iteration would append a second one. The @ belongs to the tail, so a word with no @ has el_tail 0 and the rejoin is a no-op -- one path, not two. The bounds check is against sizeof(job->line), not MAXLINE: job->line is MAXLINE+MAXLINE while MAXLINE is the rule engine output clamp, so a test against MAXLINE would abort runs that are fine.
+ *
+ * outmax reserves the domain AND the widest mask, because the mask block has no clamp of its own and MAX_MASK_POS is 256 per side on the CPU. Without the reservation a rule that expands the local to its clamp, plus a mask, plus the domain exceeds MAXLINE and dies downstream on checkhash Output line too long. Reserving puts the loss in the right place: per the ruling at ruleproc.c:442 a rule exceeding its limit does what it can and stops, so the sacrificed bytes are GENERATED output, never the operator SUPPLIED domain.
+ *
+ * -8 needs no variant. applyrule_u32 takes UTF-8 bytes and converts internally, so passing inlen = head_len is the entire change; the domain never enters utf8_to_utf32 and survives byte-exact even when it is not valid UTF-8, where the converter would have returned -3 and dropped the candidate. Byte 0x40 cannot occur inside a multi-byte sequence, so the byte scan for @ is exactly as correct as a codepoint scan.
+ *
+ * The SIMD walker is MODIFIED, not disabled, per Waffle: it serves case JOB_MD5, the hottest type in the tool, and giving that up was not acceptable. Two bugs were found getting there, both silent. First, leaving FastRule on without touching the walker ran the rule against the WHOLE address and never reached the generic apply at all -- -E -r $1 on john@gmail.com emitted john@gmail.com1. Found by instrumenting the apply site and seeing it never fire. Second, after adding the rejoin to the walker, its input still had to be truncated: the walker lives in the switch, which runs AFTER the rejoin, so cur already pointed at the rejoined address and the domain was appended twice -- JOHN@GMAIL.COM@gmail.com. Found by comparing the walker type e1 against generic-path types e8, e3 and e10 over the same words and rules; only the case rules u and c exposed it. All four paths now produce identical candidate sets, 281 over 25 fixtures and 13 rules.
+ *
+ * The reader classifies the LOCAL PART under -E. procrule classifies at its apply site and can see the split, so classifying the whole address here would make the two tools pick different engines for an ASCII local with a non-ASCII domain -- and engine choice changes the result for a locale-ambiguous case mapping, which makes that an oracle divergence rather than a performance detail. -E is known before the wordlist read begins, so this costs nothing on the candidate path.
+ *
+ * -a and -E together are refused with a message. -a rewrites the word in place with the domain inline while -E splits it off, so together each would act on the other intermediate form and produce candidates belonging to neither mode. Unifying them is plan phase 2.
+ *
+ * Verified: no regression, byte-identical to the pre-change binary for -m 0 -r, -m e8 -r, -m 0 -n, -m 0 -N -r, -m 0 -a and -m 0 -8 -r over the fixture file. regress e=1, e=8, e=31 and e=260 pass; e439 MSCACHE fails identically on the pre-change binary and is pre-existing. make regress-email is 22 passed, 0 failed, 0 skipped.
+ *
  * Revision 1.643  2026/10/30 18:23:12  dlr
  * Fold the iteration multiplier into rules-engine batch sizing, and stop reporting an unknown ETA as done. Both from A1131s report of 2026-10-30. First, the rules-engine pack site bounds a batch by GPU_RULES_DISPATCH_ROUND_BUDGET as well as by word_offset_entries, because the kernel runs its iteration loop inside each work item and a dispatch therefore costs num_words times n_rules times max_iter. See gpujob.h 1.52 for the full reasoning, the three independent reasons the reporters VRAM diagnosis does not hold, and why a smaller word axis does not undo the host overhead amortisation that the 16384 was chosen for. Maxiter is used deliberately as a conservative UPPER BOUND rather than the exact per-op value: several ops force params.max_iter to 1 at the dispatch site, SHA1DRU running its million rounds internally and the HMAC and crypt families emitting one digest per word and salt pair, so for those this over-estimates cost and packs smaller batches than it strictly must. That is harmless because every one of them is expensive enough per candidate that host overhead is already negligible, and it is the safe direction, since an upper bound can only be conservative whereas a second copy of that per-op predicate could disagree with the first, which is the failure mode gpu CLAUDE.md records for the word-offset class tag. Second, the bootstrap ETA branch no longer prints done when it has no estimate. remaining was left at 0 whenever the 0.001 progress floor was not cleared, and format_eta of 0 prints done, so the display asserted completion at exactly the moment it had least information: the reporters run showed ETA done for a job with sixteen days left, because expected_total was 6.3e16 and the fraction was 5e-6. The floor itself is right, an estimate off the first fraction of a percent is worthless, so the fix is to say unknown instead of printing the one answer that is certainly wrong. This needed three states rather than two and the first attempt got it wrong: remaining equal to 0 was overloaded to mean BOTH no estimate and nothing left, with the wq greater than zero test turning the second into finishing, so introducing minus one for the first without pinning the second to 0 reported a COMPLETE run as unknown. Caught by scratchpad eta_check.c before it shipped, which reproduces the old done on the reporters numbers and asserts the new behaviour on four cases. Also verified no regression on the healthy path: patched and released binaries give the same progress line shape and ETA on a 2M word local run, and a known-answer crack still resolves. The pack site change is compiled out of the plain macOS build, so it was syntax-checked separately under OPENCL_GPU.
  *
@@ -4714,6 +4803,10 @@ Pvoid_t OverflowHash;
 /* XOR-fold upper and lower 32 bits for compact table slot distribution.
  * On LE systems, sorted hex hashes put identical leading digits in the low bits,
  * causing massive clustering. XOR-folding mixes in the varying upper bytes. */
+/* Length to classify for the -8 engine choice: the local part under -E, the
+ * whole word otherwise.  See the call sites. */
+static inline int enclen_E(const char *w, int n);
+
 static inline uint64_t compact_mix(uint64_t k) {
     return k ^ (k >> 32);
 }
@@ -4910,6 +5003,106 @@ static void blake2b_hash(unsigned char *out, size_t outlen,
 }
 
 int NoMarkSalt, Hexkey, Rotatehash, Unicode, Dedupe, XMLchar, Email, Printall;
+/* -E: rules, masks and the key axis apply to the LOCAL PART of an email
+ * address; the domain is rejoined once, immediately before the key axis.
+ * Distinct from -a, which sweeps dot placements within the local part.
+ * See PLAN-email-address-mode.md sections 4.1 through 4.4. */
+int EmailLocal;
+
+/* -a dot-sweep width ceiling.  A local part of length L has 2^L dottings, so
+ * this is the one axis in the tool whose cost per input line spans eight orders
+ * of magnitude.  24 was an unnamed literal; naming it makes the cost visible
+ * and the decision reviewable.  It is NOT free: PLAN-email-address-mode section
+ * 2 measured 226,707 dotted locals carrying five or more dots, and the
+ * 30-character thefamousdogandcatshowyoulike1 is swept only to position 24, so
+ * the clamp has already cost real recoveries.  Raising it is plan section 9
+ * decision 3, still open -- what the width's syntax and default should be.
+ * Until then the clamp stays and the end-of-run summary says how often it bit,
+ * because a sweep that covered 24 of 30 positions looks exactly like one that
+ * covered all of them. */
+#define EMAIL_DOT_WIDTH_MAX 24
+/* -a: the narrowest dot sweep worth a GPU dispatch.
+ *
+ * 5, not 14.  The first value came from arithmetic about dispatch size and was
+ * WRONG, because the variable it tuned is not the one that matters.  Measured on
+ * fpga (GTX 1080) with UNIFORM-width synthetic lists, device candidate rate:
+ *
+ *     width  6 ->  8.4e8/s     width 10 -> 1.01e9/s
+ *     width  8 -> 1.01e9/s     width 11 ->  9.8e8/s
+ *     width  9 -> 1.03e9/s     width 13 ->  9.2e8/s
+ *
+ * Flat from 6 upward, against a CPU that does ~5.8e7 candidates/s -- the device
+ * is ~17x faster at EVERY width, so there is no crossover to find.  The ~2 s of
+ * idle in those runs is fixed start-up, identical in all of them, not
+ * per-dispatch overhead.
+ *
+ * What actually destroys -a throughput is the batch KEY changing, not the width
+ * being small.  Same 4M words, same width range, on the same card:
+ *
+ *     uniform width 6        2.30 s wall, 0.31 s busy,        246 batches
+ *     widths 5 or 6 at random  130.06 s wall, 87.00 s busy, 2,000,719 batches
+ *
+ * 44x, one batch per two words.  That is the section 15.1 fragmentation case,
+ * and the cure is ordering the input by DOTLESS local length -- which is what
+ * utils/emailprep does and what the warning below asks for -- not declining
+ * narrow words.  5 remains only as a floor against a pathological micro-sweep;
+ * nothing measured argues for more. */
+#define EMAIL_GPU_MIN_DOT_W 5
+long Email_clamped = 0;
+/* -a on the GPU: words whose sweep width differed from the batch they met, and
+ * the subset where the width went DOWN -- i.e. the input was not sorted
+ * ascending by local length.  A descending step is the signal that batches are
+ * fragmenting, and plan section 9 decision 9 says report the waste rather than
+ * refuse the input. */
+long Email_batch_splits = 0;
+long Email_cpu_cheap = 0;   /* -a words kept on the CPU: sweep too small to dispatch */
+#ifdef GPU_ENABLED
+/* See gpujob.h for why this lives here and not in a backend. */
+uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
+/* -a dot-width clamp, as the DISPATCH actually applied it.  The widest width a
+ * run asked for, and the widest it got.  These were defined in gpu_opencl.c and
+ * assigned there and read by NOBODY -- four references in the whole tree, all
+ * writes -- so the clamp section 15 introduced specifically because "a sweep
+ * that covered 13 of a 23-character local looks exactly like one that covered
+ * all of it" said nothing at all.  They live here because both backends write
+ * them and only mdxfind.c is in every build. */
+int gpu_dot_width_used = 0;
+int gpu_dot_width_asked = 0;
+#endif
+long Email_unsorted = 0;
+
+/* Size of the -a dot axis for the current word: 2^(clamped local length), or 1
+ * when the axis is inactive.  ONE definition, because it is read in three
+ * places that must agree -- the rule-advance gate, the mask-index gate and the
+ * loop-bottom bound -- and the gate's own comment has warned since Phase 4
+ * that its bound and the loop bottom are two copies of one expression.  A
+ * fourth copy was not going to end well. */
+#define EMAIL_DOTS ((Email && emailpow > 1) ? (unsigned long long)emailpow : 1ULL)
+/* The per-word mask/number axis size, exactly as the word loop's bottom
+ * computes it.  The GPU interlock that jumps number_iter past an axis the
+ * kernel already covered MUST use the SAME expression: too small and
+ * iterations are left unconsumed, so the CPU redoes the kernel's work; too
+ * large and candidates are never generated at all.  Those were two copies of
+ * one expression, and the dot-only case is where they disagreed -- the
+ * interlock read job->MaskCount, which is 0 with -a and no -n, so it both
+ * failed its own guard and would have jumped to 0.  Same reason EMAIL_DOTS
+ * above exists. */
+#define MASK_AXIS_ITERS(j) \
+    (((j)->flags & JOBFLAG_NUMBERS) \
+       ? ((j)->MaskCount ? (unsigned long long)(j)->MaskCount \
+                         : (unsigned long long)Iter_Count[(j)->digits]) \
+       : 1ULL)
+
+/* Bytes to hand classify_utf8() for the -8 engine choice.  Byte 0x40 cannot
+ * occur inside a multi-byte UTF-8 sequence, so finding the '@' before the
+ * decode is exactly as correct as finding it after. */
+static inline int enclen_E(const char *w, int n)
+{
+    const char *atp;
+    if (!EmailLocal) return n;
+    atp = memchr(w, '@', (size_t)n);
+    return atp ? (int)(atp - w) : n;
+}
 
 #ifdef GPU_ENABLED
 int NoMetal;
@@ -5000,6 +5193,22 @@ char **Typepepper;
 int XOR_key_len;
 char *XOR_key;
 char *Keys, *Readbuf, *Rules, *Peppers;
+/* -k key list: the terminator and the count, for the GPU path (plan row 6).
+ *
+ * Keys is a length-prefixed byte stream -- [len][bytes] per entry, closed by
+ * two zero bytes -- walked by `curkey` in procjob.  Keys_end points AT the
+ * first of those two zeros, which is what the walker's own break test looks
+ * for, so assigning it to curkey makes the key loop exit before it appends or
+ * hashes anything.  That is how a word whose (word, key) pairs were packed to
+ * the GPU suppresses the CPU's duplicate sweep, and it reuses the existing
+ * break rather than adding a second way out of that loop.
+ *
+ * Keycount gates admission: the key axis rides the WORD axis on the GPU (one
+ * packed entry per (word, key) pair), so a long key list shrinks the real words
+ * per batch the way unsorted input does for -a.  Bounded rather than silent. */
+char *Keys_end = NULL;
+long  Keycount = 0;
+int   Keymaxlen = 0;    /* longest key, for the pack-site space bound */
 /* ValidRules deleted 2026-09-12: it had exactly three references -- this
  * declaration, one malloc_lock of MemSize+4 and one memmove from Rules --
  * and was never read anywhere in the tree.  At Hash-IT_Crazy_Rules scale
@@ -10585,7 +10794,13 @@ unsigned long long MaskChunkSize;
  * `total = n_words * n_rules * mask_size`.  It lived as a local inside
  * adaptive_bf_chunk_size, which is why the -n mask fan-out added later never
  * inherited it.  One definition now. */
+/* Now defined once in gpujob.h, which gpu/gpu_opencl.c also includes -- its
+ * dot-width clamp must read the same ceiling this producer enforces.  Kept as a
+ * guarded fallback so an out-of-band compile without gpujob.h's body still
+ * sees it. */
+#ifndef MDX_NDRANGE_HARD
 #define MDX_NDRANGE_HARD ((unsigned long long)1 << 31)
+#endif
 
 /* Separate prepend/append patterns for simultaneous -N/-n */
 struct MaskPos   MaskAppendPattern[MAX_MASK_POS];
@@ -13801,7 +14016,8 @@ int done2, saltlen, maxsaltlen, maxsaltlens, pass0;
  * analysis cannot prove out (see Email / pepper paths in procjob);
  * the actual reads happen only when the same conditions guard the writes.
  * Initialising silences the false positive without altering behaviour. */
-int emaillen = 0, emailcur = 0, emailpow = 0, peplen = 0;
+int emaillen = 0, emailpow = 0, peplen = 0;
+
 __attribute__((unused)) int do_pack_gpu = 0, gpu_maxlen = 55;
 int snap_valid, nsalts_job;
 unsigned int found, lineproc;
@@ -13850,7 +14066,19 @@ uint32_t *d32, *f32, *dd32;
 struct job *ljob;
 char *linebuf, *linebuf2, *tsalt, *tline, *XMLline, *Origline;
 char *rule_base;       /* Phase 4: cached rule output for mid-mask-cycle restore */
+/* Phase 2 dot-insertion scratch.  A buffer of its own, not a borrowed one:
+ * the first attempt used tline, which is the RULE ENGINE'S INPUT, filled once
+ * per word and re-read by every apply -- so the dotted output fed straight
+ * back into the next rule and `-a -r '$1'` on ab@c produced a...1@c.  Every
+ * other per-thread buffer here has an owner too. */
+char *email_buf;
 int rule_base_len = -1;
+/* -E: the split of the current word.  Origline holds the WHOLE address,
+ * untouched, for the life of the word; job->line is truncated to the local
+ * part and every mangling stage sees only that.  el_tail is what the rejoin
+ * copies back, and it starts AT the '@', so a word with no '@' has el_tail 0
+ * and the rejoin is a no-op with no second code path. */
+int el_head = 0, el_tail = 0;
 wchar_t *wline, *wline1;
 /* UTF-32 scratch for the ruleproc32 conversions: they run per candidate, so a
  * MAXLINE-sized local is not an option. */
@@ -13897,6 +14125,7 @@ linebuf2 = malloc_lock(MAXLINE * 3,memreason);
 tsalt = malloc_lock(MAXLINE,memreason);
 tline = malloc_lock(MAXLINE + 16,memreason);
 rule_base = malloc_lock(MAXLINE + 16,memreason);  /* Phase 4 rules+masks restore */
+email_buf = malloc_lock(MAXLINE + 16,memreason);  /* Phase 2 -a dot insertion */
 XMLline = malloc_lock(MAXLINE + 16,memreason);
 Origline = malloc_lock(MAXLINE + 16,memreason);
 wline = malloc_lock((MAXLINE + 16) * sizeof(wchar_t),memreason);
@@ -13955,6 +14184,21 @@ argon2_ws = NULL;
  * reviving this stub. */
 struct jobg *my_jobg = NULL;
 struct jobg *my_jobg_rules = NULL;  /* rules-engine batch (sub-commit C2) */
+/* -a: the dot sweep's width is LAUNCH-WIDE, so one gpujob may hold words of one
+ * width only -- the widest word would otherwise set the width for every narrow
+ * one in the batch (a 23-char local among 8-char ones is a 32,768x waste each),
+ * or the width is clamped down and the long word is swept incompletely and
+ * silently.  So the batch is KEYED by width: pack while the width holds, and on
+ * a change dispatch what is accumulated and let the differing word seed the
+ * next slot.  -1 means the slot is empty and the next word sets the key.
+ * Properly sorted input (which utils/emailprep -L produces, plan section 3)
+ * makes those batches full; random input fragments them, which is what
+ * Email_unsorted counts so the run can say so. */
+int my_jobg_dot_w = -1;
+/* The width THIS word needs, set at the flush test and read again at the pack
+ * a few lines later -- the two are in different blocks, so it cannot be a
+ * block-local. */
+int this_dot_w = -1;
 unsigned int gpu_reacquire = 0;
 #endif
 
@@ -14148,6 +14392,12 @@ while (1) {
      * these checks), the chokepoint pack would still need to admit
      * BF-chunk jobs. JOBFLAG_BF_CHUNK + GPU_CAT_MASK + gpujob_available
      * is the entry condition. */
+    /* EmailLocal is deliberately NOT added to this condition.  Its one
+     * surviving effect is `if (do_pack_gpu) FastRule = 0`, and -E works WITH
+     * the SIMD walker as of 1.644 -- adding it here would silently throw that
+     * away on every GPU host, which is the opposite of what phase 1 built.
+     * The two gates that matter for correctness are the rules-engine admit and
+     * the C2.3 rule-skip below, and both now carry !EmailLocal. */
     if (gpujob_available() &&
         ((Rules || Keys || Email) ||
          (job->flags & JOBFLAG_BF_CHUNK)) &&
@@ -14436,6 +14686,18 @@ while (1) {
     currule = Rules;
     job->Ruleindex = 0;
 #if defined(OPENCL_GPU) || defined(METAL_GPU)
+    /* -k row 6: set when every (word, key) pair for this word reached the
+     * device AND every rule did, which is the only case where the CPU may skip
+     * its key walk.  Read at `curkey = ...` far below. */
+    int keys_packed_by_gpu = 0;
+    /* -k eligibility and entry count for THIS word.  Declared out here rather
+     * than at the pack site because the flush test and the emission loop that
+     * both read them sit in SIBLING scopes: the block holding max_words_lanes
+     * closes before the emission begins.  Assigned at the pack site, which is
+     * the only place `len` is known.  Caught by the .205 build -- the local one
+     * compiles none of this, GPU_ENABLED being undefined there, so a scope
+     * error in the GPU pack path cannot fail it. */
+    int k_gpu_ok = 0, k_nk = 1;
     int word_packed_by_rules_engine = 0;  /* Set by the C2.2 hook below when this word's
                                            * original bytes get packed into my_jobg_rules.
                                            * The legacy chokepoint then knows the kernel
@@ -14492,6 +14754,62 @@ while (1) {
         (MaskPrependLen >= 0 && MaskPrependLen <= 32 &&
          MaskAppendLen  >= 0 && MaskAppendLen  <= 32 &&
          (MaskPrependLen + MaskAppendLen) >= 1);
+
+    /* Phase 3.5 (2026-10-31): the SALT-axis ceiling.  PLAN-email-address-mode
+     * section 6 names three uint32 ceilings; checking the code found that two
+     * are already covered and named WHERE the third still bites.
+     *
+     *   grid   numline x (Numrules+1) x masks -- covered by MDX_NDRANGE_HARD
+     *          (2^31) at the mask fan-out producer, added after the plan's
+     *          analysis.  Its failure was the same silent one: the kernels
+     *          bound themselves with a 32-bit product that WRAPPED and retired
+     *          most of the dispatch while the 64-bit host counters still
+     *          reported the full keyspace, so the run reconciled exactly and
+     *          exited clean -- nine lines of a five-position ?a mask found 0
+     *          of 2 planted answers where eight lines found 2 of 2.
+     *   words  per-dispatch work size -- fails LOUDLY at enqueue with
+     *          CL_INVALID_GLOBAL_WORK_SIZE, which is survivable.
+     *   SALT   gpu_opencl.c packs `num_salts = effective_mask_size *
+     *          this_page_salts` into a uint32 FIELD, and the kernel recovers
+     *          mask_size by dividing it back out.  The hit encoding multiplies
+     *          the same two by the rule count into one uint32 combined_ridx.
+     *          Neither product is checked anywhere, and MDX_NDRANGE_HARD does
+     *          not help: _lanes_per_mask carries numline and rules but NO salt
+     *          factor at all.
+     *
+     * So the exposure is salted ops with a mask, which is exactly what section
+     * 6 concluded, and the check belongs here -- where a false eligibility
+     * already means the long-standing, well-tested CPU path -- rather than at
+     * the pack site, where declining needs a status the caller must honour.
+     *
+     * Conservative on purpose: nsalts_job is the whole snapshot while a
+     * dispatch sees at most one salt page, so this declines some runs that
+     * would have fit.  Declining costs throughput; admitting a run whose
+     * encoding cannot represent its own answers costs correct output, and the
+     * two are not comparable.  The width that WOULD fit is printed, because a
+     * decline with no number is a dead end for whoever reads it. */
+    int salt_axis_eligible = 1;
+    if (job->MaskCount && nsalts_job > 0) {
+      unsigned long long _mask   = (unsigned long long)job->MaskCount;
+      unsigned long long _salts  = (unsigned long long)nsalts_job;
+      unsigned long long _rules  = (unsigned long long)gpu_rule_count + 1ULL;
+      unsigned long long _packed = _mask * _salts;              /* params.num_salts */
+      unsigned long long _ridx   = _packed * _rules;            /* combined_ridx   */
+      if (_packed > 0xFFFFFFFFULL || _ridx > 0xFFFFFFFFULL ||
+          (_salts && _packed / _salts != _mask)) {
+        static int _warned = 0;
+        salt_axis_eligible = 0;
+        if (!_warned) {
+          _warned = 1;
+          fprintf(stderr,
+            "GPU declined for %s: mask %llu x %llu salts x %llu rule states needs "
+            "%llu encoding slots, past the 4294967295 a uint32 can hold. Running "
+            "on CPU. A mask of at most %llu indices would fit.\n",
+            TYPENAME(job->op), _mask, _salts, _rules, _ridx,
+            (_salts * _rules) ? (0xFFFFFFFFULL / (_salts * _rules)) : 0ULL);
+        }
+      }
+    }
     /* v1.529: the OpenCL rules dispatch caps its per-page salt count so the
        1-D global work size (words x rules x mask x salt-axis) stays under the
        device's 32-bit work-item limit; without it a large salted hashlist plus
@@ -15119,8 +15437,18 @@ while (1) {
           * (multi-emit outlier; deferred to a future codegen sub-phase). */
          (job->op == JOB_MD5MD5SALT
           || gpu_codegen_kernelb_family_md5pass_eligible(job->op))) &&
-        mask_b71_eligible &&
-        !Email && !Keys &&
+        mask_b71_eligible && salt_axis_eligible &&
+        /* -E is now SERVED on the GPU (plan phase 4, 2026-10-31).  The device
+         * learns each word's local-part length from word_offset bits 22-29,
+         * mangles only that, and appends the domain straight out of the packed
+         * word as the last step before hashing; the host hit replay reproduces
+         * the same split. */
+        /* -k is served as of row 6, but only in the shape the pack site can
+         * tag: a bounded key list and no -E/-a.  The per-WORD half of the test
+         * (a word short enough for the 8-bit head_len field) lives at the pack
+         * site, which is the only place the length is known. */
+        (!Keys || (Keycount >= 1 && Keycount <= 16 &&
+                   !Email && !EmailLocal && !NoMetal)) &&
         !Printall &&
         (Numrules == 0 || currule != NULL) &&
         /* B6 salt-axis (2026-05-06): for salted ops require a non-empty
@@ -15460,6 +15788,7 @@ while (1) {
           my_jobg_rules->rules_engine = 1;   /* activates sub-commit B dispatch */
           my_jobg_rules->packed_count = 0;
           my_jobg_rules->packed_pos = 0;
+          my_jobg_dot_w = -1;        /* empty slot: the next word sets the key */
         }
       }
       if (my_jobg_rules) {
@@ -15505,8 +15834,133 @@ while (1) {
           if (wbudget < (long long)max_words_lanes)
             max_words_lanes = (int)wbudget;
         }
-        if ((int)my_jobg_rules->packed_count >= max_words_lanes ||
-            my_jobg_rules->packed_pos + 2 + len > my_jobg_rules->packed_buf_size) {
+        /* -a: the width this word needs, measured on the RAW word -- the
+         * normalization below is what strips its dots, and the width is the
+         * dotless local length either way. */
+        this_dot_w = Email ? gpu_email_dot_width((const char *)cur, len) : -1;
+        /* -a COVERAGE (plan 15.4).  The dispatch clamps the dot width to fit
+         * the grid (gpu_opencl.c), and now that the interlock stops the CPU
+         * re-walking the dot axis, a clamp means candidates NOBODY computed --
+         * silent, in a run that exits 0.  The batch is keyed by exact width, so
+         * the batch's width IS this word's, and the fit condition reduces to a
+         * word-count bound:
+         *
+         *     words x (rules + 1) x 2^d  <=  MDX_NDRANGE_HARD
+         *
+         * Folding that into max_words_lanes reuses the flush that is already
+         * there -- the batch simply shrinks on the WORD axis, which is the
+         * trade section 15 chose -- and makes the dispatch-side clamp a net
+         * that never fires rather than the thing that loses the candidates. */
+        if (Email && this_dot_w >= 0) {
+          int _d = (this_dot_w > EMAIL_DOT_WIDTH_MAX)
+                   ? EMAIL_DOT_WIDTH_MAX : this_dot_w;
+          unsigned long long _per = (unsigned long long)gpu_rule_count + 1ULL;
+          unsigned long long _lanes_per_word = _per << _d;
+          unsigned long long _cap = _lanes_per_word
+              ? ((unsigned long long)MDX_NDRANGE_HARD / _lanes_per_word) : 0ULL;
+          if (_cap >= 1ULL && _cap < (unsigned long long)max_words_lanes)
+            max_words_lanes = (int)_cap;
+        }
+        if (Email && my_jobg_rules->packed_count > 0 &&
+            my_jobg_dot_w >= 0 && this_dot_w != my_jobg_dot_w) {
+          Email_batch_splits++;
+          if (this_dot_w < my_jobg_dot_w) Email_unsorted++;
+          /* First change of the batch key, reported once.  A change dispatches
+           * the batch early, so the rate at which it happens IS the throughput:
+           * ~270 of them over w1 is the harmless band-boundary case, one every
+           * couple of words is the 44x collapse.
+           *
+           * The direction is the diagnosis and is printed for that reason.  An
+           * INCREASE is what a correctly ordered list does at each boundary. A
+           * DECREASE cannot happen in a list ordered by dotless local length,
+           * so it means the ordering is by something else -- line length, most
+           * likely, which stops matching once any local carries a dot. */
+          /* TWO independent one-shots, not one, because the two directions
+           * mean opposite things and a single flag reports whichever happened
+           * first.  A fixture of widths 10, 11, 10 fired on the 10->11
+           * INCREASE and called it normal, so the 11->10 decrease -- the one
+           * that says the list is misordered -- was never announced at all. */
+          if (this_dot_w < my_jobg_dot_w) {
+            static int _lendown = 0;
+            if (__atomic_exchange_n(&_lendown, 1, __ATOMIC_RELAXED) == 0)
+              fprintf(stderr,
+                "-a WARNING: local-part length DECREASED %d -> %d while "
+                "packing, which an input ordered by dotless local length "
+                "cannot do -- so this list is not in that order and batches "
+                "will fragment, measured at 44x slower. Order it with "
+                "utils/emailprep. The end-of-run summary counts every split "
+                "and how many decreased.\n",
+                my_jobg_dot_w, this_dot_w);
+          } else {
+            static int _lenup = 0;
+            if (__atomic_exchange_n(&_lenup, 1, __ATOMIC_RELAXED) == 0)
+              fprintf(stderr,
+                "-a NOTE: local-part length changed %d -> %d while packing, so "
+                "that batch was dispatched early. An increase is normal at a "
+                "length boundary -- it is the FREQUENCY that matters, which the "
+                "end-of-run summary reports.\n",
+                my_jobg_dot_w, this_dot_w);
+          }
+        }
+        /* -k GPU eligibility, decided per WORD (plan row 6).  Rules and masks
+         * are fine: the kernel applies them to the head and appends the tail
+         * afterwards, which is the measured CPU order.  Excluded for now:
+         * -E and -a, because there the dispatch tags the staging copy from its
+         * own '@' scan and would fight the tag written here.
+         *
+         * head_len is an 8-bit field stored biased by one, so a word longer
+         * than 254 cannot be tagged.  Such a word is NOT packed at all -- k_nk
+         * goes to 0 -- rather than packed without its key, which would have the
+         * device hash the bare word and emit a plaintext -k never asked for. */
+        k_gpu_ok = (Keys != NULL && Keycount >= 1 && Keycount <= 16 &&
+                    !Email && !EmailLocal &&
+                    len <= (int)WOFF_H_HEAD_MASK - 1);
+        /* -a: a sweep narrower than EMAIL_GPU_MIN_DOT_W is not worth a
+         * dispatch, so the word is not packed at all and the CPU keeps it.
+         * Entries-to-emit of 0 is the existing "CPU owns this word" path, so
+         * the flags and the interlock below stand down with it. */
+        int email_too_cheap = (Email && this_dot_w >= 0 &&
+                               this_dot_w < EMAIL_GPU_MIN_DOT_W);
+        if (email_too_cheap)
+          __atomic_fetch_add(&Email_cpu_cheap, 1L, __ATOMIC_RELAXED);
+        /* A dotted local reaching the device means the list was NOT ordered by
+         * dotless local length, which is the key this batch is keyed on.  Each
+         * change of that key dispatches early, so a dotted list fragments into
+         * roughly one batch per word and runs ~44x slower than the same words
+         * ordered properly -- measured, see EMAIL_GPU_MIN_DOT_W above.  The
+         * operator cannot see this from the hit rate, so say it once, at the
+         * first occurrence, rather than only in the end-of-run summary where it
+         * arrives too late to act on. */
+        if (Email && !email_too_cheap && this_dot_w >= 0) {
+          int _raw = 0;
+          while (_raw < len && cur[_raw] != '@') _raw++;
+          if (this_dot_w < _raw) {
+            static int _dotwarn = 0;
+            if (__atomic_exchange_n(&_dotwarn, 1, __ATOMIC_RELAXED) == 0)
+              fprintf(stderr,
+                "-a WARNING: a local part containing '.' was sent to the GPU. "
+                "Batches are keyed by the DOTLESS local length, so a list that "
+                "is not ordered that way dispatches a new batch almost every "
+                "word -- measured at 44x slower, one batch per two words. Order "
+                "it with utils/emailprep, which strips the dots and then sorts "
+                "on the length that matters. Sorting by line length is NOT the "
+                "same thing once any local carries a dot.\n");
+          }
+        }
+        k_nk = email_too_cheap ? 0
+             : (Keys ? (k_gpu_ok ? (int)Keycount : 0) : 1);
+        /* Reserve room for ALL of this word's entries in ONE test.  The
+         * emission loop must not need a flush part way through a key set: that
+         * would split one word's keys across two dispatches while the CPU
+         * suppression below believes all of them were covered. */
+        if (k_nk > 0 &&
+           ((int)my_jobg_rules->packed_count + k_nk > max_words_lanes ||
+            my_jobg_rules->packed_pos
+              + (uint32_t)k_nk * (uint32_t)(2 + len + Keymaxlen)
+              > my_jobg_rules->packed_buf_size ||
+            /* width change: dispatch what we have, this word seeds the next */
+            (Email && my_jobg_rules->packed_count > 0 &&
+             my_jobg_dot_w >= 0 && this_dot_w != my_jobg_dot_w))) {
           gpujob_submit(my_jobg_rules);
           my_jobg_rules = gpujob_get_free_rules(job->filename, job->startline);
           if (my_jobg_rules) {
@@ -15534,6 +15988,7 @@ while (1) {
             my_jobg_rules->rules_engine = 1;
             my_jobg_rules->packed_count = 0;
             my_jobg_rules->packed_pos = 0;
+            my_jobg_dot_w = -1;      /* empty slot: this word sets the key */
           }
         }
       }
@@ -15553,63 +16008,116 @@ while (1) {
             (void *)my_jobg_rules->packed_buf);
           abort();
         }
-        my_jobg_rules->word_offset[my_jobg_rules->packed_count] = my_jobg_rules->packed_pos;
-        /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): host-side
-         * truncation clamp for JOB_DESCRYPT at the rules-engine pack
-         * site. Standard DES uses only the first 8 bytes of the key
-         * (crypt-des.c:626 NUL-terminate-on-first-NUL semantics); post-
-         * rule outputs longer than 8 bytes silently truncate to 8 on
-         * the CPU side. We pre-truncate the packed length here so the
-         * GPU receives the same 8-byte canonical form regardless of
-         * whether the rule produced a 9- or 39-byte output. The kernel
-         * has its own defensive `if (plen > 8) plen = 8;` cap as
-         * belt-and-suspenders; the host-side clamp is the architect-
-         * specified honor of the user's "prior to dispatching" intent
-         * for the no-rule synthetic pass. Two distinct rule outputs
-         * that differ only in bytes 9+ collide on the same DES output
-         * (acceptable -- same as CPU). Phase 5 of the Unix-crypt ladder
-         * (FINAL phase). */
-        int pack_len = len;
-        if (job->op == JOB_DESCRYPT && pack_len > 8) pack_len = 8;
-        /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): host-side
-         * truncation clamp for JOB_BCRYPT at the rules-engine pack site.
-         * Standard bcrypt silently truncates passwords > 72 bytes via
-         * BF_set_key key-cycling natural drop semantics (matches CPU
-         * crypt_blowfish/wrapper.c:288 "chars after 72 are ignored").
-         * We pre-truncate the packed length here so the GPU receives
-         * the same 72-byte canonical form regardless of whether the
-         * rule produced a 73-byte or 200-byte output. The kernel has
-         * its own defensive `if (len > 72) len = 72;` cap as belt-and-
-         * suspenders; the host-side clamp is the architect-specified
-         * honor of the user's "prior to dispatching" intent for the
-         * no-rule synthetic pass. Two distinct rule outputs that
-         * differ only in bytes 73+ collide on the same bcrypt output
-         * (acceptable -- same as CPU). Phase 6 of the slab-retirement
-         * ladder (final major slab kernel). */
-        if (job->op == JOB_BCRYPT && pack_len > 72) pack_len = 72;
-        /* 2-BYTE LITTLE-ENDIAN LENGTH HEADER (2026-09-11, operator ruling).
-         * This field was ONE byte, while the admission gate at :13469 allows
-         * GPU_RULES_MAX_INPUT_LEN (40959).  Any word of 256..40959 bytes was
-         * therefore hashed as its first (len mod 256) bytes -- a 285-byte word
-         * as its first 29 -- and the emitted plaintext matched the emitted
-         * digest, so nothing downstream could detect it.  Silent lost coverage,
-         * measured at 7 words in rockyou's 14.3M and unbounded on lists where
-         * MAXLINE was raised deliberately, which is exactly the tail the 40959
-         * gate was widened to admit.  The kernels' `if (wlen > RULE_BUF_LIMIT)`
-         * guard could never fire: 255 is never > 40959.
+        /* -k ON THE GPU: the key axis rides the WORD axis (plan row 6).
          *
-         * Written byte-by-byte rather than as a uint16 store: the packed buffer
-         * is an unaligned byte stream uploaded verbatim to the device, so this
-         * must not depend on host alignment or host endianness.  Every reader
-         * (11 kernel sites across 7 .cl/.metal files, plus the two hit decoders
-         * in gpujob_opencl.c and gpujob_metal.m) reassembles it the same way. */
-        my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] =
-            (char)(pack_len & 0xff);
-        my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] =
-            (char)((pack_len >> 8) & 0xff);
-        memcpy(my_jobg_rules->packed_buf + my_jobg_rules->packed_pos, cur, pack_len);
-        my_jobg_rules->packed_pos += pack_len;
-        my_jobg_rules->packed_count++;
+         * One packed entry per (word, key) pair, with head_len tagged so the
+         * device mangles only the word and appends the key afterwards -- the
+         * same head/tail path -E's domain rejoin already uses, which is why
+         * this needs no kernel change at all.  Measured CPU order is
+         * mask_pre + rule(word) + mask_app + key, and that is the order the
+         * kernel produces: rule, dots, mask, then tail.
+         *
+         * k_nk is 1 whenever -k is absent or not eligible, so every other run
+         * emits exactly one entry and is byte-for-byte unchanged. */
+        { const unsigned char *_kcur = (k_nk > 1 || k_gpu_ok)
+                                       ? (const unsigned char *)Keys : NULL;
+          int _ki;
+          for (_ki = 0; _ki < k_nk; _ki++) {
+            int _klen = 0;
+            const unsigned char *_kb = NULL;
+            if (_kcur) {
+              _klen = (int)_kcur[0];
+              _kb   = _kcur + 1;
+              _kcur += (size_t)_klen + 1;
+            }
+          my_jobg_rules->word_offset[my_jobg_rules->packed_count] = my_jobg_rules->packed_pos;
+          /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): host-side
+           * truncation clamp for JOB_DESCRYPT at the rules-engine pack
+           * site. Standard DES uses only the first 8 bytes of the key
+           * (crypt-des.c:626 NUL-terminate-on-first-NUL semantics); post-
+           * rule outputs longer than 8 bytes silently truncate to 8 on
+           * the CPU side. We pre-truncate the packed length here so the
+           * GPU receives the same 8-byte canonical form regardless of
+           * whether the rule produced a 9- or 39-byte output. The kernel
+           * has its own defensive `if (plen > 8) plen = 8;` cap as
+           * belt-and-suspenders; the host-side clamp is the architect-
+           * specified honor of the user's "prior to dispatching" intent
+           * for the no-rule synthetic pass. Two distinct rule outputs
+           * that differ only in bytes 9+ collide on the same DES output
+           * (acceptable -- same as CPU). Phase 5 of the Unix-crypt ladder
+           * (FINAL phase). */
+          int pack_len = len;
+          if (job->op == JOB_DESCRYPT && pack_len > 8) pack_len = 8;
+          /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): host-side
+           * truncation clamp for JOB_BCRYPT at the rules-engine pack site.
+           * Standard bcrypt silently truncates passwords > 72 bytes via
+           * BF_set_key key-cycling natural drop semantics (matches CPU
+           * crypt_blowfish/wrapper.c:288 "chars after 72 are ignored").
+           * We pre-truncate the packed length here so the GPU receives
+           * the same 72-byte canonical form regardless of whether the
+           * rule produced a 73-byte or 200-byte output. The kernel has
+           * its own defensive `if (len > 72) len = 72;` cap as belt-and-
+           * suspenders; the host-side clamp is the architect-specified
+           * honor of the user's "prior to dispatching" intent for the
+           * no-rule synthetic pass. Two distinct rule outputs that
+           * differ only in bytes 73+ collide on the same bcrypt output
+           * (acceptable -- same as CPU). Phase 6 of the slab-retirement
+           * ladder (final major slab kernel). */
+          if (job->op == JOB_BCRYPT && pack_len > 72) pack_len = 72;
+          /* 2-BYTE LITTLE-ENDIAN LENGTH HEADER (2026-09-11, operator ruling).
+           * This field was ONE byte, while the admission gate at :13469 allows
+           * GPU_RULES_MAX_INPUT_LEN (40959).  Any word of 256..40959 bytes was
+           * therefore hashed as its first (len mod 256) bytes -- a 285-byte word
+           * as its first 29 -- and the emitted plaintext matched the emitted
+           * digest, so nothing downstream could detect it.  Silent lost coverage,
+           * measured at 7 words in rockyou's 14.3M and unbounded on lists where
+           * MAXLINE was raised deliberately, which is exactly the tail the 40959
+           * gate was widened to admit.  The kernels' `if (wlen > RULE_BUF_LIMIT)`
+           * guard could never fire: 255 is never > 40959.
+           *
+           * Written byte-by-byte rather than as a uint16 store: the packed buffer
+           * is an unaligned byte stream uploaded verbatim to the device, so this
+           * must not depend on host alignment or host endianness.  Every reader
+           * (11 kernel sites across 7 .cl/.metal files, plus the two hit decoders
+           * in gpujob_opencl.c and gpujob_metal.m) reassembles it the same way. */
+          /* -k: tag head_len so the kernel mangles only the WORD and appends
+           * the key after -- BIASED BY ONE, 0 meaning untagged (gpujob.h).  The
+           * header below carries word+key, so without this tag the kernel would
+           * hand the rule the key as well. */
+          if (_klen > 0)
+            my_jobg_rules->word_offset[my_jobg_rules->packed_count] |=
+                ((uint32_t)pack_len + 1u) << WOFF_H_HEAD_SHIFT;
+          my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] =
+              (char)((pack_len + _klen) & 0xff);
+          my_jobg_rules->packed_buf[my_jobg_rules->packed_pos++] =
+              (char)(((pack_len + _klen) >> 8) & 0xff);
+          /* -a: pack the NORMALIZED address.  The chokepoint runs BEFORE the -a
+           * setup normalizes for the CPU, so without this the device is handed
+           * the raw word and sweeps dots onto an already-dotted local -- the same
+           * defect phase 2 fixed on the CPU side.  One helper, two callers, so
+           * the two cannot drift.  The length header two bytes back has to be
+           * rewritten, because normalizing shortens the word. */
+          if (Email) {
+            char *_dst = my_jobg_rules->packed_buf + my_jobg_rules->packed_pos;
+            int _nl = gpu_email_normalize((const char *)cur, pack_len, _dst, NULL);
+            my_jobg_rules->packed_buf[my_jobg_rules->packed_pos - 2] =
+                (char)(_nl & 0xff);
+            my_jobg_rules->packed_buf[my_jobg_rules->packed_pos - 1] =
+                (char)((_nl >> 8) & 0xff);
+            my_jobg_rules->packed_pos += _nl;
+          } else {
+            memcpy(my_jobg_rules->packed_buf + my_jobg_rules->packed_pos, cur, pack_len);
+            my_jobg_rules->packed_pos += pack_len;
+          }
+          if (_klen > 0) {
+            memcpy(my_jobg_rules->packed_buf + my_jobg_rules->packed_pos,
+                   _kb, (size_t)_klen);
+            my_jobg_rules->packed_pos += (uint32_t)_klen;
+          }
+          my_jobg_rules->packed_count++;
+          if (Email && my_jobg_dot_w < 0) my_jobg_dot_w = this_dot_w;
+          }
+        }
         /*
          * CARRY THIS JOB'S MASK RANGE TO THE GPU.
          *
@@ -15639,6 +16147,9 @@ while (1) {
             my_jobg_rules->bf_mask_start = (uint64_t)job->MaskIndex;
             my_jobg_rules->bf_num_masks  = (uint32_t)job->MaskCount;
         }
+        /* k_nk == 0 means -k is active and this word could not be tagged, so
+         * nothing was emitted and the word belongs entirely to the CPU. */
+        if (k_nk > 0)
         word_packed_by_rules_engine = 1;  /* legacy chokepoint will skip pass0==0 below */
         /* All rules are GPU-eligible (gpu_legacy_slot_unused) AND this
          * word packed successfully — the kernel will compute every
@@ -15647,7 +16158,28 @@ while (1) {
          * times per word just to hit C2.3 and `continue`, which on
          * HashMob.100k × 200k words is 20 billion no-op iterations.
          * NULL currule so the outer loop exits after the no-rule pass. */
-        if (gpu_legacy_slot_unused) currule = NULL;
+        /* -k: the CPU's key walk is suppressed only when the kernel covered
+         * EVERY rule for this word.  With CPU-only rules in the mix those rules
+         * still need their keys appended, so the walk has to run. */
+        /* The device must actually be going to run this.  gpujob_available()
+         * and !NoMetal are defence in depth rather than the fix for anything:
+         * the admit gate already declines -k when NoMetal is set, so nothing is
+         * packed under -G none and the CPU keeps the whole job.  Suppressing
+         * the key walk when no dispatch will follow would compute the
+         * (word, key) pairs NOWHERE, which is the one failure this flag can
+         * cause, so it is worth two cheap tests.
+         *
+         * Recorded because it cost a detour: a `-k -G none` run that recovered
+         * 0 of 2 on dev1 was read as this flag arming wrongly, and it was not.
+         * A probe had already shown the suppression working exactly as intended
+         * (flag 1, Keys_end valid, the walker's own break firing).  The real
+         * cause was that removing that probe had deleted the `curkey`
+         * assignment on the line below it, leaving the GPU arm of the #if empty
+         * so curkey was never assigned at all.  Two conditions were added here
+         * against a bug that was never here. */
+        if (k_nk > 0 && k_gpu_ok && gpu_legacy_slot_unused && gpujob_available()
+            && !NoMetal)
+          keys_packed_by_gpu = 1;
         /* Memo B Phase B7.1 (2026-05-05): when the rules-engine path
          * absorbed a single-position append mask, the kernel iterated
          * every mask_idx for every (word, rule) pair. The outer do/
@@ -15661,11 +16193,48 @@ while (1) {
          * path will fully cover this word's (rule, mask) Cartesian).
          * For mixed GPU+CPU rules (gpu_legacy_slot_unused == 0), the
          * CPU walker still needs to iterate masks for the CPU rules. */
-        if (gpu_legacy_slot_unused && job->MaskCount &&
+        /* The jump must clear the WHOLE loop bound, and since phase 2 that
+         * bound is MaskCount x EMAIL_DOTS, not MaskCount.  Setting it to
+         * MaskCount alone left the -a dot cycle unconsumed, so the CPU
+         * re-iterated every dotting the kernel had already covered --
+         * duplicate work, and candidates re-hashed from a plaintext the
+         * elif-currule branch never refreshed.
+         *
+         * The mask-position test is widened to admit a dot-only run: with -a
+         * and no -n there are no prepend or append positions, so the old
+         * (MaskPrependLen + MaskAppendLen) >= 1 clause was false and the jump
+         * never fired for exactly the configuration that needs it most. */
+        /* k_nk > 0 is REQUIRED: a word the pack site declined -- too cheap to
+         * dispatch, or untaggable -- was never sent anywhere, so skipping the
+         * CPU's dot walk for it would drop its candidates entirely. */
+        if (k_nk > 0 && gpu_legacy_slot_unused &&
+            (job->MaskCount || EMAIL_DOTS > 1ULL) &&
             MaskPrependLen >= 0 && MaskPrependLen <= 32 &&
             MaskAppendLen  >= 0 && MaskAppendLen  <= 32 &&
-            (MaskPrependLen + MaskAppendLen) >= 1) {
-          number_iter = (unsigned long long)job->MaskCount;  /* loop bottom: !(number_iter < MaskCount) */
+            ((MaskPrependLen + MaskAppendLen) >= 1 || EMAIL_DOTS > 1ULL)) {
+          /* THIS word's dot axis, not EMAIL_DOTS.  emailpow is recomputed
+           * per word in the `if (Email)` block BELOW this chokepoint, so at
+           * this point it still holds the PREVIOUS word's width -- and the
+           * jump has to clear the bound the loop bottom will compute from the
+           * current one.  Too small and the CPU re-walks part of the dot axis
+           * the kernel already covered; this_dot_w is the width the pack site
+           * already measured for the batch key, from the same helper, so it
+           * costs nothing and cannot disagree. */
+          { int _dw = (this_dot_w > 0) ? this_dot_w : 0;
+            if (_dw > EMAIL_DOT_WIDTH_MAX) _dw = EMAIL_DOT_WIDTH_MAX;
+            /* Only skip the CPU's dot walk if the kernel can actually cover
+             * this word's full width.  A single word needs
+             * (rules + 1) x 2^d lanes; when even that exceeds the grid the
+             * dispatch WILL clamp, and skipping here would drop every
+             * candidate above the clamp with nothing to report it.  Letting
+             * the CPU sweep such a word as well costs duplicate work on a rare
+             * long address and loses nothing, which is the right direction.
+             * The word-axis bound above keeps this off the normal path. */
+            unsigned long long _per  = (unsigned long long)gpu_rule_count + 1ULL;
+            unsigned long long _need = _per << _dw;
+            if (_need <= (unsigned long long)MDX_NDRANGE_HARD)
+              number_iter = MASK_AXIS_ITERS(job) * (1ULL << _dw);
+          }
         }
       }
     }
@@ -15684,28 +16253,126 @@ while (1) {
       FastRule = 0;
 
     pass0 = 0;
+    /* -E: stash the whole address in Origline and truncate the word at the
+     * first '@'.  Origline already exists for exactly this purpose on the -a
+     * path, is per-thread, and is written once per word and read nowhere else
+     * per candidate, so it needs no companion buffer.  tline is NOT usable as
+     * the source: it is filled only inside `if (currule)` above, so on the
+     * no-rule pass it still holds the previous word-and-rule's text and would
+     * splice a stale domain onto a live local.
+     *
+     * Byte 0x40 cannot occur inside a multi-byte UTF-8 sequence -- lead bytes
+     * are 0xC2 and above, continuations 0x80 to 0xBF -- so this byte scan is
+     * exactly as correct as a codepoint scan would be, and -8 needs no
+     * variant of it (see section 4.2 of the plan). */
+    /* !Email because -a does its own split, after normalizing the local part.
+     * Running this one first would truncate at the '@' and leave -a a local
+     * with no '@' to find, so el_tail would be 0 and the domain lost. With
+     * both flags the -a block governs, which is the right semantics: -a
+     * already implies local-part scoping. */
+    if (EmailLocal && !Email) {
+      char *atp = memchr(cur, '@', len);
+      el_head = atp ? (int)(atp - cur) : len;
+      el_tail = len - el_head;              /* includes the '@' itself */
+      memcpy(Origline, cur, len);
+      Origline[len] = 0;
+      len = orig_len = el_head;
+      cur = job->line;
+      cur[len] = 0;
+    }
+/* Both modes split at the first '@' and both rejoin: -a adopted the mechanism
+ * in phase 2, which is what makes `-a -E` coherent rather than refused. */
+#define EL_ACTIVE (EmailLocal || Email)
+
+/* -E: append the stashed domain to a finished candidate and return its new
+ * length.  A macro rather than a function because el_head, el_tail and
+ * Origline are procjob locals, one set per worker thread.
+ *
+ * el_tail == 0 -- a word with no '@' -- makes this the identity, so every call
+ * site has one path and not two.  Used at the SIMD walker's apply sites as
+ * well as the generic one: the walker serves JOB_MD5, the hottest type in the
+ * tool, so leaving it out would have cost the fast path on exactly the
+ * workload that needs it most (Waffle, 2026-10-31). */
+#define EL_JOIN(p, n) do {                                                  \
+    if (EmailLocal && el_tail > 0) {                                        \
+      memcpy((p) + (n), Origline + el_head, (size_t)el_tail);               \
+      (n) += el_tail;                                                       \
+      (p)[(n)] = 0;                                                         \
+    }                                                                       \
+  } while (0)
+/* outmax for an apply whose output this will be appended to. */
+#define EL_OUTMAX (EL_ACTIVE ? MAXLINE - el_tail : MAXLINE)
+/* Input length for an apply inside the SIMD walker.  The walker lives in the
+ * switch, which runs AFTER the rejoin above, so its `cur` already points at
+ * the whole rejoined address -- passing `len` would hand the rule the domain
+ * too and EL_JOIN would then append a second copy.  Measured: `-E -r u` on
+ * john@gmail.com produced JOHN@GMAIL.COM@gmail.com.  el_head is the local
+ * part's length and `cur` holds local and domain contiguously, so truncating
+ * the length is the whole fix -- no copy, no second buffer.
+ *
+ * Caught by comparing the walker type (e1) against a generic-path type (e8)
+ * over the same words and rules; the case rules u and c were the only ones
+ * that showed it, because every other rule in the set left the domain alone
+ * and the double-append was the only visible difference. */
+#define EL_INLEN(n) ((EL_ACTIVE && el_tail > 0) ? el_head : (n))
+
+    /* -a: normalize the local part by removing its dots, then split exactly as
+     * -E does.  Phase 2 (2026-10-31): the two modes now share one mechanism.
+     * Before this, -a kept the domain INLINE in job->line and rebuilt the whole
+     * line from Origline on every dot iteration, which is what made `-a -r`
+     * silently wrong -- the rebuild ran AFTER mdx_apply had written the rule
+     * output into job->line, so the rule result was discarded and the two axes
+     * advanced in lockstep instead of forming a cross product.  It also read
+     * `len - emaillen` bytes from Origline using the CURRENT len, so a rule
+     * that changed the length over- or under-read the stash.
+     *
+     * Now: Origline holds the normalized WHOLE address, job->line the
+     * normalized LOCAL PART, and the domain is restored by the one -E rejoin
+     * at the key-axis seam.  The dot axis inserts into whatever the rule left
+     * in job->line. */
     if (Email) {
-      emailpow = emaillen = emailcur = 0;
+      int nl = 0;
+      emailpow = emaillen = 0;
       d = Origline;
       s = cur;
-      for (x = emaillen = 0; x < len; x++, s++) {
+      for (x = 0; x < len; x++, s++) {
 	if (*s == '@')
 	  break;
 	if (*s == '.')
 	  continue;
 	*d++ = *s;
-	emaillen++;
+	nl++;
       }
+      /* Tail runs from the '@' to the end of the word and is copied verbatim;
+       * x is its start offset in the ORIGINAL word, which is the length that
+       * must be used here -- not the running `len`, which the rule axis
+       * changes under us. */
       for (; x < len; x++)
 	*d++ = *s++;
       *d = 0;
-      cur = Origline;
-      len = d - Origline;
-      fastcopy(cur, job->line, len);
-      orig_len = len;
+      el_head = nl;
+      el_tail = (int)(d - Origline) - nl;
+      /* fastcopy is (dest, src) -- mdxfind.c:5510.  The pre-phase-2 code read
+       * fastcopy(cur, job->line, len) with cur already set to Origline, which
+       * copies job->line INTO Origline: the normalized address this block had
+       * just built was overwritten by the ORIGINAL word, every time.  So -a
+       * never swept the dotless seed it computed; it dotted an already-dotted
+       * local and emitted the adjacent-'..' forms that section 2 of the plan
+       * measures as unreachable by the model (510 of 512 candidates for
+       * j.o.h.n.smith@gmail.com carried '..', and only 162 were distinct).
+       * It also mis-copied the domain, truncating @gmail.com to @gmail. */
+      fastcopy(job->line, Origline, nl);
+      len = orig_len = nl;
       cur = job->line;
-      if (emaillen > 24)
-	emaillen = 24;
+      cur[len] = 0;
+      /* The walker drains every rule from job->line in one pass, which cannot
+       * interleave with a per-iteration dot rewrite and the rule_base
+       * accounting it depends on.  -a has always run without it; giving it the
+       * walker is not phase 2's job. */
+      FastRule = 0;
+      emaillen = nl > EMAIL_DOT_WIDTH_MAX ? EMAIL_DOT_WIDTH_MAX : nl;
+      if (nl > EMAIL_DOT_WIDTH_MAX)
+        __atomic_fetch_add(&Email_clamped, 1L, __ATOMIC_RELAXED);
       emailpow = 1 << emaillen;
     }
 
@@ -15772,9 +16439,27 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
  * uses MaskCount when -n with mask syntax, else Iter_Count[digits] for
  * legacy -n N numeric iteration. For neither, value is 1 (no iteration). */
 {
-  unsigned long long loop_bound = (job->flags & JOBFLAG_NUMBERS)
+  /* Phase 2 (2026-10-31): the -a dot axis rides the SAME iteration machinery as
+   * the mask axis instead of being a separate outer loop.  That is the whole
+   * fix for `-a -r`: the rule is now held across a full dot cycle and restored
+   * from rule_base between dots, so rules x dots is a genuine cross product
+   * rather than two axes advancing in lockstep.
+   *
+   * email_dots is PER WORD -- 2^len of the local part -- which is why the dot
+   * factor cannot simply multiply a global MaskCount the way a mask section
+   * can.  It multiplies the per-word loop bound here instead, and the mask
+   * index advances once per completed dot cycle (see the mask block), which
+   * makes dots the innermost axis.
+   *
+   * Every expression below collapses to its previous value when -a is off:
+   * email_dots is 1, iter_active is JOBFLAG_NUMBERS, and loop_bound is
+   * unchanged.  That is deliberate -- it makes the change inert without -a,
+   * which is what the byte-identity regression test checks. */
+  unsigned long long email_dots = EMAIL_DOTS;
+  int iter_active = (job->flags & JOBFLAG_NUMBERS) || email_dots > 1ULL;
+  unsigned long long loop_bound = ((job->flags & JOBFLAG_NUMBERS)
       ? (job->MaskCount ? (unsigned long long)job->MaskCount : (unsigned long long)Iter_Count[job->digits])
-      : 1ULL;
+      : 1ULL) * email_dots;
 
   if (pass0 == 0) {
     /* No-rule pass: stash the original word into rule_base so subsequent
@@ -15793,8 +16478,8 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
      * For rules-only (no -n), JOBFLAG_NUMBERS is false → number_iter never
      * increments → must use the !NUMBERS guard to advance every iter, like
      * the pre-Phase-4 behavior. For rules+masks, advance only on wrap. */
-    if (!(job->flags & JOBFLAG_NUMBERS) || number_iter >= loop_bound) {
-      /* Masks wrapped (or no mask) — advance to next rule. */
+    if (!iter_active || number_iter >= loop_bound) {
+      /* Masks and dots wrapped (or neither active) — advance to next rule. */
       if (*((unsigned short int *) currule) == 0)
         break;
       job->Ruleindex++;
@@ -15828,7 +16513,10 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
           gpu_rule_membership[job->Ruleindex - 1] &&
           gpu_rule_count > 0 && job->op == JOB_MD5 &&
           b71_mask_skip_ok &&
-          !Email && !Keys && !Printall) {
+          /* -E and -a are both served as of phase 4; see the admit gate
+           * above.  Neither appears here, because the kernel covers the
+           * (rule, mask, dot) cross product for every word it was handed. */
+          !Keys && !Printall) {
         /* Maxiter>1 path: kernel iterates internally (md5_rules_phase0);
          * see gate at top of word loop for full rationale. */
         /* Rule is GPU-eligible: advance currule past it and skip CPU applyrule. */
@@ -15838,7 +16526,22 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
         continue;
       }
 #endif /* OPENCL_GPU || METAL_GPU */
-      len = mdx_apply(job->Ruleindex, tline, orig_len, cur, MAXLINE,
+      /* tline holds the WHOLE address -- it was filled from job->line before
+       * the -E split above -- so passing orig_len, which the split set to the
+       * local-part length, hands the engine exactly the local part and leaves
+       * the domain bytes in tline unread.
+       *
+       * outmax reserves the domain and the widest mask that can still be
+       * appended below.  Without the reservation a rule that expands the local
+       * to the clamp, plus a mask, plus the domain exceeds MAXLINE and dies
+       * downstream on checkhash's "Output line too long".  Reserving here also
+       * puts the loss in the right place: per the standing ruling at
+       * ruleproc.c:442 a rule that exceeds its limit "does what it can and
+       * stops", so the bytes sacrificed are GENERATED output, never the
+       * operator's SUPPLIED domain.  MAX_MASK_POS is 256 per side on the CPU. */
+      len = mdx_apply(job->Ruleindex, tline, orig_len, cur,
+                      EmailLocal ? MAXLINE - el_tail - MaskPrependLen - MaskAppendLen
+                                 : MAXLINE,
                       currule + 2, rule_ws);
       job->len = job->clen = len;
       currule += *((unsigned short int *) currule) + 2;
@@ -15876,11 +16579,36 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
   }
 }
 pass0 = 1;
-if (Email && emailcur < emailpow) {
-  FastRule = 0;
-  d = job->line;
-  s = Origline;
-  for (x = 0; x < emaillen; x++) {
+/* -a: insert dots into the LOCAL PART that is currently in job->line -- which
+ * is the rule output when a rule is active, and the bare normalized local
+ * otherwise.  The domain is not here; the -E rejoin below puts it back.
+ *
+ * Built through email_buf rather than in place because insertion grows the
+ * string and an in-place pass would overwrite bytes it has yet to read.
+ *
+ * The bitmask is a block-local derived from the iteration counter.  It was a
+ * carried file-scope counter advanced inside this block, which is what made the
+ * axes run in lockstep rather than as a cross product; nothing needs it to
+ * survive the iteration now, so nothing may. */
+if (Email && emailpow > 1 && len > 0) {
+  int dw;
+  /* Dots are the INNERMOST axis, so the bitmask is the low digit of the
+   * iteration counter.  Derived rather than carried: a counter advanced inside
+   * this block is what made the axes move in lockstep.
+   *
+   * The source is rule_base, the stable base for this (rule, mask) pair, NOT
+   * job->line.  job->line still holds the PREVIOUS dot iteration's output --
+   * the gate restores it only on the `else if (currule)` path, so with no -r
+   * nothing restores it at all and the dots accumulate: local "ab" produced
+   * ab, a.b, then a.. and a... as each pass re-dotted its own output. Reading
+   * the base makes the block idempotent in its input and removes the question
+   * of which restore path ran. */
+  int emailcur = (int)(number_iter % (unsigned long long)emailpow);
+  if (rule_base_len >= 0) { s = rule_base; len = rule_base_len; }
+  else                      s = job->line;
+  dw = len < emaillen ? len : emaillen;       /* a rule may have shortened it */
+  d = email_buf;
+  for (x = 0; x < dw; x++) {
     *d++ = *s++;
     if (emailcur & (1 << x))
       *d++ = '.';
@@ -15888,8 +16616,9 @@ if (Email && emailcur < emailpow) {
   for (; x < len; x++)
     *d++ = *s++;
   *d = 0;
-  len = d - job->line;
-  emailcur++;
+  len = (int)(d - email_buf);
+  memcpy(job->line, email_buf, (size_t)len + 1);
+  cur = job->line;
 }
 
 if (job->flags & JOBFLAG_NUMBERS) {
@@ -15951,11 +16680,50 @@ if (job->flags & JOBFLAG_NUMBERS) {
   }
 
   job->Numbers++;
-  job->MaskIndex++;
+  /* Dots are innermost, so the mask index moves only when the dot cycle wraps.
+   * Without this gate the mask and the dot axis would advance together and the
+   * product would be a diagonal rather than a rectangle. */
+  if (EMAIL_DOTS == 1ULL || ((number_iter + 1) % EMAIL_DOTS) == 0)
+    job->MaskIndex++;
+}
+/* -E: rejoin the domain.  This is the LAST mangling step and it has to be:
+ * rule_base caches job->line for the mid-mask-cycle restore and job->prefix
+ * saves it for the prepend-mask restore, so a rejoin upstream of either would
+ * cache a line that already carries a domain and the next iteration would
+ * append a second one.  Everything above -- rules, the dot axis, the mask
+ * block -- has now run against the local part alone.
+ *
+ * The '@' is part of the tail, so a word with no '@' has el_tail == 0 and this
+ * is a no-op: one path, not two.  Origline is the untouched whole address,
+ * written once per word at the split. */
+if (EL_ACTIVE && el_tail > 0) {
+  if (len + el_tail >= (int)sizeof(job->line)) {
+    /* Unreachable as sized today -- job->line is MAXLINE+MAXLINE while the
+     * rule clamp above reserves el_tail and the mask -- which is exactly why
+     * it is worth keeping: it costs one compare and it names the three things
+     * whose agreement makes it unreachable, so a later change to any of them
+     * fails here rather than somewhere downstream. */
+    fprintf(stderr, "FATAL: %s:%d -E rejoin overflow: local %d + domain %d exceeds %d\n",
+            __FILE__, __LINE__, len, el_tail, (int)sizeof(job->line));
+    exit(1);
+  }
+  memcpy(&job->line[len], Origline + el_head, (size_t)el_tail);
+  len += el_tail;
+  job->line[len] = 0;
+  cur = job->line;
+  job->clen = len;
 }
 Lfstate = 0;
 pass_len1 = pass_len = len;
+/* -k: when the device covered every (word, key) pair for this word, point the
+ * walker AT the list terminator so its own break fires before it appends or
+ * hashes anything.  Setting curkey to NULL would instead hash the BARE word,
+ * which is a candidate -k never asks for. */
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
+curkey = keys_packed_by_gpu ? Keys_end : Keys;
+#else
 curkey = Keys;
+#endif
 
 do {
   if (curkey) {
@@ -17257,7 +18025,7 @@ do {
 	  unsigned char *cp_rec = (unsigned char *)linebuf;
 	  unsigned char *cp_pt  = (unsigned char *)linebuf + MAXLINE;
 	  int si, cp_nh = cppenc_hashcount(cp);
-	  int cp_kbase = 0, cp_nkey = 0;
+	  int cp_kbase = 0, cpk_nkey = 0;
 
 	  if (TYPEDONE(job->op)) break;
 	  /* NO GUARD ON len HERE, DELIBERATELY. Every other case in this switch
@@ -17292,7 +18060,7 @@ do {
 	   * right reading of them rather than something to drop.
 	   *
 	   * Records land in [0, nsalts_job) and keys in
-	   * [cp_kbase, cp_kbase+cp_nkey). cp_kbase is the ORIGINAL record count
+	   * [cp_kbase, cp_kbase+cpk_nkey). cp_kbase is the ORIGINAL record count
 	   * and never moves, so the retire-swap
 	   * `saltsnap[si] = saltsnap[--nsalts_job]` can only ever pull another
 	   * RECORD down: the record region shrinks from its top and leaves a
@@ -17319,7 +18087,7 @@ do {
 	      }
 	    }
 	    cp_kbase   = cp_nrec;
-	    cp_nkey    = nsalts_job - cp_nrec;
+	    cpk_nkey    = nsalts_job - cp_nrec;
 	    nsalts_job = cp_nrec;
 	  }
 	  if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
@@ -17365,7 +18133,7 @@ do {
 	      TYPEDONE(job->op) = 1;
 	      break;
 	    }
-	    if (!cp_nkey) {
+	    if (!cpk_nkey) {
 	      /* UNSATISFIABLE, not a miss. The type's arity is not met: there
 	       * are records and no key anywhere. Printing these as plain
 	       * unresolved lines would make "no key supplied" indistinguishable
@@ -17431,7 +18199,7 @@ do {
 	      if (cp_round >= CPPENC_MAXROUNDS) { cp_capped = 1; break; }
 	      cp_round++;
 	      saltsnap[cp_anchor].hashsalt = saltsnap[cp_anchor].salt;
-	      for (ki = 0; ki < cp_nkey && nsalts_job; ki++) {
+	      for (ki = 0; ki < cpk_nkey && nsalts_job; ki++) {
 	        int pl, keyok, opened = 0, failed = 0;
 	        unsigned char *pk;
 	        pl = saltsnap[cp_kbase + ki].saltlen;
@@ -31962,10 +32730,15 @@ md5sha256:
                     job->Ruleindex++;
                     ljob[ljobi].Ruleindex = job->Ruleindex;
                     /* Ruleindex was incremented just above, so it names this rule. */
-                    x = mdx_apply(job->Ruleindex, cur, len, ljob[ljobi].pass,
-                                  MAXLINE, currule + 2, rule_ws);
+                    x = mdx_apply(job->Ruleindex, cur, EL_INLEN(len), ljob[ljobi].pass,
+                                  EL_OUTMAX, currule + 2, rule_ws);
                     if (x >= 0) {
                       rulecnt++;
+                      /* -E: rejoin before the lowercase fold and before the
+                       * length is published, so the fold sees the domain too
+                       * -- which is what this type's own semantics want, and
+                       * is what the generic path produces for the same rule. */
+                      EL_JOIN(ljob[ljobi].pass, x);
                       s = ljob[ljobi].pass;
                       for (y = 0; y < x; y++) {
                         char c;
@@ -32523,10 +33296,11 @@ md5sha256:
                     job->Ruleindex++;
                     /* Ruleindex was incremented just above, so it names this rule. */
                     x = mdx_apply(job->Ruleindex, tline, orig_len, cur,
-                                  MAXLINE, currule + 2, rule_ws);
+                                  EL_OUTMAX, currule + 2, rule_ws);
                     currule += *((unsigned short int *)currule) + 2;
                     if (x >= 0) {
                       rulecnt++;
+                      EL_JOIN(cur, x);
                       job->len = job->clen = len = x;
                       hashcnt += Maxiter;
                       for (x=1; x <= Maxiter; x++) {
@@ -32616,12 +33390,13 @@ md5sha256:
                      * current rule is Ruleindex + 1 here.  The two ljob sites read
                      * identically and differ ONLY in this -- exactly the asymmetry a
                      * copied predicate gets wrong, which is why there is one helper. */
-                    x = mdx_apply(job->Ruleindex + 1, cur, len, ljob[ljobi].pass,
-                                  MAXLINE, currule + 2, rule_ws);
+                    x = mdx_apply(job->Ruleindex + 1, cur, EL_INLEN(len), ljob[ljobi].pass,
+                                  EL_OUTMAX, currule + 2, rule_ws);
                     currule += *((unsigned short int *) currule) + 2;
                     job->Ruleindex++;
                     if (x >= 0) {
                       rulecnt++;
+                      EL_JOIN(ljob[ljobi].pass, x);
                       ljob[ljobi].Ruleindex = job->Ruleindex;
                       ljob[ljobi].clen = ljob[ljobi].len = x;
                       if (x >= 56) {
@@ -44229,7 +45004,16 @@ gpu_packed_done: ;
 #endif
           } while (job->flags & JOBFLAG_HEX);
         } while (curkey);
-      } while (((job->flags & JOBFLAG_NUMBERS) && (++number_iter < (job->MaskCount ? job->MaskCount : Iter_Count[job->digits]))) || currule || (Email && emailcur < emailpow));
+      /* Phase 2: one bound for all three axes.  It must equal the gate's
+       * loop_bound exactly -- the comment there has said so since Phase 4 and
+       * the two are still two copies, so a change to either belongs in both.
+       * Collapses to the pre-phase-2 expression when -a is off, since
+       * _edots is then 1 and the Email clause is dead. */
+      } while (({ unsigned long long _edots = EMAIL_DOTS;
+                  unsigned long long _mb = MASK_AXIS_ITERS(job);
+                  ((job->flags & JOBFLAG_NUMBERS) || _edots > 1ULL)
+                      && (++number_iter < _mb * _edots); })
+               || currule);
     }
 #ifdef GPU_ENABLED
     /* Flush partial GPU batch at end of job. BF Phase 3 (2026-05-10):
@@ -44787,8 +45571,15 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
        * tools/ruletests/encoding/UTF8test1.txt: 8,819 of 53,976 lines (16.3%)
        * are ASCII raw and non-ASCII decoded.  Gated on -8, which is safe here
        * because wordlists are trailing arguments consumed after getopt. */
+      /* -E classifies the LOCAL PART only.  procrule classifies at its apply
+       * site and can see the split, so if mdxfind classified the whole address
+       * the two would pick different engines for an ASCII local with a
+       * non-ASCII domain -- and engine choice can change the result for a
+       * locale-ambiguous case mapping, which makes that an ORACLE divergence,
+       * not a performance detail.  -E is known before the read begins, so this
+       * costs nothing on the candidate path. */
       readindex[Linecount].enc = Utf32Rules
-          ? (unsigned char)classify_utf8(&curpos[curindex], (size_t)rlen)
+          ? (unsigned char)classify_utf8(&curpos[curindex], (size_t)enclen_E(&curpos[curindex], rlen))
           : (unsigned char)U8C_NONE;
       curpos[curindex + rlen] = 0;
       curindex += len + 1;
@@ -44808,8 +45599,15 @@ unsigned int cacheline(gzFile fi, char **mybuf, struct LineInfo **myindex) {
          * newline.  There are exactly TWO places this struct's len is set and
          * both need it; a word classified in only one of them would behave
          * differently depending on its position in the file. */
+        /* -E classifies the LOCAL PART only.  procrule classifies at its apply
+         * site and can see the split, so if mdxfind classified the whole address
+         * the two would pick different engines for an ASCII local with a
+         * non-ASCII domain -- and engine choice can change the result for a
+         * locale-ambiguous case mapping, which makes that an ORACLE divergence,
+         * not a performance detail.  -E is known before the read begins, so this
+         * costs nothing on the candidate path. */
         readindex[Linecount].enc = Utf32Rules
-            ? (unsigned char)classify_utf8(&curpos[curindex], (size_t)rlen)
+            ? (unsigned char)classify_utf8(&curpos[curindex], (size_t)enclen_E(&curpos[curindex], rlen))
             : (unsigned char)U8C_NONE;
         if (rlen < MAXLINE) {
           Linecount++;
@@ -54870,7 +55668,7 @@ union HashU curin;
     }
   }
 
-  while ((ch = getopt(argc, argv, "?8abcdelpvVyzZG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:L:N:R:M:S:U:P:W:X:")) != -1) {
+  while ((ch = getopt(argc, argv, "?8abcdelpvVyzZEG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:L:N:R:M:S:U:P:W:X:")) != -1) {
     switch (ch) {
       case 'X':
         s = optarg;
@@ -55064,6 +55862,14 @@ union HashU curin;
       case 'a':
         fprintf(stderr, "Email address munging on\n");
         Email = 1;
+        break;
+
+      /* -E: scope rules, masks and keys to the local part of an email address.
+       * procrule spells this the same way; -A was not available there, being
+       * its audit mode since well before this existed. */
+      case 'E':
+        fprintf(stderr, "Email local-part mode on: rules and masks apply to the local part\n");
+        EmailLocal = 1;
         break;
 
       case 'b':
@@ -56400,6 +57206,22 @@ badrule:
     }
     *s++ = 0;
     *s = 0;
+    /* s now points at the SECOND zero; the walker's break tests curkey[0] and
+     * curkey[1], so the terminator it recognises starts one byte earlier. */
+    Keys_end = s - 1;
+    Keycount = x;
+    /* Longest key, so the GPU pack site can reserve space for a whole word's
+     * worth of (word, key) entries in ONE flush test and then emit them all
+     * without a mid-loop flush.  Walk the finished stream rather than tracking
+     * it during the build: the build has three branches (hex, $HEX[], plain)
+     * and a fourth place to update is a fourth place to forget. */
+    { const unsigned char *kw = (const unsigned char *)Keys;
+      Keymaxlen = 0;
+      while (!(kw[0] == 0 && kw[1] == 0)) {
+        if ((int)kw[0] > Keymaxlen) Keymaxlen = (int)kw[0];
+        kw += (size_t)kw[0] + 1;
+      }
+    }
     fprintf(stderr, "%d total keys in use\n", x);
     Numsalts += x;
     JSLFA(RC, KeyArray);
@@ -56621,6 +57443,7 @@ usage:
     printf("\t  -m e1-e10     internal types e1 through e10\n");
     printf("\t  -m e1,1000    mix internal (e1=MD5) and hashcat (1000=NTLM)\n");
     printf("-a\tDo email address munging\n");
+    printf("-E\tRules, masks and keys apply to the email local part only\n");
     printf("-b\tExpand each word into unicode, best effort\n");
     printf("-c\tReplace each special char (<>&, etc) with XML equivalents\n");
     printf("-d\tDe-duplicate wordlists, best effort\n");
@@ -62032,7 +62855,37 @@ usage:
 	        LINEHINTS(x).lineswanted = 512;
 	    }
 	    numline = LINEHINTS(x).lineswanted;
-	    if (Email) numline = 1;
+	    /* -a: one address per job is right on the CPU, where a single address
+	     * IS 2^N candidates of work.  On the GPU it is ruinous, because the
+	     * end-of-job flush dispatches the rules-engine batch -- so one line
+	     * per job means ONE WORD PER DISPATCH.  Measured on fpga (GTX 1080,
+	     * 50,000 addresses, locals 8-11): 50,000 batches for 50,000 words at
+	     * ~5 Mh/s on a card that does MD5 in GH/s, with length-sorted and
+	     * shuffled input indistinguishable (2.38 s vs 2.37 s busy) because no
+	     * batch ever held two words to order.  Per-arm counters put all 50,000
+	     * dispatches on the end-of-job flush and none on the slot cap, the
+	     * buffer bound or the width split.
+	     *
+	     * Hand the GPU a job that can fill one batch exactly; the width-keyed
+	     * split (plan 15.1) is then the only thing that fragments, which is
+	     * the point of keying it.  op_can_reach_gpu is the same predicate the
+	     * lineswanted gate above uses, and returns 0 when no GPU backend is
+	     * compiled in, so the CPU value is reached by the honest route. */
+	    if (Email) {
+	      /* GPU_RULES_MAX_WORDS_PER_BATCH lives in gpujob.h, whose whole body
+	       * sits behind the same backend test that defines GPU_ENABLED -- so
+	       * the constant does not exist in a plain non-GPU build and naming it
+	       * unguarded broke the local macOS x86_64 target while .205's OpenCL
+	       * build stayed green.  Same shape as the 1.533 break that
+	       * op_can_reach_gpu was introduced to fix. */
+#ifdef GPU_ENABLED
+	      numline = op_can_reach_gpu((int)x)
+	                ? (unsigned long long)GPU_RULES_MAX_WORDS_PER_BATCH
+	                : 1ULL;
+#else
+	      numline = 1ULL;
+#endif
+	    }
 	  }
 	  if ((curline + numline) > Linecount)
 	    numline = Linecount - curline;
@@ -62272,6 +63125,59 @@ bf_done:
     if (Utf32Rules && Unreachable)
       fprintf(stderr, "%s (word,rule) pairs skipped: rule needs UTF-32 and the "
                       "word is not valid UTF-8\n", commify(Unreachable));
+    /* -a width waste, per plan section 9 decision 9.  The clamp is silent
+     * otherwise, and a sweep that covered 24 of a 30-character local looks
+     * exactly like one that covered all of it. */
+    if (Email && Email_batch_splits) {
+      fprintf(stderr,
+        "-a GPU batching: %s batch(es) dispatched early because the local-part "
+        "length changed", commify(Email_batch_splits));
+      if (Email_unsorted)
+        fprintf(stderr,
+          ", %s of them where the length DECREASED -- the input is not sorted "
+          "shortest-first, so batches fragment and the GPU runs far below its "
+          "rate. utils/emailprep orders a list correctly",
+          commify(Email_unsorted));
+      fprintf(stderr, ".\n");
+    }
+#ifdef GPU_ENABLED
+    /* The clamp costs SPEED, not coverage, and the reason is an invariant
+     * rather than luck.  The dispatch clamps only when a single word's full
+     * width will not fit the grid -- the pack site bounds the word axis per
+     * width (plan 15.4), so any batch it assembles fits by construction.  The
+     * interlock that lets the CPU skip the dot axis is gated on the SAME
+     * inequality, so for exactly the words that provoke a clamp it does not
+     * fire and the CPU sweeps them in full.  Clamp and interlock are therefore
+     * complementary: whenever one engages the other stands down, and no
+     * candidate is lost either way.
+     *
+     * An earlier version of this message said the run was INCOMPLETE.  That
+     * was wrong, and a wrong diagnostic is worse than none -- it would have
+     * sent someone looking for lost candidates in a run that had computed all
+     * of them, slowly.  What the operator needs to know is that the rule count
+     * is too high for that local-part width to stay on the device. */
+    if (Email && gpu_dot_width_asked > gpu_dot_width_used)
+      fprintf(stderr,
+        "-a GPU dot width narrowed to %d of the %d some batch asked for: with "
+        "this rule count a local part that wide does not fit the GPU grid, so "
+        "those addresses were swept on the CPU instead. Coverage is complete; "
+        "the run is slower than it looks. Fewer rules per pass, or a narrower "
+        "local-part width, keeps the whole sweep on the device.\n",
+        gpu_dot_width_used, gpu_dot_width_asked);
+#endif
+    if (Email && Email_cpu_cheap)
+      fprintf(stderr,
+        "-a: %s word(s) kept on the CPU because the dot sweep was narrower than "
+        "%d positions -- below that a GPU dispatch costs more than it saves. "
+        "That is expected at the START of an emailprep-ordered list, which is "
+        "sorted shortest-first.\n",
+        commify(Email_cpu_cheap), EMAIL_GPU_MIN_DOT_W);
+    if (Email && Email_clamped)
+      fprintf(stderr,
+        "%s word(s) had a local part longer than %d characters; the dot sweep "
+        "covered only the first %d positions of each. Dottings beyond that were "
+        "not tried.\n",
+        commify(Email_clamped), EMAIL_DOT_WIDTH_MAX, EMAIL_DOT_WIDTH_MAX);
     if (Utf32Rules && Variants_dropped)
       fprintf(stderr, "%s (word,rule) pairs had more than one UTF-32 locale "
                       "variant; only the first was tried (use -L to pin one)\n",

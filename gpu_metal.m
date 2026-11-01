@@ -101,6 +101,12 @@
  * other gpu_* macros. Until that edit lands this TU still compiles in
  * isolation via the defensive forward-declarations below. */
 #include "gpujob.h"
+extern int Email;
+/* -a dot-width clamp high-water marks; defined in mdxfind.c, reported at the
+ * end of the run.  Same two counters the OpenCL twin writes. */
+extern int gpu_dot_width_used;
+extern int gpu_dot_width_asked;
+extern int EmailLocal;
 #include "job_types.h"     /* JOB_MD5 */
 
 /* Defensive forward-declarations for the symbols gpujob.h gates on
@@ -2142,6 +2148,52 @@ int gpu_metal_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
 
     GPU_DEBUG_FPRINTF(stderr, "Metal: mask binding (%d positions, %llu combos)\n",
             ntotal, (unsigned long long)gpu_mask_total);
+    return 0;
+}
+
+/* -a with no -n: bind DEGENERATE mask buffers so the dot axis has a PSO.
+ *
+ * The dot sweep rides the mask axis (plan section 15) but owns no mask
+ * POSITIONS, so gpu_metal_set_mask refuses it -- it rejects npre+napp == 0 --
+ * and use_mask would stay 0.  On this backend that is not merely a missing
+ * optimisation: the no-mask PSO variant hard-codes `mask_size = 1u`
+ * (metal_template.metal), so the inner loop runs exactly once, every dot
+ * bitmask is 0, and -a would compute the undotted seed and nothing else.  A
+ * silent miss, on Metal alone -- the OpenCL template has no no-mask variant and
+ * carries its mask code unconditionally.
+ *
+ * All sizes are 1 and the charsets are zero, so the kernel's position block
+ * (`if (npre >= 1u || napp >= 1u)`) stays inert and the all-positions product
+ * is an empty product of 1.  Only the axis SIZE crosses, which is what the dot
+ * radix needs.  Idempotent: returns immediately once bound. */
+static int metal_bind_dot_only_mask(void)
+{
+    if (buf_mask_charsets != nil && buf_mask_sizes != nil) return 0;
+    if (!metal_ready || mtl_device == nil) return -1;
+    @autoreleasepool {
+        static uint8_t  zero_charsets[METAL_MASK_TOTAL_CAP * 256];
+        uint32_t ones[METAL_MASK_TOTAL_CAP];
+        int i;
+        for (i = 0; i < METAL_MASK_TOTAL_CAP; i++) ones[i] = 1u;
+        buf_mask_charsets =
+            [mtl_device newBufferWithBytes:zero_charsets
+                                    length:sizeof(zero_charsets)
+                                   options:MTLResourceStorageModeShared];
+        buf_mask_sizes =
+            [mtl_device newBufferWithBytes:ones
+                                    length:sizeof(ones)
+                                   options:MTLResourceStorageModeShared];
+        if (buf_mask_charsets == nil || buf_mask_sizes == nil) {
+            fprintf(stderr, "FATAL: %s:%d -a dot axis: could not bind the "
+                            "degenerate mask buffers on this device\n",
+                    __FILE__, __LINE__);
+            exit(1);
+        }
+    }
+    gpu_mask_n_prepend = 0;
+    gpu_mask_n_append  = 0;
+    memset(gpu_mask_sizes, 1, sizeof(gpu_mask_sizes));
+    if (gpu_mask_total == 0) gpu_mask_total = 1;
     return 0;
 }
 
@@ -6216,6 +6268,15 @@ static uint32_t *gpu_metal_kernelb_dispatch_proto_chunked(
             if (metal_ensure_u32_scratch_pool(num_words) < 0) return NULL;
             if (metal_ensure_u32_case_tab() < 0) return NULL;
         }
+        /* -E / -a: tag each word's local-part length into the PAYLOAD COPY's
+         * word_offset, bits 22-29.  Outside gpu_u32_active() on purpose: -E is
+         * independent of -8, so this runs in byte mode too.  Both taggers are
+         * non-destructive so their order does not matter.  NEVER the jobg slot's
+         * array -- the hit replay reads that one and masks nothing. */
+        if (EmailLocal || Email) {
+            gpu_tag_head_lens((uint32_t *)(p + 132), num_words,
+                              (const unsigned char *)(p + payload_pkt));
+        }
 
         /* --- A2. One-time buf_hashes_shown alloc + zero (cross-chunk dedup). *
          * Sized for hash_data_count + overflow_count. Zeroed ONCE for the
@@ -6967,6 +7028,15 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
             ((OCLParams *)p)->num_masks = (uint32_t)gpu_u32_dev_nrules;
             if (metal_ensure_u32_scratch_pool(num_words) < 0) return NULL;
             if (metal_ensure_u32_case_tab() < 0) return NULL;
+        }
+        /* -E / -a: tag each word's local-part length into the PAYLOAD COPY's
+         * word_offset, bits 22-29.  Outside gpu_u32_active() on purpose: -E is
+         * independent of -8, so this runs in byte mode too.  Both taggers are
+         * non-destructive so their order does not matter.  NEVER the jobg slot's
+         * array -- the hit replay reads that one and masks nothing. */
+        if (EmailLocal || Email) {
+            gpu_tag_head_lens((uint32_t *)(p + 132), num_words,
+                              (const unsigned char *)(p + payload_pkt));
         }
 
         /* Zero the kernel-A state buffer (slot/byte/overflow counters). */
@@ -8775,10 +8845,14 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * and the position test below rejects it. The only behaviour this
          * adds is the degenerate single-combination mask, which now pays a
          * mask-variant JIT and returns the right answer. */
-        int use_mask = (gpu_mask_total > 0
+        /* -a: bind the degenerate buffers before the test, so the dot axis
+         * can select a mask PSO without any mask positions of its own. */
+        if (Email) (void)metal_bind_dot_only_mask();
+        int use_mask = (((gpu_mask_total > 0
+                          && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1)
+                         || Email)
                         && buf_mask_charsets != nil
-                        && buf_mask_sizes    != nil
-                        && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1);
+                        && buf_mask_sizes    != nil);
 
         /* Phase 2c row 1: salt mode is selected when gpu_metal_set_salt
          * has been called for this batch (cached_salts_count > 0) AND
@@ -9080,6 +9154,64 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         uint32_t mask_size_for_pack = use_mask
             ? (bf_num_masks > 0u ? bf_num_masks : (uint32_t)gpu_mask_total)
             : 1u;
+        /* -a dot axis (plan sections 5, 15, 16).  Same arithmetic as the
+         * OpenCL twin at gpu/gpu_opencl.c:15206: the widest local part in THIS
+         * batch gives N, and 2^N is multiplied into the mask axis as its
+         * outermost digit.  The kernel divides the position product back out.
+         *
+         * The CLAMP differs from OpenCL and the difference is the point.  There
+         * the mask is a GRID axis and MDX_NDRANGE_HARD is a ceiling the driver
+         * enforces.  Here the grid is num_words alone, with rule and mask as
+         * inner loops, so 2^N multiplies PER-THREAD work and the failure mode is
+         * Apple's watchdog, not an error code.  gpu/CLAUDE.md records that a
+         * per-dispatch item count does not predict that watchdog -- 33.5M items
+         * survived where 16.4M FATALed on a narrower grid -- so this ceiling is
+         * not a prediction, it is a bound that keeps the two backends sweeping
+         * the SAME width for the same batch.  Plan section 16.2 records the
+         * follow-on: chunk the dot axis the way brute force already chunks the
+         * mask axis, which puts it back under the adaptive timer. */
+        if (Email && num_words > 0 && packed_words && word_offset) {
+            uint32_t dot_w = 0, i;
+            for (i = 0; i < num_words; i++) {
+                uint32_t off = word_offset[i] & WOFF_H_OFF_MASK;
+                if (off + 2u > packed_size) continue;
+                uint32_t wl = (uint32_t)(uint8_t)packed_words[off]
+                            | ((uint32_t)(uint8_t)packed_words[off + 1] << 8);
+                const char *w = packed_words + off + 2;
+                uint32_t h = wl, j;
+                if (off + 2u + wl > packed_size) continue;
+                for (j = 0; j < wl; j++) if (w[j] == '@') { h = j; break; }
+                if (h > dot_w) dot_w = h;
+            }
+            if (dot_w > (uint32_t)GPU_EMAIL_DOT_WIDTH_MAX)
+                dot_w = (uint32_t)GPU_EMAIL_DOT_WIDTH_MAX;
+            if ((int)dot_w > gpu_dot_width_asked) gpu_dot_width_asked = (int)dot_w;
+            {
+                unsigned long long lanes =
+                    (unsigned long long)num_words
+                    /* gpu_rule_count, not n_rules: that local belongs to the
+                     * kernel-B proto dispatch, a different function.  Caught by
+                     * the dev1 build, which is the only one that compiles this
+                     * file. */
+                    * ((unsigned long long)gpu_rule_count + 1ULL)
+                    * (unsigned long long)mask_size_for_pack;
+                if (lanes < 1ULL) lanes = 1ULL;
+                while (dot_w > 0u &&
+                       lanes * (1ULL << dot_w)
+                           > (unsigned long long)MDX_NDRANGE_HARD)
+                    dot_w--;
+            }
+            if (dot_w > 0u) {
+                mask_size_for_pack <<= dot_w;
+                if ((int)dot_w > gpu_dot_width_used)
+                    gpu_dot_width_used = (int)dot_w;
+            }
+        }
+        /* Publish the base the hit replay must decode against (gpujob.h).  This
+         * backend is single-device, so slot 0.  The kernel recovers its
+         * mask_size as num_salts / num_salts_per_page, which is exactly
+         * mask_size_for_pack in both the salted and unsalted packs. */
+        gpu_dispatch_mask_size[0] = (uint64_t)mask_size_for_pack;
         params->num_salts            = mask_size_for_pack;
         /* Phase 2e.1: salt_start is the per-dispatch salt-page base
          * (was always 0 in Phase 2c when one dispatch covered the full
@@ -9321,6 +9453,15 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                     "A(ascii)=%u W(utf8)=%u I(undecodable)=%u of %u\n",
                     cls_counts[0], cls_counts[1], cls_counts[2], num_words);
             }
+        }
+        /* -E / -a: tag each word's local-part length into the PAYLOAD COPY's
+         * word_offset, bits 22-29.  Outside gpu_u32_active() on purpose: -E is
+         * independent of -8, so this runs in byte mode too.  Both taggers are
+         * non-destructive so their order does not matter.  NEVER the jobg slot's
+         * array -- the hit replay reads that one and masks nothing. */
+        if (EmailLocal || Email) {
+            gpu_tag_head_lens((uint32_t *)(p + 132), num_words,
+                              (const unsigned char *)(p + payload_pkt));
         }
 
         /* Ensure the on-GPU dedup buffer exists. Sized to

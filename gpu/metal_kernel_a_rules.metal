@@ -1368,7 +1368,7 @@ void cand_rules_phase0(device uchar         *payload,
     /* Private buffer (16-byte aligned, matches md5_rules_phase0). */
     __attribute__((aligned(16))) uchar buf[KA_BUF_BYTES];
 
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;

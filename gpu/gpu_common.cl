@@ -102,6 +102,59 @@
  * e541/e542 differ only in inner-digest hex encoding step). Host sets this
  * field at dispatch time based on op; kernel branches on it. Reusable for
  * other hash families that have similar minor-variant clusters. */
+/* ==== word_offset bit layout -- ONE definition, unconditionally available ====
+ *
+ * word_offset[] carries one uint32 per packed word.  It is not just an offset:
+ *
+ *   bits  0-21  offset into the packed-words region.  22 bits is exact --
+ *               GPUBATCH_RULES_PACKED_SIZE is 16384 x 256 = 2^22 (gpujob.h).
+ *   bits 22-29  head_len, the length of the part of the word that mangling
+ *               may touch.  0 means "the whole word", which is every run that
+ *               is not -E, so an untagged array reads correctly.
+ *   bits 30-31  the UTF-32 word class, written only under -8.
+ *
+ * 22 + 8 + 2 = 32.  The field is now FULL; there is no spare bit left.
+ *
+ * WHY THESE LIVE HERE.  They used to be in gpu_u32_walker.cl, which is appended
+ * to a program only when gpu_u32_active() -- so in byte mode they were not
+ * unused, they were UNDEFINED, and every byte-mode reader therefore read
+ * word_offset raw because it could not do otherwise.  That was safe only
+ * because the one tag that existed was written only under -8, where the masked
+ * arm is what compiles.  head_len breaks that invariant: -E is independent of
+ * -8, so the byte-mode arm can now meet a tagged array.  Hence one definition,
+ * in the file every program includes.  (note: the walker's U32_OFF_MASK and
+ * U32_TAG_SHIFT now derive from these.)
+ *
+ * EVERY reader must mask.  An unmasked read of a tagged entry indexes wild
+ * global memory; the signature in this tree is md5_rules ovr-state read
+ * err=-5, and tagging an array whose reader does not mask it has bitten three
+ * times in this feature already. */
+#define WOFF_OFF_BITS    22u
+#define WOFF_OFF_MASK    0x003fffffu
+#define WOFF_HEAD_SHIFT  22u
+#define WOFF_HEAD_MASK   0xffu
+#define WOFF_CLASS_SHIFT 30u
+/* -a dot-sweep width cap, equal to EMAIL_DOT_WIDTH_MAX in mdxfind.c.  Bounds
+ * the bit scan so a 1UL shift can never reach 64 -- new_len can be 40960 and
+ * `1UL << i` past 63 is undefined -- and keeps the device sweep identical to
+ * the CPU's, which is what GPU == CPU is testing. */
+#define WOFF_DOT_WIDTH_MAX 24u
+
+/* Offset, head_len and class from a raw word_offset entry.
+ *
+ * head_len is stored BIASED BY ONE: the stored field is head_len + 1, so 0
+ * means untagged and a caller needs no -E test.  The bias is not cosmetic --
+ * an address beginning with '@' has a genuine head_len of ZERO, and the
+ * fixture file carries exactly that case, so an unbiased field could not tell
+ * "local part is empty" from "no tag present" and would mangle the domain of
+ * every such word.  Biased, the representable range is head_len 0..254, and
+ * RFC 5321 caps a local part at 64. */
+#define WOFF_OFF(raw)           ((raw) & WOFF_OFF_MASK)
+#define WOFF_CLASS(raw)         ((raw) >> WOFF_CLASS_SHIFT)
+#define WOFF_HEAD_RAW(raw)      (((raw) >> WOFF_HEAD_SHIFT) & WOFF_HEAD_MASK)
+#define WOFF_HEAD(raw, wlen)    ((WOFF_HEAD_RAW(raw) == 0u) ? (wlen) \
+                                  : (int)(WOFF_HEAD_RAW(raw) - 1u))
+
 typedef struct {
     ulong compact_mask;       /*  0: hash table mask */
     ulong mask_start;         /*  8: mask keyspace offset */

@@ -317,7 +317,7 @@ void cand_masks_phase0(
     uint pkt_off = 132u + (n_words * 4u);
     __global const uchar  *words = payload + pkt_off;
 
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     uint wlen = (uint)words[wpos++];
 
     /* Final candidate length: [prebuf][word][appbuf]. */

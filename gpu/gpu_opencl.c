@@ -64,6 +64,13 @@ extern void tsfprintf(FILE *fp, const char *fmt, ...)
 
 /* ---- Multi-GPU device state ---- */
 #define MAX_GPU_DEVICES 64
+/* gpu_dispatch_mask_size[] is sized by GPUJOB_MAX_DEVS in gpujob.h, which the
+ * replay indexes with the same device slot this file writes.  The two caps must
+ * not drift, and a drift would be an out-of-bounds write on a large rig rather
+ * than anything visible on a one-GPU desk. */
+#if MAX_GPU_DEVICES > GPUJOB_MAX_DEVS
+#error "MAX_GPU_DEVICES exceeds GPUJOB_MAX_DEVS (gpujob.h)"
+#endif
 
 /* ============================================================
  * Dynamic-sizer prototype (2026-05-09)
@@ -1502,6 +1509,15 @@ extern int                MaskAppendLen;
 extern unsigned long long MaskAppendTotal;
 extern struct MaskPos   MaskPrependPattern[MAX_MASK_POS_CPU];
 extern int                MaskPrependLen;
+extern int                Email;
+/* -a: the dot width the last dispatch actually used, and the widest local it
+ * had to clamp.  Reported at end of run, because a sweep that covered 13 of a
+ * 23-character local is indistinguishable from a complete one otherwise. */
+/* Defined in mdxfind.c, which is in every build; written here and read at the
+ * end of the run.  Both are high-water marks across dispatches. */
+extern int gpu_dot_width_used;
+extern int gpu_dot_width_asked;
+extern int                EmailLocal;
 extern unsigned long long MaskPrependTotal;
 extern unsigned long long MaskTotal;
 
@@ -12832,6 +12848,16 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
             gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
             ((OCLParams *)staging)->num_masks = (uint32_t)d->gpu_n_rules;
         }
+        /* -E / -a: tag each word's local-part length into the PAYLOAD COPY's
+         * word_offset, bits 22-29.  Outside the gpu_u32_active() block on
+         * purpose: -E is independent of -8, so this must run in byte mode too.
+         * Both taggers are non-destructive, so their order does not matter.
+         * NEVER the jobg slot's array -- the host hit replay reads that one and
+         * masks nothing; see gpu_u32_tag_word_offsets. */
+        if (EmailLocal || Email) {
+            gpu_tag_head_lens((uint32_t *)(staging + 132), num_words,
+                              (const unsigned char *)(staging + 132 + payload_woff_bytes));
+        }
     }
     err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
                                0, payload_size, d->h_dispatch_payload,
@@ -13752,6 +13778,16 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
             uint32_t cls_counts[3];
             gpu_u32_tag_word_offsets(pwoff, num_words, ppk, cls_counts);
             ((OCLParams *)staging)->num_masks = (uint32_t)d->gpu_n_rules;
+        }
+        /* -E / -a: tag each word's local-part length into the PAYLOAD COPY's
+         * word_offset, bits 22-29.  Outside the gpu_u32_active() block on
+         * purpose: -E is independent of -8, so this must run in byte mode too.
+         * Both taggers are non-destructive, so their order does not matter.
+         * NEVER the jobg slot's array -- the host hit replay reads that one and
+         * masks nothing; see gpu_u32_tag_word_offsets. */
+        if (EmailLocal || Email) {
+            gpu_tag_head_lens((uint32_t *)(staging + 132), num_words,
+                              (const unsigned char *)(staging + 132 + payload_woff_bytes));
         }
     }
 
@@ -15176,6 +15212,7 @@ validator_skip:
         b71_mask_size = (uint32_t)gpu_mask_total;
     }
 
+
     /* BF chunk-as-job Phase 2 (2026-05-10): effective_mask_size is the
      * kernel's per-word mask iteration range. For BF chunks (bf_num_masks
      * > 0) this is the chunk's per-word slice; for non-BF dispatches it
@@ -15187,6 +15224,85 @@ validator_skip:
      * named local keeps both arms in sync. */
     uint32_t effective_mask_size = (bf_num_masks > 0u)
         ? bf_num_masks : b71_mask_size;
+
+    /* -a dot axis (plan sections 5, 15).  The dot sweep rides the mask axis as
+     * its OUTERMOST digit, so all the host has to do is multiply 2^N into the
+     * axis size; the kernel divides the prepend/append product back out and
+     * what remains is the dot bitmask.  No params field, no flag, no width
+     * crossing to the device.
+     *
+     * It is applied to effective_mask_size, NOT to b71_mask_size, and that
+     * ordering is the whole of a defect found on 2026-10-31: with a mask
+     * present, `bf_num_masks` OVERRIDES b71_mask_size a few lines below, so a
+     * radix multiplied in before that point was simply discarded.  Measured on
+     * fpga -- `-a -r` alone recovered 1 of 1 on the device, and `-a -r -n ?d`
+     * recovered 0 while the CPU found it -- which is the three-axis cross
+     * product silently losing its outermost axis.  The Metal twin applies the
+     * shift after its own override and was already correct.
+     *
+     * N is the widest local part in THIS batch, which is cheap to find and
+     * tight because the input is length-ordered (section 3) -- a batch is a
+     * contiguous run of near-equal local lengths, so one width fits it with
+     * little waste.  That is the third thing the ordering turns out to buy.
+     *
+     * Then N is clamped to what the grid can hold.  mask_size is launch-wide,
+     * so it enters the NDRange as n_words x n_rules x 2^N x spp against
+     * MDX_NDRANGE_HARD; section 15 computes that 16,384 words with 10 rules
+     * leaves N = 13.  Clamping N loses coverage of longer locals, and the clamp
+     * is REPORTED for that reason -- a sweep that covered 13 of a 23-character
+     * local looks exactly like one that covered all of it.
+     *
+     * Section 15 argues for narrowing the WORD axis instead, trading measured
+     * throughput for coverage.  That is a refinement and is deliberately not
+     * done here: it belongs at the pack site in mdxfind.c, which chooses the
+     * batch, not at the dispatch which only sees the batch it was handed. */
+    if (Email && num_words > 0 && packed_words && word_offset) {
+        uint32_t dot_w = 0, i;
+        for (i = 0; i < num_words; i++) {
+            uint32_t off = word_offset[i] & WOFF_H_OFF_MASK;
+            if (off + 2u > packed_size) continue;
+            uint32_t wl = (uint32_t)(uint8_t)packed_words[off]
+                        | ((uint32_t)(uint8_t)packed_words[off + 1] << 8);
+            const char *w = packed_words + off + 2;
+            uint32_t h = wl, j;
+            if (off + 2u + wl > packed_size) continue;
+            for (j = 0; j < wl; j++) if (w[j] == '@') { h = j; break; }
+            if (h > dot_w) dot_w = h;
+        }
+        /* GPU_EMAIL_DOT_WIDTH_MAX (gpujob.h), not WOFF_DOT_WIDTH_MAX: the
+         * latter is a DEVICE macro in gpu_common.cl and a .cl is not a C
+         * translation unit, so host code cannot see it.  The two are the same
+         * number and the regress suite asserts that, along with mdxfind.c's
+         * EMAIL_DOT_WIDTH_MAX -- one value under three names, in three files
+         * that cannot share a header. */
+        if (dot_w > (uint32_t)GPU_EMAIL_DOT_WIDTH_MAX)
+            dot_w = (uint32_t)GPU_EMAIL_DOT_WIDTH_MAX;
+        if ((int)dot_w > gpu_dot_width_asked) gpu_dot_width_asked = (int)dot_w;
+
+        /* Clamp to the NDRange ceiling, counting the synthetic no-rule pass. */
+        {
+            unsigned long long lanes =
+                (unsigned long long)num_words
+                * ((unsigned long long)d->gpu_n_rules + 1ULL)
+                * (unsigned long long)effective_mask_size;
+            if (lanes < 1ULL) lanes = 1ULL;
+            while (dot_w > 0u &&
+                   lanes * (1ULL << dot_w) > (unsigned long long)MDX_NDRANGE_HARD)
+                dot_w--;
+        }
+        if (dot_w > 0u) {
+            effective_mask_size <<= dot_w;
+            if ((int)dot_w > gpu_dot_width_used) gpu_dot_width_used = (int)dot_w;
+        }
+    }
+    /* Hand the hit replay the base it must decode against (gpujob.h).  This is
+     * the ONLY place the value exists after the dot radix and the grid clamp,
+     * so it is the only honest place to publish it.  For every non-`-a`
+     * dispatch it equals the expression the replay used to compute for itself
+     * -- bf_num_masks when chunked, else gpu_mask_total when the mask is
+     * eligible, else 1 -- so nothing but `-a` changes. */
+    if (dev_idx >= 0 && dev_idx < GPUJOB_MAX_DEVS)
+        gpu_dispatch_mask_size[dev_idx] = (uint64_t)effective_mask_size;
 
     /* B6 salt-axis (2026-05-06; §13.2 row 16.5): derive is-salted at the
      * pack site (op-direct). Row 17's `kern_is_salted_template` covers
@@ -16173,6 +16289,16 @@ validator_skip:
                 }
             }
         }
+        /* -E / -a: tag each word's local-part length into the PAYLOAD COPY's
+         * word_offset, bits 22-29.  Outside the gpu_u32_active() block on
+         * purpose: -E is independent of -8, so this must run in byte mode too.
+         * Both taggers are non-destructive, so their order does not matter.
+         * NEVER the jobg slot's array -- the host hit replay reads that one and
+         * masks nothing; see gpu_u32_tag_word_offsets. */
+        if (EmailLocal || Email) {
+            gpu_tag_head_lens((uint32_t *)(p + 132), num_words,
+                              (const unsigned char *)(p + payload_pkt_off));
+        }
     }
 
     /* ONE coalesced host->GPU write — synchronous (CL_TRUE) per hashcat
@@ -16963,8 +17089,21 @@ validator_skip:
      * of redundant work-items. The OCLParams.num_salts pack at line ~10420
      * already uses `bf_num_masks > 0u ? bf_num_masks : b71_mask_size` for
      * the kernel's mask_size; this enqueue must mirror that. */
-    size_t kernel_mask_size = (bf_num_masks > 0u) ? (size_t)bf_num_masks
-                                                  : (size_t)b71_mask_size;
+    /* effective_mask_size, NOT a second copy of its defining expression.
+     *
+     * This line used to recompute `bf_num_masks > 0 ? bf_num_masks :
+     * b71_mask_size` for itself, which was the same value -- until the -a dot
+     * radix had to move onto effective_mask_size so it would survive the
+     * bf_num_masks override (see the dot block above).  Then one copy carried
+     * the radix and this one did not, so the NDRange lost its mask factor: the
+     * grid became num_words x n_rules, every lane resolved to word 0, and a
+     * batch recovered exactly its FIRST word.  Measured on fpga -- 10 of 10
+     * known answers before, 5 after, one per width-keyed batch, with the DEVICE
+     * reporting 5 hits so it was the grid and not the replay.
+     *
+     * Two copies of one expression, which is the failure gpu/CLAUDE.md already
+     * records for the word-offset class tag. There is now one. */
+    size_t kernel_mask_size = (size_t)effective_mask_size;
     size_t total = (size_t)num_words * (size_t)d->gpu_n_rules
                    * kernel_mask_size;
     /* The kernels bound themselves with a 32-bit

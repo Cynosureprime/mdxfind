@@ -1328,7 +1328,7 @@ void cand_rules_phase0(
         wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
         if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;
 #else
-        wpos = word_offset[word_idx];
+        wpos = WOFF_OFF(word_offset[word_idx]);
         int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
         wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
         if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;

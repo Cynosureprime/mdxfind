@@ -1334,7 +1334,7 @@ void cand_rules_masks_phase0(
      * into the packed output buffer. */
     __attribute__((aligned(16))) uchar buf[RULE_BUF_MAX];
 
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;

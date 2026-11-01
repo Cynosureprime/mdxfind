@@ -1,8 +1,8 @@
 /* Auto-generated from metal_kernel_a_masks.metal -- do not edit */
 static const char metal_kernel_a_masks_str[] =
     "/*\n"
-    " * $Revision: $\n"
-    " * $Log: $\n"
+    " * $Revisio" "n: $\n"
+    " * $Lo" "g: $\n"
     " *\n"
     " * Hand-ported from gpu_kernel_a_masks.cl (post 2026-05-30 long-mask\n"
     " * amendment). Walker rewrite is non-trivial (per-thread var table +\n"
@@ -184,7 +184,7 @@ static const char metal_kernel_a_masks_str[] =
     "    uint pkt_off = 132u + (n_words * 4u);\n"
     "    device const uchar  *words = payload + pkt_off;\n"
     "\n"
-    "    uint wpos = word_offset[word_idx];\n"
+    "    uint wpos = WOFF_OFF(word_offset[word_idx]);\n"
     "    uint wlen = (uint)words[wpos++];\n"
     "\n"
     "    uint final_len = (uint)prelen + wlen + (uint)applen;\n"

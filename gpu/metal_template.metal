@@ -360,18 +360,23 @@ kernel void template_phase0(
      *   - HAS_SALT defined (2c): mask_size = num_salts / num_salts_per_page
      *     (mirrors gpu_template.cl:251-256 overload).
      *
-     * mask_active is the gate: a mask is in scope only when n_prepend or
-     * n_append is >= 1. With no mask, the kernel collapses to the (word,
-     * rule) shape (mask_size==1). */
-    uint mask_active = ((params.n_prepend >= 1u) || (params.n_append >= 1u)) ? 1u : 0u;
+     * mask_active is derived from the mask axis SIZE, not from the presence
+     * of prepend/append positions.  The -a dot axis multiplies 2^N into the
+     * same axis (plan section 15) and has no positions of its own, so a
+     * positions-only test would collapse mask_size to 1 and the dot sweep
+     * would never iterate.  Deriving it from the size is self-consistent --
+     * the axis is active exactly when it has more than one coordinate -- and
+     * is neutral for every existing run, because the host sets the mask size
+     * to 1 when no mask is configured.  Byte-identical reasoning to
+     * gpu_template.cl; the two must not drift. */
+    uint mask_active = 1u;   /* refined below, once mask_size is known */
 #ifdef GPU_TEMPLATE_HAS_SALT
-    uint mask_size = mask_active
-        ? (params.num_salts / num_salts_per_page)
-        : 1u;
+    uint mask_size = params.num_salts / num_salts_per_page;
 #else
-    uint mask_size = mask_active ? params.num_salts : 1u;
+    uint mask_size = params.num_salts;
 #endif
     if (mask_size == 0u) mask_size = 1u;
+    mask_active = (mask_size > 1u) ? 1u : 0u;
 #else
     uint mask_size = 1u;
 #endif
@@ -501,11 +506,26 @@ kernel void template_phase0(
     uint wcls = raw_woff >> U32_TAG_SHIFT;
     uint wpos = raw_woff & U32_OFF_MASK;
 #else
-    uint wpos = raw_woff;
+    /* The byte-mode arm masks too, as of the head_len packing.  It read raw
+     * because the only tag was the class, written only under -8, where the
+     * arm above is what compiles -- the two never met.  head_len is written
+     * under -E, which is independent of -8, so this arm can now meet a tagged
+     * entry and an unmasked read indexes wild global memory. */
+    uint wpos = WOFF_OFF(raw_woff);
 #endif
     int wlen_orig = (int)words[wpos] | ((int)words[wpos + 1] << 8);
     wpos += 2;   /* 2-byte little-endian length: see gpujob.h */
     if (wlen_orig > RULE_BUF_LIMIT) wlen_orig = RULE_BUF_LIMIT;
+    /* -E / -a: OpenCL twin gpu_template.cl.  The mangled part is the LOCAL
+     * PART and the domain is appended unchanged after the mask block.  head_len
+     * rides word_offset bits 22-29 biased by one, so WOFF_HEAD returns the full
+     * length when the entry is untagged and any run that is not -E behaves
+     * exactly as before.  Derived AFTER the RULE_BUF_LIMIT clamp, which can cut
+     * below head_len.  The domain needs no buffer of its own -- it is still in
+     * `words` at wpos + hlen_orig. */
+    int hlen_orig = WOFF_HEAD(raw_woff, wlen_orig);
+    if (hlen_orig > wlen_orig) hlen_orig = wlen_orig;
+    int tlen_orig = wlen_orig - hlen_orig;
 
 #ifdef GPU_TEMPLATE_HAS_MASK
     /* Loop-invariant mask geometry, hoisted out of the rule x mask double
@@ -527,6 +547,18 @@ kernel void template_phase0(
         mask_append_combos_h *= (ulong)sz;
     }
     if (mask_append_combos_h == 0u) mask_append_combos_h = 1u;
+    /* -a dot axis: the product over ALL positions, prepend and append, which
+     * is the radix the dot bitmask sits above.  Hoisted rather than recomputed
+     * per candidate because on this backend the mask is an inner LOOP, not a
+     * grid axis, so a per-candidate 32-iteration multiply chain would be paid
+     * mask_size times per word instead of once. */
+    ulong mask_all_combos_h = 1u;
+    for (uint j = 0u; j < mask_npre_h + mask_napp_h; j++) {
+        uint sz = mask_sizes[j];
+        if (sz == 0u) sz = 1u;
+        mask_all_combos_h *= (ulong)sz;
+    }
+    if (mask_all_combos_h == 0u) mask_all_combos_h = 1u;
     ushort mdig[32];
     for (uint i = 0u; i < 32u; i++) mdig[i] = 0u;
 #endif
@@ -555,7 +587,9 @@ kernel void template_phase0(
              * and/or mask expansion. Cost = wlen bytes per (rule, mask)
              * tuple — typically 6-20 bytes (rockyou word length); the
              * rule walker + MD5 finalize dwarf this. */
-            int wlen = wlen_orig;
+            /* -E: stage the LOCAL PART only; the rule, the no-op test and the
+             * mask block all act on it, and the domain is appended below. */
+            int wlen = hlen_orig;
             for (int i = 0; i < wlen; i++) buf[i] = words[wpos + i];
 
 #ifdef GPU_TEMPLATE_HAS_RULES
@@ -629,11 +663,76 @@ kernel void template_phase0(
             int new_len = wlen;
 #endif
 
+
+            /* -a dot axis (plan sections 5 and 15), the Metal twin of the
+             * block in gpu_template.cl.  The dot sweep is the OUTERMOST digit
+             * of the mask axis: divide the absolute mask index by the product
+             * of the position sizes and what remains IS the dot bitmask.  The
+             * odometer below is unaffected, because it carries the position
+             * digits only and wraps every _dcomb candidates --
+             * which is exactly the remainder the OpenCL arm takes explicitly.
+             *
+             * SELF-GATING: with no dot radix multiplied in, the quotient is 0,
+             * the popcount is 0 and nothing is inserted, so a run without -a is
+             * bit-identical and needs no test.
+             *
+             * Bit x inserts a dot AFTER character x, matching the CPU
+             * (mdxfind.c) and the OpenCL kernel.  Inserted in place walking
+             * backwards -- reads from low indices, writes to higher ones -- so
+             * no scratch buffer is needed.
+             *
+             * new_len here is the LOCAL PART: the rule has run and the domain
+             * is appended only after this block, so the dots land inside the
+             * local exactly as the -E split requires. */
+            {
+#ifdef GPU_TEMPLATE_HAS_MASK
+                ulong _dcomb = mask_all_combos_h;
+#else
+                ulong _dcomb = 1u;   /* no positions: the whole index is dots */
+#endif
+                /* The LOCAL mask coordinate, not the absolute index.  The
+                 * absolute index carries mask_start and the per-word offset,
+                 * which belong to the POSITION digits; mixing them into the
+                 * dot bitmask broke every GPU mask run on the OpenCL twin
+                 * (200 known answers -> 0) before it was caught.  The host
+                 * multiplies the dot radix into mask_size, and
+                 * mask_idx_local is the coordinate on that axis, so the local
+                 * value decomposes as dot * _dcomb + position_index. */
+                /* No guard on _dcomb: it is an empty product of 1 when there
+                 * are no mask positions, which is the -a-with-no--n case, so
+                 * a `> 1` test would zero the dot digit for the only
+                 * configuration that needs it.  It can never be 0. */
+                ulong _dot = (ulong)mask_idx_local / _dcomb;
+                if (_dot != 0u && new_len > 0) {
+                    /* Bounded by WOFF_DOT_WIDTH_MAX: new_len reaches 40960 and
+                     * a 1-shift past 63 is undefined.  The cap equals the
+                     * CPU's EMAIL_DOT_WIDTH_MAX, so the device sweeps the same
+                     * positions the CPU does, which is the whole content of
+                     * GPU == CPU here. */
+                    int _dw = new_len;
+                    if (_dw > (int)WOFF_DOT_WIDTH_MAX)
+                        _dw = (int)WOFF_DOT_WIDTH_MAX;
+                    int _nd = 0;
+                    for (int i = 0; i < _dw; i++)
+                        if (_dot & (1ul << (uint)i)) _nd++;
+                    if (_nd > 0 && (uint)(new_len + _nd) <= RULE_BUF_LIMIT) {
+                        int j = new_len + _nd - 1;
+                        for (int i = new_len - 1; i >= 0; i--) {
+                            if (i < _dw && (_dot & (1ul << (uint)i)))
+                                buf[j--] = '.';
+                            buf[j--] = buf[i];
+                        }
+                        new_len += _nd;
+                    }
+                }
+            }
+
 #ifdef GPU_TEMPLATE_HAS_MASK
             /* Phase 2b row 1 mask: decompose mask_idx into prepend+append
              * per-position indices and modify buf in-place. Mirrors
              * gpu_template.cl lines 405-531. Steps 1-4 identical to
              * pre-task-#250 layout — only address space of `buf` changes. */
+
             uint npre = mask_npre_h;
             uint napp = mask_napp_h;
 
@@ -726,6 +825,22 @@ kernel void template_phase0(
                 }
             }
 #endif
+
+            /* -E / -a: rejoin the domain, the LAST step before the hash, for
+             * the same reason the CPU path rejoins at the key-axis seam -- the
+             * rule, the no-op test and the mask block have all acted on the
+             * local part alone.  Bytes come straight out of `words`, which
+             * still holds the whole address; only the staging above was
+             * narrowed.  tlen_orig is 0 for every untagged word, so this is one
+             * path and not two.  OpenCL twin gpu_template.cl. */
+            if (tlen_orig > 0) {
+                uint tail_end = (uint)new_len + (uint)tlen_orig;
+                if (tail_end <= RULE_BUF_LIMIT) {
+                    for (int i = 0; i < tlen_orig; i++)
+                        buf[new_len + i] = words[wpos + hlen_orig + i];
+                    new_len = (int)tail_end;
+                }
+            }
 
             /* Phase 2c salt-inner loop. With HAS_SALT undef this loop
              * collapses to a single iteration (salt_count==1, salt_local

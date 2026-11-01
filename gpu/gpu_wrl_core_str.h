@@ -1,13 +1,13 @@
 /* Auto-generated from gpu_wrl_core.cl -- do not edit */
 static const char gpu_wrl_core_str[] =
     "/*\n"
-    " * $Revision: 1.3 $\n"
-    " * $Log: gpu_wrl_core.cl,v $\n"
+    " * $Revisio" "n: 1.3 $\n"
+    " * $Lo" "g: gpu_wrl_core.cl,v $\n"
     " * Revision 1.3  2026/08/10 14:50:25  dlr\n"
     " * Remove duplicate WRL_RC, WRL_SBOX and WRL_OP definitions. gpu_common.cl rev 1.28 lifted the wrl_block primitive in from librhash for the WRLMD5PASS family helper and supplies all three; this file is only ever concatenated after gpu_common.cl in gpu_opencl_template_compile_wrl, so the second copy made every WRL template build fail with CL_BUILD_PROGRAM_FAILURE, redefinition of WRL_RC and WRL_SBOX. The effect was not merely loss of GPU acceleration: resolve_kernel returned NULL and the work was never re-routed to CPU, so WRL found zero hashes on any OpenCL device from 2026-05-27 onward while the run exited normally. Tables verified value-identical, 10 of 10 round constants and 2048 of 2048 S-box entries; the two WRL_OP bodies differ only in parenthesisation of the src argument, immaterial at the K[m] and state[m] call sites. Header note corrected: it reasoned only about gpu_wrlunsalted.cl being a separate cl_program and overlooked gpu_common.cl being in the same one. Validated on fpga GTX 1080 at iter 1 and iter 3, GPU and CPU byte-identical, 15 of 15.\n"
     " *\n"
     " * Revision 1.2  2026/05/11 05:22:02  dlr\n"
-    " * Backfill $Revision/$Log RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revision/$Log keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.\n"
+    " * Backfill $Revisio" "n/$Lo" "g RCS keyword stanzas per feedback_rcs_keyword_stanzas.md. Passive 4-line comment block at top of file; no behavioral change. Hand-authored .cl file was missing required stanzas (per memory: all hand-authored .c/.h/.cl/.frag/.tmpl/.py/.sh files MUST contain $Revisio" "n/$Lo" "g keyword stanzas). Build green on .205 against the post-add files; OpenCL compile strips comments so no kernel behavior change.\n"
     " *\n"
     " */\n"
     "/* gpu_wrl_core.cl — Whirlpool (WRL, -m e5) algorithm extension functions\n"

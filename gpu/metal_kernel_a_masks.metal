@@ -182,7 +182,7 @@ void cand_masks_phase0(device uchar         *payload                    [[buffer
     uint pkt_off = 132u + (n_words * 4u);
     device const uchar  *words = payload + pkt_off;
 
-    uint wpos = word_offset[word_idx];
+    uint wpos = WOFF_OFF(word_offset[word_idx]);
     uint wlen = (uint)words[wpos++];
 
     uint final_len = (uint)prelen + wlen + (uint)applen;

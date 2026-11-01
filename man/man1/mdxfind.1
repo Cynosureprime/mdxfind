@@ -1,8 +1,17 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.16 $
+.\" $Revision: 1.19 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.19  2026/11/01 05:46:42  dlr
+.\" Bring the .TH version field up to the tool revision it documents. The field carries the TOOL version, not this pages revision -- mdsplit.1 1.3 says mdsplit 1.30 -- and it read mdxfind 1.606 against a tool at 1.654, so the footer of the page shipped in a v1.654 release would have named a revision 48 behind. Date advanced to the day the page was last changed.
+.\"
+.\" Revision 1.18  2026/11/01 05:16:39  dlr
+.\" Document -a in full: the dot sweep that generates every dotting of the dotless local part, the exponential cost with the 24-position cap whose reached-count the end-of-run summary reports, the emailprep ordering precondition measured at 246 batches and 2.3s ordered against 2,000,719 batches and 130s interleaved, and the two one-shot warnings on a dotted local part and on a decrease in local-part length. Correct the -E entry: -a accepts -E alongside it and nothing changes, because -a already splits at the first @ and preserves the domain, replacing the claim that the two cannot presently be combined. Document the second use of -k: over a list of email local parts a key file of @domain lines makes the domain an axis, which needs no -E because a key is appended after the rules and masks have run, and is GPU-served for key lists of 1 to 16; under -E with domains already in the word the key lands after the rejoined domain instead. Add emailprep to SEE ALSO.
+.\"
+.\" Revision 1.17  2026/10/31 15:26:30  dlr
+.\" Document mdxfind -E: rules, masks and the key axis apply to the local part of an email address, the domain is rejoined afterwards and preserved byte for byte including under -8, rule length predicates therefore measure the local part, and -E cannot append a domain to mask-generated text since -n appends to each wordlist candidate -- -k is the tool for a fixed suffix. Notes that procrule spells it the same way and that it cannot presently be combined with -a.
+.\"
 .\" Revision 1.16  2026/10/26 13:21:44  dlr
 .\" Drop the paragraph narrating what -m 4510 -s saltfile did before 1.640. A man page states current behaviour; the surrounding paragraphs already say what the four dual-channel modes do now, and the removed text documented only what was. Waffle, 2026-10-26: we document what is, not what was.
 .\"
@@ -55,7 +64,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-09-27" "mdxfind 1.606" "Password Recovery"
+.TH MDXFIND 1 "2026-10-31" "mdxfind 1.654" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS
@@ -576,6 +585,38 @@ Load keys (suffixes) from
 Lines wrapped in
 .BI $HEX[ ... ]
 are decoded.  Each key is truncated to 255 bytes.
+.IP
+Over a list of email local parts, a key file of
+.BI @ domain
+lines makes the domain an axis.  With no
+.B @
+in the word, every local part is tried against every domain, which explores a
+set of new or previously unused domains without building the cross product on
+disk first.
+.B \-E
+is not needed for this: a key is appended after the rules and masks have run, so
+there is no domain for them to reach.  Rule
+.B u
+over
+.B fred
+with the key
+.B @proton.me
+gives
+.BR FRED@proton.me ,
+and
+.B \-n
+lands before the domain in the same way.  The GPU serves key lists of 1 to 16;
+a longer list is computed correctly but entirely on the CPU.
+.IP
+Under
+.B \-E
+with domains already in the word, the key lands after the rejoined domain
+instead, so
+.B fred@gmail.com
+with the key
+.B 1
+gives
+.BR fred@gmail.com1 .
 .TP
 .BI \-x " file"
 As
@@ -741,7 +782,94 @@ and
 compose, and the combined keyspace is their product.
 .TP
 .B \-a
-Email address munging.
+Sweep every dotting of an email address's
+.IR "local part" .
+Gmail and googlemail ignore dots in the local part, so
+.BR f.r.ed@gmail.com ,
+.B fred@gmail.com
+and
+.B fr.ed@gmail.com
+are one account, and a leak may store any one of those spellings.
+.B \-a
+strips the dots from the local part and then generates every placement of dots
+across what remains, rejoining the domain as
+.B \-E
+does.
+.IP
+The cost is exponential in the dotless length, because a dot may follow each
+character: a local part of 10 characters yields 1,024 candidates, one of 14
+yields 16,384, and one of 20 yields 1,048,576.  The sweep is capped at 24
+positions, so a longer local part is swept to 24 and its remaining positions are
+not tried.  The end-of-run summary counts the words that reached the cap,
+because a partial sweep is otherwise indistinguishable from a complete one.
+.IP
+Order the input with
+.BR emailprep (1)
+first.  This is a correctness and throughput precondition, not a tuning step.
+GPU work is batched by the
+.I dotless
+local-part length, so every change of that length dispatches the batch early.
+Four million words of two widths took 246 batches and 2.3 seconds when ordered,
+against 2,000,719 batches and 130 seconds with the same widths interleaved.
+Sorting by whole line length looks right and is not, because line length and
+dotless length stop agreeing as soon as any local part carries a dot.
+.IP
+mdxfind reports that condition rather than leaving it to be inferred from the
+rate.  The first dotted local part reaching the GPU, and the first decrease in
+local-part length, each produce one warning naming
+.BR emailprep .
+An increase is normal at a length boundary; a decrease cannot occur in a
+correctly ordered list.
+.TP
+.B \-E
+Treat each word as an email address and apply
+.BR \-r ,
+.BR \-n ,
+.B \-N
+and the key axis to its
+.I local part
+only \(em the text before the first
+.B @
+\(em rejoining the domain onto every candidate afterwards.  A word containing no
+.B @
+is unaffected, so a mixed wordlist needs no separation.
+.IP
+The domain is preserved byte for byte.  It is never case-folded, normalized or
+re-encoded, including under
+.BR \-8 ,
+where only the local part is converted to UTF\-32; a domain that is not valid
+UTF\-8 survives unchanged rather than causing the candidate to be dropped.
+.IP
+Rule length predicates therefore measure the
+.IR "local part" :
+.BR >N ,
+.BR <N ,
+.B _N
+and
+.B 'N
+all test the text before the
+.BR @ ,
+not the whole address.
+.IP
+.B \-E
+cannot append a domain to mask-generated text, because
+.B \-n
+appends to each wordlist candidate and so the
+.B @
+must arrive in the word.  Use
+.B \-k
+to supply the domain instead.
+.BR procrule (1)
+spells this option the same way, so a candidate stream generated there and piped
+here means the same thing.
+.B \-a
+accepts
+.B \-E
+alongside it and nothing changes, because
+.B \-a
+already splits at the first
+.B @
+and preserves the domain itself.
 .TP
 .B \-b
 Expand each word into Unicode, best effort.
@@ -1394,6 +1522,7 @@ is the only way to guarantee CPU-exact output.  See
 .BR rules32 (7),
 .BR rling (1),
 .BR getpass (1),
+.BR emailprep (1),
 .BR hx (1)
 .PP
 The mm-macro reference manual for

@@ -1119,8 +1119,13 @@ U32_SI int u32_pick_engine(uint wclass, int u32_can, int byte_can)
 /* Per-word class values live in gpu_u32_walker.inc beside u32_pick_engine,
  * which is the only thing that interprets them. */
 
-#define U32_OFF_MASK  0x3fffffffu
-#define U32_TAG_SHIFT 30
+/* Derived from the ONE definition in gpu_common.cl / metal_common.metal, which
+ * every program includes.  These were 0x3fffffffu and 30 -- a 30-bit offset
+ * field -- and narrowing the offset to 22 bits to make room for head_len has to
+ * happen in one place or the two disagree silently.  Kept as aliases rather
+ * than deleted so the walker's own call sites read unchanged. */
+#define U32_OFF_MASK  WOFF_OFF_MASK
+#define U32_TAG_SHIFT WOFF_CLASS_SHIFT
 
 /* U32_OUT_BYTES (the encoder's worst case, 4 UTF-8 bytes per codepoint) and
  * U32_SLOT_BYTES are defined ONCE, at the top of this file beside

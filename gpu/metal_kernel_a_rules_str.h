@@ -1370,7 +1370,7 @@ static const char metal_kernel_a_rules_str[] =
     "    /* Private buffer (16-byte aligned, matches md5_rules_phase0). */\n"
     "    __attribute__((aligned(16))) uchar buf[KA_BUF_BYTES];\n"
     "\n"
-    "    uint wpos = word_offset[word_idx];\n"
+    "    uint wpos = WOFF_OFF(word_offset[word_idx]);\n"
     "    int wlen = (int)words[wpos] | ((int)words[wpos + 1] << 8);\n"
     "    wpos += 2;   /* 2-byte little-endian length: see gpujob.h */\n"
     "    if (wlen > RULE_BUF_LIMIT) wlen = RULE_BUF_LIMIT;\n"
