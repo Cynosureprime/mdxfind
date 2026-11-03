@@ -486,6 +486,14 @@ struct gpu_device {
      * HASH_BLOCK_BYTES=64). */
     cl_program prog_template_sql5;
     cl_kernel  kern_template_phase0_sql5;
+    /* MD5SHA256 (e179, JOB_MD5SHA256=179): md5(hex64(sha256(p))), then
+     * iterated MD5 on the 32-byte hex of the previous MD5.  The x01 MD5
+     * message is exactly 64 bytes, so it takes TWO md5 blocks -- see the
+     * header of gpu_md5sha256_core.cl.  defines_str matches plain MD5
+     * (HASH_WORDS=4, HASH_BLOCK_BYTES=64); the cache entry is distinct by
+     * source-text hash. */
+    cl_program prog_template_md5sha256;
+    cl_kernel  kern_template_phase0_md5sha256;
     /* Memo B Phase B6.11 (2026-05-06): SHA1DRU (Drupal SHA1, hashcat -m 7900,
      * JOB_SHA1DRU=404). First 1M-iteration algorithm on the unified template
      * path. Algorithm: SHA1(pass) followed by 1,000,000 iterations of
@@ -2028,6 +2036,10 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
  * with UPPERCASE-hex feedback in the iter step. Per-algo template_state
  * holds two SHA1 chains. CPU reference at mdxfind.c JOB_SQL5 (line 25301). */
 #include "gpu_sql5_core_str.h"
+/* MD5SHA256 (e179): SHA-256 of the candidate, hex-encoded to 64 ASCII
+ * bytes, then iterated MD5.  SHA-256 is applied ONCE, at x01; the iter
+ * step is MD5-only.  CPU reference at mdxfind.c `case JOB_MD5SHA256`. */
+#include "gpu_md5sha256_core_str.h"
 /* Memo B Phase B6.11 (2026-05-06): SHA1DRU (Drupal SHA1, hashcat -m 7900).
  * First 1M-iteration algorithm on the unified template path. SHA1(pass) +
  * 1M iters of SHA1(hex_lc(state) || pass); ONE probe at the final state.
@@ -7432,6 +7444,62 @@ static int gpu_opencl_template_kernel_lazy_sql5(struct gpu_device *d, int dev_id
 }
 
 /* ----------------------------------------------------------------------
+ * MD5SHA256 (e179, JOB_MD5SHA256=179): md5(hex64(sha256(p)))
+ *
+ * Composite core: one SHA-256 then a TWO-BLOCK MD5, because the hex of a
+ * SHA-256 is exactly 64 bytes and fills an MD5 block completely.  The -i
+ * loop re-hashes the 32-byte hex of the previous MD5 and never touches
+ * SHA-256 again, so the per-lane state is the MD5 chain alone.
+ *
+ * Cache key (R3): defines_str = "HASH_WORDS=4,HASH_BLOCK_BYTES=64" -- the
+ * same two axes as MD5 / MD5RAW; the distinct cache entry comes from the
+ * source-text hash (the sha256 pre-pass and the two-block finalize are
+ * unique to this core).
+ * ---------------------------------------------------------------------- */
+
+static int gpu_opencl_template_compile_md5sha256(struct gpu_device *d, int dev_idx) {
+    if (d->prog_template_md5sha256) return 0;
+    cl_int err = CL_SUCCESS;
+    const char *sources[6];
+    cl_uint nsrc = gpu_template_sources(sources, gpu_md5sha256_core_str);
+    const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
+    d->prog_template_md5sha256 = gpu_kernel_cache_build_program_ex(
+        d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
+    if (!d->prog_template_md5sha256 || err != CL_SUCCESS) {
+        char log[8192] = {0};
+        if (d->prog_template_md5sha256) {
+            clGetProgramBuildInfo(d->prog_template_md5sha256, d->dev,
+                                  CL_PROGRAM_BUILD_LOG,
+                                  sizeof(log) - 1, log, NULL);
+        }
+        fprintf(stderr,
+            "OpenCL GPU[%d]: MD5SHA256 template program build error (err=%d) "
+            "-- MD5SHA256 template path unavailable:\n%s\n", dev_idx, err, log);
+        if (d->prog_template_md5sha256) clReleaseProgram(d->prog_template_md5sha256);
+        d->prog_template_md5sha256 = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int gpu_opencl_template_kernel_lazy_md5sha256(struct gpu_device *d, int dev_idx) {
+    if (d->kern_template_phase0_md5sha256) return 0;
+    if (!d->prog_template_md5sha256) return -1;
+    cl_int err;
+    d->kern_template_phase0_md5sha256 = clCreateKernel(d->prog_template_md5sha256,
+                                                       "template_phase0", &err);
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5sha256) {
+        fprintf(stderr,
+            "OpenCL GPU[%d]: template_phase0 (MD5SHA256) kernel create failed "
+            "(err=%d) -- MD5SHA256 template path unavailable\n", dev_idx, err);
+        d->kern_template_phase0_md5sha256 = NULL;
+        return -1;
+    }
+    tpl_kernel_report(d->kern_template_phase0_md5sha256, d->dev, dev_idx, "md5sha256");
+    return 0;
+}
+
+/* ----------------------------------------------------------------------
  * Memo B Phase B6.11 (2026-05-06): SHA1DRU (Drupal SHA1, hashcat -m 7900,
  * JOB_SHA1DRU=404)
  *
@@ -9910,6 +9978,12 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
             if (gpu_opencl_template_compile_sql5(d, dev_idx) == 0 &&
                 gpu_opencl_template_kernel_lazy_sql5(d, dev_idx) == 0)
                 return d->kern_template_phase0_sql5;
+            break;
+        /* MD5SHA256 (e179): sha256 pre-pass + two-block MD5 finalize. */
+        case JOB_MD5SHA256:
+            if (gpu_opencl_template_compile_md5sha256(d, dev_idx) == 0 &&
+                gpu_opencl_template_kernel_lazy_md5sha256(d, dev_idx) == 0)
+                return d->kern_template_phase0_md5sha256;
             break;
         /* B6.11 SHA1DRU (2026-05-06): Drupal SHA1; first 1M-iter algo on
          * template path. 1M loop in template_finalize; max_iter=1 forced. */
@@ -14558,6 +14632,15 @@ int gpu_opencl_op_supported(int op)
         op != JOB_MD5RAW && op != JOB_SHA1RAW && op != JOB_SHA256RAW &&
         /* B5 sub-batch 6 Tier C (2026-05-03): SQL5. */
         op != JOB_SQL5 &&
+        /* MD5SHA256 (e179): md5(hex64(sha256(p))) with MD5-only iteration.
+         * Composite core, sha256 pre-pass plus a TWO-BLOCK md5 finalize
+         * (gpu_md5sha256_core.cl). Unsalted, so the dispatch geometry is
+         * the MD5 one and nothing else here changes. This entry is the
+         * load-bearing one: without it the dispatch refuses op=179 at the
+         * gate above BEFORE gpu_template_resolve_kernel runs, the words
+         * are not walked by the CPU either, and the run reports 0 hits and
+         * exit 0 -- the e812 failure this function's header describes. */
+        op != JOB_MD5SHA256 &&
         /* B6.11 (2026-05-06): SHA1DRU — Drupal SHA1, first 1M-iter algo on
          * template path. 1M loop runs INSIDE template_finalize; max_iter=1
          * forced at the dispatch params site. */

@@ -169,6 +169,9 @@ extern char *prmd5(unsigned char *md5, char *out, int len);
  * pause flags, salt globals, etc.). Phase 2a's worker only needs the
  * unsalted + rules-engine subset; we extern just what we touch. */
 extern int Printall;
+/* -C: see the note in gpu/gpujob_opencl.c.  Mirrored here because the Metal
+ * path has its own MTL_PV_DEC and its own match_flags gates. */
+extern int Contfound;
 extern int Maxiter;
 extern volatile int MDXpause;
 extern volatile int MDXpaused_count;
@@ -570,6 +573,12 @@ static int metal_gpu_hash_words(int op)
     case JOB_MD4:
     case JOB_MD5RAW:
     case JOB_MD4UTF16:
+    /* e179 MD5SHA256: the DIGEST is an MD5, 4 uint32.  The interior
+     * SHA-256 is 8 words wide but never leaves template_finalize, so it
+     * has no bearing on the hit-replay width.  Listed explicitly per
+     * feedback_metal_hash_words_width_helper.md rather than relying on
+     * the default arm. */
+    case JOB_MD5SHA256:
     case JOB_MD5SALT:
     case JOB_MD5PASSSALT:
     case JOB_MD5SALTPASS:
@@ -667,11 +676,11 @@ extern int     gpu_rules_engine_active;
  * was the one that took PV from 1 to 0 (this salt just retired);
  * 0 otherwise (PV already 0, or still >0 after DEC). Race-correct:
  * only the winning CAS sees _old == 1 in the success branch. */
-#define MTL_PV_DEC(pv) ({ unsigned long _old = *(pv); int _retired = 0; \
+#define MTL_PV_DEC(pv) ({ int _retired = 0; if (!Contfound) { unsigned long _old = *(pv); \
   while (_old > 0) { \
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { \
       _retired = (_old == 1); break; } \
-    _old = *(pv); } _retired; })
+    _old = *(pv); } } _retired; })
 
 /* struct saltentry mirror. The original lives in mdxfind.c at line 2763;
  * gpu/gpujob_opencl.c carries a redeclaration at line 270 (same layout
@@ -2637,7 +2646,7 @@ static void gpujob_metal_worker(void *arg) {
                                 int hf = hybrid_check((const unsigned char *)curin.h,
                                                       16,
                                                       &match_len, &match_flags);
-                                if (hf && *match_flags != (unsigned short)g->op) {
+                                if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
                                     *match_flags = g->op;
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
@@ -2684,7 +2693,7 @@ static void gpujob_metal_worker(void *arg) {
                                 int hf = hybrid_check((const unsigned char *)curin.h,
                                                       32,
                                                       &match_len, &match_flags);
-                                if (hf && *match_flags != (unsigned short)g->op) {
+                                if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
                                     *match_flags = g->op;
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
@@ -2746,7 +2755,7 @@ static void gpujob_metal_worker(void *arg) {
                                 int hf = hybrid_check((const unsigned char *)curin.h,
                                                       64,
                                                       &match_len, &match_flags);
-                                if (hf && *match_flags != (unsigned short)g->op) {
+                                if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
                                     *match_flags = g->op;
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;

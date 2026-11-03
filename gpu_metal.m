@@ -160,6 +160,7 @@ extern int EmailLocal;
 #include "gpu/metal_md4_core_str.h"      /* Phase 2d.2.1b md4 core */
 #include "gpu/metal_md4utf16_core_str.h" /* Phase 2d.2.2 md4utf16 core */
 #include "gpu/metal_sql5_core_str.h" /* e259 SQL5 Metal twin */
+#include "gpu/metal_md5sha256_core_str.h" /* e179 MD5SHA256 Metal twin */
 #include "gpu/metal_ntlmh_core_str.h" /* e786 NTLMH; needs the ALT_DIGEST template hook */
 #include "gpu/metal_ripemd160saltpass_core_str.h" /* HMAC-RMD160-KPASS carrier e798 */
 #include "gpu/metal_ripemd320saltpass_core_str.h" /* HMAC-RMD320-KPASS carrier e799 */
@@ -3187,6 +3188,33 @@ static struct gpu_metal_family metal_family_sql5 = {
     .pso_for_variant_v2 = metal_pso_for_variant_default,
 };
 
+/* e179 MD5SHA256 -- md5(hex64(sha256(p))), then iterated MD5 on the
+ * 32-byte hex of the previous round.  UNSALTED, 4-word digest, so none of
+ * the salted widening applies and the default PSO resolver serves it.
+ *
+ * The one thing about this op that is not like plain MD5: its x01 MD5
+ * message is exactly 64 bytes and therefore takes TWO md5 blocks.  That
+ * lives entirely inside metal_md5sha256_core.metal's template_finalize --
+ * the host side has nothing to do with it.  See the header of
+ * gpu/gpu_md5sha256_core.cl for why getting it wrong would be silent.
+ *
+ * Registering a family is what gives the op a non-NONE gpu_op_category
+ * (gpu/gpujob_metal.m derives the category from the family), so this
+ * struct plus the two init lines below plus the register call are the
+ * whole Metal host wiring. */
+static struct gpu_metal_family metal_family_md5sha256 = {
+    .op                 = JOB_MD5SHA256,
+    .name               = "md5sha256",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_NONE)
+                          | VBIT(V_R)
+                          | VBIT(V_M)
+                          | VBIT(V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = metal_pso_for_variant_default,
+};
+
 /* e786 NTLMH -- re-registered 2026-09-16 now that metal_template.metal has the
  * GPU_TEMPLATE_HAS_ALT_DIGEST hook.  The core always computed BOTH digests
  * (st.h zero-extend, st.ha real UTF-16LE) and declared the hook at :112, but
@@ -4495,6 +4523,12 @@ static void metal_register_builtin_families(void)
         @"HASH_BLOCK_BYTES": @64,
         @"BASE_ALGO":        @"sql5"
     });
+    metal_family_md5sha256.core_str    = metal_md5sha256_core_str;
+    metal_family_md5sha256.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @4,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"md5sha256"
+    });
     metal_family_ntlmh.core_str    = metal_ntlmh_core_str;
     metal_family_ntlmh.base_macros = (void *)CFBridgingRetain(@{
         @"HASH_WORDS":       @4,
@@ -4937,6 +4971,7 @@ static void metal_register_builtin_families(void)
     gpu_metal_register_family(&metal_family_md4);
     gpu_metal_register_family(&metal_family_md4utf16);
     gpu_metal_register_family(&metal_family_sql5);  /* e259 */
+    gpu_metal_register_family(&metal_family_md5sha256);  /* e179 */
     gpu_metal_register_family(&metal_family_ntlmh);  /* e786 */
     gpu_metal_register_family(&metal_family_md5ucsalt);  /* e350 */
     gpu_metal_register_family(&metal_family_md5revmd5salt);  /* e541 */

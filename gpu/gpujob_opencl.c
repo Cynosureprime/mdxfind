@@ -321,11 +321,11 @@ extern uint64_t gpu_mask_total;
  * one that took PV from 1 to 0 (this salt just retired); 0 otherwise
  * (PV already 0, or still >0 after DEC). Race-correct: only the winning
  * CAS sees _old == 1 in the success branch. Mirrors gpujob_metal.m. */
-#define PV_DEC(pv) ({ unsigned long _old = *(pv); int _retired = 0; \
+#define PV_DEC(pv) ({ int _retired = 0; if (!Contfound) { unsigned long _old = *(pv); \
   while (_old > 0) { \
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { \
       _retired = (_old == 1); break; } \
-    _old = *(pv); } _retired; })
+    _old = *(pv); } } _retired; })
 
 struct saltentry {
     char *salt;
@@ -337,6 +337,11 @@ struct saltentry {
 };
 
 extern unsigned char i64hex[];  /* base64url decode table from mdxfind.c */
+/* -C: keep reporting a hash that is already solved.  Defined in mdxfind.c.
+ * The device path carries its OWN copies of both suppressors -- the macro
+ * below and the match_flags gates -- so leaving it out here would make -C
+ * work on the CPU and quietly do nothing for any GPU-dispatched type. */
+extern int Contfound;
 
 /* gpu_compute_iter_sum: compute the total internal iterations across all
  * packed salts for GPU Tothash accounting. For iterated hash types each
@@ -3149,7 +3154,7 @@ void gpujob(void *arg) {
                                     int match_len; unsigned short *match_flags;
                                     int hf = hybrid_check(curin.h, 16,
                                                           &match_len, &match_flags);
-                                    if (hf && *match_flags != (unsigned short)g->op) {
+                                    if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
                                         *match_flags = g->op;
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
@@ -3188,7 +3193,7 @@ void gpujob(void *arg) {
                                     int match_len; unsigned short *match_flags;
                                     int hf = hybrid_check(curin.h, 32,
                                                           &match_len, &match_flags);
-                                    if (hf && *match_flags != (unsigned short)g->op) {
+                                    if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
                                         *match_flags = g->op;
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
@@ -3285,7 +3290,7 @@ void gpujob(void *arg) {
                                     int match_len; unsigned short *match_flags;
                                     int hf = hybrid_check(curin.h, 64,
                                                           &match_len, &match_flags);
-                                    if (hf && *match_flags != (unsigned short)g->op) {
+                                    if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
                                         *match_flags = g->op;
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
@@ -4569,6 +4574,10 @@ int gpu_op_category(int op) {
     case JOB_KECCAK224: case JOB_KECCAK256: case JOB_KECCAK384: case JOB_KECCAK512:
     case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
     case JOB_SQL5: case JOB_SHA1RAW: case JOB_MD5RAW:
+    /* MD5SHA256 (e179): md5(hex64(sha256(p))) with MD5-only iteration.
+     * Unsalted, 4-word digest, so it rides the same GPU_CAT_MASK path as
+     * MD5 / MD5RAW; only the finalize differs (gpu_md5sha256_core.cl). */
+    case JOB_MD5SHA256:
     /* B6.11 (2026-05-06): JOB_SHA1DRU joins as first 1M-iter algo on the
      * unified template path. 1M loop runs INSIDE template_finalize
      * (gpu_sha1dru_core.cl); host forces params.max_iter=1 so kernel's
@@ -4999,6 +5008,10 @@ int gpu_op_family(int op) {
         return FAM_MD4UNSALTED;
     case JOB_SHA1: case JOB_SHA1RAW: case JOB_SQL5:
         return FAM_SHA1UNSALTED;
+    /* MD5SHA256 (e179): the DIGEST is an MD5, which is what this family
+     * tag describes -- the SHA-256 is an interior stage, not the output. */
+    case JOB_MD5SHA256:
+        return FAM_MD5UNSALTED;
     case JOB_SHA224: case JOB_SHA256: case JOB_SHA256RAW:
         return FAM_SHA256UNSALTED;
     case JOB_SHA384: case JOB_SHA384RAW:

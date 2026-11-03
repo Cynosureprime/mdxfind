@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.654 2026/11/01 04:43:39 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.656 2026/11/03 18:26:39 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.654 2026/11/01 04:43:39 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.656 2026/11/03 18:26:39 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,26 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.656  2026/11/03 18:26:39  dlr
+ * Admit e179 MD5SHA256 to the GPU. Three sites: the gpu_rules_engine_active chokepoint OR-chain, the gpu_ops table which drives both the need_gpu activation set and the GPU tag on the type listing, and the FAM_MD5UNSALTED family bitmask. The type is md5 of the 64-byte lowercase hex of sha256 of the candidate, then iterated MD5 over the 32-byte hex of the previous round: SHA-256 is applied once at x01 inside template_finalize and the iter step is MD5-only, which is why the device template_iterate is byte-identical to the plain MD5 core, the CPU reaching the same MDstart loop by goto. New cores gpu/gpu_md5sha256_core.cl 1.1 and gpu/metal_md5sha256_core.metal 1.1 with overlay gpu/codegen/cl2metal_overrides/md5sha256.yaml 1.1; host wiring in gpu/gpu_opencl.c 1.230, gpu/gpujob_opencl.c 1.180, gpu/gpujob_metal.m 1.65 and gpu_metal.m 1.151. Validated byte-exact CPU versus GPU at iter 1 and iter 3 on fpga GTX 1080 OpenCL and dev1 M1 Metal, 11 of 11 known answers each covering the 55, 56, 63, 64 and 65-byte candidate boundaries and the empty string, with the device line reporting the hits; the UTF-32 acceptance fixture passes on both backends. Seven other GPU types re-checked CPU-identical on the same binary. Rates measured 428.6 Mh per second on the GTX 1080 and 1.06 Gh per second on an RTX 4070 Ti SUPER against 31.1 Mh per second on CPU, a 34x device speedup on the faster card. bench_rates.h line 183 still carries the CPU rate of 1224707 for this type and now understates the device throughput by three orders of magnitude.
+ *
+ * Revision 1.655  2026/11/01 13:47:14  dlr
+ * Add -C: continue reporting a hash that is already solved, so every candidate matching it is reported rather than only the first. Requested for a user-defined type whose stored digest is TRUNCATED -- u8888, a partial md5 -- where many plaintexts legitimately share one stored value and reporting one of them discards the rest.
+ *
+ * TWO things suppress a repeat and only widening the first would have produced a quiet half-fix. The solved gates test *PV == 0, and 102 of them are widened to admit a matched-but-solved hash. Salt RETIREMENT is the other: a refcount reaching zero drops that salt from the next snapshot and then trips TYPEDONE, so output stops for a reason that has nothing to do with the gate and nothing reports it. Every such decrement goes through PV_DEC, so the guard is in the macro and covers all 309 call sites at once; the saltsnap removal tests and the bcrypt outstanding counter then fall into line for free, and build_salt_snapshot needs no change because refcounts never reach zero for it to filter on.
+ *
+ * The gate count is worth recording because I had it wrong. Anchoring on the Printall prefix finds 83 PV2 gates; there are 91. The extra eight are TACACS, krb5pa and VEEAM-VBK, which carry no Printall because they are structural-verify types with no -z generate path, and anchoring on that prefix would have skipped eight types silently. An assertion on the expected count caught it.
+ *
+ * Three things deliberately NOT touched, each of which a blanket edit breaks. Printall or *PV > 0 asks whether a salt or userid is LIVE, not whether a hash is solved. The loader JSLI followed by *PV == 0 means newly inserted, and admitting a solved entry there would re-malloc the stored line on every duplicate. And the IKE arm gates on a memcmp of the computed against the expected digest under the same if-not-Printall spelling: treating that as a suppression site manufactures false positives.
+ *
+ * Implies -v. Retiring the salt a hash was solved with would stop the very repeats this option exists to report.
+ *
+ * The device path carries its OWN copies of both suppressors, a private PV_DEC and its own three match_flags gates in each of gpu/gpujob_opencl.c and gpu/gpujob_metal.m, so -C would have worked on the CPU and done nothing at all for a GPU-dispatched type. Handled in those files in the same revision. Their macros are statement expressions returning whether the salt retired and the refresh counters read that, so the guarded form still yields 0 rather than nothing.
+ *
+ * Per-type counters now count REPORTED LINES and not distinct hashes, so the N TYPE hashes found summary no longer agrees with the hashes loaded. Stated in the usage text and in mdxfind.1, because the summary is a counter and has been misread as a label before.
+ *
+ * Verified. A user-defined type whose digest is the first 2 hex of md5, against a stored value of 5f: 1 line without -C and 80 with, and the 80 are byte-identical to the collision set computed independently in python rather than merely a larger number. md5 of password with the word twice in the list: 1 line then 2. No change without the flag, which is provable rather than sampled since Contfound zero reduces every edited expression to its original text, and measured anyway: 21 regress types A/B identical, 0 differing. e918 DCC2 differed on a first pass and is flaky in BOTH binaries, 1 fail of 4 on the released source and 2 of 4 here.
+ *
  * Revision 1.654  2026/11/01 04:43:39  dlr
  * The -a GPU cut-over drops to 5, and two one-shot alerts name the real hazard. The threshold at 14 tuned the wrong variable. Measured on fpga with UNIFORM-width synthetic lists, the device holds about 1.0e9 candidates per second flat from width 6 through 13 -- 8.4e8 at 6, 1.03e9 at 9, 9.8e8 at 11, 9.2e8 at 13 -- against a CPU doing about 5.8e7, so the device is roughly 17 times faster at EVERY width and there is no crossover to find. The two seconds of idle in those runs is fixed start-up, the same in all of them, not per-dispatch overhead. What destroys -a throughput is the batch KEY changing. Same four million words, same width range, same card: uniform width 6 ran 2.30s wall and 0.31s busy in 246 batches, while widths 5 or 6 at random ran 130.06s wall and 87.00s busy in 2,000,719 batches. Forty-four times slower, one batch per two words. That is the section 15.1 fragmentation case, and the cure is ordering by DOTLESS local length, which is what utils/emailprep produces. Waffles live run looked like a width problem because w1 was sorted by LINE length while 21.6 percent of its locals carry a dot: sampling one line-length band found dotless widths of 12, 11, 10, 9 and 8 interleaved, so the key changed about every fourth word. Re-prepared dotless, the same run now processes at 1 Gh per second. So: floor of 5 only as insurance against a pathological micro-sweep; a one-shot WARNING the first time a dotted local reaches the device, naming emailprep; and a one-shot per DIRECTION on a change of batch key while packing. The direction split is deliberate and was found by testing: a single flag fired on the first change, and with widths 10, 11, 10 that was the 10 to 11 INCREASE, reported as normal, so the 11 to 10 decrease -- the one that proves the list is misordered -- was never announced. An increase is normal at a length boundary; a decrease cannot happen in a correctly ordered list. The temporary MDXFIND_EMAIL_MIN_DOT_W environment knob added for the sweep is REMOVED, restoring the no-environment-knob rule; MDXFIND_CACHE is again the only environment input. Validated: regress-email-gpu 15 of 15 on fpga GTX 1080 and dev1 M1, regress-email 32 of 32 local, all three alert cases checked independently, source byte-identical on all three build hosts.
  *
@@ -5003,6 +5023,25 @@ static void blake2b_hash(unsigned char *out, size_t outlen,
 }
 
 int NoMarkSalt, Hexkey, Rotatehash, Unicode, Dedupe, XMLchar, Email, Printall;
+/* -C: keep reporting a hash that is already solved, so every candidate which
+ * matches it is reported rather than only the first.  Needed for any type
+ * whose stored digest is TRUNCATED -- a user-defined type declaring a short
+ * diglen_hex above all -- where many plaintexts legitimately share one stored
+ * value and reporting only one of them discards the rest.
+ *
+ * Two separate things suppress a repeat and both are disabled here.  The
+ * solved gates test *PV == 0 and are widened to admit a matched-but-solved
+ * hash.  Salt RETIREMENT is the other and is easy to miss: a salt refcount
+ * reaching zero drops that salt from the next snapshot and then trips
+ * TYPEDONE, so output would stop for a reason that has nothing to do with the
+ * gate.  Every one of those decrements goes through PV_DEC, so it is guarded
+ * there rather than at its 309 call sites.
+ *
+ * NOT touched: the `Printall || *PV > 0` sites, which ask whether a salt or
+ * userid is live rather than whether a hash is solved; the loader's
+ * `JSLI` followed by `*PV == 0`, which means newly inserted; and the -z
+ * bootstrap that seeds a default salt refcount. */
+int Contfound;
 /* -E: rules, masks and the key axis apply to the LOCAL PART of an email
  * address; the domain is rejoined once, immediately before the key axis.
  * Distinct from -a, which sweeps dot placements within the local part.
@@ -9540,10 +9579,10 @@ static inline char *typedone_ref(unsigned op) {
 #define TYPEOPT_NEEDPEPPER 128
 
 /* Atomic decrement of Judy PV refcount, with underflow guard */
-#define PV_DEC(pv) { Word_t _old = *(pv); \
+#define PV_DEC(pv) { if (!Contfound) { Word_t _old = *(pv); \
   while (_old > 0) { \
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) break; \
-    _old = *(pv); } }
+    _old = *(pv); } } }
 
 static unsigned short TypeOpts[JOB_DONE] = {
     [1] = TYPEOPT_NEEDSF,  /* MD5 */
@@ -12072,7 +12111,7 @@ struct Hashchain found;
             match_len = len / 2;
             hfound = 1;
           }
-          if (hfound && *match_flags != (unsigned short)job->op) {
+          if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
             hitcount++;
             *match_flags = job->op;
             key = fmt_saltfield(keybuf, key, keylen);
@@ -12137,7 +12176,7 @@ release(FreeWaiting);
         match_len = len / 2;
         hfound = 1;
       }
-      if (hfound && *match_flags != (unsigned short)job->op) {
+      if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
         hitcount++;
         *match_flags = job->op;
         key = fmt_saltfield(keybuf, key, keylen);
@@ -12469,7 +12508,7 @@ struct Hashchain found;
         match_len = len / 2;
         hfound = 1;
       }
-      if (hfound && *match_flags != (unsigned short)job->op) {
+      if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
           hitcount++;
           *match_flags = job->op;
           job->pass[job->clen] = 0;
@@ -12603,7 +12642,7 @@ dorot:
           match_len = len / 2;
           hfound = 1;
         }
-        if (hfound && *match_flags != (unsigned short)job->op) {
+        if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
           hitcount++;
           *match_flags = job->op;
           job->pass[job->clen] = 0;
@@ -12703,7 +12742,7 @@ struct Hashchain found;
             match_len = len / 2;
             hfound = 1;
           }
-          if (hfound && *match_flags != (unsigned short)job->op) {
+          if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
             hitcount++;
             *match_flags = job->op;
             saltbuf[saltlen] = 0;
@@ -12787,7 +12826,7 @@ release(FreeWaiting);
         match_len = len / 2;
         hfound = 1;
       }
-      if (hfound && *match_flags != (unsigned short)job->op) {
+      if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
         hitcount++;
         *match_flags = job->op;
         saltbuf[saltlen] = 0;
@@ -12892,7 +12931,7 @@ int checkhashsalt2(union HashU *curin, int len,
     match_len = len / 2;
     hfound = 1;
   }
-  if (hfound && *match_flags != (unsigned short)job->op) {
+  if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
     hitcount++;
     *match_flags = job->op;
     prmd5(curin->h, newbuf2, match_len * 2);
@@ -12989,7 +13028,7 @@ struct Hashchain found;
       match_flags = &found.flags;
       hfound = 1;
     }
-    if (hfound && *match_flags != (unsigned short)job->op) {
+    if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
       hitcount++;
       *match_flags = job->op;
 
@@ -14849,6 +14888,13 @@ while (1) {
           * SHA1(SHA1(p)) with UPPERCASE-hex iter feedback. Two SHA1 chains
           * in template_state. CPU reference at mdxfind.c JOB_SQL5 (line 25301). */
          job->op == JOB_SQL5 ||
+         /* MD5SHA256 (e179): md5(hex64(sha256(p))), then iterated MD5 on
+          * the 32-byte hex of the previous round.  SHA-256 runs once, at
+          * x01, inside template_finalize; template_iterate is MD5-only and
+          * byte-identical to plain MD5's, because the CPU reaches the same
+          * MDstart loop by `goto`.  CPU reference: mdxfind.c
+          * `case JOB_MD5SHA256`. */
+         job->op == JOB_MD5SHA256 ||
          /* B6.11 SHA1DRU fan-out (2026-05-06): SHA1DRU (Drupal SHA1, hashcat
           * -m 7900) — first 1M-iteration algorithm on the unified template
           * path. SHA1(pass) followed by 1,000,000 iterations of
@@ -17090,7 +17136,7 @@ do {
                     if (_fl > 0) {
                       Word_t *_FV;
                       JSLG(_FV, JUDYJ(job->op), (unsigned char *)_fb);
-                      if (Printall || (_FV && *_FV == 0)) {
+                      if (Printall || (_FV && (Contfound || *_FV == 0))) {
                         if (!Printall) *_FV = 1;
                         prfound(job, _fb);
                       }
@@ -17141,7 +17187,7 @@ do {
          * fixed 36-character tail in a full pass. */
         linebuf[16] = 0;
         JSLG(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)linebuf);
-        if (Printall || (PV && *PV == 0)) {
+        if (Printall || (PV && (Contfound || *PV == 0))) {
 	  if (!Printall) *PV = 1;
 	  prfound(job,linebuf);
 	}
@@ -17233,7 +17279,7 @@ do {
 	      memcpy(expect, "{PKCS5S2}", 9);
 	      b64_encode(newbuf, expect + 9, 48);
 	      JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
-	      if (Printall || (PV && *PV == 0)) {
+	      if (Printall || (PV && (Contfound || *PV == 0))) {
 		if (!Printall) {
 		  *PV = 1;
 		    PV_DEC(saltsnap[si].PV);
@@ -17289,7 +17335,7 @@ do {
 		  int pfxlen = sprintf(expect, "%s%c", saltsnap[si].salt, sep);
 		  b64_encode((char *)curin.h, expect + pfxlen, 32);
 		  JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
-		  if (Printall || (PV && *PV == 0)) {
+		  if (Printall || (PV && (Contfound || *PV == 0))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17349,7 +17395,7 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, 16);
 		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
-		  if (Printall || (PV && *PV == 0)) {
+		  if (Printall || (PV && (Contfound || *PV == 0))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17419,7 +17465,7 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, 16);
 		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
-		  if (Printall || (PV && *PV == 0)) {
+		  if (Printall || (PV && (Contfound || *PV == 0))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17479,7 +17525,7 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, 24);
 		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
-		  if (Printall || (PV && *PV == 0)) {
+		  if (Printall || (PV && (Contfound || *PV == 0))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17520,7 +17566,7 @@ do {
 	    c8_full[61] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_CISCO8),(unsigned char *)c8_full);
-	      if (Printall || (PV2 && *PV2 == 0)) {
+	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
 	        if (!Printall) {
 	          *PV2 = 1;
 	          PV_DEC(saltsnap[si].PV);
@@ -17564,7 +17610,7 @@ do {
 	    c9_full[61] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_CISCO9),(unsigned char *)c9_full);
-	      if (Printall || (PV2 && *PV2 == 0)) {
+	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
 	        if (!Printall) {
 	          *PV2 = 1;
 	          PV_DEC(saltsnap[si].PV);
@@ -17628,7 +17674,7 @@ do {
 	    mdbuf[32] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_DCC2), (unsigned char *)mdbuf);
-	      if (Printall || (PV2 && *PV2 == 0)) {
+	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
 	        snprintf(linebuf2, MAXLINE*3, "$DCC2$%d#%s#%s", dcc_iter, uname, mdbuf);
 	        if (!Printall) {
 	          *PV2 = 1;
@@ -17680,7 +17726,7 @@ do {
 	    mdbuf[64] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_PWSAFE3), (unsigned char *)mdbuf);
-	      if (Printall || (PV2 && *PV2 == 0)) {
+	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
 	        /* Reconstruct hex: PWS3 + salt + iter_le + hash */
 	        char pw_out[200];
 	        int po = 0;
@@ -17784,7 +17830,7 @@ do {
 	    }
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(job->op), (unsigned char *)sl);
-	      if (Printall || (PV2 && *PV2 == 0)) {
+	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
 	        if (!Printall) {
 	          *PV2 = 1;
 	          PV_DEC(saltsnap[si].PV);
@@ -19275,7 +19321,7 @@ release(FreeWaiting);
                   { int match_len;
                     unsigned short *match_flags;
                     int hfound = hybrid_check(curin.h, 16, &match_len, &match_flags);
-                    if (Printall || (hfound && *match_flags != (unsigned short)job->op)) {
+                    if (Printall || (hfound && (Contfound || *match_flags != (unsigned short)job->op))) {
                       if (hfound) *match_flags = job->op;
                       PV_DEC(saltsnap[si].PV);
                       if (!Printall && *saltsnap[si].PV == 0) {
@@ -20061,7 +20107,7 @@ nextbb:
 			    /* look up computed hash in JudyJ[JOB_BCRYPT] Judy */
 			    { Word_t *PV2;
 			      JSLG(PV2, JUDYJ(JOB_BCRYPT),(unsigned char *)(linebuf2+MAXLINE*2));
-			      if (Printall || (PV2 && *PV2 == 0)) {
+			      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
 				if (!Printall) {
 				  *PV2 = 1;
 				  PV_DEC(PV);
@@ -20124,7 +20170,7 @@ nextbb:
 			hashcnt++;
 			crypt_rn(lmac, linebuf, linebuf2, BCRYPT_HASHSIZE);
 			JSLG(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
-			if (Printall || (PV && *PV == 0)) {
+			if (Printall || (PV && (Contfound || *PV == 0))) {
 			  if (!Printall) {
 			    *PV = 1;
 			    { Word_t *SPV;
@@ -20224,7 +20270,7 @@ nextbb:
                       continue;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Format output: $bcrypt-sha256$v=2,t=2b,r=NN$SALT22$HASH31 */
                       /* setting[4..5] = rounds, setting[7..28] = salt22 */
                       /* linebuf2 = "$2b$NN$salt22hash31", hash31 = linebuf2 + slen */
@@ -20300,7 +20346,7 @@ BC_Start:
                     hashcnt++;
                     crypt_rn(cur, linebuf, linebuf2, BCRYPT_HASHSIZE);
                     JSLG(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
-                    if (Printall || (PV && *PV == 0)) {
+                    if (Printall || (PV && (Contfound || *PV == 0))) {
                       if (!Printall) {
                         *PV = 1;
                         { Word_t *SPV;
@@ -20409,7 +20455,7 @@ BC_Start:
                        * error marker "*0", which BC_Start learned the hard way was
                        * then emitted as though it were a hash.  Skip those here for
                        * the same reason. */
-                      if ((Printall || *PV == 0) && linebuf2[2] != 'k') {
+                      if ((Printall || Contfound || *PV == 0) && linebuf2[2] != 'k') {
                         outstanding++;
                         hashcnt++;
                         if (crypt_rn(mdbuf, linebuf2, newbuf, BCRYPT_HASHSIZE) &&
@@ -23030,7 +23076,7 @@ md4utf16:
                   fastcopy(mdbuf + 40, s1, 20);
                   mdbuf[60] = 0;
                   JSLG(PV, JUDYJ(JOB_ORACLE11), (unsigned char *)mdbuf);
-                  if (Printall || (PV && *PV == 0)) {
+                  if (Printall || (PV && (Contfound || *PV == 0))) {
                     if (!Printall) {
                       *PV = 1;
                       PV_DEC(saltsnap[si].PV);
@@ -25184,7 +25230,7 @@ sha11saltmd5:
                 b64_encode((char *)curin.h, linebuf2, 20);
                 linebuf2[28] = 0;
                 JSLG(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)linebuf2);
-                if (Printall || (PV && *PV == 0)) {
+                if (Printall || (PV && (Contfound || *PV == 0))) {
                   if (!Printall)
                     *PV = 1;
 #if ARM < 8
@@ -25264,7 +25310,7 @@ sha11saltmd5:
                         expect[el] = 0;
                       }
                       JSLG(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)expect);
-                      if (Printall || (PV && *PV == 0)) {
+                      if (Printall || (PV && (Contfound || *PV == 0))) {
                         if (!Printall) {
                           *PV = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -25336,7 +25382,7 @@ sha11saltmd5:
                     /* look up in JudyJ[JOB_HMAILSERVER] */
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_HMAILSERVER), (unsigned char *)hm_full);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -25397,7 +25443,7 @@ sha11saltmd5:
                   hashcnt++;
                   juniper_encode(curin.h, linebuf2);
                   JSLG(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)linebuf2);
-                  if (Printall || (PV && *PV == 0)) {
+                  if (Printall || (PV && (Contfound || *PV == 0))) {
                     if (!Printall)
                       *PV = 1;
 #if ARM < 8
@@ -25447,7 +25493,7 @@ sha11saltmd5:
                   cisco_pix_encode(curin.h, pix_enc);
                   hashcnt++;
                   JSLG(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)pix_enc);
-                  if (Printall || (PV && *PV == 0)) {
+                  if (Printall || (PV && (Contfound || *PV == 0))) {
                     if (!Printall)
                       *PV = 1;
 #if ARM < 8
@@ -25520,7 +25566,7 @@ sha11saltmd5:
                     hashcnt++;
                     { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_CISCOASA), (unsigned char *)asa_enc);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -25596,7 +25642,7 @@ sha11saltmd5:
                         strcpy(linebuf + 41, saltsnap[si].salt);
                         { Word_t *PV2;
                           JSLG(PV2, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)linebuf);
-                          if (Printall || (PV2 && *PV2 == 0)) {
+                          if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                             /* save salt before compaction may invalidate si */
                             const char *matched_salt = saltsnap[si].salt;
                             if (!Printall) {
@@ -25676,7 +25722,7 @@ sha11saltmd5:
                         strcpy(linebuf + 33, saltsnap[si].salt);
                         { Word_t *PV2;
                           JSLG(PV2, JUDYJ(JOB_IPMI_MD5), (unsigned char *)linebuf);
-                          if (Printall || (PV2 && *PV2 == 0)) {
+                          if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                             /* save salt before compaction may invalidate si */
                             const char *matched_salt = saltsnap[si].salt;
                             if (!Printall) {
@@ -25768,7 +25814,7 @@ sha11saltmd5:
                       strcpy(linebuf + 33, salt_str);
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)linebuf);
-                        if (Printall || (PV2 && *PV2 == 0)) {
+                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                           const char *matched_salt = saltsnap[si].salt;
                           if (!Printall) {
                             *PV2 = 1;
@@ -26005,7 +26051,7 @@ sha11saltmd5:
                       mdbuf[49] = 0;
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_NETSCALER), (unsigned char *)mdbuf);
-                        if (Printall || (PV2 && *PV2 == 0)) {
+                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -26110,7 +26156,7 @@ sha11saltmd5:
                   mdbuf[129] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26227,7 +26273,7 @@ sha11saltmd5:
 
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ORACLE7), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26353,7 +26399,7 @@ sha11saltmd5:
                   /* match — look up in JudyJ */
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_NETNTLMV1), (unsigned char *)sl);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26490,7 +26536,7 @@ sha11saltmd5:
                   /* match */
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_NETNTLMV2), (unsigned char *)sl);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26577,7 +26623,7 @@ sha11saltmd5:
                   }
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_LASTPASS), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* reconstruct full format: hash:salt for output */
                       char outkey[256];
                       sprintf(outkey, "%s:%s", mdbuf, sl);
@@ -26629,7 +26675,7 @@ sha11saltmd5:
                       { Word_t *PV2;
                         JSLF(PV2, JUDYJ(JOB_LASTPASS), (unsigned char *)mdbuf);
                         while (PV2) {
-                          if (Printall || *PV2 == 0) {
+                          if (Printall || Contfound || *PV2 == 0) {
                             unsigned char hash_bin[16], decrypted[16], plain[16];
                             if (get32(mdbuf, hash_bin, 16) == 16) {
                               AES_ecb_encrypt(hash_bin, decrypted, aeskey, AES_DECRYPT);
@@ -26717,7 +26763,7 @@ sha11saltmd5:
                   mdbuf[40] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_FORTIGATE), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* reconstruct AK1 + base64(salt + sha1) for output */
                       char fg_raw[32], fg_out[64];
                       memcpy(fg_raw, tsalt, 12);
@@ -26838,7 +26884,7 @@ sha11saltmd5:
 
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_DOMINO8), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct (H...) hash for output */
                       unsigned char d8_enc_raw[36];
                       memcpy(d8_enc_raw, d8_salt16, 16);
@@ -26900,7 +26946,7 @@ sha11saltmd5:
                     hashcnt++;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SIPHASH), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output format: hash:2:4:key */
                       snprintf(linebuf, MAXLINE, "%s:2:4:%s", mdbuf, ts);
                       if (!Printall) {
@@ -26951,7 +26997,7 @@ sha11saltmd5:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_CRAMMD5), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct $cram_md5$challenge$response with new HMAC */
                       /* Decode old response to get username prefix */
                       int cm_resplen;
@@ -27032,7 +27078,7 @@ sha11saltmd5:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct {x-issha, ITER}BASE64(hash+salt) for output */
                       unsigned char sh_raw[280];
                       memcpy(sh_raw, curin.h, 20);
@@ -27090,7 +27136,7 @@ sha11saltmd5:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_REDHAT389DS), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct {PBKDF2_SHA256}BASE64(iter4_BE+salt64+hash256) */
                       unsigned char rh_raw[324];
                       rh_raw[0] = (rh_iter >> 24) & 0xff;
@@ -27155,7 +27201,7 @@ sha11saltmd5:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: $postgres$user*challenge*hash */
                       snprintf(linebuf2, MAXLINE*3, "$postgres$%.*s*%s*%s",
                                pg_ulen, ts, pg_chal_hex, mdbuf);
@@ -27214,7 +27260,7 @@ sha11saltmd5:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE*3, "$mysqlna$%s*%s", ts, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -27268,7 +27314,7 @@ sha11saltmd5:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SHIRO1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct: $shiro1$SHA-512$iter$b64salt$b64hash */
                       char sh_b64s[32], sh_b64h[100];
                       int sh_b64slen = b64_encode((char *)sh_salt, sh_b64s, 16);
@@ -27322,7 +27368,7 @@ sha11saltmd5:
                     mdbuf[16] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ECRYPTFS), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE*3, "$ecryptfs$0$1$%s$%s", ts, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -27375,7 +27421,7 @@ sha11saltmd5:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ORACLE12), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: 128 UC hex hash + 32 UC hex salt */
                       char or_out[161];
                       for (x = 0; x < 64; x++) {
@@ -27433,7 +27479,7 @@ sha11saltmd5:
                     cf_hex[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_COLDFUSION10), (unsigned char *)cf_hex);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE*3, "%s:%s", cf_hex, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -27492,7 +27538,7 @@ sha11saltmd5:
                     az_hex[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AZURESYNC), (unsigned char *)az_hex);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE*3, "v1;PPH1_MD4,%s,%d,%s", hp, az_iter, az_hex);
                       if (!Printall) {
                         *PV2 = 1;
@@ -27544,7 +27590,7 @@ sha11saltmd5:
                     af_hex[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)af_hex);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: salt2(64) + hmac(64) + salt(32) = 160 hex */
                       char af_out[161];
                       memcpy(af_out, ts, 64); /* salt2 */
@@ -27878,7 +27924,7 @@ sha11saltmd5:
                   mdbuf[32] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && *PV2 == 0)) {
+                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                     snprintf(linebuf2, MAXLINE*3, "$axcrypt_sha1$%s", mdbuf);
                     if (!Printall) *PV2 = 1;
                     prfound(job, linebuf2);
@@ -27920,7 +27966,7 @@ sha11saltmd5:
                       linebuf2[81] = 0;
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_WBB3), (unsigned char *)linebuf2);
-                        if (Printall || (PV2 && *PV2 == 0)) {
+                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -27995,7 +28041,7 @@ sha11saltmd5:
                       linebuf[86] = 0;
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)linebuf);
-                        if (Printall || (PV2 && *PV2 == 0)) {
+                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -29173,7 +29219,7 @@ sha11saltmd5:
                     /* look up in JudyJ[JOB_MEDIAWIKI] */
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)mw_full);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -29272,7 +29318,7 @@ sha11saltmd5:
                   c4_enc[43] = 0; /* strip trailing '=' */
                   hashcnt++;
                   JSLG(PV, JUDYJ(JOB_CISCO4), (unsigned char *)c4_enc);
-                  if (Printall || (PV && *PV == 0)) {
+                  if (Printall || (PV && (Contfound || *PV == 0))) {
                     if (!Printall)
                       *PV = 1;
 #if ARM < 8
@@ -29340,7 +29386,7 @@ sha11saltmd5:
                       /* look up in JudyJ[JOB_CISCOISE] */
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_CISCOISE), (unsigned char *)mdbuf);
-                        if (Printall || (PV2 && *PV2 == 0)) {
+                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -29494,7 +29540,7 @@ sha11saltmd5:
                       snprintf(jkey, sizeof(jkey), "%.*s$%s",
                                saltlen, s1, aix_enc);
                       JSLG(PV2, *aixjudy, (unsigned char *)jkey);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -31374,7 +31420,7 @@ nextsalt1:
                   s = bsd_crypt_des(cur, s1, linebuf, desblock);
                   if (s) {
                     JSLG(HPV, JUDYJ(JOB_DESCRYPT),(unsigned char *)linebuf);
-                    if (Printall || (HPV && *HPV == 0)) {
+                    if (Printall || (HPV && (Contfound || *HPV == 0))) {
                       i = len;
                       if (*s1 != '_' && i > 8) i = 8;
                       for (y = x = 0; x < i; x++) {
@@ -31463,7 +31509,7 @@ nextsalt1:
                   s = bsd_crypt_des(cur, s1, linebuf, desblock);
                   if (s) {
                     JSLG(BPVB, JUDYJ(JOB_BSDICRYPT),(unsigned char *)linebuf);
-                    if (Printall || (BPVB && *BPVB == 0)) {
+                    if (Printall || (BPVB && (Contfound || *BPVB == 0))) {
                       i = len;
                       for (y = x = 0; x < i; x++) {
                         if ((signed char) cur[x] < ' ') {
@@ -34797,7 +34843,7 @@ sha1md5md5uc:
                       Word_t *PV2;
                       b64_encode((char *)curin.h, yaf_b64, 20);
                       JSLG(PV2, JUDYJ(JOB_YAF_SHA1), (unsigned char *)yaf_b64);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -39655,7 +39701,7 @@ HAV256_5_start:
 		      match_flags = &dummy_flags;
 		      hfound = 1;
 		    }
-		    if (hfound && *match_flags != (unsigned short)job->op) {
+		    if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
 		      char outhash[128];
 		      *match_flags = job->op;
 		      /* SHA1_cs = SHA1(UTF16LE(pass) . salt) — for output */
@@ -39923,7 +39969,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_PS_TOKEN), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -39971,7 +40017,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WINPHONE), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -40279,7 +40325,7 @@ HAV256_5_start:
                     if (valid) {
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_TACACS), (unsigned char *)saltsnap[si].salt);
-                      if (PV2 && *PV2 == 0) {
+                      if (PV2 && (Contfound || *PV2 == 0)) {
                         snprintf(linebuf, MAXLINE, "$tacacs-plus$0$%.*s$%.*s$%s",
                                  8, ts, ct_hexlen, c1 + 1, c2 + 1);
                         *PV2 = 1;
@@ -40411,7 +40457,7 @@ HAV256_5_start:
                                zpk, iter, 32, c2 + 1, c3 + 1);
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)linebuf2);
-                      if (PV2 && *PV2 == 0) {
+                      if (PV2 && (Contfound || *PV2 == 0)) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -40450,7 +40496,7 @@ HAV256_5_start:
                   mdbuf[32] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && *PV2 == 0)) {
+                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                     snprintf(linebuf, MAXLINE, "{CRAM-MD5}%s00000000000000000000000000000000", mdbuf);
                     if (!Printall) *PV2 = 1;
                     prfound(job, linebuf);
@@ -40534,7 +40580,7 @@ HAV256_5_start:
                     linebuf[hmac_len * 2] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_JWT), (unsigned char *)linebuf);
-                    if (PV2 && *PV2 == 0) {
+                    if (PV2 && (Contfound || *PV2 == 0)) {
                       /* Output = full JWT string */
                       snprintf(linebuf2, MAXLINE, "%s", jwt);
                         *PV2 = 1;
@@ -40585,7 +40631,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_QNX_MD5), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "@m,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
                         *PV2 = 1;
@@ -40636,7 +40682,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_QNX_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "@s,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
                         *PV2 = 1;
@@ -40689,7 +40735,7 @@ HAV256_5_start:
                     mdbuf[128] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_QNX_SHA512), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "@S,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
                         *PV2 = 1;
@@ -40754,7 +40800,7 @@ HAV256_5_start:
                       /* Try JudyJ with the computed format */
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_QNX7_SHA512), (unsigned char *)linebuf);
-                      if (PV2 && *PV2 == 0) {
+                      if (PV2 && (Contfound || *PV2 == 0)) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
                         if (*saltsnap[si].PV == 0) {
@@ -41051,7 +41097,7 @@ HAV256_5_start:
                         snprintf(linebuf2, MAXLINE, "$krb5pa$%d$%.*s$%.*s$%s",
                                  is_17 ? 17 : 18, userlen, c1 + 1, realmlen, ts, hexdata);
                         JSLG(PV2, JUDYJ(job->op), (unsigned char *)linebuf2);
-                        if (PV2 && *PV2 == 0) {
+                        if (PV2 && (Contfound || *PV2 == 0)) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -41117,7 +41163,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WPA_PMKID), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: WPA*01*pmkid*macap*macsta*essid*** */
                       snprintf(linebuf2, MAXLINE, "WPA*01*%s*%.*s*%.*s*%.*s***",
                                mdbuf, 12, c1 + 1, 12, c2 + 1, essid_hexlen, ts);
@@ -41246,7 +41292,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: WPA*02*mic*macap*macsta*essid*anonce*eapol*00 */
                       char *hp2 = linebuf2;
                       hp2 += sprintf(hp2, "WPA*02*%s*%.*s*%.*s*%.*s*%.*s*%.*s*00",
@@ -41326,7 +41372,7 @@ HAV256_5_start:
                       mdbuf[32] = 0;
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_WPA_PMK), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         snprintf(linebuf2, MAXLINE, "WPA*01*%s*%.*s*%.*s*%.*s***",
                                  mdbuf, 12, c1 + 1, 12, c2 + 1, essid_hexlen, essid_start);
                         if (!Printall) {
@@ -41407,7 +41453,7 @@ HAV256_5_start:
                       mdbuf[32] = 0;
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_WPA_PMK), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         char *hp2 = linebuf2;
                         hp2 += sprintf(hp2, "WPA*02*%s*%.*s*%.*s*%.*s*%.*s*%.*s*00",
                                  mdbuf,
@@ -41574,7 +41620,7 @@ HAV256_5_start:
                       continue;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WPBCRYPT), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Format output: $wp$2y$NN$SALT22HASH31 */
                       /* setting = "$2b$NN$salt22", linebuf2 = "$2b$NN$salt22hash31" */
                       /* Replace "$2b$" prefix with "$wp$2b$" — but hashcat uses 2y */
@@ -41644,7 +41690,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: $ansible$0*0*salt*ct*hmac */
                       snprintf(linebuf2, MAXLINE, "$ansible$0*0*%.*s*%s*%s",
                                64, ts, ct_start, mdbuf);
@@ -41764,7 +41810,7 @@ HAV256_5_start:
                                32, c1 + 1, iter, c2 + 1);
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_APFS), (unsigned char *)linebuf2);
-                      if (PV2 && *PV2 == 0) {
+                      if (PV2 && (Contfound || *PV2 == 0)) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -41819,7 +41865,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_OTM_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: otm_sha256:iter:salt:hash_b64 */
                       char *hp2 = linebuf;
                       b64_encode((char *)curin.h, linebuf2, 32);
@@ -41904,7 +41950,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE, "$telegram$0*%s*%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -41953,7 +41999,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "pbkdf2(%d,20,sha512)$%s$%s",
                                iter, salt, mdbuf);
                       if (!Printall) {
@@ -42050,7 +42096,7 @@ HAV256_5_start:
                     mdbuf[128] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct output format */
                       if (job->op == JOB_SOLARWINDS) {
                         b64_encode((char *)curin.h, linebuf2, 64);
@@ -42388,7 +42434,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_BITWARDEN), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output: $bitwarden$2*iter1*iter2*salt_b64*hash_b64 */
                       b64_encode(newbuf + 32, linebuf2, 32);
                       snprintf(linebuf, MAXLINE, "$bitwarden$2*%d*%d*%s*%s",
@@ -42459,7 +42505,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Re-encode for output */
                       char user_b64[128], salt_b64[32], hash_b64[32];
                       b64_encode((char *)ts, user_b64, userlen);
@@ -42520,7 +42566,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Re-encode for output */
                       char salt_b64[64], hash_b64[64];
                       b64_encode((char *)mg_salt, salt_b64, 28);
@@ -42577,7 +42623,7 @@ HAV256_5_start:
                   mdbuf[64] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_FORTIGATE256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       char fg_raw[44], fg_out[68];
                       memcpy(fg_raw, tsalt, 12);
                       memcpy(fg_raw + 12, curin.h, 32);
@@ -42636,7 +42682,7 @@ HAV256_5_start:
                   mdbuf[40] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_UMBRACO), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && *PV2 == 0)) {
+                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                     /* Base64 encode for output */
                     b64_encode((char *)curin.h, linebuf2, 20);
                     linebuf2[28] = 0;
@@ -42678,7 +42724,7 @@ HAV256_5_start:
                   mdbuf[8] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && *PV2 == 0)) {
+                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                     if (!Printall) *PV2 = 1;
                     prfound(job, mdbuf);
                   }
@@ -42899,7 +42945,7 @@ HAV256_5_start:
                     mdbuf[16] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE*3, "%.*s$%s", sp_slen, ts, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -42971,7 +43017,7 @@ HAV256_5_start:
                     snprintf(linebuf2, MAXLINE*3, "$as400$des$*%.*s*%s", ulen, ts, mdbuf);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AS400_DES), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -43052,7 +43098,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Output format: SALT$HASH */
                       snprintf(linebuf2, MAXLINE*3, "%.*s$%s", sp_slen, ts, mdbuf);
                       if (!Printall) {
@@ -43103,7 +43149,7 @@ HAV256_5_start:
                   mdbuf[40] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -43169,7 +43215,7 @@ HAV256_5_start:
                   mdbuf[32] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", mdbuf, pthex);
                       if (!Printall) {
                         *PV2 = 1;
@@ -43231,7 +43277,7 @@ HAV256_5_start:
                   mdbuf[64] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct SCRAM format for output */
                       char b64salt_out[128], b64stored_out[64];
                       b64_encode((char *)tsalt, b64salt_out, saltlen);
@@ -43324,7 +43370,7 @@ HAV256_5_start:
                   /* Lookup computed signature in JudyJ */
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AWSSIGV4), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf((char *)wline, MAXLINE,
                         "$AWS-Sig-v4$0$%.*s$%.*s$%.*s$%s$%s",
                         longdate_len, ts, region_len, c1 + 1,
@@ -43403,7 +43449,7 @@ HAV256_5_start:
                     mdbuf[keylen * 2] = 0;
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         snprintf(linebuf2, MAXLINE, "$krb5db$%d$%.*s$%.*s$%s",
                                  is_17 ? 17 : 18, userlen, c1 + 1, realmlen, ts, mdbuf);
                         if (!Printall) {
@@ -43523,7 +43569,7 @@ HAV256_5_start:
                     hashcnt++;
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_MURMUR3), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                         if (!Printall) {
                           *PV2 = 1;
@@ -43584,7 +43630,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_MSSNTP), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && *PV2 == 0)) {
+                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                         snprintf(linebuf, MAXLINE, "$sntp-ms$%s$%s", mdbuf, ts);
                         if (!Printall) {
                           *PV2 = 1;
@@ -43672,7 +43718,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, hashlen2 * 2);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       { int stype_out = (job->op == JOB_SSPR_MD5) ? 0 :
                                          (job->op == JOB_SSPR_SHA1) ? 1 :
                                          (job->op == JOB_SSPR_SHA1S) ? 2 :
@@ -43750,7 +43796,7 @@ HAV256_5_start:
                     prmd5(curin.h, linebuf2, 32);  /* linebuf2 = final hash */
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_EMPIRECMS), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf, MAXLINE, "%s:%.*s:%.*s", linebuf2, salt1len, ts, salt2len, salt2);
                       if (!Printall) {
                         *PV2 = 1;
@@ -43811,7 +43857,7 @@ HAV256_5_start:
                     b64out[b64len] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)b64out);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct PBKDF1:sha1:ITER:B64SALT:B64HASH */
                       char saltb64[400];
                       int saltb64len = b64_encode((char *)tsalt, saltb64, saltbinlen);
@@ -43894,7 +43940,7 @@ HAV256_5_start:
                         snprintf(mdbuf, MAXLINE+16, "$MSONLINEACCOUNT$0$%d$%.*s", iter,
                           (int)(saltsnap[si].saltlen - (datahex - ts)), datahex);
                         JSLG(PV2, JUDYJ(JOB_MSONLINE), (unsigned char *)mdbuf);
-                        if (PV2 && *PV2 == 0) {
+                        if (PV2 && (Contfound || *PV2 == 0)) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -43933,7 +43979,7 @@ HAV256_5_start:
                     crypt_rn(linebuf2, setting, mdbuf, BCRYPT_HASHSIZE);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WBB4), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -43976,7 +44022,7 @@ HAV256_5_start:
                   snprintf(linebuf2, MAXLINE*3, "$mongodb$0$%.*s$%s", ul, ts, mdbuf);
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_MONGODB), (unsigned char *)linebuf2);
-                  if (Printall || (PV2 && *PV2 == 0)) {
+                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                     if (!Printall) {
                       *PV2 = 1;
                       PV_DEC(saltsnap[si].PV);
@@ -44017,7 +44063,7 @@ HAV256_5_start:
                     snprintf(linebuf2, MAXLINE*3, "$h$6$%.*s$%.*s", sl, ts, h3l, h3b); }
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_H3C), (unsigned char *)linebuf2);
-                  if (Printall || (PV2 && *PV2 == 0)) {
+                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                     if (!Printall) {
                       *PV2 = 1;
                       PV_DEC(saltsnap[si].PV);
@@ -44098,7 +44144,7 @@ HAV256_5_start:
                              df512 ? '4' : '3', sl, ts, dj, dfb);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -44149,7 +44195,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       unsigned char sh_raw[400];
                       memcpy(sh_raw, curin.h, 32);
                       memcpy(sh_raw + 32, tsalt, sh_saltlen);
@@ -44213,7 +44259,7 @@ HAV256_5_start:
                     mdbuf[96] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       unsigned char sh_raw[400];
                       memcpy(sh_raw, curin.h, 48);
                       memcpy(sh_raw + 48, tsalt, sh_saltlen);
@@ -44275,7 +44321,7 @@ HAV256_5_start:
                     mdbuf[128] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       /* Reconstruct {x-isSHA512, ITER}BASE64(hash+salt) */
                       unsigned char sh_raw[400];
                       memcpy(sh_raw, curin.h, 64);
@@ -44327,7 +44373,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AS400SSHA1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       snprintf(linebuf2, MAXLINE*3, "$as400$ssha1$*%.*s*%s", userlen, user, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -44427,7 +44473,7 @@ HAV256_5_start:
                         { int jj; for (jj = 0; jkey[jj]; jj++) jkey[jj] = tolower(jkey[jj]); }
                         { Word_t *PV2;
                           JSLG(PV2, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)jkey);
-                          if (PV2 && *PV2 == 0) {
+                          if (PV2 && (Contfound || *PV2 == 0)) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
                             if (*saltsnap[si].PV == 0) {
@@ -44617,7 +44663,7 @@ HAV256_5_start:
                              a2sig, a2ver, a2m, a2t, a2p, b64salt, b64hash);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && *PV2 == 0)) {
+                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -47109,6 +47155,8 @@ static const int gpu_ops[] = {
     JOB_SHA512CRYPT, JOB_SHA256CRYPT, JOB_SHA512CRYPTMD5,
     JOB_MD5RAW, JOB_SHA1RAW, JOB_SHA384RAW, JOB_SHA512RAW,
     JOB_SQL5, JOB_MYSQL3, JOB_DESCRYPT,
+    /* MD5SHA256 (e179): composite sha256-then-two-block-MD5 template core. */
+    JOB_MD5SHA256,
     JOB_RMD160, JOB_RMD320, JOB_BLAKE2S256,
     /* B5 sub-batch 3 (2026-05-06): BLAKE2B-256 / BLAKE2B-512 GPU
      * template. BLAKE2B-160 omitted -- no JOB_BLAKE2B160. */
@@ -55668,7 +55716,7 @@ union HashU curin;
     }
   }
 
-  while ((ch = getopt(argc, argv, "?8abcdelpvVyzZEG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:L:N:R:M:S:U:P:W:X:")) != -1) {
+  while ((ch = getopt(argc, argv, "?8abcdelpvVyzZECG:f:g:h:i:j:k:m:n:q:r:s:t:u:w:x:F:J:L:N:R:M:S:U:P:W:X:")) != -1) {
     switch (ch) {
       case 'X':
         s = optarg;
@@ -56548,6 +56596,16 @@ badrule:
       case 'v':
         NoMarkSalt = 1;
         fprintf(stderr, "Do not mark salts as found\n");
+        break;
+
+      case 'C':
+        /* Implies -v.  A solved hash is no longer retired, so retiring the
+         * SALT it was solved with would stop the very repeats -C exists to
+         * report -- and would do it quietly, by shrinking the next snapshot
+         * rather than by reporting anything. */
+        Contfound = 1;
+        NoMarkSalt = 1;
+        fprintf(stderr, "Continue reporting hashes that are already solved\n");
         break;
 
       case 'V':
@@ -57495,6 +57553,11 @@ usage:
     printf("\t-W none disable ETA (overrides MDXFIND_CACHE)\n");
     printf("\tMDXFIND_CACHE=/path/to/mdxfind.db enables -W auto automatically\n");
     printf("-y\tEnable directory recursion for wordlists\n");
+    printf("-C\tContinue reporting a hash after it is solved, so every\n");
+    printf("  \tcandidate that matches is reported and not just the first.\n");
+    printf("  \tFor types whose stored digest is truncated, where many\n");
+    printf("  \tplaintexts share one stored value. Implies -v. The per-type\n");
+    printf("  \tcounts then count REPORTED LINES, not distinct hashes\n");
     printf("-z\tEnable debugging information/hash results\n");
     printf("-Z\tEnable histogram of rule hits\n");
     printf("\nUse -h with no other options to display the list of supported hash types\n");
@@ -61624,6 +61687,7 @@ usage:
             case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
               fam |= 1u << FAM_KECCAKUNSALTED; break;
             case JOB_SQL5: fam |= 1u << FAM_SHA1UNSALTED; break;
+            case JOB_MD5SHA256: fam |= 1u << FAM_MD5UNSALTED; break;
             case JOB_MYSQL3: fam |= 1u << FAM_MYSQL3UNSALTED; break;
             case JOB_HMAC_MD5: case JOB_HMAC_MD5_KPASS:
               fam |= 1u << FAM_MD5SALT; break;
