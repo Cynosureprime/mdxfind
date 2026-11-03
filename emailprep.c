@@ -116,10 +116,13 @@ static ssize_t ep_getline(char **lineptr, size_t *n, FILE *stream)
  * stops holding.  regress/regress-email.sh checks the two against one fixture.
  */
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/utils/RCS/emailprep.c,v 1.5 2026/11/01 05:30:17 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/utils/RCS/emailprep.c,v 1.6 2026/11/01 17:48:36 dlr Exp dlr $";
 
 /*
  * $Log: emailprep.c,v $
+ * Revision 1.6  2026/11/01 17:48:36  dlr
+ * Accept the rling(1) stream names "stdin" and "stdout" in addition to "-". The input argument may be written "-" or "stdin", the output "-" or "stdout". rling accepts only the words and treats "-" as an ordinary filename, so the set emailprep accepts is a superset of rlings and a pipeline written in either style reads the same way through both tools. A file genuinely named stdin is still reachable by any path that is not the bare word, such as ./stdin. All six combinations of the two spellings produce output byte-identical to the file-to-file baseline.
+ *
  * Revision 1.5  2026/11/01 05:30:17  dlr
  * Carry a getline replacement for Windows. getline is POSIX 2008 and the Windows CRT has none: the llvm-mingw cross-compilers this project ships with reject it outright as an undeclared function on x86_64 and aarch64, while the i686 gcc only warned and then linked a binary that file(1) reports as data rather than a PE image. Every other libc call in this file compiles there unchanged. The replacement sits in the source rather than in mdxfind-release, for the reason bertillon.h states for its own copy: the published source then cross-compiles on its own, without reproducing release machinery a person cloning the repository cannot see. Guarded by ifdef _WIN32, so the POSIX path is untouched and verified byte-identical on the same fixture. emailprep now builds on all eleven release platforms and is bundled into each one.
  *
@@ -255,7 +258,7 @@ static void usage(void)
       "  -N          do not normalize (dedup and order only)\n"
       "  -u          do not dedup (normalize and order only)\n"
       "  -q          suppress the stderr histogram\n"
-      "input and output may each be '-' for stdin / stdout.\n"
+      "input may be '-' or 'stdin'; output may be '-' or 'stdout'.\n"
       "Order is by the length of the NORMALIZED LOCAL PART, shortest first,\n"
       "stable within a length.  See emailprep(1).\n", MAXDOMAINS);
     exit(1);
@@ -292,9 +295,15 @@ int main(int argc, char **argv)
     if (argc - optind != 2) usage();
     hexinit();
 
-    in  = strcmp(argv[optind],   "-") ? fopen(argv[optind],   "r") : stdin;
+    /* Either stream may be named "-" or by the rling(1) spelling, "stdin" for
+     * the input and "stdout" for the output.  rling accepts only the words and
+     * treats "-" as an ordinary filename; emailprep accepts both forms, so a
+     * pipeline written either way behaves the same across the two tools. */
+    in  = (!strcmp(argv[optind], "-") || !strcmp(argv[optind], "stdin"))
+            ? stdin : fopen(argv[optind], "r");
     if (!in)  { perror(argv[optind]);   exit(1); }
-    out = strcmp(argv[optind+1], "-") ? fopen(argv[optind+1], "w") : stdout;
+    out = (!strcmp(argv[optind+1], "-") || !strcmp(argv[optind+1], "stdout"))
+            ? stdout : fopen(argv[optind+1], "w");
     if (!out) { perror(argv[optind+1]); exit(1); }
 
     while ((n = getline(&line, &linecap, in)) > 0) {
