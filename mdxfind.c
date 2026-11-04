@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.656 2026/11/03 18:26:39 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.657 2026/11/04 12:22:28 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.656 2026/11/03 18:26:39 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.657 2026/11/04 12:22:28 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.657  2026/11/04 12:22:28  dlr
+ * e962 RORAILS-SHA1 accepts a salt of any width, which is what the algorithm has always computed. restful_authentication joins its arguments with a double dash and never consults the width or alphabet of the salt, so SHA1 of dash-dash salt dash-dash pass dash-dash is defined for any salt. 40 hex is merely what Rails make_token, a SHA-1 hexdigest, happens to emit, and hashcat module_27200.c wrote that accident into its token spec as FIXED_LENGTH 40 plus VERIFY_HEX because every sample line in hashcat issue 2913 carried one. mdxfind copied the same limit. An app that keeps the restful_authentication digest but swaps its token generator is therefore unloadable, and that is the common case rather than the exotic one: in the published 27200 corpus of 1,729,406 records, 1,707,447 carry a 20-character mixed-case token and only 20,502 carry a 40-hex salt. The structured loader is unchanged and still claims a 40hex:40hex line exclusively, so that path is byte-identical. What changes is that a 40-hex DIGEST filed by the plain-hex fallthrough is now also inserted into this type own JudyJ when e962 is selected, which is the same additive treatment e918 DCC2 received for the same reason: the type compares against its own JudyJ, the Dosalt suffix capture was already filing the salt correctly, and the digest went only to the compact table where this type never looks. The consequence was a clean-looking run that computed nothing. mdxfind printed found N unique salts for RORAILS-SHA1, listed the type under Working on hash types, then worked it with N salts and ZERO hashes: every digest computed, every lookup missed, exit status zero, and no line distinguishing it from an honest negative. The salt line read like success. hashcat at least fails loudly on the same input with Token length exception and No hashes loaded. The salt reaches the compute arm VERBATIM through Dosalt, with no case folding, which is the second half of the fix and the reason the structured loader was not simply widened: that loader lowercases its salt, free for 40 hex and fatal for a mixed-case token. The compute arm already used the snapshot saltlen and needed no change. Filed only on the slow -F path, not the fast -f one: a NEEDSF type takes its salt from the same line as its hash, so filing the digest on a channel that captures no suffix would reproduce the half-loaded state this removes. Measured on the full corpus through hashpipe: 20,501 verified before, 1,727,898 after, an 84-fold increase, with the remaining 1,076 recognised as SHA1SALTPASS, being the same construction attacked as mode 120 with the delimiters folded into the salt field. mdxfind solves 200 of 200 on a single file holding both widths, 100 through each loader. Regression: hashpipe -T 1061 passed 0 failed 2 skipped, regress/test-F-salted.sh 29 passed 0 failed, hashcat own published 27200 vector recovers in both tools, -z round-trip matches the registered vector, and selecting e962 alongside e120 on a 40hex:textsalt file leaves e120 solving exactly as it does alone, so no line is shadowed.
+ *
  * Revision 1.656  2026/11/03 18:26:39  dlr
  * Admit e179 MD5SHA256 to the GPU. Three sites: the gpu_rules_engine_active chokepoint OR-chain, the gpu_ops table which drives both the need_gpu activation set and the GPU tag on the type listing, and the FAM_MD5UNSALTED family bitmask. The type is md5 of the 64-byte lowercase hex of sha256 of the candidate, then iterated MD5 over the 32-byte hex of the previous round: SHA-256 is applied once at x01 inside template_finalize and the iter step is MD5-only, which is why the device template_iterate is byte-identical to the plain MD5 core, the CPU reaching the same MDstart loop by goto. New cores gpu/gpu_md5sha256_core.cl 1.1 and gpu/metal_md5sha256_core.metal 1.1 with overlay gpu/codegen/cl2metal_overrides/md5sha256.yaml 1.1; host wiring in gpu/gpu_opencl.c 1.230, gpu/gpujob_opencl.c 1.180, gpu/gpujob_metal.m 1.65 and gpu_metal.m 1.151. Validated byte-exact CPU versus GPU at iter 1 and iter 3 on fpga GTX 1080 OpenCL and dev1 M1 Metal, 11 of 11 known answers each covering the 55, 56, 63, 64 and 65-byte candidate boundaries and the empty string, with the device line reporting the hits; the UTF-32 acceptance fixture passes on both backends. Seven other GPU types re-checked CPU-identical on the same binary. Rates measured 428.6 Mh per second on the GTX 1080 and 1.06 Gh per second on an RTX 4070 Ti SUPER against 31.1 Mh per second on CPU, a 34x device speedup on the faster card. bench_rates.h line 183 still carries the CPU rate of 1224707 for this type and now understates the device throughput by three orders of magnitude.
  *
@@ -55167,6 +55170,34 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
             _dh[_dy] = tolower((unsigned char)line[_dy]);
           _dh[32] = 0;
           JSLI(PV, JUDYJ(JOB_DCC2), (unsigned char *)_dh);
+        }
+        /* RORAILS-SHA1 (e962) compares against its OWN JudyJ, and until now
+         * the only thing that filled it was the 40hex:40hex structured loader
+         * above. Real lists of this type do not carry a 40-hex salt: the salt
+         * is whatever the Rails app's token generator emitted, and the one
+         * that produced the bulk of the published 27200 corpus emits a
+         * 20-character mixed-case token. Those lines fall past the structured
+         * loader to here, where the Dosalt[] capture below files the salt
+         * correctly while the digest went only to the compact table -- which
+         * this type never consults. The run then printed "found N unique salts
+         * for RORAILS-SHA1", listed the type as working, and ran it with N
+         * salts and ZERO hashes: every digest computed, every lookup missed,
+         * exit clean. Nothing distinguished that from an honest negative, and
+         * the salt line read like success. 20 bytes only, the sole width SHA-1
+         * emits. Additive: a 40-hex salt is still claimed by the structured
+         * loader and never reaches this line, so that path is byte-identical.
+         *
+         * The salt is filed by Dosalt[] VERBATIM, with no case folding. That
+         * matters here and is why the fix does not simply widen the structured
+         * loader: that loader lowercases its salt, which is free for 40 hex
+         * and destroys a mixed-case token. */
+        if (hlen == 20 && lf[JOB_RORAILS_SHA1]) {
+          char _rh[41];
+          int _ry;
+          for (_ry = 0; _ry < 40; _ry++)
+            _rh[_ry] = tolower((unsigned char)line[_ry]);
+          _rh[40] = 0;
+          JSLI(PV, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)_rh);
         }
         /* Check for :suffix on hex hashes (salt and/or user) */
         if ((LoadSalt || LoadUser) && line[hlen * 2] == ':' && line[hlen * 2 + 1]) {
