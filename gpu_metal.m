@@ -10090,20 +10090,28 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                 if (new_hit_count > GPU_MAX_HITS) new_hit_count = GPU_MAX_HITS;
                 uint32_t nspp = (uint32_t)this_salt_chunk;
                 if (nspp == 0u) nspp = 1u;
-                uint32_t total_salts_dyn = (uint32_t)cached_salts_count;
-                if (total_salts_dyn == 0u) total_salts_dyn = 1u;
+                /* The "implicit cap" above held for rules and NOT for a BF
+                 * chunk: x * nsalts wraps uint32 above 32768 salts under a
+                 * 131072 mask.  The salt goes out of band (gpujob.h); x alone
+                 * fits, because the kernel's x * nspp did. */
+                if (!gpu_dispatch_hit_salt[0]) {
+                    gpu_dispatch_hit_salt[0] =
+                        (uint32_t *)malloc(GPU_MAX_HITS * sizeof(uint32_t));
+                    if (!gpu_dispatch_hit_salt[0])
+                        GPU_FATAL("Metal: hit_salt malloc(%zu bytes) failed",
+                                  (size_t)GPU_MAX_HITS * sizeof(uint32_t));
+                }
+                uint32_t *hsalt = gpu_dispatch_hit_salt[0];
                 uint32_t *hit_words = (uint32_t *)[buf_hits contents];
                 for (uint32_t h = prev_hit_count;
                      h < new_hit_count && h < GPU_MAX_HITS;
                      h++) {
                     uint32_t cri = hit_words[h * GPU_HIT_STRIDE + 1];
-                    uint32_t salt_local      = cri % nspp;
-                    uint32_t x               = cri / nspp;
-                    uint32_t salt_idx_global = (uint32_t)salt_base + salt_local;
-                    hit_words[h * GPU_HIT_STRIDE + 1] =
-                        x * total_salts_dyn + salt_idx_global;
+                    hit_words[h * GPU_HIT_STRIDE + 1] = cri / nspp;
+                    hsalt[h] = (uint32_t)salt_base + cri % nspp;
                 }
                 prev_hit_count = new_hit_count;
+                gpu_dispatch_hit_salt_n[0] = new_hit_count;
             }
         }
 

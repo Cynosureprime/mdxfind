@@ -17522,20 +17522,24 @@ validator_skip:
                     OCLParams *pparams = (OCLParams *)d->h_dispatch_payload;
                     uint32_t nspp = (uint32_t)pparams->num_salts_per_page;
                     uint32_t salt_start_now = pparams->salt_start;
-                    uint32_t total_salts_dyn = (uint32_t)d->salts_count;
                     if (nspp == 0u) nspp = 1u;
-                    if (total_salts_dyn == 0u) total_salts_dyn = 1u;
+                    /* The salt goes OUT of band (gpujob.h): X * salts_count
+                     * wrapped uint32 above 32768 salts under a 131072 BF
+                     * mask.  X alone fits, because the kernel's X * nspp did. */
+                    if (!gpu_dispatch_hit_salt[dev_idx])
+                        gpu_dispatch_hit_salt[dev_idx] = (uint32_t *)malloc_lock(
+                            GPU_PACKED_MAX_HITS * sizeof(uint32_t), "hit_salt");
+                    uint32_t *hsalt = gpu_dispatch_hit_salt[dev_idx];
                     for (uint32_t hi = 0; hi < to_read; hi++) {
                         uint32_t *entry = &d->h_hits[
                             (size_t)(total_hits + hi) * GPU_HIT_STRIDE];
                         uint32_t cri = entry[1];
-                        uint32_t salt_local      = cri % nspp;
-                        uint32_t X               = cri / nspp;
-                        uint32_t salt_idx_global = salt_start_now + salt_local;
-                        entry[1] = X * total_salts_dyn + salt_idx_global;
+                        entry[1] = cri / nspp;
+                        hsalt[total_hits + hi] = salt_start_now + cri % nspp;
                     }
                 }
                 total_hits += to_read;
+                if (is_salted_pack) gpu_dispatch_hit_salt_n[dev_idx] = total_hits;
             }
         }
 

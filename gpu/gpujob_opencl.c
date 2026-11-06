@@ -1041,6 +1041,10 @@ void gpujob(void *arg) {
                  * to the standard dispatch_md5_rules path. */
                 uint64_t b71_mask_size_acct = 1; /* hoisted: referenced past !_proto_fired scope (Phase 4 fix) */
                 int _proto_fired = 0;
+                /* No dispatch below has published a hit-salt array yet; only
+                 * the salted template path sets it (gpujob.h). */
+                if (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS)
+                    gpu_dispatch_hit_salt_n[my_slot] = 0;
 
                 /* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force)
                  * dispatch arm. Routes BF chunks (g->bf_chunk == 1) to
@@ -2330,6 +2334,13 @@ void gpujob(void *arg) {
                     uint32_t nsalts_for_decode =
                         is_salted_op ? (uint32_t)nsalts_packed : 1u;
                     if (nsalts_for_decode == 0u) nsalts_for_decode = 1u;
+                    /* Salt index carried out of band by the dispatch, when it
+                     * published one for every stored hit (gpujob.h). */
+                    const uint32_t *hit_salt =
+                        (is_salted_op && my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
+                         && gpu_dispatch_hit_salt[my_slot]
+                         && gpu_dispatch_hit_salt_n[my_slot] >= (uint32_t)stored)
+                        ? gpu_dispatch_hit_salt[my_slot] : NULL;
 
                     for (int h = 0; h < stored; h++) {
                         uint32_t *entry = hits + h * GPU_HIT_STRIDE;
@@ -2340,8 +2351,14 @@ void gpujob(void *arg) {
                          * salt snapshot). For unsalted: nsalts_for_decode
                          * == 1, salt_idx_global == 0, the rest collapses
                          * to the pre-B6 layout. */
-                        uint32_t salt_idx_global = combined_ridx % nsalts_for_decode;
-                        uint32_t tmp             = combined_ridx / nsalts_for_decode;
+                        uint32_t salt_idx_global, tmp;
+                        if (hit_salt) {
+                            salt_idx_global = hit_salt[h];
+                            tmp             = combined_ridx;
+                        } else {
+                            salt_idx_global = combined_ridx % nsalts_for_decode;
+                            tmp             = combined_ridx / nsalts_for_decode;
+                        }
                         /* Phase 1.5 (2026-05-10): b71_mask_size is uint64
                          * but combined_ridx (and thus tmp) is uint32, so
                          * the divmod result fits uint32. Cast for clarity. */

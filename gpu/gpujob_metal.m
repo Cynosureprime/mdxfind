@@ -1602,6 +1602,8 @@ static void gpujob_metal_worker(void *arg) {
                           g->op, (unsigned)g->packed_count,
                           _hn[0] ? _hn : "(unknown)", g->op);
             }
+            /* Only this dispatch may publish a hit-salt array (gpujob.h). */
+            gpu_dispatch_hit_salt_n[0] = 0;
             hits = gpu_metal_dispatch_md5_rules(
                 0 /* dev_idx */,
                 g->packed_buf, g->packed_pos,
@@ -2122,6 +2124,12 @@ static void gpujob_metal_worker(void *arg) {
                 uint32_t nsalts_for_decode =
                     is_salted_op ? (uint32_t)nsalts_packed : 1u;
                 if (nsalts_for_decode == 0u) nsalts_for_decode = 1u;
+                /* Salt index carried out of band by the dispatch, when it
+                 * published one for every stored hit (gpujob.h). */
+                const uint32_t *hit_salt =
+                    (is_salted_op && gpu_dispatch_hit_salt[0]
+                     && gpu_dispatch_hit_salt_n[0] >= (uint32_t)stored)
+                    ? gpu_dispatch_hit_salt[0] : NULL;
 
                 /* The text that used to sit here said BF chunk-as-job is
                  * "OUT OF SCOPE on Metal", that the OpenCL twin's
@@ -2168,10 +2176,16 @@ static void gpujob_metal_worker(void *arg) {
                      * For unsalted ops nsalts_for_decode==1 so the
                      * salt mod is always 0 and ridx/mask collapse to
                      * Phase 2b layout bit-identical. */
-                    uint32_t salt_idx_global =
-                        (uint32_t)((uint64_t)combined_ridx % nsalts_for_decode);
-                    uint32_t tmp =
-                        (uint32_t)((uint64_t)combined_ridx / nsalts_for_decode);
+                    uint32_t salt_idx_global, tmp;
+                    if (hit_salt) {
+                        salt_idx_global = hit_salt[h];
+                        tmp             = combined_ridx;
+                    } else {
+                        salt_idx_global =
+                            (uint32_t)((uint64_t)combined_ridx % nsalts_for_decode);
+                        tmp =
+                            (uint32_t)((uint64_t)combined_ridx / nsalts_for_decode);
+                    }
                     uint32_t mask_idx = (uint32_t)((uint64_t)tmp % b71_mask_size);
                     uint32_t ridx     = (uint32_t)((uint64_t)tmp / b71_mask_size);
 

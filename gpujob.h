@@ -323,6 +323,21 @@ static inline int gpu_email_normalize(const char *src, int srclen,
  * mdxfind.c is common to all of them. */
 #define GPUJOB_MAX_DEVS 64
 extern uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
+/* The global salt index of each hit of a salted template dispatch, parallel to
+ * the returned hit records, and how many of them are valid for the dispatch the
+ * replay is decoding (0 = this dispatch published none; decode slot[1] as
+ * before).  Slot[1] then holds only rule*mask_size + mask_idx.
+ *
+ * It used to hold that times the FULL salt count plus the salt index, in one
+ * uint32.  A brute-force chunk has mask_size 131072, so the product wrapped once
+ * a run had more than 32768 salts: the digest matched, the replay decoded the
+ * wrong salt and candidate, printed a line that does not verify, and the hash
+ * was marked solved.  The two axes need ~37 bits together; neither 32-bit field
+ * spare in the 19-word hit record (iter is the -i depth) can carry the rest.
+ * The workers zero the count before every dispatch, so a proto/kernel-B
+ * dispatch, which never sets it, can never decode against a stale array. */
+extern uint32_t *gpu_dispatch_hit_salt[GPUJOB_MAX_DEVS];
+extern uint32_t gpu_dispatch_hit_salt_n[GPUJOB_MAX_DEVS];
 #endif
 static inline int gpu_email_dot_width(const char *src, int srclen)
 {

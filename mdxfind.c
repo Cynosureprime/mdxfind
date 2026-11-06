@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.659 2026/11/05 22:09:41 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.660 2026/11/06 12:47:54 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.659 2026/11/05 22:09:41 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.660 2026/11/06 12:47:54 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.660  2026/11/06 12:47:54  dlr
+ * Salted template GPU hits above 32768 salts printed the wrong salt and password. The dispatcher packed the hit as X times the FULL salt count plus the global salt index in one uint32, X being rule times mask_size plus mask; a brute-force chunk has mask_size 131072, so the product wrapped once a run had more than 32768 salts. The digest matched, the replay decoded the wrong salt and candidate, printed a line that does not verify, and marked the hash solved, so the true answer was never reported. Reported by Waffle on mmt: e31 MD5SALT, ?a?a?a, the 903952 generated salts, 2517 hits and none verify. Every op in the salted template set was affected, on OpenCL by brute force and on Metal by -n masks. The global salt index now travels out of band in gpu_dispatch_hit_salt, defined here beside gpu_dispatch_mask_size because this is the one file in every build; gpujob.h states the contract. Verified against python oracles, never mdxfind: on the RTX 4070 Ti SUPER, 40 hashcat 2611 vectors 40 of 40 at 903952 generated salts where 1.659 gave 2, the reported file 2517 of 2517, seven salted modes 140 of 140 at 40000 salts where 1.659 gave 16 to 19 of 20 each, and rules plus salts and unsalted brute force byte-identical to 1.659; on the dev1 M1, 20 of 20 Metal hits verify with salt indexes to 39578.
+ *
  * Revision 1.659  2026/11/05 22:09:41  dlr
  * GPU hits print a user field the same way the CPU does. On fpga GTX 1080, 1.658 found the same hashes on GPU and CPU for all 52 NEEDUSER types, but the eight GPU-served ones (e211, e213 to e218, e543) printed a userid containing a colon raw on a GPU hit and as $HEX[] on a CPU hit, because the GPU hit replay in gpujob_* calls the plain checkhashkeylen and checkhashsalt rather than the _user variants. The two print routines now decide from the op: an op whose only key data is a userid, NEEDUSER without NEEDSALT, prints that field as a user whoever reports the hit. Only e918 and e1060 carry both flags and both print their users by their own route. Verified on fpga with 100,001 candidates and eight hostile users per type: GPU and -G none output byte-identical on all 52 types, each GPU-served type reporting 8 GPU hits. The same run shows the old split this series removed: 1.657 found all eight hostile users on the GPU, which decoded $HEX[] through build_salt_snapshot, and one on the CPU. Locally, clean-user -z output stays byte-identical to 1.657 on all 52 types and the hostile-user results are unchanged; regress/test-F-salted.sh 29 passed 0 failed.
  *
@@ -5107,6 +5110,8 @@ long Email_cpu_cheap = 0;   /* -a words kept on the CPU: sweep too small to disp
 #ifdef GPU_ENABLED
 /* See gpujob.h for why this lives here and not in a backend. */
 uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
+uint32_t *gpu_dispatch_hit_salt[GPUJOB_MAX_DEVS];
+uint32_t gpu_dispatch_hit_salt_n[GPUJOB_MAX_DEVS];
 /* -a dot-width clamp, as the DISPATCH actually applied it.  The widest width a
  * run asked for, and the widest it got.  These were defined in gpu_opencl.c and
  * assigned there and read by NOBODY -- four references in the whole tree, all
