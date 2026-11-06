@@ -1,6 +1,9 @@
 .\" emailprep(1) -- man-macro reference page
-.\" $Revision: 1.5 $
+.\" $Revision: 1.6 $
 .\" $Log: emailprep.1,v $
+.\" Revision 1.6  2026/11/01 17:48:40  dlr
+.\" Document the rling(1) stream names. Either filename may name a standard stream: the input as "-" or stdin, the output as "-" or stdout. States that rling accepts only the words and treats "-" as an ordinary filename, so what emailprep accepts is a superset of rlings, and that a file genuinely named stdin remains reachable by any path that is not the bare word. New EXAMPLES entry showing the pipe form. .TH version field to emailprep 1.6. mandoc -Tlint and groff both clean.
+.\"
 .\" Revision 1.5  2026/11/01 05:46:42  dlr
 .\" Bring the .TH version field up to emailprep.c 1.5, which added the Windows getline replacement. The field carries the tool version, and this page ships in the mdxfind distribution from v1.654.
 .\"
@@ -16,7 +19,7 @@
 .\" Revision 1.1  2026/10/31 14:32:28  dlr
 .\" Initial revision: emailprep(1) man page. Documents the three ordered steps and why the order cannot be rearranged, the four options, the stderr histogram as the way to size a run before launching it, and the distinction between that predicted cost and the waste mdxfind reports as measured at the end of a run. Records the three deliberate non-behaviours -- no lowercasing, no CR stripping, no $HEX[] decoding -- each with the reason, which in every case is that the hash is computed over the bytes as typed. Notes that unlike rling it does accept - for stdin and stdout, since rling creates a file of that name, and that gmail.com and googlemail.com must be run as separate files because their suffixes differ by five bytes and the domain cannot be rewritten to match. States the shared first-@ invariant with mdxfind -E and names the regression target that checks it. Cross-references splitlen(1) as the right tool when the whole line is what is being measured. mandoc -Tlint clean.
 .\"
-.TH EMAILPREP 1 "2026-10-31" "emailprep 1.5" "Password Recovery"
+.TH EMAILPREP 1 "2026-11-01" "emailprep 1.6" "Password Recovery"
 .SH NAME
 emailprep \- normalize, deduplicate and order email addresses by sweep cost
 .SH SYNOPSIS
@@ -69,17 +72,25 @@ magnitude inside one unsorted file.  Shortest-first spends the early budget
 where candidates-per-find is lowest, which is what matters on a run that is
 stopped rather than finished.
 .PP
-Either filename may be
+Either filename may name a standard stream instead of a file.  The input may be
+written
 .B \-
-for standard input or standard output.  Note that
+or
+.BR stdin ,
+and the output
+.B \-
+or
+.BR stdout .
 .BR rling (1)
-does
-.I not
-accept
+accepts only the words and treats
 .B \-
-this way and will create a file of that name;
+as an ordinary filename, so the set
 .B emailprep
-differs from it deliberately.
+accepts is a superset of rling's: a pipeline written in either style reads the
+same way through both tools.  A file genuinely named
+.B stdin
+remains reachable by any path that is not the bare word, such as
+.BR ./stdin .
 .PP
 Ordering is stable: lines of equal local-part length keep their input order, so
 two runs over the same input produce byte-identical output.
@@ -231,6 +242,16 @@ be rewritten to match because the hash is over the stored bytes:
 .nf
 $ emailprep \-d gmail.com       leak.txt g1.txt
 $ emailprep \-d googlemail.com  leak.txt g2.txt
+.fi
+.RE
+.PP
+Read several leaks from a pipe, naming the input the way
+.BR rling (1)
+does:
+.PP
+.RS 7n
+.nf
+$ cat leak*.txt | emailprep \-d gmail.com stdin ordered.txt
 .fi
 .RE
 .PP

@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.657 2026/11/04 12:22:28 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.659 2026/11/05 22:09:41 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.657 2026/11/04 12:22:28 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.659 2026/11/05 22:09:41 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,12 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.659  2026/11/05 22:09:41  dlr
+ * GPU hits print a user field the same way the CPU does. On fpga GTX 1080, 1.658 found the same hashes on GPU and CPU for all 52 NEEDUSER types, but the eight GPU-served ones (e211, e213 to e218, e543) printed a userid containing a colon raw on a GPU hit and as $HEX[] on a CPU hit, because the GPU hit replay in gpujob_* calls the plain checkhashkeylen and checkhashsalt rather than the _user variants. The two print routines now decide from the op: an op whose only key data is a userid, NEEDUSER without NEEDSALT, prints that field as a user whoever reports the hit. Only e918 and e1060 carry both flags and both print their users by their own route. Verified on fpga with 100,001 candidates and eight hostile users per type: GPU and -G none output byte-identical on all 52 types, each GPU-served type reporting 8 GPU hits. The same run shows the old split this series removed: 1.657 found all eight hostile users on the GPU, which decoded $HEX[] through build_salt_snapshot, and one on the CPU. Locally, clean-user -z output stays byte-identical to 1.657 on all 52 types and the hostile-user results are unchanged; regress/test-F-salted.sh 29 passed 0 failed.
+ *
+ * Revision 1.658  2026/11/05 19:33:39  dlr
+ * User lists accept and emit $HEX[], per Waffle. Every user channel loaded $HEX[...] as literal text, so a userid carrying a byte that cannot sit in a line or a field could not be attacked, while mdxfind itself already printed such users wrapped and so emitted lines it could not read back. Reproduced on e372 MD5USERPASS with a user ending in LF: -u, -U and -F hash:user all loaded it and found nothing. Users are now held in ONE canonical form, set by user_canon at every user load site (-u, -U, the -F generic hash:user loader, the hex:suffix capture and the JuniperSSG recogniser): a well-formed $HEX[] is decoded, and the bytes are stored raw when printable and colon-free, else as $HEX[lowercase hex]. The stored key is therefore the printed field, so output reloads by construction, a raw and a wrapped spelling of one name are one user whose counts add, and a NUL-bearing user fits a JudySL key. Clean ASCII users are stored exactly as before. At the point of use the UJSLF/UJSLN walk macros put the decoded bytes in tsalt and their length in Uklen; the 20 arms that walk a user Judy take the length from Uklen, three byte-copy loops that ran to the first NUL are bounded by it, and the userdef arm, the first-user UTF-16 arm and the DCC2 fold were converted by hand. The DCC2 fold also had 256-byte key buffers that a long user key overflowed. A colon in a USER field is now $HEX[]-wrapped on output, through new _user variants of checkhashkeylen, checkhashsalt and checkhashsalt2 used only by the user arms; salt fields keep a raw colon for legacy readers. fmt_saltfield replaces four inline copies of the same wrap loop and now also wraps bytes that begin with $HEX[, as passwords already are, so a user whose bytes are literally such a wrapper reads back as itself. DCC2 skips a user carrying a control byte, which is invalid in $DCC2$iter#user#hash, and reports the count. Salts are deliberately unchanged. Verified: a 12-user hostile fixture (LF, CR, NUL leading, middle and trailing, colon, space, 0x7f, UTF-8, raw and wrapped abc, malformed $HEX[zz], a literal wrapper) cracks 12 of 12 on -u, -U and -F against python-computed digests, hashpipe verifies 12 of 12, and the -F round trip is byte-identical. Over all 52 NEEDUSER types, -z output with clean users is byte-identical to 1.657, and with hostile users 49 verify and reload fully. Exceptions: e432 MD5AM treats a colon inside a user as its own field separator; e918 DCC2 builds UTF-16 by zero-extending bytes, so a non-ASCII user does not match hashpipe, which predates this change; e355 meets a hashpipe-side edge on an x01-tagged line whose user decodes to text beginning $HEX[. regress/test-F-salted.sh 29 passed 0 failed; regress.sh identical to 1.657 on all 52 user types. Not yet run: CPU against GPU on the KSALT ops, whose GPU path already decoded $HEX[] through build_salt_snapshot.
+ *
  * Revision 1.657  2026/11/04 12:22:28  dlr
  * e962 RORAILS-SHA1 accepts a salt of any width, which is what the algorithm has always computed. restful_authentication joins its arguments with a double dash and never consults the width or alphabet of the salt, so SHA1 of dash-dash salt dash-dash pass dash-dash is defined for any salt. 40 hex is merely what Rails make_token, a SHA-1 hexdigest, happens to emit, and hashcat module_27200.c wrote that accident into its token spec as FIXED_LENGTH 40 plus VERIFY_HEX because every sample line in hashcat issue 2913 carried one. mdxfind copied the same limit. An app that keeps the restful_authentication digest but swaps its token generator is therefore unloadable, and that is the common case rather than the exotic one: in the published 27200 corpus of 1,729,406 records, 1,707,447 carry a 20-character mixed-case token and only 20,502 carry a 40-hex salt. The structured loader is unchanged and still claims a 40hex:40hex line exclusively, so that path is byte-identical. What changes is that a 40-hex DIGEST filed by the plain-hex fallthrough is now also inserted into this type own JudyJ when e962 is selected, which is the same additive treatment e918 DCC2 received for the same reason: the type compares against its own JudyJ, the Dosalt suffix capture was already filing the salt correctly, and the digest went only to the compact table where this type never looks. The consequence was a clean-looking run that computed nothing. mdxfind printed found N unique salts for RORAILS-SHA1, listed the type under Working on hash types, then worked it with N salts and ZERO hashes: every digest computed, every lookup missed, exit status zero, and no line distinguishing it from an honest negative. The salt line read like success. hashcat at least fails loudly on the same input with Token length exception and No hashes loaded. The salt reaches the compute arm VERBATIM through Dosalt, with no case folding, which is the second half of the fix and the reason the structured loader was not simply widened: that loader lowercases its salt, free for 40 hex and fatal for a mixed-case token. The compute arm already used the snapshot saltlen and needed no change. Filed only on the slow -F path, not the fast -f one: a NEEDSF type takes its salt from the same line as its hash, so filing the digest on a channel that captures no suffix would reproduce the half-loaded state this removes. Measured on the full corpus through hashpipe: 20,501 verified before, 1,727,898 after, an 84-fold increase, with the remaining 1,076 recognised as SHA1SALTPASS, being the same construction attacked as mode 120 with the delimiters folded into the salt field. mdxfind solves 200 of 200 on a single file holding both widths, 100 through each loader. Regression: hashpipe -T 1061 passed 0 failed 2 skipped, regress/test-F-salted.sh 29 passed 0 failed, hashcat own published 27200 vector recovers in both tools, -z round-trip matches the registered vector, and selecting e962 alongside e120 on a 40hex:textsalt file leaves e120 solving exactly as it does alone, so no line is shadowed.
  *
@@ -12043,13 +12049,19 @@ int checkhashkeylen(union HashU *curin, int len, char *key, int keylen, struct j
  * The printable test itself was already right: (signed char)(c+1) < '!' is true
  * for 0x00, for 0x7f and for every high byte, so only the bounds needed fixing.
  * buf needs 5 + 2*klen + 2 bytes. */
-static char *fmt_saltfield(char *buf, const char *key, int klen)
+static char *fmt_saltfield(char *buf, const char *key, int klen, int wrapcolon)
 {
   static const char lc[] = "0123456789abcdef";
   int j, clean = 1;
   if (klen < 0) klen = 0;
   for (j = 0; j < klen; j++)
     if ((signed char) (key[j] + 1) < '!') { clean = 0; break; }
+  /* Bytes that themselves begin "$HEX[" are wrapped, as a password is, or the
+   * reader decodes them into something else. */
+  if (klen >= 5 && memcmp(key, "$HEX[", 5) == 0) clean = 0;
+  /* A USER field also wraps a colon (Waffle, 2026-11-05), so hash:user:pass
+   * stays parseable. Salt fields keep a raw colon for legacy readers. */
+  if (wrapcolon && clean && memchr(key, ':', (size_t)klen)) clean = 0;
   if (clean) {
     /* Copy exactly klen bytes rather than returning key: the caller's buffer
      * may hold trailing bytes past the salt, and %s would print them. */
@@ -12067,14 +12079,134 @@ static char *fmt_saltfield(char *buf, const char *key, int klen)
   return buf;
 }
 
+/* Decode a WELL-FORMED $HEX[...] (even count of hex digits, closing bracket
+ * last) of length kl into dst. Returns the byte count, or -1 when key is not
+ * such a wrapper -- a malformed one is literal text, never an error. */
+static int unhex_wrapper(const char *key, int kl, unsigned char *dst)
+{
+  int j, n;
+  if (kl < 6 || memcmp(key, "$HEX[", 5) || key[kl - 1] != ']' || ((kl - 6) & 1))
+    return -1;
+  n = (kl - 6) / 2;
+  for (j = 0; j < n; j++) {
+    unsigned char c1 = trhex[(unsigned char)key[5 + 2 * j]];
+    unsigned char c2 = trhex[(unsigned char)key[6 + 2 * j]];
+    if (c1 > 15 || c2 > 15) return -1;
+    dst[j] = (unsigned char)((c1 << 4) | c2);
+  }
+  return n;
+}
+
+/* Canonical STORED form of a userid, applied at every user load site (-u, -U,
+ * -F hash:user, the hex:suffix capture, the JuniperSSG recogniser).
+ *
+ * A userid is binary data, but every user Judy is a JudySL keyed by a C
+ * string, so a NUL, a CR or an LF could never be a user byte, and a user
+ * mdxfind itself had printed as $HEX[...] loaded back as that literal text.
+ * The canonical form fixes both: decode a well-formed $HEX[], then store the
+ * bytes raw when they are printable and hold no colon, else as $HEX[lowercase].
+ * The stored key is therefore exactly the field mdxfind prints, so output
+ * reloads by construction, and "abc" and $HEX[616263] are ONE user whose
+ * reference counts add. Clean ASCII users are stored exactly as before.
+ *
+ * Bytes that begin with "$HEX[" are kept wrapped, so a literal (or malformed)
+ * wrapper survives as itself instead of decoding on the next pass. A wrapped
+ * form that would not fit MAXLINE falls back to the old raw C-string storage.
+ * out needs 2*MAXLINE+16 bytes (its upper half is decode scratch). Returns the
+ * stored length; 0 means an empty user, which every caller skips. */
+static int user_canon(const char *in, int inlen, char *out)
+{
+  static const char lc[] = "0123456789abcdef";
+  unsigned char *raw = (unsigned char *)out + MAXLINE + 8;
+  int n, j, clean = 1;
+
+  if (inlen > MAXLINE - 1) inlen = MAXLINE - 1;
+  n = unhex_wrapper(in, inlen, raw);
+  if (n < 0) { memcpy(raw, in, (size_t)inlen); n = inlen; }
+  for (j = 0; j < n; j++)
+    if ((signed char)(raw[j] + 1) < '!') { clean = 0; break; }
+  if (n >= 5 && memcmp(raw, "$HEX[", 5) == 0) clean = 0;
+  if (memchr(raw, ':', (size_t)n)) clean = 0;   /* a user field wraps ':' */
+  if (clean || 5 + 2 * n + 1 > MAXLINE - 1) {
+    /* ponytail: an over-long binary user keeps the legacy raw form, so a NUL
+     * in it still truncates; widen the user Judy keys if that ever matters. */
+    memcpy(out, raw, (size_t)n);
+    out[n] = 0;
+    return (int)strlen(out);
+  }
+  memcpy(out, "$HEX[", 5);
+  for (j = 0; j < n; j++) {
+    out[5 + 2 * j]     = lc[raw[j] >> 4];
+    out[5 + 2 * j + 1] = lc[raw[j] & 15];
+  }
+  out[5 + 2 * n] = ']';
+  out[5 + 2 * n + 1] = 0;
+  return 5 + 2 * n + 1;
+}
+
+/* Load-time scratch for user_canon; every user load site runs single-threaded
+ * at startup. */
+static char Ucanon[2 * MAXLINE + 16];
+
+/* The inverse, at the point of use: the bytes a stored user key stands for.
+ * dst gets them NUL-terminated; the return is their true length, which a
+ * NUL-bearing user makes different from strlen(dst). */
+static int user_decode(const char *key, char *dst)
+{
+  int kl = (int)strlen(key), n;
+  if (key[0] == '$' && (n = unhex_wrapper(key, kl, (unsigned char *)dst)) >= 0) {
+    dst[n] = 0;
+    return n;
+  }
+  memcpy(dst, key, (size_t)kl + 1);
+  return kl;
+}
+
+/* Walk a user Judy with the stored key in ukey and the DECODED user in tsalt,
+ * its length in Uklen. Compute arms keep using tsalt as the user bytes; they
+ * must take the length from Uklen, never from mystrlen(tsalt). */
+#define UJSLF(PV, J) do { ukey[0] = 0; JSLF(PV, J, (unsigned char *)ukey); \
+                          if (PV) Uklen = user_decode(ukey, tsalt); } while (0)
+#define UJSLN(PV, J) do { JSLN(PV, J, (unsigned char *)ukey); \
+                          if (PV) Uklen = user_decode(ukey, tsalt); } while (0)
+
 /* C-string wrapper, for callers whose key genuinely is one (a hex digest, a
  * userid). A caller holding a BINARY salt must use checkhashkeylen and pass
  * the stored length, or a NUL in the salt truncates the printed field. */
+/* The _user variants print their (last) salt field as a USERID: a colon in
+ * it is $HEX[]-wrapped as well. Every arm that walks a user Judy uses them. */
+static int checkhashkeylen_f(union HashU *curin, int len, char *key, int keylen, struct job *job, int uf);
+static int checkhashsalt_f(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job, int uf);
+static int checkhashsalt2_f(union HashU *curin, int len, char *salt1, int salt1len,
+                            char *salt2, int salt2len, int x, struct job *job, int uf);
+int checkhashkeylen(union HashU *curin, int len, char *key, int keylen, struct job *job)
+{ return checkhashkeylen_f(curin, len, key, keylen, job, 0); }
+int checkhashkeylen_user(union HashU *curin, int len, char *key, int keylen, struct job *job)
+{ return checkhashkeylen_f(curin, len, key, keylen, job, 1); }
+int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job)
+{ return checkhashsalt_f(curin, len, salt, saltlen, x, job, 0); }
+int checkhashsalt_user(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job)
+{ return checkhashsalt_f(curin, len, salt, saltlen, x, job, 1); }
+int checkhashsalt2(union HashU *curin, int len, char *salt1, int salt1len,
+                   char *salt2, int salt2len, int x, struct job *job)
+{ return checkhashsalt2_f(curin, len, salt1, salt1len, salt2, salt2len, x, job, 0); }
+int checkhashsalt2_user(union HashU *curin, int len, char *salt1, int salt1len,
+                        char *salt2, int salt2len, int x, struct job *job)
+{ return checkhashsalt2_f(curin, len, salt1, salt1len, salt2, salt2len, x, job, 1); }
+
 int checkhashkey(union HashU *curin, int len, char *key, struct job *job) {
   return checkhashkeylen(curin, len, key, mystrlen(key), job);
 }
 
-int checkhashkeylen(union HashU *curin, int len, char *key, int keylen, struct job *job) {
+/* An op whose only key data is a userid -- NEEDUSER without NEEDSALT, the
+ * user-keyed HMAC KSALT families among them -- prints that userid in the
+ * salt field whoever reports the hit. The GPU hit replay in gpujob_* calls
+ * the plain checkhashkeylen/checkhashsalt, so deciding here, from the op,
+ * is what makes a GPU hit print the same line as a CPU one. */
+#define USERFIELD_OP(op) ((TYPEOPTS(op) & TYPEOPT_NEEDUSER) && \
+                          !(TYPEOPTS(op) & TYPEOPT_NEEDSALT))
+
+static int checkhashkeylen_f(union HashU *curin, int len, char *key, int keylen, struct job *job, int uf) {
   unsigned char *t;
   int i, j, offset, rotval, dohex;
   char newbuf[513], rotbuf[513];
@@ -12083,6 +12215,7 @@ int checkhashkeylen(union HashU *curin, int len, char *key, int keylen, struct j
 struct Hashchain found;
   int hitcount = 0;
 
+  if (USERFIELD_OP(job->op)) uf = 1;
   Origin = curin;
   if (Rotatehash) {
     rotval = Rotatehash;
@@ -12117,7 +12250,7 @@ struct Hashchain found;
           if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
             hitcount++;
             *match_flags = job->op;
-            key = fmt_saltfield(keybuf, key, keylen);
+            key = fmt_saltfield(keybuf, key, keylen, uf);
             job->pass[job->clen] = 0;
             for (dohex = j = 0; j < job->clen; j++) {
               if ((signed char) (job->pass[j]+1) < '!' || job->pass[j] ==':') {
@@ -12182,7 +12315,7 @@ release(FreeWaiting);
       if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
         hitcount++;
         *match_flags = job->op;
-        key = fmt_saltfield(keybuf, key, keylen);
+        key = fmt_saltfield(keybuf, key, keylen, uf);
         switch (job->op) {
           case JOB_APACHE_SHA:
           case JOB_APACHE_SHA_TRUNC16:
@@ -12259,7 +12392,7 @@ int checkhashwerkzeug(union HashU *curin, int len, char *key, int keylen,
     return 0;
   *match_flags = job->op;
   /* Binary salt: scan keylen bytes, not to the first NUL. */
-  key = fmt_saltfield(keybuf, key, keylen);
+  key = fmt_saltfield(keybuf, key, keylen, 0);
   prmd5(curin->h, newbuf, match_len * 2);
   job->pass[job->clen] = 0;
   for (dohex = j = 0; j < job->clen; j++) {
@@ -12699,7 +12832,7 @@ release(FreeWaiting);
   return (hitcount);
 }
 
-int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job) {
+static int checkhashsalt_f(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job, int uf) {
   unsigned char *t;
   int i, j, offset, rotval, dohex;
   char newbuf[513], rotbuf[513];
@@ -12713,6 +12846,7 @@ struct Hashchain found;
     fprintf(stderr,"Password: %s\n",job->pass);
     exit(1);
   }
+  if (USERFIELD_OP(job->op)) uf = 1;
   Origin = curin;
   if (Rotatehash) {
     rotval = Rotatehash;
@@ -12748,18 +12882,7 @@ struct Hashchain found;
           if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
             hitcount++;
             *match_flags = job->op;
-            saltbuf[saltlen] = 0;
-            for (j = 0; j < saltlen; j++) {
-              saltbuf[j] = salt[j];
-              if ((signed char) (salt[j]+1) < '!') {
-                strcpy(saltbuf, "$HEX[");
-                for (j = 0; j < saltlen; j++)
-                  sprintf(&saltbuf[2 * j + 5], "%02x", salt[j] & 0xff);
-                saltbuf[2 * j + 5] = ']';
-                saltbuf[2 * j + 6] = 0;
-                break;
-              }
-            }
+            fmt_saltfield(saltbuf, salt, saltlen, uf);
 
             job->pass[job->clen] = 0;
             for (dohex = j = 0; j < job->clen; j++) {
@@ -12832,18 +12955,7 @@ release(FreeWaiting);
       if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
         hitcount++;
         *match_flags = job->op;
-        saltbuf[saltlen] = 0;
-        for (j = 0; j < saltlen; j++) {
-          saltbuf[j] = salt[j];
-          if ((signed char) (salt[j]+1) < '!') {
-            strcpy(saltbuf, "$HEX[");
-            for (j = 0; j < saltlen; j++)
-              sprintf(&saltbuf[2 * j + 5], "%02x", salt[j] & 0xff);
-            saltbuf[2 * j + 5] = ']';
-            saltbuf[2 * j + 6] = 0;
-            break;
-          }
-        }
+        fmt_saltfield(saltbuf, salt, saltlen, uf);
         switch (job->op) {
           case JOB_BLAKE2B512PASSSALT:
           case JOB_BLAKE2B512SALTPASS:
@@ -12911,10 +13023,10 @@ release(FreeWaiting);
   return (hitcount);
 }
 
-int checkhashsalt2(union HashU *curin, int len,
+static int checkhashsalt2_f(union HashU *curin, int len,
     char *salt1, int salt1len,
     char *salt2, int salt2len,
-    int x, struct job *job) {
+    int x, struct job *job, int uf) {
   int match_len;
   unsigned short *match_flags;
   int hfound = hybrid_check(curin->h, len, &match_len, &match_flags);
@@ -12939,31 +13051,9 @@ int checkhashsalt2(union HashU *curin, int len,
     *match_flags = job->op;
     prmd5(curin->h, newbuf2, match_len * 2);
     /* encode salt1 */
-    saltbuf1[salt1len] = 0;
-    for (j = 0; j < salt1len; j++) {
-      saltbuf1[j] = salt1[j];
-      if ((signed char) (salt1[j]+1) < '!') {
-        strcpy(saltbuf1, "$HEX[");
-        for (j = 0; j < salt1len; j++)
-          sprintf(&saltbuf1[2 * j + 5], "%02x", salt1[j] & 0xff);
-        saltbuf1[2 * j + 5] = ']';
-        saltbuf1[2 * j + 6] = 0;
-        break;
-      }
-    }
+    fmt_saltfield(saltbuf1, salt1, salt1len, 0);
     /* encode salt2 */
-    saltbuf2[salt2len] = 0;
-    for (j = 0; j < salt2len; j++) {
-      saltbuf2[j] = salt2[j];
-      if ((signed char) (salt2[j]+1) < '!') {
-        strcpy(saltbuf2, "$HEX[");
-        for (j = 0; j < salt2len; j++)
-          sprintf(&saltbuf2[2 * j + 5], "%02x", salt2[j] & 0xff);
-        saltbuf2[2 * j + 5] = ']';
-        saltbuf2[2 * j + 6] = 0;
-        break;
-      }
-    }
+    fmt_saltfield(saltbuf2, salt2, salt2len, uf);
     job->pass[job->clen] = 0;
     for (dohex = j = 0; j < job->clen; j++) {
       if ((signed char) (job->pass[j]+1) < '!' || job->pass[j] == ':') {
@@ -14107,6 +14197,8 @@ int ljobi = 0, FastRule;
 uint32_t *d32, *f32, *dd32;
 struct job *ljob;
 char *linebuf, *linebuf2, *tsalt, *tline, *XMLline, *Origline;
+char *ukey;            /* stored user key during UJSLF/UJSLN walks */
+int Uklen = 0;         /* decoded length of the user in tsalt */
 char *rule_base;       /* Phase 4: cached rule output for mid-mask-cycle restore */
 /* Phase 2 dot-insertion scratch.  A buffer of its own, not a borrowed one:
  * the first attempt used tline, which is the RULE ENGINE'S INPUT, filled once
@@ -14165,6 +14257,7 @@ ljob = malloc_lock(sizeof(struct job)*(4+1),memreason);
 linebuf = malloc_lock(MAXLINE * 3,memreason);
 linebuf2 = malloc_lock(MAXLINE * 3,memreason);
 tsalt = malloc_lock(MAXLINE,memreason);
+ukey = malloc_lock(MAXLINE,memreason);
 tline = malloc_lock(MAXLINE + 16,memreason);
 rule_base = malloc_lock(MAXLINE + 16,memreason);  /* Phase 4 rules+masks restore */
 email_buf = malloc_lock(MAXLINE + 16,memreason);  /* Phase 2 -a dot insertion */
@@ -17087,9 +17180,12 @@ do {
                 JSLF(PV, ujudy, (unsigned char *)ubuf);
                 while (PV) {
                   if (Printall || *PV > 0) {
-                    int ulen = mystrlen(ubuf);
+                    /* ubuf is the Judy cursor; the user bytes go to tsalt,
+                     * which the salt snapshot no longer needs (it lives in
+                     * saltpool). */
+                    int ulen = user_decode(ubuf, tsalt);
                     hx_val r = hx_vm_run(&userdef_vm, vpass, vplen,
-                                         ssalt, slen, "", 0, "", 0, ubuf, ulen);
+                                         ssalt, slen, "", 0, "", 0, tsalt, ulen);
                     int hlen = (r.data && r.len > 0) ? r.len : 0;
                     hashcnt++;
                     if (hlen > 0 && !(hlen & 1) &&
@@ -17101,10 +17197,10 @@ do {
                        * for a salted type loses the one field needed to
                        * re-verify or to file the result with mdsplit. */
                       if (uses_salt)
-                        checkhashsalt2(&curin, hlen, (char *)ssalt, slen,
-                                       ubuf, ulen, x, job);
+                        checkhashsalt2_user(&curin, hlen, (char *)ssalt, slen,
+                                       tsalt, ulen, x, job);
                       else
-                        checkhashsalt(&curin, hlen, ubuf, ulen, x, job);
+                        checkhashsalt_user(&curin, hlen, tsalt, ulen, x, job);
                       last_hlen = hlen;
                       last_hex  = (const char *)r.data;
                     }
@@ -20935,21 +21031,21 @@ sha1passsalt:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       MHASH td;
-                      y = mystrlen(tsalt);
+                      y = Uklen;
                       td = mhash_hmac_init(MHASH_MD5, tsalt, y, mhash_get_hash_pblock(MHASH_MD5));
                       mhash(td, cur, len);
                       mhash_hmac_deinit(td, curin.h);
                       hashcnt += 2;
 		      prmd5(curin.h, mdbuf, 32);
 		      mysha1(mdbuf,32,curin.h);
-                      if (checkhashkey(&curin, 40, tsalt, job))
+                      if (checkhashkeylen_user(&curin, 40, tsalt, Uklen, job))
                         PV_DEC(PV);
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -21599,12 +21695,12 @@ sha1saltpass:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       s1 = tsalt;
                       d = newbuf;
-                      i = saltlen = mystrlen(tsalt);
+                      i = saltlen = Uklen;
                       memcpy(newbuf, tsalt, i);
 		      x = U8TO16LE(newbuf, i, wline, MAXLINE*2);
 		      if (x > 0) {
@@ -21622,10 +21718,10 @@ sha1saltpass:
                       }
                       memmove(linebuf + 16, wline, i);
                       MD4(linebuf, 16 + i, curin.h);
-                      if (checkhashsalt(&curin, 32, s1, saltlen, 1, job))
+                      if (checkhashsalt_user(&curin, 32, s1, saltlen, 1, job))
                         PV_DEC(PV);
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -22680,17 +22776,17 @@ md4utf16:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       len = y;
                       d = linebuf + MAXLINE;
                       s1 = tsalt;
                       cur = d -= i;
                       len += i;
                       { const char *sp = tsalt;
-                        while (*sp) {
+                        while (sp < tsalt + i) {
                           if (douc && islower(*sp))
                             *d++ = toupper(*sp);
                           else
@@ -22702,7 +22798,7 @@ md4utf16:
                       { int ulen = i;
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt++;
-                        if (checkhashsalt(&curin, 40, s1, ulen, x, job))
+                        if (checkhashsalt_user(&curin, 40, s1, ulen, x, job))
                           PV_DEC(PV);
                         if (x < Maxiter) {
                           prmd5(curin.h, newbuf, 40);
@@ -22711,7 +22807,7 @@ md4utf16:
                       }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -23157,10 +23253,10 @@ md4utf16:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
-                      i = saltlen = mystrlen(tsalt);
+                      i = saltlen = Uklen;
                       s1 = tsalt;
                       s = linebuf + len;
                       memmove(s, s1, i);
@@ -23172,7 +23268,7 @@ md4utf16:
                       mymd5(linebuf2, 32 + 40, md5buf.h);
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt++;
-                        if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job))
+                        if (checkhashsalt_user(&md5buf, 32, s1, saltlen, x, job))
                           PV_DEC(PV);
                         if (x < Maxiter) {
                           prmd5(md5buf.h, linebuf2, 32);
@@ -23180,7 +23276,7 @@ md4utf16:
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -24357,12 +24453,12 @@ morepep:
                   mysha1((char *)(linebuf + 32), 32, md5buf.h);
                   prmd5(md5buf.h, linebuf + 32, 40);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
                       s1 = tsalt;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       mymd5(tsalt, i, curin.h);
                       prmd5(curin.h, mdbuf, 32);
@@ -24370,7 +24466,7 @@ morepep:
                       mymd5(linebuf, 32 + 40, md5buf.h);
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt++;
-                        if (checkhashsalt(&md5buf, 32, s1, saltlen, x, job)) {
+                        if (checkhashsalt_user(&md5buf, 32, s1, saltlen, x, job)) {
                           PV_DEC(PV);
                         }
                         if (x < Maxiter) {
@@ -24379,7 +24475,7 @@ morepep:
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -24558,11 +24654,11 @@ morepep:
                   if (!ujudy) break;
                   memmove(linebuf + MAXLINE, cur, len);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       memmove(linebuf + MAXLINE - saltlen, tsalt, saltlen);
@@ -24594,11 +24690,11 @@ morepep:
                       curin.x[2] ^= md5buf.x[2];
                       curin.x[3] ^= md5buf.x[3];
 #endif
-                      if (checkhashkey(&curin, 128, s1, job)) {
+                      if (checkhashkeylen_user(&curin, 128, s1, Uklen, job)) {
                         PV_DEC(PV);
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -24613,12 +24709,12 @@ morepep:
                   mysql3(cur, len, linebuf + MAXLINE + 1);
                   linebuf[MAXLINE] = ':';
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
                       int hashlen;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       d = linebuf + MAXLINE - i;
@@ -24631,7 +24727,7 @@ morepep:
                       }
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt++;
-                        if (checkhashsalt(&curin, hashlen, s1, saltlen, x, job)) {
+                        if (checkhashsalt_user(&curin, hashlen, s1, saltlen, x, job)) {
                           PV_DEC(PV);
                         }
                         if (x < Maxiter) {
@@ -24644,7 +24740,7 @@ morepep:
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -24660,12 +24756,12 @@ morepep:
                   if (!ujudy) break;
                   mysha512(cur, len, (unsigned char *)linebuf);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
                       int hashlen;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       memmove(linebuf + 64, tsalt, i + 1);
@@ -24677,7 +24773,7 @@ morepep:
                       }
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt++;
-                        if (checkhashsalt(&curin, hashlen, s1, saltlen, x, job)) {
+                        if (checkhashsalt_user(&curin, hashlen, s1, saltlen, x, job)) {
                           PV_DEC(PV);
                         }
                         if (x < Maxiter) {
@@ -24690,7 +24786,7 @@ morepep:
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -24707,12 +24803,12 @@ morepep:
                   mysha1(cur, len, curin.h);
                   prmd5(curin.h, linebuf, 40);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
                       int hashlen;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       memmove(linebuf + 40, tsalt, i + 1);
@@ -24724,7 +24820,7 @@ morepep:
                       }
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt++;
-                        if (checkhashsalt(&curin, hashlen, s1, saltlen, x, job)) {
+                        if (checkhashsalt_user(&curin, hashlen, s1, saltlen, x, job)) {
                           PV_DEC(PV);
                         }
                         if (x < Maxiter) {
@@ -24737,7 +24833,7 @@ morepep:
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -24767,13 +24863,13 @@ morepep:
                   if ((job->op == JOB_MD5CAPMD5USER || job->op == JOB_MD5CAPMD5MD5USER) && islower(linebuf2[0]))
                     linebuf2[0] = toupper(linebuf2[0]);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
                       int hashlen;
                       s1 = tsalt;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       memmove(linebuf + 32, tsalt, i + 1);
                       d = linebuf2 + 32;
@@ -24794,10 +24890,10 @@ morepep:
                       }
                       for (x = 1; x <= Maxiter; x++) {
                         hashcnt += 2;
-                        if (checkhashsalt(&mdcur[0], hashlen, s1, saltlen, x, job)) {
+                        if (checkhashsalt_user(&mdcur[0], hashlen, s1, saltlen, x, job)) {
                           PV_DEC(PV);
                         }
-                        if (checkhashsalt(&mdcur[1], hashlen, s1, saltlen, x, job)) {
+                        if (checkhashsalt_user(&mdcur[1], hashlen, s1, saltlen, x, job)) {
                           PV_DEC(PV);
                         }
                         if (x < Maxiter) {
@@ -24816,7 +24912,7 @@ morepep:
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -24837,17 +24933,17 @@ morepep:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       len = y;
                       d = linebuf + MAXLINE;
                       s1 = tsalt;
                       cur = d -= i;
                       len += i;
                       { const char *sp = tsalt;
-                        while (*sp) {
+                        while (sp < tsalt + i) {
                           if (islower(*sp))
                             *d++ = toupper(*sp);
                           else
@@ -24857,10 +24953,10 @@ morepep:
                       }
                       mysha1(cur, len+1, curin.h);
                       hashcnt++;
-                      if (checkhashkey(&curin, 40, s1, job))
+                      if (checkhashkeylen_user(&curin, 40, s1, Uklen, job))
                         PV_DEC(PV);
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -24873,17 +24969,17 @@ morepep:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       len = y;
                       d = job->line;
                       s1 = tsalt;
                       cur = d -= i;
                       len += i;
                       { const char *sp = tsalt;
-                        while (*sp) {
+                        while (sp < tsalt + i) {
                           if (isupper(*sp))
                             *d++ = tolower(*sp);
                           else
@@ -24893,10 +24989,10 @@ morepep:
                       }
                       mysha1(cur, len, curin.h);
                       hashcnt++;
-                      if (checkhashkey(&curin, 40, s1, job))
+                      if (checkhashkeylen_user(&curin, 40, s1, Uklen, job))
                         PV_DEC(PV);
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -24911,11 +25007,11 @@ morepep:
                   if (!ujudy) break;
                   y = len;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       len = y;
                       s1 = tsalt;
                       cur = job->line - 1 - i;
@@ -24924,11 +25020,11 @@ morepep:
                       cur[i] = 0;
                       mymd5(cur, len, curin.h);
                       hashcnt++;
-                      if (checkhashkey(&curin, 32, s1, job)) {
+                      if (checkhashkeylen_user(&curin, 32, s1, Uklen, job)) {
                         PV_DEC(PV);
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -25092,11 +25188,11 @@ sha11saltmd5:
                   mymd5(cur, len, curin.h);
                   cur = prmd5(curin.h, linebuf + MAXLINE, 32);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       if (i <= MAXLINE) {
@@ -25104,20 +25200,20 @@ sha11saltmd5:
                         memmove(s, tsalt, i);
                         mymd5(&linebuf[MAXLINE - i], 32 + i, curin.h);
                         hashcnt++;
-                        if (checkhashkey(&curin, 32, s1, job)) {
+                        if (checkhashkeylen_user(&curin, 32, s1, Uklen, job)) {
                           PV_DEC(PV);
                         }
                         for (x = 2; x <= Maxiter; x++) {
                           hashcnt++;
                           prmd5(curin.h, mdbuf, 32);
                           mymd5(mdbuf, 32, curin.h);
-                          if (checkhashsalt(&curin, 32, s1, saltlen, x, job)) {
+                          if (checkhashsalt_user(&curin, 32, s1, saltlen, x, job)) {
                             PV_DEC(PV);
                           }
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -25133,11 +25229,11 @@ sha11saltmd5:
                   if (!ujudy) break;
                   fastcopy(linebuf + MAXLINE, cur, len);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       if (i <= MAXLINE) {
@@ -25145,20 +25241,20 @@ sha11saltmd5:
                         memmove(s, tsalt, i);
                         mymd5(&linebuf[MAXLINE - i], len + i, curin.h);
                         hashcnt++;
-                        if (checkhashkey(&curin, 32, s1, job)) {
+                        if (checkhashkeylen_user(&curin, 32, s1, Uklen, job)) {
                           PV_DEC(PV);
                         }
                         for (x = 2; x <= Maxiter; x++) {
                           hashcnt++;
                           prmd5(curin.h, mdbuf, 32);
                           mymd5(mdbuf, 32, curin.h);
-                          if (checkhashsalt(&curin, 32, s1, saltlen, x, job)) {
+                          if (checkhashsalt_user(&curin, 32, s1, saltlen, x, job)) {
                             PV_DEC(PV);
                           }
                         }
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -25174,21 +25270,21 @@ sha11saltmd5:
                   if (!ujudy) break;
                   fastcopy(linebuf, cur, len);
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       salts_active = 1;
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       memmove(linebuf + len, tsalt, i);
                       mymd5(linebuf, len + i, curin.h);
                       hashcnt++;
-                      if (checkhashkey(&curin, 32, s1, job)) {
+                      if (checkhashkeylen_user(&curin, 32, s1, Uklen, job)) {
                         PV_DEC(PV);
                       }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                   if (!salts_active) TYPEDONE(job->op) = 1;
                 }
@@ -25201,10 +25297,10 @@ sha11saltmd5:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                       memmove(linebuf, s1, i);
@@ -25212,10 +25308,10 @@ sha11saltmd5:
                       memmove(linebuf + i + 8, cur, len);
                       mymd5(linebuf, i + 8 + len, curin.h);
                       hashcnt++;
-                      if (checkhashkey(&curin, 32, s1, job))
+                      if (checkhashkeylen_user(&curin, 32, s1, Uklen, job))
                         PV_DEC(PV);
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -25432,10 +25528,10 @@ sha11saltmd5:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
-                      i = mystrlen(tsalt);
+                      i = Uklen;
                       saltlen = i;
                       s1 = tsalt;
                   /* build: username + ":Administration Tools:" + password */
@@ -25472,17 +25568,17 @@ sha11saltmd5:
                         if ((signed char) (job->pass[x]+1) < '!') { y2 = 1; break; }
                       }
                       if (y2)  {
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", TYPENAME(job->op), linebuf2, s1);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:$HEX[", TYPENAME(job->op), linebuf2, ukey);
                         prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                         job->outlen += job->clen*2;
                         job->outbuf[job->outlen++] = ']';
                         job->outbuf[job->outlen++] = '\n';
                       } else
-                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", TYPENAME(job->op), linebuf2, s1, job->pass);
+                        job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s:%s\n", TYPENAME(job->op), linebuf2, ukey, job->pass);
                     }
                   }
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -31329,7 +31425,7 @@ nextsalt1:
                         mymd5(linebuf, iul + dlen, curin.h);
                         for (x = 1; x <= Maxiter; x++) {
                           hashcnt++;
-                          if (checkhashsalt2(&curin, 32, dsalt, 2, iu, iul, x, job))
+                          if (checkhashsalt2_user(&curin, 32, dsalt, 2, iu, iul, x, job))
                             PV_DEC(saltsnap[si].PV);
                           if (x < Maxiter) {
                             prmd5(curin.h, newbuf, 32);
@@ -31358,7 +31454,7 @@ nextsalt1:
                             mymd5(linebuf, ulen + dlen, curin.h);
                             for (x = 1; x <= Maxiter; x++) {
                               hashcnt++;
-                              if (checkhashsalt2(&curin, 32, dsalt, 2,
+                              if (checkhashsalt2_user(&curin, 32, dsalt, 2,
                                                  uu, ulen, x, job)) {
                                 PV_DEC(UPV);
                                 PV_DEC(saltsnap[si].PV);
@@ -32918,11 +33014,11 @@ md5sha256:
                   f32 = (uint32_t *) hashes;
 #endif
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       s = tsalt;
-                      { int kl = mystrlen(tsalt);
+                      { int kl = Uklen;
                         if (kl > MAXLINE - 1) kl = MAXLINE - 1;
                         memcpy(sbufcopy + ljobi * MAXLINE, tsalt, kl);
                         sbufcopy[ljobi * MAXLINE + kl] = 0;
@@ -32954,7 +33050,7 @@ md5sha256:
                       }
                       ljobi++;
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                     if (ljobi >= 4 || (!PV && ljobi)) {
 #ifndef NOTINTEL
                       { __m128i *p, r1;
@@ -37983,19 +38079,19 @@ HAV256_5_start:
                   if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
                   if (!ujudy) break;
                   tsalt[0] = 0;
-                  JSLF(PV, ujudy, (unsigned char *)tsalt);
+                  UJSLF(PV, ujudy);
                   while (PV) {
                     if (Printall || *PV > 0) {
                       MHASH td;
-                      y = mystrlen(tsalt);
+                      y = Uklen;
                       td = mhash_hmac_init(hmac_type, tsalt, y, mhash_get_hash_pblock(hmac_type));
                       mhash(td, cur, len);
                       mhash_hmac_deinit(td, curin.h);
                       hashcnt++;
-                      if (checkhashkey(&curin, hmac_len, tsalt, job))
+                      if (checkhashkeylen_user(&curin, hmac_len, tsalt, Uklen, job))
                         PV_DEC(PV);
                     }
-                    JSLN(PV, ujudy, (unsigned char *)tsalt);
+                    UJSLN(PV, ujudy);
                   }
                 }
                 break;
@@ -38599,14 +38695,14 @@ HAV256_5_start:
 		    { Pvoid_t uj = (Pvoid_t)TYPEUSER(job->op);
 		      if (!uj) uj = (Pvoid_t)UseridJudy;
 		      ukeys = "admin";
+		      ulen = 5;
 		      if (uj) {
-		        tsalt[0] = 0;
+		        ukey[0] = 0;
 		        Word_t *upv;
-		        JSLF(upv, uj, (unsigned char *)tsalt);
-		        if (upv) ukeys = tsalt;
+		        JSLF(upv, uj, (unsigned char *)ukey);
+		        if (upv) { ulen = user_decode(ukey, tsalt); ukeys = tsalt; }
 		      }
 		    }
-		    ulen = mystrlen(ukeys);
 		    /* hex-encode username for output */
 		    uhexlen = 0;
 		    { int ux;
@@ -50125,8 +50221,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         *s = 0;
         JSLI(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)line);
         *s = ':';
-        if (s[1])
-          JSLI(PV, UserArray, (unsigned char *)(s + 1));
+        if (s[1] && user_canon(s + 1, (int)strlen(s + 1), Ucanon) > 0)
+          JSLI(PV, UserArray, (unsigned char *)Ucanon);
         Foundcnt[JOB_JUNIPERSSG]++;
         continue;
       }
@@ -50286,10 +50382,9 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         JSLI(PV, JUDYJ(_uop), (unsigned char *)line);
         if (_sl && _sll > 0)
           Saltloaded[_uop] += store_typesalt(_uop, (char *)_sl, _sll);
-        if (_us && _usl > 0) {
+        if (_us && _usl > 0 && user_canon((char *)_us, _usl, Ucanon) > 0) {
           Word_t *_UV;
-          memcpy(salttmp, _us, (size_t)_usl); salttmp[_usl] = 0;
-          JSLI(_UV, TYPEUSER(_uop), (unsigned char *)salttmp);
+          JSLI(_UV, TYPEUSER(_uop), (unsigned char *)Ucanon);
           if (_UV) { if ((*_UV)++ == 0) Userloaded[_uop]++; }
         }
         Foundcnt[_uop]++;
@@ -55207,8 +55302,9 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
 	     if (PV) { if ((*PV)++ == 0) {Saltloaded[Dosalt[x]]++;} }
 	     /* Typehashsalt populated in main() after all salts loaded */
           }
+	  if (Dousercnt && user_canon(suffix, (int)strlen(suffix), Ucanon) > 0)
 	  for (x=0;  x < Dousercnt; x++) {
-	     JSLI(PV, TYPEUSER(Douser[x]),(unsigned char *)suffix);
+	     JSLI(PV, TYPEUSER(Douser[x]),(unsigned char *)Ucanon);
 	     if (PV) { if ((*PV)++ == 0) {Userloaded[Douser[x]]++;} }
           }
         }
@@ -56148,8 +56244,8 @@ union HashU curin;
               JSLI(PV, SaltArray, (unsigned char *)line);
               break;
             case 'u':
-              if (len != 0) {
-                JSLI(PV, UserArray, (unsigned char *)line);
+              if (len != 0 && user_canon(line, len, Ucanon) > 0) {
+                JSLI(PV, UserArray, (unsigned char *)Ucanon);
               }
               break;
             case 'k':
@@ -56918,12 +57014,14 @@ badrule:
           while (fgets(line, MAXLINE, uf)) {
             cur = strchr(line, 13); if (cur) *cur = 0;
             cur = strchr(line, 10); if (cur) *cur = 0;
-            if (mystrlen(line) > 0) {
+            if (mystrlen(line) > 0 &&
+                user_canon(line, (int)mystrlen(line), Ucanon) > 0) {
               /* Count occurrences: a userid supplied N times is a userid that
                * accounts for N hashes, and that count becomes its reference
                * count below, so it retires when its hashes are solved. JSLI
-               * initialises a new value to 0, so ++ yields 1 on first sight. */
-              JSLI(PV, TmpUser, (unsigned char *)line);
+               * initialises a new value to 0, so ++ yields 1 on first sight.
+               * Canonical form, so a raw and a $HEX[] spelling count as one. */
+              JSLI(PV, TmpUser, (unsigned char *)Ucanon);
               if (PV) (*PV)++;
               ucnt++;
             }
@@ -61512,26 +61610,46 @@ usage:
     J1T(RC, Dohash, dti);
     if (RC && TYPEUSER(JOB_DCC2)) {
       Pvoid_t dcc_uj = (Pvoid_t)TYPEUSER(JOB_DCC2);
-      char dcc_u[256], dcc_s[288];
+      /* Sized for any stored user key: a canonical $HEX[] key is longer than
+       * the name it stands for. */
+      char *dcc_u = malloc(MAXLINE), *dcc_b = malloc(MAXLINE);
+      char *dcc_s = malloc(MAXLINE), *dcc_c = malloc(2 * MAXLINE + 16);
       Word_t *DUPV, *DSPV;
-      int dcc_n = 0;
+      int dcc_n = 0, dcc_skip = 0;
+      if (!dcc_u || !dcc_b || !dcc_s || !dcc_c) {
+        fprintf(stderr, "%s:%d: malloc failed folding DCC2 userids\n", __FILE__, __LINE__);
+        exit(1);
+      }
       dcc_u[0] = 0;
       JSLF(DUPV, dcc_uj, (unsigned char *)dcc_u);
       while (DUPV) {
-        int ul = mystrlen(dcc_u), k, off;
-        if (ul > 0 && ul < 200) {
-          off = snprintf(dcc_s, sizeof(dcc_s), "%d:", DCC2_DEFAULT_ITER);
+        /* The userid's BYTES, then iter:lc(user) re-canonicalised, so a user
+         * needing $HEX[] is stored as one whole wrapper that
+         * build_salt_snapshot decodes back to iter:bytes. */
+        int ul = user_decode(dcc_u, dcc_b), k, off, bad = 0;
+        /* A control byte (CR, LF, NUL, ...) cannot appear in the
+         * $DCC2$iter#user#hash construct, so such a user is invalid for
+         * this type and is skipped, and counted (Waffle, 2026-11-05). */
+        for (k = 0; k < ul; k++)
+          if ((unsigned char)dcc_b[k] < 0x20 || dcc_b[k] == 0x7f) { bad = 1; break; }
+        if (bad) dcc_skip++;
+        else if (ul > 0 && ul < 200) {
+          off = snprintf(dcc_s, 32, "%d:", DCC2_DEFAULT_ITER);
           for (k = 0; k < ul; k++)
-            dcc_s[off + k] = tolower((unsigned char)dcc_u[k]);
-          dcc_s[off + ul] = 0;
-          JSLI(DSPV, TYPESALT(JOB_DCC2), (unsigned char *)dcc_s);
+            dcc_s[off + k] = tolower((unsigned char)dcc_b[k]);
+          user_canon(dcc_s, off + ul, dcc_c);
+          JSLI(DSPV, TYPESALT(JOB_DCC2), (unsigned char *)dcc_c);
           if (DSPV) { *DSPV += *DUPV; dcc_n++; }
         }
         JSLN(DUPV, dcc_uj, (unsigned char *)dcc_u);
       }
+      free(dcc_u); free(dcc_b); free(dcc_s); free(dcc_c);
       if (dcc_n)
         fprintf(stderr, "DCC2: %d userid(s) from -u/-U folded into salts "
                         "at %d iterations\n", dcc_n, DCC2_DEFAULT_ITER);
+      if (dcc_skip)
+        fprintf(stderr, "DCC2: %d userid(s) skipped: a control byte is invalid "
+                        "in $DCC2$iter#user#hash\n", dcc_skip);
     }
   }
   if (combo_pepper) {

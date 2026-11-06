@@ -1,8 +1,17 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.19 $
+.\" $Revision: 1.22 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.22  2026/11/06 04:30:43  dlr
+.\" Document $HEX[] userids, new in mdxfind 1.658/1.659. The -u entry states that a wrapped userid is decoded on every userid channel (-u, -U, the userid field of -F), so a userid can hold a colon, CR, LF or NUL; a malformed wrapper stays literal; raw and wrapped spellings of one userid load once. On output a userid with a control byte, space, high-bit byte, colon or a leading $HEX[ is written wrapped, so a found line round-trips through -F and hashpipe, and CPU and GPU give the same line. DCC2 has no escape in $DCC2$iter#user#hash and skips control-byte userids with a count on stderr. Salts are unchanged. -U points at -u. TH to 2026-11-05, mdxfind 1.659.
+.\"
+.\" Revision 1.21  2026/11/01 13:48:13  dlr
+.\" Date field to the day the -C entry was written. 1.20 moved the version field and left the date behind.
+.\"
+.\" Revision 1.20  2026/11/01 13:47:59  dlr
+.\" Document -C: continue reporting a hash after it is solved, so every candidate matching it is reported rather than only the first. For a type whose stored digest is truncated, where many plaintexts legitimately share one stored value. Records that it implies -v, and why that extends to every salted type rather than just the ones -v reaches: retiring the salt a hash was solved with would stop the very repeats the option exists to report, and would do it by shrinking the next salt snapshot rather than by saying anything. Also states that the per-type counters then count reported lines and not distinct hashes, so the N TYPE hashes found summary stops agreeing with the number of hashes loaded; that summary is a counter and has been read as a label before. Version field to mdxfind 1.655.
+.\"
 .\" Revision 1.19  2026/11/01 05:46:42  dlr
 .\" Bring the .TH version field up to the tool revision it documents. The field carries the TOOL version, not this pages revision -- mdsplit.1 1.3 says mdsplit 1.30 -- and it read mdxfind 1.606 against a tool at 1.654, so the footer of the page shipped in a v1.654 release would have named a revision 48 behind. Date advanced to the day the page was last changed.
 .\"
@@ -64,7 +73,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-10-31" "mdxfind 1.654" "Password Recovery"
+.TH MDXFIND 1 "2026-11-05" "mdxfind 1.659" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS
@@ -519,6 +528,42 @@ instead when the salts should retire as their hashes are solved.
 .BI \-u " file"
 Load userids into the global userid array, one per line.  Empty lines are
 ignored.
+.IP
+A userid wrapped in
+.BI $HEX[ ... ]
+is decoded, so a userid may hold any byte, including a colon, a carriage
+return, a line feed or a NUL.  This applies to every userid channel:
+.BR \-u ,
+.B \-U
+and the userid field of a
+.B \-F
+record.  A malformed wrapper, such as an odd number of digits, is taken
+literally.
+.B abc
+and
+.B $HEX[616263]
+are the same userid and load once.
+.IP
+On output, a userid containing a byte that does not survive the line format
+(a control character, a space, a high\-bit byte, a colon, or text that begins
+.BR $HEX[ )
+is written wrapped, in the same way as a password.  A found line can therefore
+be read back through
+.BR \-F ,
+or checked with
+.BR hashpipe (1),
+with its userid intact.  The same userid list gives the same output with or
+without the GPU.
+.IP
+.B DCC2
+.RB ( $DCC2$ iter # user # hash )
+has no escape for its userid field.  A userid containing a control byte is
+skipped for that type, and the number skipped is reported on stderr.
+.IP
+Salts are not decoded this way:
+.BR \-s ,
+.B \-S
+and salt fields keep their current handling.
 .TP
 .BI \-j " file"
 Load
@@ -578,6 +623,9 @@ global otherwise.  The filename
 or
 .B \-
 reads standard input.
+.B $HEX[]
+userids are decoded as for
+.BR \-u .
 .TP
 .BI \-k " file"
 Load keys (suffixes) from
@@ -1124,6 +1172,32 @@ the full digest.
 .B \-v
 Do not mark salts as found.  A salt that has produced one crack is normally
 retired; this keeps it live.
+.TP
+.B \-C
+Continue reporting a hash after it has been solved.  A hash is normally retired
+on its first match, so one stored value yields at most one output line; under
+.B \-C
+every candidate that matches it is reported.
+.IP
+This is for a type whose stored digest is
+.IR truncated ,
+where many plaintexts legitimately share one stored value and reporting only
+one of them discards the rest.  A user-defined type declaring a short digest
+length is the usual case: a stored value of two hex characters is matched by
+roughly one word in 256, and all of them are wanted.
+.IP
+Implies
+.BR \-v ,
+and for the same reason extended to every salted type: retiring the salt a hash
+was solved with would stop the very repeats this option exists to report, and
+would do it silently, by shrinking the next salt snapshot rather than by saying
+anything.
+.IP
+The per\-type counters then count REPORTED LINES and not distinct hashes, so
+the
+.I "N TYPE hashes found"
+summary no longer agrees with the number of hashes loaded.  That is the honest
+number for a truncated digest, but it is no longer a hash count.
 .SH "OUTPUT AND DIAGNOSTICS"
 .TP
 .B \-p
