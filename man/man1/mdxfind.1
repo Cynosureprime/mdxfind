@@ -1,8 +1,11 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.22 $
+.\" $Revision: 1.23 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.23  2026/11/07 16:39:04  dlr
+.\" mdxfind 1.661. The -F founds-file paragraphs: a line that no selected type accepts is now offered again with its last colon field removed, right to left, and the longest prefix that loads is kept, so DESCRYPT, BSDICRYPT, CISCOPIX, the 0x MSSQL and Sybase forms, Oracle, NetScaler, NetNTLM, SAP and others load from hash:plain and from hash:bad:pass. Removed the sentence that said those self-delimiting forms are read whole, which is no longer true. States that a line that loads as written is never cut, and that hash:salt:plain in a salted type loads with salt:plain as its salt. TH to 2026-11-07, mdxfind 1.661.
+.\"
 .\" Revision 1.22  2026/11/06 04:30:43  dlr
 .\" Document $HEX[] userids, new in mdxfind 1.658/1.659. The -u entry states that a wrapped userid is decoded on every userid channel (-u, -U, the userid field of -F), so a userid can hold a colon, CR, LF or NUL; a malformed wrapper stays literal; raw and wrapped spellings of one userid load once. On output a userid with a control byte, space, high-bit byte, colon or a leading $HEX[ is written wrapped, so a found line round-trips through -F and hashpipe, and CPU and GPU give the same line. DCC2 has no escape in $DCC2$iter#user#hash and skips control-byte userids with a count on stderr. Salts are unchanged. -U points at -u. TH to 2026-11-05, mdxfind 1.659.
 .\"
@@ -73,7 +76,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-11-05" "mdxfind 1.659" "Password Recovery"
+.TH MDXFIND 1 "2026-11-07" "mdxfind 1.661" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS
@@ -454,8 +457,24 @@ and
 .BI $ name $ \fR...
 wrappers \(em the trailing
 .BI : plain
-is cut off and the hash loads.  Re-processing a founds file therefore needs
-no preparation for those types.
+is cut off before the line is read.
+.IP
+Any other line that no selected type accepts is offered again with its last
+colon-separated field removed, then again, right to left, until a selected
+type accepts it.  The longest prefix that loads is the one kept, so a hash
+whose own grammar holds colons is still read whole.  This covers the
+self-delimiting hashes that look like a bare digest \(em
+.BR DESCRYPT ,
+.BR BSDICRYPT ,
+.BR CISCOPIX ,
+the
+.B 0x
+MSSQL and Sybase forms, Oracle, NetScaler, NetNTLM, SAP and others \(em
+and a line with more than one trailing field, such as
+.BR hash:bad:pass .
+A line that loads as written is never cut, so no line that loaded before
+loads differently.  Re-processing a founds file, or a list of incorrect
+solves, therefore needs no preparation for these types.
 .IP
 This does not, and cannot, extend to a salted type.  Its
 .B \-F
@@ -476,16 +495,11 @@ the hash is data, not a plaintext:
 for the BLAKE2 PASSSALT and SALTPASS types, and the bcrypt MCF when
 .B e1059
 BCRYPTMD5PASSSALT is in the selection, which takes a site salt from there.
-A hash that is self-delimiting but indistinguishable from a bare digest
-.RB ( DESCRYPT ,
-.BR BSDICRYPT ,
-.BR CISCOPIX ,
-the
-.B 0x
-MSSQL and Sybase forms, Oracle, NetScaler)
-is also read whole, since cutting it would break the ordinary
-.BI hash : salt
-line.
+The same holds for
+.BI hash : salt : plain
+in a salted type: it loads as written, with
+.BI salt : plain
+as its salt, so it is never cut.
 .TP
 .BI \-J " file"
 As

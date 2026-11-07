@@ -415,10 +415,10 @@ int Neon;
 #define mysha1 SHA1
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.660 2026/11/06 12:47:54 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.661 2026/11/07 16:38:57 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.660 2026/11/06 12:47:54 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.661 2026/11/07 16:38:57 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 static __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -436,6 +436,9 @@ static __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.661  2026/11/07 16:38:57  dlr
+ * The -F loader ignores data after a fully accepted hash, per Waffle. A line that loaded nothing is offered to the whole recognizer chain again with its last colon field removed, right to left, at most 32 times, so the longest prefix a selected type accepts wins and a hash whose own grammar holds colons is still read whole. Whether a line loaded is measured by claim_mark, HashesThisFile plus Foundcnt over the selected types (lf, plus Dohash members since YAF-SHA1 gates on Dohash), so a line that loads as written is never retried and loads exactly as before. The line is restored from rt_orig before each try because a recognizer may write into the buffer and then decline. hexform_cut ends the hash at the colon for the fixed-width all-hex blobs ORACLE11 60, ORACLE12 160, ANDROIDFDE 160, NETSCALER-SHA512 137 lead 2 and NETSCALER-PBKDF2 129 lead 5, which the plain-hex loader otherwise took as hex:salt before the retry could see them. Also two faults found by the same sweep. PROGRESSENCODE and the unsalted $BLAKE2$ forms of BLAKE2B512, BLAKE2S256 and BLAKE2B256 are TYPEOPT_NEEDSF, so selected alone they left LoadStructured at 0 and the hex-only fast path ran, never reaching their recognizers: none loaded its own -z line. They now force the slow path unless hex_only. YAF-SHA1 printed its salt after the swap-remove of the salt snapshot had moved si, reading saltsnap[-1] with one salt and printing (null), which is why it looked intermittent; the salt pointer is now taken first. No other of the 276 swap-remove sites prints a salt after the remove. Measured by feeding every type its own -z line back with :password, :badpass and :bad:pass: 777 of 947 types take all three, against 736 in 1.660, none worse; the 170 left are salted, where hash:salt:plain loads with salt:plain as its salt. test-F-salted.sh 29 of 29. A million hex:salt lines load in 2.36 s against 2.38 s; a million lines that load nothing take 1.64 s against 1.25 s.
+ *
  * Revision 1.660  2026/11/06 12:47:54  dlr
  * Salted template GPU hits above 32768 salts printed the wrong salt and password. The dispatcher packed the hit as X times the FULL salt count plus the global salt index in one uint32, X being rule times mask_size plus mask; a brute-force chunk has mask_size 131072, so the product wrapped once a run had more than 32768 salts. The digest matched, the replay decoded the wrong salt and candidate, printed a line that does not verify, and marked the hash solved, so the true answer was never reported. Reported by Waffle on mmt: e31 MD5SALT, ?a?a?a, the 903952 generated salts, 2517 hits and none verify. Every op in the salted template set was affected, on OpenCL by brute force and on Metal by -n masks. The global salt index now travels out of band in gpu_dispatch_hit_salt, defined here beside gpu_dispatch_mask_size because this is the one file in every build; gpujob.h states the contract. Verified against python oracles, never mdxfind: on the RTX 4070 Ti SUPER, 40 hashcat 2611 vectors 40 of 40 at 903952 generated salts where 1.659 gave 2, the reported file 2517 of 2517, seven salted modes 140 of 140 at 40000 salts where 1.659 gave 16 to 19 of 20 each, and rules plus salts and unsalted brute force byte-identical to 1.659; on the dev1 M1, 20 of 20 Metal hits verify with salt indexes to 39578.
  *
@@ -34948,6 +34951,10 @@ sha1md5md5uc:
                       b64_encode((char *)curin.h, yaf_b64, 20);
                       JSLG(PV2, JUDYJ(JOB_YAF_SHA1), (unsigned char *)yaf_b64);
                       if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                        /* Keep the salt before the swap-remove below: it moves
+                         * si, and the print then read saltsnap[-1] (with one
+                         * salt) and wrote "(null)" for the salt. */
+                        const char *yaf_salt = saltsnap[si].salt;
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -34971,14 +34978,14 @@ sha1md5md5uc:
                           }
                           if (dohex) {
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s %s:$HEX[",
-                              TYPENAME(job->op), yaf_b64, saltsnap[si].salt);
+                              TYPENAME(job->op), yaf_b64, yaf_salt);
                             prmd5((unsigned char *)job->pass, &job->outbuf[job->outlen], job->clen*2);
                             job->outlen += job->clen*2;
                             job->outbuf[job->outlen++] = ']';
                             job->outbuf[job->outlen++] = '\n';
                           } else
                             job->outlen += sprintf(&job->outbuf[job->outlen], "%s %s %s:%s\n",
-                              TYPENAME(job->op), yaf_b64, saltsnap[si].salt, job->pass);
+                              TYPENAME(job->op), yaf_b64, yaf_salt, job->pass);
                         }
                       }
                     }
@@ -49982,6 +49989,37 @@ static int stored_form_len(const char *s, int len, const char *lf)
   return c ? (int)(c - s) : 0;
 }
 
+/* How much has load_hash_file filed so far?  Compared across one line to
+ * tell "nothing loaded it" from "something did", for the trailing-field
+ * retry.  HashesThisFile counts the plain-hex commits. */
+static unsigned long claim_mark(const int *found, const int *sel, int nsel)
+{
+  unsigned long t = HashesThisFile;
+  int i;
+  for (i = 0; i < nsel; i++) t += (unsigned long)found[sel[i]];
+  return t;
+}
+
+/* A fixed-width, all-hex stored form followed by ":<anything>".
+ *
+ * Oracle 11 and 12, Android FDE and the NetScaler forms are one hex blob
+ * that carries its own salt.  Followed by a colon, the plain-hex loader
+ * claims the line as "<hex>:<salt>" before the trailing-field retry ever
+ * sees it, so "<blob>:bad-password" loads a digest that cannot match.  The
+ * blob's width is the type's own, so when that type is selected and the
+ * line is exactly n hex digits and then a colon, the colon ends the hash
+ * and the rest is ignored.  first, when not 0, is the required lead char. */
+static void hexform_cut(char *line, int *len, int n, char first)
+{
+  int i;
+  if (*len <= n || line[n] != ':') return;
+  if (first && line[0] != first) return;
+  for (i = 0; i < n; i++)
+    if (!isxdigit((unsigned char)line[i])) return;
+  line[n] = 0;
+  *len = n;
+}
+
 static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
                            int hex_only) {
   char line[MAXLINE + 16], *cur, *s;
@@ -49990,6 +50028,9 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
   static const int jsigpos[] = {0, 6, 12, 17, 23, 29};
   static const char jsig[] = "nrcstn";
   int Foundcnt[JOB_DONE];
+  static char rt_orig[MAXLINE + 16];  /* trailing-field retry, see loop end */
+  int rt_cut = 0, rt_tries = 0, rt_nsel = 0, rt_sel[JOB_DONE];
+  unsigned long rt_mark = 0;
   char lf[JOB_DONE],LoadStructured = 0, salttmp[MAXLINE+16];
   int Dosalt[JOB_DONE],Douser[JOB_DONE];
   int Dosaltcnt = 0, Dousercnt = 0;
@@ -50054,6 +50095,16 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
     }
   }
 
+  /* Four TYPEOPT_NEEDSF types also have a stored form that is NOT plain
+   * hex: PROGRESSENCODE (16 letters) and the unsalted $BLAKE2$<hex> forms.
+   * Their recognizers live in the slow path. Selected alone, NEEDSF left
+   * LoadStructured at 0, the hex-only fast path ran, and every one of
+   * their own -z lines loaded nothing. hex_only (-f) never runs the
+   * recognizers, so the fast path stays correct there. */
+  if (!hex_only && (lf[JOB_PROGRESSENCODE] || lf[JOB_BLAKE2B512] ||
+                    lf[JOB_BLAKE2S256] || lf[JOB_BLAKE2B256]))
+    LoadStructured = 1;
+
   if (!any) {
     fprintf(stderr, "No hash types selected for %s\n", filename);
     return;
@@ -50100,6 +50151,13 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
   }
 
   /* Slow path: structured format handlers + hex fallthrough */
+  /* Only a selected type can be filed, so only those counters move.  A few
+   * recognizers (YAF-SHA1) gate on Dohash rather than lf[], so take both. */
+  for (x = 0; x < JOB_DONE; x++) {
+    if (lf[x]) { rt_sel[rt_nsel++] = x; continue; }
+    J1T(RC, Dohash, x);
+    if (RC) rt_sel[rt_nsel++] = x;
+  }
   while (gzgets(gi, line, MAXLINE)) {
     cur = strchr(line, 13);
     if (cur) *cur = 0;
@@ -50136,6 +50194,15 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
       if (_hx < len) { line[_hx] = 0; len = _hx; }
       if (len == 0) continue;
     }
+    /* Arm the trailing-field retry at the bottom of this loop.  See there. */
+    rt_cut = 0;
+    if (!hex_only && memchr(line, ':', (size_t)len)) {
+      memcpy(rt_orig, line, (size_t)len + 1);
+      rt_cut = len;
+      rt_tries = 0;
+      rt_mark = claim_mark(Foundcnt, rt_sel, rt_nsel);
+    }
+  reparse:
     /* mdxfind's own output read back: "<stored form>:<plaintext>".  Where the
      * format's grammar excludes the colon, cut at the first one so the
      * recognizers below see the shape they measure.  -f is exempt: it has
@@ -50409,6 +50476,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
      * output, so a found line can be fed straight back to Oracle or to us.
      * Oracle stores uppercase, and so does the JudyJ key built here, matching
      * what procjob assembles with prmd5UC. */
+    if (lf[JOB_ORACLE11]) hexform_cut(line, &len, 60, 0);
     if (lf[JOB_ORACLE11] && len == 60 && !strchr(line, ':')) {
       int ook = 1;
       for (y = 0; y < 60; y++) {
@@ -54727,6 +54795,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
     }
     /* Oracle 12+ (12300): 160 hex chars = 128 hash + 32 salt (uppercase)
      * JudyJ key = first 64 hex (lowercase), Typesalt = 32-hex salt (lowercase) */
+    if (lf[JOB_ORACLE12]) hexform_cut(line, &len, 160, 0);
     if (lf[JOB_ORACLE12] && len == 160) {
       int or_ok = 1;
       for (y = 0; y < 160; y++)
@@ -54811,6 +54880,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
     /* Android FDE Samsung DEK (12900): HMAC-SHA256(PBKDF2-SHA256(pass,salt,4096,32), salt2)
      * Format: 160 hex = salt2(64) + hmac(64) + salt(32)
      * JudyJ = 64-hex hmac (lc), Typesalt = salt2_hex:salt_hex */
+    if (lf[JOB_ANDROIDFDE]) hexform_cut(line, &len, 160, 0);
     if (lf[JOB_ANDROIDFDE] && len == 160) {
       int af_ok = 1;
       for (y = 0; y < 160; y++)
@@ -55025,6 +55095,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
       }
     }
     /* NetScaler PBKDF2: 5 + 64-hex-salt + 64-hex-hash (129 chars) → Judy + Typesalt */
+    if (lf[JOB_NETSCALER_PBKDF2]) hexform_cut(line, &len, 129, '5');
     if (lf[JOB_NETSCALER_PBKDF2] && len == 129 && line[0] == '5') {
       int ns_ok = 1;
       for (y = 1; y < 129; y++) {
@@ -55038,6 +55109,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
       }
     }
     /* NetScaler SHA512: 2SALTHEXHASH (1 + 8salt + 128hex = 137 chars) → reformat as hexhash:salt */
+    if (lf[JOB_NETSCALER_SHA512]) hexform_cut(line, &len, 137, '2');
     if (lf[JOB_NETSCALER_SHA512] && mystrlen(line) == 137 && line[0] == '2') {
       char tmp[MAXLINE + 16];
       /* hex hash is at positions 9..136, salt at positions 1..8 */
@@ -55314,6 +55386,46 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
           }
         }
         continue;
+      }
+    }
+    /* Nothing loaded this line.  Retry it without its trailing field.
+     *
+     * A structured hash followed by ":<anything>" -- most often a founds
+     * file holding a WRONG solve, "hash:bad-password" -- is refused by every
+     * recognizer that measures its hash, DESCRYPT's len == 13 among them.
+     * The general rule is that once a hash has been fully accepted, what
+     * follows it on the line is ignored.  That cannot be done by cutting
+     * first, because the ordinary "<hash>:<salt>" form is the same shape and
+     * a salt may be any length and contain anything.  So it is done by
+     * cutting LAST: the whole line has already been offered to every
+     * recognizer and to the hex loader, and only a line that loaded NOTHING
+     * comes back here.  Every line that loads today loads exactly as before.
+     *
+     * The cut moves right to left through the colons, so the longest prefix
+     * any selected type accepts wins.  That is what keeps a hash whose own
+     * grammar uses the colon whole: "sha256:1000:<salt>:<digest>:bad" is
+     * offered as "sha256:1000:<salt>:<digest>" before anything shorter.
+     *
+     * "Nothing loaded" is measured, not assumed: a few recognizers load and
+     * fall through rather than continue, so the per-type counters are summed
+     * before and after.  The original line is restored before each try
+     * because a recognizer may write into the buffer and then decline.
+     *
+     * Known limit: a salted hash with a wrong solve appended,
+     * "<hex>:<salt>:<bad>", already loads on the first pass, with
+     * "<salt>:<bad>" as its salt.  That is the ambiguity this cannot
+     * resolve, and that line is unchanged. */
+    if (rt_cut > 0 && rt_tries < 32 &&
+        claim_mark(Foundcnt, rt_sel, rt_nsel) == rt_mark) {
+      int c = rt_cut - 1;
+      while (c > 0 && rt_orig[c] != ':') c--;
+      if (c > 0) {
+        memcpy(line, rt_orig, (size_t)c);
+        line[c] = 0;
+        len = c;
+        rt_cut = c;
+        rt_tries++;
+        goto reparse;
       }
     }
   }
