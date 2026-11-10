@@ -29367,30 +29367,29 @@ static const hx_program _hx_program_850 = {
     .has_emit  = 0,
 };
 
-/* eidx=851 e854 MACOSX7 : `pbkdf2_sha512(pass, salt, N, 128)` (hx.8 line 953) */
+/* eidx=851 e854 MACOSX7 : `sha512(fromhex(salt) . pass)` (hx.8 line 953) */
 static const char *_hx_callnames_851[] = {
     [0] = NULL,
-    [1] = NULL,
+    [1] = "fromhex",
     [2] = NULL,
     [3] = NULL,
-    [4] = "pbkdf2_sha512",
+    [4] = "sha512",
     [5] = NULL,
 };
 static const hx_inst _hx_code_851[6] = {
-    [0] = { .op = 0, .u.slot = 0 },
-    [1] = { .op = 0, .u.slot = 1 },
-    [2] = { .op = 0, .u.slot = 5 },
-    [3] = { .op = 2, .u.ival = (int64_t)128 },
-    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 4, .role = 0 } /* fn="pbkdf2_sha512" */ },
+    [0] = { .op = 0, .u.slot = 1 },
+    [1] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="fromhex" */ },
+    [2] = { .op = 0, .u.slot = 0 },
+    [3] = { .op = 5 },
+    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="sha512" */ },
     [5] = { .op = 6 },
 };
-static const char *_hx_varnames_851[6] = {
+static const char *_hx_varnames_851[5] = {
     [0] = "pass",
     [1] = "salt",
     [2] = "salt2",
     [3] = "pepper",
     [4] = "user",
-    [5] = "N",
 };
 static const hx_program _hx_program_851 = {
     .code      = (hx_inst *)_hx_code_851,
@@ -29399,8 +29398,8 @@ static const hx_program _hx_program_851 = {
     .strlens   = NULL,
     .nstrings  = 0,
     .varnames  = (char **)_hx_varnames_851,
-    .nvars     = 6,
-    .max_stack = 12,
+    .nvars     = 5,
+    .max_stack = 10,
     .has_emit  = 0,
 };
 
@@ -30533,20 +30532,22 @@ static const hx_program _hx_program_883 = {
     .has_emit  = 0,
 };
 
-/* eidx=884 e887 ARUBAOS : `md5(salt . pass)` (hx.8 line 986) */
+/* eidx=884 e887 ARUBAOS : `sha1(fromhex(salt) . pass)` (hx.8 line 986) */
 static const char *_hx_callnames_884[] = {
     [0] = NULL,
-    [1] = NULL,
+    [1] = "fromhex",
     [2] = NULL,
-    [3] = "md5",
-    [4] = NULL,
+    [3] = NULL,
+    [4] = "sha1",
+    [5] = NULL,
 };
-static const hx_inst _hx_code_884[5] = {
+static const hx_inst _hx_code_884[6] = {
     [0] = { .op = 0, .u.slot = 1 },
-    [1] = { .op = 0, .u.slot = 0 },
-    [2] = { .op = 5 },
-    [3] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="md5" */ },
-    [4] = { .op = 6 },
+    [1] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="fromhex" */ },
+    [2] = { .op = 0, .u.slot = 0 },
+    [3] = { .op = 5 },
+    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 1, .role = 0 } /* fn="sha1" */ },
+    [5] = { .op = 6 },
 };
 static const char *_hx_varnames_884[5] = {
     [0] = "pass",
@@ -30557,7 +30558,7 @@ static const char *_hx_varnames_884[5] = {
 };
 static const hx_program _hx_program_884 = {
     .code      = (hx_inst *)_hx_code_884,
-    .ncode     = 5,
+    .ncode     = 6,
     .strings   = NULL,
     .strlens   = NULL,
     .nstrings  = 0,
@@ -30567,82 +30568,72 @@ static const hx_program _hx_program_884 = {
     .has_emit  = 0,
 };
 
-/* eidx=885 e888 ISCSI-CHAP : OUTLIER (hx.8 line 987) */
-/* eidx=886 e889 WERKZEUG-MD5 : `pbkdf2_md5(pass, salt, N, 32)` (hx.8 line 988) */
+/* eidx=885 e888 ISCSI-CHAP : OUTLIER (hx.8 line 988) */
+/* eidx=886 e889 WERKZEUG-MD5 : `hmac_md5(pass, salt)` (hx.8 line 989) */
 static const char *_hx_callnames_886[] = {
     [0] = NULL,
     [1] = NULL,
-    [2] = NULL,
+    [2] = "hmac_md5",
     [3] = NULL,
-    [4] = "pbkdf2_md5",
-    [5] = NULL,
 };
-static const hx_inst _hx_code_886[6] = {
+static const hx_inst _hx_code_886[4] = {
     [0] = { .op = 0, .u.slot = 0 },
     [1] = { .op = 0, .u.slot = 1 },
-    [2] = { .op = 0, .u.slot = 5 },
-    [3] = { .op = 2, .u.ival = (int64_t)32 },
-    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 4, .role = 0 } /* fn="pbkdf2_md5" */ },
-    [5] = { .op = 6 },
+    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 2, .role = 0 } /* fn="hmac_md5" */ },
+    [3] = { .op = 6 },
 };
-static const char *_hx_varnames_886[6] = {
+static const char *_hx_varnames_886[5] = {
     [0] = "pass",
     [1] = "salt",
     [2] = "salt2",
     [3] = "pepper",
     [4] = "user",
-    [5] = "N",
 };
 static const hx_program _hx_program_886 = {
     .code      = (hx_inst *)_hx_code_886,
-    .ncode     = 6,
+    .ncode     = 4,
     .strings   = NULL,
     .strlens   = NULL,
     .nstrings  = 0,
     .varnames  = (char **)_hx_varnames_886,
-    .nvars     = 6,
-    .max_stack = 12,
+    .nvars     = 5,
+    .max_stack = 10,
     .has_emit  = 0,
 };
 
-/* eidx=887 e890 WERKZEUG-SHA256 : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 989) */
+/* eidx=887 e890 WERKZEUG-SHA256 : `hmac_sha256(pass, salt)` (hx.8 line 990) */
 static const char *_hx_callnames_887[] = {
     [0] = NULL,
     [1] = NULL,
-    [2] = NULL,
+    [2] = "hmac_sha256",
     [3] = NULL,
-    [4] = "pbkdf2_sha256",
-    [5] = NULL,
 };
-static const hx_inst _hx_code_887[6] = {
+static const hx_inst _hx_code_887[4] = {
     [0] = { .op = 0, .u.slot = 0 },
     [1] = { .op = 0, .u.slot = 1 },
-    [2] = { .op = 0, .u.slot = 5 },
-    [3] = { .op = 2, .u.ival = (int64_t)32 },
-    [4] = { .op = 4, .u.call = { .entry = NULL, .nargs = 4, .role = 0 } /* fn="pbkdf2_sha256" */ },
-    [5] = { .op = 6 },
+    [2] = { .op = 4, .u.call = { .entry = NULL, .nargs = 2, .role = 0 } /* fn="hmac_sha256" */ },
+    [3] = { .op = 6 },
 };
-static const char *_hx_varnames_887[6] = {
+static const char *_hx_varnames_887[5] = {
     [0] = "pass",
     [1] = "salt",
     [2] = "salt2",
     [3] = "pepper",
     [4] = "user",
-    [5] = "N",
 };
 static const hx_program _hx_program_887 = {
     .code      = (hx_inst *)_hx_code_887,
-    .ncode     = 6,
+    .ncode     = 4,
     .strings   = NULL,
     .strlens   = NULL,
     .nstrings  = 0,
     .varnames  = (char **)_hx_varnames_887,
-    .nvars     = 6,
-    .max_stack = 12,
+    .nvars     = 5,
+    .max_stack = 10,
     .has_emit  = 0,
 };
 
-/* eidx=888 e891 AUTHME : `sha256(sha256(pass) . salt)` (hx.8 line 990) */
+/* eidx=888 e891 AUTHME : `sha256(sha256(pass) . salt)` (hx.8 line 991) */
 static const char *_hx_callnames_888[] = {
     [0] = NULL,
     [1] = "sha256",
@@ -30678,8 +30669,8 @@ static const hx_program _hx_program_888 = {
     .has_emit  = 0,
 };
 
-/* eidx=889 e892 NETWITNESS : OUTLIER (hx.8 line 991) */
-/* eidx=890 e893 NETSCALER-SHA512 : `sha512(salt . pass . fromhex("00"))` (hx.8 line 992) */
+/* eidx=889 e892 NETWITNESS : OUTLIER (hx.8 line 992) */
+/* eidx=890 e893 NETSCALER-SHA512 : `sha512(salt . pass . fromhex("00"))` (hx.8 line 993) */
 static const char *_hx_callnames_890[] = {
     [0] = NULL,
     [1] = NULL,
@@ -30723,7 +30714,7 @@ static const hx_program _hx_program_890 = {
     .has_emit  = 0,
 };
 
-/* eidx=891 e894 SHA1SHA1SALTPASSSALT : `sha1(sha1(salt . pass . salt))` (hx.8 line 993) */
+/* eidx=891 e894 SHA1SHA1SALTPASSSALT : `sha1(sha1(salt . pass . salt))` (hx.8 line 994) */
 static const char *_hx_callnames_891[] = {
     [0] = NULL,
     [1] = NULL,
@@ -30763,7 +30754,7 @@ static const hx_program _hx_program_891 = {
     .has_emit  = 0,
 };
 
-/* eidx=892 e895 NETSCALER-PBKDF2 : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 994) */
+/* eidx=892 e895 NETSCALER-PBKDF2 : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 995) */
 static const char *_hx_callnames_892[] = {
     [0] = NULL,
     [1] = NULL,
@@ -30800,7 +30791,7 @@ static const hx_program _hx_program_892 = {
     .has_emit  = 0,
 };
 
-/* eidx=893 e896 ORACLE7 : `upper(oracle7(pass, salt))` (hx.8 line 995) */
+/* eidx=893 e896 ORACLE7 : `upper(oracle7(pass, salt))` (hx.8 line 996) */
 static const char *_hx_callnames_893[] = {
     [0] = NULL,
     [1] = NULL,
@@ -30834,7 +30825,7 @@ static const hx_program _hx_program_893 = {
     .has_emit  = 0,
 };
 
-/* eidx=894 e897 NETNTLMV1 : `des_block(md4(utf16le(pass)), challenge)` (hx.8 line 996) */
+/* eidx=894 e897 NETNTLMV1 : `des_block(md4(utf16le(pass)), challenge)` (hx.8 line 997) */
 static const char *_hx_callnames_894[] = {
     [0] = NULL,
     [1] = "utf16le",
@@ -30871,7 +30862,7 @@ static const hx_program _hx_program_894 = {
     .has_emit  = 0,
 };
 
-/* eidx=895 e898 NETNTLMV2 : `hmac_md5(md4(utf16le(pass)), challenge)` (hx.8 line 997) */
+/* eidx=895 e898 NETNTLMV2 : `hmac_md5(md4(utf16le(pass)), challenge)` (hx.8 line 998) */
 static const char *_hx_callnames_895[] = {
     [0] = NULL,
     [1] = "utf16le",
@@ -30908,7 +30899,7 @@ static const hx_program _hx_program_895 = {
     .has_emit  = 0,
 };
 
-/* eidx=896 e899 LASTPASS : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 998) */
+/* eidx=896 e899 LASTPASS : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 999) */
 static const char *_hx_callnames_896[] = {
     [0] = NULL,
     [1] = NULL,
@@ -30945,7 +30936,7 @@ static const hx_program _hx_program_896 = {
     .has_emit  = 0,
 };
 
-/* eidx=897 e900 FORTIGATE : `sha1(salt . pass . salt)` (hx.8 line 999) */
+/* eidx=897 e900 FORTIGATE : `sha1(salt . pass . salt)` (hx.8 line 1000) */
 static const char *_hx_callnames_897[] = {
     [0] = NULL,
     [1] = NULL,
@@ -30983,8 +30974,8 @@ static const hx_program _hx_program_897 = {
     .has_emit  = 0,
 };
 
-/* eidx=898 e901 DOMINO8 : OUTLIER (hx.8 line 1000) */
-/* eidx=899 e902 SIPHASH : `siphash(pass, fromhex(salt))` (hx.8 line 1001) */
+/* eidx=898 e901 DOMINO8 : OUTLIER (hx.8 line 1001) */
+/* eidx=899 e902 SIPHASH : `siphash(pass, fromhex(salt))` (hx.8 line 1002) */
 static const char *_hx_callnames_899[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31018,7 +31009,7 @@ static const hx_program _hx_program_899 = {
     .has_emit  = 0,
 };
 
-/* eidx=900 e903 CRAMMD5 : `hmac_md5(pass, challenge)` (hx.8 line 1002) */
+/* eidx=900 e903 CRAMMD5 : `hmac_md5(pass, challenge)` (hx.8 line 1003) */
 static const char *_hx_callnames_900[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31051,7 +31042,7 @@ static const hx_program _hx_program_900 = {
     .has_emit  = 0,
 };
 
-/* eidx=901 e904 SAPCODVNH : `sha1(pass . salt)` (hx.8 line 1003) */
+/* eidx=901 e904 SAPCODVNH : `sha1(pass . salt)` (hx.8 line 1004) */
 static const char *_hx_callnames_901[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31085,7 +31076,7 @@ static const hx_program _hx_program_901 = {
     .has_emit  = 0,
 };
 
-/* eidx=902 e905 REDHAT389DS : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 1004) */
+/* eidx=902 e905 REDHAT389DS : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 1005) */
 static const char *_hx_callnames_902[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31122,7 +31113,7 @@ static const hx_program _hx_program_902 = {
     .has_emit  = 0,
 };
 
-/* eidx=903 e906 POSTGRESCRAM : `md5(md5(pass . user) . fromhex(salt))` (hx.8 line 1005) */
+/* eidx=903 e906 POSTGRESCRAM : `md5(md5(pass . user) . fromhex(salt))` (hx.8 line 1006) */
 static const char *_hx_callnames_903[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31164,7 +31155,7 @@ static const hx_program _hx_program_903 = {
     .has_emit  = 0,
 };
 
-/* eidx=904 e907 MYSQLCRAM : `upper(sha1(sha1_bin(pass)))` (hx.8 line 1006) */
+/* eidx=904 e907 MYSQLCRAM : `upper(sha1(sha1_bin(pass)))` (hx.8 line 1007) */
 static const char *_hx_callnames_904[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -31198,7 +31189,7 @@ static const hx_program _hx_program_904 = {
     .has_emit  = 0,
 };
 
-/* eidx=905 e908 SHIRO1 : `pbkdf2_sha1(pass, salt, N, 16)` (hx.8 line 1007) */
+/* eidx=905 e908 SHIRO1 : `pbkdf2_sha1(pass, salt, N, 16)` (hx.8 line 1008) */
 static const char *_hx_callnames_905[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31235,7 +31226,7 @@ static const hx_program _hx_program_905 = {
     .has_emit  = 0,
 };
 
-/* eidx=906 e909 ECRYPTFS : `sha512^65536(pass . salt)` (hx.8 line 1008) */
+/* eidx=906 e909 ECRYPTFS : `sha512^65536(pass . salt)` (hx.8 line 1009) */
 static const char *_hx_callnames_906[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31284,7 +31275,7 @@ static const hx_program _hx_program_906 = {
     .has_emit  = 0,
 };
 
-/* eidx=907 e910 ORACLE12 : `pbkdf2_sha512(pass, salt, 4096, 64)` (hx.8 line 1009) */
+/* eidx=907 e910 ORACLE12 : `pbkdf2_sha512(pass, salt, 4096, 64)` (hx.8 line 1010) */
 static const char *_hx_callnames_907[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31320,7 +31311,7 @@ static const hx_program _hx_program_907 = {
     .has_emit  = 0,
 };
 
-/* eidx=908 e911 COLDFUSION10 : `sha256(salt . upper(sha1(pass)))` (hx.8 line 1010) */
+/* eidx=908 e911 COLDFUSION10 : `sha256(salt . upper(sha1(pass)))` (hx.8 line 1011) */
 static const char *_hx_callnames_908[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31358,7 +31349,7 @@ static const hx_program _hx_program_908 = {
     .has_emit  = 0,
 };
 
-/* eidx=909 e912 AZURESYNC : `pbkdf2_sha256(pass, salt, 1000, 32)` (hx.8 line 1011) */
+/* eidx=909 e912 AZURESYNC : `pbkdf2_sha256(pass, salt, 1000, 32)` (hx.8 line 1012) */
 static const char *_hx_callnames_909[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31394,7 +31385,7 @@ static const hx_program _hx_program_909 = {
     .has_emit  = 0,
 };
 
-/* eidx=910 e913 ANDROIDFDE : `pbkdf2_sha1(pass, salt, 2000, 16)` (hx.8 line 1012) */
+/* eidx=910 e913 ANDROIDFDE : `pbkdf2_sha1(pass, salt, 2000, 16)` (hx.8 line 1013) */
 static const char *_hx_callnames_910[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31430,7 +31421,7 @@ static const hx_program _hx_program_910 = {
     .has_emit  = 0,
 };
 
-/* eidx=911 e914 KRB5TGS23 : `rc4_hmac_md5(pass, realm, spn)` (hx.8 line 1013) */
+/* eidx=911 e914 KRB5TGS23 : `rc4_hmac_md5(pass, realm, spn)` (hx.8 line 1014) */
 static const char *_hx_callnames_911[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31466,7 +31457,7 @@ static const hx_program _hx_program_911 = {
     .has_emit  = 0,
 };
 
-/* eidx=912 e915 AXCRYPT : `axcrypt(pass, fromhex(salt), iter)` (hx.8 line 1014) */
+/* eidx=912 e915 AXCRYPT : `axcrypt(pass, fromhex(salt), iter)` (hx.8 line 1015) */
 static const char *_hx_callnames_912[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31503,7 +31494,7 @@ static const hx_program _hx_program_912 = {
     .has_emit  = 0,
 };
 
-/* eidx=913 e916 AXCRYPTSHA1 : `cut(sha1(pass), 0, 32)` (hx.8 line 1015) */
+/* eidx=913 e916 AXCRYPTSHA1 : `cut(sha1(pass), 0, 32)` (hx.8 line 1016) */
 static const char *_hx_callnames_913[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -31539,7 +31530,7 @@ static const hx_program _hx_program_913 = {
     .has_emit  = 0,
 };
 
-/* eidx=914 e917 CISCO9 : `scrypt(pass, salt, 16384, 1, 1)` (hx.8 line 1016) */
+/* eidx=914 e917 CISCO9 : `scrypt(pass, salt, 16384, 1, 1)` (hx.8 line 1017) */
 static const char *_hx_callnames_914[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31577,7 +31568,7 @@ static const hx_program _hx_program_914 = {
     .has_emit  = 0,
 };
 
-/* eidx=915 e918 DCC2 : `pbkdf2_sha1(md4_bin(md4_bin(utf16le(pass)) . utf16le(lower(user))), utf16le(lower(user)), N, 16)` (hx.8 line 1017) */
+/* eidx=915 e918 DCC2 : `pbkdf2_sha1(md4_bin(md4_bin(utf16le(pass)) . utf16le(lower(user))), utf16le(lower(user)), N, 16)` (hx.8 line 1018) */
 static const char *_hx_callnames_915[] = {
     [0] = NULL,
     [1] = "utf16le",
@@ -31632,8 +31623,8 @@ static const hx_program _hx_program_915 = {
     .has_emit  = 0,
 };
 
-/* eidx=916 e919 PWSAFE3 : OUTLIER (hx.8 line 1018) */
-/* eidx=917 e920 IKEPSK-MD5 : `hmac_md5(psk, ike_payload)` (hx.8 line 1021) */
+/* eidx=916 e919 PWSAFE3 : OUTLIER (hx.8 line 1019) */
+/* eidx=917 e920 IKEPSK-MD5 : `hmac_md5(psk, ike_payload)` (hx.8 line 1022) */
 static const char *_hx_callnames_917[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31667,7 +31658,7 @@ static const hx_program _hx_program_917 = {
     .has_emit  = 0,
 };
 
-/* eidx=918 e921 IKEPSK-SHA1 : `hmac_sha1(psk, ike_payload)` (hx.8 line 1022) */
+/* eidx=918 e921 IKEPSK-SHA1 : `hmac_sha1(psk, ike_payload)` (hx.8 line 1023) */
 static const char *_hx_callnames_918[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31701,7 +31692,7 @@ static const hx_program _hx_program_918 = {
     .has_emit  = 0,
 };
 
-/* eidx=919 e922 SAP-BCODE : `upper(sap_bcode(pass, salt))` (hx.8 line 1023) */
+/* eidx=919 e922 SAP-BCODE : `upper(sap_bcode(pass, salt))` (hx.8 line 1024) */
 static const char *_hx_callnames_919[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31735,7 +31726,7 @@ static const hx_program _hx_program_919 = {
     .has_emit  = 0,
 };
 
-/* eidx=920 e923 SAP-BCODE4 : `cut(upper(sap_bcode(pass, salt)), 0, 8) . "00000000"` (hx.8 line 1024) */
+/* eidx=920 e923 SAP-BCODE4 : `cut(upper(sap_bcode(pass, salt)), 0, 8) . "00000000"` (hx.8 line 1025) */
 static const char *_hx_callnames_920[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31783,9 +31774,9 @@ static const hx_program _hx_program_920 = {
     .has_emit  = 0,
 };
 
-/* eidx=921 e924 SAP-PASSCODE : OUTLIER (hx.8 line 1025) */
-/* eidx=922 e925 SAP-PASSCODE5 : OUTLIER (hx.8 line 1026) */
-/* eidx=923 e926 AS400-DES : `upper(as400_des(pass, salt))` (hx.8 line 1027) */
+/* eidx=921 e924 SAP-PASSCODE : OUTLIER (hx.8 line 1026) */
+/* eidx=922 e925 SAP-PASSCODE5 : OUTLIER (hx.8 line 1027) */
+/* eidx=923 e926 AS400-DES : `upper(as400_des(pass, salt))` (hx.8 line 1028) */
 static const char *_hx_callnames_923[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31819,7 +31810,7 @@ static const hx_program _hx_program_923 = {
     .has_emit  = 0,
 };
 
-/* eidx=924 e927 PS-TOKEN : `sha1(fromhex(salt) . utf16le(pass))` (hx.8 line 1028) */
+/* eidx=924 e927 PS-TOKEN : `sha1(fromhex(salt) . utf16le(pass))` (hx.8 line 1029) */
 static const char *_hx_callnames_924[] = {
     [0] = NULL,
     [1] = "fromhex",
@@ -31857,7 +31848,7 @@ static const hx_program _hx_program_924 = {
     .has_emit  = 0,
 };
 
-/* eidx=925 e928 WINPHONE : `sha256(utf16le(pass) . fromhex(salt))` (hx.8 line 1029) */
+/* eidx=925 e928 WINPHONE : `sha256(utf16le(pass) . fromhex(salt))` (hx.8 line 1030) */
 static const char *_hx_callnames_925[] = {
     [0] = NULL,
     [1] = "utf16le",
@@ -31895,9 +31886,9 @@ static const hx_program _hx_program_925 = {
     .has_emit  = 0,
 };
 
-/* eidx=926 e929 RACF-KDFAES : OUTLIER (hx.8 line 1030) */
-/* eidx=927 e930 TACACS : OUTLIER (hx.8 line 1031) */
-/* eidx=928 e931 APPLE-SECURE-NOTES : `pbkdf2_sha256(pass, salt, 20000, 32)` (hx.8 line 1032) */
+/* eidx=926 e929 RACF-KDFAES : OUTLIER (hx.8 line 1031) */
+/* eidx=927 e930 TACACS : OUTLIER (hx.8 line 1032) */
+/* eidx=928 e931 APPLE-SECURE-NOTES : `pbkdf2_sha256(pass, salt, 20000, 32)` (hx.8 line 1033) */
 static const char *_hx_callnames_928[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31933,7 +31924,7 @@ static const hx_program _hx_program_928 = {
     .has_emit  = 0,
 };
 
-/* eidx=929 e932 CRAMMD5-DOVECOT : `hmac_md5(pass, challenge)` (hx.8 line 1033) */
+/* eidx=929 e932 CRAMMD5-DOVECOT : `hmac_md5(pass, challenge)` (hx.8 line 1034) */
 static const char *_hx_callnames_929[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31966,8 +31957,8 @@ static const hx_program _hx_program_929 = {
     .has_emit  = 0,
 };
 
-/* eidx=930 e933 JWT : OUTLIER (hx.8 line 1034) */
-/* eidx=931 e934 QNX-MD5 : `md5crypt(pass, salt)` (hx.8 line 1037) */
+/* eidx=930 e933 JWT : OUTLIER (hx.8 line 1035) */
+/* eidx=931 e934 QNX-MD5 : `md5crypt(pass, salt)` (hx.8 line 1038) */
 static const char *_hx_callnames_931[] = {
     [0] = NULL,
     [1] = NULL,
@@ -31999,7 +31990,7 @@ static const hx_program _hx_program_931 = {
     .has_emit  = 0,
 };
 
-/* eidx=932 e935 QNX-SHA256 : `sha256crypt(pass, salt, rounds)` (hx.8 line 1038) */
+/* eidx=932 e935 QNX-SHA256 : `sha256crypt(pass, salt, rounds)` (hx.8 line 1039) */
 static const char *_hx_callnames_932[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32034,7 +32025,7 @@ static const hx_program _hx_program_932 = {
     .has_emit  = 0,
 };
 
-/* eidx=933 e936 QNX-SHA512 : `sha512crypt(pass, salt, rounds)` (hx.8 line 1039) */
+/* eidx=933 e936 QNX-SHA512 : `sha512crypt(pass, salt, rounds)` (hx.8 line 1040) */
 static const char *_hx_callnames_933[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32069,7 +32060,7 @@ static const hx_program _hx_program_933 = {
     .has_emit  = 0,
 };
 
-/* eidx=934 e937 QNX7-SHA512 : `sha512crypt(pass, salt, rounds)` (hx.8 line 1040) */
+/* eidx=934 e937 QNX7-SHA512 : `sha512crypt(pass, salt, rounds)` (hx.8 line 1041) */
 static const char *_hx_callnames_934[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32104,7 +32095,7 @@ static const hx_program _hx_program_934 = {
     .has_emit  = 0,
 };
 
-/* eidx=935 e938 SHA1-S1PS2 : `sha1(s1 . pass . s2)` (hx.8 line 1041) */
+/* eidx=935 e938 SHA1-S1PS2 : `sha1(s1 . pass . s2)` (hx.8 line 1042) */
 static const char *_hx_callnames_935[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32144,16 +32135,16 @@ static const hx_program _hx_program_935 = {
     .has_emit  = 0,
 };
 
-/* eidx=936 e939 RAILS-RESTFUL : OUTLIER (hx.8 line 1042) */
-/* eidx=937 e940 KRB5PA-17 : OUTLIER (hx.8 line 1045) */
-/* eidx=938 e941 KRB5PA-18 : OUTLIER (hx.8 line 1048) */
-/* eidx=939 e942 WPA-PMKID : OUTLIER (hx.8 line 1051) */
-/* eidx=940 e943 WPA-EAPOL : OUTLIER (hx.8 line 1052) */
-/* eidx=941 e944 ANSIBLE-VAULT : OUTLIER (hx.8 line 1053) */
-/* eidx=942 e945 APFS : OUTLIER (hx.8 line 1054) */
-/* eidx=943 e946 OTM-SHA256 : OUTLIER (hx.8 line 1055) */
-/* eidx=944 e947 TELEGRAM-SHA256 : OUTLIER (hx.8 line 1056) */
-/* eidx=945 e948 WEB2PY-SHA512 : `pbkdf2_sha512(pass, salt, 1000, 64)` (hx.8 line 1059) */
+/* eidx=936 e939 RAILS-RESTFUL : OUTLIER (hx.8 line 1043) */
+/* eidx=937 e940 KRB5PA-17 : OUTLIER (hx.8 line 1046) */
+/* eidx=938 e941 KRB5PA-18 : OUTLIER (hx.8 line 1049) */
+/* eidx=939 e942 WPA-PMKID : OUTLIER (hx.8 line 1052) */
+/* eidx=940 e943 WPA-EAPOL : OUTLIER (hx.8 line 1053) */
+/* eidx=941 e944 ANSIBLE-VAULT : OUTLIER (hx.8 line 1054) */
+/* eidx=942 e945 APFS : OUTLIER (hx.8 line 1055) */
+/* eidx=943 e946 OTM-SHA256 : OUTLIER (hx.8 line 1056) */
+/* eidx=944 e947 TELEGRAM-SHA256 : OUTLIER (hx.8 line 1057) */
+/* eidx=945 e948 WEB2PY-SHA512 : `pbkdf2_sha512(pass, salt, 1000, 64)` (hx.8 line 1060) */
 static const char *_hx_callnames_945[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32189,9 +32180,9 @@ static const hx_program _hx_program_945 = {
     .has_emit  = 0,
 };
 
-/* eidx=946 e949 SOLARWINDS : OUTLIER (hx.8 line 1060) */
-/* eidx=947 e950 SOLARWINDS2 : OUTLIER (hx.8 line 1061) */
-/* eidx=948 e951 SIMPLACMS : `md5(salt . pass . md5(pass))` (hx.8 line 1062) */
+/* eidx=946 e949 SOLARWINDS : OUTLIER (hx.8 line 1061) */
+/* eidx=947 e950 SOLARWINDS2 : OUTLIER (hx.8 line 1062) */
+/* eidx=948 e951 SIMPLACMS : `md5(salt . pass . md5(pass))` (hx.8 line 1063) */
 static const char *_hx_callnames_948[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32231,8 +32222,8 @@ static const hx_program _hx_program_948 = {
     .has_emit  = 0,
 };
 
-/* eidx=949 e952 APPLE-KEYCHAIN : OUTLIER (hx.8 line 1063) */
-/* eidx=950 e953 APPLE-IWORK : `pbkdf2_sha1(pass, salt, 50000, 16)` (hx.8 line 1066) */
+/* eidx=949 e952 APPLE-KEYCHAIN : OUTLIER (hx.8 line 1064) */
+/* eidx=950 e953 APPLE-IWORK : `pbkdf2_sha1(pass, salt, 50000, 16)` (hx.8 line 1067) */
 static const char *_hx_callnames_950[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32268,7 +32259,7 @@ static const hx_program _hx_program_950 = {
     .has_emit  = 0,
 };
 
-/* eidx=951 e954 BITWARDEN : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 1067) */
+/* eidx=951 e954 BITWARDEN : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 1068) */
 static const char *_hx_callnames_951[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32305,9 +32296,9 @@ static const hx_program _hx_program_951 = {
     .has_emit  = 0,
 };
 
-/* eidx=952 e955 MONGODB-SHA1 : OUTLIER (hx.8 line 1068) */
-/* eidx=953 e956 MONGODB-SHA256 : OUTLIER (hx.8 line 1071) */
-/* eidx=954 e957 FORTIGATE256 : `sha256(salt . pass . salt)` (hx.8 line 1074) */
+/* eidx=952 e955 MONGODB-SHA1 : OUTLIER (hx.8 line 1069) */
+/* eidx=953 e956 MONGODB-SHA256 : OUTLIER (hx.8 line 1072) */
+/* eidx=954 e957 FORTIGATE256 : `sha256(salt . pass . salt)` (hx.8 line 1075) */
 static const char *_hx_callnames_954[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32345,7 +32336,7 @@ static const hx_program _hx_program_954 = {
     .has_emit  = 0,
 };
 
-/* eidx=955 e958 UMBRACO : `hmac_sha1(pass, salt)` (hx.8 line 1075) */
+/* eidx=955 e958 UMBRACO : `hmac_sha1(pass, salt)` (hx.8 line 1076) */
 static const char *_hx_callnames_955[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32377,7 +32368,7 @@ static const hx_program _hx_program_955 = {
     .has_emit  = 0,
 };
 
-/* eidx=956 e959 DAHUA-AUTH : `dahua_encode(md5_bin(pass))` (hx.8 line 1076) */
+/* eidx=956 e959 DAHUA-AUTH : `dahua_encode(md5_bin(pass))` (hx.8 line 1077) */
 static const char *_hx_callnames_956[] = {
     [0] = NULL,
     [1] = "md5",
@@ -32409,7 +32400,7 @@ static const hx_program _hx_program_956 = {
     .has_emit  = 0,
 };
 
-/* eidx=957 e960 BESDER-AUTH : `besder_encode(md5_bin(pass))` (hx.8 line 1077) */
+/* eidx=957 e960 BESDER-AUTH : `besder_encode(md5_bin(pass))` (hx.8 line 1078) */
 static const char *_hx_callnames_957[] = {
     [0] = NULL,
     [1] = "md5",
@@ -32441,7 +32432,7 @@ static const hx_program _hx_program_957 = {
     .has_emit  = 0,
 };
 
-/* eidx=958 e961 SQLCIPHER : `pbkdf2_sha1(pass, salt, N, 32)` (hx.8 line 1078) */
+/* eidx=958 e961 SQLCIPHER : `pbkdf2_sha1(pass, salt, N, 32)` (hx.8 line 1079) */
 static const char *_hx_callnames_958[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32478,7 +32469,7 @@ static const hx_program _hx_program_958 = {
     .has_emit  = 0,
 };
 
-/* eidx=959 e962 RORAILS-SHA1 : `sha1("--" . salt . "--" . pass . "--")` (hx.8 line 1079) */
+/* eidx=959 e962 RORAILS-SHA1 : `sha1("--" . salt . "--" . pass . "--")` (hx.8 line 1080) */
 static const char *_hx_callnames_959[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32528,7 +32519,7 @@ static const hx_program _hx_program_959 = {
     .has_emit  = 0,
 };
 
-/* eidx=960 e963 AES128-NOKDF : `aes_ecb_encrypt(pad(pass, 16), fromhex(salt))` (hx.8 line 1080) */
+/* eidx=960 e963 AES128-NOKDF : `aes_ecb_encrypt(pad(pass, 16), fromhex(salt))` (hx.8 line 1081) */
 static const char *_hx_callnames_960[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32566,7 +32557,7 @@ static const hx_program _hx_program_960 = {
     .has_emit  = 0,
 };
 
-/* eidx=961 e964 AES192-NOKDF : `aes_ecb_encrypt(pad(pass, 24), fromhex(salt))` (hx.8 line 1081) */
+/* eidx=961 e964 AES192-NOKDF : `aes_ecb_encrypt(pad(pass, 24), fromhex(salt))` (hx.8 line 1082) */
 static const char *_hx_callnames_961[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32604,7 +32595,7 @@ static const hx_program _hx_program_961 = {
     .has_emit  = 0,
 };
 
-/* eidx=962 e965 AES256-NOKDF : `aes_ecb_encrypt(pad(pass, 32), fromhex(salt))` (hx.8 line 1082) */
+/* eidx=962 e965 AES256-NOKDF : `aes_ecb_encrypt(pad(pass, 32), fromhex(salt))` (hx.8 line 1083) */
 static const char *_hx_callnames_962[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32642,7 +32633,7 @@ static const hx_program _hx_program_962 = {
     .has_emit  = 0,
 };
 
-/* eidx=963 e966 VMWARE-VMX : `pbkdf2_sha1(pass, salt, N, 32)` (hx.8 line 1083) */
+/* eidx=963 e966 VMWARE-VMX : `pbkdf2_sha1(pass, salt, N, 32)` (hx.8 line 1084) */
 static const char *_hx_callnames_963[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32679,7 +32670,7 @@ static const hx_program _hx_program_963 = {
     .has_emit  = 0,
 };
 
-/* eidx=964 e967 BCRYPTSHA512 : `bcrypt(sha512(pass), salt, cost)` (hx.8 line 1084) */
+/* eidx=964 e967 BCRYPTSHA512 : `bcrypt(sha512(pass), salt, cost)` (hx.8 line 1085) */
 static const char *_hx_callnames_964[] = {
     [0] = NULL,
     [1] = "sha512",
@@ -32716,11 +32707,11 @@ static const hx_program _hx_program_964 = {
     .has_emit  = 0,
 };
 
-/* eidx=965 e968 POSTGRESSCRAM256 : OUTLIER (hx.8 line 1085) */
-/* eidx=966 e969 AWSSIGV4 : OUTLIER (hx.8 line 1088) */
-/* eidx=967 e970 KRB5DB17 : OUTLIER (hx.8 line 1089) */
-/* eidx=968 e971 KRB5DB18 : OUTLIER (hx.8 line 1092) */
-/* eidx=969 e972 MURMUR3 : `murmur3(pass, seed)` (hx.8 line 1095) */
+/* eidx=965 e968 POSTGRESSCRAM256 : OUTLIER (hx.8 line 1086) */
+/* eidx=966 e969 AWSSIGV4 : OUTLIER (hx.8 line 1089) */
+/* eidx=967 e970 KRB5DB17 : OUTLIER (hx.8 line 1090) */
+/* eidx=968 e971 KRB5DB18 : OUTLIER (hx.8 line 1093) */
+/* eidx=969 e972 MURMUR3 : `murmur3(pass, seed)` (hx.8 line 1096) */
 static const char *_hx_callnames_969[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32753,11 +32744,11 @@ static const hx_program _hx_program_969 = {
     .has_emit  = 0,
 };
 
-/* eidx=970 e973 VEEAM-VBK : OUTLIER (hx.8 line 1096) */
-/* eidx=971 e974 MSSNTP : OUTLIER (hx.8 line 1099) */
-/* eidx=972 e975 SSPR-MD5 : OUTLIER (hx.8 line 1100) */
-/* eidx=973 e976 SSPR-SHA1 : OUTLIER (hx.8 line 1101) */
-/* eidx=974 e977 SSPR-SHA1S : `sha1(pass . salt)` (hx.8 line 1102) */
+/* eidx=970 e973 VEEAM-VBK : OUTLIER (hx.8 line 1097) */
+/* eidx=971 e974 MSSNTP : OUTLIER (hx.8 line 1100) */
+/* eidx=972 e975 SSPR-MD5 : OUTLIER (hx.8 line 1101) */
+/* eidx=973 e976 SSPR-SHA1 : OUTLIER (hx.8 line 1102) */
+/* eidx=974 e977 SSPR-SHA1S : `sha1(pass . salt)` (hx.8 line 1103) */
 static const char *_hx_callnames_974[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32791,9 +32782,9 @@ static const hx_program _hx_program_974 = {
     .has_emit  = 0,
 };
 
-/* eidx=975 e978 SSPR-SHA256 : OUTLIER (hx.8 line 1103) */
-/* eidx=976 e979 SSPR-SHA512 : OUTLIER (hx.8 line 1104) */
-/* eidx=977 e980 EMPIRECMS : `md5(md5(salt) . md5(pass))` (hx.8 line 1105) */
+/* eidx=975 e978 SSPR-SHA256 : OUTLIER (hx.8 line 1104) */
+/* eidx=976 e979 SSPR-SHA512 : OUTLIER (hx.8 line 1105) */
+/* eidx=977 e980 EMPIRECMS : `md5(md5(salt) . md5(pass))` (hx.8 line 1106) */
 static const char *_hx_callnames_977[] = {
     [0] = NULL,
     [1] = "md5",
@@ -32831,7 +32822,7 @@ static const hx_program _hx_program_977 = {
     .has_emit  = 0,
 };
 
-/* eidx=978 e981 PBKDF1-SHA1 : `pbkdf1_sha1(pass, salt, iter)` (hx.8 line 1106) */
+/* eidx=978 e981 PBKDF1-SHA1 : `pbkdf1_sha1(pass, salt, iter)` (hx.8 line 1107) */
 static const char *_hx_callnames_978[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32866,7 +32857,7 @@ static const hx_program _hx_program_978 = {
     .has_emit  = 0,
 };
 
-/* eidx=979 e982 MSONLINE : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 1107) */
+/* eidx=979 e982 MSONLINE : `pbkdf2_sha256(pass, salt, N, 32)` (hx.8 line 1108) */
 static const char *_hx_callnames_979[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32903,7 +32894,7 @@ static const hx_program _hx_program_979 = {
     .has_emit  = 0,
 };
 
-/* eidx=980 e983 WBB4 : `sha1(salt . sha1(salt . sha1(pass)))` (hx.8 line 1108) */
+/* eidx=980 e983 WBB4 : `sha1(salt . sha1(salt . sha1(pass)))` (hx.8 line 1109) */
 static const char *_hx_callnames_980[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32945,7 +32936,7 @@ static const hx_program _hx_program_980 = {
     .has_emit  = 0,
 };
 
-/* eidx=981 e984 SAPCODVNH512 : `pbkdf2_sha512(pass, salt, N, 64)` (hx.8 line 1109) */
+/* eidx=981 e984 SAPCODVNH512 : `pbkdf2_sha512(pass, salt, N, 64)` (hx.8 line 1110) */
 static const char *_hx_callnames_981[] = {
     [0] = NULL,
     [1] = NULL,
@@ -32982,7 +32973,7 @@ static const hx_program _hx_program_981 = {
     .has_emit  = 0,
 };
 
-/* eidx=982 e985 SM3CRYPT : `sm3crypt(pass, salt, rounds)` (hx.8 line 1110) */
+/* eidx=982 e985 SM3CRYPT : `sm3crypt(pass, salt, rounds)` (hx.8 line 1111) */
 static const char *_hx_callnames_982[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33017,8 +33008,8 @@ static const hx_program _hx_program_982 = {
     .has_emit  = 0,
 };
 
-/* eidx=983 e986 AS400SSHA1 : OUTLIER (hx.8 line 1111) */
-/* eidx=984 e987 ARGON2 : `argon2(pass, salt, m, t, p)` (hx.8 line 1112) */
+/* eidx=983 e986 AS400SSHA1 : OUTLIER (hx.8 line 1112) */
+/* eidx=984 e987 ARGON2 : `argon2(pass, salt, m, t, p)` (hx.8 line 1113) */
 static const char *_hx_callnames_984[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33059,7 +33050,7 @@ static const hx_program _hx_program_984 = {
     .has_emit  = 0,
 };
 
-/* eidx=985 e988 SM3 : `sm3(pass)` (hx.8 line 1113) */
+/* eidx=985 e988 SM3 : `sm3(pass)` (hx.8 line 1114) */
 static const char *_hx_callnames_985[] = {
     [0] = NULL,
     [1] = "sm3",
@@ -33089,7 +33080,7 @@ static const hx_program _hx_program_985 = {
     .has_emit  = 0,
 };
 
-/* eidx=986 e989 BCRYPTHMACSHA256 : `bcrypt(base64(hmac_sha256_bin(salt, pass)), salt, N)` (hx.8 line 1114) */
+/* eidx=986 e989 BCRYPTHMACSHA256 : `bcrypt(base64(hmac_sha256_bin(salt, pass)), salt, N)` (hx.8 line 1115) */
 static const char *_hx_callnames_986[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33130,8 +33121,8 @@ static const hx_program _hx_program_986 = {
     .has_emit  = 0,
 };
 
-/* eidx=987 e990 WPA-PMK : OUTLIER (hx.8 line 1115) */
-/* eidx=988 e991 MD5SALT1SALT2 : `md5(salt . pass . salt2)` (hx.8 line 1116) */
+/* eidx=987 e990 WPA-PMK : OUTLIER (hx.8 line 1116) */
+/* eidx=988 e991 MD5SALT1SALT2 : `md5(salt . pass . salt2)` (hx.8 line 1117) */
 static const char *_hx_callnames_988[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33169,8 +33160,8 @@ static const hx_program _hx_program_988 = {
     .has_emit  = 0,
 };
 
-/* eidx=989 e992 SYMFONY256 : OUTLIER (hx.8 line 1117) */
-/* eidx=990 e993 WPBCRYPT : `bcrypt(base64(hmac_sha384_bin(pass, "wp-sha384")), salt, N)` (hx.8 line 1118) */
+/* eidx=989 e992 SYMFONY256 : OUTLIER (hx.8 line 1118) */
+/* eidx=990 e993 WPBCRYPT : `bcrypt(base64(hmac_sha384_bin(pass, "wp-sha384")), salt, N)` (hx.8 line 1119) */
 static const char *_hx_callnames_990[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33215,7 +33206,7 @@ static const hx_program _hx_program_990 = {
     .has_emit  = 0,
 };
 
-/* eidx=991 e994 GOST12512CRYPT : `gost12_512crypt(pass, salt, rounds)` (hx.8 line 1119) */
+/* eidx=991 e994 GOST12512CRYPT : `gost12_512crypt(pass, salt, rounds)` (hx.8 line 1120) */
 static const char *_hx_callnames_991[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33250,7 +33241,7 @@ static const hx_program _hx_program_991 = {
     .has_emit  = 0,
 };
 
-/* eidx=992 e995 YESCRYPT : `yescrypt(pass, salt, N, r, p)` (hx.8 line 1120) */
+/* eidx=992 e995 YESCRYPT : `yescrypt(pass, salt, N, r, p)` (hx.8 line 1121) */
 static const char *_hx_callnames_992[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33291,7 +33282,7 @@ static const hx_program _hx_program_992 = {
     .has_emit  = 0,
 };
 
-/* eidx=993 e996 MD5SHA256SHA256 : `md5(sha256(sha256(pass)))` (hx.8 line 1121) */
+/* eidx=993 e996 MD5SHA256SHA256 : `md5(sha256(sha256(pass)))` (hx.8 line 1122) */
 static const char *_hx_callnames_993[] = {
     [0] = NULL,
     [1] = "sha256",
@@ -33325,7 +33316,7 @@ static const hx_program _hx_program_993 = {
     .has_emit  = 0,
 };
 
-/* eidx=994 e997 BSDICRYPT : `bsdicrypt(pass, salt)` (hx.8 line 1122) */
+/* eidx=994 e997 BSDICRYPT : `bsdicrypt(pass, salt)` (hx.8 line 1123) */
 static const char *_hx_callnames_994[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33357,7 +33348,7 @@ static const hx_program _hx_program_994 = {
     .has_emit  = 0,
 };
 
-/* eidx=995 e998 GOST-YESCRYPT : `gost_yescrypt(pass, salt)` (hx.8 line 1123) */
+/* eidx=995 e998 GOST-YESCRYPT : `gost_yescrypt(pass, salt)` (hx.8 line 1124) */
 static const char *_hx_callnames_995[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33389,7 +33380,7 @@ static const hx_program _hx_program_995 = {
     .has_emit  = 0,
 };
 
-/* eidx=996 e999 SHA1CRYPT : `sha1crypt(pass, salt, rounds)` (hx.8 line 1124) */
+/* eidx=996 e999 SHA1CRYPT : `sha1crypt(pass, salt, rounds)` (hx.8 line 1125) */
 static const char *_hx_callnames_996[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33424,7 +33415,7 @@ static const hx_program _hx_program_996 = {
     .has_emit  = 0,
 };
 
-/* eidx=997 e1000 7ZIP : `sevenzip(pass, salt)` (hx.8 line 1125) */
+/* eidx=997 e1000 7ZIP : `sevenzip(pass, salt)` (hx.8 line 1126) */
 static const char *_hx_callnames_997[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33456,7 +33447,7 @@ static const hx_program _hx_program_997 = {
     .has_emit  = 0,
 };
 
-/* eidx=998 e1001 CMIYC : `cmiyc(pass, salt)` (hx.8 line 1126) */
+/* eidx=998 e1001 CMIYC : `cmiyc(pass, salt)` (hx.8 line 1127) */
 static const char *_hx_callnames_998[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33488,7 +33479,7 @@ static const hx_program _hx_program_998 = {
     .has_emit  = 0,
 };
 
-/* eidx=999 e1002 RMD256 : `rmd256(pass)` (hx.8 line 1127) */
+/* eidx=999 e1002 RMD256 : `rmd256(pass)` (hx.8 line 1128) */
 static const char *_hx_callnames_999[] = {
     [0] = NULL,
     [1] = "rmd256",
@@ -33518,7 +33509,7 @@ static const hx_program _hx_program_999 = {
     .has_emit  = 0,
 };
 
-/* eidx=1000 e1003 MD4SALTPASS : `md4(salt . pass)` (hx.8 line 1128) */
+/* eidx=1000 e1003 MD4SALTPASS : `md4(salt . pass)` (hx.8 line 1129) */
 static const char *_hx_callnames_1000[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33552,7 +33543,7 @@ static const hx_program _hx_program_1000 = {
     .has_emit  = 0,
 };
 
-/* eidx=1001 e1004 MD4PASSSALT : `md4(pass . salt)` (hx.8 line 1129) */
+/* eidx=1001 e1004 MD4PASSSALT : `md4(pass . salt)` (hx.8 line 1130) */
 static const char *_hx_callnames_1001[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33586,7 +33577,7 @@ static const hx_program _hx_program_1001 = {
     .has_emit  = 0,
 };
 
-/* eidx=1002 e1005 SHA1UCUSERPASS : `sha1(upper(user) . ":" . pass)` (hx.8 line 1130) */
+/* eidx=1002 e1005 SHA1UCUSERPASS : `sha1(upper(user) . ":" . pass)` (hx.8 line 1131) */
 static const char *_hx_callnames_1002[] = {
     [0] = NULL,
     [1] = "upper",
@@ -33630,7 +33621,7 @@ static const hx_program _hx_program_1002 = {
     .has_emit  = 0,
 };
 
-/* eidx=1003 e1006 SHA1USERCOLONPASS : `sha1(user . ":" . pass)` (hx.8 line 1131) */
+/* eidx=1003 e1006 SHA1USERCOLONPASS : `sha1(user . ":" . pass)` (hx.8 line 1132) */
 static const char *_hx_callnames_1003[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33672,7 +33663,7 @@ static const hx_program _hx_program_1003 = {
     .has_emit  = 0,
 };
 
-/* eidx=1004 e1007 MD5PASSSALTMD5PASSSALT : `md5(pass . salt . md5(pass . salt))` (hx.8 line 1132) */
+/* eidx=1004 e1007 MD5PASSSALTMD5PASSSALT : `md5(pass . salt . md5(pass . salt))` (hx.8 line 1133) */
 static const char *_hx_callnames_1004[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33716,7 +33707,7 @@ static const hx_program _hx_program_1004 = {
     .has_emit  = 0,
 };
 
-/* eidx=1005 e1008 QAS-VASAUTH : `sha256("#" . salt . "-" . pass)` (hx.8 line 1133) */
+/* eidx=1005 e1008 QAS-VASAUTH : `sha256("#" . salt . "-" . pass)` (hx.8 line 1134) */
 static const char *_hx_callnames_1005[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33763,7 +33754,7 @@ static const hx_program _hx_program_1005 = {
     .has_emit  = 0,
 };
 
-/* eidx=1006 e1009 POSTOFFICE : `md5(salt . "Y" . pass . fromhex("f7") . salt)` (hx.8 line 1134) */
+/* eidx=1006 e1009 POSTOFFICE : `md5(salt . "Y" . pass . fromhex("f7") . salt)` (hx.8 line 1135) */
 static const char *_hx_callnames_1006[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33816,7 +33807,7 @@ static const hx_program _hx_program_1006 = {
     .has_emit  = 0,
 };
 
-/* eidx=1007 e1010 IPB2 : `md5(md5(fromhex(salt)) . md5(pass))` (hx.8 line 1135) */
+/* eidx=1007 e1010 IPB2 : `md5(md5(fromhex(salt)) . md5(pass))` (hx.8 line 1136) */
 static const char *_hx_callnames_1007[] = {
     [0] = NULL,
     [1] = "fromhex",
@@ -33856,7 +33847,7 @@ static const hx_program _hx_program_1007 = {
     .has_emit  = 0,
 };
 
-/* eidx=1008 e1011 MD5USERMD5PASSSALT : `md5(user . md5(pass) . salt)` (hx.8 line 1136) */
+/* eidx=1008 e1011 MD5USERMD5PASSSALT : `md5(user . md5(pass) . salt)` (hx.8 line 1137) */
 static const char *_hx_callnames_1008[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33896,8 +33887,8 @@ static const hx_program _hx_program_1008 = {
     .has_emit  = 0,
 };
 
-/* eidx=1009 e1012 RVARY : OUTLIER (hx.8 line 1137) */
-/* eidx=1010 e1013 SHA512RAWPASSSALT : `sha512_bin(pass . salt)` (hx.8 line 1138) */
+/* eidx=1009 e1012 RVARY : OUTLIER (hx.8 line 1138) */
+/* eidx=1010 e1013 SHA512RAWPASSSALT : `sha512_bin(pass . salt)` (hx.8 line 1139) */
 static const char *_hx_callnames_1010[] = {
     [0] = NULL,
     [1] = NULL,
@@ -33931,7 +33922,7 @@ static const hx_program _hx_program_1010 = {
     .has_emit  = 0,
 };
 
-/* eidx=1011 e1014 EPISERVER-SID : `sha1(cut(fromhex(salt), 0, 29) . pass . fromhex("00"))` (hx.8 line 1139) */
+/* eidx=1011 e1014 EPISERVER-SID : `sha1(cut(fromhex(salt), 0, 29) . pass . fromhex("00"))` (hx.8 line 1140) */
 static const char *_hx_callnames_1011[] = {
     [0] = NULL,
     [1] = "fromhex",
@@ -33983,7 +33974,7 @@ static const hx_program _hx_program_1011 = {
     .has_emit  = 0,
 };
 
-/* eidx=1012 e1015 ORACLE11 : `upper(sha1(pass . fromhex(salt)))` (hx.8 line 1140) */
+/* eidx=1012 e1015 ORACLE11 : `upper(sha1(pass . fromhex(salt)))` (hx.8 line 1141) */
 static const char *_hx_callnames_1012[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34021,9 +34012,9 @@ static const hx_program _hx_program_1012 = {
     .has_emit  = 0,
 };
 
-/* eidx=1013 e1016 SAPCODVNH256 : OUTLIER (hx.8 line 1141) */
-/* eidx=1014 e1017 SAPCODVNH384 : OUTLIER (hx.8 line 1142) */
-/* eidx=1015 e1018 MONGODB : `md5(user . ":mongo:" . pass)` (hx.8 line 1143) */
+/* eidx=1013 e1016 SAPCODVNH256 : OUTLIER (hx.8 line 1142) */
+/* eidx=1014 e1017 SAPCODVNH384 : OUTLIER (hx.8 line 1143) */
+/* eidx=1015 e1018 MONGODB : `md5(user . ":mongo:" . pass)` (hx.8 line 1144) */
 static const char *_hx_callnames_1015[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34065,8 +34056,8 @@ static const hx_program _hx_program_1015 = {
     .has_emit  = 0,
 };
 
-/* eidx=1016 e1019 H3C : OUTLIER (hx.8 line 1144) */
-/* eidx=1017 e1020 ARGON2MD5 : `argon2(md5(pass), salt, m, t, p)` (hx.8 line 1145) */
+/* eidx=1016 e1019 H3C : OUTLIER (hx.8 line 1145) */
+/* eidx=1017 e1020 ARGON2MD5 : `argon2(md5(pass), salt, m, t, p)` (hx.8 line 1146) */
 static const char *_hx_callnames_1017[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34109,7 +34100,7 @@ static const hx_program _hx_program_1017 = {
     .has_emit  = 0,
 };
 
-/* eidx=1018 e1021 DRAGONFLY3-32 : `sha256(pass . "$3$" . fromhex("00") . salt)` (hx.8 line 1146) */
+/* eidx=1018 e1021 DRAGONFLY3-32 : `sha256(pass . "$3$" . fromhex("00") . salt)` (hx.8 line 1147) */
 static const char *_hx_callnames_1018[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34158,7 +34149,7 @@ static const hx_program _hx_program_1018 = {
     .has_emit  = 0,
 };
 
-/* eidx=1019 e1022 DRAGONFLY3-64 : `sha256(pass . "$3$" . fromhex("00") . "sha5" . salt)` (hx.8 line 1147) */
+/* eidx=1019 e1022 DRAGONFLY3-64 : `sha256(pass . "$3$" . fromhex("00") . "sha5" . salt)` (hx.8 line 1148) */
 static const char *_hx_callnames_1019[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34212,7 +34203,7 @@ static const hx_program _hx_program_1019 = {
     .has_emit  = 0,
 };
 
-/* eidx=1020 e1023 DRAGONFLY4-32 : `sha512(pass . "$4$" . fromhex("00") . salt)` (hx.8 line 1148) */
+/* eidx=1020 e1023 DRAGONFLY4-32 : `sha512(pass . "$4$" . fromhex("00") . salt)` (hx.8 line 1149) */
 static const char *_hx_callnames_1020[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34261,7 +34252,7 @@ static const hx_program _hx_program_1020 = {
     .has_emit  = 0,
 };
 
-/* eidx=1021 e1024 DRAGONFLY4-64 : `sha512(pass . "$4$" . fromhex("00") . "/etc" . salt)` (hx.8 line 1149) */
+/* eidx=1021 e1024 DRAGONFLY4-64 : `sha512(pass . "$4$" . fromhex("00") . "/etc" . salt)` (hx.8 line 1150) */
 static const char *_hx_callnames_1021[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34315,7 +34306,7 @@ static const hx_program _hx_program_1021 = {
     .has_emit  = 0,
 };
 
-/* eidx=1022 e1025 GOST12256CRYPT : `gost12_256crypt(pass, salt, rounds)` (hx.8 line 1150) */
+/* eidx=1022 e1025 GOST12256CRYPT : `gost12_256crypt(pass, salt, rounds)` (hx.8 line 1151) */
 static const char *_hx_callnames_1022[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34350,7 +34341,7 @@ static const hx_program _hx_program_1022 = {
     .has_emit  = 0,
 };
 
-/* eidx=1023 e1026 GOST94CRYPT : `gost94crypt(pass, salt, rounds)` (hx.8 line 1151) */
+/* eidx=1023 e1026 GOST94CRYPT : `gost94crypt(pass, salt, rounds)` (hx.8 line 1152) */
 static const char *_hx_callnames_1023[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34385,7 +34376,7 @@ static const hx_program _hx_program_1023 = {
     .has_emit  = 0,
 };
 
-/* eidx=1024 e1027 SUNMD5 : `sunmd5(pass, salt, rounds)` (hx.8 line 1152) */
+/* eidx=1024 e1027 SUNMD5 : `sunmd5(pass, salt, rounds)` (hx.8 line 1153) */
 static const char *_hx_callnames_1024[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34420,9 +34411,9 @@ static const hx_program _hx_program_1024 = {
     .has_emit  = 0,
 };
 
-/* eidx=1025 e1028 CRYPTOPPLEGACY : OUTLIER (hx.8 line 1153) */
-/* eidx=1026 e1029 CRYPTOPPDEFAULT : OUTLIER (hx.8 line 1154) */
-/* eidx=1027 e1030 MD5BASE64MD5SHA1 : `md5(base64(md5(sha1(pass))))` (hx.8 line 1155) */
+/* eidx=1025 e1028 CRYPTOPPLEGACY : OUTLIER (hx.8 line 1154) */
+/* eidx=1026 e1029 CRYPTOPPDEFAULT : OUTLIER (hx.8 line 1155) */
+/* eidx=1027 e1030 MD5BASE64MD5SHA1 : `md5(base64(md5(sha1(pass))))` (hx.8 line 1156) */
 static const char *_hx_callnames_1027[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -34458,7 +34449,7 @@ static const hx_program _hx_program_1027 = {
     .has_emit  = 0,
 };
 
-/* eidx=1028 e1031 WRLSHA1 : `wrl(sha1(pass))` (hx.8 line 1156) */
+/* eidx=1028 e1031 WRLSHA1 : `wrl(sha1(pass))` (hx.8 line 1157) */
 static const char *_hx_callnames_1028[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -34490,7 +34481,7 @@ static const hx_program _hx_program_1028 = {
     .has_emit  = 0,
 };
 
-/* eidx=1029 e1032 MD5sub8-24MD5sub8-24MD5MD5MD5 : `md5(cut(md5(cut(md5(md5(md5(pass))), 8, 16)), 8, 16))` (hx.8 line 1157) */
+/* eidx=1029 e1032 MD5sub8-24MD5sub8-24MD5MD5MD5 : `md5(cut(md5(cut(md5(md5(md5(pass))), 8, 16)), 8, 16))` (hx.8 line 1158) */
 static const char *_hx_callnames_1029[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34540,7 +34531,7 @@ static const hx_program _hx_program_1029 = {
     .has_emit  = 0,
 };
 
-/* eidx=1030 e1033 MD5SHA1SHA1MD5SHA1MD5 : `md5(sha1(sha1(md5(sha1(md5(pass))))))` (hx.8 line 1158) */
+/* eidx=1030 e1033 MD5SHA1SHA1MD5SHA1MD5 : `md5(sha1(sha1(md5(sha1(md5(pass))))))` (hx.8 line 1159) */
 static const char *_hx_callnames_1030[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34580,7 +34571,7 @@ static const hx_program _hx_program_1030 = {
     .has_emit  = 0,
 };
 
-/* eidx=1031 e1034 MD5SHA1SHA1SHA1 : `md5(sha1(sha1(sha1(pass))))` (hx.8 line 1159) */
+/* eidx=1031 e1034 MD5SHA1SHA1SHA1 : `md5(sha1(sha1(sha1(pass))))` (hx.8 line 1160) */
 static const char *_hx_callnames_1031[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -34616,7 +34607,7 @@ static const hx_program _hx_program_1031 = {
     .has_emit  = 0,
 };
 
-/* eidx=1032 e1035 MD5SHA1MD5SHA1MD5SHA1 : `md5(sha1(md5(sha1(md5(sha1(pass))))))` (hx.8 line 1160) */
+/* eidx=1032 e1035 MD5SHA1MD5SHA1MD5SHA1 : `md5(sha1(md5(sha1(md5(sha1(pass))))))` (hx.8 line 1161) */
 static const char *_hx_callnames_1032[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -34656,7 +34647,7 @@ static const hx_program _hx_program_1032 = {
     .has_emit  = 0,
 };
 
-/* eidx=1033 e1036 MD5SHA512MD5 : `md5(sha512(md5(pass)))` (hx.8 line 1161) */
+/* eidx=1033 e1036 MD5SHA512MD5 : `md5(sha512(md5(pass)))` (hx.8 line 1162) */
 static const char *_hx_callnames_1033[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34690,7 +34681,7 @@ static const hx_program _hx_program_1033 = {
     .has_emit  = 0,
 };
 
-/* eidx=1034 e1037 MD5sub1-16MD5 : `md5(cut(md5(pass), 0, 16))` (hx.8 line 1162) */
+/* eidx=1034 e1037 MD5sub1-16MD5 : `md5(cut(md5(pass), 0, 16))` (hx.8 line 1163) */
 static const char *_hx_callnames_1034[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34728,7 +34719,7 @@ static const hx_program _hx_program_1034 = {
     .has_emit  = 0,
 };
 
-/* eidx=1035 e1038 MD5sub1-28MD5 : `md5(cut(md5(pass), 0, 28))` (hx.8 line 1163) */
+/* eidx=1035 e1038 MD5sub1-28MD5 : `md5(cut(md5(pass), 0, 28))` (hx.8 line 1164) */
 static const char *_hx_callnames_1035[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34766,7 +34757,7 @@ static const hx_program _hx_program_1035 = {
     .has_emit  = 0,
 };
 
-/* eidx=1036 e1039 MD5MD5sub1-30MD5 : `md5(md5(cut(md5(pass), 0, 30)))` (hx.8 line 1164) */
+/* eidx=1036 e1039 MD5MD5sub1-30MD5 : `md5(md5(cut(md5(pass), 0, 30)))` (hx.8 line 1165) */
 static const char *_hx_callnames_1036[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34806,7 +34797,7 @@ static const hx_program _hx_program_1036 = {
     .has_emit  = 0,
 };
 
-/* eidx=1037 e1040 APACHE-SHA-TRUNC16 : `"{SHA}" . base64(trunc(sha1_bin(pass), 16))` (hx.8 line 1165) */
+/* eidx=1037 e1040 APACHE-SHA-TRUNC16 : `"{SHA}" . base64(trunc(sha1_bin(pass), 16))` (hx.8 line 1166) */
 static const char *_hx_callnames_1037[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34850,7 +34841,7 @@ static const hx_program _hx_program_1037 = {
     .has_emit  = 0,
 };
 
-/* eidx=1038 e1041 MD5SALTLAST16 : `cut(md5(md5(pass) . salt), -16)` (hx.8 line 1166) */
+/* eidx=1038 e1041 MD5SALTLAST16 : `cut(md5(md5(pass) . salt), -16)` (hx.8 line 1167) */
 static const char *_hx_callnames_1038[] = {
     [0] = NULL,
     [1] = "md5",
@@ -34890,7 +34881,7 @@ static const hx_program _hx_program_1038 = {
     .has_emit  = 0,
 };
 
-/* eidx=1039 e1042 MD5SALTMD5PASS-PASS : `md5(salt . md5(pass) . ":" . pass)` (hx.8 line 1167) */
+/* eidx=1039 e1042 MD5SALTMD5PASS-PASS : `md5(salt . md5(pass) . ":" . pass)` (hx.8 line 1168) */
 static const char *_hx_callnames_1039[] = {
     [0] = NULL,
     [1] = NULL,
@@ -34938,7 +34929,7 @@ static const hx_program _hx_program_1039 = {
     .has_emit  = 0,
 };
 
-/* eidx=1040 e1043 MD5-1xMD5SHA1pSHA1p : `md5(md5(sha1(pass)) . sha1(pass))` (hx.8 line 1168) */
+/* eidx=1040 e1043 MD5-1xMD5SHA1pSHA1p : `md5(md5(sha1(pass)) . sha1(pass))` (hx.8 line 1169) */
 static const char *_hx_callnames_1040[] = {
     [0] = NULL,
     [1] = "sha1",
@@ -34978,7 +34969,7 @@ static const hx_program _hx_program_1040 = {
     .has_emit  = 0,
 };
 
-/* eidx=1041 e1044 MD5-1xMD5SHA256pSHA256p : `md5(md5(sha256(pass)) . sha256(pass))` (hx.8 line 1169) */
+/* eidx=1041 e1044 MD5-1xMD5SHA256pSHA256p : `md5(md5(sha256(pass)) . sha256(pass))` (hx.8 line 1170) */
 static const char *_hx_callnames_1041[] = {
     [0] = NULL,
     [1] = "sha256",
@@ -35018,7 +35009,7 @@ static const hx_program _hx_program_1041 = {
     .has_emit  = 0,
 };
 
-/* eidx=1042 e1045 MD5-1xMD5SHA512pSHA512p : `md5(md5(sha512(pass)) . sha512(pass))` (hx.8 line 1170) */
+/* eidx=1042 e1045 MD5-1xMD5SHA512pSHA512p : `md5(md5(sha512(pass)) . sha512(pass))` (hx.8 line 1171) */
 static const char *_hx_callnames_1042[] = {
     [0] = NULL,
     [1] = "sha512",
@@ -35058,7 +35049,7 @@ static const hx_program _hx_program_1042 = {
     .has_emit  = 0,
 };
 
-/* eidx=1043 e1046 MD5-1xMD5MD5pMD5p : `md5(md5(md5(pass)) . md5(pass))` (hx.8 line 1171) */
+/* eidx=1043 e1046 MD5-1xMD5MD5pMD5p : `md5(md5(md5(pass)) . md5(pass))` (hx.8 line 1172) */
 static const char *_hx_callnames_1043[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35098,7 +35089,7 @@ static const hx_program _hx_program_1043 = {
     .has_emit  = 0,
 };
 
-/* eidx=1044 e1047 MD5-1xMD5pMD5SHA1p : `md5(md5(pass) . md5(sha1(pass)))` (hx.8 line 1172) */
+/* eidx=1044 e1047 MD5-1xMD5pMD5SHA1p : `md5(md5(pass) . md5(sha1(pass)))` (hx.8 line 1173) */
 static const char *_hx_callnames_1044[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35138,7 +35129,7 @@ static const hx_program _hx_program_1044 = {
     .has_emit  = 0,
 };
 
-/* eidx=1045 e1048 MD5-1xMD5pMD5SHA256p : `md5(md5(pass) . md5(sha256(pass)))` (hx.8 line 1173) */
+/* eidx=1045 e1048 MD5-1xMD5pMD5SHA256p : `md5(md5(pass) . md5(sha256(pass)))` (hx.8 line 1174) */
 static const char *_hx_callnames_1045[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35178,7 +35169,7 @@ static const hx_program _hx_program_1045 = {
     .has_emit  = 0,
 };
 
-/* eidx=1046 e1049 MD5-1xMD5pMD5SHA512p : `md5(md5(pass) . md5(sha512(pass)))` (hx.8 line 1174) */
+/* eidx=1046 e1049 MD5-1xMD5pMD5SHA512p : `md5(md5(pass) . md5(sha512(pass)))` (hx.8 line 1175) */
 static const char *_hx_callnames_1046[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35218,7 +35209,7 @@ static const hx_program _hx_program_1046 = {
     .has_emit  = 0,
 };
 
-/* eidx=1047 e1050 MD5SHA1revMD5 : `md5(sha1(rev(md5(pass))))` (hx.8 line 1175) */
+/* eidx=1047 e1050 MD5SHA1revMD5 : `md5(sha1(rev(md5(pass))))` (hx.8 line 1176) */
 static const char *_hx_callnames_1047[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35254,7 +35245,7 @@ static const hx_program _hx_program_1047 = {
     .has_emit  = 0,
 };
 
-/* eidx=1048 e1051 MD5MD5RAWMD5PASS : `md5(md5_bin(md5(pass) . pass))` (hx.8 line 1176) */
+/* eidx=1048 e1051 MD5MD5RAWMD5PASS : `md5(md5_bin(md5(pass) . pass))` (hx.8 line 1177) */
 static const char *_hx_callnames_1048[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35292,7 +35283,7 @@ static const hx_program _hx_program_1048 = {
     .has_emit  = 0,
 };
 
-/* eidx=1049 e1052 MD5MD5RAWMD5 : `md5(md5_bin(md5(pass)))` (hx.8 line 1177) */
+/* eidx=1049 e1052 MD5MD5RAWMD5 : `md5(md5_bin(md5(pass)))` (hx.8 line 1178) */
 static const char *_hx_callnames_1049[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35326,7 +35317,7 @@ static const hx_program _hx_program_1049 = {
     .has_emit  = 0,
 };
 
-/* eidx=1050 e1053 MD5SHA1SHA1MD5MD5 : `md5(sha1(sha1(md5(md5(pass)))))` (hx.8 line 1178) */
+/* eidx=1050 e1053 MD5SHA1SHA1MD5MD5 : `md5(sha1(sha1(md5(md5(pass)))))` (hx.8 line 1179) */
 static const char *_hx_callnames_1050[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35364,7 +35355,7 @@ static const hx_program _hx_program_1050 = {
     .has_emit  = 0,
 };
 
-/* eidx=1051 e1054 SHA256MD5PASSSALT : `sha256(md5(pass . salt))` (hx.8 line 1179) */
+/* eidx=1051 e1054 SHA256MD5PASSSALT : `sha256(md5(pass . salt))` (hx.8 line 1180) */
 static const char *_hx_callnames_1051[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35400,7 +35391,7 @@ static const hx_program _hx_program_1051 = {
     .has_emit  = 0,
 };
 
-/* eidx=1052 e1055 WATTPAD : `hmac_sha256("d2e1a4c569e7018cc142e9cce755a964bd9b193d2d31f02d80bb589c959afd7e", sha1(salt) . pass)` (hx.8 line 1180) */
+/* eidx=1052 e1055 WATTPAD : `hmac_sha256("d2e1a4c569e7018cc142e9cce755a964bd9b193d2d31f02d80bb589c959afd7e", sha1(salt) . pass)` (hx.8 line 1181) */
 static const char *_hx_callnames_1052[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35442,7 +35433,7 @@ static const hx_program _hx_program_1052 = {
     .has_emit  = 0,
 };
 
-/* eidx=1053 e1056 HMAC-SHA256-SHA1SALTPASS : `hmac_sha256(salt2, sha1(salt) . pass)` (hx.8 line 1181) */
+/* eidx=1053 e1056 HMAC-SHA256-SHA1SALTPASS : `hmac_sha256(salt2, sha1(salt) . pass)` (hx.8 line 1182) */
 static const char *_hx_callnames_1053[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35480,7 +35471,7 @@ static const hx_program _hx_program_1053 = {
     .has_emit  = 0,
 };
 
-/* eidx=1054 e1057 MD5SQL5MD5MD5 : `md5("*" . upper(sha1(sha1_bin(md5(md5(pass))))))` (hx.8 line 1182) */
+/* eidx=1054 e1057 MD5SQL5MD5MD5 : `md5("*" . upper(sha1(sha1_bin(md5(md5(pass))))))` (hx.8 line 1183) */
 static const char *_hx_callnames_1054[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35528,7 +35519,7 @@ static const hx_program _hx_program_1054 = {
     .has_emit  = 0,
 };
 
-/* eidx=1055 e1058 MD5SQL5MD5MD5MD5 : `md5("*" . upper(sha1(sha1_bin(md5(md5(md5(pass)))))))` (hx.8 line 1183) */
+/* eidx=1055 e1058 MD5SQL5MD5MD5MD5 : `md5("*" . upper(sha1(sha1_bin(md5(md5(md5(pass)))))))` (hx.8 line 1184) */
 static const char *_hx_callnames_1055[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35578,7 +35569,7 @@ static const hx_program _hx_program_1055 = {
     .has_emit  = 0,
 };
 
-/* eidx=1056 e1059 BCRYPTMD5PASSSALT : `bcrypt(md5(pass . salt2), salt, cost)` (hx.8 line 1184) */
+/* eidx=1056 e1059 BCRYPTMD5PASSSALT : `bcrypt(md5(pass . salt2), salt, cost)` (hx.8 line 1185) */
 static const char *_hx_callnames_1056[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35619,7 +35610,7 @@ static const hx_program _hx_program_1056 = {
     .has_emit  = 0,
 };
 
-/* eidx=1057 e1060 MD5USERDESCRYPT : `md5(user . descrypt(pass, salt))` (hx.8 line 1185) */
+/* eidx=1057 e1060 MD5USERDESCRYPT : `md5(user . descrypt(pass, salt))` (hx.8 line 1186) */
 static const char *_hx_callnames_1057[] = {
     [0] = NULL,
     [1] = NULL,
@@ -35657,7 +35648,7 @@ static const hx_program _hx_program_1057 = {
     .has_emit  = 0,
 };
 
-/* eidx=1058 e1061 MD5CRYPTMD5 : `md5crypt(md5(pass), salt)` (hx.8 line 1186) */
+/* eidx=1058 e1061 MD5CRYPTMD5 : `md5crypt(md5(pass), salt)` (hx.8 line 1187) */
 static const char *_hx_callnames_1058[] = {
     [0] = NULL,
     [1] = "md5",
@@ -35691,7 +35682,7 @@ static const hx_program _hx_program_1058 = {
     .has_emit  = 0,
 };
 
-/* eidx=1059 e1062 SHA256BASE64 : `sha256(base64(pass))` (hx.8 line 1187) */
+/* eidx=1059 e1062 SHA256BASE64 : `sha256(base64(pass))` (hx.8 line 1188) */
 static const char *_hx_callnames_1059[] = {
     [0] = NULL,
     [1] = "base64",
@@ -36575,7 +36566,7 @@ const struct hx_spec_entry hx_specs_data[] = {
     { .job_enum = 851, .name = "MSSQL2005", .expression = "sha1(utf16le(pass) . salt)", .hx8_line = 950, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_848, .call_names = _hx_callnames_848, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 852, .name = "MSSQL2012", .expression = "sha512(utf16le(pass) . salt)", .hx8_line = 951, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_849, .call_names = _hx_callnames_849, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 853, .name = "MACOSX", .expression = "sha1(fromhex(salt) . pass)", .hx8_line = 952, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_850, .call_names = _hx_callnames_850, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 854, .name = "MACOSX7", .expression = "pbkdf2_sha512(pass, salt, N, 128)", .hx8_line = 953, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_851, .call_names = _hx_callnames_851, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 854, .name = "MACOSX7", .expression = "sha512(fromhex(salt) . pass)", .hx8_line = 953, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_851, .call_names = _hx_callnames_851, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 855, .name = "POSTGRESQL", .expression = "md5(pass . user)", .hx8_line = 954, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_852, .call_names = _hx_callnames_852, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 856, .name = "JUNIPERSSG", .expression = "juniper_encode(md5_bin(user . \":Administration Tools:\" . pass))", .hx8_line = 955, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_853, .call_names = _hx_callnames_853, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 857, .name = "SKYPE", .expression = "md5(user . fromhex(\"0a\") . \"skyper\" . fromhex(\"0a\") . pass)", .hx8_line = 956, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_854, .call_names = _hx_callnames_854, .emit_class = 0, .note_ref = 0 },
@@ -36608,182 +36599,182 @@ const struct hx_spec_entry hx_specs_data[] = {
     { .job_enum = 884, .name = "SCRYPT", .expression = "scrypt(pass, salt, N, r, p)", .hx8_line = 983, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_881, .call_names = _hx_callnames_881, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 885, .name = "JUNIPERIVE", .expression = "md5(salt . md5(pass))", .hx8_line = 984, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_882, .call_names = _hx_callnames_882, .emit_class = 0, .note_ref = 0 },
     { .job_enum = 886, .name = "PHPS", .expression = "md5(salt . md5(pass))", .hx8_line = 985, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_883, .call_names = _hx_callnames_883, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 887, .name = "ARUBAOS", .expression = "md5(salt . pass)", .hx8_line = 986, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_884, .call_names = _hx_callnames_884, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 888, .name = "ISCSI-CHAP", .expression = "", .hx8_line = 987, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 889, .name = "WERKZEUG-MD5", .expression = "pbkdf2_md5(pass, salt, N, 32)", .hx8_line = 988, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_886, .call_names = _hx_callnames_886, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 890, .name = "WERKZEUG-SHA256", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 989, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_887, .call_names = _hx_callnames_887, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 891, .name = "AUTHME", .expression = "sha256(sha256(pass) . salt)", .hx8_line = 990, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_888, .call_names = _hx_callnames_888, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 892, .name = "NETWITNESS", .expression = "", .hx8_line = 991, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 893, .name = "NETSCALER-SHA512", .expression = "sha512(salt . pass . fromhex(\"00\"))", .hx8_line = 992, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_890, .call_names = _hx_callnames_890, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 894, .name = "SHA1SHA1SALTPASSSALT", .expression = "sha1(sha1(salt . pass . salt))", .hx8_line = 993, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_891, .call_names = _hx_callnames_891, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 895, .name = "NETSCALER-PBKDF2", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 994, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_892, .call_names = _hx_callnames_892, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 896, .name = "ORACLE7", .expression = "upper(oracle7(pass, salt))", .hx8_line = 995, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_893, .call_names = _hx_callnames_893, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 897, .name = "NETNTLMV1", .expression = "des_block(md4(utf16le(pass)), challenge)", .hx8_line = 996, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_894, .call_names = _hx_callnames_894, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 898, .name = "NETNTLMV2", .expression = "hmac_md5(md4(utf16le(pass)), challenge)", .hx8_line = 997, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_895, .call_names = _hx_callnames_895, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 899, .name = "LASTPASS", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 998, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_896, .call_names = _hx_callnames_896, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 900, .name = "FORTIGATE", .expression = "sha1(salt . pass . salt)", .hx8_line = 999, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_897, .call_names = _hx_callnames_897, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 901, .name = "DOMINO8", .expression = "", .hx8_line = 1000, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 902, .name = "SIPHASH", .expression = "siphash(pass, fromhex(salt))", .hx8_line = 1001, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_899, .call_names = _hx_callnames_899, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 903, .name = "CRAMMD5", .expression = "hmac_md5(pass, challenge)", .hx8_line = 1002, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_900, .call_names = _hx_callnames_900, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 904, .name = "SAPCODVNH", .expression = "sha1(pass . salt)", .hx8_line = 1003, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_901, .call_names = _hx_callnames_901, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 905, .name = "REDHAT389DS", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 1004, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_902, .call_names = _hx_callnames_902, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 906, .name = "POSTGRESCRAM", .expression = "md5(md5(pass . user) . fromhex(salt))", .hx8_line = 1005, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_903, .call_names = _hx_callnames_903, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 907, .name = "MYSQLCRAM", .expression = "upper(sha1(sha1_bin(pass)))", .hx8_line = 1006, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_904, .call_names = _hx_callnames_904, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 908, .name = "SHIRO1", .expression = "pbkdf2_sha1(pass, salt, N, 16)", .hx8_line = 1007, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_905, .call_names = _hx_callnames_905, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 909, .name = "ECRYPTFS", .expression = "sha512^65536(pass . salt)", .hx8_line = 1008, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_906, .call_names = _hx_callnames_906, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 910, .name = "ORACLE12", .expression = "pbkdf2_sha512(pass, salt, 4096, 64)", .hx8_line = 1009, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_907, .call_names = _hx_callnames_907, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 911, .name = "COLDFUSION10", .expression = "sha256(salt . upper(sha1(pass)))", .hx8_line = 1010, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_908, .call_names = _hx_callnames_908, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 912, .name = "AZURESYNC", .expression = "pbkdf2_sha256(pass, salt, 1000, 32)", .hx8_line = 1011, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_909, .call_names = _hx_callnames_909, .emit_class = 0, .note_ref = 49 },
-    { .job_enum = 913, .name = "ANDROIDFDE", .expression = "pbkdf2_sha1(pass, salt, 2000, 16)", .hx8_line = 1012, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_910, .call_names = _hx_callnames_910, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 914, .name = "KRB5TGS23", .expression = "rc4_hmac_md5(pass, realm, spn)", .hx8_line = 1013, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_911, .call_names = _hx_callnames_911, .emit_class = 0, .note_ref = 49 },
-    { .job_enum = 915, .name = "AXCRYPT", .expression = "axcrypt(pass, fromhex(salt), iter)", .hx8_line = 1014, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_912, .call_names = _hx_callnames_912, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 916, .name = "AXCRYPTSHA1", .expression = "cut(sha1(pass), 0, 32)", .hx8_line = 1015, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_913, .call_names = _hx_callnames_913, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 917, .name = "CISCO9", .expression = "scrypt(pass, salt, 16384, 1, 1)", .hx8_line = 1016, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_914, .call_names = _hx_callnames_914, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 918, .name = "DCC2", .expression = "pbkdf2_sha1(md4_bin(md4_bin(utf16le(pass)) . utf16le(lower(user))), utf16le(lower(user)), N, 16)", .hx8_line = 1017, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_915, .call_names = _hx_callnames_915, .emit_class = 0, .note_ref = 49 },
-    { .job_enum = 919, .name = "PWSAFE3", .expression = "T{", .hx8_line = 1018, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 920, .name = "IKEPSK-MD5", .expression = "hmac_md5(psk, ike_payload)", .hx8_line = 1021, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_917, .call_names = _hx_callnames_917, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 921, .name = "IKEPSK-SHA1", .expression = "hmac_sha1(psk, ike_payload)", .hx8_line = 1022, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_918, .call_names = _hx_callnames_918, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 922, .name = "SAP-BCODE", .expression = "upper(sap_bcode(pass, salt))", .hx8_line = 1023, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_919, .call_names = _hx_callnames_919, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 923, .name = "SAP-BCODE4", .expression = "cut(upper(sap_bcode(pass, salt)), 0, 8) . \"00000000\"", .hx8_line = 1024, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_920, .call_names = _hx_callnames_920, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 924, .name = "SAP-PASSCODE", .expression = "", .hx8_line = 1025, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 925, .name = "SAP-PASSCODE5", .expression = "", .hx8_line = 1026, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 926, .name = "AS400-DES", .expression = "upper(as400_des(pass, salt))", .hx8_line = 1027, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_923, .call_names = _hx_callnames_923, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 927, .name = "PS-TOKEN", .expression = "sha1(fromhex(salt) . utf16le(pass))", .hx8_line = 1028, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_924, .call_names = _hx_callnames_924, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 928, .name = "WINPHONE", .expression = "sha256(utf16le(pass) . fromhex(salt))", .hx8_line = 1029, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_925, .call_names = _hx_callnames_925, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 929, .name = "RACF-KDFAES", .expression = "", .hx8_line = 1030, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 930, .name = "TACACS", .expression = "", .hx8_line = 1031, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 931, .name = "APPLE-SECURE-NOTES", .expression = "pbkdf2_sha256(pass, salt, 20000, 32)", .hx8_line = 1032, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_928, .call_names = _hx_callnames_928, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 932, .name = "CRAMMD5-DOVECOT", .expression = "hmac_md5(pass, challenge)", .hx8_line = 1033, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_929, .call_names = _hx_callnames_929, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 933, .name = "JWT", .expression = "T{", .hx8_line = 1034, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 934, .name = "QNX-MD5", .expression = "md5crypt(pass, salt)", .hx8_line = 1037, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_931, .call_names = _hx_callnames_931, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 935, .name = "QNX-SHA256", .expression = "sha256crypt(pass, salt, rounds)", .hx8_line = 1038, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_932, .call_names = _hx_callnames_932, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 936, .name = "QNX-SHA512", .expression = "sha512crypt(pass, salt, rounds)", .hx8_line = 1039, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_933, .call_names = _hx_callnames_933, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 937, .name = "QNX7-SHA512", .expression = "sha512crypt(pass, salt, rounds)", .hx8_line = 1040, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_934, .call_names = _hx_callnames_934, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 938, .name = "SHA1-S1PS2", .expression = "sha1(s1 . pass . s2)", .hx8_line = 1041, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_935, .call_names = _hx_callnames_935, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 939, .name = "RAILS-RESTFUL", .expression = "T{", .hx8_line = 1042, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 940, .name = "KRB5PA-17", .expression = "T{", .hx8_line = 1045, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 941, .name = "KRB5PA-18", .expression = "T{", .hx8_line = 1048, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 942, .name = "WPA-PMKID", .expression = "", .hx8_line = 1051, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 12 },
-    { .job_enum = 943, .name = "WPA-EAPOL", .expression = "", .hx8_line = 1052, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 13 },
-    { .job_enum = 944, .name = "ANSIBLE-VAULT", .expression = "", .hx8_line = 1053, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 945, .name = "APFS", .expression = "", .hx8_line = 1054, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 946, .name = "OTM-SHA256", .expression = "", .hx8_line = 1055, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 947, .name = "TELEGRAM-SHA256", .expression = "T{", .hx8_line = 1056, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 948, .name = "WEB2PY-SHA512", .expression = "pbkdf2_sha512(pass, salt, 1000, 64)", .hx8_line = 1059, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_945, .call_names = _hx_callnames_945, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 949, .name = "SOLARWINDS", .expression = "", .hx8_line = 1060, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 950, .name = "SOLARWINDS2", .expression = "", .hx8_line = 1061, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 951, .name = "SIMPLACMS", .expression = "md5(salt . pass . md5(pass))", .hx8_line = 1062, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_948, .call_names = _hx_callnames_948, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 952, .name = "APPLE-KEYCHAIN", .expression = "T{", .hx8_line = 1063, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 953, .name = "APPLE-IWORK", .expression = "pbkdf2_sha1(pass, salt, 50000, 16)", .hx8_line = 1066, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_950, .call_names = _hx_callnames_950, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 954, .name = "BITWARDEN", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 1067, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_951, .call_names = _hx_callnames_951, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 955, .name = "MONGODB-SHA1", .expression = "T{", .hx8_line = 1068, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 956, .name = "MONGODB-SHA256", .expression = "T{", .hx8_line = 1071, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 957, .name = "FORTIGATE256", .expression = "sha256(salt . pass . salt)", .hx8_line = 1074, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_954, .call_names = _hx_callnames_954, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 958, .name = "UMBRACO", .expression = "hmac_sha1(pass, salt)", .hx8_line = 1075, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_955, .call_names = _hx_callnames_955, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 959, .name = "DAHUA-AUTH", .expression = "dahua_encode(md5_bin(pass))", .hx8_line = 1076, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_956, .call_names = _hx_callnames_956, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 960, .name = "BESDER-AUTH", .expression = "besder_encode(md5_bin(pass))", .hx8_line = 1077, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_957, .call_names = _hx_callnames_957, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 961, .name = "SQLCIPHER", .expression = "pbkdf2_sha1(pass, salt, N, 32)", .hx8_line = 1078, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_958, .call_names = _hx_callnames_958, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 962, .name = "RORAILS-SHA1", .expression = "sha1(\"--\" . salt . \"--\" . pass . \"--\")", .hx8_line = 1079, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_959, .call_names = _hx_callnames_959, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 963, .name = "AES128-NOKDF", .expression = "aes_ecb_encrypt(pad(pass, 16), fromhex(salt))", .hx8_line = 1080, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_960, .call_names = _hx_callnames_960, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 964, .name = "AES192-NOKDF", .expression = "aes_ecb_encrypt(pad(pass, 24), fromhex(salt))", .hx8_line = 1081, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_961, .call_names = _hx_callnames_961, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 965, .name = "AES256-NOKDF", .expression = "aes_ecb_encrypt(pad(pass, 32), fromhex(salt))", .hx8_line = 1082, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_962, .call_names = _hx_callnames_962, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 966, .name = "VMWARE-VMX", .expression = "pbkdf2_sha1(pass, salt, N, 32)", .hx8_line = 1083, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_963, .call_names = _hx_callnames_963, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 967, .name = "BCRYPTSHA512", .expression = "bcrypt(sha512(pass), salt, cost)", .hx8_line = 1084, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_964, .call_names = _hx_callnames_964, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 968, .name = "POSTGRESSCRAM256", .expression = "T{", .hx8_line = 1085, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 969, .name = "AWSSIGV4", .expression = "", .hx8_line = 1088, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 3 },
-    { .job_enum = 970, .name = "KRB5DB17", .expression = "T{", .hx8_line = 1089, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 971, .name = "KRB5DB18", .expression = "T{", .hx8_line = 1092, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 972, .name = "MURMUR3", .expression = "murmur3(pass, seed)", .hx8_line = 1095, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_969, .call_names = _hx_callnames_969, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 973, .name = "VEEAM-VBK", .expression = "T{", .hx8_line = 1096, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 974, .name = "MSSNTP", .expression = "", .hx8_line = 1099, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 975, .name = "SSPR-MD5", .expression = "md5^N(pass)", .hx8_line = 1100, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 976, .name = "SSPR-SHA1", .expression = "sha1^N(pass)", .hx8_line = 1101, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 977, .name = "SSPR-SHA1S", .expression = "sha1(pass . salt)", .hx8_line = 1102, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_974, .call_names = _hx_callnames_974, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 978, .name = "SSPR-SHA256", .expression = "sha256^N(salt . pass)", .hx8_line = 1103, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 979, .name = "SSPR-SHA512", .expression = "sha512^N(salt . pass)", .hx8_line = 1104, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 980, .name = "EMPIRECMS", .expression = "md5(md5(salt) . md5(pass))", .hx8_line = 1105, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_977, .call_names = _hx_callnames_977, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 981, .name = "PBKDF1-SHA1", .expression = "pbkdf1_sha1(pass, salt, iter)", .hx8_line = 1106, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_978, .call_names = _hx_callnames_978, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 982, .name = "MSONLINE", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 1107, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_979, .call_names = _hx_callnames_979, .emit_class = 0, .note_ref = 49 },
-    { .job_enum = 983, .name = "WBB4", .expression = "sha1(salt . sha1(salt . sha1(pass)))", .hx8_line = 1108, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_980, .call_names = _hx_callnames_980, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 984, .name = "SAPCODVNH512", .expression = "pbkdf2_sha512(pass, salt, N, 64)", .hx8_line = 1109, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_981, .call_names = _hx_callnames_981, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 985, .name = "SM3CRYPT", .expression = "sm3crypt(pass, salt, rounds)", .hx8_line = 1110, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_982, .call_names = _hx_callnames_982, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 986, .name = "AS400SSHA1", .expression = "", .hx8_line = 1111, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 987, .name = "ARGON2", .expression = "argon2(pass, salt, m, t, p)", .hx8_line = 1112, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_984, .call_names = _hx_callnames_984, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 988, .name = "SM3", .expression = "sm3(pass)", .hx8_line = 1113, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_985, .call_names = _hx_callnames_985, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 989, .name = "BCRYPTHMACSHA256", .expression = "bcrypt(base64(hmac_sha256_bin(salt, pass)), salt, N)", .hx8_line = 1114, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_986, .call_names = _hx_callnames_986, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 990, .name = "WPA-PMK", .expression = "", .hx8_line = 1115, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 991, .name = "MD5SALT1SALT2", .expression = "md5(salt . pass . salt2)", .hx8_line = 1116, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_988, .call_names = _hx_callnames_988, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 992, .name = "SYMFONY256", .expression = "", .hx8_line = 1117, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 993, .name = "WPBCRYPT", .expression = "bcrypt(base64(hmac_sha384_bin(pass, \"wp-sha384\")), salt, N)", .hx8_line = 1118, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_990, .call_names = _hx_callnames_990, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 994, .name = "GOST12512CRYPT", .expression = "gost12_512crypt(pass, salt, rounds)", .hx8_line = 1119, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_991, .call_names = _hx_callnames_991, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 995, .name = "YESCRYPT", .expression = "yescrypt(pass, salt, N, r, p)", .hx8_line = 1120, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_992, .call_names = _hx_callnames_992, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 996, .name = "MD5SHA256SHA256", .expression = "md5(sha256(sha256(pass)))", .hx8_line = 1121, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_993, .call_names = _hx_callnames_993, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 997, .name = "BSDICRYPT", .expression = "bsdicrypt(pass, salt)", .hx8_line = 1122, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_994, .call_names = _hx_callnames_994, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 998, .name = "GOST-YESCRYPT", .expression = "gost_yescrypt(pass, salt)", .hx8_line = 1123, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_995, .call_names = _hx_callnames_995, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 999, .name = "SHA1CRYPT", .expression = "sha1crypt(pass, salt, rounds)", .hx8_line = 1124, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_996, .call_names = _hx_callnames_996, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1000, .name = "7ZIP", .expression = "sevenzip(pass, salt)", .hx8_line = 1125, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_997, .call_names = _hx_callnames_997, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1001, .name = "CMIYC", .expression = "cmiyc(pass, salt)", .hx8_line = 1126, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_998, .call_names = _hx_callnames_998, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1002, .name = "RMD256", .expression = "rmd256(pass)", .hx8_line = 1127, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_999, .call_names = _hx_callnames_999, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1003, .name = "MD4SALTPASS", .expression = "md4(salt . pass)", .hx8_line = 1128, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1000, .call_names = _hx_callnames_1000, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1004, .name = "MD4PASSSALT", .expression = "md4(pass . salt)", .hx8_line = 1129, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1001, .call_names = _hx_callnames_1001, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1005, .name = "SHA1UCUSERPASS", .expression = "sha1(upper(user) . \":\" . pass)", .hx8_line = 1130, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1002, .call_names = _hx_callnames_1002, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1006, .name = "SHA1USERCOLONPASS", .expression = "sha1(user . \":\" . pass)", .hx8_line = 1131, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1003, .call_names = _hx_callnames_1003, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1007, .name = "MD5PASSSALTMD5PASSSALT", .expression = "md5(pass . salt . md5(pass . salt))", .hx8_line = 1132, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1004, .call_names = _hx_callnames_1004, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1008, .name = "QAS-VASAUTH", .expression = "sha256(\"#\" . salt . \"-\" . pass)", .hx8_line = 1133, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1005, .call_names = _hx_callnames_1005, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1009, .name = "POSTOFFICE", .expression = "md5(salt . \"Y\" . pass . fromhex(\"f7\") . salt)", .hx8_line = 1134, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1006, .call_names = _hx_callnames_1006, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1010, .name = "IPB2", .expression = "md5(md5(fromhex(salt)) . md5(pass))", .hx8_line = 1135, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1007, .call_names = _hx_callnames_1007, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1011, .name = "MD5USERMD5PASSSALT", .expression = "md5(user . md5(pass) . salt)", .hx8_line = 1136, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1008, .call_names = _hx_callnames_1008, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1012, .name = "RVARY", .expression = "", .hx8_line = 1137, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1013, .name = "SHA512RAWPASSSALT", .expression = "sha512_bin(pass . salt)", .hx8_line = 1138, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1010, .call_names = _hx_callnames_1010, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1014, .name = "EPISERVER-SID", .expression = "sha1(cut(fromhex(salt), 0, 29) . pass . fromhex(\"00\"))", .hx8_line = 1139, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1011, .call_names = _hx_callnames_1011, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1015, .name = "ORACLE11", .expression = "upper(sha1(pass . fromhex(salt)))", .hx8_line = 1140, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1012, .call_names = _hx_callnames_1012, .emit_class = 0, .note_ref = 40 },
-    { .job_enum = 1016, .name = "SAPCODVNH256", .expression = "", .hx8_line = 1141, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 41 },
-    { .job_enum = 1017, .name = "SAPCODVNH384", .expression = "", .hx8_line = 1142, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 41 },
-    { .job_enum = 1018, .name = "MONGODB", .expression = "md5(user . \":mongo:\" . pass)", .hx8_line = 1143, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1015, .call_names = _hx_callnames_1015, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1019, .name = "H3C", .expression = "", .hx8_line = 1144, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 42 },
-    { .job_enum = 1020, .name = "ARGON2MD5", .expression = "argon2(md5(pass), salt, m, t, p)", .hx8_line = 1145, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1017, .call_names = _hx_callnames_1017, .emit_class = 0, .note_ref = 43 },
-    { .job_enum = 1021, .name = "DRAGONFLY3-32", .expression = "sha256(pass . \"$3$\" . fromhex(\"00\") . salt)", .hx8_line = 1146, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1018, .call_names = _hx_callnames_1018, .emit_class = 0, .note_ref = 44 },
-    { .job_enum = 1022, .name = "DRAGONFLY3-64", .expression = "sha256(pass . \"$3$\" . fromhex(\"00\") . \"sha5\" . salt)", .hx8_line = 1147, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1019, .call_names = _hx_callnames_1019, .emit_class = 0, .note_ref = 44 },
-    { .job_enum = 1023, .name = "DRAGONFLY4-32", .expression = "sha512(pass . \"$4$\" . fromhex(\"00\") . salt)", .hx8_line = 1148, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1020, .call_names = _hx_callnames_1020, .emit_class = 0, .note_ref = 44 },
-    { .job_enum = 1024, .name = "DRAGONFLY4-64", .expression = "sha512(pass . \"$4$\" . fromhex(\"00\") . \"/etc\" . salt)", .hx8_line = 1149, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1021, .call_names = _hx_callnames_1021, .emit_class = 0, .note_ref = 44 },
-    { .job_enum = 1025, .name = "GOST12256CRYPT", .expression = "gost12_256crypt(pass, salt, rounds)", .hx8_line = 1150, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1022, .call_names = _hx_callnames_1022, .emit_class = 0, .note_ref = 45 },
-    { .job_enum = 1026, .name = "GOST94CRYPT", .expression = "gost94crypt(pass, salt, rounds)", .hx8_line = 1151, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1023, .call_names = _hx_callnames_1023, .emit_class = 0, .note_ref = 45 },
-    { .job_enum = 1027, .name = "SUNMD5", .expression = "sunmd5(pass, salt, rounds)", .hx8_line = 1152, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1024, .call_names = _hx_callnames_1024, .emit_class = 0, .note_ref = 46 },
-    { .job_enum = 1028, .name = "CRYPTOPPLEGACY", .expression = "", .hx8_line = 1153, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 50 },
-    { .job_enum = 1029, .name = "CRYPTOPPDEFAULT", .expression = "", .hx8_line = 1154, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 50 },
-    { .job_enum = 1030, .name = "MD5BASE64MD5SHA1", .expression = "md5(base64(md5(sha1(pass))))", .hx8_line = 1155, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1027, .call_names = _hx_callnames_1027, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1031, .name = "WRLSHA1", .expression = "wrl(sha1(pass))", .hx8_line = 1156, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1028, .call_names = _hx_callnames_1028, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1032, .name = "MD5sub8-24MD5sub8-24MD5MD5MD5", .expression = "md5(cut(md5(cut(md5(md5(md5(pass))), 8, 16)), 8, 16))", .hx8_line = 1157, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1029, .call_names = _hx_callnames_1029, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1033, .name = "MD5SHA1SHA1MD5SHA1MD5", .expression = "md5(sha1(sha1(md5(sha1(md5(pass))))))", .hx8_line = 1158, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1030, .call_names = _hx_callnames_1030, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1034, .name = "MD5SHA1SHA1SHA1", .expression = "md5(sha1(sha1(sha1(pass))))", .hx8_line = 1159, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1031, .call_names = _hx_callnames_1031, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1035, .name = "MD5SHA1MD5SHA1MD5SHA1", .expression = "md5(sha1(md5(sha1(md5(sha1(pass))))))", .hx8_line = 1160, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1032, .call_names = _hx_callnames_1032, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1036, .name = "MD5SHA512MD5", .expression = "md5(sha512(md5(pass)))", .hx8_line = 1161, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1033, .call_names = _hx_callnames_1033, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1037, .name = "MD5sub1-16MD5", .expression = "md5(cut(md5(pass), 0, 16))", .hx8_line = 1162, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1034, .call_names = _hx_callnames_1034, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1038, .name = "MD5sub1-28MD5", .expression = "md5(cut(md5(pass), 0, 28))", .hx8_line = 1163, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1035, .call_names = _hx_callnames_1035, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1039, .name = "MD5MD5sub1-30MD5", .expression = "md5(md5(cut(md5(pass), 0, 30)))", .hx8_line = 1164, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1036, .call_names = _hx_callnames_1036, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1040, .name = "APACHE-SHA-TRUNC16", .expression = "\"{SHA}\" . base64(trunc(sha1_bin(pass), 16))", .hx8_line = 1165, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1037, .call_names = _hx_callnames_1037, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1041, .name = "MD5SALTLAST16", .expression = "cut(md5(md5(pass) . salt), -16)", .hx8_line = 1166, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1038, .call_names = _hx_callnames_1038, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1042, .name = "MD5SALTMD5PASS-PASS", .expression = "md5(salt . md5(pass) . \":\" . pass)", .hx8_line = 1167, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1039, .call_names = _hx_callnames_1039, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1043, .name = "MD5-1xMD5SHA1pSHA1p", .expression = "md5(md5(sha1(pass)) . sha1(pass))", .hx8_line = 1168, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1040, .call_names = _hx_callnames_1040, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1044, .name = "MD5-1xMD5SHA256pSHA256p", .expression = "md5(md5(sha256(pass)) . sha256(pass))", .hx8_line = 1169, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1041, .call_names = _hx_callnames_1041, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1045, .name = "MD5-1xMD5SHA512pSHA512p", .expression = "md5(md5(sha512(pass)) . sha512(pass))", .hx8_line = 1170, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1042, .call_names = _hx_callnames_1042, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1046, .name = "MD5-1xMD5MD5pMD5p", .expression = "md5(md5(md5(pass)) . md5(pass))", .hx8_line = 1171, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1043, .call_names = _hx_callnames_1043, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1047, .name = "MD5-1xMD5pMD5SHA1p", .expression = "md5(md5(pass) . md5(sha1(pass)))", .hx8_line = 1172, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1044, .call_names = _hx_callnames_1044, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1048, .name = "MD5-1xMD5pMD5SHA256p", .expression = "md5(md5(pass) . md5(sha256(pass)))", .hx8_line = 1173, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1045, .call_names = _hx_callnames_1045, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1049, .name = "MD5-1xMD5pMD5SHA512p", .expression = "md5(md5(pass) . md5(sha512(pass)))", .hx8_line = 1174, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1046, .call_names = _hx_callnames_1046, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1050, .name = "MD5SHA1revMD5", .expression = "md5(sha1(rev(md5(pass))))", .hx8_line = 1175, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1047, .call_names = _hx_callnames_1047, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1051, .name = "MD5MD5RAWMD5PASS", .expression = "md5(md5_bin(md5(pass) . pass))", .hx8_line = 1176, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1048, .call_names = _hx_callnames_1048, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1052, .name = "MD5MD5RAWMD5", .expression = "md5(md5_bin(md5(pass)))", .hx8_line = 1177, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1049, .call_names = _hx_callnames_1049, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1053, .name = "MD5SHA1SHA1MD5MD5", .expression = "md5(sha1(sha1(md5(md5(pass)))))", .hx8_line = 1178, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1050, .call_names = _hx_callnames_1050, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1054, .name = "SHA256MD5PASSSALT", .expression = "sha256(md5(pass . salt))", .hx8_line = 1179, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1051, .call_names = _hx_callnames_1051, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1055, .name = "WATTPAD", .expression = "hmac_sha256(\"d2e1a4c569e7018cc142e9cce755a964bd9b193d2d31f02d80bb589c959afd7e\", sha1(salt) . pass)", .hx8_line = 1180, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1052, .call_names = _hx_callnames_1052, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1056, .name = "HMAC-SHA256-SHA1SALTPASS", .expression = "hmac_sha256(salt2, sha1(salt) . pass)", .hx8_line = 1181, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1053, .call_names = _hx_callnames_1053, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1057, .name = "MD5SQL5MD5MD5", .expression = "md5(\"*\" . upper(sha1(sha1_bin(md5(md5(pass))))))", .hx8_line = 1182, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1054, .call_names = _hx_callnames_1054, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1058, .name = "MD5SQL5MD5MD5MD5", .expression = "md5(\"*\" . upper(sha1(sha1_bin(md5(md5(md5(pass)))))))", .hx8_line = 1183, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1055, .call_names = _hx_callnames_1055, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1059, .name = "BCRYPTMD5PASSSALT", .expression = "bcrypt(md5(pass . salt2), salt, cost)", .hx8_line = 1184, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1056, .call_names = _hx_callnames_1056, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1060, .name = "MD5USERDESCRYPT", .expression = "md5(user . descrypt(pass, salt))", .hx8_line = 1185, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1057, .call_names = _hx_callnames_1057, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1061, .name = "MD5CRYPTMD5", .expression = "md5crypt(md5(pass), salt)", .hx8_line = 1186, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1058, .call_names = _hx_callnames_1058, .emit_class = 0, .note_ref = 0 },
-    { .job_enum = 1062, .name = "SHA256BASE64", .expression = "sha256(base64(pass))", .hx8_line = 1187, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1059, .call_names = _hx_callnames_1059, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 887, .name = "ARUBAOS", .expression = "sha1(fromhex(salt) . pass)", .hx8_line = 986, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_884, .call_names = _hx_callnames_884, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 888, .name = "ISCSI-CHAP", .expression = "", .hx8_line = 988, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 889, .name = "WERKZEUG-MD5", .expression = "hmac_md5(pass, salt)", .hx8_line = 989, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_886, .call_names = _hx_callnames_886, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 890, .name = "WERKZEUG-SHA256", .expression = "hmac_sha256(pass, salt)", .hx8_line = 990, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_887, .call_names = _hx_callnames_887, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 891, .name = "AUTHME", .expression = "sha256(sha256(pass) . salt)", .hx8_line = 991, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_888, .call_names = _hx_callnames_888, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 892, .name = "NETWITNESS", .expression = "", .hx8_line = 992, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 893, .name = "NETSCALER-SHA512", .expression = "sha512(salt . pass . fromhex(\"00\"))", .hx8_line = 993, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_890, .call_names = _hx_callnames_890, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 894, .name = "SHA1SHA1SALTPASSSALT", .expression = "sha1(sha1(salt . pass . salt))", .hx8_line = 994, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_891, .call_names = _hx_callnames_891, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 895, .name = "NETSCALER-PBKDF2", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 995, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_892, .call_names = _hx_callnames_892, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 896, .name = "ORACLE7", .expression = "upper(oracle7(pass, salt))", .hx8_line = 996, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_893, .call_names = _hx_callnames_893, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 897, .name = "NETNTLMV1", .expression = "des_block(md4(utf16le(pass)), challenge)", .hx8_line = 997, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_894, .call_names = _hx_callnames_894, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 898, .name = "NETNTLMV2", .expression = "hmac_md5(md4(utf16le(pass)), challenge)", .hx8_line = 998, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_895, .call_names = _hx_callnames_895, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 899, .name = "LASTPASS", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 999, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_896, .call_names = _hx_callnames_896, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 900, .name = "FORTIGATE", .expression = "sha1(salt . pass . salt)", .hx8_line = 1000, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_897, .call_names = _hx_callnames_897, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 901, .name = "DOMINO8", .expression = "", .hx8_line = 1001, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 902, .name = "SIPHASH", .expression = "siphash(pass, fromhex(salt))", .hx8_line = 1002, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_899, .call_names = _hx_callnames_899, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 903, .name = "CRAMMD5", .expression = "hmac_md5(pass, challenge)", .hx8_line = 1003, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_900, .call_names = _hx_callnames_900, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 904, .name = "SAPCODVNH", .expression = "sha1(pass . salt)", .hx8_line = 1004, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_901, .call_names = _hx_callnames_901, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 905, .name = "REDHAT389DS", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 1005, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_902, .call_names = _hx_callnames_902, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 906, .name = "POSTGRESCRAM", .expression = "md5(md5(pass . user) . fromhex(salt))", .hx8_line = 1006, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_903, .call_names = _hx_callnames_903, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 907, .name = "MYSQLCRAM", .expression = "upper(sha1(sha1_bin(pass)))", .hx8_line = 1007, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_904, .call_names = _hx_callnames_904, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 908, .name = "SHIRO1", .expression = "pbkdf2_sha1(pass, salt, N, 16)", .hx8_line = 1008, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_905, .call_names = _hx_callnames_905, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 909, .name = "ECRYPTFS", .expression = "sha512^65536(pass . salt)", .hx8_line = 1009, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_906, .call_names = _hx_callnames_906, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 910, .name = "ORACLE12", .expression = "pbkdf2_sha512(pass, salt, 4096, 64)", .hx8_line = 1010, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_907, .call_names = _hx_callnames_907, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 911, .name = "COLDFUSION10", .expression = "sha256(salt . upper(sha1(pass)))", .hx8_line = 1011, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_908, .call_names = _hx_callnames_908, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 912, .name = "AZURESYNC", .expression = "pbkdf2_sha256(pass, salt, 1000, 32)", .hx8_line = 1012, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_909, .call_names = _hx_callnames_909, .emit_class = 0, .note_ref = 49 },
+    { .job_enum = 913, .name = "ANDROIDFDE", .expression = "pbkdf2_sha1(pass, salt, 2000, 16)", .hx8_line = 1013, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_910, .call_names = _hx_callnames_910, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 914, .name = "KRB5TGS23", .expression = "rc4_hmac_md5(pass, realm, spn)", .hx8_line = 1014, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_911, .call_names = _hx_callnames_911, .emit_class = 0, .note_ref = 49 },
+    { .job_enum = 915, .name = "AXCRYPT", .expression = "axcrypt(pass, fromhex(salt), iter)", .hx8_line = 1015, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_912, .call_names = _hx_callnames_912, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 916, .name = "AXCRYPTSHA1", .expression = "cut(sha1(pass), 0, 32)", .hx8_line = 1016, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_913, .call_names = _hx_callnames_913, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 917, .name = "CISCO9", .expression = "scrypt(pass, salt, 16384, 1, 1)", .hx8_line = 1017, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_914, .call_names = _hx_callnames_914, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 918, .name = "DCC2", .expression = "pbkdf2_sha1(md4_bin(md4_bin(utf16le(pass)) . utf16le(lower(user))), utf16le(lower(user)), N, 16)", .hx8_line = 1018, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_915, .call_names = _hx_callnames_915, .emit_class = 0, .note_ref = 49 },
+    { .job_enum = 919, .name = "PWSAFE3", .expression = "T{", .hx8_line = 1019, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 920, .name = "IKEPSK-MD5", .expression = "hmac_md5(psk, ike_payload)", .hx8_line = 1022, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_917, .call_names = _hx_callnames_917, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 921, .name = "IKEPSK-SHA1", .expression = "hmac_sha1(psk, ike_payload)", .hx8_line = 1023, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_918, .call_names = _hx_callnames_918, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 922, .name = "SAP-BCODE", .expression = "upper(sap_bcode(pass, salt))", .hx8_line = 1024, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_919, .call_names = _hx_callnames_919, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 923, .name = "SAP-BCODE4", .expression = "cut(upper(sap_bcode(pass, salt)), 0, 8) . \"00000000\"", .hx8_line = 1025, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_920, .call_names = _hx_callnames_920, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 924, .name = "SAP-PASSCODE", .expression = "", .hx8_line = 1026, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 925, .name = "SAP-PASSCODE5", .expression = "", .hx8_line = 1027, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 926, .name = "AS400-DES", .expression = "upper(as400_des(pass, salt))", .hx8_line = 1028, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_923, .call_names = _hx_callnames_923, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 927, .name = "PS-TOKEN", .expression = "sha1(fromhex(salt) . utf16le(pass))", .hx8_line = 1029, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_924, .call_names = _hx_callnames_924, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 928, .name = "WINPHONE", .expression = "sha256(utf16le(pass) . fromhex(salt))", .hx8_line = 1030, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_925, .call_names = _hx_callnames_925, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 929, .name = "RACF-KDFAES", .expression = "", .hx8_line = 1031, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 930, .name = "TACACS", .expression = "", .hx8_line = 1032, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 931, .name = "APPLE-SECURE-NOTES", .expression = "pbkdf2_sha256(pass, salt, 20000, 32)", .hx8_line = 1033, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_928, .call_names = _hx_callnames_928, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 932, .name = "CRAMMD5-DOVECOT", .expression = "hmac_md5(pass, challenge)", .hx8_line = 1034, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_929, .call_names = _hx_callnames_929, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 933, .name = "JWT", .expression = "T{", .hx8_line = 1035, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 934, .name = "QNX-MD5", .expression = "md5crypt(pass, salt)", .hx8_line = 1038, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_931, .call_names = _hx_callnames_931, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 935, .name = "QNX-SHA256", .expression = "sha256crypt(pass, salt, rounds)", .hx8_line = 1039, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_932, .call_names = _hx_callnames_932, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 936, .name = "QNX-SHA512", .expression = "sha512crypt(pass, salt, rounds)", .hx8_line = 1040, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_933, .call_names = _hx_callnames_933, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 937, .name = "QNX7-SHA512", .expression = "sha512crypt(pass, salt, rounds)", .hx8_line = 1041, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_934, .call_names = _hx_callnames_934, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 938, .name = "SHA1-S1PS2", .expression = "sha1(s1 . pass . s2)", .hx8_line = 1042, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_935, .call_names = _hx_callnames_935, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 939, .name = "RAILS-RESTFUL", .expression = "T{", .hx8_line = 1043, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 940, .name = "KRB5PA-17", .expression = "T{", .hx8_line = 1046, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 941, .name = "KRB5PA-18", .expression = "T{", .hx8_line = 1049, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 942, .name = "WPA-PMKID", .expression = "", .hx8_line = 1052, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 12 },
+    { .job_enum = 943, .name = "WPA-EAPOL", .expression = "", .hx8_line = 1053, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 13 },
+    { .job_enum = 944, .name = "ANSIBLE-VAULT", .expression = "", .hx8_line = 1054, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 945, .name = "APFS", .expression = "", .hx8_line = 1055, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 946, .name = "OTM-SHA256", .expression = "", .hx8_line = 1056, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 947, .name = "TELEGRAM-SHA256", .expression = "T{", .hx8_line = 1057, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 948, .name = "WEB2PY-SHA512", .expression = "pbkdf2_sha512(pass, salt, 1000, 64)", .hx8_line = 1060, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_945, .call_names = _hx_callnames_945, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 949, .name = "SOLARWINDS", .expression = "", .hx8_line = 1061, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 950, .name = "SOLARWINDS2", .expression = "", .hx8_line = 1062, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 951, .name = "SIMPLACMS", .expression = "md5(salt . pass . md5(pass))", .hx8_line = 1063, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_948, .call_names = _hx_callnames_948, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 952, .name = "APPLE-KEYCHAIN", .expression = "T{", .hx8_line = 1064, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 953, .name = "APPLE-IWORK", .expression = "pbkdf2_sha1(pass, salt, 50000, 16)", .hx8_line = 1067, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_950, .call_names = _hx_callnames_950, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 954, .name = "BITWARDEN", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 1068, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_951, .call_names = _hx_callnames_951, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 955, .name = "MONGODB-SHA1", .expression = "T{", .hx8_line = 1069, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 956, .name = "MONGODB-SHA256", .expression = "T{", .hx8_line = 1072, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 957, .name = "FORTIGATE256", .expression = "sha256(salt . pass . salt)", .hx8_line = 1075, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_954, .call_names = _hx_callnames_954, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 958, .name = "UMBRACO", .expression = "hmac_sha1(pass, salt)", .hx8_line = 1076, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_955, .call_names = _hx_callnames_955, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 959, .name = "DAHUA-AUTH", .expression = "dahua_encode(md5_bin(pass))", .hx8_line = 1077, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_956, .call_names = _hx_callnames_956, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 960, .name = "BESDER-AUTH", .expression = "besder_encode(md5_bin(pass))", .hx8_line = 1078, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_957, .call_names = _hx_callnames_957, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 961, .name = "SQLCIPHER", .expression = "pbkdf2_sha1(pass, salt, N, 32)", .hx8_line = 1079, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_958, .call_names = _hx_callnames_958, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 962, .name = "RORAILS-SHA1", .expression = "sha1(\"--\" . salt . \"--\" . pass . \"--\")", .hx8_line = 1080, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_959, .call_names = _hx_callnames_959, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 963, .name = "AES128-NOKDF", .expression = "aes_ecb_encrypt(pad(pass, 16), fromhex(salt))", .hx8_line = 1081, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_960, .call_names = _hx_callnames_960, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 964, .name = "AES192-NOKDF", .expression = "aes_ecb_encrypt(pad(pass, 24), fromhex(salt))", .hx8_line = 1082, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_961, .call_names = _hx_callnames_961, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 965, .name = "AES256-NOKDF", .expression = "aes_ecb_encrypt(pad(pass, 32), fromhex(salt))", .hx8_line = 1083, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_962, .call_names = _hx_callnames_962, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 966, .name = "VMWARE-VMX", .expression = "pbkdf2_sha1(pass, salt, N, 32)", .hx8_line = 1084, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_963, .call_names = _hx_callnames_963, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 967, .name = "BCRYPTSHA512", .expression = "bcrypt(sha512(pass), salt, cost)", .hx8_line = 1085, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_964, .call_names = _hx_callnames_964, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 968, .name = "POSTGRESSCRAM256", .expression = "T{", .hx8_line = 1086, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 969, .name = "AWSSIGV4", .expression = "", .hx8_line = 1089, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 3 },
+    { .job_enum = 970, .name = "KRB5DB17", .expression = "T{", .hx8_line = 1090, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 971, .name = "KRB5DB18", .expression = "T{", .hx8_line = 1093, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 972, .name = "MURMUR3", .expression = "murmur3(pass, seed)", .hx8_line = 1096, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_969, .call_names = _hx_callnames_969, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 973, .name = "VEEAM-VBK", .expression = "T{", .hx8_line = 1097, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 974, .name = "MSSNTP", .expression = "", .hx8_line = 1100, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 975, .name = "SSPR-MD5", .expression = "md5^N(pass)", .hx8_line = 1101, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 976, .name = "SSPR-SHA1", .expression = "sha1^N(pass)", .hx8_line = 1102, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 977, .name = "SSPR-SHA1S", .expression = "sha1(pass . salt)", .hx8_line = 1103, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_974, .call_names = _hx_callnames_974, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 978, .name = "SSPR-SHA256", .expression = "sha256^N(salt . pass)", .hx8_line = 1104, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 979, .name = "SSPR-SHA512", .expression = "sha512^N(salt . pass)", .hx8_line = 1105, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 980, .name = "EMPIRECMS", .expression = "md5(md5(salt) . md5(pass))", .hx8_line = 1106, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_977, .call_names = _hx_callnames_977, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 981, .name = "PBKDF1-SHA1", .expression = "pbkdf1_sha1(pass, salt, iter)", .hx8_line = 1107, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_978, .call_names = _hx_callnames_978, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 982, .name = "MSONLINE", .expression = "pbkdf2_sha256(pass, salt, N, 32)", .hx8_line = 1108, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_979, .call_names = _hx_callnames_979, .emit_class = 0, .note_ref = 49 },
+    { .job_enum = 983, .name = "WBB4", .expression = "sha1(salt . sha1(salt . sha1(pass)))", .hx8_line = 1109, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_980, .call_names = _hx_callnames_980, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 984, .name = "SAPCODVNH512", .expression = "pbkdf2_sha512(pass, salt, N, 64)", .hx8_line = 1110, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_981, .call_names = _hx_callnames_981, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 985, .name = "SM3CRYPT", .expression = "sm3crypt(pass, salt, rounds)", .hx8_line = 1111, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_982, .call_names = _hx_callnames_982, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 986, .name = "AS400SSHA1", .expression = "", .hx8_line = 1112, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 987, .name = "ARGON2", .expression = "argon2(pass, salt, m, t, p)", .hx8_line = 1113, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_984, .call_names = _hx_callnames_984, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 988, .name = "SM3", .expression = "sm3(pass)", .hx8_line = 1114, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_985, .call_names = _hx_callnames_985, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 989, .name = "BCRYPTHMACSHA256", .expression = "bcrypt(base64(hmac_sha256_bin(salt, pass)), salt, N)", .hx8_line = 1115, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_986, .call_names = _hx_callnames_986, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 990, .name = "WPA-PMK", .expression = "", .hx8_line = 1116, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 991, .name = "MD5SALT1SALT2", .expression = "md5(salt . pass . salt2)", .hx8_line = 1117, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_988, .call_names = _hx_callnames_988, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 992, .name = "SYMFONY256", .expression = "", .hx8_line = 1118, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 993, .name = "WPBCRYPT", .expression = "bcrypt(base64(hmac_sha384_bin(pass, \"wp-sha384\")), salt, N)", .hx8_line = 1119, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_990, .call_names = _hx_callnames_990, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 994, .name = "GOST12512CRYPT", .expression = "gost12_512crypt(pass, salt, rounds)", .hx8_line = 1120, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_991, .call_names = _hx_callnames_991, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 995, .name = "YESCRYPT", .expression = "yescrypt(pass, salt, N, r, p)", .hx8_line = 1121, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_992, .call_names = _hx_callnames_992, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 996, .name = "MD5SHA256SHA256", .expression = "md5(sha256(sha256(pass)))", .hx8_line = 1122, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_993, .call_names = _hx_callnames_993, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 997, .name = "BSDICRYPT", .expression = "bsdicrypt(pass, salt)", .hx8_line = 1123, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_994, .call_names = _hx_callnames_994, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 998, .name = "GOST-YESCRYPT", .expression = "gost_yescrypt(pass, salt)", .hx8_line = 1124, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_995, .call_names = _hx_callnames_995, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 999, .name = "SHA1CRYPT", .expression = "sha1crypt(pass, salt, rounds)", .hx8_line = 1125, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_996, .call_names = _hx_callnames_996, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1000, .name = "7ZIP", .expression = "sevenzip(pass, salt)", .hx8_line = 1126, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_997, .call_names = _hx_callnames_997, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1001, .name = "CMIYC", .expression = "cmiyc(pass, salt)", .hx8_line = 1127, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_998, .call_names = _hx_callnames_998, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1002, .name = "RMD256", .expression = "rmd256(pass)", .hx8_line = 1128, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_999, .call_names = _hx_callnames_999, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1003, .name = "MD4SALTPASS", .expression = "md4(salt . pass)", .hx8_line = 1129, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1000, .call_names = _hx_callnames_1000, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1004, .name = "MD4PASSSALT", .expression = "md4(pass . salt)", .hx8_line = 1130, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1001, .call_names = _hx_callnames_1001, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1005, .name = "SHA1UCUSERPASS", .expression = "sha1(upper(user) . \":\" . pass)", .hx8_line = 1131, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1002, .call_names = _hx_callnames_1002, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1006, .name = "SHA1USERCOLONPASS", .expression = "sha1(user . \":\" . pass)", .hx8_line = 1132, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1003, .call_names = _hx_callnames_1003, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1007, .name = "MD5PASSSALTMD5PASSSALT", .expression = "md5(pass . salt . md5(pass . salt))", .hx8_line = 1133, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1004, .call_names = _hx_callnames_1004, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1008, .name = "QAS-VASAUTH", .expression = "sha256(\"#\" . salt . \"-\" . pass)", .hx8_line = 1134, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1005, .call_names = _hx_callnames_1005, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1009, .name = "POSTOFFICE", .expression = "md5(salt . \"Y\" . pass . fromhex(\"f7\") . salt)", .hx8_line = 1135, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1006, .call_names = _hx_callnames_1006, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1010, .name = "IPB2", .expression = "md5(md5(fromhex(salt)) . md5(pass))", .hx8_line = 1136, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1007, .call_names = _hx_callnames_1007, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1011, .name = "MD5USERMD5PASSSALT", .expression = "md5(user . md5(pass) . salt)", .hx8_line = 1137, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1008, .call_names = _hx_callnames_1008, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1012, .name = "RVARY", .expression = "", .hx8_line = 1138, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1013, .name = "SHA512RAWPASSSALT", .expression = "sha512_bin(pass . salt)", .hx8_line = 1139, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1010, .call_names = _hx_callnames_1010, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1014, .name = "EPISERVER-SID", .expression = "sha1(cut(fromhex(salt), 0, 29) . pass . fromhex(\"00\"))", .hx8_line = 1140, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1011, .call_names = _hx_callnames_1011, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1015, .name = "ORACLE11", .expression = "upper(sha1(pass . fromhex(salt)))", .hx8_line = 1141, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1012, .call_names = _hx_callnames_1012, .emit_class = 0, .note_ref = 40 },
+    { .job_enum = 1016, .name = "SAPCODVNH256", .expression = "", .hx8_line = 1142, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 41 },
+    { .job_enum = 1017, .name = "SAPCODVNH384", .expression = "", .hx8_line = 1143, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 41 },
+    { .job_enum = 1018, .name = "MONGODB", .expression = "md5(user . \":mongo:\" . pass)", .hx8_line = 1144, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1015, .call_names = _hx_callnames_1015, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1019, .name = "H3C", .expression = "", .hx8_line = 1145, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 42 },
+    { .job_enum = 1020, .name = "ARGON2MD5", .expression = "argon2(md5(pass), salt, m, t, p)", .hx8_line = 1146, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1017, .call_names = _hx_callnames_1017, .emit_class = 0, .note_ref = 43 },
+    { .job_enum = 1021, .name = "DRAGONFLY3-32", .expression = "sha256(pass . \"$3$\" . fromhex(\"00\") . salt)", .hx8_line = 1147, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1018, .call_names = _hx_callnames_1018, .emit_class = 0, .note_ref = 44 },
+    { .job_enum = 1022, .name = "DRAGONFLY3-64", .expression = "sha256(pass . \"$3$\" . fromhex(\"00\") . \"sha5\" . salt)", .hx8_line = 1148, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1019, .call_names = _hx_callnames_1019, .emit_class = 0, .note_ref = 44 },
+    { .job_enum = 1023, .name = "DRAGONFLY4-32", .expression = "sha512(pass . \"$4$\" . fromhex(\"00\") . salt)", .hx8_line = 1149, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1020, .call_names = _hx_callnames_1020, .emit_class = 0, .note_ref = 44 },
+    { .job_enum = 1024, .name = "DRAGONFLY4-64", .expression = "sha512(pass . \"$4$\" . fromhex(\"00\") . \"/etc\" . salt)", .hx8_line = 1150, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1021, .call_names = _hx_callnames_1021, .emit_class = 0, .note_ref = 44 },
+    { .job_enum = 1025, .name = "GOST12256CRYPT", .expression = "gost12_256crypt(pass, salt, rounds)", .hx8_line = 1151, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1022, .call_names = _hx_callnames_1022, .emit_class = 0, .note_ref = 45 },
+    { .job_enum = 1026, .name = "GOST94CRYPT", .expression = "gost94crypt(pass, salt, rounds)", .hx8_line = 1152, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1023, .call_names = _hx_callnames_1023, .emit_class = 0, .note_ref = 45 },
+    { .job_enum = 1027, .name = "SUNMD5", .expression = "sunmd5(pass, salt, rounds)", .hx8_line = 1153, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1024, .call_names = _hx_callnames_1024, .emit_class = 0, .note_ref = 46 },
+    { .job_enum = 1028, .name = "CRYPTOPPLEGACY", .expression = "", .hx8_line = 1154, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 50 },
+    { .job_enum = 1029, .name = "CRYPTOPPDEFAULT", .expression = "", .hx8_line = 1155, .is_outlier = 1, .compile_failed = 0, .program = NULL, .call_names = NULL, .emit_class = 0, .note_ref = 50 },
+    { .job_enum = 1030, .name = "MD5BASE64MD5SHA1", .expression = "md5(base64(md5(sha1(pass))))", .hx8_line = 1156, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1027, .call_names = _hx_callnames_1027, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1031, .name = "WRLSHA1", .expression = "wrl(sha1(pass))", .hx8_line = 1157, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1028, .call_names = _hx_callnames_1028, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1032, .name = "MD5sub8-24MD5sub8-24MD5MD5MD5", .expression = "md5(cut(md5(cut(md5(md5(md5(pass))), 8, 16)), 8, 16))", .hx8_line = 1158, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1029, .call_names = _hx_callnames_1029, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1033, .name = "MD5SHA1SHA1MD5SHA1MD5", .expression = "md5(sha1(sha1(md5(sha1(md5(pass))))))", .hx8_line = 1159, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1030, .call_names = _hx_callnames_1030, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1034, .name = "MD5SHA1SHA1SHA1", .expression = "md5(sha1(sha1(sha1(pass))))", .hx8_line = 1160, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1031, .call_names = _hx_callnames_1031, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1035, .name = "MD5SHA1MD5SHA1MD5SHA1", .expression = "md5(sha1(md5(sha1(md5(sha1(pass))))))", .hx8_line = 1161, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1032, .call_names = _hx_callnames_1032, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1036, .name = "MD5SHA512MD5", .expression = "md5(sha512(md5(pass)))", .hx8_line = 1162, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1033, .call_names = _hx_callnames_1033, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1037, .name = "MD5sub1-16MD5", .expression = "md5(cut(md5(pass), 0, 16))", .hx8_line = 1163, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1034, .call_names = _hx_callnames_1034, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1038, .name = "MD5sub1-28MD5", .expression = "md5(cut(md5(pass), 0, 28))", .hx8_line = 1164, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1035, .call_names = _hx_callnames_1035, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1039, .name = "MD5MD5sub1-30MD5", .expression = "md5(md5(cut(md5(pass), 0, 30)))", .hx8_line = 1165, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1036, .call_names = _hx_callnames_1036, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1040, .name = "APACHE-SHA-TRUNC16", .expression = "\"{SHA}\" . base64(trunc(sha1_bin(pass), 16))", .hx8_line = 1166, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1037, .call_names = _hx_callnames_1037, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1041, .name = "MD5SALTLAST16", .expression = "cut(md5(md5(pass) . salt), -16)", .hx8_line = 1167, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1038, .call_names = _hx_callnames_1038, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1042, .name = "MD5SALTMD5PASS-PASS", .expression = "md5(salt . md5(pass) . \":\" . pass)", .hx8_line = 1168, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1039, .call_names = _hx_callnames_1039, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1043, .name = "MD5-1xMD5SHA1pSHA1p", .expression = "md5(md5(sha1(pass)) . sha1(pass))", .hx8_line = 1169, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1040, .call_names = _hx_callnames_1040, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1044, .name = "MD5-1xMD5SHA256pSHA256p", .expression = "md5(md5(sha256(pass)) . sha256(pass))", .hx8_line = 1170, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1041, .call_names = _hx_callnames_1041, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1045, .name = "MD5-1xMD5SHA512pSHA512p", .expression = "md5(md5(sha512(pass)) . sha512(pass))", .hx8_line = 1171, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1042, .call_names = _hx_callnames_1042, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1046, .name = "MD5-1xMD5MD5pMD5p", .expression = "md5(md5(md5(pass)) . md5(pass))", .hx8_line = 1172, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1043, .call_names = _hx_callnames_1043, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1047, .name = "MD5-1xMD5pMD5SHA1p", .expression = "md5(md5(pass) . md5(sha1(pass)))", .hx8_line = 1173, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1044, .call_names = _hx_callnames_1044, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1048, .name = "MD5-1xMD5pMD5SHA256p", .expression = "md5(md5(pass) . md5(sha256(pass)))", .hx8_line = 1174, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1045, .call_names = _hx_callnames_1045, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1049, .name = "MD5-1xMD5pMD5SHA512p", .expression = "md5(md5(pass) . md5(sha512(pass)))", .hx8_line = 1175, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1046, .call_names = _hx_callnames_1046, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1050, .name = "MD5SHA1revMD5", .expression = "md5(sha1(rev(md5(pass))))", .hx8_line = 1176, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1047, .call_names = _hx_callnames_1047, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1051, .name = "MD5MD5RAWMD5PASS", .expression = "md5(md5_bin(md5(pass) . pass))", .hx8_line = 1177, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1048, .call_names = _hx_callnames_1048, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1052, .name = "MD5MD5RAWMD5", .expression = "md5(md5_bin(md5(pass)))", .hx8_line = 1178, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1049, .call_names = _hx_callnames_1049, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1053, .name = "MD5SHA1SHA1MD5MD5", .expression = "md5(sha1(sha1(md5(md5(pass)))))", .hx8_line = 1179, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1050, .call_names = _hx_callnames_1050, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1054, .name = "SHA256MD5PASSSALT", .expression = "sha256(md5(pass . salt))", .hx8_line = 1180, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1051, .call_names = _hx_callnames_1051, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1055, .name = "WATTPAD", .expression = "hmac_sha256(\"d2e1a4c569e7018cc142e9cce755a964bd9b193d2d31f02d80bb589c959afd7e\", sha1(salt) . pass)", .hx8_line = 1181, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1052, .call_names = _hx_callnames_1052, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1056, .name = "HMAC-SHA256-SHA1SALTPASS", .expression = "hmac_sha256(salt2, sha1(salt) . pass)", .hx8_line = 1182, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1053, .call_names = _hx_callnames_1053, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1057, .name = "MD5SQL5MD5MD5", .expression = "md5(\"*\" . upper(sha1(sha1_bin(md5(md5(pass))))))", .hx8_line = 1183, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1054, .call_names = _hx_callnames_1054, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1058, .name = "MD5SQL5MD5MD5MD5", .expression = "md5(\"*\" . upper(sha1(sha1_bin(md5(md5(md5(pass)))))))", .hx8_line = 1184, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1055, .call_names = _hx_callnames_1055, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1059, .name = "BCRYPTMD5PASSSALT", .expression = "bcrypt(md5(pass . salt2), salt, cost)", .hx8_line = 1185, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1056, .call_names = _hx_callnames_1056, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1060, .name = "MD5USERDESCRYPT", .expression = "md5(user . descrypt(pass, salt))", .hx8_line = 1186, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1057, .call_names = _hx_callnames_1057, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1061, .name = "MD5CRYPTMD5", .expression = "md5crypt(md5(pass), salt)", .hx8_line = 1187, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1058, .call_names = _hx_callnames_1058, .emit_class = 0, .note_ref = 0 },
+    { .job_enum = 1062, .name = "SHA256BASE64", .expression = "sha256(base64(pass))", .hx8_line = 1188, .is_outlier = 0, .compile_failed = 0, .program = &_hx_program_1059, .call_names = _hx_callnames_1059, .emit_class = 0, .note_ref = 0 },
 };
 const int hx_specs_count = 1060;
 

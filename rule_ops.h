@@ -1,6 +1,9 @@
-/* $Revision: 1.4 $
+/* $Revision: 1.5 $
  *
  * $Log: rule_ops.h,v $
+ * Revision 1.5  2026/11/09 21:45:40  dlr
+ * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
+ *
  * Revision 1.4  2026/09/29 13:44:07  dlr
  * Correct the attribution wording in the header comment.
  *
@@ -209,6 +212,13 @@
  * 2026-09-11 on the operator's ruling.  0xc0 was the only free value below
  * the existing 0xc1-0xfd band. */
 #define RULE_OP_CHR_ADD     0xc0
+
+/* hashcat 'N' RULE_OP_MANGLE_REPLACE_NTH: `NnXY` replaces the n'th occurrence,
+ * counted from 0, of X with Y; if there is no such occurrence the word is
+ * unchanged.  hashcat PR 5071 (merged 2026-11-09); John has no `N`.  Packs as
+ * op, position, X, Y -- four bytes.  0x8a is the first free value after the
+ * class band 0x80-0x89. */
+#define RULE_OP_REPLACE_NTH 0x8a
 
 /* ---- Character classes (D6, 2026-09-11) --------------------------------
  *

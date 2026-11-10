@@ -206,6 +206,7 @@
 #define RULE_OP_HEX_LOWER   0xc2
 #define RULE_OP_DIV_INSERT  0xc1
 #define RULE_OP_CHR_ADD     0xc0
+#define RULE_OP_REPLACE_NTH 0x8a
 
 /* Rule-walker scratch in ELEMENTS; host injects -D RULE_BUF_MAX from
  * GPU_RULES_WALKER_BUF_ELEMS (gpujob.h).  Fallback only.  LIMIT is MAX-15
@@ -357,6 +358,19 @@ static int apply_rule_thread(device const uchar *prog, thread uchar *buf, int le
                 int safe_pos = valid ? pos : 0;
                 buf[safe_pos] = (uchar)(buf[safe_pos] + (valid ? add : (uchar)0));
                 k += 3;
+                break;
+            }
+            case RULE_OP_REPLACE_NTH: {
+                /* hashcat `NnXY`: replace the n'th occurrence (from 0) of X
+                 * with Y; no such occurrence is a no-op.  Mirrors
+                 * ruleproc.c RULE_OP_REPLACE_NTH. */
+                int nth = (int)prog[k + 1] - 1;
+                uchar from = prog[k + 2], to = prog[k + 3];
+                for (int j = 0; j < len; j++) {
+                    if (buf[j] != from) continue;
+                    if (nth-- == 0) { buf[j] = to; break; }
+                }
+                k += 4;
                 break;
             }
             case RULE_OP_INC: {

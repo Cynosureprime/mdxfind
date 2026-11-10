@@ -104,7 +104,7 @@ YESCRYPT_OBJS = yescrypt/yescrypt-common.o yescrypt/yescrypt-opt.o \
                 yescrypt/sha256.o yescrypt/insecure_memzero.o
 
 # SQLite amalgamation: https://www.sqlite.org/2025/sqlite-amalgamation-3490100.zip
-MDXFIND_OBJS = mdxfind.o sqlite3.o yarn.o gosthash/gosthash.o rmd128.o mymd5.o \
+MDXFIND_OBJS = mdxfind.o mdxmain.o sqlite3.o yarn.o gosthash/gosthash.o rmd128.o mymd5.o \
                ruleproc.o ruleproc32.o classify_utf8.o crypt-des.o myprogress.o
 MDSPLIT_OBJS = mdsplit.o
 
@@ -154,8 +154,11 @@ endif
 
 all: mdxfind mdsplit getpass mdxpause emailprep
 
-mdxfind.o: mdxfind.c mdxfind.h job_types.h gpujob.h sqlite3.h
+mdxfind.o: mdxfind.c mdxint.h mdxfind.h job_types.h gpujob.h sqlite3.h
 	$(CC) $(CFLAGS) -c mdxfind.c
+
+mdxmain.o: mdxmain.c mdxint.h mdxfind.h job_types.h gpujob.h sqlite3.h
+	$(CC) $(CFLAGS) -c mdxmain.c
 
 sqlite3.o: sqlite3.c sqlite3.h
 	$(CC) -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -c sqlite3.c

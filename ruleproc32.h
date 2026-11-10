@@ -1,6 +1,9 @@
-/* $Revision: 1.6 $
+/* $Revision: 1.7 $
  *
  * $Log: ruleproc32.h,v $
+ * Revision 1.7  2026/11/09 21:45:40  dlr
+ * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
+ *
  * Revision 1.6  2026/10/05 03:43:33  dlr
  * Declare the encoding conversions added to ruleproc32.c, with the contract and the reasons in one place: a length or a negative RULE32_ERR_, never a partial result; the caller owns the UTF-32 scratch because these run per candidate and a MAXLINE local is not an option; and the three defects of asking iconv instead -- silent dropping under //IGNORE, a return value glibc and macOS libiconv disagree about, and a static link that dlopens gconv modules and segfaults on a host with a different glibc. Documents that utf16_to_utf8 refuses an unpaired surrogate rather than emitting CESU-8, and treats a dropped codepoint from utf32_to_utf8 as an error, since a drop there would mean the caller conversion was unsound.
  *
@@ -75,6 +78,7 @@
 #define RULE32_OP_DIV_INS_STR   0x100Au /* insert a STRING every N clusters */
 #define RULE32_OP_TOGGLE_SEP_STR 0x100Bu /* toggle after the Nth STRING */
 #define RULE32_OP_TITLE_SEP_STR 0x100Cu /* title-case after each STRING */
+#define RULE32_OP_NTH_STR       0x100Du /* replace the n'th occurrence of a STRING */
 #define RULE32_QUOTE 0x0022u  /* the operand delimiter */
 
 /* Collapsed append/prepend runs. `$1$2$3` is ONE op with a count and three

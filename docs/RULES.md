@@ -205,6 +205,7 @@ references rather than being invented here, and which one is stated:
 | Rule | Description | Example |
 |------|-------------|---------|
 | `sXY` | Replace all occurrences of X with Y | `password` → `p@ssword` (sa@) |
+| `NnXY` | Replace only the nth occurrence of X with Y, counting from 0 | `seeds` → `seods` (N1eo) |
 | `@X` | Purge — remove all occurrences of X | `password` → `pssword` (@a) |
 | `+N` | Increment ASCII value at position N | `password` → `qassword` (+0) |
 | `-N` | Decrement ASCII value at position N | `password` → `oassword` (-0) |
@@ -224,6 +225,13 @@ It is **not** in the hashcat 6.2.5 release and does not exist in John, so a rule
 it will not run under either. hashcat's own example is `B50` on `hello0`, which yields
 `hello` followed by a backtick (0x30 + 0x30 = 0x60). `procrule -u` refuses the verb
 outright: the UTF-32 engine does not implement it.
+
+`NnXY` is hashcat's `RULE_OP_MANGLE_REPLACE_NTH`, in hashcat **master** only (merged
+November 2026), and is not in John. If the nth occurrence does not exist the word is left
+unchanged, so `N9eo` on `seeds` is a no-op. Under `-8` either operand may be a quoted
+string and the lengths may differ: `N1 "this" "that"` turns `this is this` into
+`this is that`; see rules32(7). The single-character form runs on the GPU; the quoted
+form, like quoted `s`, runs on the CPU.
 
 ## Encoding
 

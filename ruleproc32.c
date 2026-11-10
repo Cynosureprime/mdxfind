@@ -1,6 +1,9 @@
-/* $Revision: 1.19 $
+/* $Revision: 1.20 $
  *
  * $Log: ruleproc32.c,v $
+ * Revision 1.20  2026/11/09 21:45:40  dlr
+ * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
+ *
  * Revision 1.19  2026/10/23 13:16:06  dlr
  * INSERT_STR guard corrected from > to >=: inserting at a position equal to the cluster count is an APPEND, matching RULE_OP_INSERT here and RULE_OP_INSERT in the byte engine, both of which cite john and hashcat 6.2.5. This arm was the last holdout on the pre-fix spelling, so on the two-cluster word ab, i2X appended to give abX while i2"XY" silently did nothing. A position beyond the length stays a no-op. Found while planning the device twin: transliterating the arm as it stood would have baked the divergence into the GPU walker.
  *
@@ -1261,6 +1264,47 @@ static int packrule32_pass(const uint32_t *line, int linelen,
                 i += 1 + fu + tu; break;
             }
 
+            /* `NnXY` -- replace the n'th occurrence (from 0) of X with Y,
+             * hashcat RULE_OP_MANGLE_REPLACE_NTH; no such occurrence leaves
+             * the word unchanged.  Either operand may be a quoted string, so
+             * N1 "this" "that" replaces the second "this", and the lengths may
+             * differ.  As for `s`, separators are skipped only before a QUOTED
+             * operand -- here after the position as well as between the two --
+             * because an unquoted space is a perfectly good operand. */
+            case 'N': {
+                uint32_t fb[512], tb[512];
+                int fu = 0, tu = 0, fn, tn, k, p, q, fq;
+                NEED(3);
+                p = pos_of(line[i+1]);
+                if (p < 0) return RULE32_ERR_INVALID;
+                q = i + 2;
+                if (!Rule32LiteralQuotes) {
+                    int q2 = skip_seps(line, linelen, q);
+                    if (q2 > q && q2 < linelen && line[q2] == RULE32_QUOTE) q = q2;
+                }
+                fq = !Rule32LiteralQuotes && line[q] == RULE32_QUOTE;
+                fn = read_operand(line, linelen, q, fb, 512, &fu);
+                if (fn <= 0) return RULE32_ERR_INVALID;   /* empty needle */
+                fu += q - (i + 2);                        /* count any separators */
+                { int q0 = i + 2 + fu, r = q0;
+                  if (fq) {
+                      int q2 = skip_seps(line, linelen, q0);
+                      if (q2 < linelen && line[q2] == RULE32_QUOTE) r = q2;
+                  }
+                  if (r >= linelen) return RULE32_ERR_INVALID;
+                  tn = read_operand(line, linelen, r, tb, 512, &tu);
+                  if (tn < 0) return RULE32_ERR_INVALID;
+                  tu += r - q0; }
+                if (fn == 1 && tn == 1) {
+                    EMIT(RULE_OP_REPLACE_NTH); EMIT(p); EMIT(fb[0]); EMIT(tb[0]);
+                } else {
+                    EMIT(RULE32_OP_NTH_STR); EMIT(p);
+                    EMIT(fn); for (k = 0; k < fn; k++) EMIT(fb[k]);
+                    EMIT(tn); for (k = 0; k < tn; k++) EMIT(tb[k]);
+                }
+                i += 2 + fu + tu; break;
+            }
+
             case '*':   /* *NM -- swap the codepoints at N and M */
                 NEED(2); EMIT(RULE_OP_SWAP_AT);
                 { int p = pos_of(line[i+1]), q = pos_of(line[i+2]);
@@ -1846,6 +1890,40 @@ int applyrule32(const uint32_t *rule, const uint32_t *in, int inlen,
 
             /* eS -- title-case: raise the first cased codepoint, and the first
              * after each occurrence of the separator string, lower the rest. */
+            case RULE_OP_REPLACE_NTH: {
+                int y = (int)*rule++;      /* already 0-based; see packrule32 */
+                uint32_t from = *rule++, to = *rule++;
+                for (i = 0; i < len; i++)
+                    if (buf[i] == from && y-- == 0) { buf[i] = to; break; }
+                break;
+            }
+
+            /* String form of `N`.  Occurrences are counted left to right
+             * without overlap, as `s` scans, and only the n'th is replaced, so
+             * the word may grow or shrink by the difference in length. */
+            case RULE32_OP_NTH_STR: {
+                int y = (int)*rule++;
+                int fn = (int)*rule++;
+                const uint32_t *fp = rule, *tp;
+                int tn, k;
+                rule += fn;
+                tn = (int)*rule++;
+                tp = rule;
+                rule += tn;
+                for (i = 0; i + fn <= len; ) {
+                    for (k = 0; k < fn && buf[i+k] == fp[k]; k++) ;
+                    if (k < fn) { i++; continue; }
+                    if (y-- > 0) { i += fn; continue; }
+                    if (len - fn + tn > RULE32_MAXCP) return RULE32_ERR_NOROOM;
+                    memmove(buf + i + tn, buf + i + fn,
+                            (size_t)(len - i - fn) * sizeof(uint32_t));
+                    for (k = 0; k < tn; k++) buf[i+k] = tp[k];
+                    len += tn - fn;
+                    break;
+                }
+                break;
+            }
+
             case RULE32_OP_TITLE_SEP_STR: {
                 int sn = (int)*rule++;
                 const uint32_t *sp = rule;

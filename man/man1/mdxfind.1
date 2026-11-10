@@ -1,8 +1,17 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.23 $
+.\" $Revision: 1.26 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.26  2026/11/09 21:45:23  dlr
+.\" TH to mdxfind 1.668.
+.\"
+.\" Revision 1.25  2026/11/09 16:10:46  dlr
+.\" -e takes a mode: 0 whole hashes only, 1 standard windows, 2 byte by byte, with the automatic default and its one-line notice, and the GPU staying off for modes 1 and 2, -X and -g. TH to mdxfind 1.666.
+.\"
+.\" Revision 1.24  2026/11/08 15:40:26  dlr
+.\" mdxfind 1.662. OPTION ORDER: -M must precede -F rewritten to state what the code does. A selection applies only to the files read after it, which is what lets each hash list carry its own -M, with the example -M e450 -F bcrypt.txt -M e511 -F md5crypt.txt; the refusal is only a -F or -J read before ANY selection followed by one, fatal since 1.578; -F with no selection anywhere loads against the MD5 default. -F entry: the crypt(3) types carry their salt in the stored hash, so -z generates once for every salt in the loaded hashes; with -z anywhere on the command line a setting alone, with no hash after it, also loads as a salt, and without -z such a line is not loaded. Lists the setting forms for MD5CRYPT, SHA256CRYPT, SHA512CRYPT with rounds, BCRYPT and DESCRYPT, notes the compounds read the same lines, and gives a run example with two dollar-6 settings. Renders with man; the tbl warning is pre-existing.
+.\"
 .\" Revision 1.23  2026/11/07 16:39:04  dlr
 .\" mdxfind 1.661. The -F founds-file paragraphs: a line that no selected type accepts is now offered again with its last colon field removed, right to left, and the longest prefix that loads is kept, so DESCRYPT, BSDICRYPT, CISCOPIX, the 0x MSSQL and Sybase forms, Oracle, NetScaler, NetNTLM, SAP and others load from hash:plain and from hash:bad:pass. Removed the sentence that said those self-delimiting forms are read whole, which is no longer true. States that a line that loads as written is never cut, and that hash:salt:plain in a salted type loads with salt:plain as its salt. TH to 2026-11-07, mdxfind 1.661.
 .\"
@@ -76,7 +85,7 @@
 .\" Revision 1.1  2026/08/29 16:29:54  dlr
 .\" Initial revision: mdxfind(1) man page. Documents all 39 getopt options plus the pre-scanned -Y, including the 9 previously undocumented in the built-in usage text (-G -J -M -P -S -U -X -j -x). Option bodies read from the switch in main(). Highlights the -M before -F ordering requirement, the -j versus -P pepper scope distinction, the -h regex foot-gun, and -z as generate mode.
 .\"
-.TH MDXFIND 1 "2026-11-07" "mdxfind 1.661" "Password Recovery"
+.TH MDXFIND 1 "2026-11-09" "mdxfind 1.668" "Password Recovery"
 .SH NAME
 mdxfind \- multi-algorithm hash search over candidate password lists
 .SH SYNOPSIS
@@ -139,32 +148,42 @@ reaches them.  Three consequences:
 .TP
 .B \-M must precede \-F
 .B \-F
-parses its hash file immediately, using the type set that
-.B \-M
-has established.  A
-.B \-M
-that appears
+parses its hash file immediately, using the types selected at that
+moment.  A selection that appears
 .I after
+a
 .B \-F
-has no effect on that file, which is then parsed against whatever
-.B \-m
-or
-.B \-h
-had selected so far \(em or against the MD5 default if nothing had.
+does not reach that file; it applies only to the files read after it.
+That is what lets each hash list carry its own selection:
+.sp
+.in +4n
+.nf
+mdxfind \-M e450 \-F bcrypt.txt \-M e511 \-F md5crypt.txt words.txt
+.fi
+.in -4n
 .IP
-Since 1.578 this is refused rather than tolerated: a
-.BR \-m ,
-.B \-M
-or
-.B \-h
-that follows a
+Each file loads into its own type, and the run searches both.
+.IP
+One order is refused, since 1.578: a
 .B \-F
 or
 .B \-J
-is fatal, and names both the file and the option that read it.  Earlier
-versions ran to completion, printing a plausible
+read before
+.I any
+.BR \-m ,
+.B \-M
+or
+.BR \-h ,
+followed by a selection.  That file was parsed with no types to load into
+and kept nothing, so the run stops with a fatal error that names the file
+and the option that read it.  Earlier versions ran to completion, printing a
+plausible
 .RB \(lq "Working on hash types:" \(rq
 line and finding nothing, which is indistinguishable from a genuine negative.
+A
+.B \-F
+with no selection anywhere on the command line is not refused: it loads
+against the MD5 default.
 .TP
 .B \-M must precede \-S, \-U and \-P
 Those three load per-type salts, userids and peppers for the types
@@ -500,6 +519,59 @@ The same holds for
 in a salted type: it loads as written, with
 .BI salt : plain
 as its salt, so it is never cut.
+.IP
+The crypt(3) types carry their salt inside the stored hash, so with
+.B \-z
+each candidate is generated once for every salt in the loaded hashes.  With
+.B \-z
+anywhere on the command line, a line that is the setting alone, with no hash
+after it, also loads as a salt; without
+.BR \-z ,
+such a line is not a hash and is not loaded.  The settings are
+.B $1$\fIsalt\fB$
+for MD5CRYPT,
+.B $5$\fIsalt\fB$
+for SHA256CRYPT,
+.B $6$\fIsalt\fB$
+or
+.B $6$rounds=\fIN\fB$\fIsalt\fB$
+for SHA512CRYPT,
+.B $2a$\fINN\fB$
+and the 22-character salt for BCRYPT, and the two salt characters alone for
+DESCRYPT.  The closing
+.B $
+of a
+.BR $1$ ,
+.B $5$
+or
+.B $6$
+setting may be left off.  The types built on these \(em MD5CRYPTMD5,
+SHA512CRYPTMD5, the BCRYPT and DESCRYPT compounds \(em read the same lines.
+A file of settings reports salts and no hashes, and each candidate is
+generated once per supplied salt, in place of the default
+salt (or, for DESCRYPT, all 4096).  With
+.I salts.txt
+holding
+.sp
+.in +4n
+.nf
+$6$mysalt$
+$6$rounds=10000$othersalt$
+.fi
+.in -4n
+.sp
+this prints one SHA512CRYPT hash of
+.B password
+for each of the two settings:
+.sp
+.in +4n
+.nf
+echo password | mdxfind \-M e513 \-F salts.txt \-z stdin
+.fi
+.in -4n
+.IP
+A settings file and a hash file may be read together, or the two kinds of
+line mixed in one file; a salt supplied both ways is used once.
 .TP
 .BI \-J " file"
 As
@@ -1179,9 +1251,45 @@ once at start-up, with no way to supply one on the command line.  Should
 ever gain a single-expression mode, the letter is already spoken for and one
 of the two has to move.
 .TP
-.B \-e
-Extended match: accept truncated hashes, matching on a prefix rather than
-the full digest.
+.BI \-e " mode"
+Extended matching, for hash lists holding values shorter than the digest of
+a selected type.
+A stored hash shorter than the digest is always compared as a prefix of the
+computed digest.
+Extended matching also tests the stored value against later
+.I windows
+of the digest.
+.RS
+.TP 4
+.B 0
+Whole hashes only: compare at the start of the digest and nowhere else.
+.TP
+.B 1
+Standard windows: the start of the digest, then every multiple of the
+shortest loaded hash length, then the tail.
+A 32-character value is found as the first or the last 32 characters of a
+40-character SHA-1.
+.TP
+.B 2
+Byte by byte: every byte offset of the digest.
+.RE
+.IP
+Without
+.BR \-e ,
+mode 1 applies on its own whenever a loaded hash is shorter than the
+compare length of a selected type, and
+.B mdxfind
+says so once, naming the type, before the search begins.
+Modes 1 and 2 run only on the CPU: the GPU is not used, and the CPU search is
+slower because every computed digest is probed at each window.
+.B \-e 0
+keeps both.
+Any argument other than 0, 1 or 2 is an error.
+The XOR key
+.RB ( \-X )
+and hash rotation
+.RB ( \-g )
+are CPU-only for the same reason.
 .TP
 .B \-v
 Do not mark salts as found.  A salt that has produced one crack is normally

@@ -481,6 +481,9 @@ CL_CONSTANT uint u32_expand[510] = {
 #define RULE32_OP_TOGGLE_SEP_STR 0x100Bu
 #define RULE32_OP_TITLE_SEP_STR  0x100Cu
 #endif
+#ifndef RULE32_OP_NTH_STR
+#define RULE32_OP_NTH_STR        0x100Du
+#endif
 
 /* read_operand()'s bufmax (ruleproc32.c:728, :886).  No operand the host can
  * pack is longer, so a count above it means a truncated or corrupt stream and
@@ -527,6 +530,11 @@ CL_CONSTANT uint u32_expand[510] = {
  * to the high-bit opcode range.  gpu_common.cl already names them for the
  * byte walker; ../rule_ops.h does not, so the host twin test needs them from
  * here.  Guarded so whichever source arrives first wins. */
+/* hashcat `N` -- the byte kernels define it for the device and ../rule_ops.h
+ * for the host twin test; guarded likewise. */
+#ifndef RULE_OP_REPLACE_NTH
+#define RULE_OP_REPLACE_NTH  0x8au
+#endif
 #ifndef RULE_OP_REJ_AT_CHR
 #define RULE_OP_REJ_AT_CHR   0x3du
 #endif
@@ -1323,6 +1331,51 @@ U32_SI int apply_rule32(U32_GLOBAL const uint *prog,
             case RULE_OP_SUB: { uint from = prog[k++], to = prog[k++];
                 for (i = 0; i < len; i++) if (buf[i] == from) buf[i] = to;
                 break; }
+
+            /* `NnXY` -- replace the n'th occurrence (from 0) of X with Y; none
+             * is a no-op.  ruleproc32.c RULE_OP_REPLACE_NTH; the position is
+             * already 0-based, as packrule32 stores it. */
+            case RULE_OP_REPLACE_NTH: { int nth = (int)prog[k++];
+                uint from = prog[k++], to = prog[k++];
+                for (i = 0; i < len; i++)
+                    if (buf[i] == from && nth-- == 0) { buf[i] = to; break; }
+                break; }
+
+            /* String form of `N`, ruleproc32.c RULE32_OP_NTH_STR.  Matches
+             * are counted left to right without overlap, as `s` scans, and
+             * only the n'th is replaced.  In place, with no scratch buffer:
+             * the match is found first, then the tail is shifted once by
+             * tn - fn (backwards when growing, forwards when shrinking) and
+             * the replacement copied in. */
+            case RULE32_OP_NTH_STR: {
+                int nth = (int)prog[k++];
+                int fn = (int)prog[k++];
+                int fp, tn, tp, at = -1, nl;
+
+                if (fn < 1 || fn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                fp = k;
+                k += fn;
+                tn = (int)prog[k++];
+                if (tn > U32_OPERAND_MAX) return U32_ERR_INVALID;
+                tp = k;
+                k += tn;
+                for (i = 0; i + fn <= len; ) {
+                    for (j = 0; j < fn && buf[i + j] == prog[fp + j]; j++) ;
+                    if (j < fn) { i++; continue; }
+                    if (nth-- == 0) { at = i; break; }
+                    i += fn;
+                }
+                if (at < 0) break;
+                nl = len - fn + tn;
+                U32_ROOM(nl);
+                if (tn > fn)
+                    for (i = len - 1; i >= at + fn; i--) buf[i + tn - fn] = buf[i];
+                else if (tn < fn)
+                    for (i = at + fn; i < len; i++) buf[i + tn - fn] = buf[i];
+                for (j = 0; j < tn; j++) buf[at + j] = prog[tp + j];
+                len = nl;
+                break;
+            }
 
             /* `s"F" "TTT"` -- STRING substitute.  Left to right,
              * non-overlapping (`i += fn` on a match), and it does NOT rescan

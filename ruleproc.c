@@ -41,9 +41,12 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.48 2026/10/23 13:16:06 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.49 2026/11/09 21:45:40 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.49  2026/11/09 21:45:40  dlr
+ * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
+ *
  * Revision 1.48  2026/10/23 13:16:06  dlr
  * Add Ruleecho: an intact copy of the source line for the compiler diagnostic ECHO. packrules_len compiles its buffer IN PLACE, so by the time rule_error fires the leading bytes hold packed opcodes rather than source text: s"ab" "X" echoed with its first byte destroyed and the message named command b, so the echo contradicted the authored line and the caret pointed into rubble. The caret OFFSET needs no adjustment because the in-place compile never shifts a byte. NULL means echo the compile buffer, which is what every caller did before, so an unconverted caller is unaffected.
  *
@@ -1042,6 +1045,7 @@ static char format_op_for_error(unsigned char b) {
         case RULE_OP_HEX_UPPER:  return 'H';
         case RULE_OP_HEX_LOWER:  return 'h';
         case RULE_OP_CHR_ADD:    return 'B';
+        case RULE_OP_REPLACE_NTH: return 'N';
         case RULE_OP_DIV_INSERT: return 'v';
         /* Class forms report as their base verb.  The caret in the error
          * already points at the operand, which is where the class sits. */
@@ -1385,6 +1389,24 @@ int packrules_len(char *line, int *packedlen) {
           rulefail++;
         }
         *d++ = positiontranslate(n);
+        *d++ = *s++;
+        break;
+
+      case 'N':
+        /* hashcat `NnXY`: replace the n'th occurrence (from 0) of X with Y.
+         * Four bytes: op, position, X, Y. */
+        NEED_BYTES(3);
+        *d++ = RULE_OP_REPLACE_NTH;
+        n = *s++;
+        if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
+	   (n > 'z') ) {
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
+          rulefail++;
+        }
+        *d++ = positiontranslate(n);
+        *d++ = *s++;
         *d++ = *s++;
         break;
 
@@ -1980,6 +2002,24 @@ char * parserules(char *line) {
         s++;
         break;
 
+      case 'N':
+        /* hashcat `NnXY`: a position and two characters. */
+        n = *s++;
+        if ((n < '0') || (n > '9' && n < 'A') || (n > 'Z' && n < 'a') ||
+	   (n > 'z') ) {
+          { char _msg[64]; snprintf(_msg, sizeof(_msg),
+            "Invalid position '%c' for command '%c'", n, c);
+            rule_error(_msg, line, s - 1); }
+          rulefail++;
+        }
+        if (!s[0] || !s[1]) {
+          rule_error("'N' needs a position and two characters: NnXY", line, s);
+          rulefail++;
+          break;
+        }
+        s += 2;
+        break;
+
       case '3':
         /* Hashcat TOGGLE_AT_SEP: `3 N C` — same shape as 'i'/'o'. */
         n = *s++;
@@ -2274,6 +2314,7 @@ static int gpu_rule_safe_phase0(const char *packed_rule, int len) {
              * of two, desynchronising the walk: d3ad0ne.rule went from 37
              * CPU-only rules to 14,958. */
             case RULE_OP_MEM_INSERT:
+            case RULE_OP_REPLACE_NTH:
                 if (k + 3 > len) return 0;
                 k += 3;
                 continue;
@@ -3342,6 +3383,18 @@ if (len < FASTLEN) {
         c = *rule++;
         if (y < clen)
           cpass[y] = (unsigned char)(cpass[y] + c);
+        break;
+
+      /* hashcat `NnXY`: replace the n'th occurrence (from 0) of X with Y;
+       * no such occurrence is a no-op, matching mangle_replace_nth(). */
+      case RULE_OP_REPLACE_NTH:
+        y = *rule++ - 1;
+        c1 = *rule++;
+        c = *rule++;
+        for (x = 0; x < clen; x++) {
+          if ((unsigned char)cpass[x] != c1) continue;
+          if (y-- == 0) { cpass[x] = c; break; }
+        }
         break;
 
       case RULE_OP_INC:
@@ -4442,6 +4495,18 @@ slowrule:
         c = *rule++;
         if (y < clen)
           pass[y] = (unsigned char)(pass[y] + c);
+        break;
+
+      /* hashcat `NnXY`: replace the n'th occurrence (from 0) of X with Y;
+       * no such occurrence is a no-op, matching mangle_replace_nth(). */
+      case RULE_OP_REPLACE_NTH:
+        y = *rule++ - 1;
+        c1 = *rule++;
+        c = *rule++;
+        for (x = 0; x < clen; x++) {
+          if ((unsigned char)pass[x] != c1) continue;
+          if (y-- == 0) { pass[x] = c; break; }
+        }
         break;
 
       case RULE_OP_INC:

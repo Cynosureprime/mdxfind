@@ -727,6 +727,25 @@ uint8_t  gpu_mask_charsets_host[METAL_MASK_TOTAL_CAP][256];
  * gpu_metal_dispatch_md5_rules). Sized once to GPU_MAX_HITS *
  * GPU_HIT_STRIDE * 4 bytes. */
 static uint32_t *h_hits = NULL;
+static size_t    h_hits_cap = 0;   /* records h_hits holds; GPU_MAX_HITS at init */
+
+/* Make room for `need` hit records in h_hits, keeping the first `have`.  The
+ * rules dispatch collects hits across dispatches and re-dispatches, so one
+ * call can return up to GPU_PACKED_MAX_HITS (the caller's limit, gpujob.h). */
+static void h_hits_reserve(size_t need, size_t have)
+{
+    size_t cap = h_hits_cap ? h_hits_cap : (size_t)GPU_MAX_HITS;
+    uint32_t *nh;
+    if (need <= h_hits_cap) return;
+    while (cap < need) cap *= 2;
+    if (cap > (size_t)GPU_PACKED_MAX_HITS) cap = (size_t)GPU_PACKED_MAX_HITS;
+    nh = (uint32_t *)realloc(h_hits, cap * GPU_HIT_STRIDE * sizeof(uint32_t));
+    if (nh == NULL)
+        GPU_FATAL("Metal: h_hits realloc(%zu records) failed (keeping %zu)",
+                  cap, have);
+    h_hits = nh;
+    h_hits_cap = cap;
+}
 
 /* MIN_BUFFER_BYTES from gpu_opencl.c — driver-side validators on some
  * platforms reject sub-floor buffers at NDRange time. Metal on macOS
@@ -2245,6 +2264,7 @@ int gpu_metal_init(void)
             fprintf(stderr, "Metal: h_hits calloc(%zu) failed\n", bytes);
             return -1;
         }
+        h_hits_cap = (size_t)GPU_MAX_HITS;
     }
 
     /* Phase 2d.2.1a: populate the family registry. Must happen after
@@ -9849,6 +9869,14 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * salt-chunk loop; advances per dispatch. */
         uint32_t prev_hit_count = 0u;
 
+        /* Hits collected on the host across every dispatch of this call.
+         * Each dispatch's hits are copied out and the device count reset, so
+         * the device buffer holds one dispatch at a time; a dispatch that
+         * overflows it is run again (see the drain below). */
+        uint32_t acc_n = 0u;
+        uint64_t acc_lost = 0ull;
+        uint32_t overflow_reruns = 0u;
+
         /* End-of-batch summary counters (Phase 2e.1 §6). */
         uint32_t total_salt_chunks = 0u;
         uint32_t total_rule_chunks_per_salt = 0u;
@@ -9877,13 +9905,21 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
             total_salt_chunks++;
             uint32_t rule_chunks_this_salt = 0u;
 
+        /* Advance by the chunk actually DISPATCHED, never by rule_chunk_size:
+         * the adaptive resize below changes rule_chunk_size after each
+         * dispatch, so stepping by it skipped every rule between the old and
+         * new size whenever the size grew.  With 2,008 words the first chunk
+         * is 522 rules; it doubled to 1,044 and the loop ended, so of 896
+         * rules the last 374 never ran and their cracks were silently lost. */
+        uint32_t rule_advance = 0u;
         for (uint32_t rule_base = 0u;
              rule_base < total_rules;
-             rule_base += rule_chunk_size) {
+             rule_base += rule_advance) {
 
             uint32_t this_chunk = rule_chunk_size;
             if (rule_base + this_chunk > total_rules)
                 this_chunk = total_rules - rule_base;
+            rule_advance = this_chunk;
 
             /* Repack params for this chunk. The wire-format payload was
              * memset to 0 above; we re-write the OCLParams prefix each
@@ -10094,24 +10130,58 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                  * chunk: x * nsalts wraps uint32 above 32768 salts under a
                  * 131072 mask.  The salt goes out of band (gpujob.h); x alone
                  * fits, because the kernel's x * nspp did. */
+                /* Sized for the whole collected set, not one dispatch:
+                 * entry acc_n + h is the salt of collected hit acc_n + h. */
                 if (!gpu_dispatch_hit_salt[0]) {
                     gpu_dispatch_hit_salt[0] =
-                        (uint32_t *)malloc(GPU_MAX_HITS * sizeof(uint32_t));
+                        (uint32_t *)malloc((size_t)GPU_PACKED_MAX_HITS * sizeof(uint32_t));
                     if (!gpu_dispatch_hit_salt[0])
                         GPU_FATAL("Metal: hit_salt malloc(%zu bytes) failed",
-                                  (size_t)GPU_MAX_HITS * sizeof(uint32_t));
+                                  (size_t)GPU_PACKED_MAX_HITS * sizeof(uint32_t));
                 }
                 uint32_t *hsalt = gpu_dispatch_hit_salt[0];
                 uint32_t *hit_words = (uint32_t *)[buf_hits contents];
                 for (uint32_t h = prev_hit_count;
-                     h < new_hit_count && h < GPU_MAX_HITS;
+                     h < new_hit_count && h < GPU_MAX_HITS
+                         && acc_n + h < (uint32_t)GPU_PACKED_MAX_HITS;
                      h++) {
                     uint32_t cri = hit_words[h * GPU_HIT_STRIDE + 1];
                     hit_words[h * GPU_HIT_STRIDE + 1] = cri / nspp;
-                    hsalt[h] = (uint32_t)salt_base + cri % nspp;
+                    hsalt[acc_n + h] = (uint32_t)salt_base + cri % nspp;
                 }
-                prev_hit_count = new_hit_count;
-                gpu_dispatch_hit_salt_n[0] = new_hit_count;
+            }
+
+            /* Drain this dispatch's hits to the host and reset the device
+             * count.  When the device buffer overflowed, the kernel's
+             * overflow arm cleared the dedup bit of every hit it could not
+             * store (EMIT_HIT_4_DEDUP_OR_OVERFLOW, metal_common.metal), so
+             * running the SAME chunk again delivers exactly those, while the
+             * ones already delivered stay suppressed.  Each rerun delivers up
+             * to GPU_MAX_HITS new hits, so it ends.  Before this, the hits of
+             * every dispatch shared the one GPU_MAX_HITS buffer and the excess
+             * was dropped with a warning. */
+            {
+                uint32_t hc = 0u, got, keep, room;
+                memcpy(&hc, p + 128, sizeof(hc));
+                got  = hc > (uint32_t)GPU_MAX_HITS ? (uint32_t)GPU_MAX_HITS : hc;
+                room = (uint32_t)GPU_PACKED_MAX_HITS - acc_n;
+                keep = got < room ? got : room;
+                if (keep > 0u) {
+                    h_hits_reserve((size_t)acc_n + keep, acc_n);
+                    memcpy(h_hits + (size_t)acc_n * GPU_HIT_STRIDE,
+                           [buf_hits contents],
+                           (size_t)keep * GPU_HIT_STRIDE * sizeof(uint32_t));
+                }
+                acc_n += keep;
+                acc_lost += (uint64_t)(got - keep);
+                mtl_audit_hits_delivered += (uint64_t)got;
+                *((uint32_t *)(p + 128)) = 0u;
+                params->overflow_first_set  = 0;
+                params->overflow_first_word = 0xFFFFFFFFu;
+                if (hc > (uint32_t)GPU_MAX_HITS && room > got) {
+                    rule_advance = 0u;      /* run this chunk again */
+                    overflow_reruns++;
+                }
             }
         }
 
@@ -10141,26 +10211,20 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
          * existing hit-replay decode in gpu/gpujob_metal.m:751-808
          * (which divmods by nsalts_packed) recovers the correct
          * salt_idx_global / mask_idx / ridx without further host work. */
-        uint32_t raw_nhits = 0;
-        memcpy(&raw_nhits, p + 128, sizeof(raw_nhits));
-        uint32_t emitted = raw_nhits > GPU_MAX_HITS ? GPU_MAX_HITS : raw_nhits;
-        /* 2026-08-30 emission audit: raw_nhits (not the clamped value) is
-         * the number of dedup claims this batch turned into hit-slot
-         * reservations. Clamping loss is separately loud below. */
-        mtl_audit_hits_delivered += (uint64_t)raw_nhits;
-        if (raw_nhits > (uint32_t)GPU_MAX_HITS) {
+        if (use_salt) gpu_dispatch_hit_salt_n[0] = acc_n;
+        if (overflow_reruns > 0u)
+            GPU_DEBUG_FPRINTF(stderr,
+                "Metal: hit buffer full %u time(s); chunk rerun, %u hits "
+                "collected (op=%d)\n", (unsigned)overflow_reruns,
+                (unsigned)acc_n, op);
+        if (acc_lost > 0ull) {
             fprintf(stderr,
-                "mdxfind: WARNING %s:%d Metal legacy carrier: hit buffer "
-                "overflow -- %u records produced, GPU_MAX_HITS=%d "
-                "delivered; %u cracks LOST for this batch (op=%d)\n",
-                __FILE__, __LINE__, (unsigned)raw_nhits, GPU_MAX_HITS,
-                (unsigned)(raw_nhits - (uint32_t)GPU_MAX_HITS), op);
+                "mdxfind: WARNING %s:%d Metal legacy carrier: %llu hits beyond "
+                "GPU_PACKED_MAX_HITS=%d in one batch were LOST (op=%d)\n",
+                __FILE__, __LINE__, (unsigned long long)acc_lost,
+                GPU_PACKED_MAX_HITS, op);
         }
-
-        if (emitted > 0) {
-            size_t bytes = (size_t)emitted * GPU_HIT_STRIDE * sizeof(uint32_t);
-            memcpy(h_hits, [buf_hits contents], bytes);
-        }
+        uint32_t emitted = acc_n;
         *nhits_out = (int)emitted;
         return (emitted > 0) ? h_hits : NULL;
     }
