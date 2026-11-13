@@ -1,5 +1,7 @@
 # 7-Zip Archives (7zAES) — `-m e1000`
 
+*This page is about recovering the password of an encrypted 7z archive. For reading a `.7z` file as a wordlist, see [COMPRESSED.md](COMPRESSED.md).*
+
 mdxfind type `e1000` recovers passwords for AES-256 encrypted `.7z` archives. It maps to
 hashcat mode `11600` and consumes the same `$7z$` hash format that `7z2john.pl` produces.
 

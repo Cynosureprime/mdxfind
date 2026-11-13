@@ -6,7 +6,7 @@
 
 Multi-threaded, multi-algorithm hash search engine. Searches wordlists against large hash collections across 1001 hash types simultaneously, using Judy arrays for memory-efficient hash storage and SIMD acceleration on supported platforms. Includes **mdsplit**, a companion tool that separates solved hashes by type into organized output files.
 
-See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons. See [docs/SEVENZIP.md](docs/SEVENZIP.md) for 7-Zip (`-m e1000`) archive recovery, including the silent false negatives that affect other tools. See [docs/EMAIL.md](docs/EMAIL.md) for email-address plaintexts (`-E` local-part rules, `-a` dot sweeps, and why `emailprep` ordering is a correctness precondition rather than a tuning step). See [docs/SALTS_AND_USERS.md](docs/SALTS_AND_USERS.md) for how salts and usernames reach mdxfind (`-F` alongside the hash, `-S`/`-U` per-type lists, `-s`/`-u` global pools) and how their reference counts decide whether a run silently under-reports.
+See [HASH_TYPES.md](HASH_TYPES.md) for the complete list of supported hash types with hashcat mode mappings. See [docs/HOWTO.md](docs/HOWTO.md) for a practical guide to hash recovery workflows. See [docs/EXAMPLES.md](docs/EXAMPLES.md) for detailed examples of iterations, rotations, salts, and advanced features. See [docs/RULES.md](docs/RULES.md) for the complete rule reference. See [docs/BRUTE_FORCE.md](docs/BRUTE_FORCE.md) for mask-based brute-force mode and multi-GPU dispatch. See [docs/PROGRESS.md](docs/PROGRESS.md) for the progress-line format reference. See [docs/COMPRESSED.md](docs/COMPRESSED.md) for compressed wordlists and hash files: which formats work, where, and why a compressed pipe is refused. See [docs/BENCHMARK.md](docs/BENCHMARK.md) for performance comparisons. See [docs/SEVENZIP.md](docs/SEVENZIP.md) for 7-Zip (`-m e1000`) archive recovery, including the silent false negatives that affect other tools. See [docs/EMAIL.md](docs/EMAIL.md) for email-address plaintexts (`-E` local-part rules, `-a` dot sweeps, and why `emailprep` ordering is a correctness precondition rather than a tuning step). See [docs/SALTS_AND_USERS.md](docs/SALTS_AND_USERS.md) for how salts and usernames reach mdxfind (`-F` alongside the hash, `-S`/`-U` per-type lists, `-s`/`-u` global pools) and how their reference counts decide whether a run silently under-reports.
 
 Uses [yarn.c](https://github.com/madler/pigz) for threading, [libJudy](https://judy.sourceforge.net/) for compressed hash lookup, and [hashpipe](https://github.com/Cynosureprime/hashpipe) for hash verification.
 
@@ -86,7 +86,7 @@ mdxfind is designed for processing very large hash collections (100+ million has
 - Append or prepend character masks to each candidate
 - Handle salts, usernames, peppers, and suffixes from separate files or embedded in the hash file
 - Deduplicate wordlists on the fly
-- Read compressed wordlists directly (gzip, bzip2, XZ/LZMA, Zstandard, ZIP)
+- Read compressed wordlists directly (gzip, xz, LZMA, bzip2, Zstandard, ZIP, 7z) — see [docs/COMPRESSED.md](docs/COMPRESSED.md)
 - Expand passwords to Unicode, XML-escape special characters, or munge email addresses
 - Rotate calculated hashes to match truncated or manipulated input hashes
 - Output results in a standardized `TYPE hash[:salt]:password` format consumed by mdsplit
@@ -187,7 +187,7 @@ When `-W` is active, the progress line shows completion percentage and estimated
 Working on words.txt, w=62, 3.3M/10.0M (33.0%), Found=12, 307.90Mh/s, 61.59Kc/s, ETA 2m05s
 ```
 
-The SQLite cache (`mdxfind.db` in the current directory by default) stores line counts keyed on file path, size, and modification time. Subsequent runs skip decompression entirely for cached files. The cache handles gzip, xz, bzip2, zstd, and zip-compressed wordlists.
+The SQLite cache (`mdxfind.db` in the current directory by default) stores line counts keyed on file path, size, and modification time. Subsequent runs skip decompression entirely for cached files. The cache handles gzip, xz, bzip2, zstd, zip and 7z-compressed wordlists.
 
 Set `MDXFIND_CACHE` to enable automatic ETA for all runs without specifying `-W auto` each time:
 
@@ -308,28 +308,32 @@ d06be999220ca97b73b14db78492be76:Kp
 
 ### Compressed Wordlists
 
-mdxfind can read compressed wordlists directly — no need to decompress before processing. The compression format is auto-detected from the file header (magic bytes), not the file extension. Supported formats:
+mdxfind reads compressed wordlists directly — no need to decompress before processing. The format is detected from the file's first bytes (magic number), not its extension. See [docs/COMPRESSED.md](docs/COMPRESSED.md) for the full reference, including why a compressed pipe is refused.
 
-| Format | Extensions | Library |
-|--------|-----------|---------|
-| gzip | `.gz` | zlib |
-| bzip2 | `.bz2` | libbz2 |
-| XZ / LZMA | `.xz`, `.lzma` | liblzma |
-| Zstandard | `.zst` | libzstd |
-| ZIP | `.zip` | zlib (deflate) |
+| Format | Extension | Library | Named wordlist | Pipe / `stdin` |
+|--------|-----------|---------|:---:|:---:|
+| gzip | `.gz` | zlib | yes | yes |
+| xz | `.xz` | liblzma | yes | FATAL |
+| LZMA | `.lzma` | liblzma | yes | FATAL |
+| bzip2 | `.bz2` | libbz2 | yes | FATAL |
+| Zstandard | `.zst` | libzstd | yes | FATAL |
+| ZIP (first entry) | `.zip` | zlib, libbz2, liblzma, libzstd | yes | FATAL |
+| 7z (one file, LZMA2) | `.7z` | liblzma | yes | FATAL |
 
 ```bash
 # Use compressed wordlists directly
 mdxfind -m e1 -f hashes.txt rockyou.txt.gz
 
 # Mix compressed and uncompressed
-mdxfind -m e1 -f hashes.txt dict1.txt.zst dict2.txt.bz2 plain.txt
+mdxfind -m e1 -f hashes.txt dict1.txt.zst dict2.txt.bz2 big.found.7z plain.txt
 
-# Pipe compressed data via stdin wordlist
-mdxfind -m e1 -f hashes.txt < wordlist.xz
+# On a pipe, decompress first and read stdin
+xz -dc wordlist.xz | mdxfind -m e1 -f hashes.txt stdin
 ```
 
-ZIP files are processed as single-entry archives (the first entry is read). For multi-entry ZIP files, extract first or use a tool like `unzip -p` to pipe the contents.
+**Only gzip is decompressed from a pipe or stdin.** Every other decoder reopens the file by name, and a pipe has none; a 7z also needs its directory, which is at the end of the file. Without a decoder, the compressed bytes would be hashed as candidate passwords and the run would complete with nothing found, so mdxfind stops with a FATAL error that names the format and the command to use instead. Hash files follow the same rule: gzip is read directly, anything else must be decompressed first.
+
+ZIP archives are read as single-entry archives (the first entry). 7z archives are read when they hold one file compressed with LZMA2 alone, which is how large wordlists such as the hashmob.net found lists are distributed; the decoded size and CRC are checked, and any other 7z (several files, a BCJ or Delta filter, another method, encryption) stops with an error naming the reason. `.lzma` files, which carry no magic number, are recognised from their header fields.
 
 ### Brute-Force Mode
 
@@ -867,7 +871,7 @@ mdxfind requires the following static libraries (all built automatically by `mak
 | [PCRE](https://github.com/luvit/pcre) 8.45 | `libpcre.a` | Perl-compatible regular expressions (for `-h` type selection) |
 | LM hash | `lm/lm.a` | LM/NTLM hash support (bundled) |
 | [zlib](https://github.com/madler/zlib) | `-lz` | gzip and ZIP decompression for compressed wordlists |
-| [liblzma](https://github.com/tukaani-project/xz) | `-llzma` | XZ/LZMA decompression for compressed wordlists |
+| [liblzma](https://github.com/tukaani-project/xz) | `-llzma` | xz, `.lzma` and 7z (LZMA2) decompression for compressed wordlists |
 | [libbz2](https://sourceware.org/bzip2/) | `-lbz2` | bzip2 decompression for compressed wordlists |
 | [libzstd](https://github.com/facebook/zstd) | `-lzstd` | Zstandard decompression for compressed wordlists |
 

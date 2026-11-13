@@ -1,8 +1,11 @@
 .\" mdxfind(1) -- man-macro reference page
 .\" This file is a man page.  The mm-macro reference document of the same
 .\" stem is a separate, unrelated deliverable and is not derived from this.
-.\" $Revision: 1.26 $
+.\" $Revision: 1.27 $
 .\" $Log: mdxfind.1,v $
+.\" Revision 1.27  2026/11/11 06:01:08  dlr
+.\" Compressed input: 7z and lzma added to the wordlist formats, with the single-file LZMA2 restriction for 7z and how a .lzma file is recognised without a magic number. New paragraph on pipes, standard input and hash files: only gzip is decompressed there, why, and that input beginning with another format's signature is a fatal error naming the format.
+.\"
 .\" Revision 1.26  2026/11/09 21:45:23  dlr
 .\" TH to mdxfind 1.668.
 .\"
@@ -115,8 +118,30 @@ Candidate passwords come from the trailing
 arguments.  The literal name
 .B stdin
 may be used as a wordlist to read candidates from standard input.  Wordlists
-may be gzip, xz, bzip2, zstd or zip compressed; they are decompressed
-transparently.  Directories are skipped unless
+may be gzip, xz, lzma, bzip2, zstd, zip or 7z compressed; they are decompressed
+transparently when the wordlist is named on the command line.  A 7z wordlist
+must hold one file compressed with LZMA2 alone, the form in which large
+wordlists are distributed; its size and CRC are checked, and any other 7z
+stops the run with an error naming the reason.
+.PP
+Only gzip is decompressed from a pipe or standard input, or from a hash file.
+Every other decoder reopens its input by name, and a 7z must also seek to the
+directory at the end of the file.  Read without its decoder, compressed data
+would be hashed as candidate passwords, or would load no hashes, and the run
+would look complete; so input on a pipe, on standard input, or in a
+.BR \-f ,
+.B \-F
+or
+.B \-J
+hash file that begins with an xz, lzma, bzip2, zstd, zip or 7z signature is a
+fatal error naming the format.  Decompress such input first, for example
+.BR "xz \-dc list.xz | mdxfind ... stdin" .
+An
+.I .lzma
+file has no magic number and is recognised from its header fields: a valid
+properties byte, a dictionary of at least 4 KB that is a power of two or
+three times a power of two, and a decoded size that is unknown or below 2^38.
+Directories are skipped unless
 .B \-y
 is given.
 .PP
