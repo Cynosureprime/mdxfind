@@ -254,14 +254,17 @@ gpu_metal.o: gpu_metal.m gpu_metal.h gpujob.h job_types.h gpu/mdxfind_metallib.h
              gpu/gpu_codegen_eligible.h \
              codegen/hx_spec.h codegen/hx_walker.h codegen/hx_spec_entry.h hx_vm.h hx_ast.h \
              gpu/gpu_fatal.h gpu/gpu_debug.h
-	$(CC) -x objective-c++ $(CFLAGS) -Icodegen -std=c++11 -c gpu_metal.m
+	$(CC) -x objective-c++ $(CFLAGS) -Icodegen -std=c++11 -fobjc-arc -fno-exceptions -fno-objc-arc-exceptions -c gpu_metal.m
 
+# Both Metal files are built with ARC, which frees the per-dispatch Metal
+# buffers; without it every dispatch leaks them. gpujob_metal.m is plain
+# Objective-C, not Objective-C++.
 gpu/gpujob_metal.o: gpu/gpujob_metal.m gpujob.h job_types.h gpu_metal.h mdxfind.h \
                     gpu/gpu_codegen_eligible.h gpu/gpu_fatal.h gpu/gpu_debug.h
 ifeq ($(UNAME_M),x86_64)
-	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -include emmintrin.h -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
+	$(CC) $(CFLAGS) -fobjc-arc -include emmintrin.h -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
 else
-	$(CC) -x objective-c++ $(CFLAGS) -std=c++11 -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
+	$(CC) $(CFLAGS) -fobjc-arc -c gpu/gpujob_metal.m -o gpu/gpujob_metal.o
 endif
 endif
 
