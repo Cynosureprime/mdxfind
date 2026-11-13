@@ -10239,6 +10239,7 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
          * POSITION=APPEND (vs PREPEND) — same BASE_ALGO=sha1 +
          * HASH_WORDS=5. */
         case JOB_SHA1PASSSALT:
+        case JOB_SHA1PASSUSERPASSUSER:  /* e1063: same kernel, algo_mode 1 */
             if (gpu_opencl_template_compile_sha1passsalt(d, dev_idx) == 0 &&
                 gpu_opencl_template_kernel_lazy_sha1passsalt(d, dev_idx) == 0)
                 return d->kern_template_phase0_sha1passsalt;
@@ -14681,6 +14682,7 @@ int gpu_opencl_op_supported(int op)
          * shape salted variant. Same dispatch geometry; only finalize-time
          * salt position differs from SHA1SALTPASS. */
         op != JOB_SHA1PASSSALT &&
+        op != JOB_SHA1PASSUSERPASSUSER &&  /* e1063: SHA1PASSSALT kernel, algo_mode 1 */
         /* B6.7 SHA256PASSSALT fan-out (2026-05-06): second SHA-family
          * APPEND-shape salted variant. Same dispatch geometry; only
          * finalize-time salt position differs from SHA256SALTPASS. */
@@ -15418,6 +15420,7 @@ validator_skip:
                           op == JOB_SHA224SALTPASS ||
                           op == JOB_MD5PASSSALT ||
                           op == JOB_SHA1PASSSALT ||
+                          op == JOB_SHA1PASSUSERPASSUSER ||  /* e1063 */
                           /* B6.7 SHA256PASSSALT fan-out (2026-05-06):
                            * second SHA-family APPEND-shape salted variant.
                            * Same salt-pack geometry as the other salted
@@ -15929,6 +15932,9 @@ validator_skip:
         else if (op == JOB_MD5revMD5SALT)         pparams->algo_mode = 2u;
         else if (op == JOB_MD5sub8_24SALT)        pparams->algo_mode = 3u;
         else if (op == JOB_MD5_MD5SALTMD5PASS)    pparams->algo_mode = 4u;
+        /* e1063 SHA1PASSUSERPASSUSER rides the SHA1PASSSALT kernel; mode 1
+         * makes finalize_append_be hash (pass || salt) twice. */
+        else if (op == JOB_SHA1PASSUSERPASSUSER)  pparams->algo_mode = 1u;
         /* Family A (2026-05-07): HMAC-MD5 modes share the MD5SALT
          * template kernel; algo_mode 5 = KSALT (e214: key=salt,msg=pass),
          * 6 = KPASS (e792: key=pass,msg=salt). The HMAC body at the top

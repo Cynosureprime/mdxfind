@@ -222,10 +222,10 @@ int Neon;
 #define bswap_64(x) __builtin_bswap64(x)
 #endif
 
-char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.668 2026/11/09 21:46:51 dlr Exp dlr $";
+char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.669 2026/11/13 13:43:25 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.668 2026/11/09 21:46:51 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.669 2026/11/13 13:43:25 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -243,6 +243,9 @@ __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.669  2026/11/13 13:43:25  dlr
+ * Add e1063 SHA1PASSUSERPASSUSER, sha1(pass . user . pass . user), the user from the userid channel: the digest of PHP sha1(str_repeat($password . $username, 2)). tools/hx_dedup_check reported NO MATCH over 1060 catalog entries. Types[] appended at the end, JOB define 1063, TypeOpts NEEDSF|NEEDUSER, TypeDigest 20, default user administrator for -z. The CPU case builds pass.user in the upper part of linebuf, doubles it, and iterates as every SHA1 type does, sha1 of the previous round lowercase hex; a pair whose doubled length passes 2*MAXLINE is skipped. GPU on OpenCL and Metal: the type runs on the SHA1PASSSALT kernels in algo_mode 1, which hashes pass||salt written twice, with the userid as the salt; it joins the rules-engine chokepoint, the salt-snapshot exclusion, and an admission arm beside the HMAC KSALT TYPEUSER arm, so -u and -F hash:user both reach the device. Hits replay through checkhashsalt and USERFIELD_OP, so a GPU line equals a CPU line. Verified: -z and x02 against an independent python computation; real hashes of this construction crack through -F hash:user and -u; on a GTX 1080 (OpenCL) and an Apple M2 Max (Metal), 1400 python-generated hashes over 133 users and 120000 words give GPU output byte-identical to the CPU and to the oracle, with and without rules, at -i 1 and -i 2, through -F and -u; e405 and e413, which share the kernel fragment, are unchanged; wrong-user and wrong-password controls give no hits. Also removes customer-identifying text and three attribution lines from this log, and a customer mask from the parse_mask_into comment.
+ *
  * Revision 1.668  2026/11/09 21:46:51  dlr
  * Release with the hashcat N rule and two Metal fixes; no code change in this file. N, RULE_OP_MANGLE_REPLACE_NTH, replaces only the nth occurrence of a character counting from 0 and is a no-op when there is none; it is in both rule engines, ruleproc.c 1.49 and ruleproc32.c 1.20, where -8 also takes quoted strings of any length, and in every GPU rule walker. gpu_metal.m 1.153: the Metal rules dispatch skipped rules whenever its adaptive chunk size grew, losing cracks without a warning on most multi-chunk rule sets, and dropped hits beyond 32,768 per call; it now advances by the chunk dispatched and collects hits per dispatch, rerunning a chunk whose hit buffer overflowed.
  *
@@ -1260,7 +1263,7 @@ __attribute__((unused)) const char *mdxfind_rev_string(void) {
  * sub-phase 5b1a4 mdxfind admit oracle plus dlen plus harness gates extended for MD2MD5PASS e120 oracle_compute_md5pass_family adds JOB_MD2MD5PASS arm calls sph_md2_init plus sph_md2 plus sph_md2_close on hex32 md5 pass concat pass buffer returns 16-byte digest hx_family_md5pass_validate_run_shared dlen switch adds JOB_MD2MD5PASS dlen 16 byte chokepoint admit family_ops list widens from 7 to 8 entries adds JOB_MD2MD5PASS leading e120 OpenCL harness gate at hx_family_md5pass_validate_run_shared OpenCL backend dispatch widens from 7 to 8 OR-chain entries adds JOB_MD2MD5PASS Metal harness gate parallel widens from 7 to 8 OR-chain entries adds JOB_MD2MD5PASS sph_md2_h header already included at mdxfind.c line 83 from existing JOB_MD2 plus JOB_MD5MD2 plus JOB_SHA1MD2 paths no new include needed
  *
  * Revision 1.505  2026/05/27 00:29:53  dlr
- * Raise MAX_MASK_POS from 16 to 256; add MAX_MASK_POS_GPU_SIDE=16 for GPU per-side cap; FATAL on overlong masks. Customer mask 21-char ?d?d?d?d?d?d?d?d?d?d@myecou.com was silently truncated to 16 positions causing wrong hashes. parse_mask_into now exits with diagnostic on overflow. GPU upload sites at lines ~50390, ~50510, ~50780 now check input mask against GPU per-side cap and skip upload + warn when exceeded so CPU path handles long masks. Validated on fpga.local GTX 1080 - customer hash a7cd8421ed4f949af68b68a3b116ede1 cracked at 2399938728@myecou.com over 10e10 keyspace in 194s at 51 Mh per second with 17 threads.
+ * Raise MAX_MASK_POS from 16 to 256; add MAX_MASK_POS_GPU_SIDE=16 for GPU per-side cap; FATAL on overlong masks. A 21-position mask, ten digits and a fixed domain suffix, was silently truncated to 16 positions causing wrong hashes. parse_mask_into now exits with diagnostic on overflow. GPU upload sites at lines ~50390, ~50510, ~50780 now check input mask against GPU per-side cap and skip upload + warn when exceeded so CPU path handles long masks. Validated on fpga.local GTX 1080 - a known hash of such a mask cracked over a 10e10 keyspace in 194s at 51 Mh per second with 17 threads.
  *
  * Revision 1.504  2026/05/26 22:45:15  dlr
  * Fix two limitations in -n mask attack mode. Limitation 1 number_iter declared int caused signed-int overflow at exactly 2-to-31 candidates terminating the loop prematurely. Widen number_iter and loop_bound from int to unsigned long long. Drop int cast on job-MaskCount. Limitation 2 seed-file path submitted exactly one job per algo-per-line which only spawned one procjob worker thread regardless of -t value. Add mask-iteration chunking around the job submission site so when a mask is configured AND MaskTotal is at or above maxt times 65536 AND maxt is more than 1 AND Numrules is at most 1 the job is split into maxt sub-jobs covering disjoint MaskIndex ranges. Each sub-job triggers a launch up to maxt enabling true parallelism. Gated on Numrules at most 1 because the per-rule MaskIndex reset to zero at line 12147 would corrupt chunk ranges when real rules are walked. Verified on fpga.local Pascal GTX 1080 16 cores. Full 10-to-10 keyspace sweep at 60 megahashes per second using 16 threads completes in 166 seconds cracking target plaintext 9999988888 at MaskIndex near 10-to-10 well past the prior 2-to-31 cap. Previous behavior 466 seconds 4.6 megahashes per second on 1 thread and only 2-to-31 candidates covered. Regression check short-mask 1000-candidate sweep unaffected single-thread path preserved when below chunking threshold.
@@ -2425,8 +2428,6 @@ __attribute__((unused)) const char *mdxfind_rev_string(void) {
  * CRAMMD5-DOVECOT uses TYPEOPT_NEEDSJ (not NEEDSF) to avoid hex fast-path.
  * Uses sph_md5 intermediate state (no finalization) matching hashcat mode 16400.
  *
- * Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
- *
  * Revision 1.200  2026/03/08 16:32:53  dlr
  * Add SAP-BCODE/BCODE4/PASSCODE/PASSCODE5/AS400-DES procjob+loading+bootstrap; fix CRAMMD5 output (reconstruct response b64 with new HMAC); fix RACF output (HASH:USER format); add sapb_trans_tbl/bcodeArray tables
  *
@@ -2561,12 +2562,8 @@ __attribute__((unused)) const char *mdxfind_rev_string(void) {
  * Revision 1.166  2026/02/26 22:41:50  dlr
  * Removed Typelock: SPV decrements use PV_DEC, default salt creation moved to init_default_salts() called from main before procjob launch
  *
- * Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
- *
  * Revision 1.165  2026/02/26 17:18:38  dlr
  * Saltloaded/Userloaded tracking: fixed PV==1 to PV==0 (first insertion), added Saltloaded[] to all 17 store_typesalt callers
- *
- * Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
  *
  * Revision 1.164  2026/02/26 15:05:39  dlr
  * PV_DEC macro: atomic CAS decrement with underflow guard, replaces 145 possess/release blocks
@@ -8049,6 +8046,7 @@ char *Types[] = {
     "MD5USERDESCRYPT",
     "MD5CRYPTMD5",
     "SHA256BASE64",
+    "SHA1PASSUSERPASSUSER",
 
 NULL
 
@@ -9142,6 +9140,7 @@ NULL
 #define JOB_MD5USERDESCRYPT 1060
 #define JOB_MD5CRYPTMD5 1061
 #define JOB_SHA256BASE64 1062
+#define JOB_SHA1PASSUSERPASSUSER 1063
 
 #define JOB_DONE 2000
 
@@ -10280,6 +10279,7 @@ unsigned short TypeOpts[JOB_DONE] = {
      * [538] SHA512CRYPTMD5 -- identical construction, one crypt over. */
     [1061] = TYPEOPT_NEEDSJ | TYPEOPT_NEEDSALT | TYPEOPT_SALTJUDY,  /* MD5CRYPTMD5 */
     [1062] = TYPEOPT_NEEDSF,  /* SHA256BASE64 */
+    [1063] = TYPEOPT_NEEDSF | TYPEOPT_NEEDUSER,  /* SHA1PASSUSERPASSUSER */
 };
 
 /* TypeDigest: per type, the length in BYTES of what its match path compares
@@ -11188,6 +11188,7 @@ unsigned int TypeDigest[JOB_DONE] = {
     [1060] = 16,  /* MD5USERDESCRYPT */
     [1061] = 16,  /* MD5CRYPTMD5 */
     [1062] = 32,  /* SHA256BASE64 */
+    [1063] = 20,  /* SHA1PASSUSERPASSUSER */
 };
 unsigned short UserTypeOpts[USERDEF_MAX];
 
@@ -11346,8 +11347,8 @@ static int parse_char_class(const char *p, struct MaskClass *mc) {
  * when the input mask exceeds MAX_MASK_POS positions. Pre-fix the loop
  * stopped consuming characters once plen reached MAX_MASK_POS (then 16)
  * and reported success with a truncated pattern, causing wrong hashes
- * for masks like "?d?d?d?d?d?d?d?d?d?d@myecou.com" (21 positions) which
- * were silently shortened to "?d?d?d?d?d?d?d?d?d?d@myeco". Per
+ * for masks like "?d?d?d?d?d?d?d?d?d?d@example.co" (21 positions) which
+ * were silently shortened to "?d?d?d?d?d?d?d?d?d?d@examp". Per
  * feedback_external_failures_are_fatal.md: external/input failures must
  * never silently degrade. */
 int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out,
@@ -12198,6 +12199,7 @@ static const struct { int job; const char *user; } default_users[] = {
   { JOB_JUNIPERSSG, "netscreen" },
   { JOB_SHA1UCUSERPASS, "administrator" },
   { JOB_SHA1USERCOLONPASS, "administrator" },
+  { JOB_SHA1PASSUSERPASSUSER, "administrator" },
   /* SMF is sha1(strtolower(user) . pass), so with no username there is nothing
    * to compute and the type emitted nothing at all under -z.  Administrator is
    * traditional for it.  The compute arm lowercases for hashing and reports the
@@ -15498,6 +15500,11 @@ while (1) {
           * post-category-move (gpu_op_category returns GPU_CAT_MASK,
           * gpu_try_pack returns 0 for non-GPU_CAT_SALTED/SALTPASS ops). */
          job->op == JOB_SHA1PASSSALT ||
+         /* e1063 SHA1PASSUSERPASSUSER: the SHA1PASSSALT kernel with
+          * algo_mode 1 (message = pass.user twice).  Its "salt" is the
+          * userid; admission needs users present -- see the TYPEUSER arm
+          * of the snapshot guard below. */
+         job->op == JOB_SHA1PASSUSERPASSUSER ||
          /* B6.7 SHA256PASSSALT fan-out (2026-05-06): SHA256PASSSALT (-m 1410) —
           * second SHA-family APPEND-shape salted variant on the codegen
           * path. SHA256(pass || salt) (simple append; mdxfind.c:27639-27677).
@@ -15965,6 +15972,7 @@ while (1) {
            * identical to SHA1SALTPASS — only finalize-time byte order
            * differs. */
           job->op != JOB_SHA1PASSSALT &&
+          job->op != JOB_SHA1PASSUSERPASSUSER &&
           /* B6.7 SHA256PASSSALT fan-out (2026-05-06): JOB_SHA256PASSSALT
            * joins the salted-op set for this guard. Salt-snapshot
            * precondition identical to SHA256SALTPASS — only finalize-time
@@ -16230,7 +16238,11 @@ while (1) {
            job->op == JOB_HMAC_SHA224 || job->op == JOB_HMAC_SHA256 ||
            job->op == JOB_HMAC_SHA384 || job->op == JOB_HMAC_SHA512 ||
            job->op == JOB_HMAC_RMD160 || job->op == JOB_HMAC_RMD320) &&
-          TYPEUSER(job->op) != NULL)) &&
+          TYPEUSER(job->op) != NULL) ||
+         /* e1063 takes its users the way its CPU arm does: TYPEUSER, else
+          * the -u pool in UseridJudy.  gpu_salt_judy() resolves the same. */
+         (job->op == JOB_SHA1PASSUSERPASSUSER &&
+          (TYPEUSER(job->op) != NULL || UseridJudy != NULL))) &&
         len > 0 && len <= GPU_RULES_MAX_INPUT_LEN) {
       /* Maxiter > 1 is now handled by the iter loop inside
        * md5_rules_phase0 (mirrors gpu_md5_packed.cl). The host upload
@@ -23149,6 +23161,45 @@ md4utf16:
                           mysha1(newbuf, 40, curin.h);
                         }
                       }
+                      }
+                    }
+                    UJSLN(PV, ujudy);
+                  }
+                }
+                break;
+
+              case JOB_SHA1PASSUSERPASSUSER:
+                /* e1063 sha1(pass . user . pass . user), the user from the
+                 * userid channel.  Built in the upper part of linebuf
+                 * (MAXLINE*3), as JOB_SHA1USERCOLONPASS does, so a word held
+                 * in the low part is never overwritten:
+                 *   [MAXLINE .. +len-1]            pass
+                 *   [+len .. +len+ulen-1]          user
+                 *   [+half .. +2*half-1]           pass . user again
+                 * A pair whose doubled length passes 2*MAXLINE is skipped. */
+                if (len > MAXLINE)
+                  break;
+                fastcopy(linebuf + MAXLINE, cur, len);
+                { Pvoid_t ujudy = (Pvoid_t)TYPEUSER(job->op);
+                  char *pu = linebuf + MAXLINE;
+                  if (!ujudy) ujudy = (Pvoid_t)UseridJudy;
+                  if (!ujudy) break;
+                  tsalt[0] = 0;
+                  UJSLF(PV, ujudy);
+                  while (PV) {
+                    if ((Printall || *PV > 0) && 2 * (len + Uklen) <= 2 * MAXLINE) {
+                      int ulen = Uklen, half = len + Uklen;
+                      memcpy(pu + len, tsalt, ulen);
+                      memcpy(pu + half, pu, half);
+                      mysha1(pu, 2 * half, curin.h);
+                      for (x = 1; x <= Maxiter; x++) {
+                        hashcnt++;
+                        if (checkhashsalt_user(&curin, 40, tsalt, ulen, x, job))
+                          PV_DEC(PV);
+                        if (x < Maxiter) {
+                          prmd5_40(curin.h, newbuf);
+                          mysha1(newbuf, 40, curin.h);
+                        }
                       }
                     }
                     UJSLN(PV, ujudy);

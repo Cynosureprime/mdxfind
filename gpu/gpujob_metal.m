@@ -474,6 +474,7 @@ static int metal_gpu_hash_words(int op)
     case JOB_SHA1RAW:     /* Phase 2d.3.2: 5 uint32 (binary-digest re-feed) */
     case JOB_SHA1DRU:     /* Phase 2d.3.3: 5 uint32 (1M-iter Drupal SHA-1) */
     case JOB_SHA1PASSSALT: /* Phase 2d.3.4: 5 uint32 (sha1(pass||salt)) */
+    case JOB_SHA1PASSUSERPASSUSER: /* e1063: sha1passsalt carrier, algo_mode 1 */
     case JOB_SHA1SALTPASS: /* Phase 2d.3.5: 5 uint32 (sha1(salt||pass)) */
     case JOB_RMD160:      /* Phase 2d.6.1: 5 uint32 (RIPEMD-160 LE; FIRST RIPEMD-family) */
     /* Sub-phase 5a.5 (2026-05-22): family hit-replay width. The codegen
@@ -643,6 +644,7 @@ static int metal_gpu_hash_words(int op)
 struct saltentry;
 extern void **Typesalt;
 extern void **Typeuser;
+extern Pvoid_t UseridJudy;
 extern char  Typedone[];
 extern int   build_salt_snapshot(void *snap, char *pool, void *judy,
                                  char *keybuf, int printall);
@@ -737,6 +739,10 @@ static void *gpu_salt_judy(int op) {
         case JOB_HMAC_RMD160:       /* e211 */
         case JOB_HMAC_RMD320:       /* e213 */
             return Typeuser ? Typeuser[op] : NULL;
+        /* e1063 reads its users as its CPU arm does: TYPEUSER, else the -u
+         * pool in UseridJudy, which -u fills without binding Typeuser. */
+        case JOB_SHA1PASSUSERPASSUSER:
+            return (Typeuser && Typeuser[op]) ? Typeuser[op] : (void *)UseridJudy;
     /* Future HMAC families with TYPEOPT_NEEDUSER (JOB_HMAC_MD5,
      * JOB_HMAC_SHA1, JOB_HMAC_SHA224, JOB_HMAC_SHA256, JOB_HMAC_SHA384,
      * JOB_HMAC_SHA512, JOB_HMAC_RMD160, JOB_HMAC_RMD320) will add
@@ -2023,6 +2029,7 @@ static void gpujob_metal_worker(void *arg) {
                                     g->op == JOB_MD5PASSSALT ||
                                     g->op == JOB_MD5SALTPASS ||
                                     g->op == JOB_SHA1PASSSALT ||
+                                    g->op == JOB_SHA1PASSUSERPASSUSER || /* e1063 */
                                     g->op == JOB_SHA1SALTPASS ||
                                     /* Forward-stage 2d.4.x SHA-2/224+256 salted family. */
                                     g->op == JOB_SHA224SALTPASS ||

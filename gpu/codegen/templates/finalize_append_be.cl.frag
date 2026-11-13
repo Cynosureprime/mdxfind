@@ -43,9 +43,13 @@ static inline void template_finalize(template_state *st,
                                      uint slen,
                                      uint algo_mode)
 {
-    (void)algo_mode;  /* unused in this fragment; reserved for variant flags */
+    /* algo_mode 1, set by the host only for e1063 SHA1PASSUSERPASSUSER: the message is
+     * (pass || salt) TWICE, the salt being the userid.  Every other op
+     * passes 0, for which unit == total_len and q == p below, so the
+     * byte stream is exactly pass || salt as before. */
     uint M[16];
-    int total_len = len + (int)slen;
+    int unit = len + (int)slen;
+    int total_len = (algo_mode == 1u) ? 2 * unit : unit;
     int pos = 0;
 
     /* IV install is the responsibility of template_init() — called by
@@ -62,11 +66,12 @@ static inline void template_finalize(template_state *st,
         for (int j = 0; j < 16; j++) M[j] = 0;
         for (int i = 0; i < HASH_BLOCK_BYTES; i++) {
             int p = pos + i;
+            int q = (p >= unit) ? p - unit : p;
             uchar c;
-            if (p < len) {
-                c = data[p];
+            if (q < len) {
+                c = data[q];
             } else {
-                c = salt_buf[p - len];
+                c = salt_buf[q - len];
             }
             M[i >> 2] |= ((uint)c) << ((3 - (i & 3)) * 8);
         }
@@ -80,11 +85,12 @@ static inline void template_finalize(template_state *st,
     for (int j = 0; j < 16; j++) M[j] = 0;
     for (int i = 0; i < rem; i++) {
         int p = pos + i;
+        int q = (p >= unit) ? p - unit : p;
         uchar c;
-        if (p < len) {
-            c = data[p];
+        if (q < len) {
+            c = data[q];
         } else {
-            c = salt_buf[p - len];
+            c = salt_buf[q - len];
         }
         M[i >> 2] |= ((uint)c) << ((3 - (i & 3)) * 8);
     }

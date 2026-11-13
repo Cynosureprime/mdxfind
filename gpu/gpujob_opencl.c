@@ -89,6 +89,7 @@ extern Pvoid_t *Typehashsalt;
 extern char Typedone[];
 extern void **Typesalt;
 extern void **Typeuser;
+extern Pvoid_t UseridJudy;
 extern void *OverflowHash;
 extern Pvoid_t JudyJ[];
 extern char phpitoa64[];
@@ -277,6 +278,10 @@ static void *gpu_salt_judy(int op) {
     case JOB_HMAC_RMD160:
     case JOB_HMAC_RMD320:
         return Typeuser ? Typeuser[op] : NULL;
+    /* e1063 reads its users as its CPU arm does: TYPEUSER, else the -u
+     * pool in UseridJudy, which -u fills without binding Typeuser. */
+    case JOB_SHA1PASSUSERPASSUSER:
+        return (Typeuser && Typeuser[op]) ? Typeuser[op] : (void *)UseridJudy;
     default:
         return Typesalt ? Typesalt[op] : NULL;
     }
@@ -2028,6 +2033,11 @@ void gpujob(void *arg) {
                          g->op == JOB_SHA224SALTPASS ||
                          g->op == JOB_MD5PASSSALT ||
                          g->op == JOB_SHA1PASSSALT ||
+                         /* e1063: SHA1PASSSALT kernel, algo_mode 1; the
+                          * "salt" is the userid, replayed through
+                          * checkhashsalt, which USERFIELD_OP prints as
+                          * the user field exactly as the CPU arm does. */
+                         g->op == JOB_SHA1PASSUSERPASSUSER ||
                          /* B6.7 SHA256PASSSALT fan-out (2026-05-06):
                           * second SHA-family APPEND-shape salted variant.
                           * Hit-replay 64-byte SHA256 hex; APPEND vs
@@ -4802,6 +4812,7 @@ int gpu_op_category(int op) {
      * (vs PREPEND); same BASE_ALGO=sha1 + HASH_WORDS=5. From MD5PASSSALT
      * via HASH_WORDS=5 + BASE_ALGO=sha1 (both axes differ). */
     case JOB_SHA1PASSSALT:
+    case JOB_SHA1PASSUSERPASSUSER:  /* e1063: SHA1PASSSALT kernel, algo_mode 1 */
     /* B6.7 SHA256PASSSALT fan-out (2026-05-06): second SHA-family APPEND-
      * shape salted variant. Template-routed via gpu_sha256passsalt_core.cl.
      * Cache disambiguated from SHA256SALTPASS via SALT_POSITION=APPEND
@@ -5017,6 +5028,7 @@ int gpu_op_family(int op) {
         return FAM_DESCRYPT;
     case JOB_SHA1DRU:
     case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS:
+    case JOB_SHA1PASSUSERPASSUSER:
     case JOB_HMAC_SHA1: case JOB_HMAC_SHA1_KPASS:
         return FAM_SHA1;
     case JOB_MD5: case JOB_MD5UC: case JOB_MD5RAW:
@@ -5139,6 +5151,7 @@ int gpu_hash_words(int op) {
     /* 160-bit output = 5 words */
     case JOB_SHA1: case JOB_SHA1RAW: case JOB_SQL5:
     case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU:
+    case JOB_SHA1PASSUSERPASSUSER:
     case JOB_HMAC_SHA1: case JOB_HMAC_SHA1_KPASS:
     case JOB_RMD160:
     case JOB_HMAC_RMD160: case JOB_HMAC_RMD160_KPASS:

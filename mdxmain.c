@@ -4,8 +4,14 @@
  * The hash engine, procjob and everything it calls, is in mdxfind.c; what
  * the two share is declared in mdxint.h.
  *
- * $Revision: 1.5 $
+ * $Revision: 1.7 $
  * $Log: mdxmain.c,v $
+ * Revision 1.7  2026/11/13 13:43:33  dlr
+ * e1063 SHA1PASSUSERPASSUSER joins gpu_ops[], so it carries the GPU tag and starts GPU init, and the FAM_SHA1 compile switch, so the SHA1 kernel family is built when it is selected.
+ *
+ * Revision 1.6  2026/11/11 06:01:00  dlr
+ * Compressed input: 7z and .lzma wordlists are read directly, and compressed data that cannot be decoded is FATAL instead of being hashed as text. 7z: an archive holding one file in one block compressed with LZMA2 alone, the form the hashmob.net found lists are distributed in, is read by sevenz_open and the CMP_7Z reader. sevenz_open checks the start header and both header CRCs, parses the directory at the end of the file, and leaves the descriptor at the LZMA2 stream; liblzma's raw decoder then streams it in constant memory, the dictionary only (64 MB for LZMA2:26), and the decoded size and CRC32 are checked at the end marker. Several files or blocks, more than one coder (BCJ, Delta, AES), a method other than LZMA2, and an encoded directory are FATAL naming the reason. lseek and read rather than pread, which mingw lacks. Verified on all nine hashmob 2026-11-08 lists: -t 1 -m e1 -z output byte-identical to 7zz x -so piped to stdin for micro through larger, and huge, 7,588,600,751 bytes and 704,930,689 lines, found its first, 100,000,000th and last lines in 97 s on the iMac; ten crafted archives covering every rejection, truncation, a flipped byte and a doctored CRC each exit 1. LZMA alone (.lzma) has no magic number and is recognised by is_lzma_alone_header from its 13-byte header by liblzma's own rules, properties byte, lc+lp at most 4, a dictionary of a power of two or three times a power of two, a size unknown or below 2^38, plus a dictionary of at least 4 KB, without which an empty first hash-file line in a zeroed buffer passes as a header; a sweep of the 2,758,408 line starts of a 22 MB wordlist found no false match and all six real headers matched. It is read with lzma_alone_decoder; a decode error or a file that ends first is FATAL. Pipes: only gzip is decoded on a pipe, on stdin or in a hash file, because every other decoder reopens the input by name, which the hash-file reader never records. Input there that starts with an xz, lzma, bzip2, zstd, zip or 7z signature was read as plain text, its compressed bytes hashed as candidates or parsed as hashes, with exit 0; it is now FATAL naming the format and the command that decompresses it. compressed_signature holds the test, used by creader_detect and by the gzgets slow path of load_hash_file, which salted -F hash files take and which bypassed the reader. bzip2 detection now requires BZh1 to BZh9 followed by the block or end-of-stream magic, in the reader, the pipe check and the line counter: the three letters alone took a plain wordlist file beginning BZh for bzip2 and read nothing from it. linecount_file counts 7z and .lzma and leaves a count that fails or comes up short uncached. regress/test-F-salted.sh 29 passed, 0 failed, as before.
+ *
  * Revision 1.5  2026/11/09 23:00:16  dlr
  * Include md6.h in mdxfind.c only. md6.h defines compression_hook instead of declaring it, and since the split both mdxfind.c and mdxmain.c included it through mdxint.h. gcc merges the two as a common symbol, so Linux, FreeBSD and macOS linked; llvm-mingw compiles with -fno-common and the Windows link failed with duplicate symbol compression_hook. mdxint.h now includes md6.h unless MDX_NO_MD6 is defined, and mdxmain.c, which uses only the JOB_MD6 constants, defines it. Verified with the Windows x86_64 release objects: mdxmain.o no longer defines the symbol and the release link line produces a 13,590,528-byte PE32+ executable.
  *
@@ -128,13 +134,292 @@ int linecmp(const void *a, const void *b) {
 
 
 
+/* ---- 7z input ----
+ * A 7z archive is read only in the form wordlists are distributed in: one
+ * file, in one block, compressed with LZMA2 alone.  That block is raw LZMA2,
+ * which liblzma's raw decoder streams in constant memory -- the dictionary,
+ * at most 64 MB for LZMA2:26, not the 7.6 GB a whole-block extract would
+ * hold.  The archive's directory is at the END of the file, and it is the only
+ * place the dictionary size, the decoded size and the CRC are written, so a
+ * 7z must be a regular file: a 7z on a pipe is FATAL rather than being read
+ * as plain text.  Anything else -- several files or blocks, a filter such as
+ * BCJ or Delta, another method, encryption, a compressed (encoded) header --
+ * is FATAL and names what it found.  The decoded size and the CRC32 are
+ * checked when the LZMA2 end marker is reached, and a decode error, a read
+ * error or input that ends first is FATAL: none of them may look like a
+ * clean end of the wordlist. */
+static const unsigned char SevenzMagic[6] = { '7', 'z', 0xBC, 0xAF, 0x27, 0x1C };
+
+/* bzip2: "BZh1".."BZh9" followed by the block magic (pi) or, for an empty
+ * stream, the end-of-stream magic (sqrt pi).  The three letters alone are not
+ * enough: a plain wordlist can begin with a word starting "BZh". */
+static int is_bzip2_signature(const unsigned char *b, size_t n)
+{
+  return n >= 10 && b[0] == 'B' && b[1] == 'Z' && b[2] == 'h' &&
+         b[3] >= '1' && b[3] <= '9' &&
+         (memcmp(b + 4, "\x31\x41\x59\x26\x53\x59", 6) == 0 ||
+          memcmp(b + 4, "\x17\x72\x45\x38\x50\x90", 6) == 0);
+}
+
+/* LZMA "alone" (.lzma), the format before xz, has no magic number: its
+ * 13-byte header is a properties byte, a 32-bit dictionary size and a 64-bit
+ * decoded size (all ones when unknown, as xz writes it).  It is recognised
+ * from the values, by the rules liblzma's own format detection applies: lc,
+ * lp and pb in range with lc + lp <= 4, a dictionary of 2^n or 2^n + 2^(n-1)
+ * bytes, and a size that is unknown or below 2^38.  One rule is added: a
+ * dictionary of at least 4 KB, the smallest any encoder writes.  Without it,
+ * an empty first line followed by zeros -- a short hash-file line in a zeroed
+ * buffer -- passes as a header with a 0-byte dictionary.  A text file cannot
+ * match: the dictionary field of a valid header holds at most two non-zero
+ * bytes, and text holds no NUL. */
+static int is_lzma_alone_header(const unsigned char *b, size_t n)
+{
+  uint32_t dict, d;
+  uint64_t size = 0;
+  int i;
+
+  if (n < 13 || b[0] > (4 * 5 + 4) * 9 + 8) return 0;
+  if (b[0] % 9 + (b[0] / 9) % 5 > 4) return 0;          /* lc + lp */
+  dict = b[1] | (b[2] << 8) | (b[3] << 16) | ((uint32_t)b[4] << 24);
+  if (dict < 4096) return 0;
+  if (dict != 0xFFFFFFFFu) {
+    d = dict - 1;
+    d |= d >> 2; d |= d >> 3; d |= d >> 4; d |= d >> 8; d |= d >> 16;
+    if (++d != dict) return 0;
+  }
+  for (i = 12; i >= 5; i--) size = (size << 8) | b[i];
+  if (size != UINT64_MAX && size >= ((uint64_t)1 << 38)) return 0;
+  return 1;
+}
+
+/* The compressed format other than gzip whose signature starts b[0..n), or
+ * NULL; *how gets a command that decompresses it.  gzip is absent because
+ * zlib decodes it wherever mdxfind reads. */
+static const char *compressed_signature(const unsigned char *b, size_t n, const char **how)
+{
+  if (n >= 6 && memcmp(b, SevenzMagic, 6) == 0) { *how = "7zz x -so list.7z"; return "7z"; }
+  if (n >= 6 && memcmp(b, "\xfd" "7zXZ\0", 6) == 0) { *how = "xz -dc list.xz"; return "xz"; }
+  if (is_bzip2_signature(b, n)) { *how = "bzip2 -dc list.bz2"; return "bzip2"; }
+  if (n >= 4 && memcmp(b, "\x28\xb5\x2f\xfd", 4) == 0) { *how = "zstd -dc list.zst"; return "zstd"; }
+  if (n >= 4 && memcmp(b, "PK\x03\x04", 4) == 0) { *how = "unzip -p list.zip"; return "zip"; }
+  if (is_lzma_alone_header(b, n)) { *how = "xz -dc list.lzma"; return "lzma"; }
+  return NULL;
+}
+
+struct sevenz_info {
+  uint64_t data_off;     /* file offset of the LZMA2 stream */
+  uint64_t pack_size;    /* its length in bytes */
+  uint64_t unpack_size;  /* bytes it decodes to */
+  uint32_t crc;          /* CRC32 of the decoded bytes, when has_crc */
+  int has_crc;
+  unsigned char prop;    /* LZMA2 dictionary-size property byte */
+};
+
+struct sevenz_cur { const unsigned char *p, *end; const char *fn; };
+
+static void sevenz_fatal(const char *fn, int line, const char *why)
+{
+  fprintf(stderr, "FATAL: %s:%d 7z input %s: %s\n", __FILE__, line, fn, why);
+  exit(1);
+}
+#define SZ_FATAL(fn, why) sevenz_fatal((fn), __LINE__, (why))
+
+static unsigned sevenz_byte(struct sevenz_cur *c)
+{
+  if (c->p >= c->end) SZ_FATAL(c->fn, "header ends early (truncated or corrupt)");
+  return *c->p++;
+}
+
+/* 7z NUMBER: the count of leading 1 bits in the first byte is the count of
+ * little-endian bytes that follow; the first byte's remaining bits are the
+ * most significant. */
+static uint64_t sevenz_num(struct sevenz_cur *c)
+{
+  unsigned first = sevenz_byte(c), mask = 0x80;
+  uint64_t v = 0;
+  int i;
+  for (i = 0; i < 8; i++) {
+    if ((first & mask) == 0)
+      return v | ((uint64_t)(first & (mask - 1)) << (8 * i));
+    v |= (uint64_t)sevenz_byte(c) << (8 * i);
+    mask >>= 1;
+  }
+  return v;
+}
+
+/* Digests record for n streams, n 0 or 1. */
+static void sevenz_digests(struct sevenz_cur *c, uint64_t n, uint32_t *crc, int *has)
+{
+  unsigned all = sevenz_byte(c), defined;
+  if (n > 1) SZ_FATAL(c->fn, "more than one stream carries a CRC");
+  if (n == 0) return;
+  defined = all ? 1 : (sevenz_byte(c) & 0x80);
+  if (defined) {
+    uint32_t v = sevenz_byte(c);
+    v |= sevenz_byte(c) << 8;
+    v |= sevenz_byte(c) << 16;
+    v |= (uint32_t)sevenz_byte(c) << 24;
+    *crc = v;
+    *has = 1;
+  }
+}
+
+/* Read n bytes at off; lseek + read, since mingw has no pread. */
+static int sevenz_readat(int fd, void *buf, size_t n, uint64_t off)
+{
+  unsigned char *p = buf;
+  if (lseek(fd, (off_t)off, SEEK_SET) < 0) return -1;
+  while (n > 0) {
+    ssize_t r = read(fd, p, n);
+    if (r <= 0) return -1;
+    p += r;
+    n -= (size_t)r;
+  }
+  return 0;
+}
+
+/* Read and check the start header and the directory of the 7z archive open on
+ * fd, fill zi, and leave fd at the start of the LZMA2 stream.  Every way the
+ * archive can fall outside the supported form is FATAL. */
+static void sevenz_open(int fd, const char *fn, struct sevenz_info *zi)
+{
+  unsigned char sh[32], *hdr;
+  uint64_t next_off = 0, next_size = 0, fsize, packpos, n;
+  uint32_t want_crc;
+  unsigned b, flags;
+  struct stat st;
+  struct sevenz_cur c;
+  int i, folder_has = 0;
+  uint32_t folder_crc = 0;
+
+  memset(zi, 0, sizeof(*zi));
+  if (fstat(fd, &st) != 0) SZ_FATAL(fn, "fstat failed");
+  fsize = (uint64_t)st.st_size;
+  if (sevenz_readat(fd, sh, 32, 0) != 0) SZ_FATAL(fn, "cannot read the 32-byte start header");
+  if (memcmp(sh, SevenzMagic, 6) != 0) SZ_FATAL(fn, "not a 7z archive");
+  if (sh[6] != 0) SZ_FATAL(fn, "unsupported 7z format major version");
+  want_crc = sh[8] | (sh[9] << 8) | (sh[10] << 16) | ((uint32_t)sh[11] << 24);
+  if (lzma_crc32(sh + 12, 20, 0) != want_crc) SZ_FATAL(fn, "start header CRC mismatch");
+  for (i = 7; i >= 0; i--) {
+    next_off  = (next_off  << 8) | sh[12 + i];
+    next_size = (next_size << 8) | sh[20 + i];
+  }
+  want_crc = sh[28] | (sh[29] << 8) | (sh[30] << 16) | ((uint32_t)sh[31] << 24);
+  if (next_size == 0) SZ_FATAL(fn, "archive has no directory (empty archive)");
+  if (next_size > (1u << 20)) SZ_FATAL(fn, "directory larger than 1 MB; not a single-file archive");
+  if (next_off > fsize || next_size > fsize - 32 - next_off)
+    SZ_FATAL(fn, "directory lies past the end of the file (truncated)");
+  hdr = malloc(next_size);
+  if (!hdr) SZ_FATAL(fn, "malloc failed for the directory");
+  if (sevenz_readat(fd, hdr, next_size, 32 + next_off) != 0)
+    SZ_FATAL(fn, "cannot read the directory");
+  if (lzma_crc32(hdr, next_size, 0) != want_crc) SZ_FATAL(fn, "directory CRC mismatch");
+
+  c.p = hdr; c.end = hdr + next_size; c.fn = fn;
+  b = sevenz_byte(&c);
+  if (b == 0x17) SZ_FATAL(fn, "directory is compressed (encoded header); recompress with 7z -mhc=off or extract with 7zz x -so");
+  if (b != 0x01) SZ_FATAL(fn, "directory does not start with a header record");
+  b = sevenz_byte(&c);
+  if (b == 0x02) SZ_FATAL(fn, "archive properties record is not supported");
+  if (b == 0x03) SZ_FATAL(fn, "additional streams record is not supported");
+  if (b != 0x04) SZ_FATAL(fn, "archive holds no compressed data");
+
+  /* PackInfo: exactly one packed stream. */
+  if (sevenz_byte(&c) != 0x06) SZ_FATAL(fn, "packed-stream record missing");
+  packpos = sevenz_num(&c);
+  if (sevenz_num(&c) != 1) SZ_FATAL(fn, "more than one packed stream; only a single LZMA2 block is supported");
+  while ((b = sevenz_byte(&c)) != 0x00) {
+    if (b == 0x09) zi->pack_size = sevenz_num(&c);
+    else if (b == 0x0A) { uint32_t x; int h = 0; sevenz_digests(&c, 1, &x, &h); }
+    else SZ_FATAL(fn, "unexpected record in packed-stream info");
+  }
+
+  /* UnPackInfo: one folder of one coder, LZMA2 (method id 0x21). */
+  if (sevenz_byte(&c) != 0x07) SZ_FATAL(fn, "folder record missing");
+  if (sevenz_byte(&c) != 0x0B) SZ_FATAL(fn, "folder list missing");
+  if (sevenz_num(&c) != 1) SZ_FATAL(fn, "more than one block; only a single LZMA2 block is supported");
+  if (sevenz_byte(&c) != 0) SZ_FATAL(fn, "external folder data is not supported");
+  n = sevenz_num(&c);
+  if (n != 1) SZ_FATAL(fn, "block uses more than one coder (a filter such as BCJ or Delta, or AES encryption); only plain LZMA2 is supported");
+  flags = sevenz_byte(&c);
+  if (flags & 0x10) SZ_FATAL(fn, "block uses a multi-stream coder (BCJ2); only plain LZMA2 is supported");
+  if (flags & 0x80) SZ_FATAL(fn, "block uses alternative coder methods; not supported");
+  if ((flags & 0x0F) != 1 || sevenz_byte(&c) != 0x21) {
+    SZ_FATAL(fn, "compression method is not LZMA2 (LZMA, PPMd, BZip2, Deflate and AES are not supported)");
+  }
+  if (!(flags & 0x20) || sevenz_num(&c) != 1) SZ_FATAL(fn, "LZMA2 coder has no dictionary property");
+  zi->prop = sevenz_byte(&c);
+  if (zi->prop > 40) SZ_FATAL(fn, "invalid LZMA2 dictionary property");
+  if (sevenz_byte(&c) != 0x0C) SZ_FATAL(fn, "decoded-size record missing");
+  zi->unpack_size = sevenz_num(&c);
+  while ((b = sevenz_byte(&c)) != 0x00) {
+    if (b == 0x0A) sevenz_digests(&c, 1, &folder_crc, &folder_has);
+    else SZ_FATAL(fn, "unexpected record in folder info");
+  }
+  if (folder_has) { zi->crc = folder_crc; zi->has_crc = 1; }
+
+  /* SubStreamsInfo: optional; must describe one file. */
+  b = sevenz_byte(&c);
+  if (b == 0x08) {
+    uint64_t nfiles = 1;
+    while ((b = sevenz_byte(&c)) != 0x00) {
+      if (b == 0x0D) {
+        nfiles = sevenz_num(&c);
+        if (nfiles != 1) SZ_FATAL(fn, "block holds more than one file; only a single-file archive is supported");
+      } else if (b == 0x0A) {
+        sevenz_digests(&c, folder_has ? 0 : nfiles, &zi->crc, &zi->has_crc);
+      } else SZ_FATAL(fn, "unexpected record in file-stream info");
+    }
+    b = sevenz_byte(&c);
+  }
+  if (b != 0x00) SZ_FATAL(fn, "unexpected record after stream info");
+  free(hdr);
+
+  zi->data_off = 32 + packpos;
+  if (zi->pack_size == 0 || zi->data_off > 32 + next_off ||
+      zi->pack_size > 32 + next_off - zi->data_off)
+    SZ_FATAL(fn, "packed stream size does not fit the archive");
+  if (lseek(fd, (off_t)zi->data_off, SEEK_SET) < 0) SZ_FATAL(fn, "lseek to the packed stream failed");
+}
+
+/* Start a raw LZMA2 decoder for zi on strm. */
+static void sevenz_decoder(lzma_stream *strm, const struct sevenz_info *zi, const char *fn)
+{
+  lzma_filter f[2];
+  lzma_ret r;
+
+  f[0].id = LZMA_FILTER_LZMA2;
+  f[0].options = NULL;
+  f[1].id = LZMA_VLI_UNKNOWN;
+  f[1].options = NULL;
+  r = lzma_properties_decode(&f[0], NULL, &zi->prop, 1);
+  if (r != LZMA_OK) {
+    fprintf(stderr, "FATAL: %s:%d lzma_properties_decode failed (ret=%d) for 7z input %s\n",
+            __FILE__, __LINE__, (int)r, fn);
+    exit(1);
+  }
+  *strm = (lzma_stream)LZMA_STREAM_INIT;
+  r = lzma_raw_decoder(strm, f);
+  free(f[0].options);
+  if (r != LZMA_OK) {
+    fprintf(stderr, "FATAL: %s:%d lzma_raw_decoder failed (ret=%d) for 7z input %s\n",
+            __FILE__, __LINE__, (int)r, fn);
+    exit(1);
+  }
+}
+
+static uint32_t sevenz_dict_size(unsigned char prop)
+{
+  return prop >= 40 ? 0xFFFFFFFFu : (uint32_t)(2 | (prop & 1)) << (prop / 2 + 11);
+}
+
 /* ---- Compressed file reader ----
- * Auto-detects XZ, bzip2, and ZIP formats on first read from gzread().
+ * Auto-detects XZ, LZMA (.lzma), bzip2, zstd, ZIP and 7z formats on first read from gzread().
  * gzip and plaintext are handled transparently by zlib.
  * When a non-gzip compressed format is detected, subsequent reads
  * use the appropriate library decoder instead of gzread(). */
 
-enum compress_type { CMP_GZ = 0, CMP_XZ, CMP_BZ2, CMP_ZIP, CMP_ZSTD };
+enum compress_type { CMP_GZ = 0, CMP_XZ, CMP_BZ2, CMP_ZIP, CMP_ZSTD, CMP_7Z, CMP_LZMA };
 
 static struct {
     enum compress_type type;
@@ -159,11 +444,90 @@ static struct {
     ZSTD_DStream *zstd_ds;
     ZSTD_inBuffer zstd_in;
     unsigned char zstd_inbuf[256*1024];
+    /* 7z state -- decodes with xz/xz_inbuf; see sevenz_open */
+    struct sevenz_info sz;
+    uint64_t sz_left;      /* packed bytes not yet read */
+    uint64_t sz_out;       /* bytes decoded so far */
+    uint32_t sz_crc;       /* running CRC32 of the decoded bytes */
+    int lz_inend;          /* .lzma: no more input in the file */
 } Creader;
 
 /* Read from the active decoder. Returns bytes read, 0 on EOF. */
 static size_t creader_read(void *buf, size_t len) {
-    if (Creader.type == CMP_XZ) {
+    if (Creader.type == CMP_LZMA) {
+        /* .lzma: the stream's own end -- its end marker, or the decoded size
+         * in the header -- is the only clean end.  A decode error, or a file
+         * that ends first, is FATAL. */
+        Creader.xz.next_out = (uint8_t *)buf;
+        Creader.xz.avail_out = len;
+        while (Creader.xz.avail_out > 0 && !Creader.eof) {
+            if (Creader.xz.avail_in == 0 && !Creader.lz_inend) {
+                ssize_t n = read(Creader.fd, Creader.xz_inbuf, sizeof(Creader.xz_inbuf));
+                if (n < 0) {
+                    fprintf(stderr, "FATAL: %s:%d read error on .lzma input %s: %s\n",
+                            __FILE__, __LINE__, Creader.filename, strerror(errno));
+                    exit(1);
+                }
+                if (n == 0) Creader.lz_inend = 1;
+                else { Creader.xz.next_in = Creader.xz_inbuf; Creader.xz.avail_in = n; }
+            }
+            lzma_ret r = lzma_code(&Creader.xz, Creader.lz_inend ? LZMA_FINISH : LZMA_RUN);
+            if (r == LZMA_STREAM_END) Creader.eof = 1;
+            else if (r != LZMA_OK) {
+                fprintf(stderr, "FATAL: %s:%d LZMA decode failed (ret=%d) on .lzma input %s: %s\n",
+                        __FILE__, __LINE__, (int)r, Creader.filename,
+                        r == LZMA_BUF_ERROR ? "the file ends before the stream does (truncated)"
+                                            : "corrupt data");
+                exit(1);
+            }
+        }
+        return len - Creader.xz.avail_out;
+    } else if (Creader.type == CMP_7Z) {
+        size_t got;
+        Creader.xz.next_out = (uint8_t *)buf;
+        Creader.xz.avail_out = len;
+        while (Creader.xz.avail_out > 0 && !Creader.eof) {
+            if (Creader.xz.avail_in == 0) {
+                size_t want = sizeof(Creader.xz_inbuf);
+                ssize_t n;
+                if (Creader.sz_left == 0)
+                    SZ_FATAL(Creader.filename, "packed stream ended before the LZMA2 end marker (truncated or corrupt)");
+                if (want > Creader.sz_left) want = Creader.sz_left;
+                n = read(Creader.fd, Creader.xz_inbuf, want);
+                if (n <= 0) SZ_FATAL(Creader.filename, "read error or file ended inside the packed stream");
+                Creader.sz_left -= n;
+                Creader.xz.next_in = Creader.xz_inbuf;
+                Creader.xz.avail_in = n;
+            }
+            lzma_ret r = lzma_code(&Creader.xz, LZMA_RUN);
+            if (r == LZMA_STREAM_END) Creader.eof = 1;
+            else if (r != LZMA_OK) {
+                fprintf(stderr, "FATAL: %s:%d LZMA2 decode failed (ret=%d) on 7z input %s after %llu bytes\n",
+                        __FILE__, __LINE__, (int)r, Creader.filename,
+                        (unsigned long long)(Creader.sz_out + (len - Creader.xz.avail_out)));
+                exit(1);
+            }
+        }
+        got = len - Creader.xz.avail_out;
+        Creader.sz_crc = lzma_crc32((const uint8_t *)buf, got, Creader.sz_crc);
+        Creader.sz_out += got;
+        if (Creader.eof) {
+            if (Creader.sz_out != Creader.sz.unpack_size) {
+                fprintf(stderr, "FATAL: %s:%d 7z input %s decoded to %llu bytes, directory says %llu\n",
+                        __FILE__, __LINE__, Creader.filename,
+                        (unsigned long long)Creader.sz_out,
+                        (unsigned long long)Creader.sz.unpack_size);
+                exit(1);
+            }
+            if (Creader.sz.has_crc && Creader.sz_crc != Creader.sz.crc) {
+                fprintf(stderr, "FATAL: %s:%d 7z input %s CRC mismatch: decoded %08x, directory says %08x\n",
+                        __FILE__, __LINE__, Creader.filename,
+                        (unsigned)Creader.sz_crc, (unsigned)Creader.sz.crc);
+                exit(1);
+            }
+        }
+        return got;
+    } else if (Creader.type == CMP_XZ) {
         Creader.xz.next_out = (uint8_t *)buf;
         Creader.xz.avail_out = len;
         while (Creader.xz.avail_out > 0) {
@@ -377,8 +741,48 @@ static uint64_t zip_entry_comp_size(int fd, const unsigned char *h)
 static int creader_detect(char *buf, size_t buflen) {
     unsigned char *b = (unsigned char *)buf;
 
-    /* Can only handle non-gzip formats if we can reopen the file */
-    if (!Creader.filename[0]) return 0;  /* pipe/stdin — gzip only */
+    /* No file name to reopen: a pipe, stdin, or a hash file from -f, -F or
+     * -J, whose reader never records one.  Only gzip is decompressed here, because zlib's
+     * gzread decodes it while reading.  Every other decoder works by
+     * reopening the file by name -- and 7z must also seek to the directory
+     * at the end of the file -- which a pipe cannot do.  Input that starts
+     * with another format's signature would otherwise be read as plain text
+     * and its compressed bytes hashed as candidates: a run that completes,
+     * exits 0 and finds nothing.  So it is FATAL.  The bzip2 test requires
+     * the block or end-of-stream magic after "BZh1".."BZh9", since a plain
+     * wordlist can begin with the letters BZh; the other signatures hold a
+     * NUL or bytes no text line starts with. */
+    if (!Creader.filename[0]) {
+        const char *how = NULL, *fmt = compressed_signature(b, buflen, &how);
+        if (fmt) {
+            fprintf(stderr, "FATAL: %s:%d %s-compressed input on a pipe, on stdin, or as a hash "
+                    "file (-f, -F, -J). Only gzip is decompressed there. Name a compressed "
+                    "wordlist on the command line, or decompress it first: %s | mdxfind ...\n",
+                    __FILE__, __LINE__, fmt, how);
+            exit(1);
+        }
+        return 0;
+    }
+
+    if (buflen >= 6 && memcmp(b, SevenzMagic, 6) == 0) {
+        Creader.type = CMP_7Z;
+        Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
+        if (Creader.fd < 0) {
+            fprintf(stderr, "FATAL: %s:%d cannot reopen 7z input %s: %s\n",
+                    __FILE__, __LINE__, Creader.filename, strerror(errno));
+            exit(1);
+        }
+        sevenz_open(Creader.fd, Creader.filename, &Creader.sz);
+        sevenz_decoder(&Creader.xz, &Creader.sz, Creader.filename);
+        Creader.xz.avail_in = 0;
+        Creader.sz_left = Creader.sz.pack_size;
+        Creader.sz_out = 0;
+        Creader.sz_crc = 0;
+        fprintf(stderr, "Detected 7z input (LZMA2, %u KB dictionary, %llu bytes)\n",
+                (unsigned)(sevenz_dict_size(Creader.sz.prop) >> 10),
+                (unsigned long long)Creader.sz.unpack_size);
+        return 1;
+    }
 
     /* If gzread decompressed gzip data, buf contains plaintext — no magic.
      * If file was not gzip, gzread passed raw bytes through.
@@ -403,7 +807,7 @@ static int creader_detect(char *buf, size_t buflen) {
         fprintf(stderr, "Detected XZ compressed input\n");
         return 1;
     }
-    if (buflen >= 3 && b[0] == 'B' && b[1] == 'Z' && b[2] == 'h') {
+    if (is_bzip2_signature(b, buflen)) {
         /* bzip2 format — reopen file from beginning */
         Creader.type = CMP_BZ2;
         Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
@@ -425,6 +829,29 @@ static int creader_detect(char *buf, size_t buflen) {
         Creader.zstd_in.size = 0;
         Creader.zstd_in.pos = 0;
         fprintf(stderr, "Detected Zstandard compressed input\n");
+        return 1;
+    }
+    if (is_lzma_alone_header(b, buflen)) {
+        /* LZMA alone (.lzma) -- see is_lzma_alone_header */
+        Creader.type = CMP_LZMA;
+        Creader.fd = open(Creader.filename, O_RDONLY | O_BINARY);
+        if (Creader.fd < 0) {
+            fprintf(stderr, "FATAL: %s:%d cannot reopen .lzma input %s: %s\n",
+                    __FILE__, __LINE__, Creader.filename, strerror(errno));
+            exit(1);
+        }
+        Creader.xz = (lzma_stream)LZMA_STREAM_INIT;
+        {
+            lzma_ret r = lzma_alone_decoder(&Creader.xz, UINT64_MAX);
+            if (r != LZMA_OK) {
+                fprintf(stderr, "FATAL: %s:%d lzma_alone_decoder failed (ret=%d) for %s\n",
+                        __FILE__, __LINE__, (int)r, Creader.filename);
+                exit(1);
+            }
+        }
+        Creader.xz.avail_in = 0;
+        Creader.lz_inend = 0;
+        fprintf(stderr, "Detected LZMA (.lzma) compressed input\n");
         return 1;
     }
     if (buflen >= 4 && b[0] == 'P' && b[1] == 'K' && b[2] == 3 && b[3] == 4) {
@@ -491,7 +918,7 @@ static int creader_detect(char *buf, size_t buflen) {
 }
 
 static void creader_reset(void) {
-    if (Creader.type == CMP_XZ) lzma_end(&Creader.xz);
+    if (Creader.type == CMP_XZ || Creader.type == CMP_7Z || Creader.type == CMP_LZMA) lzma_end(&Creader.xz);
     else if (Creader.type == CMP_BZ2) BZ2_bzDecompressEnd(&Creader.bz);
     else if (Creader.type == CMP_ZSTD && Creader.zstd_ds) ZSTD_freeDStream(Creader.zstd_ds);
     else if (Creader.type == CMP_ZIP) {
@@ -2259,6 +2686,7 @@ static const int gpu_ops[] = {
     JOB_SHA224SALTPASS,
     JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS,
     JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
+    JOB_SHA1PASSUSERPASSUSER,  /* e1063: SHA1PASSSALT kernel, algo_mode 1 */
     JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD5UC, JOB_MD4, JOB_SHA1,
     JOB_SHA224, JOB_SHA256, JOB_SHA384, JOB_SHA512,
     /* JOB_NTLM (e369): permanently CPU-only by design. The rules engine
@@ -3755,7 +4183,7 @@ static unsigned long long count_newlines(const unsigned char *buf, size_t len) {
     return count;
 }
 
-/* Count lines in a single file, handling gzip/xz/bz2/zstd/zip compression.
+/* Count lines in a single file, handling gzip/xz/lzma/bz2/zstd/zip/7z compression.
  * Returns line count, or 0 on error.
  * `complete` (if non-NULL) is set to 1 only if counting ran to EOF without
  * bailing on HashWaiting. The caller MUST check this before persisting the
@@ -3797,7 +4225,46 @@ static unsigned long long linecount_file(const char *filename, int *complete) {
 #define LC_FADVISE(fd) ((void)0)
 #endif
 
-    if (hdrbuf[0] == 0xfd && hdrbuf[1] == 0x37 && hdrbuf[2] == 0x7a &&
+    if (hdrlen >= 6 && memcmp(hdrbuf, SevenzMagic, 6) == 0) {
+        /* 7z.  The reader checks the size and CRC and is FATAL on any
+         * error; here an error or a short decode only leaves the count
+         * incomplete, so it is not cached. */
+        struct sevenz_info zi;
+        lzma_stream xz;
+        uint64_t left, out = 0;
+        int ended = 0;
+        fd = open(filename, O_RDONLY | O_BINARY);
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
+        sevenz_open(fd, filename, &zi);
+        sevenz_decoder(&xz, &zi, filename);
+        left = zi.pack_size;
+        while (!ended) {
+            if (xz.avail_in == 0) {
+                size_t want = LINECOUNT_BUFSZ;
+                ssize_t n;
+                if (left == 0) break;
+                if (want > left) want = left;
+                n = read(fd, inbuf, want);
+                if (n <= 0) break;
+                left -= n;
+                xz.next_in = inbuf; xz.avail_in = n;
+            }
+            xz.next_out = dbuf; xz.avail_out = LINECOUNT_BUFSZ;
+            lzma_ret r = lzma_code(&xz, LZMA_RUN);
+            size_t got = LINECOUNT_BUFSZ - xz.avail_out;
+            if (got > 0) { lines += count_newlines(dbuf, got); out += got; }
+            if (r == LZMA_STREAM_END) ended = 1;
+            else if (r != LZMA_OK) break;
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) break;
+            }
+        }
+        lzma_end(&xz);
+        close(fd);
+        if (!ended || out != zi.unpack_size) goto linecount_done;
+    } else if (hdrbuf[0] == 0xfd && hdrbuf[1] == 0x37 && hdrbuf[2] == 0x7a &&
         hdrbuf[3] == 0x58 && hdrbuf[4] == 0x5a && hdrbuf[5] == 0x00) {
         /* XZ */
         fd = open(filename, O_RDONLY | O_BINARY);
@@ -3832,7 +4299,7 @@ static unsigned long long linecount_file(const char *filename, int *complete) {
         }
         lzma_end(&xz);
         close(fd);
-    } else if (hdrbuf[0] == 'B' && hdrbuf[1] == 'Z' && hdrbuf[2] == 'h') {
+    } else if (is_bzip2_signature(hdrbuf, (size_t)hdrlen)) {
         /* bzip2 */
         fd = open(filename, O_RDONLY | O_BINARY);
         if (fd < 0) goto linecount_done;
@@ -3963,6 +4430,36 @@ static unsigned long long linecount_file(const char *filename, int *complete) {
         }
         /* bzip2 and zstd in ZIP — less common, skip for now */
         close(fd);
+    } else if (is_lzma_alone_header(hdrbuf, (size_t)hdrlen)) {
+        /* LZMA alone (.lzma).  An error or a short stream leaves the count
+         * incomplete, so it is not cached; the reader is FATAL on both. */
+        lzma_stream xz = LZMA_STREAM_INIT;
+        int ended = 0, inend = 0;
+        fd = open(filename, O_RDONLY | O_BINARY);
+        if (fd < 0) goto linecount_done;
+        LC_FADVISE(fd);
+        if (lzma_alone_decoder(&xz, UINT64_MAX) != LZMA_OK) { close(fd); goto linecount_done; }
+        while (!ended) {
+            if (xz.avail_in == 0 && !inend) {
+                ssize_t n = read(fd, inbuf, LINECOUNT_BUFSZ);
+                if (n < 0) break;
+                if (n == 0) inend = 1;
+                else { xz.next_in = inbuf; xz.avail_in = n; }
+            }
+            xz.next_out = dbuf; xz.avail_out = LINECOUNT_BUFSZ;
+            lzma_ret r = lzma_code(&xz, inend ? LZMA_FINISH : LZMA_RUN);
+            size_t got = LINECOUNT_BUFSZ - xz.avail_out;
+            if (got > 0) lines += count_newlines(dbuf, got);
+            if (r == LZMA_STREAM_END) ended = 1;
+            else if (r != LZMA_OK) break;
+            if ((lines & 0xFFFFF) == 0) {
+                possess(HashWaiting); int done = peek_lock(HashWaiting); release(HashWaiting);
+                if (done) break;
+            }
+        }
+        lzma_end(&xz);
+        close(fd);
+        if (!ended) goto linecount_done;
     } else if (hdrbuf[0] == 0x1f && hdrbuf[1] == 0x8b) {
         /* gzip — use gzread */
         gzFile gz = gzopen(filename, "rb");
@@ -5292,7 +5789,23 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
     J1T(RC, Dohash, x);
     if (RC) rt_sel[rt_nsel++] = x;
   }
-  while (gzgets(gi, line, MAXLINE)) {
+  /* This path reads with gzgets, not through the reader, so it makes its own
+   * check: a hash file in a compressed format other than gzip would otherwise
+   * be parsed as text and load nothing.  The signatures hold no newline, so
+   * the first gzgets line carries them whole; the buffer is zeroed first so
+   * a short first line cannot be completed by stale bytes. */
+  memset(line, 0, 16);
+  if (gzgets(gi, line, MAXLINE)) {
+    const char *how = NULL, *fmt = compressed_signature((unsigned char *)line, 16, &how);
+    if (fmt) {
+      fprintf(stderr, "FATAL: %s:%d hash file %s is %s-compressed. Only gzip hash files "
+              "are decompressed; decompress it first: %s | mdxfind ...\n",
+              __FILE__, __LINE__, filename, fmt, how);
+      exit(1);
+    }
+  } else line[0] = 0;
+  for (int first = 1; first || gzgets(gi, line, MAXLINE); first = 0) {
+    if (first && !line[0] && gzeof(gi)) break;
     cur = strchr(line, 13);
     if (cur) *cur = 0;
     cur = strchr(line, 10);
@@ -17311,7 +17824,8 @@ usage:
             case JOB_PHPBB3: fam |= 1u << FAM_PHPBB3; break;
             case JOB_MD5CRYPT: fam |= 1u << FAM_MD5CRYPT; break;
             case JOB_MD5_MD5SALTMD5PASS: fam |= 1u << FAM_MD5_MD5SALTMD5PASS; break;
-            case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU: fam |= 1u << FAM_SHA1; break;
+            case JOB_SHA1PASSSALT: case JOB_SHA1SALTPASS: case JOB_SHA1DRU:
+            case JOB_SHA1PASSUSERPASSUSER: fam |= 1u << FAM_SHA1; break;
             case JOB_SHA256PASSSALT: case JOB_SHA256SALTPASS: fam |= 1u << FAM_SHA256; break;
             /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS uses sha256_block
              * compression, family is FAM_SHA256 (timing/family bookkeeping). */

@@ -76,6 +76,12 @@
 #error "gpu_metal.m: Intel Mac Metal disabled — Apple MTLCompilerService XPC hang on AMD GCN + macOS Sequoia (confirmed 2026-05-17 rev 1.475 on iMac + nutshack). Edit Makefile to exclude this TU on Intel Mac, or build on Apple Silicon."
 #endif
 
+/* The per-dispatch MTLBuffers here are released by ARC. Built without it,
+ * every one leaks: a user's run reached 267 GB in four minutes. */
+#if !__has_feature(objc_arc)
+#error "gpu_metal.m must be compiled with -fobjc-arc -fno-exceptions -fno-objc-arc-exceptions"
+#endif
+
 #include "gpu_metal.h"
 
 /* Phase D5a 2026-05-16 (Task #281): host-side fatal-error macros for
@@ -3466,6 +3472,28 @@ static struct gpu_metal_family metal_family_sha1passsalt = {
     .pso_for_variant_v2 = metal_pso_for_variant_default,  /* Wave 3 */
 };
 
+/* e1063 SHA1PASSUSERPASSUSER -- sha1passsalt carrier, algo_mode=1 (the
+ * message is pass.user twice; the "salt" is the userid).  Shares the
+ * sha1passsalt PSO set; algo_mode is the runtime discriminator. */
+static void *sha1passsalt_sibling_pso_for_variant_v2(
+    struct gpu_metal_family *fam, uint8_t variant_bits)
+{
+    (void)fam;
+    return metal_pso_for_variant_default(&metal_family_sha1passsalt, variant_bits);
+}
+static struct gpu_metal_family metal_family_sha1passuserpassuser = {
+    .op                 = JOB_SHA1PASSUSERPASSUSER,
+    .name               = "sha1passuserpassuser",
+    .op_category        = GPU_CAT_MASK,
+    .supported_variants = (uint8_t)(
+                            VBIT(V_S)
+                          | VBIT(V_S | V_R)
+                          | VBIT(V_S | V_M)
+                          | VBIT(V_S | V_R | V_M)),
+    .pso_for_variant    = NULL,
+    .pso_for_variant_v2 = sha1passsalt_sibling_pso_for_variant_v2,
+};
+
 static struct gpu_metal_family metal_family_sha1saltpass = {
     .op                 = JOB_SHA1SALTPASS,
     .name               = "sha1saltpass",
@@ -4500,12 +4528,11 @@ static void metal_register_builtin_families(void)
      * Unmigrated families leave both NULL and dispatch falls back through
      * the legacy pso_for_variant slot.
      *
-     * Non-ARC: the dictionary literal is autoreleased; CFBridgingRetain
-     * gives us +1 retain count that we deliberately never release (the
-     * dict lives for process lifetime, just like the metal_families[]
-     * registry itself). This is symmetric to how mtl_lib_template_* are
-     * never released. ARC-on builds (iMac Makefile) treat CFBridgingRetain
-     * the same way. */
+     * This file is compiled with -fobjc-arc. CFBridgingRetain gives the
+     * dictionary a +1 retain count that ARC does not own and that we
+     * deliberately never release (the dict lives for process lifetime,
+     * just like the metal_families[] registry itself). This is symmetric
+     * to how mtl_lib_template_* are never released. */
     metal_family_md5.core_str    = metal_md5_core_str;
     metal_family_md5.base_macros = (void *)CFBridgingRetain(@{
         @"HASH_WORDS":       @4,
@@ -4791,6 +4818,12 @@ static void metal_register_builtin_families(void)
         @"HASH_BLOCK_BYTES": @64,
         @"BASE_ALGO":        @"sha1"
     });
+    metal_family_sha1passuserpassuser.core_str    = metal_sha1passsalt_core_str;
+    metal_family_sha1passuserpassuser.base_macros = (void *)CFBridgingRetain(@{
+        @"HASH_WORDS":       @5,
+        @"HASH_BLOCK_BYTES": @64,
+        @"BASE_ALGO":        @"sha1"
+    });
     metal_family_sha1saltpass.core_str    = metal_sha1saltpass_core_str;
     metal_family_sha1saltpass.base_macros = (void *)CFBridgingRetain(@{
         @"HASH_WORDS":       @5,
@@ -5007,6 +5040,7 @@ static void metal_register_builtin_families(void)
     gpu_metal_register_family(&metal_family_sha1raw);
     gpu_metal_register_family(&metal_family_sha1dru);
     gpu_metal_register_family(&metal_family_sha1passsalt);
+    gpu_metal_register_family(&metal_family_sha1passuserpassuser);  /* e1063 */
     gpu_metal_register_family(&metal_family_sha1saltpass);
     gpu_metal_register_family(&metal_family_sha256);
     gpu_metal_register_family(&metal_family_sha256raw);
@@ -6975,10 +7009,10 @@ uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
             "did caller invoke gpu_metal_set_compact_table + gpu_metal_set_salt "
             "before dispatch on %s?\n",
             __FILE__, __LINE__, dev_idx,
-            (void *)buf_compact_fp, (void *)buf_compact_idx,
-            (void *)buf_hash_data, (void *)buf_hash_data_off,
-            (void *)buf_salt_data, (void *)buf_salt_off,
-            (void *)buf_salt_lens, hostname);
+            (__bridge void *)buf_compact_fp, (__bridge void *)buf_compact_idx,
+            (__bridge void *)buf_hash_data, (__bridge void *)buf_hash_data_off,
+            (__bridge void *)buf_salt_data, (__bridge void *)buf_salt_off,
+            (__bridge void *)buf_salt_lens, hostname);
         exit(1);
     }
 
@@ -8927,6 +8961,7 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                             || op == JOB_MD5PASSSALT
                             || op == JOB_MD5SALTPASS
                             || op == JOB_SHA1PASSSALT
+                            || op == JOB_SHA1PASSUSERPASSUSER  /* e1063: sha1passsalt carrier */
                             || op == JOB_SHA1SALTPASS
                             || op == JOB_SHA256PASSSALT
                             || op == JOB_SHA256SALTPASS
@@ -9421,6 +9456,7 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
         else if (op == JOB_MD5revMD5SALT)           params->algo_mode = 2u;  /* e541 */
         else if (op == JOB_MD5sub8_24SALT)          params->algo_mode = 3u;  /* e542 */
         else if (op == JOB_MD5_MD5SALTMD5PASS)      params->algo_mode = 4u;  /* e367 */
+        else if (op == JOB_SHA1PASSUSERPASSUSER)    params->algo_mode = 1u;  /* e1063 */
         else if (op == JOB_HMAC_MD5_KPASS)          params->algo_mode = 6u;  /* e792 */
         else if (op == JOB_HMAC_SHA1_KPASS)         params->algo_mode = 6u;  /* e793 */
         else if (op == JOB_HMAC_SHA224_KPASS)       params->algo_mode = 6u;  /* e794 */
@@ -10466,7 +10502,7 @@ int gpu_metal_jit_compile_source_with_common_keep(
     fprintf(stderr,
             "hx codegen: Metal JIT (with common, retained) succeeded on "
             "%s dev[%d] entry=%s pso=%p\n",
-            hostname, dev_idx, entry_point_name, (void *)pso);
+            hostname, dev_idx, entry_point_name, (__bridge void *)pso);
 
     /* Bridge-retain the ObjC refs so they survive out of ARC scope. The
      * caller will release via gpu_metal_jit_release_keep -> CFBridgingRelease. */
@@ -10550,10 +10586,10 @@ int gpu_metal_e347_validate_dispatch(
             "did caller invoke gpu_metal_set_compact_table + "
             "gpu_metal_set_salt?\n",
             __FILE__, __LINE__, hostname,
-            (void *)buf_compact_fp, (void *)buf_compact_idx,
-            (void *)buf_hash_data, (void *)buf_hash_data_off,
-            (void *)buf_salt_data, (void *)buf_salt_off,
-            (void *)buf_salt_lens);
+            (__bridge void *)buf_compact_fp, (__bridge void *)buf_compact_idx,
+            (__bridge void *)buf_hash_data, (__bridge void *)buf_hash_data_off,
+            (__bridge void *)buf_salt_data, (__bridge void *)buf_salt_off,
+            (__bridge void *)buf_salt_lens);
         exit(1);
     }
 
@@ -10837,10 +10873,10 @@ int gpu_metal_kernelb_family_validate_dispatch(
             "did caller invoke gpu_metal_set_compact_table + "
             "gpu_metal_set_salt?\n",
             __FILE__, __LINE__, hostname,
-            (void *)buf_compact_fp, (void *)buf_compact_idx,
-            (void *)buf_hash_data, (void *)buf_hash_data_off,
-            (void *)buf_salt_data, (void *)buf_salt_off,
-            (void *)buf_salt_lens);
+            (__bridge void *)buf_compact_fp, (__bridge void *)buf_compact_idx,
+            (__bridge void *)buf_hash_data, (__bridge void *)buf_hash_data_off,
+            (__bridge void *)buf_salt_data, (__bridge void *)buf_salt_off,
+            (__bridge void *)buf_salt_lens);
         exit(1);
     }
 
