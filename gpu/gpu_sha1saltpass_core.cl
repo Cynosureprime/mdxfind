@@ -194,92 +194,37 @@ static inline void template_finalize(template_state *st,
 
         int klen;
         int mlen;
-        /* Step 1: prepare 64-byte key_block. If key > 64 bytes, replace
-         * with SHA1(key) (20 bytes). Else pad to 64 with zeros. */
-        if (algo_mode == 5u) {
-            /* KSALT: key = salt (global). */
-            klen = (int)slen;
-            mlen = len;
-            if (klen > 64) {
-                /* Hash global key into key_block[0..4] (5 BE words bswapped
-                 * to LE for storage in key_block). Slab oracle line 76-90. */
-                uint kstate[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
-                                   0x10325476u, 0xC3D2E1F0u };
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                /* SHA1 = BIG-ENDIAN: byte i shift = (3 - (i & 3)) * 8. */
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
+        /* Step 1: KSALT (mode 5) keys with the salt and hashes the password;
+         * KPASS (mode 6) keys with the password and hashes the salt. A key
+         * longer than the 64-byte block is replaced by H(key) (RFC 2104).
+         * Both the key hash and the message (Step 2) stream any number of
+         * blocks, so no key or candidate length is capped on the device. */
+        klen = (algo_mode == 5u) ? (int)slen : len;
+        mlen = (algo_mode == 5u) ? len : (int)slen;
+        if (klen > 64) {
+            uint kstate[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
+
+                               0x10325476u, 0xC3D2E1F0u };
+
+            uint kM[16];
+            int nb = (klen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) kM[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < klen) ? (uint)((algo_mode == 5u) ? salt_buf[i] : data[i])
+                                 : ((i == klen) ? (uint)0x80u : 0u);
+                    kM[j >> 2] |= v << ((3 - (j & 3)) * 8);
                 }
+                if (b == nb - 1) { kM[14] = 0u; kM[15] = (uint)(klen) * 8u; }
                 sha1_block(&kstate[0], kM);
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                int rem = klen - 64;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                /* 0x80 marker, BE position. */
-                {
-                    int p = (rem > 0) ? rem : 0;
-                    kM[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                /* BE length: M[14]=high, M[15]=low. */
-                kM[14] = 0;
-                kM[15] = (uint)klen * 8u;
-                sha1_block(&kstate[0], kM);
-                /* Store hashed key as LE uint32 words (slab oracle line 90:
-                 * `key_block[i] = bswap32(kstate[i])`). */
-                for (int i = 0; i < 5; i++) key_block[i] = bswap32(kstate[i]);
-                klen = 20;
-            } else {
-                /* Pack key bytes into key_block[0..15] uint LE words.
-                 * Slab oracle line 93-98. */
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
             }
+            for (int i = 0; i < 5; i++) key_block[i] = bswap32(kstate[i]);
+            klen = 20;
         } else {
-            /* Mode 6 KPASS: key = data (private = post-rule password). */
-            klen = len;
-            mlen = (int)slen;
-            if (klen > 64) {
-                uint kstate[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
-                                   0x10325476u, 0xC3D2E1F0u };
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                sha1_block(&kstate[0], kM);
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                int rem = klen - 64;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                {
-                    int p = (rem > 0) ? rem : 0;
-                    kM[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                kM[14] = 0;
-                kM[15] = (uint)klen * 8u;
-                sha1_block(&kstate[0], kM);
-                for (int i = 0; i < 5; i++) key_block[i] = bswap32(kstate[i]);
-                klen = 20;
-            } else {
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)data[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
+            for (int i = 0; i < klen; i++) {
+                uint v = (uint)((algo_mode == 5u) ? salt_buf[i] : data[i]);
+                key_block[i >> 2] |= v << ((i & 3) * 8);
             }
         }
 
@@ -297,82 +242,19 @@ static inline void template_finalize(template_state *st,
                            0x10325476u, 0xC3D2E1F0u };
         sha1_block(&istate[0], hm);
 
-        /* Continue with message bytes + 0x80 + length; total = 64 (ipad)
-         * + mlen. SHA1 BE byte-pack. */
-        if (algo_mode == 5u) {
-            /* msg = data (private). Slab oracle line 113-130. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
+        /* Continue with the message, any length: bytes, 0x80, and the
+         * bit length of (64 + mlen) in the last block. */
+        {
+            int nb = (mlen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) hm[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < mlen) ? (uint)((algo_mode == 5u) ? data[i] : salt_buf[i])
+                                 : ((i == mlen) ? (uint)0x80u : 0u);
+                    hm[j >> 2] |= v << ((3 - (j & 3)) * 8);
                 }
-                hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (mlen < 64)
-                    hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                sha1_block(&istate[0], hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            }
-        } else {
-            /* Mode 6 KPASS: msg = salt_buf (global). Slab oracle line 226-241. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (mlen < 64)
-                    hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                sha1_block(&istate[0], hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
+                if (b == nb - 1) { hm[14] = 0u; hm[15] = (uint)(64 + mlen) * 8u; }
                 sha1_block(&istate[0], hm);
             }
         }
@@ -442,107 +324,39 @@ static inline void template_finalize(template_state *st,
 
         int klen;
         int mlen;
-        /* Step 1: prepare 64-byte key_block. If key > 64 bytes, replace
-         * with SHA224(key) (28 bytes). Else pad to 64 with zeros. */
-        if (algo_mode == 5u) {
-            /* KSALT: key = salt (global). */
-            klen = (int)slen;
-            mlen = len;
-            if (klen > 64) {
-                /* Hash global key into key_block[0..6] (7 BE words bswapped
-                 * to LE for storage in key_block). Slab oracle line 297-
-                 * 312. State is 8 words but only 7 are stored. */
-                uint kstate[8] = { 0xc1059ed8u, 0x367cd507u, 0x3070dd17u,
-                                   0xf70e5939u, 0xffc00b31u, 0x68581511u,
-                                   0x64f98fa7u, 0xbefa4fa4u };
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                /* SHA224 = BIG-ENDIAN: byte i shift = (3 - (i & 3)) * 8. */
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
+        /* Step 1: KSALT (mode 5) keys with the salt and hashes the password;
+         * KPASS (mode 6) keys with the password and hashes the salt. A key
+         * longer than the 64-byte block is replaced by H(key) (RFC 2104).
+         * Both the key hash and the message (Step 2) stream any number of
+         * blocks, so no key or candidate length is capped on the device. */
+        klen = (algo_mode == 5u) ? (int)slen : len;
+        mlen = (algo_mode == 5u) ? len : (int)slen;
+        if (klen > 64) {
+            uint kstate[8] = { 0xc1059ed8u, 0x367cd507u, 0x3070dd17u,
+
+                               0xf70e5939u, 0xffc00b31u, 0x68581511u,
+
+                               0x64f98fa7u, 0xbefa4fa4u };
+
+            uint kM[16];
+            int nb = (klen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) kM[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < klen) ? (uint)((algo_mode == 5u) ? salt_buf[i] : data[i])
+                                 : ((i == klen) ? (uint)0x80u : 0u);
+                    kM[j >> 2] |= v << ((3 - (j & 3)) * 8);
                 }
-                if (klen <= 55) {
-                    kM[klen >> 2] |= ((uint)0x80u) << ((3 - (klen & 3)) * 8);
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                }
+                if (b == nb - 1) { kM[14] = 0u; kM[15] = (uint)(klen) * 8u; }
                 sha1_block(&kstate[0], kM);
-                if (klen > 55) {
-                    for (int i = 0; i < 16; i++) kM[i] = 0;
-                    int rem = klen - 64;
-                    if (rem > 0) {
-                        for (int i = 0; i < rem; i++) {
-                            uint v = (uint)salt_buf[64 + i];
-                            kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                        }
-                    }
-                    {
-                        int p = (rem > 0) ? rem : 0;
-                        kM[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                    }
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                    sha1_block(&kstate[0], kM);
-                }
-                /* Store hashed key as LE uint32 words (slab oracle line
-                 * 311: `key_block[i] = bswap32(kstate[i])`). 7 words. */
-                for (int i = 0; i < 7; i++) key_block[i] = bswap32(kstate[i]);
-                klen = 28;
-            } else {
-                /* Pack key bytes into key_block[0..15] uint LE words.
-                 * Slab oracle line 314-316. */
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
             }
+            for (int i = 0; i < 7; i++) key_block[i] = bswap32(kstate[i]);
+            klen = 28;
         } else {
-            /* Mode 6 KPASS: key = data (private = post-rule password). */
-            klen = len;
-            mlen = (int)slen;
-            if (klen > 64) {
-                uint kstate[8] = { 0xc1059ed8u, 0x367cd507u, 0x3070dd17u,
-                                   0xf70e5939u, 0xffc00b31u, 0x68581511u,
-                                   0x64f98fa7u, 0xbefa4fa4u };
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (klen <= 55) {
-                    kM[klen >> 2] |= ((uint)0x80u) << ((3 - (klen & 3)) * 8);
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                }
-                sha1_block(&kstate[0], kM);
-                if (klen > 55) {
-                    for (int i = 0; i < 16; i++) kM[i] = 0;
-                    int rem = klen - 64;
-                    if (rem > 0) {
-                        for (int i = 0; i < rem; i++) {
-                            uint v = (uint)data[64 + i];
-                            kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                        }
-                    }
-                    {
-                        int p = (rem > 0) ? rem : 0;
-                        kM[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                    }
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                    sha1_block(&kstate[0], kM);
-                }
-                for (int i = 0; i < 7; i++) key_block[i] = bswap32(kstate[i]);
-                klen = 28;
-            } else {
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)data[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
+            for (int i = 0; i < klen; i++) {
+                uint v = (uint)((algo_mode == 5u) ? salt_buf[i] : data[i]);
+                key_block[i >> 2] |= v << ((i & 3) * 8);
             }
         }
 
@@ -561,83 +375,19 @@ static inline void template_finalize(template_state *st,
                            0x64f98fa7u, 0xbefa4fa4u };
         sha1_block(&istate[0], hm);
 
-        /* Continue with message bytes + 0x80 + length; total = 64 (ipad)
-         * + mlen. SHA224 BE byte-pack. */
-        if (algo_mode == 5u) {
-            /* msg = data (private). Slab oracle line 325-341. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
+        /* Continue with the message, any length: bytes, 0x80, and the
+         * bit length of (64 + mlen) in the last block. */
+        {
+            int nb = (mlen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) hm[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < mlen) ? (uint)((algo_mode == 5u) ? data[i] : salt_buf[i])
+                                 : ((i == mlen) ? (uint)0x80u : 0u);
+                    hm[j >> 2] |= v << ((3 - (j & 3)) * 8);
                 }
-                hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (mlen < 64)
-                    hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                sha1_block(&istate[0], hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            }
-        } else {
-            /* Mode 6 KPASS: msg = salt_buf (global). Slab oracle line
-             * 421-437. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (mlen < 64)
-                    hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                sha1_block(&istate[0], hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
+                if (b == nb - 1) { hm[14] = 0u; hm[15] = (uint)(64 + mlen) * 8u; }
                 sha1_block(&istate[0], hm);
             }
         }
@@ -715,107 +465,39 @@ static inline void template_finalize(template_state *st,
 
         int klen;
         int mlen;
-        /* Step 1: prepare 64-byte key_block. If key > 64 bytes, replace
-         * with SHA256(key) (32 bytes). Else pad to 64 with zeros. */
-        if (algo_mode == 5u) {
-            /* KSALT: key = salt (global). */
-            klen = (int)slen;
-            mlen = len;
-            if (klen > 64) {
-                /* Hash global key into key_block[0..7] (8 BE words bswapped
-                 * to LE for storage in key_block). SHA256 IV (FIPS 180-4
-                 * §5.3.3). */
-                uint kstate[8] = { 0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
-                                   0xa54ff53au, 0x510e527fu, 0x9b05688cu,
-                                   0x1f83d9abu, 0x5be0cd19u };
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                /* SHA256 = BIG-ENDIAN: byte i shift = (3 - (i & 3)) * 8. */
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
+        /* Step 1: KSALT (mode 5) keys with the salt and hashes the password;
+         * KPASS (mode 6) keys with the password and hashes the salt. A key
+         * longer than the 64-byte block is replaced by H(key) (RFC 2104).
+         * Both the key hash and the message (Step 2) stream any number of
+         * blocks, so no key or candidate length is capped on the device. */
+        klen = (algo_mode == 5u) ? (int)slen : len;
+        mlen = (algo_mode == 5u) ? len : (int)slen;
+        if (klen > 64) {
+            uint kstate[8] = { 0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
+
+                               0xa54ff53au, 0x510e527fu, 0x9b05688cu,
+
+                               0x1f83d9abu, 0x5be0cd19u };
+
+            uint kM[16];
+            int nb = (klen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) kM[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < klen) ? (uint)((algo_mode == 5u) ? salt_buf[i] : data[i])
+                                 : ((i == klen) ? (uint)0x80u : 0u);
+                    kM[j >> 2] |= v << ((3 - (j & 3)) * 8);
                 }
-                if (klen <= 55) {
-                    kM[klen >> 2] |= ((uint)0x80u) << ((3 - (klen & 3)) * 8);
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                }
+                if (b == nb - 1) { kM[14] = 0u; kM[15] = (uint)(klen) * 8u; }
                 sha1_block(&kstate[0], kM);
-                if (klen > 55) {
-                    for (int i = 0; i < 16; i++) kM[i] = 0;
-                    int rem = klen - 64;
-                    if (rem > 0) {
-                        for (int i = 0; i < rem; i++) {
-                            uint v = (uint)salt_buf[64 + i];
-                            kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                        }
-                    }
-                    {
-                        int p = (rem > 0) ? rem : 0;
-                        kM[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                    }
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                    sha1_block(&kstate[0], kM);
-                }
-                /* Store hashed key as LE uint32 words (slab oracle line
-                 * 71: `key_block[i] = bswap32(kstate[i])`). All 8 words. */
-                for (int i = 0; i < 8; i++) key_block[i] = bswap32(kstate[i]);
-                klen = 32;
-            } else {
-                /* Pack key bytes into key_block[0..15] uint LE words.
-                 * Slab oracle line 75-79. */
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
             }
+            for (int i = 0; i < 8; i++) key_block[i] = bswap32(kstate[i]);
+            klen = 32;
         } else {
-            /* Mode 6 KPASS: key = data (private = post-rule password). */
-            klen = len;
-            mlen = (int)slen;
-            if (klen > 64) {
-                uint kstate[8] = { 0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u,
-                                   0xa54ff53au, 0x510e527fu, 0x9b05688cu,
-                                   0x1f83d9abu, 0x5be0cd19u };
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (klen <= 55) {
-                    kM[klen >> 2] |= ((uint)0x80u) << ((3 - (klen & 3)) * 8);
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                }
-                sha1_block(&kstate[0], kM);
-                if (klen > 55) {
-                    for (int i = 0; i < 16; i++) kM[i] = 0;
-                    int rem = klen - 64;
-                    if (rem > 0) {
-                        for (int i = 0; i < rem; i++) {
-                            uint v = (uint)data[64 + i];
-                            kM[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                        }
-                    }
-                    {
-                        int p = (rem > 0) ? rem : 0;
-                        kM[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                    }
-                    kM[14] = 0;
-                    kM[15] = (uint)klen * 8u;
-                    sha1_block(&kstate[0], kM);
-                }
-                for (int i = 0; i < 8; i++) key_block[i] = bswap32(kstate[i]);
-                klen = 32;
-            } else {
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)data[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
+            for (int i = 0; i < klen; i++) {
+                uint v = (uint)((algo_mode == 5u) ? salt_buf[i] : data[i]);
+                key_block[i >> 2] |= v << ((i & 3) * 8);
             }
         }
 
@@ -834,83 +516,19 @@ static inline void template_finalize(template_state *st,
                            0x1f83d9abu, 0x5be0cd19u };
         sha1_block(&istate[0], hm);
 
-        /* Continue with message bytes + 0x80 + length; total = 64 (ipad)
-         * + mlen. SHA256 BE byte-pack. */
-        if (algo_mode == 5u) {
-            /* msg = data (private). Slab oracle line 95-112. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
+        /* Continue with the message, any length: bytes, 0x80, and the
+         * bit length of (64 + mlen) in the last block. */
+        {
+            int nb = (mlen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) hm[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < mlen) ? (uint)((algo_mode == 5u) ? data[i] : salt_buf[i])
+                                 : ((i == mlen) ? (uint)0x80u : 0u);
+                    hm[j >> 2] |= v << ((3 - (j & 3)) * 8);
                 }
-                hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (mlen < 64)
-                    hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                sha1_block(&istate[0], hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            }
-        } else {
-            /* Mode 6 KPASS: msg = salt_buf (global). Slab oracle line
-             * 213-229. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
-                sha1_block(&istate[0], hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                }
-                if (mlen < 64)
-                    hm[mlen >> 2] |= ((uint)0x80u) << ((3 - (mlen & 3)) * 8);
-                sha1_block(&istate[0], hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        hm[i >> 2] |= v << ((3 - (i & 3)) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= ((uint)0x80u) << ((3 - (p & 3)) * 8);
-                }
-                hm[14] = 0;
-                hm[15] = (uint)(64 + mlen) * 8u;
+                if (b == nb - 1) { hm[14] = 0u; hm[15] = (uint)(64 + mlen) * 8u; }
                 sha1_block(&istate[0], hm);
             }
         }

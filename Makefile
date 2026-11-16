@@ -29,9 +29,9 @@ else ifeq ($(UNAME_M),ppc64le)
 else ifeq ($(UNAME_M),ppc64)
   ARCHOPT = -DPOWERPC
 else ifeq ($(UNAME_M),aarch64)
-  ARCHOPT = -DARM
+  ARCHOPT = -DNOTINTEL=1 -DARM=8
 else ifeq ($(UNAME_M),arm64)
-  ARCHOPT = -DARM
+  ARCHOPT = -DNOTINTEL=1 -DARM=8
 else
   ARCHOPT =
 endif
@@ -249,8 +249,7 @@ gpu_metal.o: gpu_metal.m gpu_metal.h gpujob.h job_types.h gpu/mdxfind_metallib.h
              gpu/metal_template.metal gpu/metal_common.metal \
              $(patsubst gpu/metal_%_core.metal,gpu/metal_%_core_str.h,$(wildcard gpu/metal_*_core.metal)) \
              gpu/metal_common_str.h gpu/metal_template_str.h \
-             gpu/metal_kernel_a_rules_str.h gpu/metal_kernel_a_masks_str.h \
-             gpu/metal_kernel_a_rules_masks_str.h gpu/metal_kernel_a_bruteforce_str.h \
+             gpu/metal_kernel_a_rules_str.h \
              gpu/gpu_codegen_eligible.h \
              codegen/hx_spec.h codegen/hx_walker.h codegen/hx_spec_entry.h hx_vm.h hx_ast.h \
              gpu/gpu_fatal.h gpu/gpu_debug.h
@@ -309,8 +308,7 @@ gpu/gpu_opencl.o: gpu/gpu_opencl.c gpu/gpu_opencl.h gpu/gpu_kernel_cache.h gpujo
                   gpu/gpu_hmac_streebog256_core_str.h gpu/gpu_hmac_streebog512_core_str.h \
                   gpu/gpu_phpbb3_core_str.h gpu/gpu_md5crypt_core_str.h gpu/gpu_shacrypt_core_str.h \
                   gpu/gpu_descrypt_core_str.h gpu/gpu_bcrypt_core_str.h \
-                  gpu/gpu_kernel_a_rules_str.h gpu/gpu_kernel_a_masks_str.h \
-                  gpu/gpu_kernel_a_rules_masks_str.h gpu/gpu_kernel_a_bruteforce_str.h \
+                  gpu/gpu_kernel_a_rules_str.h \
                   gpu/gpu_codegen_eligible.h \
                   codegen/hx_spec.h codegen/hx_walker.h codegen/hx_spec_entry.h hx_vm.h hx_ast.h \
                   gpu/gpu_fatal.h gpu/gpu_debug.h

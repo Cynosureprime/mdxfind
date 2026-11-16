@@ -1616,10 +1616,13 @@ constant uchar MTL_B2S_SIGMA[10][16] = {
  * overloads. Metal requires distinct function signatures per address
  * space (no generic address-space pointers); both overloads use this
  * single body via the textual macro to keep the compression byte-exact
- * with the OpenCL twin. */
+ * with the OpenCL twin.  The chaining state goes through hl[] and an
+ * explicit eight-statement write-back exactly as in the OpenCL twin, where
+ * AMD fglrx 1573.4 miscompiled the read-modify-write loop (2026-11-15). */
 #define MTL_B2S_COMPRESS_BODY(_HPTR, _BLOCK) \
-    uint v[16], m[16]; \
-    for (int i = 0; i < 8; i++) { v[i] = (_HPTR)[i]; v[i+8] = MTL_B2S_IV[i]; } \
+    uint v[16], m[16], hl[8]; \
+    for (int i = 0; i < 8; i++) hl[i] = (_HPTR)[i]; \
+    for (int i = 0; i < 8; i++) { v[i] = hl[i]; v[i+8] = MTL_B2S_IV[i]; } \
     v[12] ^= (uint)counter; \
     v[13] ^= (uint)(counter >> 32); \
     if (last) v[14] = ~v[14]; \
@@ -1645,7 +1648,10 @@ constant uchar MTL_B2S_SIGMA[10][16] = {
         v[3]+=v[4]+m[s[14]]; v[14]=rotl32(v[14]^v[3],(uint)16); v[9]+=v[14]; v[4]=rotl32(v[4]^v[9],(uint)20); \
         v[3]+=v[4]+m[s[15]]; v[14]=rotl32(v[14]^v[3],(uint)24); v[9]+=v[14]; v[4]=rotl32(v[4]^v[9],(uint)25); \
     } \
-    for (int i = 0; i < 8; i++) (_HPTR)[i] ^= v[i] ^ v[i+8];
+    (_HPTR)[0] = hl[0] ^ v[0] ^ v[8];  (_HPTR)[1] = hl[1] ^ v[1] ^ v[9]; \
+    (_HPTR)[2] = hl[2] ^ v[2] ^ v[10]; (_HPTR)[3] = hl[3] ^ v[3] ^ v[11]; \
+    (_HPTR)[4] = hl[4] ^ v[4] ^ v[12]; (_HPTR)[5] = hl[5] ^ v[5] ^ v[13]; \
+    (_HPTR)[6] = hl[6] ^ v[6] ^ v[14]; (_HPTR)[7] = hl[7] ^ v[7] ^ v[15];
 
 /* Thread-address-space block overload. Used by template_iterate (which
  * builds the next-iter input in a thread-local buf[64]). */
@@ -1719,7 +1725,7 @@ constant uchar MTL_B2B_SIGMA[12][16] = {
 /* b2b_compress macro body shared between thread and device address-space
  * overloads (same rationale as MTL_B2S_COMPRESS_BODY above). */
 #define MTL_B2B_COMPRESS_BODY(_HPTR, _BLOCK) \
-    ulong v[16], m[16]; \
+    ulong v[16], m[16], hl[8]; \
     for (int i = 0; i < 16; i++) { \
         int b = i * 8; \
         m[i] = ((ulong)(_BLOCK)[b]) \
@@ -1731,7 +1737,8 @@ constant uchar MTL_B2B_SIGMA[12][16] = {
              | ((ulong)(_BLOCK)[b + 6] << 48) \
              | ((ulong)(_BLOCK)[b + 7] << 56); \
     } \
-    for (int i = 0; i < 8; i++) { v[i] = (_HPTR)[i]; v[i + 8] = MTL_B2B_IV[i]; } \
+    for (int i = 0; i < 8; i++) hl[i] = (_HPTR)[i]; \
+    for (int i = 0; i < 8; i++) { v[i] = hl[i]; v[i + 8] = MTL_B2B_IV[i]; } \
     v[12] ^= t0; \
     v[13] ^= t1; \
     if (last) v[14] = ~v[14]; \
@@ -1746,7 +1753,10 @@ constant uchar MTL_B2B_SIGMA[12][16] = {
         MTL_B2B_G(v[ 2], v[ 7], v[ 8], v[13], m[s[12]], m[s[13]]); \
         MTL_B2B_G(v[ 3], v[ 4], v[ 9], v[14], m[s[14]], m[s[15]]); \
     } \
-    for (int i = 0; i < 8; i++) (_HPTR)[i] ^= v[i] ^ v[i + 8];
+    (_HPTR)[0] = hl[0] ^ v[0] ^ v[8];  (_HPTR)[1] = hl[1] ^ v[1] ^ v[9]; \
+    (_HPTR)[2] = hl[2] ^ v[2] ^ v[10]; (_HPTR)[3] = hl[3] ^ v[3] ^ v[11]; \
+    (_HPTR)[4] = hl[4] ^ v[4] ^ v[12]; (_HPTR)[5] = hl[5] ^ v[5] ^ v[13]; \
+    (_HPTR)[6] = hl[6] ^ v[6] ^ v[14]; (_HPTR)[7] = hl[7] ^ v[7] ^ v[15];
 
 /* Thread-block overload. Used by template_iterate (next-iter input in
  * thread-local buf[128]). */

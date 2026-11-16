@@ -140,6 +140,41 @@ static inline void md5crypt_oneshot(thread const uchar *buf, int buflen, thread 
     }
 }
 
+/* Streaming MD5, fed one byte at a time, for passwords too long for the
+ * staged path (plen > 39).  A block is compressed as soon as it fills, so
+ * nothing caps the message length.  h[4] chain, m[16] the block being
+ * filled (kept zero beyond the bytes written), n[0] bytes fed so far. */
+static inline void md5s_init(thread uint *h, thread uint *m, thread uint *n)
+{
+    h[0] = 0x67452301u; h[1] = 0xEFCDAB89u;
+    h[2] = 0x98BADCFEu; h[3] = 0x10325476u;
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    n[0] = 0;
+}
+
+static inline void md5s_byte(thread uint *h, thread uint *m, thread uint *n, uint b)
+{
+    uint p = n[0] & 63u;
+    m[p >> 2] |= (b & 0xffu) << ((p & 3u) * 8u);
+    n[0] += 1u;
+    if ((n[0] & 63u) == 0u) {
+        md5_block(h[0], h[1], h[2], h[3], m);
+        for (int i = 0; i < 16; i++) m[i] = 0;
+    }
+}
+
+static inline void md5s_final(thread uint *h, thread uint *m, thread uint *n)
+{
+    uint bits = n[0] * 8u;
+    md5s_byte(h, m, n, 0x80u);
+    if ((n[0] & 63u) > 56u) {
+        md5_block(h[0], h[1], h[2], h[3], m);
+        for (int i = 0; i < 16; i++) m[i] = 0;
+    }
+    m[14] = bits;
+    md5_block(h[0], h[1], h[2], h[3], m);
+}
+
 /* template_finalize: full MD5CRYPT chain (3 steps + 1000-iter loop).
  *
  * Step 1: digest_b = MD5(pass || raw_salt || pass)
@@ -152,10 +187,9 @@ static inline void md5crypt_oneshot(thread const uchar *buf, int buflen, thread 
  * Final state in st->h[0..3] (4 LE uint32 = 16 binary bytes), probed
  * by template_digest_compare.
  *
- * Password length cap: matches CPU's handling -- typical mdxfind
- * passwords are <= 39 bytes by default (see gpu_maxlen_val derivation).
- * Defensive cap below clamps plen to 39 so the working buffer never
- * exceeds the md5crypt_oneshot 191-byte cap.
+ * Password length: none.  Up to 39 bytes the messages are staged in buf[192]
+ * (md5crypt_oneshot's 191-byte cap); longer passwords stream through
+ * md5s_* instead, as the CPU arm hashes any length.
  *
  * algo_mode: MD5CRYPT has only one mode. The arg is unused; kept for
  * interface symmetry with the salted-template signature. */
@@ -168,10 +202,9 @@ static inline void template_finalize(thread template_state &st,
 {
     (void)algo_mode;
 
-    /* Defensive: clamp plen at 39 (mdxfind default max) so buffer
-     * lengths stay within md5crypt_oneshot's 191-byte cap. */
+    /* plen > 39 takes the streaming path below, so the staged path never
+     * exceeds md5crypt_oneshot's 191-byte cap. */
     int plen = len;
-    if (plen > 39) plen = 39;
 
     /* Extract raw salt: salt_bytes points at "$1$<salt>$"; raw salt
      * starts at byte 3, ends at next '$' or salt_len. Cap at 8.
@@ -187,6 +220,48 @@ static inline void template_finalize(thread template_state &st,
         }
     }
     if (saltlen > 8) saltlen = 8;
+
+    /* Passwords longer than 39 bytes do not fit the staged buffers below
+     * (buf[192], md5crypt_oneshot's 191-byte cap), so they stream every
+     * message through md5s_*, reading the password where it lies.  Same
+     * three steps, same byte order as the CPU arm; no length cap. */
+    if (plen > 39) {
+        uint h[4], m[16], n[1];
+        uchar db[16];
+        md5s_init(h, m, n);
+        for (int i = 0; i < plen; i++)    md5s_byte(h, m, n, data[i]);
+        for (int i = 0; i < saltlen; i++) md5s_byte(h, m, n, salt_bytes[3 + i]);
+        for (int i = 0; i < plen; i++)    md5s_byte(h, m, n, data[i]);
+        md5s_final(h, m, n);
+        for (int i = 0; i < 16; i++) db[i] = (uchar)(h[i >> 2] >> ((i & 3) * 8));
+
+        md5s_init(h, m, n);
+        for (int i = 0; i < plen; i++)    md5s_byte(h, m, n, data[i]);
+        md5s_byte(h, m, n, '$'); md5s_byte(h, m, n, '1'); md5s_byte(h, m, n, '$');
+        for (int i = 0; i < saltlen; i++) md5s_byte(h, m, n, salt_bytes[3 + i]);
+        for (int x = plen; x > 0; x -= 16) {
+            int c = (x > 16) ? 16 : x;
+            for (int i = 0; i < c; i++)   md5s_byte(h, m, n, db[i]);
+        }
+        for (int x = plen; x != 0; x >>= 1)
+            md5s_byte(h, m, n, (x & 1) ? 0u : (uint)data[0]);
+        md5s_final(h, m, n);
+        for (int i = 0; i < 16; i++) db[i] = (uchar)(h[i >> 2] >> ((i & 3) * 8));
+
+        for (int x = 0; x < 1000; x++) {
+            md5s_init(h, m, n);
+            if (x & 1) { for (int i = 0; i < plen; i++) md5s_byte(h, m, n, data[i]); }
+            else       { for (int i = 0; i < 16; i++)   md5s_byte(h, m, n, db[i]); }
+            if (x % 3) { for (int i = 0; i < saltlen; i++) md5s_byte(h, m, n, salt_bytes[3 + i]); }
+            if (x % 7) { for (int i = 0; i < plen; i++) md5s_byte(h, m, n, data[i]); }
+            if (x & 1) { for (int i = 0; i < 16; i++)   md5s_byte(h, m, n, db[i]); }
+            else       { for (int i = 0; i < plen; i++) md5s_byte(h, m, n, data[i]); }
+            md5s_final(h, m, n);
+            for (int i = 0; i < 16; i++) db[i] = (uchar)(h[i >> 2] >> ((i & 3) * 8));
+        }
+        st.h[0] = h[0]; st.h[1] = h[1]; st.h[2] = h[2]; st.h[3] = h[3];
+        return;
+    }
 
     /* Working buffer: max input 125 bytes (step 3 iter worst case);
      * round to 192 to leave headroom for the md5crypt_oneshot cap. */

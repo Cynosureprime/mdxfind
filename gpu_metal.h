@@ -190,7 +190,6 @@ int gpu_metal_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
  * dispatch time based on (use_rules, use_mask, use_salt). Returns
  * 0 on success, -1 on failure. Idempotent. */
 int gpu_metal_template_pso_lazy_md5_salt(void);
-int gpu_metal_template_pso_lazy_md5_salt_rules(void);
 int gpu_metal_template_pso_lazy_md5_salt_mask(void);
 int gpu_metal_template_pso_lazy_md5_salt_rules_mask(void);
 
@@ -480,94 +479,6 @@ int gpu_metal_op_variant_admitted(int op, uint8_t variant_bits_mask);
  * Returns 0 before gpu_metal_compile_families has been called. */
 int gpu_metal_admitted_family_count(void);
 
-/* Phase 1a sub-phase 1a.1b (2026-05-20): Metal twin of
- * gpu_opencl_kernel_a_proto_enabled() declared in gpu/gpu_opencl.h.
- *
- * Phase 0 of 1a.1b ships this as a STUB returning 0 so mdxfind.c (which
- * calls this symbol from BOTH backend-shared chokepoint admit and
- * need_gpu override sites at lines 11448-11450 and 38075-38081
- * respectively) links cleanly on Metal builds. Without the stub the
- * Metal build on dev1.local fails with "undefined reference to
- * gpu_opencl_kernel_a_proto_enabled" — the unconditional call landed
- * in mdxfind.c rev 1.488 (2026-05-19) under the assumption that the
- * symbol was backend-shared; it is OpenCL-only.
- *
- * Phase 2 of 1a.1b replaces the stub with the real variant validator
- * (port of gpu/gpu_opencl.c:9847-9880): reads MDXFIND_KERNEL_A_PROTO +
- * MDXFIND_KERNEL_A_VARIANT, caches the decision, emits a one-time
- * stderr advisory on first call. */
-int gpu_metal_kernel_a_proto_enabled(void);
-
-/* Phase 1a sub-phase 1a.1b-continued (2026-05-20): Metal twin of
- * gpu_opencl_kernelb_dispatch_proto (declared in gpu/gpu_opencl.h).
- *
- * A1-only sub-phase ship: dispatches kernel A1 (cand_rules_phase0) to
- * produce candidate plaintexts for the harness trace channel. Kernel B
- * is NOT wired here (separate follow-on sub-phase). Returns a non-NULL
- * pointer on dispatch fire, NULL when env-gate unset / not-ready.
- * *nhits_out is always 0 in this sub-phase (no hit-replay surface).
- *
- * Gated on gpu_metal_kernel_a_proto_enabled() and op == JOB_MD5MD5SALT,
- * matching the OpenCL twin.  The MDXFIND_KERNEL_B_PROTO half of the old
- * union was removed 2026-09-16. */
-uint32_t *gpu_metal_kernelA_dispatch_proto(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
-
-/* Phase 1a sub-phase 1a.2 (2026-05-21): sibling of _proto_enabled per
- * D9.4.a. Returns numeric variant int (1/2/3/4) when proto enabled, 0
- * otherwise. Mirrors gpu_opencl_kernel_a_active_variant. */
-int gpu_metal_kernel_a_active_variant(void);
-
-/* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only) top-level
- * dispatch entry. Metal twin of gpu_opencl_kernel_a_masks_dispatch.
- * Returns non-NULL on dispatch fire, NULL when variant != 2, no active
- * mask, build/upload fails, or device not ready. *nhits_out is always
- * 0 in this v1 ship (harness mode via MDXFIND_KERNEL_A_TRACE; no
- * kernel B wired for A2 yet). */
-uint32_t *gpu_metal_kernelA_masks_dispatch(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
-
-/* Phase 1a sub-phase 1a.3 (2026-05-21): A3 (rules + masks) top-level
- * dispatch entry. Metal twin of gpu_opencl_kernel_a_rules_masks_dispatch.
- * Compositional product of A1+A2 (cand_rules_masks_phase0 PSO, 10-arg
- * signature). Returns non-NULL on dispatch fire, NULL when variant != 3,
- * no active rules, no active mask, build/upload fails, or device not
- * ready. *nhits_out is always 0 in this v1 ship (harness mode; no
- * kernel B wired for A3 yet). */
-uint32_t *gpu_metal_kernelA_rules_masks_dispatch(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
-
-/* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force) top-level
- * dispatch entry. Metal twin of gpu_opencl_kernel_a_bruteforce_dispatch.
- * Pure BF; no rule axis, no prepend mask axis (BF invariant
- * MaskPrependLen == 0 enforced). Routes to cand_bruteforce_phase0 (8-arg
- * PSO byte-identical to A2 signature; mask_pattern_prepend slot bound to
- * the zeroed mtl_buf_kern_a_mask_prepend buffer).
- *
- * Signature differs from A1/A2/A3: takes struct jobg *g directly (no
- * packed_words / word_offset / num_words args). Reads g->bf_chunk,
- * g->bf_mask_start, g->bf_offset_per_word, g->bf_num_masks,
- * g->packed_count + global MaskAppendLen + MaskAppendPattern +
- * MaskClasses[]. Reuses the 4 mask buffers already uploaded by A2/A3
- * (D11.2.a); zero new persistent buffers.
- *
- * Single-shot per dispatch (host pre-sized chunk via adaptive_bf_chunk_-
- * size servo). Host caps max_packed at 256 MB and FATAL-exits on
- * overflow.
- *
- * v1 ship is harness-mode: returns non-NULL on dispatch fire, NULL when
- * variant != 4, no active append mask, build/upload fails, or device
- * not ready. *nhits_out is always 0 (no kernel B wired). */
-struct jobg;
-uint32_t *gpu_metal_kernelA_bruteforce_dispatch(int dev_idx,
-    struct jobg *g, int *nhits_out);
-
 /* hx codegen sub-phase 2a.4 (2026-05-21): Metal twin of
  * gpu_opencl_jit_compile_source_with_common. Concatenate metal_common_str
  * + caller-provided emitted Metal source and JIT-compile via
@@ -653,69 +564,9 @@ int gpu_metal_hx_codegen_enabled(void);
  * per (op, iter, rules, mask, bf, backend_kind). Developer FORCE
  * override: MDXFIND_GPU_BACKEND={auto|legacy|codegen}. */
 
-/* Knob G (Metal twin, 2026-05-29): env-flag gate that activates the
- * coalesced uint4 (16-byte) candidate write path in Metal kernel A1
- * (cand_rules_phase0). Returns 1 when MDXFIND_METAL_EXPERIMENT_KNOBG_-
- * VEC_WRITE=1 is set; 0 otherwise. Decision cached.
- *
- * Unlike the OpenCL twin (which composes with the parent codegen
- * experiment flag), the Metal flag stands alone: Metal kernel A1 is
- * the production path for e347 + the 7 Phase-5a MAKE_MD5PASS family
- * algos (e122/e159/e161/e163/e165/e167/e169). Unset = byte-identical
- * to production-baseline Metal kernel (Phase 4a.2b, 2026-05-22).
- *
- * Consumed by metal_load_library_kernel_a_rules to thread
- * -DKNOBG_VEC_WRITE=1 into MTLCompileOptions.preprocessorMacros at
- * JIT library compile time. Spec: project_metal_knob_g_spec_2026-05-
- * 29.md. */
-int gpu_metal_experiment_knobg_vec_write_enabled(void);
-
-/* Phase 0 timing harness (Knob G spec D3, 2026-05-29; D2.b refactored
- * 2026-05-29 to auto-enable on MDXFIND_METAL_PROFILE_VARIANT): env-flag
- * gate that enables per-dispatch kernel-A wall time recording via the
- * MTLCommandBuffer's GPUStartTime/GPUEndTime, plus a shutdown-time
- * aggregate dump. Returns 1 when EITHER MDXFIND_METAL_KERNEL_A_TIMING=1
- * OR MDXFIND_METAL_PROFILE_VARIANT in 1..6 is set; 0 otherwise.
- * Decision cached. Used for end-to-end + kernel-A A/B measurement when
- * toggling Knob G on/off AND for PROFILE_VARIANT V0..V6 decomposition. */
+/* Phase 0 kernel-A timing harness gate (Knob G spec D3, 2026-05-29).
+ * Always 0 since its env var went (2026-09-16). */
 int gpu_metal_kernel_a_timing_enabled(void);
-
-/* PROFILE_VARIANT-for-Metal perf-decomposition env-flag gate (2026-05-29):
- * returns 0..6 if MDXFIND_METAL_PROFILE_VARIANT is set to "0".."6";
- * returns 0 (production-baseline V0) otherwise. Variants 1..5 are
- * throwaway timing stubs (no valid candidates); V6 produces valid
- * candidates with Metal Knob G FORCED ON (bit-equivalent to V0 +
- * KNOBG_VEC_WRITE=1). Consumed by metal_load_library_kernel_a_rules to
- * thread -DPROFILE_VARIANT=N into MTLCompileOptions.preprocessorMacros
- * at JIT library compile time; cache forks automatically per variant
- * (Apple MTLLibrary self-cache is keyed on source + macros).
- * Spec: project_metal_profile_variant_spec_2026-05-29.md. */
-int gpu_metal_profile_variant(void);
-
-/* gpu_metal_kernel_a4_profile_variant -- PROFILE_VARIANT-for-A4 env-flag
- * gate (Metal twin, 2026-05-30). Returns 1..5 when MDXFIND_METAL_KERNEL_-
- * A4_PROFILE_VARIANT is set to a valid value AND the active kernel-A
- * variant is 4 (host gate R5); returns 0 otherwise (legacy byte-identical
- * baseline V0 = production unchanged).
- *
- * Variant meanings (also documented in gpu/metal_kernel_a_bruteforce.metal
- * file-top A4_PROFILE_VARIANT block):
- *   V0 (unset / 0)  baseline -- full cand_bruteforce_phase0 (uint4 stores
- *                    by default post-2026-05-30 A4 C5 default-on refactor;
- *                    the env-gated KNOBG path + V6 cell were removed
- *                    because the A/B measurement was decisive)
- *   V1               no atomic claim (per-lane gid*256 strided; CONFOUNDED
- *                    on AGX per spec §9 R1)
- *   V2               no candidate write (atomic still runs)
- *   V3               stub charset walk -- EXPECTED A4 DOMINANT
- *   V4               decode-only (return after absolute_mask_idx ladder)
- *   V5               empty kernel (return immediately)
- *
- * Per spec §4 D1.a: separate per-engine env var (cross-engine pollution
- * avoidance). Apple MTLLibrary self-cache is keyed on source + macros
- * so JIT cache disambiguation per variant is automatic.
- * Spec: project_kernel_a_a4_profile_variant_spec_2026-05-30.md. */
-int gpu_metal_kernel_a4_profile_variant(void);
 
 /* Phase 4 sub-phase 4a.2 (2026-05-21): lazy-init helper that returns the
  * cached MTLComputePipelineState for the hx-codegen-emitted Metal kernel
@@ -741,7 +592,7 @@ void *gpu_metal_kernelb_codegen_pso(int dev_idx);
 /* Sub-phase 5a.3 (2026-05-22): per-JOB parameterized variant of
  * gpu_metal_kernelb_codegen_pso. Mirror of OpenCL twin
  * gpu_opencl_kernelb_codegen_kernel_for. Lazy-init on miss, linear scan
- * over the 16-slot module-local mtl_codegen_slots[] cache; FATAL on cap
+ * over the 64-slot module-local mtl_codegen_slots[] cache; FATAL on cap
  * exhaustion. job_enum selects the kernel + entry point:
  *   JOB_MD5MD5SALT  -> kernelb_hx_e347_phase0 (e347 hand-tuned chain)
  *   JOB_*MD5PASS    -> kernelb_hx_codegen_phase0 (family emit; SHA1 in
@@ -803,7 +654,10 @@ int gpu_metal_kernelb_family_validate_dispatch(
 uint32_t *gpu_metal_kernelb_dispatch_proto(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
+    int op, uint64_t mask_start, uint32_t mask_count, int *nhits_out);
+/* mask_start/mask_count: the job's slice of the -n/-N mask (jobg
+ * bf_mask_start/bf_num_masks); count 0 = the whole mask.  Read only by the
+ * MAKE_MD5PASS family kernel (checklist 70). */
 
 /* Metal twin of gpu_opencl_kernelb_proto_plaintext (gpu/gpu_opencl.c:14483).
  * Recover the post-rule candidate plaintext for a hit emitted by the Metal

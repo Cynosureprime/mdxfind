@@ -146,6 +146,41 @@ static inline void template_transform(template_state *st,
     md5_block(&st->h[0], &st->h[1], &st->h[2], &st->h[3], M);
 }
 
+/* Streaming MD5, fed one byte at a time, for passwords too long for the
+ * staged path (plen > 39; see template_finalize).  A block is compressed as soon as it fills, so
+ * nothing caps the message length.  h[4] chain, m[16] the block being
+ * filled (kept zero beyond the bytes written), n[0] bytes fed so far. */
+static inline void md5s_init(uint *h, uint *m, uint *n)
+{
+    h[0] = 0x67452301u; h[1] = 0xEFCDAB89u;
+    h[2] = 0x98BADCFEu; h[3] = 0x10325476u;
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    n[0] = 0;
+}
+
+static inline void md5s_byte(uint *h, uint *m, uint *n, uint b)
+{
+    uint p = n[0] & 63u;
+    m[p >> 2] |= (b & 0xffu) << ((p & 3u) * 8u);
+    n[0] += 1u;
+    if ((n[0] & 63u) == 0u) {
+        md5_block(&h[0], &h[1], &h[2], &h[3], m);
+        for (int i = 0; i < 16; i++) m[i] = 0;
+    }
+}
+
+static inline void md5s_final(uint *h, uint *m, uint *n)
+{
+    uint bits = n[0] * 8u;
+    md5s_byte(h, m, n, 0x80u);
+    if ((n[0] & 63u) > 56u) {
+        md5_block(&h[0], &h[1], &h[2], &h[3], m);
+        for (int i = 0; i < 16; i++) m[i] = 0;
+    }
+    m[14] = bits;
+    md5_block(&h[0], &h[1], &h[2], &h[3], m);
+}
+
 /* template_finalize: full PHPBB3 chain.
  *
  * Step 1: state = MD5(salt8 || pass)
@@ -158,12 +193,10 @@ static inline void template_transform(template_state *st,
  *   - M[4..] receive pass + 0x80 padding + length, computed ONCE outside
  *     the loop (pass + length doesn't change across iterations).
  *
- * Password length cap: matches the slab kernel's "pass max 39 bytes"
- * comment (gpu_phpbb3.cl:6). With plen <= 39, total = 16 + 39 = 55 bytes
- * fits in a single MD5 block (55 + 1 padding + 8 length = 64). The
- * chokepoint admit at mdxfind.c gates job->clen <= 39 so this path
- * is only entered for valid passwords. Defensive cap below clamps to
- * 39 on entry.
+ * Password length: none.  With plen <= 39, total = 16 + 39 = 55 bytes
+ * fits in a single MD5 block (55 + 1 padding + 8 length = 64), which the
+ * fast loop below relies on.  Rule outputs reach any length, so a longer
+ * password streams through md5s_* (multi-block) rather than being cut.
  *
  * algo_mode: PHPBB3 has only one mode. The arg is unused; kept for
  * interface symmetry with the salted-template signature. */
@@ -180,12 +213,11 @@ static inline void template_finalize(template_state *st,
     (void)algo_mode;
     (void)salt_len;
 
-    /* Defensive: PHPBB3 caps password length at 39 bytes (CPU at
-     * mdxfind.c:13450 gates job->clen <= 39 before GPU dispatch).
-     * Clamp here too so a malformed call doesn't produce out-of-bounds
-     * writes to M[]. */
+    /* Up to 39 bytes, 16 + plen + 9 fits one MD5 block and the fast
+     * single-block loop below applies.  A longer password (a rule output
+     * can be any length) streams through md5s_* instead -- the CPU arm has
+     * no length cap, so neither may this. */
     int plen = len;
-    if (plen > 39) plen = 39;
 
     /* Decode iter count from salt_bytes[3] via phpitoa64 reverse lookup.
      * Mirrors slab kernel gpu_phpbb3.cl lines 31-34 byte-for-byte. */
@@ -195,6 +227,24 @@ static inline void template_finalize(template_state *st,
         if (phpbb3_phpitoa64[k] == ic) { log2count = k; break; }
     }
     uint count = 1u << log2count;
+
+    if (plen > 39) {
+        uint h[4], m[16], n[1];
+        md5s_init(h, m, n);
+        for (int i = 0; i < 8; i++)    md5s_byte(h, m, n, salt_bytes[4 + i]);
+        for (int i = 0; i < plen; i++) md5s_byte(h, m, n, data[i]);
+        md5s_final(h, m, n);
+        for (uint ic2 = 0; ic2 < count; ic2++) {
+            uint d0 = h[0], d1 = h[1], d2 = h[2], d3 = h[3];
+            md5s_init(h, m, n);
+            m[0] = d0; m[1] = d1; m[2] = d2; m[3] = d3;
+            n[0] = 16u;
+            for (int i = 0; i < plen; i++) md5s_byte(h, m, n, data[i]);
+            md5s_final(h, m, n);
+        }
+        st->h[0] = h[0]; st->h[1] = h[1]; st->h[2] = h[2]; st->h[3] = h[3];
+        return;
+    }
 
     /* Step 1: MD5(salt[4..11] || pass) -- single MD5 block (8 + 39 + 1
      * padding + 8 length = 56 max, well under 64).

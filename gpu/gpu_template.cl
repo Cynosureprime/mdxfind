@@ -459,9 +459,21 @@ void template_phase0(
      * back to Phase 1.7's single-pass shape. Host-side machinery
      * (params.inner_iter, adaptive_bf_chunk_size servo, jobg bf_inner_iter)
      * is left as dead-but-harmless; cleanup can happen separately. */
+    /* -a: the local axis is dot * C + position, C = the job's mask count
+     * (params.mask_base0, 0 when no dot radix was applied).  Dividing by the
+     * FULL position product instead (checklist 74) was right only when the
+     * job was the whole mask: a chunk of 1/k swept 2^N/k dottings and wrapped
+     * its positions over the whole mask. */
+    uint dot_base = (uint)params.mask_base0;
+    uint dot_idx  = 0u;
+    uint mask_pos_local = mask_idx_local;
+    if (dot_base != 0u) {
+        dot_idx        = mask_idx_local / dot_base;
+        mask_pos_local = mask_idx_local - dot_idx * dot_base;
+    }
     ulong mask_idx_abs_base = params.mask_start
                        + (ulong)word_idx * (ulong)params.mask_offset_per_word
-                       + (ulong)mask_idx_local;
+                       + (ulong)mask_pos_local;
     uint gid_wrr  = gid_wr / n_words;
     uint rule_idx = gid_wrr % n_rules;
 #ifdef GPU_TEMPLATE_HAS_SALT
@@ -638,16 +650,14 @@ void template_phase0(
     }
 
     /* -a dot axis (plan sections 5 and 15).  The dot sweep is the OUTERMOST
-     * digit of the mask axis, which is what lets it ride that axis with no new
-     * params field, no new flag and no width crossing to the device: divide the
-     * LOCAL mask index by the product of the prepend/append position sizes and
-     * what remains IS the dot bitmask.  The peel below is untouched -- it
-     * already discards digits above the position product.
+     * digit of the mask axis: the LOCAL mask index divided by the job's mask
+     * count C (params.mask_base0) IS the dot bitmask, and the remainder is the
+     * position index the peel below decodes (dot_idx / mask_pos_local, split
+     * where the index is derived).
      *
-     * SELF-GATING.  When the host has not multiplied a dot radix into the mask
-     * axis, mask_size equals mask_combos, dot_bits is 0, popcount is 0 and the
-     * loop below inserts nothing -- so a run without -a is bit-identical and
-     * needs no test.
+     * SELF-GATING.  When the host has not multiplied a dot radix in, it sends
+     * C = 0, dot_idx stays 0 and the loop below inserts nothing -- so a run
+     * without -a is bit-identical.
      *
      * Bit x inserts a dot AFTER character x, matching the CPU (mdxfind.c).
      * Inserted IN PLACE, walking backwards: reads come from low indices and
@@ -658,51 +668,11 @@ void template_phase0(
      * only after the mask block, so the dots land inside the local exactly as
      * the -E split requires. */
     {
-        uint _dnpre = params.n_prepend, _dnapp = params.n_append;
-        if (_dnpre > 32u) _dnpre = 32u;
-        if (_dnapp > 32u) _dnapp = 32u;
-        ulong _mcombos = 1UL;
-        for (uint _i = 0u; _i < _dnpre + _dnapp; _i++) {
-            uint _ps = mask_sizes[_i];
-            if (_ps == 0u) _ps = 1u;
-            _mcombos *= (ulong)_ps;
-        }
-        /* The dot digit comes from the LOCAL mask coordinate, not from the
-         * absolute index, and nothing here mutates the absolute index.
-         *
-         * This was wrong in the first cut and it broke EVERY GPU mask run --
-         * `-n` and `-N`, with and without rules -- while leaving rules-only
-         * correct, so the suite that was run did not see it.  Measured on fpga:
-         * 200 of 200 known answers before, 0 after, CPU unaffected, and 200
-         * again with this block disabled.
-         *
-         * Two mistakes, one line each.  `mask_idx_abs_base` is
-         * `mask_start + word_idx * mask_offset_per_word + mask_idx_local`, so
-         * for a chunked or fanned-out mask run it carries a base that belongs
-         * to the POSITION digits; dividing it by the position product mixed
-         * that base into the dot bitmask and dotted candidates that should
-         * have had no dots.  And `%=` mutated the value the peel below reads,
-         * which the peel never needed -- it consumes exactly npre+napp digits
-         * by divmod and discards everything above them on its own.
-         *
-         * The host multiplies the dot radix into `mask_size`, which is the
-         * size of the LOCAL axis (`mask_idx_local = gid % mask_size`).  So the
-         * local coordinate decomposes as `dot * mask_combos + position_index`,
-         * and the dot digit is exactly `mask_idx_local / mask_combos`.
-         *
-         * SELF-GATING, now provably: with no dot radix, mask_size equals
-         * mask_combos, so mask_idx_local < mask_combos and the quotient is 0
-         * for every lane.  A run without -a is bit-identical and the peel sees
-         * precisely the value it saw before this block existed. */
-        /* NO guard on _mcombos.  It is an empty product of 1 when there are no
-         * mask positions, which is exactly the -a-with-no--n case, so a
-         * `_mcombos > 1` test zeroed the dot digit for the only configuration
-         * that needs it -- the second time this block has been wrong by
-         * over-guarding.  _mcombos starts at 1 and is only ever multiplied by
-         * values forced to >= 1, so it can never be 0 and the divide is safe.
-         * With no dot radix, mask_size == _mcombos and mask_idx_local is below
-         * it, so the quotient is 0 and the block stays inert. */
-        ulong _dot = (ulong)mask_idx_local / _mcombos;
+        /* The dot digit, split off the LOCAL coordinate above (dot_idx);
+         * nothing here touches the absolute index, which carries mask_start
+         * and so belongs to the POSITION digits.  0 on every run without a
+         * dot radix, so the block is inert there. */
+        ulong _dot = (ulong)dot_idx;
         if (_dot != 0UL && new_len > 0) {
             /* Bit scan bounded by WOFF_DOT_WIDTH_MAX: new_len reaches 40960 and
              * a 1UL shift past 63 is undefined.  The cap equals the CPU's

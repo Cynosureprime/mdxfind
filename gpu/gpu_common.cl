@@ -4923,8 +4923,14 @@ __constant uchar B2S_SIGMA[10][16] = {
 };
 
 void b2s_compress(uint *h, const uchar *block, ulong counter, int last) {
-    uint v[16], m[16];
-    for (int i = 0; i < 8; i++) { v[i] = h[i]; v[i+8] = B2S_IV[i]; }
+    uint v[16], m[16], hl[8];
+    /* The chaining state is read once into hl[] and written back as eight
+     * explicit statements: AMD fglrx 1573.4 (Tahiti) miscompiled the
+     * h[i] ^= v[i] ^ v[i+8] read-modify-write loop through this pointer and
+     * returned a wrong digest for any input of more than one block
+     * (2026-11-15).  Same algorithm, same result everywhere else. */
+    for (int i = 0; i < 8; i++) hl[i] = h[i];
+    for (int i = 0; i < 8; i++) { v[i] = hl[i]; v[i+8] = B2S_IV[i]; }
     v[12] ^= (uint)counter;
     v[13] ^= (uint)(counter >> 32);
     if (last) v[14] = ~v[14];
@@ -4950,7 +4956,10 @@ void b2s_compress(uint *h, const uchar *block, ulong counter, int last) {
         v[3]+=v[4]+m[s[14]]; v[14]=rotate(v[14]^v[3],(uint)16); v[9]+=v[14]; v[4]=rotate(v[4]^v[9],(uint)20);
         v[3]+=v[4]+m[s[15]]; v[14]=rotate(v[14]^v[3],(uint)24); v[9]+=v[14]; v[4]=rotate(v[4]^v[9],(uint)25);
     }
-    for (int i = 0; i < 8; i++) h[i] ^= v[i] ^ v[i+8];
+    h[0] = hl[0] ^ v[0] ^ v[8];  h[1] = hl[1] ^ v[1] ^ v[9];
+    h[2] = hl[2] ^ v[2] ^ v[10]; h[3] = hl[3] ^ v[3] ^ v[11];
+    h[4] = hl[4] ^ v[4] ^ v[12]; h[5] = hl[5] ^ v[5] ^ v[13];
+    h[6] = hl[6] ^ v[6] ^ v[14]; h[7] = hl[7] ^ v[7] ^ v[15];
 }
 
 /* ---- BLAKE2B compress (Memo B Phase B5 sub-batch 3) ----
@@ -5010,7 +5019,8 @@ __constant uchar B2B_SIGMA[12][16] = {
 } while (0)
 
 void b2b_compress(ulong *h, const uchar *block, ulong t0, ulong t1, int last) {
-    ulong v[16], m[16];
+    ulong v[16], m[16], hl[8];
+    /* hl[] and the explicit write-back: see b2s_compress (fglrx 1573.4). */
     /* Load 128-byte block as 16 ulong LITTLE-ENDIAN (BLAKE2b spec). */
     for (int i = 0; i < 16; i++) {
         int b = i * 8;
@@ -5023,7 +5033,8 @@ void b2b_compress(ulong *h, const uchar *block, ulong t0, ulong t1, int last) {
              | ((ulong)block[b + 6] << 48)
              | ((ulong)block[b + 7] << 56);
     }
-    for (int i = 0; i < 8; i++) { v[i] = h[i]; v[i + 8] = B2B_IV[i]; }
+    for (int i = 0; i < 8; i++) hl[i] = h[i];
+    for (int i = 0; i < 8; i++) { v[i] = hl[i]; v[i + 8] = B2B_IV[i]; }
     v[12] ^= t0;
     v[13] ^= t1;
     if (last) v[14] = ~v[14];
@@ -5038,7 +5049,10 @@ void b2b_compress(ulong *h, const uchar *block, ulong t0, ulong t1, int last) {
         B2B_G(v[ 2], v[ 7], v[ 8], v[13], m[s[12]], m[s[13]]);
         B2B_G(v[ 3], v[ 4], v[ 9], v[14], m[s[14]], m[s[15]]);
     }
-    for (int i = 0; i < 8; i++) h[i] ^= v[i] ^ v[i + 8];
+    h[0] = hl[0] ^ v[0] ^ v[8];  h[1] = hl[1] ^ v[1] ^ v[9];
+    h[2] = hl[2] ^ v[2] ^ v[10]; h[3] = hl[3] ^ v[3] ^ v[11];
+    h[4] = hl[4] ^ v[4] ^ v[12]; h[5] = hl[5] ^ v[5] ^ v[13];
+    h[6] = hl[6] ^ v[6] ^ v[14]; h[7] = hl[7] ^ v[7] ^ v[15];
 }
 
 /* ---- Keccak-f[1600] permutation (Memo B Phase B5 sub-batch 4, 2026-05-03) -

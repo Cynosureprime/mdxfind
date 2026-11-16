@@ -12,9 +12,9 @@
  * kernel source string into the caller-supplied dynamic buffer. The
  * buffer is grown via realloc as needed; caller frees it.
  *
- * hx_dump_source writes the emitted source verbatim to the path
- * named by env_var_name (if that env var is set). Idempotent if the
- * env var is unset.
+ * hx_dump_source writes the emitted source verbatim to <dir>/<name>,
+ * where <dir> is the value of env_var_name (MDXFIND_HX_CODEGEN_DUMP), a
+ * directory.  A no-op when the variable is unset or empty.
  *
  * Return codes: 0 = success; negative = walker error (unimplemented
  * opcode for sub-phase 2a.2, unrecognized function CALL for 2a.2's
@@ -37,8 +37,11 @@
  * for callers without an entry (test harnesses); patterns that need the
  * sidecar FATAL on NULL.
  *
- * $Revision: 1.4 $
+ * $Revision: 1.5 $
  * $Log: hx_walker.h,v $
+ * Revision 1.5  2026/11/14 22:14:35  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.4  2026/05/23 02:02:34  dlr
  * sub-phase 5a.2 add HX_PATTERN_FAMILY_MD5PASS dispatch arm forwards prog spec and entry to hx_emit_family_md5pass_opencl when backend is OpenCL with FATAL on NULL entry per per-program callnames sidecar requirement; Metal arm still falls through to per-opcode generic until 5a.3 Metal twin lands; walker signature gains entry parameter so family emitters can reach the sidecar without O of N reverse lookup over hx_specs_data
  *
@@ -96,7 +99,10 @@ int hx_emit_kernel(const hx_program *prog,
  * Returns 0 on success (including the "env var unset" case), negative
  * on I/O error.
  */
-int hx_dump_source(const char *src, const char *env_var_name);
+/* 1 = written (path in path_out), 0 = not requested (path_out "(none)"),
+ * -1 = requested but failed (reason already on stderr; caller must exit). */
+int hx_dump_source(const char *src, const char *env_var_name,
+                   const char *name, char *path_out, size_t path_cap);
 
 /*
  * printf-style appender that grows *out as needed. Exposed so the

@@ -39,12 +39,6 @@
  * alongside JOB_MD5MD5SALT. */
 #include "gpu_codegen_eligible.h"
 
-/* gpu_opencl.h cannot include gpujob.h, so the two constants are pinned here,
- * where both are in scope. RULE_BUF_MAX_HOST sizes the validator record; the
- * kernel is compiled with -D RULE_BUF_MAX = GPU_RULES_WALKER_BUF_ELEMS. They
- * drifted 20x apart between 2026-09-12 and 2026-09-24. */
-_Static_assert(RULE_BUF_MAX_HOST == GPU_RULES_WALKER_BUF_ELEMS,
-               "RULE_BUF_MAX_HOST must equal GPU_RULES_WALKER_BUF_ELEMS");
 
 /* malloc_pinned() lives in mdxfind.c -- page-aligned + mlock helper for
  * GPU-upload host buffers. We don't pull in mdxfind.h (would drag the
@@ -199,9 +193,6 @@ struct gpu_device {
     size_t hexhash_cap, hexlens_cap;
     uint32_t *h_hits;    /* host-side hit buffer */
 
-    /* Mask mode */
-    cl_mem bgpu_mask_desc;  /* mask descriptor: charset IDs per position */
-
     /* Memo B Phase B7.1-B7.5/B7.8: multi-position prepend+append mask
      * charsets for the template_phase0 kernel. Sized for up to
      * MASK_POS_CAP=16 prepend + 16 append = 32 total positions × 256
@@ -244,30 +235,13 @@ struct gpu_device {
      * any stray read produces psize==1, divmod loop terminates safely). */
     cl_mem b_template_mask_sizes;
 
-    /* Packed password dispatch buffers — repurposed post-B7.9.
-     *
-     * b_packed_buf / b_chunk_index / packed_buf_cap / chunk_index_cap remain
-     * live: the validator path (gpu_opencl_dispatch_md5_rules with
-     * MDXFIND_GPU_VALIDATOR=1) re-uses them as a 2nd packed-buffer route
-     * around b_dispatch_payload (see ~line 7885). The rules-engine production
-     * path uses b_dispatch_payload exclusively.
-     *
-     * B7.9 (2026-05-07): kern_packed and kern_packed_fam[] retired. Both
-     * fields kept for ABI stability with sibling builds and as defensive
-     * placeholders; they are now dead storage (never assigned, never read).
-     * A future cleanup phase may delete them along with the FAM_MD5PACKED
-     * enum slot in gpujob.h. */
-    cl_mem b_packed_buf, b_chunk_index;
-    cl_kernel kern_packed;                 /* B7.9: dead, retained for ABI */
-    cl_kernel kern_packed_fam[FAM_COUNT];  /* B7.9: dead, retained for ABI */
-    size_t packed_buf_cap, chunk_index_cap;
 
     /* Memo B B1 (2026-05-04): coalesced rules-engine dispatch payload.
      *
      * b_dispatch_payload is ONE cl_mem holding {OCLParams params,
      * uint hit_count, uint word_offset[num_words], uchar packed_words[]}.
-     * Layout offsets are deterministic from params.num_words; see
-     * gpu/gpu_md5_rules.cl md5_rules_phase0 kernel header.
+     * Layout offsets are deterministic from params.num_words; see the
+     * payload comment in gpu_template.cl.
      *
      * h_dispatch_payload is the matching pinned host staging buffer
      * (malloc_pinned -- posix_memalign + mlock). The dispatch function
@@ -291,12 +265,9 @@ struct gpu_device {
      * staging buffer matches the pattern the baseline numbers were
      * measured against.
      *
-     * Existing b_packed_buf / b_chunk_index / b_params / b_hit_count
-     * stay allocated -- gpu_opencl_dispatch_batch and the validate path
-     * still use them. Only the rules-engine production path was rewired
-     * in B1. (B7.9 2026-05-07: gpu_opencl_dispatch_packed retired; that
-     * caller is gone but the buffers remain for the validate / batch
-     * paths above.) */
+     * b_params / b_hit_count stay allocated for the paths that still bind
+     * them.  (The packed-buffer pair and the env-gated validator that last
+     * used it were removed 2026-11-15.) */
     cl_mem   b_dispatch_payload;
     size_t   dispatch_payload_cap;
     void    *h_dispatch_payload;
@@ -307,26 +278,14 @@ struct gpu_device {
      * via gpu_opencl_set_rules() at session start; per-dispatch only
      * needs to upload the words batch. global_size = n_words * n_rules;
      * the kernel emits hits with (word_idx, rule_idx) for host replay. */
-    cl_program prog_md5_rules;
-    cl_kernel  kern_md5_rules_phase0;
-    /* UTF-32 path (2026-09-13).  Built from the SAME prog_md5_rules, which is
-     * why it costs no second program object: the three UTF-32 sources are
-     * appended to that program when the UTF-32 path is active. */
-    cl_kernel  kern_md5_rules_mixed_phase0;
+    /* (prog_md5_rules, compiled per device for kernels nothing dispatched,
+     * and the env-gated md5_rules validator were removed 2026-11-15.) */
     int        u32_rules_uploaded;   /* combined program uploaded to this device */
     cl_mem     b_u32_case_tab;       /* the two 1:1 case tables, concatenated.
                                       * __global, not __constant: 26,048 bytes
                                       * of constant data put the rules program
                                       * 13 KB past NVIDIA's 64 KB bank and
                                       * ptxas refused the build. */
-    cl_kernel  kern_md5_rules_phase0_validate;  /* env-gated: MDXFIND_GPU_VALIDATOR=1
-                                                   replaces the production kernel
-                                                   for this dispatch with a
-                                                   per-(word,rule) buffer-state
-                                                   emitter for diff against the
-                                                   CPU validator (ruleproc.c
-                                                   rev 1.24, gated by
-                                                   MDXFIND_RULE_VALIDATOR=1). */
 
     /* Memo B B2 template path, and since B5 the only path for MD5.
      * Same kernel signature as the legacy md5_rules_phase0 it displaced,
@@ -935,29 +894,12 @@ struct gpu_device {
      * Phase 6 of the slab-retirement ladder (final major slab kernel). */
     cl_program prog_template_bcrypt;
     cl_kernel  kern_template_phase0_bcrypt;
-    cl_mem     b_validate_records; /* validator output buffer; sized lazily */
-    size_t     validate_records_cap;
-    /* Host-side mirror of rule_program / rule_offset, retained ONLY when
-     * MDXFIND_GPU_VALIDATOR=1 — the validator needs to emit `rulebytes=<hex>`
-     * for each rule_idx, which means it must be able to read the bytecode
-     * back on the host. Production path (validator off) leaves these NULL
-     * with zero allocation cost. Allocated/grown in gpu_opencl_set_rules
-     * when validator is enabled. */
-    unsigned char *h_rule_program;
-    uint32_t       h_rule_program_len;
-    uint32_t      *h_rule_offset;
-    int            h_rule_offset_n;
     cl_mem     b_rule_program;
     cl_mem     b_rule_offset;
     size_t     rule_program_cap;
     size_t     rule_offset_cap;
     int        gpu_n_rules;        /* 0 = set_rules not yet called */
 
-    /* Per-family timing-based dispatch sizing */
-    uint32_t fam_max_items[FAM_COUNT];  /* timed max work items per dispatch */
-    int      fam_timed[FAM_COUNT];      /* 1 = probed for this family */
-    double   fam_rate_hps[FAM_COUNT];   /* Phase 6: hashes/sec, captured during timing probe.
-                                           0 = not yet probed. Used by multi-GPU BF partition. */
 
     /* BF Phase 3 (2026-05-10): per-device bf_range_{start,end,pos} fields
      * deleted alongside the legacy bf_mode machinery in gpu_opencl_dispatch_-
@@ -1013,42 +955,7 @@ struct gpu_device {
      * any existing program/kernel slots. OpenCL only (Metal deferred per
      * design doc §10). */
     cl_program prog_kernel_a;             /* cand_rules_phase0 program (A1, rules) */
-    cl_program prog_kernel_a2;            /* Phase 1a sub-phase 1a.2 (2026-05-21):
-                                           * cand_masks_phase0 program (A2, masks-only).
-                                           * Sibling to prog_kernel_a -- built lazily
-                                           * by gpu_opencl_kernel_a2_build_prog when
-                                           * MDXFIND_KERNEL_A_VARIANT=2 first dispatches. */
-    cl_program prog_kernel_a3;            /* Phase 1a sub-phase 1a.3 (2026-05-21):
-                                           * cand_rules_masks_phase0 program (A3,
-                                           * rules + masks composition). Sibling to
-                                           * prog_kernel_a / prog_kernel_a2; built
-                                           * lazily by gpu_opencl_kernel_a3_build_prog
-                                           * when MDXFIND_KERNEL_A_VARIANT=3 first
-                                           * dispatches. Reuses all five buffers
-                                           * already uploaded by A1+A2 (rule program
-                                           * + rule offset + 4 mask buffers). */
-    cl_program prog_kernel_a4;            /* Phase 1a sub-phase 1a.4 (2026-05-21):
-                                           * cand_bruteforce_phase0 program (A4,
-                                           * pure brute-force candidate generator).
-                                           * Sibling to prog_kernel_a / a2 / a3;
-                                           * built lazily by gpu_opencl_kernel_a4_-
-                                           * build_prog when MDXFIND_KERNEL_A_-
-                                           * VARIANT=4 first dispatches. Reuses
-                                           * the 4 mask buffers already uploaded
-                                           * by A2/A3 (mask prepend/append/charsets/
-                                           * counts). Zero new persistent buffers. */
     cl_kernel  kern_kernel_a_rules;       /* extracted kernel object: cand_rules_phase0 */
-    cl_kernel  kern_kernel_a_masks;       /* Phase 1a sub-phase 1a.2 (2026-05-21):
-                                           * extracted kernel object: cand_masks_phase0. */
-    cl_kernel  kern_kernel_a_rules_masks; /* Phase 1a sub-phase 1a.3 (2026-05-21):
-                                           * extracted kernel object:
-                                           * cand_rules_masks_phase0 (10-arg sig). */
-    cl_kernel  kern_kernel_a_bruteforce;  /* Phase 1a sub-phase 1a.4 (2026-05-21):
-                                           * extracted kernel object:
-                                           * cand_bruteforce_phase0 (8-arg sig
-                                           * matching A2; mask_pattern_prepend arg
-                                           * bound to a zeroed buffer since BF
-                                           * invariant is MaskPrependLen == 0). */
     /* Phase 4 sub-phase 4a.3 (2026-05-22): prog_kernel_b + kern_kernel_b
      * fields removed along with the hand-written kernel B source files.
      * hx-codegen kernel B below is now the only OpenCL path for
@@ -1079,21 +986,6 @@ struct gpu_device {
         cl_program prog;
         cl_kernel  kern;
     } hx_codegen_slots[64];
-    /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 mask wire-format buffers.
-     * Sized fixed (see Phase 4-5 spec §5 + project_kernel_a_a2_masks_spec_-
-     * 2026-05-20.md), allocated lazily on the first A2 dispatch with non-
-     * zero MaskPrependLen+MaskAppendLen. b_kern_a_mask_prepend and
-     * b_kern_a_mask_append hold MAX_MASK_POS x 2 = 32 bytes each. The
-     * host upload path encodes mdxfind's signed MASK_LITERAL (-1) as the
-     * 0xff byte sentinel (D9.2.a). b_kern_a_mask_charsets holds
-     * MASK_MAX_CLASSES x 256 = 4096 bytes flat (charsets[N*256+i] = class
-     * N's i-th byte). b_kern_a_mask_counts holds MASK_MAX_CLASSES x 4
-     * = 64 bytes (uint32 per-class count). */
-    cl_mem     b_kern_a_mask_prepend;     /* 32 bytes: 16 (classid, literal) pairs */
-    cl_mem     b_kern_a_mask_append;      /* 32 bytes: 16 (classid, literal) pairs */
-    cl_mem     b_kern_a_mask_charsets;    /* 4096 bytes: 16*256 flat */
-    cl_mem     b_kern_a_mask_counts;      /* 64 bytes: 16 uints */
-    int        b_kern_a_mask_allocated;   /* 1 = upload complete; 0 = lazy */
     /* Phase 4 sub-phase 4a.3 (2026-05-22): Gate 6 register-pressure probe
      * fields removed (kernelb_priv_mem, kernelb_max_wg, kernelb_pref_wg,
      * kernelb_unavailable). The probe + soft-gate fallback to
@@ -1107,9 +999,7 @@ struct gpu_device {
      * dispatch; sized worst-case (n_words * n_rules slots). All three use
      * create_min_buf + calloc + USE_HOST_PTR per hashcat host-buffer pattern.
      * b_proto_kernelA_state is exactly 12 bytes (3 uints); MIN_BUFFER_BYTES floor
-     * applied via create_min_buf. NOT shared with existing b_packed_buf /
-     * b_chunk_index (validator path reuses those; proto path has private copies
-     * so the two paths cannot collide). */
+     * applied via create_min_buf. */
     cl_mem     b_proto_packed_buf;        /* kernel A output: packed [len][bytes] candidates */
     cl_mem     b_proto_chunk_index;       /* kernel A output: per-slot byte offsets */
     cl_mem     b_proto_kernelA_state;     /* kernel A counters: [slot_counter, byte_counter, overflow_flag] */
@@ -1467,16 +1357,10 @@ static int _overflow_count = 0;
 /* gpu_op, max_iter, mask_resume, salt_resume, last_mask_start are
  * per-device fields in struct gpu_device for multi-GPU safety */
 
-/* ---- Timing-based dispatch sizing constants ---- */
-#define TIMING_BUDGET_MIN_MS  200.0
-#define TIMING_BUDGET_MAX_MS  400.0
-#define TIMING_INITIAL_SIZE   65536   /* 64K work items */
-#define TIMING_WATCHDOG_MS    5000.0  /* never risk exceeding this */
-
 extern int gpu_op_family(int op);
 
 /* Mask state — defined at file scope below (gpu_opencl_set_mask).
- * Forward-declared here so warm-probe and other early functions can read them. */
+ * Forward-declared here so early functions can read them. */
 extern int gpu_mask_n_prepend;
 extern int gpu_mask_n_append;
 extern uint64_t gpu_mask_total;
@@ -1528,92 +1412,6 @@ extern int gpu_dot_width_asked;
 extern int                EmailLocal;
 extern unsigned long long MaskPrependTotal;
 extern unsigned long long MaskTotal;
-
-/* ---- Per-kernel autotune state ---- */
-#define TUNE_CANDIDATES 4
-static const size_t tune_sizes[TUNE_CANDIDATES] = { 64, 128, 256, 512 };
-
-#define MAX_GPU_KERNELS 2048   /* indexed by op type, same as JOB_DONE */
-
-struct gpu_kern {
-    cl_kernel kernel;        /* NULL if no GPU kernel for this op */
-    size_t local_size;       /* current work group size */
-    size_t max_local;        /* from CL_KERNEL_WORK_GROUP_SIZE */
-    int tuned;               /* 1 = done tuning */
-    int tune_candidate;      /* which tune_sizes[] we're testing */
-    int tune_samples;        /* dispatches at current candidate */
-    double tune_best_time;   /* best avg ms so far */
-    size_t tune_best_size;   /* size that produced best_time */
-    double tune_cur_total;   /* accumulated ms for current candidate */
-    int dev_idx;             /* device index for status messages */
-};
-
-/* Per-device kernel table — each device has its own compiled kernels */
-struct gpu_kern_table {
-    struct gpu_kern kerns[MAX_GPU_KERNELS];
-};
-static struct gpu_kern_table dev_kerns[MAX_GPU_DEVICES];
-
-#define TUNE_SAMPLES 3  /* dispatches per candidate before moving on */
-
-static void kern_register(int di, int op, cl_kernel kernel) {
-    if (di < 0 || di >= MAX_GPU_DEVICES) return;
-    if (op < 0 || op >= MAX_GPU_KERNELS || !kernel) return;
-    struct gpu_kern *k = &dev_kerns[di].kerns[op];
-    size_t max_wg = 0;
-    clGetKernelWorkGroupInfo(kernel, gpu_devs[di].dev, CL_KERNEL_WORK_GROUP_SIZE, sizeof(max_wg), &max_wg, NULL);
-    /* Check for reqd_work_group_size — if set, the required size overrides max_wg */
-    size_t req_wg[3] = {0, 0, 0};
-    clGetKernelWorkGroupInfo(kernel, gpu_devs[di].dev, CL_KERNEL_COMPILE_WORK_GROUP_SIZE, sizeof(req_wg), req_wg, NULL);
-    if (req_wg[0] > 0) max_wg = req_wg[0];
-    k->kernel = kernel;
-    k->max_local = max_wg;
-    k->dev_idx = di;
-    k->tuned = 0;
-    k->tune_candidate = 0;
-    k->tune_samples = 0;
-    k->tune_best_time = 1e30;
-    k->tune_best_size = max_wg ? max_wg : 64;
-    k->tune_cur_total = 0;
-    int c = 0;
-    while (c < TUNE_CANDIDATES && tune_sizes[c] > max_wg) c++;
-    k->tune_candidate = c;
-    k->local_size = (c < TUNE_CANDIDATES) ? tune_sizes[c] : max_wg;
-}
-
-static size_t kern_get_local_size(struct gpu_kern *k) {
-    if (k->tuned) return k->local_size;
-    if (k->tune_candidate >= TUNE_CANDIDATES) {
-        k->tuned = 1;
-        k->local_size = k->tune_best_size;
-        GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: autotuned work group size = %zu\n", k->dev_idx, k->local_size);
-        return k->local_size;
-    }
-    return tune_sizes[k->tune_candidate];
-}
-
-static void kern_record_time(struct gpu_kern *k, double ms) {
-    if (k->tuned) return;
-    k->tune_cur_total += ms;
-    k->tune_samples++;
-    if (k->tune_samples >= TUNE_SAMPLES) {
-        double avg = k->tune_cur_total / k->tune_samples;
-        if (avg < k->tune_best_time) {
-            k->tune_best_time = avg;
-            k->tune_best_size = tune_sizes[k->tune_candidate];
-        }
-        k->tune_candidate++;
-        while (k->tune_candidate < TUNE_CANDIDATES && tune_sizes[k->tune_candidate] > k->max_local)
-            k->tune_candidate++;
-        k->tune_samples = 0;
-        k->tune_cur_total = 0;
-        if (k->tune_candidate >= TUNE_CANDIDATES) {
-            k->tuned = 1;
-            k->local_size = k->tune_best_size;
-            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: autotuned work group size = %zu\n", k->dev_idx, k->local_size);
-        }
-    }
-}
 
 #define GPU_MAX_HITS 32768
 
@@ -1867,8 +1665,8 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
  * sha256/sha512/rmd160/blake2s256/keccak/md6256/wrl/mysql3 unsalted) are
  * gone alongside the .cl/.h sources. All GPU_CAT_MASK ops now route exclu-
  * sively through the unified template path (rules-engine kernel via
- * gpu_opencl_dispatch_md5_rules); mask configs > 16+16 positions and other
- * unmapped configurations CPU-fallback per architect §11 (B9 row). The
+ * gpu_opencl_dispatch_md5_rules); a -n/-N mask over 16 positions per side
+ * is FATAL at the mdxmain.c upload site while the GPU is active. The
  * gpu_opencl_dispatch_batch() function and the worker's slab dispatch
  * branch (gpujob_opencl.c) STAY — they remain load-bearing for SALTED /
  * SALTPASS ops (PHPBB3, MD5CRYPT, DESCRYPT, HMAC_*, SHA512CRYPT,
@@ -1925,9 +1723,9 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
 /* UTF-32 rule path (2026-09-13).  Three generated kernel sources plus the
  * header-only host side.  gpu_u32_tables_str.h and gpu_u32_walker_str.h are
  * generated from ../combining.h, ../latin_case.h and gpu_u32_walker.inc;
- * gpu_md5_rules32_str.h carries the kernel bodies.  All three are appended to
- * the rules program ONLY when the UTF-32 path is active, so a byte-mode run
- * compiles exactly what it compiled before -- including the same cache key. */
+ * The walker is appended to the template programs ONLY when the UTF-32 path
+ * is active, so a byte-mode run keeps its cache key.  (gpu_md5_rules32.cl,
+ * the UTF-32 rules-program kernels, is no longer compiled: 2026-11-15.) */
 /* gpu_u32_tables_str.h is deliberately NOT included: the tables are inlined
  * into gpu_u32_walker.cl by gen_u32_walker.py, so a second copy here would
  * declare every array twice. */
@@ -1935,7 +1733,6 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
 /* The HOST's copy of the two case tables, uploaded as a __global kernel
  * argument.  Generated alongside the device tables from ../latin_case.h. */
 #include "gpu_u32_case_host.h"
-#include "gpu_md5_rules32_str.h"
 #include "gpu_u32_host.h"
 /* Memo B Phase B2 (2026-05-04): generic dispatch-template skeleton +
  * MD5 algorithm core. Template kernel (template_phase0) is resolved at
@@ -2292,9 +2089,6 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
  * linker sees the string constants regardless, which is fine — zero runtime
  * cost when the env flag is not set). */
 #include "gpu_kernel_a_rules_str.h"   /* Phase 1a A1: renamed from gpu_cand_rules_str.h */
-#include "gpu_kernel_a_masks_str.h"   /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 masks-only producer (cand_masks_phase0) */
-#include "gpu_kernel_a_rules_masks_str.h"  /* Phase 1a sub-phase 1a.3 (2026-05-21): A3 rules+masks producer (cand_rules_masks_phase0) */
-#include "gpu_kernel_a_bruteforce_str.h"   /* Phase 1a sub-phase 1a.4 (2026-05-21): A4 brute-force producer (cand_bruteforce_phase0) */
 /* gpu_kernelb_md5md5salt_nocache_str.h: include removed 2026-05-22 per
  * Phase 4 sub-phase 4a.3. The hand-written kernel B (broken md5md5salt
  * variant) was deleted from the source tree; hx-codegen is the only
@@ -2309,8 +2103,7 @@ void gpu_opencl_device_bdf(int dev_idx, char *out, size_t out_sz) {
  * See gpu_common_str.h + gpu_*_str.h
  *
  * REMOVED: ~300 lines of inline kernel string (kernel_source_embedded_unused)
-"}\n";
-#endif
+ */
 
 /* ---- List GPU devices and exit (called early from option parsing) ---- */
 void gpu_opencl_list_devices(void) {
@@ -2610,201 +2403,6 @@ static const char *family_source[FAM_COUNT] = {
      * compile-families loop NULL-skips this slot. */
 };
 
-/* B7.9 (2026-05-07): packed_kernel_map[] + packed_family() retired with
- * the chokepoint pack. Their only consumer was gpu_opencl_dispatch_packed,
- * also retired in this commit. RCS history retains the prior versions of
- * this file. The 5 packed kernel sources (md5/sha1/sha256/md4/sha512_packed)
- * have been deleted from the working tree per
- * feedback_remove_retired_gpu_kernels.md. */
-
-/* Kernel-to-op mapping table. Each entry: kernel function name, ops it serves, family.
- * Adding a new GPU algorithm = one line here + a .cl file in gpu/. */
-static const struct {
-    const char *name;
-    int ops[8];      /* -1 terminated */
-    int family;
-} kernel_map[] = {
-    /* B8 retirement (2026-05-06): 11 slab kernels removed — md5salt_batch,
-     * md5salt_sub8_24, md5saltpass_batch, md5passsalt_batch,
-     * md5_md5saltmd5pass_batch, sha1passsalt_batch, sha1saltpass_batch,
-     * sha256passsalt_batch, sha256saltpass_batch, sha512passsalt_batch (in
-     * the FAM_HMAC_SHA512 group below), sha512saltpass_batch (likewise).
-     * All ops now route through the unified template path via B6/B6.x
-     * fan-outs. RCS history retains the kernel sources.
-     *
-     * 2026-05-07: md5salt_iter retired — JOB_MD5SALT iter coverage handled
-     * by the unified template path's per-iter loop in template_phase0
-     * (gpu_template.cl) using gpu_md5salt_core.cl as the iterate body.
-     * probe_max_dispatch migrated to hmac_md5_ksalt_batch. */
-    /* md5_iter_lc, md5_iter_uc retired in B12 (2026-05-08): FAM_MD5ITER
-     * slab kernels gone — JOB_MD5/JOB_MD5UC iteration handled by the
-     * rules-engine + template paths. */
-    /* md5_mask_batch retired in B12 (2026-05-08): FAM_MD5MASK slab kernel
-     * gone — JOB_MD5 mask coverage handled by the unified template path
-     * (B6 -n/-N integration). */
-    /* B8.x retirement (B6.11 commit, 2026-05-06): sha1dru_batch removed —
-     * JOB_SHA1DRU routes through the unified template path via B6.11
-     * fan-out (gpu_sha1dru_core.cl). The slab kernel sha1dru_batch in
-     * gpu_sha1.cl was removed in this same commit. RCS history retains
-     * the kernel source at gpu/RCS/gpu_sha1.cl,v. */
-    /* PHPBB3 slab kernel phpbb3_batch retired in PHPBB3 carrier ship
-     * (2026-05-08): JOB_PHPBB3 routes through the unified template path
-     * via the carrier kernel (gpu_phpbb3_core.cl). RCS history retains
-     * the slab kernel source at gpu/RCS/gpu_phpbb3.cl,v. */
-    /* MD5CRYPT slab kernel md5crypt_batch retired in MD5CRYPT carrier ship
-     * (2026-05-08): JOB_MD5CRYPT routes through the unified template path
-     * via the carrier kernel (gpu_md5crypt_core.cl). RCS history retains
-     * the slab kernel source at gpu/RCS/gpu_md5crypt.cl,v. probe_max_-
-     * dispatch is anchored on FAM_MD5SALT (hmac_md5_ksalt_batch), not
-     * FAM_MD5CRYPT, so retirement does not require a probe migration. */
-    /* DESCRYPT slab kernel descrypt_batch retired in DESCRYPT carrier
-     * ship (2026-05-08, Unix-crypt Phase 5): JOB_DESCRYPT routes through
-     * the unified template path via the hand-written Path A carrier
-     * (gpu_descrypt_core.cl). RCS history retains the slab kernel source
-     * at gpu/RCS/gpu_descrypt.cl,v. probe_max_dispatch is anchored on
-     * FAM_MD5SALT (hmac_md5_ksalt_batch), not FAM_DESCRYPT, so retirement
-     * does not require a probe migration. After this Phase 5, FAM_DESCRYPT
-     * has zero kernel_map entries -- the entire family is dead and the
-     * family_source[FAM_DESCRYPT] slot is NULL (above). */
-    /* B9 (2026-05-07): 22 unsalted slab kernel entries retired (md5/md4/
-     * md4utf16/sha1/sha256/sha224/sha256raw/sha512/sha384/wrl/md6_256/
-     * keccak{224,256,384,512}/sha3_{224,256,384,512}/sql5/sha1raw/md5raw/
-     * sha384raw/sha512raw/mysql3/rmd160/blake2s256). The legacy mask short-
-     * circuit at mdxfind.c:10911-10951 was the sole reachability path;
-     * that short-circuit + gpu_try_pack_unsalted() in mdxfind.c were
-     * retired in this same commit. All GPU_CAT_MASK ops now route exclu-
-     * sively through the unified template path. RCS history retains the
-     * kernel sources. */
-    /* Family C (2026-05-07): hmac_sha224_ksalt_batch + hmac_sha224_kpass_batch
-     * RETIRED. JOB_HMAC_SHA224 / JOB_HMAC_SHA224_KPASS now route through the
-     * unified SHA224SALTPASS template path (gpu_template.cl + gpu_sha224saltpass_-
-     * core.cl) via params.algo_mode = 5 / 6.
-     * Family D (2026-05-08): hmac_sha256_ksalt_batch + hmac_sha256_kpass_batch
-     * RETIRED. JOB_HMAC_SHA256 / JOB_HMAC_SHA256_KPASS now route through the
-     * unified SHA256SALTPASS template path (gpu_template.cl + gpu_sha256saltpass_-
-     * core.cl) via params.algo_mode = 5 / 6 + RUNTIME-gated HMAC body in
-     * finalize_prepend_be.cl.frag (NEVER `#if HASH_WORDS == 8`; rev 1.7
-     * Pascal NVIDIA ABORT lesson). After this Family D retirement, FAM_SHA256
-     * has zero kernel_map entries — the entire family is dead and gpu_sha256.cl
-     * is whole-file deleted in this same commit (mirrors Family J pattern).
-     * The family_source[FAM_SHA256] slot is dropped to NULL implicit-init.
-     * Final HMAC family in the ladder; HMAC ladder COMPLETE 21/21 algos
-     * shipped. RCS history retains the kernel sources at gpu/RCS/gpu_sha256.cl,v. */
-    {"hmac_md5_ksalt_batch",    {JOB_HMAC_MD5, -1}, FAM_MD5SALT},
-    {"hmac_md5_kpass_batch",    {JOB_HMAC_MD5_KPASS, -1}, FAM_MD5SALT},
-    /* Family B (2026-05-07): hmac_sha1_ksalt_batch + hmac_sha1_kpass_batch
-     * RETIRED. JOB_HMAC_SHA1 / JOB_HMAC_SHA1_KPASS now route through the
-     * unified SHA1SALTPASS template path (gpu_template.cl + gpu_sha1saltpass_-
-     * core.cl) via params.algo_mode = 5 / 6. probe_max_dispatch is anchored
-     * on FAM_MD5SALT (hmac_md5_ksalt_batch) — FAM_SHA1's HMAC kernels were
-     * NOT the probe anchor, so this retirement does not require migrating
-     * the probe. RCS history retains the kernel sources at
-     * gpu/RCS/gpu_sha1.cl,v. */
-    /* B8 retirement (2026-05-06): sha512passsalt_batch + sha512saltpass_batch
-     * removed from FAM_HMAC_SHA512 — JOB_SHA512PASSSALT / JOB_SHA512SALTPASS
-     * route through the unified template path via B6.9 / B6.10 fan-out.
-     * Family E HMAC-SHA384 carrier (2026-05-08): hmac_sha384_ksalt_batch +
-     * hmac_sha384_kpass_batch RETIRED.
-     * Family F (2026-05-08): hmac_sha512_ksalt_batch + hmac_sha512_kpass_batch
-     * RETIRED. JOB_HMAC_SHA512 / JOB_HMAC_SHA512_KPASS now route through
-     * the unified template path (gpu_template.cl + gpu_sha512saltpass_core.cl)
-     * via params.algo_mode = 5 / 6. After this Family F retirement,
-     * FAM_HMAC_SHA512 has zero kernel_map entries — the entire family is
-     * dead and the family_source[FAM_HMAC_SHA512] slot is NULL (above).
-     * The gpu_hmac_sha512.cl file is `#if 0`-wrapped as a retirement-record;
-     * RCS history retains the kernel sources at gpu/RCS/gpu_hmac_sha512.cl,v. */
-    /* B9 (2026-05-07): six more unsalted slab kernel entries retired
-     * (sql5/sha1raw/md5raw/sha384raw/sha512raw/mysql3) — see top-of-table
-     * B9 comment for the full list and rationale. */
-    /* Family G retirement (2026-05-08): hmac_rmd160_{ksalt,kpass}_batch
-     * removed from kernel_map[]. Both ops route through the
-     * RIPEMD160SALTPASS-shaped carrier template kernel via algo_mode=5/6. */
-    /* Family H retirement (2026-05-08): hmac_rmd320_{ksalt,kpass}_batch
-     * removed from kernel_map[]. Both ops route through the
-     * RIPEMD320SALTPASS-shaped carrier template kernel via algo_mode=5/6.
-     * After this Family H retirement, FAM_HMAC_RMD320 has zero kernel_map
-     * entries — the entire family is dead and the family_source[FAM_HMAC_-
-     * RMD320] slot is NULL (above). The gpu_hmac_rmd320.cl file is
-     * `#if 0`-wrapped as a retirement-record; RCS history retains the
-     * kernel sources at gpu/RCS/gpu_hmac_rmd320.cl,v. */
-    /* Family I retirement (2026-05-08): hmac_blake2s_kpass_batch removed
-     * from kernel_map[]. JOB_HMAC_BLAKE2S routes through the hand-written
-     * Path A carrier template kernel (gpu_hmac_blake2s_core.cl) via
-     * algo_mode=5. After this Family I retirement, FAM_HMAC_BLAKE2S has
-     * zero kernel_map entries — the entire family is dead and the
-     * family_source[FAM_HMAC_BLAKE2S] slot is NULL (above). The
-     * gpu_hmac_blake2s.cl file is `#if 0`-wrapped as a retirement-record;
-     * RCS history retains the kernel sources at gpu/RCS/gpu_hmac_blake2s.cl,v. */
-    /* B10 retirement (2026-05-07): streebog256_unsalted_batch +
-     * streebog512_unsalted_batch removed. JOB_STREEBOG_32 / JOB_STREEBOG_64
-     * route through the unified template path (gpu_template.cl +
-     * gpu_streebog{256,512}_core.cl) via params.algo_mode. */
-    /* Family J retirement (2026-05-08): hmac_streebog256_kpass_batch +
-     * hmac_streebog256_ksalt_batch entries deleted. JOB_HMAC_STREEBOG256_-
-     * KPASS / JOB_HMAC_STREEBOG256_KSALT now route through the hand-written
-     * Path A carrier template kernel (gpu_hmac_streebog256_core.cl) via
-     * algo_mode = 5/6. The slab kernels themselves were surgically deleted
-     * from gpu_streebog.cl in this same commit (lines 837-966 removed). */
-    /* Family K retirement (2026-05-08): hmac_streebog512_kpass_batch +
-     * hmac_streebog512_ksalt_batch entries deleted. JOB_HMAC_STREEBOG512_-
-     * KPASS / JOB_HMAC_STREEBOG512_KSALT now route through the hand-
-     * written Path A carrier template kernel (gpu_hmac_streebog512_core.cl)
-     * via algo_mode = 5/6. The slab kernels themselves were surgically
-     * deleted from gpu_streebog.cl in this same commit (lines 859-989
-     * removed; whole-file #if 0 wrap since the file is empty post-
-     * retirement). Final HMAC family in the ladder. FAM_STREEBOG family_-
-     * source slot is now NULL - no live slab kernels remain in the
-     * Streebog family (B10 retired unsalted streebog batches earlier;
-     * Family J retired streebog256 HMACs; Family K retires streebog512
-     * HMACs). */
-    /* SHA512CRYPT/SHA512CRYPTMD5 slab kernel sha512crypt_batch retired in
-     * SHA512CRYPTMD5 carrier ship (2026-05-08): both JOB_SHA512CRYPT
-     * (Phase 3) and JOB_SHA512CRYPTMD5 (Phase 4) now route through the
-     * unified template path via the carrier kernel (gpu_shacrypt_core.cl
-     * at HASH_WORDS=16). The MD5-preprocess for SHA512CRYPTMD5 is host-
-     * side at mdxfind.c:12256-12258 (job->pass swapped with 32-char MD5
-     * hex of the original password before gpu_try_pack). RCS history
-     * retains the slab kernel source at gpu/RCS/gpu_sha512crypt.cl,v.
-     * probe_max_dispatch is anchored on FAM_MD5SALT (hmac_md5_ksalt_-
-     * batch), not FAM_SHA512CRYPT, so retirement does not require a
-     * probe migration. Phase 4 of the Unix-crypt ladder (final phase;
-     * Unix-crypt slab path fully retired). */
-    /* SHA256CRYPT slab kernel sha256crypt_batch retired in SHA256CRYPT
-     * carrier ship (2026-05-08): JOB_SHA256CRYPT routes through the
-     * unified template path via the carrier kernel (gpu_shacrypt_core.cl
-     * at HASH_WORDS=8). RCS history retains the slab kernel source at
-     * gpu/RCS/gpu_sha256crypt.cl,v. probe_max_dispatch is anchored on
-     * FAM_MD5SALT (hmac_md5_ksalt_batch), not FAM_SHA256CRYPT, so
-     * retirement does not require a probe migration. Phase 2 of the
-     * Unix-crypt ladder. */
-    /* B9 (2026-05-07): rmd160_unsalted_batch + blake2s256_unsalted_batch
-     * retired — see top-of-table B9 comment. */
-    /* BCRYPT slab kernel bcrypt_batch retired in BCRYPT carrier ship
-     * (2026-05-08, Unix-crypt Phase 6): JOB_BCRYPT routes through the
-     * unified template path via the hand-written Path A carrier
-     * (gpu_bcrypt_core.cl). RCS history retains the slab kernel source
-     * at gpu/RCS/gpu_bcrypt.cl,v. probe_max_dispatch is anchored on
-     * FAM_MD5SALT (hmac_md5_ksalt_batch), not FAM_BCRYPT, so retirement
-     * does not require a probe migration. After this Phase 6, FAM_BCRYPT
-     * has zero kernel_map entries -- the entire family is dead and the
-     * family_source[FAM_BCRYPT] slot is NULL (above). Phase 6 of the
-     * slab-retirement ladder (final major slab kernel). */
-    /* B7.9 (2026-05-07): {"md5_packed_batch", FAM_MD5PACKED} entry retired
-     * with the chokepoint pack. The kernel was dispatched directly via
-     * gpu_opencl_dispatch_packed (not by op-routing through this table),
-     * which is why it had no JOB_ entry. Now both the dispatch function
-     * and the .cl source are gone — leave the kernel_map terminator. */
-    {NULL, {-1}, 0}
-};
-/* B8 (2026-05-06): switched from positional KERN_ITER_IDX to name-based
- * lookup so future kernel_map[] surgery (B8.x slab retirement) can't shift
- * the salted-iter slot under us. Cost: one strcmp per kernel registration.
- *
- * 2026-05-07: KERN_NAME_SALT_ITER #define + 3 strcmp lookup sites + 4
- * kern_salt_iter struct/assignment sites + 1 dispatch_batch override
- * removed alongside md5salt_iter kernel deletion. JOB_MD5SALT iter
- * coverage routes through the unified template path. */
-
 /* OpenCL async error callback — called by the driver on compute errors.
  *
  * The driver invokes this callback on its own thread when an
@@ -2895,17 +2493,6 @@ static int init_device(int di, cl_device_id dev_id) {
      * (host-side timestamp read on each event), and DISPATCH_TRACE is itself
      * an opt-in diagnostic mode — no impact when env var is unset. */
     /* No dispatch-stage profiling on the queue; MDXFIND_DISPATCH_TRACE used to enable it. */
-    /* PROFILE_VARIANT-for-A4 (2026-05-30, architect spec project_kernel_-
-     * a_a4_profile_variant_spec_2026-05-30.md D5.a): the A4 standalone
-     * dispatcher records kernel_a4_us via cl_event profiling, which
-     * requires the queue to be CL_QUEUE_PROFILING_ENABLE. Auto-enable
-     * whenever the A4 PROFILE_VARIANT env var is set (any value) so
-     * the operator only needs ONE env flag for the common decomp run.
-     * Direct check on getenv (not via the accessor) to avoid host-gate
-     * recursion at queue-creation time -- queue lives across all dispatch
-     * variants, doesn't matter if VARIANT != 4 at this point. */
-        /* No queue profiling.  MDXFIND_KERNEL_A4_PROFILE_VARIANT used to
-         * add CL_QUEUE_PROFILING_ENABLE here for A4 dispatch timings. */
     d->queue = clCreateCommandQueue(d->ctx, dev_id, qprops, &err);
     if (!d->queue && qprops != 0) {
         d->queue = clCreateCommandQueue(d->ctx, dev_id, 0, &err);
@@ -2932,21 +2519,10 @@ static int init_device(int di, cl_device_id dev_id) {
         GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: kernel build DONE in %.2fs (common+selftest)\n",
                   di, _kb_ms / 1e3);
     }
-    if (!d->prog || err != CL_SUCCESS) {
-        char log[4096] = {0};
-        if (d->prog)
-            clGetProgramBuildInfo(d->prog, dev_id, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
-        fprintf(stderr, "OpenCL GPU[%d] common kernel compile error (err=%d):\n%s\n",
-                di, err, log);
-        if (d->prog) clReleaseProgram(d->prog);
-        d->prog = NULL;
-        return -1;
-    }
 
     /* Compile only the md5salt family at init (needed for selftest/probe).
      * Other families are compiled later by gpu_opencl_compile_families(). */
     memset(d->fam_prog, 0, sizeof(d->fam_prog));
-    memset(&dev_kerns[di], 0, sizeof(dev_kerns[di]));
     {
         struct timespec _kb2_t0, _kb2_t1;
         clock_gettime(CLOCK_MONOTONIC, &_kb2_t0);
@@ -2960,28 +2536,6 @@ static int init_device(int di, cl_device_id dev_id) {
                            + (_kb2_t1.tv_nsec - _kb2_t0.tv_nsec) / 1e6;
             GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: kernel build DONE in %.2fs (md5salt family)\n",
                       di, _kb2_ms / 1e3);
-        }
-        if (!d->fam_prog[FAM_MD5SALT] || err != CL_SUCCESS) {
-            char log[4096] = {0};
-            if (d->fam_prog[FAM_MD5SALT])
-                clGetProgramBuildInfo(d->fam_prog[FAM_MD5SALT], dev_id, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
-            fprintf(stderr, "OpenCL GPU[%d] md5salt compile error (err=%d) — device excluded:\n%s\n",
-                    di, err, log);
-            if (d->fam_prog[FAM_MD5SALT]) clReleaseProgram(d->fam_prog[FAM_MD5SALT]);
-            d->fam_prog[FAM_MD5SALT] = NULL;
-            return -1;
-        }
-        /* Register md5salt kernels */
-        for (int k = 0; kernel_map[k].name; k++) {
-            if (kernel_map[k].family != FAM_MD5SALT) continue;
-            cl_kernel kern = clCreateKernel(d->fam_prog[FAM_MD5SALT], kernel_map[k].name, &err);
-            if (!kern) {
-                fprintf(stderr, "OpenCL GPU[%d]: md5salt kernel '%s' create failed (err=%d) — device excluded\n",
-                        di, kernel_map[k].name, err);
-                return -1;
-            }
-            for (int j = 0; kernel_map[k].ops[j] >= 0; j++)
-                kern_register(di, kernel_map[k].ops[j], kern);
         }
     }
 
@@ -3081,13 +2635,13 @@ static int init_device(int di, cl_device_id dev_id) {
  * Returns 0 if all sizes pass (no limit needed). */
 static int probe_max_dispatch(int di) {
     struct gpu_device *d = &gpu_devs[di];
-    cl_int err;
+    cl_int err = CL_INVALID_PROGRAM;
 
     cl_kernel test_kern = d->fam_prog[FAM_MD5SALT]
         ? clCreateKernel(d->fam_prog[FAM_MD5SALT], "hmac_md5_ksalt_batch", &err) : NULL;
     if (!test_kern) {
-        fprintf(stderr, "OpenCL GPU[%d]: probe kernel not found (err=%d)\n", di, err);
-        return 0;
+        GPU_FATAL("probe kernel hmac_md5_ksalt_batch create failed (err=%d) "
+                  "on device %d", err, di);
     }
 
     /* Test word (password): bytes "61" of length 2 (hexlens[w]=2).
@@ -3455,52 +3009,8 @@ int gpu_opencl_init(void) {
 /* Compile additional kernel families on demand. Called from main() after
  * hash types are known. fam_mask is a bitmask of FAM_* values to compile. */
 void gpu_opencl_compile_families(unsigned int fam_mask) {
+    (void)fam_mask;  /* every live family is built at init */
     if (!ocl_ready) return;
-    for (int di = 0; di < num_gpu_devs; di++) {
-        struct gpu_device *d = &gpu_devs[di];
-        if (d->device_disabled) continue;
-        cl_int err;
-        for (int f = 0; f < FAM_COUNT; f++) {
-            if (d->fam_prog[f]) continue;  /* already compiled */
-            if (!(fam_mask & (1u << f))) continue;  /* not requested */
-            /* B8 (2026-05-06): family_source[f] may be NULL for retired
-             * FAM_* slots (FAM_MD5SALTPASS, FAM_MD5_MD5SALTMD5PASS) whose
-             * kernels were removed when their ops moved to the unified
-             * template path. Silently skip — the template path doesn't use
-             * fam_prog[f], and host code in mdxfind.c still maps these JOB_
-             * to FAM_ for timing/bookkeeping. No kernels register against
-             * a NULL family, so the skip is safe end-to-end. */
-            if (!family_source[f]) continue;
-            const char *sources[2] = { gpu_common_str, family_source[f] };
-            d->fam_prog[f] = gpu_kernel_cache_build_program(d->ctx, d->dev, 2, sources,
-                                                             "-cl-std=CL1.2", &err);
-            if (!d->fam_prog[f] || err != CL_SUCCESS) {
-                char log[4096] = {0};
-                if (d->fam_prog[f])
-                    clGetProgramBuildInfo(d->fam_prog[f], d->dev, CL_PROGRAM_BUILD_LOG, sizeof(log), log, NULL);
-                fprintf(stderr, "OpenCL GPU[%d] family %d compile error (err=%d) — DEVICE DISABLED, no GPU work routes here:\n%s\n",
-                        di, f, err, log);
-                if (d->fam_prog[f]) clReleaseProgram(d->fam_prog[f]);
-                d->fam_prog[f] = NULL;
-                d->device_disabled = 1;
-                break;
-            }
-            /* Register kernels from this family */
-            for (int k = 0; kernel_map[k].name; k++) {
-                if (kernel_map[k].family != f) continue;
-                cl_kernel kern = clCreateKernel(d->fam_prog[f], kernel_map[k].name, &err);
-                if (!kern) {
-                    fprintf(stderr, "OpenCL GPU[%d]: family %d kernel '%s' create failed (err=%d) — DEVICE DISABLED, no GPU work routes here\n",
-                            di, f, kernel_map[k].name, err);
-                    d->device_disabled = 1;
-                    break;
-                }
-                for (int j = 0; kernel_map[k].ops[j] >= 0; j++)
-                    kern_register(di, kernel_map[k].ops[j], kern);
-            }
-            if (d->device_disabled) break;
-        }
-    }
     gpu_opencl_finalize_active_count();
 }
 
@@ -4467,540 +3977,15 @@ int gpu_opencl_max_batch(int dev_idx) {
     return gpu_devs[dev_idx].max_batch;
 }
 
-/* Phase 6: read the autotuned hashes/sec for a (device, family) pair.
- * Returns 0.0 if the device has not yet completed an autotune probe for
- * this family. Surviving accessor post-Phase-3; the per-device
- * fam_rate_hps[] is still populated by the warm-probe path and read by
- * external callers if they need a rate estimate. */
-double gpu_opencl_fam_rate(int dev_idx, int fam) {
-    if (dev_idx < 0 || dev_idx >= num_gpu_devs) return 0.0;
-    if (fam < 0 || fam >= FAM_COUNT) return 0.0;
-    return gpu_devs[dev_idx].fam_rate_hps[fam];
-}
-
 /* BF Phase 3 (2026-05-10): gpu_opencl_bf_set_partition + gpu_opencl_bf_-
  * set_tail_start retired alongside the rest of the bf_partition_setup
  * machinery. RCS history retains the prior implementations (gpu_opencl.c
  * rev 1.160). */
 
-/* ===================================================================
- * Phase 6.1: synchronous and asynchronous warm-probe.
- *
- * On the lazy autotune path (inside dispatch_batch), the timing probe
- * runs only when a device first dispatches a kernel for a given family.
- * That is too late for bf_partition_setup, which needs per-device rates
- * BEFORE dispatch starts. Phase 6.1 fixes this by exposing the same
- * timing-probe logic as a callable function, plus an async dispatcher
- * that probes every device in parallel via a one-shot pthread per device.
- *
- * gpu_opencl_warm_probe(dev, op): synchronous. Idempotent — no-op if
- *     fam_timed[fam] is already set. Allocates buffer space if needed,
- *     populates a synthetic 32-hex-char input word, sets all kernel args,
- *     runs the same probe loop as dispatch_batch's autotune block, and
- *     stores fam_max_items / fam_timed / fam_rate_hps.
- * gpu_opencl_warm_probe_async(op): launches one pthread per device.
- * gpu_opencl_warm_probe_wait(): joins all outstanding probe threads.
- * =================================================================== */
-
-extern int gpu_op_category(int op);
-
-void gpu_opencl_warm_probe(int dev_idx, int op) {
-    if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return;
-    int fam = gpu_op_family(op);
-    if (fam < 0 || fam >= FAM_COUNT) return;
-
-    struct gpu_device *d = &gpu_devs[dev_idx];
-    /* Skip probe on disabled devices — same VRAM that wouldn't fit the
-     * compact table won't fit synthetic probe buffers either, and even
-     * if it did, the device is going to be skipped by every dispatch
-     * path so there's no point calibrating it. */
-    if (d->device_disabled) {
-        d->fam_timed[fam] = 1;  /* prevent re-entry */
-        return;
-    }
-    if (d->fam_timed[fam]) return;          /* probe already done */
-
-    /* AMD HSA fault on this code path (task #44 — root cause not yet
-     * narrowed). Production rules/packed/iter dispatch works correctly on
-     * AMD; only this synthetic-buffer probe path triggers
-     * HSA_STATUS_ERROR_MEMORY_FAULT. Auto-skip for AMD devices and let
-     * bf_partition_setup fall back to single-cursor mode. NVIDIA path
-     * unchanged. Override either way via MDXFIND_SKIP_WARMUP=1.
-     * MDXFIND_FORCE_WARMUP=1 overrides the AMD auto-skip (for debugging). */
-    {
-        /* The AMD auto-skip always applies; MDXFIND_FORCE_WARMUP used to
-         * override it for debugging. */
-        if ((strstr(d->name, "AMD") || strstr(d->name, "Radeon") ||
-             strncmp(d->name, "gfx", 3) == 0)) {
-            if (!d->fam_timed[fam]) {
-                GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: warm-probe skipped (AMD device, task #44)\n", dev_idx);
-                d->fam_timed[fam] = 1;   /* prevent re-entry */
-            }
-            return;
-        }
-    }
-
-    int cat = gpu_op_category(op);
-    int is_salted = (cat == GPU_CAT_SALTED || cat == GPU_CAT_SALTPASS);
-    int is_bcrypt = (fam == FAM_BCRYPT);
-    /* Phase 6.2: warm-probe is callable BEFORE set_mask runs, so we
-     * synthesize a mask-mode probe even if gpu_mask_total is still 0. */
-    int is_mask   = (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED);
-    if (!is_mask && !is_salted) return;     /* probe meaningful only for these */
-
-    if (op < 0 || op >= MAX_GPU_KERNELS) return;
-    struct gpu_kern *gk = &dev_kerns[dev_idx].kerns[op];
-    if (!gk || !gk->kernel) return;
-    cl_kernel kern = gk->kernel;
-    size_t local = kern_get_local_size(gk);
-    if (local == 0) local = 1;
-
-    /* ===== Phase 6.2: synthesize compact table and mask if main hasn't
-     * uploaded the real ones yet. Lets warm-probe fire right after
-     * gpu_opencl_compile_families(), overlapping with the rest of
-     * mdxfind's BF activation setup. After the probe completes, the
-     * synthetic buffers are released; main's set_compact_table/set_mask
-     * can run any time (concurrently is unsafe — but the wait at
-     * bf_partition_setup serializes them). ===== */
-    cl_int berr;
-    cl_mem syn_compact_fp = NULL, syn_compact_idx = NULL, syn_mask_desc = NULL;
-    cl_mem syn_salt_data = NULL, syn_salt_off = NULL, syn_salt_len = NULL;
-    cl_mem syn_hash_data = NULL, syn_hash_data_off = NULL, syn_hash_data_len = NULL;
-    cl_mem syn_ovfl_keys = NULL, syn_ovfl_hashes = NULL, syn_ovfl_offs = NULL, syn_ovfl_lens = NULL;
-    cl_mem use_compact_fp  = d->b_compact_fp;
-    cl_mem use_compact_idx = d->b_compact_idx;
-    cl_mem use_mask_desc   = d->bgpu_mask_desc;
-    cl_mem use_salt_data   = d->b_salt_data;
-    cl_mem use_salt_off    = d->b_salt_off;
-    cl_mem use_salt_len    = d->b_salt_len;
-    cl_mem use_hash_data       = d->b_hash_data;
-    cl_mem use_hash_data_off   = d->b_hash_data_off;
-    cl_mem use_hash_data_len   = d->b_hash_data_len;
-    cl_mem use_ovfl_keys       = d->b_overflow_keys;
-    cl_mem use_ovfl_hashes     = d->b_overflow_hashes;
-    cl_mem use_ovfl_offs       = d->b_overflow_offsets;
-    cl_mem use_ovfl_lens       = d->b_overflow_lengths;
-    int      use_n_prepend = gpu_mask_n_prepend;
-    int      use_n_append  = gpu_mask_n_append;
-    uint64_t use_mask_total = gpu_mask_total;
-
-    if (!use_compact_fp || !use_compact_idx) {
-        /* 4-slot empty compact table — kernel reads, finds no fingerprint
-         * matches, returns no hits. Sufficient for rate measurement. */
-        uint32_t zeros[4] = {0};
-        syn_compact_fp = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(zeros), zeros, &berr);
-        syn_compact_idx = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(zeros), zeros, &berr);
-        if (!syn_compact_fp || !syn_compact_idx) {
-            if (syn_compact_fp) clReleaseMemObject(syn_compact_fp);
-            if (syn_compact_idx) clReleaseMemObject(syn_compact_idx);
-            return;
-        }
-        use_compact_fp = syn_compact_fp;
-        use_compact_idx = syn_compact_idx;
-    }
-
-    /* AMD strict-bounds fix (task #44): when the kernel binds an arg slot
-     * to a NULL cl_mem, AMD's HSA faults the moment the compiled kernel
-     * loads the buffer pointer for that arg, even if it never dereferences.
-     * NVIDIA tolerates NULL silently. Synthesize 256-byte dummies (not 1-byte)
-     * for every potentially-NULL arg: AMD validates buffer bounds against actual
-     * read width, and some unsalted-kernel "unused" args share this slot. */
-    {
-        uint8_t zero_buf[256] = {0};
-        cl_mem *targets[] = {
-            &syn_salt_data,    &syn_salt_off,    &syn_salt_len,
-            &syn_hash_data,    &syn_hash_data_off, &syn_hash_data_len,
-            &syn_ovfl_keys,    &syn_ovfl_hashes,
-            &syn_ovfl_offs,    &syn_ovfl_lens
-        };
-        cl_mem *uses[] = {
-            &use_salt_data,    &use_salt_off,    &use_salt_len,
-            &use_hash_data,    &use_hash_data_off, &use_hash_data_len,
-            &use_ovfl_keys,    &use_ovfl_hashes,
-            &use_ovfl_offs,    &use_ovfl_lens
-        };
-        int n = (int)(sizeof(uses) / sizeof(uses[0]));
-        for (int i = 0; i < n; i++) {
-            if (!*uses[i]) {
-                *targets[i] = clCreateBuffer(d->ctx,
-                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 256, zero_buf, &berr);
-                if (!*targets[i]) {
-                    /* alloc failed — release any prior synthesized + bail */
-                    for (int j = 0; j <= i; j++) if (*targets[j]) clReleaseMemObject(*targets[j]);
-                    if (syn_compact_fp)  clReleaseMemObject(syn_compact_fp);
-                    if (syn_compact_idx) clReleaseMemObject(syn_compact_idx);
-                    return;
-                }
-                *uses[i] = *targets[i];
-            }
-        }
-    }
-
-    if (is_mask && use_mask_total == 0) {
-        /* Synthetic ?l^8 mask: 8 append positions, charset 'a'-'z' each.
-         * Cardinality = 26^8 ≈ 2.1e11 — large enough that probe_size
-         * doublings can grow num_masks freely up to the uint32_t cap.
-         * Format matches gpu_opencl_set_mask: sizes[ntotal] then
-         * tables[ntotal][256]. */
-        const int syn_ntotal = 8;
-        int bufsize = syn_ntotal + syn_ntotal * 256;
-        unsigned char *desc = (unsigned char *)calloc(1, bufsize);
-        if (!desc) {
-            if (syn_compact_fp) clReleaseMemObject(syn_compact_fp);
-            if (syn_compact_idx) clReleaseMemObject(syn_compact_idx);
-            return;
-        }
-        for (int i = 0; i < syn_ntotal; i++) desc[i] = 26;
-        for (int i = 0; i < syn_ntotal; i++) {
-            unsigned char *tbl = desc + syn_ntotal + i * 256;
-            for (int c = 0; c < 26; c++) tbl[c] = 'a' + c;
-        }
-        syn_mask_desc = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, bufsize, desc, &berr);
-        free(desc);
-        if (!syn_mask_desc) {
-            if (syn_compact_fp) clReleaseMemObject(syn_compact_fp);
-            if (syn_compact_idx) clReleaseMemObject(syn_compact_idx);
-            return;
-        }
-        use_mask_desc   = syn_mask_desc;
-        use_n_prepend   = 0;
-        use_n_append    = syn_ntotal;
-        use_mask_total  = 1;
-        for (int i = 0; i < syn_ntotal; i++) use_mask_total *= 26;
-    }
-
-    /* Synthetic input: 1024 zero words. With num_words=1 the probe loop
-     * caps probe_size on max_items before pms ever reaches the 200-400ms
-     * target, leaving sub-ms timings whose rate-formula divides-by-tiny
-     * and produces spurious 100+ TH/s rates. 1024 words gives the GPU
-     * enough total work that the doublings can converge. */
-    int num_words = 1024;
-    int word_stride = 256;  /* generous default; matches salted password stride */
-    if (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) {
-        if (op == JOB_SHA512 || op == JOB_SHA384 ||
-            op == JOB_SHA512RAW || op == JOB_SHA384RAW) word_stride = 128;
-        else if (op == JOB_MD6256) word_stride = 64;
-        else word_stride = 64;
-    }
-    size_t words_size    = (size_t)num_words * word_stride;
-    size_t hexlens_upload = (size_t)num_words * sizeof(uint16_t);
-
-    cl_int err;
-    if (words_size > d->hexhash_cap) {
-        if (d->b_hexhashes) clReleaseMemObject(d->b_hexhashes);
-        d->b_hexhashes = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, words_size, NULL, &err);
-        d->hexhash_cap = words_size;
-    }
-    if (hexlens_upload > d->hexlens_cap) {
-        if (d->b_hexlens) clReleaseMemObject(d->b_hexlens);
-        d->b_hexlens = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY, hexlens_upload, NULL, &err);
-        d->hexlens_cap = hexlens_upload;
-    }
-
-    /* Fill device word buffer with valid probe inputs.
-     * Salted kernels: hex-encoded passwords — zero fill is fine (length=32
-     *   means 16 zero bytes, a valid probe candidate).
-     * Unsalted/mask kernels: pre-padded MD5/SHA blocks — zero fill causes
-     *   M[14]=0 → total_len=0 → app_start=(0-n_app) which is negative,
-     *   causing OOB private-array access that faults AMD GPUs.
-     *   Fix: set M[14]=64 per block (= 8-byte word bit count), so
-     *   total_len=8 and app_start=8-n_app=0 for the ?l^8 synthetic mask. */
-    if (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED) {
-        /* word_stride=64 bytes = 16 uint32. Write M[14]=64 per block. */
-        uint32_t *wbuf = (uint32_t *)calloc(1, words_size);
-        if (!wbuf) GPU_FATAL("warm-probe wbuf calloc(%zu) failed dev=%d", words_size, dev_idx);
-        for (int wi = 0; wi < num_words; wi++) {
-            /* M[2] = 0x80 byte in LE uint32: padding sentinel */
-            wbuf[wi * 16 + 2] = 0x00000080u;
-            /* M[14] = bit count = 8*8 = 64 */
-            wbuf[wi * 16 + 14] = 64;
-        }
-        {
-            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_hexhashes, CL_TRUE, 0, words_size, wbuf, 0, NULL, NULL);
-            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexhashes (mask/unsalted seed) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
-        }
-        free(wbuf);
-    } else {
-        /* Zero seed. gpu_zero_buffer tries the fill and falls back to a
-         * host-staged write: the two arms this replaces treated a fill
-         * rejection as fatal although the fallback was right there. */
-        cl_int _e = gpu_zero_buffer(d->queue, d->b_hexhashes, words_size);
-        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hexhashes (salted seed, fill and host stage) dev=%d size=%zu err=%d", dev_idx, words_size, _e);
-    }
-    /* Each entry length = 32 (a valid hex hash slot). Build host-side. */
-    {
-        uint16_t *lens = (uint16_t *)malloc(hexlens_upload);
-        if (!lens) GPU_FATAL("warm-probe hexlens malloc(%zu) failed dev=%d", hexlens_upload, dev_idx);
-        for (int i = 0; i < num_words; i++) lens[i] = 32;
-        {
-            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_hexlens, CL_TRUE, 0, hexlens_upload, lens, 0, NULL, NULL);
-            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_hexlens dev=%d size=%zu err=%d", dev_idx, hexlens_upload, _e);
-        }
-        free(lens);
-    }
-
-    OCLParams params;
-    memset(&params, 0, sizeof(params));
-    params.compact_mask    = _compact_mask;
-    params.num_words       = num_words;
-    params.num_salts       = d->salts_count;
-    params.salt_start      = 0;
-    params.max_probe       = 256;
-    params.hash_data_count = _hash_data_count;
-    params.max_hits        = GPU_MAX_HITS;
-    params.overflow_count  = _overflow_count;
-    params.max_iter        = (cat == GPU_CAT_ITER) ? (d->max_iter - 1) : d->max_iter;
-    params.num_masks       = is_mask ? 1 : 0;
-    params.mask_start      = 0;
-    /* Phase 6.2: read mask geometry from local use_* values, which are the
-     * synthetic ?l^8 values when gpu_mask_total was 0 at entry, else the
-     * real (already-uploaded) values. */
-    params.n_prepend       = use_n_prepend;
-    params.n_append        = use_n_append;
-
-    uint32_t zero = 0;
-    {
-        cl_int _e = gpu_zero_buffer(d->queue, d->b_hit_count, sizeof(zero));
-        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hit_count (pre-bind) dev=%d err=%d", dev_idx, _e);
-        _e = clFinish(d->queue);
-        if (_e != CL_SUCCESS) GPU_FATAL("warm-probe clFinish (pre-bind) dev=%d err=%d", dev_idx, _e);
-    }
-
-    /* Bind kernel args identically to dispatch_batch — but use the
-     * synthetic compact/mask buffers when the real ones aren't loaded yet
-     * (Phase 6.2: lets warm-probe fire before set_compact_table/set_mask). */
-    int a = 0;
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hexhashes);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hexlens);
-    if (cat == GPU_CAT_MASK || cat == GPU_CAT_UNSALTED)
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &use_mask_desc);
-    else
-        clSetKernelArg(kern, a++, sizeof(cl_mem), &use_salt_data);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_salt_off);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_salt_len);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_compact_fp);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_compact_idx);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_params);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_hash_data);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_hash_data_off);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_hash_data_len);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hits);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &d->b_hit_count);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_ovfl_keys);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_ovfl_hashes);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_ovfl_offs);
-    clSetKernelArg(kern, a++, sizeof(cl_mem), &use_ovfl_lens);
-
-    int total_salts     = is_salted ? d->salts_count : 0;
-    int salt_start_base = is_salted ? d->salt_resume : 0;
-    total_salts         = is_salted ? (total_salts - salt_start_base) : 0;
-
-    /* === Same probe loop as dispatch_batch's autotune block === */
-    uint32_t probe_size = is_bcrypt ? 1 : TIMING_INITIAL_SIZE;
-    uint32_t best_size = probe_size;
-    double best_ms = 0;
-
-    for (int probe = 0; probe < 20; probe++) {
-        uint32_t zero_hit = 0;
-        {
-            cl_int _e = gpu_zero_buffer(d->queue, d->b_hit_count, sizeof(zero_hit));
-            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe zero b_hit_count (iter %d) dev=%d err=%d", probe, dev_idx, _e);
-        }
-
-        OCLParams probe_params = params;
-        if (is_mask) {
-            uint32_t pm = probe_size / (num_words > 0 ? num_words : 1);
-            if (pm < 1) pm = 1;
-            if ((uint64_t)pm > use_mask_total)
-                pm = (use_mask_total < 0xFFFFFFFF) ? (uint32_t)use_mask_total : 0xFFFFFFFF;
-            probe_params.num_masks = pm;
-            probe_params.mask_start = 0;
-        } else if (is_salted) {
-            int ps = (int)(probe_size / (num_words > 0 ? num_words : 1));
-            if (ps < 1) ps = 1;
-            if (ps > d->salts_count) ps = d->salts_count;
-            probe_params.num_salts = ps;
-            probe_params.salt_start = salt_start_base;
-        }
-        {
-            cl_int _e = clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0, sizeof(probe_params), &probe_params, 0, NULL, NULL);
-            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe write b_params (iter %d) dev=%d err=%d", probe, dev_idx, _e);
-        }
-
-        size_t probe_global = is_mask
-            ? (size_t)num_words * probe_params.num_masks
-            : (size_t)num_words * probe_params.num_salts;
-        probe_global = ((probe_global + local - 1) / local) * local;
-
-        struct timespec pt0, pt1;
-        clock_gettime(CLOCK_MONOTONIC, &pt0);
-        cl_int perr = clEnqueueNDRangeKernel(d->queue, kern, 1, NULL, &probe_global, &local, 0, NULL, NULL);
-        if (perr != CL_SUCCESS) break;
-        {
-            cl_int _e = clFinish(d->queue);
-            if (_e != CL_SUCCESS) GPU_FATAL("warm-probe clFinish (post-NDRange iter %d) dev=%d err=%d", probe, dev_idx, _e);
-        }
-        clock_gettime(CLOCK_MONOTONIC, &pt1);
-        double pms = (pt1.tv_sec - pt0.tv_sec) * 1e3 + (pt1.tv_nsec - pt0.tv_nsec) / 1e6;
-
-        best_size = probe_size;
-        best_ms = pms;
-
-        if (is_bcrypt) {
-            if (pms > 0) {
-                double per_item = pms;
-                uint32_t target = (uint32_t)(TIMING_BUDGET_MIN_MS / per_item);
-                if (target < 1) target = 1;
-                best_size = target;
-                d->fam_rate_hps[fam] = (double)best_size * 1000.0 / pms;
-            }
-            break;
-        }
-
-        if (pms >= TIMING_BUDGET_MIN_MS && pms <= TIMING_BUDGET_MAX_MS) break;
-        if (pms > TIMING_BUDGET_MAX_MS) {
-            best_size = probe_size / 2;
-            if (best_size < TIMING_INITIAL_SIZE) best_size = TIMING_INITIAL_SIZE;
-            break;
-        }
-        if (pms >= TIMING_WATCHDOG_MS) break;
-
-        uint64_t next = (uint64_t)probe_size * 2;
-        uint64_t max_items = is_salted ? (uint64_t)num_words * d->salts_count
-                           : is_mask   ? (uint64_t)num_words * use_mask_total
-                           : (uint64_t)num_words;
-        if (next > max_items) break;
-        if (next > 0x7FFFFFFF) next = 0x7FFFFFFF;
-        probe_size = (uint32_t)next;
-    }
-
-    /* Phase 6.1.1: rescue rate measurement on very fast GPUs.
-     * If the probe loop converged with pms < TIMING_BUDGET_MIN_MS because
-     * probe_size hit the uint32_t cap (RTX 3080 etc — 2.1B work items
-     * complete in sub-ms), dispatch the same kernel N times back-to-back
-     * to accumulate a measurable timing window. The kernel args, params,
-     * and probe_global from the last loop iteration are still bound. */
-    double final_ms = best_ms;
-    uint64_t total_work = best_size;
-    if (!is_bcrypt && best_size > 0 && best_ms < TIMING_BUDGET_MIN_MS) {
-        uint32_t reps = 1;
-        if (best_ms > 0) {
-            while ((double)reps * best_ms < TIMING_BUDGET_MIN_MS && reps < 1024)
-                reps *= 2;
-        } else {
-            reps = 256;  /* probe was unmeasurable; try 256x first */
-        }
-        if (reps > 1) {
-            uint32_t zh = 0;
-            {
-                cl_int _e = gpu_zero_buffer(d->queue, d->b_hit_count, sizeof(zh));
-                if (_e != CL_SUCCESS) GPU_FATAL("warm-probe rescue zero b_hit_count dev=%d err=%d", dev_idx, _e);
-            }
-            /* Re-establish probe_global from last iteration's params. */
-            uint32_t last_pm = (params.num_masks > 0) ? params.num_masks : best_size;
-            size_t resc_global = is_mask
-                ? (size_t)num_words * last_pm
-                : (size_t)num_words * params.num_salts;
-            resc_global = ((resc_global + local - 1) / local) * local;
-            struct timespec rt0, rt1;
-            clock_gettime(CLOCK_MONOTONIC, &rt0);
-            for (uint32_t r = 0; r < reps; r++) {
-                cl_int re = clEnqueueNDRangeKernel(d->queue, kern, 1, NULL,
-                    &resc_global, &local, 0, NULL, NULL);
-                if (re != CL_SUCCESS) { reps = r; break; }
-            }
-            {
-                cl_int _e = clFinish(d->queue);
-                if (_e != CL_SUCCESS) GPU_FATAL("warm-probe rescue clFinish dev=%d reps=%u err=%d", dev_idx, reps, _e);
-            }
-            clock_gettime(CLOCK_MONOTONIC, &rt1);
-            double total_ms = (rt1.tv_sec - rt0.tv_sec) * 1e3
-                            + (rt1.tv_nsec - rt0.tv_nsec) / 1e6;
-            if (total_ms >= 1.0 && reps > 0) {
-                final_ms = total_ms;
-                total_work = (uint64_t)best_size * reps;
-            }
-        }
-    }
-
-    d->fam_max_items[fam] = best_size;
-    d->fam_timed[fam] = 1;
-    if (final_ms >= 1.0 && d->fam_rate_hps[fam] == 0.0)
-        d->fam_rate_hps[fam] = (double)total_work * 1000.0 / final_ms;
-    GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: warm-probed family %d: max_items=%u (%.1fms, %.1f Mh/s)\n",
-            dev_idx, fam, best_size, final_ms, d->fam_rate_hps[fam] / 1e6);
-
-    /* Phase 6.2: release synthetic buffers (kernel arg state is irrelevant
-     * — main's dispatch_batch rebinds before any subsequent kernel call). */
-    if (syn_compact_fp)  clReleaseMemObject(syn_compact_fp);
-    if (syn_compact_idx) clReleaseMemObject(syn_compact_idx);
-    if (syn_mask_desc)   clReleaseMemObject(syn_mask_desc);
-    if (syn_salt_data)      clReleaseMemObject(syn_salt_data);
-    if (syn_salt_off)       clReleaseMemObject(syn_salt_off);
-    if (syn_salt_len)       clReleaseMemObject(syn_salt_len);
-    if (syn_hash_data)      clReleaseMemObject(syn_hash_data);
-    if (syn_hash_data_off)  clReleaseMemObject(syn_hash_data_off);
-    if (syn_hash_data_len)  clReleaseMemObject(syn_hash_data_len);
-    if (syn_ovfl_keys)      clReleaseMemObject(syn_ovfl_keys);
-    if (syn_ovfl_hashes)    clReleaseMemObject(syn_ovfl_hashes);
-    if (syn_ovfl_offs)      clReleaseMemObject(syn_ovfl_offs);
-    if (syn_ovfl_lens)      clReleaseMemObject(syn_ovfl_lens);
-}
-
-/* Async dispatcher: one pthread per device. Threads detach on completion;
- * the caller blocks at gpu_opencl_warm_probe_wait() until all are joined. */
-struct probe_arg { int dev_idx; int op; };
-
-static pthread_t probe_threads[MAX_GPU_DEVICES];
-static int       probe_threads_active[MAX_GPU_DEVICES];
-static int       probe_thread_count = 0;
-static int       probe_op_cached    = -1;
-
-static void *probe_thread_body(void *vp) {
-    struct probe_arg *p = (struct probe_arg *)vp;
-    gpu_opencl_warm_probe(p->dev_idx, p->op);
-    free(p);
-    return NULL;
-}
-
-void gpu_opencl_warm_probe_async(int op) {
-    if (!ocl_ready) return;
-    /* The warm probe always runs; MDXFIND_SKIP_WARMUP used to skip it. */
-    if (probe_thread_count > 0) {
-        fprintf(stderr, "WARN: warm_probe_async early-return: probe_thread_count=%d (stale from prior session?)\n",
-                probe_thread_count);
-        return;   /* already running — skip */
-    }
-    probe_op_cached = op;
-    for (int d = 0; d < num_gpu_devs && d < MAX_GPU_DEVICES; d++) {
-        struct probe_arg *arg = (struct probe_arg *)malloc(sizeof(*arg));
-        if (!arg) continue;
-        arg->dev_idx = d;
-        arg->op      = op;
-        if (pthread_create(&probe_threads[d], NULL, probe_thread_body, arg) == 0) {
-            probe_threads_active[d] = 1;
-            probe_thread_count++;
-        } else {
-            free(arg);
-            probe_threads_active[d] = 0;
-        }
-    }
-}
-
-void gpu_opencl_warm_probe_wait(void) {
-    for (int d = 0; d < num_gpu_devs && d < MAX_GPU_DEVICES; d++) {
-        if (probe_threads_active[d]) {
-            pthread_join(probe_threads[d], NULL);
-            probe_threads_active[d] = 0;
-        }
-    }
-    probe_thread_count = 0;
-    probe_op_cached    = -1;
-    __sync_synchronize();
-}
+/* The Phase 6.1 warm probe (gpu_opencl_warm_probe / _async / _wait) and
+ * gpu_opencl_fam_rate were removed 2026-11-15: nothing read the rates it
+ * stored once bf_partition_setup was retired, and its threads were never
+ * joined.  RCS holds them (gpu_opencl.c 1.237). */
 
 int gpu_opencl_set_compact_table(int dev_idx,
     uint32_t *compact_fp, uint32_t *compact_idx,
@@ -5315,8 +4300,10 @@ int gpu_opencl_get_op(int dev_idx) {
 #ifndef MAX_MASK_POS
 #define MAX_MASK_POS 32
 #endif
-uint8_t gpu_mask_desc[MAX_MASK_POS + MAX_MASK_POS * 256];
-uint8_t gpu_mask_sizes[MAX_MASK_POS];  /* for hit reconstruction */
+/* MAX_MASK_POS is per side and both sides are packed here, hence the 2x
+ * (the template accepts MASK_POS_CAP = 32 per side below). */
+uint8_t gpu_mask_desc[2 * MAX_MASK_POS + 2 * MAX_MASK_POS * 256];
+uint8_t gpu_mask_sizes[2 * MAX_MASK_POS];  /* for hit reconstruction */
 int gpu_mask_n_prepend = 0;
 int gpu_mask_n_append = 0;
 uint64_t gpu_mask_total = 0;
@@ -5334,15 +4321,6 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
     gpu_mask_total = 1;
     for (int i = 0; i < ntotal; i++)
         gpu_mask_total *= gpu_mask_wire_size(sizes[i]);   /* 0 means 256 */
-    /* Upload mask descriptor to all devices */
-    int bufsize = ntotal + ntotal * 256;
-    for (int i = 0; i < num_gpu_devs; i++) {
-        struct gpu_device *d = &gpu_devs[i];
-        if (d->bgpu_mask_desc) clReleaseMemObject(d->bgpu_mask_desc);
-        cl_int err;
-        d->bgpu_mask_desc = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                         bufsize, gpu_mask_desc, &err);
-    }
     /* Memo B Phase B7.1-B7.5/B7.8: upload the multi-position prepend+
      * append charsets and per-position sizes to the template path's
      * two dedicated buffers. The B7.5-eligible configuration is
@@ -5390,30 +4368,48 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
         }
         for (int i = 0; i < num_gpu_devs; i++) {
             struct gpu_device *d = &gpu_devs[i];
+            if (d->device_disabled) continue;   /* its context is not usable */
             if (d->b_template_mask_charsets) clReleaseMemObject(d->b_template_mask_charsets);
-            cl_int err;
+            if (d->b_template_mask_sizes) clReleaseMemObject(d->b_template_mask_sizes);
+            d->b_template_mask_sizes = NULL;
+            cl_int err, err2 = CL_SUCCESS;
             d->b_template_mask_charsets = clCreateBuffer(d->ctx,
                 CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                 sizeof(b7_charsets), b7_charsets, &err);
-            if (err != CL_SUCCESS || !d->b_template_mask_charsets) {
+            if (err == CL_SUCCESS && d->b_template_mask_charsets)
+                d->b_template_mask_sizes = clCreateBuffer(d->ctx,
+                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                    sizeof(b7_sizes), b7_sizes, &err2);
+            if (err == CL_SUCCESS && d->b_template_mask_charsets
+                && err2 == CL_SUCCESS && d->b_template_mask_sizes)
+                continue;
+            {
+                cl_int e = (err != CL_SUCCESS) ? err : err2;
+                const char *what = (err != CL_SUCCESS || !d->b_template_mask_charsets)
+                                   ? "b_template_mask_charsets" : "b_template_mask_sizes";
+                /* Out of device memory is the one external failure allowed
+                 * to return: -1 with the mask state of a run that never
+                 * uploaded one.  The brute-force caller then runs the mask
+                 * on the CPU; the -n/-N caller is FATAL (no CPU route there).
+                 * Anything else is a defect: FATAL. */
+                if (e != CL_MEM_OBJECT_ALLOCATION_FAILURE
+                    && e != CL_OUT_OF_RESOURCES && e != CL_OUT_OF_HOST_MEMORY)
+                    GPU_FATAL("%s clCreateBuffer err=%d on dev %d", what, e, i);
                 fprintf(stderr,
-                    "OpenCL GPU[%d]: b_template_mask_charsets alloc failed "
-                    "(err=%d) — template B7 mask unavailable on "
-                    "this device; will route mask jobs to slab path.\n",
-                    i, err);
-                d->b_template_mask_charsets = NULL;
-            }
-            if (d->b_template_mask_sizes) clReleaseMemObject(d->b_template_mask_sizes);
-            d->b_template_mask_sizes = clCreateBuffer(d->ctx,
-                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                sizeof(b7_sizes), b7_sizes, &err);
-            if (err != CL_SUCCESS || !d->b_template_mask_sizes) {
-                fprintf(stderr,
-                    "OpenCL GPU[%d]: b_template_mask_sizes alloc failed "
-                    "(err=%d) — template B7 mask unavailable on "
-                    "this device; will route mask jobs to slab path.\n",
-                    i, err);
-                d->b_template_mask_sizes = NULL;
+                    "OpenCL GPU[%d]: insufficient memory for the mask tables "
+                    "(%s err=%d) -- not uploaded\n", i, what, e);
+                for (int k = 0; k < num_gpu_devs; k++) {
+                    struct gpu_device *dk = &gpu_devs[k];
+                    if (dk->b_template_mask_charsets) clReleaseMemObject(dk->b_template_mask_charsets);
+                    if (dk->b_template_mask_sizes) clReleaseMemObject(dk->b_template_mask_sizes);
+                    dk->b_template_mask_charsets = NULL;
+                    dk->b_template_mask_sizes = NULL;
+                }
+                /* The state a run that never called set_mask has. */
+                gpu_mask_n_prepend = 0;
+                gpu_mask_n_append = 0;
+                gpu_mask_total = 0;
+                return -1;
             }
         }
     }
@@ -5468,169 +4464,6 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
  * harness (see gpu_rules_test.c). HashMob 100k rule-set classifier
  * coverage is 99.99%.
  * ====================================================================== */
-
-/* Lazy-build the rules program for this device. The kernel uses
- * gpu_common.cl (md5_block, OCLParams, EMIT_HIT_4, probe_compact)
- * so we concat gpu_common_str + gpu_md5_rules_str. Held separately
- * from the per-family programs since the rules kernel is its own
- * independent dispatch path. */
-/* Build the md5_rules program for this device. Note: we deliberately
- * do NOT create the kernel object here — that's deferred to the first
- * dispatch_md5_rules() call (see gpu_opencl_rules_kernel_lazy() below).
- *
- * Why: clCreateKernel'd-but-never-used kernel objects cause NVIDIA's
- * runtime to emit CL_INVALID_KERNEL_ARGS at context-finalize time
- * because the kernel never had its args bound. Sub-commit A's
- * gpu_opencl_set_rules() runs at session start, but in workloads
- * where the chokepoint never actually dispatches the rules engine
- * (e.g., non-MD5 sessions, or sub-commits A/C1 where the dispatch
- * path is unreachable) the kernel sits unused. Lazy kernel creation
- * means we only have a kernel object when we're about to bind args
- * to it, eliminating the unbound-kernel window. Cost: one branch in
- * dispatch_md5_rules() and a few microseconds at first dispatch.
- */
-static int gpu_opencl_rules_compile(struct gpu_device *d, int dev_idx) {
-    /* This backend HAS the UTF-32 kernel bodies (md5_rules_mixed_phase0 in
-     * gpu_md5_rules32.cl), so it is entitled to claim capability.  A backend
-     * that carries only the generated walker must NOT -- see
-     * gpu_u32_set_backend_capable.  Claimed here rather than at device
-     * enumeration because this is the function that would fail if the sources
-     * did not compile. */
-    gpu_u32_set_backend_capable(1);
-    if (d->prog_md5_rules) return 0;       /* already built */
-    cl_int err = CL_SUCCESS;
-    /* The UTF-32 sources are appended only when the UTF-32 path is active --
-     * i.e. `-8` was given and this backend can run the walker.
-     * Two reasons, and the second is the important one:
-     *   - 30 KB of constant tables and a second walker cost compile time and
-     *     constant-memory budget that a byte-mode run has no use for;
-     *   - the source list is part of the kernel-cache key, so a byte-mode run
-     *     keeps hitting the cache entries it already has.  Compiling the
-     *     bigger program unconditionally would invalidate every cached rules
-     *     binary in the fleet on the first run of this build. */
-    const char *sources[4] = { gpu_common_str, gpu_md5_rules_str,
-                               NULL, NULL };
-    cl_uint nsrc = 2;
-    if (gpu_u32_active()) {
-        /* TWO sources, not three.  gpu_u32_walker.cl is GENERATED with
-         * gpu_u32_tables.cl INLINED into it (gen_u32_walker.py concatenates
-         * them so the address-space macros are defined before the tables are
-         * declared).  Passing the tables as a separate source as well declared
-         * every array TWICE and, worse, the standalone copy was compiled before
-         * anything defined CL_CONSTANT -- the JIT echoed
-         * `CL_CONSTANT uint u32_marks[580] = {` back as a syntax error, the
-         * rules program failed to build, and mdxfind fell back to the CPU rule
-         * path for the whole run.  Loud, but the recovered COUNT was still
-         * right because the CPU did the work, so only the stderr line
-         * distinguished it from a successful GPU run. */
-        sources[2] = gpu_u32_walker_str;
-        sources[3] = gpu_md5_rules32_str;
-        nsrc = 4;
-    }
-    /* gpu_kernel_cache_build_program() handles cache load/store + atomic
-     * compile-with-lock when MDXFIND_CACHE is set; falls through to plain
-     * source compile when the cache is disabled. Either way returns the
-     * built cl_program (or NULL on failure) and the last cl_int via err. */
-    d->prog_md5_rules = gpu_kernel_cache_build_program(d->ctx, d->dev,
-                                                       nsrc, sources,
-                                                       "-cl-std=CL1.2", &err);
-    if (!d->prog_md5_rules || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_md5_rules) {
-            clGetProgramBuildInfo(d->prog_md5_rules, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: rules program build error (err=%d) — DEVICE DISABLED, no GPU work routes here:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_md5_rules) clReleaseProgram(d->prog_md5_rules);
-        d->prog_md5_rules = NULL;
-        d->device_disabled = 1;
-        return -1;
-    }
-    return 0;
-}
-
-/* Cached env-var read. MDXFIND_GPU_VALIDATOR=<anything> swaps the
- * production md5_rules_phase0 kernel for md5_rules_phase0_validate
- * and emits per-(word,rule) VALIDATE lines on stderr in the same
- * format as the CPU validator (ruleproc.c rev 1.24,
- * MDXFIND_RULE_VALIDATOR=1). When unset (the production path),
- * this function returns 0 after one getenv() call — no measurable
- * overhead on the dispatch hot path. */
-static int gpu_validator_enabled(void) {
-    return 0;   /* was MDXFIND_GPU_VALIDATOR */
-}
-
-/* Lazily create the md5_rules_phase0_validate kernel object. Only
- * called when the validator env var is set (see gpu_validator_enabled).
- * Mirrors gpu_opencl_rules_kernel_lazy below. */
-static int gpu_opencl_validate_kernel_lazy(struct gpu_device *d, int dev_idx) {
-    if (d->kern_md5_rules_phase0_validate) return 0;
-    if (!d->prog_md5_rules) return -1;
-    cl_int err;
-    d->kern_md5_rules_phase0_validate = clCreateKernel(d->prog_md5_rules,
-                                                       "md5_rules_phase0_validate",
-                                                       &err);
-    if (err != CL_SUCCESS || !d->kern_md5_rules_phase0_validate) {
-        fprintf(stderr, "OpenCL GPU[%d]: validator kernel create failed (err=%d) — DEVICE DISABLED, no GPU work routes here\n",
-                dev_idx, err);
-        d->kern_md5_rules_phase0_validate = NULL;
-        d->device_disabled = 1;
-        return -1;
-    }
-    return 0;
-}
-
-/* Lazily create md5_rules_mixed_phase0 -- the UTF-32 path's production
- * kernel.  Same 14-argument signature and same payload layout as
- * md5_rules_phase0, so the dispatch below swaps the handle and changes
- * nothing else.  That is what makes the T0/T1/T2 comparison measure the
- * kernel rather than the plumbing.
- *
- * A failure here is FATAL rather than a fall-back to the byte kernel.  A
- * silent fall-back would run the byte walker while the operator believed the
- * UTF-32 variant was being measured, and the result would look like a clean
- * completed run -- which is precisely the failure mode this exercise exists
- * to be able to detect. */
-static int gpu_opencl_rules32_kernel_lazy(struct gpu_device *d, int dev_idx) {
-    if (d->kern_md5_rules_mixed_phase0) return 0;
-    if (!d->prog_md5_rules) return -1;
-    cl_int err;
-    d->kern_md5_rules_mixed_phase0 =
-        clCreateKernel(d->prog_md5_rules, "md5_rules_mixed_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_md5_rules_mixed_phase0) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: md5_rules_mixed_phase0 kernel create "
-            "failed (err=%d) with -8 active. Refusing to fall "
-            "back to the byte walker: that would measure the baseline while "
-            "reporting the variant.\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    return 0;
-}
-
-/* Lazily create the md5_rules_phase0 kernel object. Called from
- * dispatch_md5_rules at the start of every dispatch — does work only
- * on the first call. See the comment on gpu_opencl_rules_compile()
- * for why kernel creation is deferred. */
-static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
-    if (d->kern_md5_rules_phase0) return 0;
-    if (!d->prog_md5_rules) return -1;
-    cl_int err;
-    d->kern_md5_rules_phase0 = clCreateKernel(d->prog_md5_rules,
-                                              "md5_rules_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_md5_rules_phase0) {
-        fprintf(stderr, "OpenCL GPU[%d]: rules kernel create failed (err=%d) — DEVICE DISABLED, no GPU work routes here\n",
-                dev_idx, err);
-        d->kern_md5_rules_phase0 = NULL;
-        d->device_disabled = 1;
-        return -1;
-    }
-    return 0;
-}
 
 /* ====================================================================
  * The generic dispatch template (Memo B, phases B2 through B7).
@@ -5953,8 +4786,7 @@ static int gpu_opencl_rules_kernel_lazy(struct gpu_device *d, int dev_idx) {
  * flips gpu_template.cl to its UTF-32 arm; the per-algorithm core supplies
  * template_init/template_finalize; gpu_template.cl is the kernel itself.
  *
- * The walker is appended ONLY when `-8` is active, for the same two reasons
- * as gpu_opencl_rules_compile():
+ * The walker is appended ONLY when `-8` is active, for two reasons:
  *   - ~30 KB of constant tables and a second walker cost compile time and
  *     24 KB of per-lane private memory that a byte-mode run has no use for;
  *   - the source list is part of the kernel-cache key, so a byte-mode run
@@ -6011,22 +4843,6 @@ static int gpu_opencl_template_compile(struct gpu_device *d, int dev_idx) {
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template) {
-            clGetProgramBuildInfo(d->prog_template, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template program build error (err=%d) "
-            "— template path unavailable; will fall back to "
-            "md5_rules_phase0:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template) clReleaseProgram(d->prog_template);
-        d->prog_template = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6037,15 +4853,9 @@ static int gpu_opencl_template_kernel_lazy(struct gpu_device *d, int dev_idx) {
     cl_int err;
     d->kern_template_phase0 = clCreateKernel(d->prog_template,
                                              "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 kernel create failed (err=%d) "
-            "— template path unavailable; will fall back to "
-            "md5_rules_phase0\n",
-            dev_idx, err);
-        d->kern_template_phase0 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5 template (err=%d) "
+                  "on device %d", err, dev_idx);
 
     /* R2 instrumentation: probe per-lane private memory size for the
      * template kernel. Used to track register pressure across vendors;
@@ -6105,22 +4915,6 @@ static int gpu_opencl_template_md5_bf_compile(struct gpu_device *d, int dev_idx)
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DBF_FAST_MD5=1",
         defines, &err);
-    if (!d->prog_template_md5_bf || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5_bf) {
-            clGetProgramBuildInfo(d->prog_template_md5_bf, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: BF-fast template program build error (err=%d) "
-            "— Phase 1.9 fast path unavailable; will fall back to slow "
-            "MD5 template kernel for BF dispatches:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_md5_bf) clReleaseProgram(d->prog_template_md5_bf);
-        d->prog_template_md5_bf = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6132,15 +4926,9 @@ static int gpu_opencl_template_md5_bf_kernel_lazy(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_md5_bf = clCreateKernel(d->prog_template_md5_bf,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5_bf) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (BF-fast MD5) kernel create "
-            "failed (err=%d) — Phase 1.9 fast path unavailable; will fall "
-            "back to slow MD5 template kernel\n",
-            dev_idx, err);
-        d->kern_template_phase0_md5_bf = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5_bf)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5_bf template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5_bf, d->dev, dev_idx, "md5_bf");
     return 0;
 }
@@ -6181,23 +4969,6 @@ static int gpu_opencl_template_compile_sha1(struct gpu_device *d, int dev_idx) {
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_sha1 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha1) {
-            clGetProgramBuildInfo(d->prog_template_sha1, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA1 template program build error (err=%d) "
-            "— SHA1 template path unavailable; will fall back to "
-            "md5_rules_phase0 (which is MD5-only -- this is a no-op for "
-            "SHA1 work; CPU will pick up the work via Typedone[]):\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha1) clReleaseProgram(d->prog_template_sha1);
-        d->prog_template_sha1 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6242,14 +5013,9 @@ static int gpu_opencl_template_kernel_lazy_sha1(struct gpu_device *d, int dev_id
     cl_int err;
     d->kern_template_phase0_sha1 = clCreateKernel(d->prog_template_sha1,
                                                   "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA1) kernel create failed "
-            "(err=%d) — SHA1 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_sha1 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha1 template (err=%d) "
+                  "on device %d", err, dev_idx);
 
     /* R2 instrumentation: probe per-lane private memory size for the
      * SHA1 template kernel. Compare against MD5's reading to detect
@@ -6293,21 +5059,6 @@ static int gpu_opencl_template_compile_sha256(struct gpu_device *d, int dev_idx)
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_sha256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha256) {
-            clGetProgramBuildInfo(d->prog_template_sha256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA256 template program build error (err=%d) "
-            "— SHA256 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha256) clReleaseProgram(d->prog_template_sha256);
-        d->prog_template_sha256 = NULL;
-        return -1;
-    }
     tpl_kernel_report(d->kern_template_phase0_sha1, d->dev, dev_idx, "sha1");
     return 0;
 }
@@ -6318,14 +5069,9 @@ static int gpu_opencl_template_kernel_lazy_sha256(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_sha256 = clCreateKernel(d->prog_template_sha256,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA256) kernel create failed "
-            "(err=%d) — SHA256 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_sha256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha256, d->dev, dev_idx, "sha256");
     return 0;
 }
@@ -6341,21 +5087,6 @@ static int gpu_opencl_template_compile_sha224(struct gpu_device *d, int dev_idx)
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_sha224 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha224) {
-            clGetProgramBuildInfo(d->prog_template_sha224, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA224 template program build error (err=%d) "
-            "— SHA224 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha224) clReleaseProgram(d->prog_template_sha224);
-        d->prog_template_sha224 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6365,14 +5096,9 @@ static int gpu_opencl_template_kernel_lazy_sha224(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_sha224 = clCreateKernel(d->prog_template_sha224,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha224) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA224) kernel create failed "
-            "(err=%d) — SHA224 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_sha224 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha224)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha224 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha224, d->dev, dev_idx, "sha224");
     return 0;
 }
@@ -6388,21 +5114,6 @@ static int gpu_opencl_template_compile_md4(struct gpu_device *d, int dev_idx) {
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_md4 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md4) {
-            clGetProgramBuildInfo(d->prog_template_md4, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD4 template program build error (err=%d) "
-            "— MD4 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_md4) clReleaseProgram(d->prog_template_md4);
-        d->prog_template_md4 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6412,14 +5123,9 @@ static int gpu_opencl_template_kernel_lazy_md4(struct gpu_device *d, int dev_idx
     cl_int err;
     d->kern_template_phase0_md4 = clCreateKernel(d->prog_template_md4,
                                                  "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md4) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD4) kernel create failed "
-            "(err=%d) — MD4 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_md4 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md4)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md4 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md4, d->dev, dev_idx, "md4");
     return 0;
 }
@@ -6457,21 +5163,6 @@ static int gpu_opencl_template_compile_sha384(struct gpu_device *d, int dev_idx)
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_sha384 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha384) {
-            clGetProgramBuildInfo(d->prog_template_sha384, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA384 template program build error (err=%d) "
-            "— SHA384 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha384) clReleaseProgram(d->prog_template_sha384);
-        d->prog_template_sha384 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6481,14 +5172,9 @@ static int gpu_opencl_template_kernel_lazy_sha384(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_sha384 = clCreateKernel(d->prog_template_sha384,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha384) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA384) kernel create failed "
-            "(err=%d) — SHA384 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_sha384 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha384)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha384 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha384, d->dev, dev_idx, "sha384");
     return 0;
 }
@@ -6504,21 +5190,6 @@ static int gpu_opencl_template_compile_sha512(struct gpu_device *d, int dev_idx)
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_sha512 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha512) {
-            clGetProgramBuildInfo(d->prog_template_sha512, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA512 template program build error (err=%d) "
-            "— SHA512 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha512) clReleaseProgram(d->prog_template_sha512);
-        d->prog_template_sha512 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6528,14 +5199,9 @@ static int gpu_opencl_template_kernel_lazy_sha512(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_sha512 = clCreateKernel(d->prog_template_sha512,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA512) kernel create failed "
-            "(err=%d) — SHA512 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_sha512 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha512 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha512, d->dev, dev_idx, "sha512");
     return 0;
 }
@@ -6573,21 +5239,6 @@ static int gpu_opencl_template_compile_ripemd160(struct gpu_device *d, int dev_i
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_ripemd160 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_ripemd160) {
-            clGetProgramBuildInfo(d->prog_template_ripemd160, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: RIPEMD-160 template program build error (err=%d) "
-            "— RIPEMD-160 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_ripemd160) clReleaseProgram(d->prog_template_ripemd160);
-        d->prog_template_ripemd160 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6597,14 +5248,9 @@ static int gpu_opencl_template_kernel_lazy_ripemd160(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_ripemd160 = clCreateKernel(d->prog_template_ripemd160,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd160) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (RIPEMD-160) kernel create failed "
-            "(err=%d) — RIPEMD-160 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_ripemd160 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd160)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the ripemd160 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_ripemd160, d->dev, dev_idx, "ripemd160");
     return 0;
 }
@@ -6620,21 +5266,6 @@ static int gpu_opencl_template_compile_ripemd320(struct gpu_device *d, int dev_i
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_ripemd320 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_ripemd320) {
-            clGetProgramBuildInfo(d->prog_template_ripemd320, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: RIPEMD-320 template program build error (err=%d) "
-            "— RIPEMD-320 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_ripemd320) clReleaseProgram(d->prog_template_ripemd320);
-        d->prog_template_ripemd320 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6644,14 +5275,9 @@ static int gpu_opencl_template_kernel_lazy_ripemd320(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_ripemd320 = clCreateKernel(d->prog_template_ripemd320,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd320) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (RIPEMD-320) kernel create failed "
-            "(err=%d) — RIPEMD-320 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_ripemd320 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd320)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the ripemd320 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_ripemd320, d->dev, dev_idx, "ripemd320");
     return 0;
 }
@@ -6677,21 +5303,6 @@ static int gpu_opencl_template_compile_blake2s256(struct gpu_device *d, int dev_
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_blake2s256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_blake2s256) {
-            clGetProgramBuildInfo(d->prog_template_blake2s256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: BLAKE2S-256 template program build error (err=%d) "
-            "— BLAKE2S-256 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_blake2s256) clReleaseProgram(d->prog_template_blake2s256);
-        d->prog_template_blake2s256 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6701,14 +5312,9 @@ static int gpu_opencl_template_kernel_lazy_blake2s256(struct gpu_device *d, int 
     cl_int err;
     d->kern_template_phase0_blake2s256 = clCreateKernel(d->prog_template_blake2s256,
                                                         "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_blake2s256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (BLAKE2S-256) kernel create failed "
-            "(err=%d) — BLAKE2S-256 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_blake2s256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_blake2s256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the blake2s256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_blake2s256, d->dev, dev_idx, "blake2s256");
     return 0;
 }
@@ -6723,21 +5329,6 @@ static int gpu_opencl_template_compile_blake2b256(struct gpu_device *d, int dev_
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_blake2b256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_blake2b256) {
-            clGetProgramBuildInfo(d->prog_template_blake2b256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: BLAKE2B-256 template program build error (err=%d) "
-            "— BLAKE2B-256 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_blake2b256) clReleaseProgram(d->prog_template_blake2b256);
-        d->prog_template_blake2b256 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6747,14 +5338,9 @@ static int gpu_opencl_template_kernel_lazy_blake2b256(struct gpu_device *d, int 
     cl_int err;
     d->kern_template_phase0_blake2b256 = clCreateKernel(d->prog_template_blake2b256,
                                                         "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_blake2b256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (BLAKE2B-256) kernel create failed "
-            "(err=%d) — BLAKE2B-256 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_blake2b256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_blake2b256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the blake2b256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_blake2b256, d->dev, dev_idx, "blake2b256");
     return 0;
 }
@@ -6769,21 +5355,6 @@ static int gpu_opencl_template_compile_blake2b512(struct gpu_device *d, int dev_
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2",
         defines, &err);
-    if (!d->prog_template_blake2b512 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_blake2b512) {
-            clGetProgramBuildInfo(d->prog_template_blake2b512, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: BLAKE2B-512 template program build error (err=%d) "
-            "— BLAKE2B-512 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_blake2b512) clReleaseProgram(d->prog_template_blake2b512);
-        d->prog_template_blake2b512 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -6793,14 +5364,9 @@ static int gpu_opencl_template_kernel_lazy_blake2b512(struct gpu_device *d, int 
     cl_int err;
     d->kern_template_phase0_blake2b512 = clCreateKernel(d->prog_template_blake2b512,
                                                         "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_blake2b512) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (BLAKE2B-512) kernel create failed "
-            "(err=%d) — BLAKE2B-512 template path unavailable\n",
-            dev_idx, err);
-        d->kern_template_phase0_blake2b512 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_blake2b512)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the blake2b512 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_blake2b512, d->dev, dev_idx, "blake2b512");
     return 0;
 }
@@ -6834,20 +5400,6 @@ static int gpu_opencl_template_compile_keccak224(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=7,HASH_BLOCK_BYTES=144";
     d->prog_template_keccak224 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_keccak224 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_keccak224) {
-            clGetProgramBuildInfo(d->prog_template_keccak224, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: KECCAK-224 template program build error (err=%d) "
-            "— KECCAK-224 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_keccak224) clReleaseProgram(d->prog_template_keccak224);
-        d->prog_template_keccak224 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_keccak224(struct gpu_device *d, int dev_idx) {
@@ -6856,13 +5408,9 @@ static int gpu_opencl_template_kernel_lazy_keccak224(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_keccak224 = clCreateKernel(d->prog_template_keccak224,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak224) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (KECCAK-224) kernel create failed "
-            "(err=%d) — KECCAK-224 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_keccak224 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak224)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the keccak224 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_keccak224, d->dev, dev_idx, "keccak224");
     return 0;
 }
@@ -6875,20 +5423,6 @@ static int gpu_opencl_template_compile_keccak256(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=136";
     d->prog_template_keccak256 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_keccak256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_keccak256) {
-            clGetProgramBuildInfo(d->prog_template_keccak256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: KECCAK-256 template program build error (err=%d) "
-            "— KECCAK-256 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_keccak256) clReleaseProgram(d->prog_template_keccak256);
-        d->prog_template_keccak256 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_keccak256(struct gpu_device *d, int dev_idx) {
@@ -6897,13 +5431,9 @@ static int gpu_opencl_template_kernel_lazy_keccak256(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_keccak256 = clCreateKernel(d->prog_template_keccak256,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (KECCAK-256) kernel create failed "
-            "(err=%d) — KECCAK-256 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_keccak256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the keccak256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_keccak256, d->dev, dev_idx, "keccak256");
     return 0;
 }
@@ -6916,20 +5446,6 @@ static int gpu_opencl_template_compile_keccak384(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=104";
     d->prog_template_keccak384 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_keccak384 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_keccak384) {
-            clGetProgramBuildInfo(d->prog_template_keccak384, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: KECCAK-384 template program build error (err=%d) "
-            "— KECCAK-384 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_keccak384) clReleaseProgram(d->prog_template_keccak384);
-        d->prog_template_keccak384 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_keccak384(struct gpu_device *d, int dev_idx) {
@@ -6938,13 +5454,9 @@ static int gpu_opencl_template_kernel_lazy_keccak384(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_keccak384 = clCreateKernel(d->prog_template_keccak384,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak384) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (KECCAK-384) kernel create failed "
-            "(err=%d) — KECCAK-384 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_keccak384 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak384)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the keccak384 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_keccak384, d->dev, dev_idx, "keccak384");
     return 0;
 }
@@ -6957,20 +5469,6 @@ static int gpu_opencl_template_compile_keccak512(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=72";
     d->prog_template_keccak512 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_keccak512 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_keccak512) {
-            clGetProgramBuildInfo(d->prog_template_keccak512, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: KECCAK-512 template program build error (err=%d) "
-            "— KECCAK-512 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_keccak512) clReleaseProgram(d->prog_template_keccak512);
-        d->prog_template_keccak512 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_keccak512(struct gpu_device *d, int dev_idx) {
@@ -6979,13 +5477,9 @@ static int gpu_opencl_template_kernel_lazy_keccak512(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_keccak512 = clCreateKernel(d->prog_template_keccak512,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak512) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (KECCAK-512) kernel create failed "
-            "(err=%d) — KECCAK-512 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_keccak512 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_keccak512)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the keccak512 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_keccak512, d->dev, dev_idx, "keccak512");
     return 0;
 }
@@ -6998,20 +5492,6 @@ static int gpu_opencl_template_compile_sha3_224(struct gpu_device *d, int dev_id
     const char *defines = "HASH_WORDS=7,HASH_BLOCK_BYTES=144";
     d->prog_template_sha3_224 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha3_224 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha3_224) {
-            clGetProgramBuildInfo(d->prog_template_sha3_224, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA3-224 template program build error (err=%d) "
-            "— SHA3-224 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha3_224) clReleaseProgram(d->prog_template_sha3_224);
-        d->prog_template_sha3_224 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_sha3_224(struct gpu_device *d, int dev_idx) {
@@ -7020,13 +5500,9 @@ static int gpu_opencl_template_kernel_lazy_sha3_224(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_sha3_224 = clCreateKernel(d->prog_template_sha3_224,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_224) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA3-224) kernel create failed "
-            "(err=%d) — SHA3-224 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha3_224 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_224)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha3_224 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha3_224, d->dev, dev_idx, "sha3_224");
     return 0;
 }
@@ -7039,20 +5515,6 @@ static int gpu_opencl_template_compile_sha3_256(struct gpu_device *d, int dev_id
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=136";
     d->prog_template_sha3_256 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha3_256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha3_256) {
-            clGetProgramBuildInfo(d->prog_template_sha3_256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA3-256 template program build error (err=%d) "
-            "— SHA3-256 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha3_256) clReleaseProgram(d->prog_template_sha3_256);
-        d->prog_template_sha3_256 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_sha3_256(struct gpu_device *d, int dev_idx) {
@@ -7061,13 +5523,9 @@ static int gpu_opencl_template_kernel_lazy_sha3_256(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_sha3_256 = clCreateKernel(d->prog_template_sha3_256,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA3-256) kernel create failed "
-            "(err=%d) — SHA3-256 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha3_256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha3_256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha3_256, d->dev, dev_idx, "sha3_256");
     return 0;
 }
@@ -7080,20 +5538,6 @@ static int gpu_opencl_template_compile_sha3_384(struct gpu_device *d, int dev_id
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=104";
     d->prog_template_sha3_384 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha3_384 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha3_384) {
-            clGetProgramBuildInfo(d->prog_template_sha3_384, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA3-384 template program build error (err=%d) "
-            "— SHA3-384 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha3_384) clReleaseProgram(d->prog_template_sha3_384);
-        d->prog_template_sha3_384 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_sha3_384(struct gpu_device *d, int dev_idx) {
@@ -7102,13 +5546,9 @@ static int gpu_opencl_template_kernel_lazy_sha3_384(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_sha3_384 = clCreateKernel(d->prog_template_sha3_384,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_384) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA3-384) kernel create failed "
-            "(err=%d) — SHA3-384 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha3_384 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_384)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha3_384 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha3_384, d->dev, dev_idx, "sha3_384");
     return 0;
 }
@@ -7121,20 +5561,6 @@ static int gpu_opencl_template_compile_sha3_512(struct gpu_device *d, int dev_id
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=72";
     d->prog_template_sha3_512 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha3_512 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha3_512) {
-            clGetProgramBuildInfo(d->prog_template_sha3_512, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA3-512 template program build error (err=%d) "
-            "— SHA3-512 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha3_512) clReleaseProgram(d->prog_template_sha3_512);
-        d->prog_template_sha3_512 = NULL;
-        return -1;
-    }
     return 0;
 }
 static int gpu_opencl_template_kernel_lazy_sha3_512(struct gpu_device *d, int dev_idx) {
@@ -7143,13 +5569,9 @@ static int gpu_opencl_template_kernel_lazy_sha3_512(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_sha3_512 = clCreateKernel(d->prog_template_sha3_512,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_512) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA3-512) kernel create failed "
-            "(err=%d) — SHA3-512 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha3_512 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha3_512)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha3_512 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha3_512, d->dev, dev_idx, "sha3_512");
     return 0;
 }
@@ -7176,20 +5598,6 @@ static int gpu_opencl_template_compile_sha384raw(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=12,HASH_BLOCK_BYTES=128";
     d->prog_template_sha384raw = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha384raw || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha384raw) {
-            clGetProgramBuildInfo(d->prog_template_sha384raw, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA384RAW template program build error (err=%d) "
-            "— SHA384RAW template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha384raw) clReleaseProgram(d->prog_template_sha384raw);
-        d->prog_template_sha384raw = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7199,13 +5607,9 @@ static int gpu_opencl_template_kernel_lazy_sha384raw(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_sha384raw = clCreateKernel(d->prog_template_sha384raw,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha384raw) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA384RAW) kernel create failed "
-            "(err=%d) — SHA384RAW template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha384raw = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha384raw)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha384raw template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha384raw, d->dev, dev_idx, "sha384raw");
     return 0;
 }
@@ -7218,20 +5622,6 @@ static int gpu_opencl_template_compile_sha512raw(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=128";
     d->prog_template_sha512raw = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha512raw || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha512raw) {
-            clGetProgramBuildInfo(d->prog_template_sha512raw, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA512RAW template program build error (err=%d) "
-            "— SHA512RAW template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha512raw) clReleaseProgram(d->prog_template_sha512raw);
-        d->prog_template_sha512raw = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7241,13 +5631,9 @@ static int gpu_opencl_template_kernel_lazy_sha512raw(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_sha512raw = clCreateKernel(d->prog_template_sha512raw,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512raw) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA512RAW) kernel create failed "
-            "(err=%d) — SHA512RAW template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha512raw = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512raw)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha512raw template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha512raw, d->dev, dev_idx, "sha512raw");
     return 0;
 }
@@ -7273,20 +5659,6 @@ static int gpu_opencl_template_compile_md5raw(struct gpu_device *d, int dev_idx)
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_md5raw = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_md5raw || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5raw) {
-            clGetProgramBuildInfo(d->prog_template_md5raw, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD5RAW template program build error (err=%d) "
-            "— MD5RAW template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_md5raw) clReleaseProgram(d->prog_template_md5raw);
-        d->prog_template_md5raw = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7296,13 +5668,9 @@ static int gpu_opencl_template_kernel_lazy_md5raw(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_md5raw = clCreateKernel(d->prog_template_md5raw,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5raw) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD5RAW) kernel create failed "
-            "(err=%d) — MD5RAW template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md5raw = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5raw)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5raw template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5raw, d->dev, dev_idx, "md5raw");
     return 0;
 }
@@ -7315,20 +5683,6 @@ static int gpu_opencl_template_compile_sha1raw(struct gpu_device *d, int dev_idx
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64";
     d->prog_template_sha1raw = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha1raw || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha1raw) {
-            clGetProgramBuildInfo(d->prog_template_sha1raw, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA1RAW template program build error (err=%d) "
-            "— SHA1RAW template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha1raw) clReleaseProgram(d->prog_template_sha1raw);
-        d->prog_template_sha1raw = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7338,13 +5692,9 @@ static int gpu_opencl_template_kernel_lazy_sha1raw(struct gpu_device *d, int dev
     cl_int err;
     d->kern_template_phase0_sha1raw = clCreateKernel(d->prog_template_sha1raw,
                                                      "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1raw) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA1RAW) kernel create failed "
-            "(err=%d) — SHA1RAW template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha1raw = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1raw)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha1raw template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha1raw, d->dev, dev_idx, "sha1raw");
     return 0;
 }
@@ -7357,20 +5707,6 @@ static int gpu_opencl_template_compile_sha256raw(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64";
     d->prog_template_sha256raw = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha256raw || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha256raw) {
-            clGetProgramBuildInfo(d->prog_template_sha256raw, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA256RAW template program build error (err=%d) "
-            "— SHA256RAW template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha256raw) clReleaseProgram(d->prog_template_sha256raw);
-        d->prog_template_sha256raw = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7380,13 +5716,9 @@ static int gpu_opencl_template_kernel_lazy_sha256raw(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_sha256raw = clCreateKernel(d->prog_template_sha256raw,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256raw) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA256RAW) kernel create failed "
-            "(err=%d) — SHA256RAW template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha256raw = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256raw)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha256raw template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha256raw, d->dev, dev_idx, "sha256raw");
     return 0;
 }
@@ -7409,20 +5741,6 @@ static int gpu_opencl_template_compile_sql5(struct gpu_device *d, int dev_idx) {
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64";
     d->prog_template_sql5 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sql5 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sql5) {
-            clGetProgramBuildInfo(d->prog_template_sql5, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SQL5 template program build error (err=%d) "
-            "— SQL5 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sql5) clReleaseProgram(d->prog_template_sql5);
-        d->prog_template_sql5 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7432,13 +5750,9 @@ static int gpu_opencl_template_kernel_lazy_sql5(struct gpu_device *d, int dev_id
     cl_int err;
     d->kern_template_phase0_sql5 = clCreateKernel(d->prog_template_sql5,
                                                   "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sql5) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SQL5) kernel create failed "
-            "(err=%d) — SQL5 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sql5 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sql5)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sql5 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sql5, d->dev, dev_idx, "sql5");
     return 0;
 }
@@ -7465,20 +5779,6 @@ static int gpu_opencl_template_compile_md5sha256(struct gpu_device *d, int dev_i
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_md5sha256 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_md5sha256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5sha256) {
-            clGetProgramBuildInfo(d->prog_template_md5sha256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD5SHA256 template program build error (err=%d) "
-            "-- MD5SHA256 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_md5sha256) clReleaseProgram(d->prog_template_md5sha256);
-        d->prog_template_md5sha256 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7488,13 +5788,9 @@ static int gpu_opencl_template_kernel_lazy_md5sha256(struct gpu_device *d, int d
     cl_int err;
     d->kern_template_phase0_md5sha256 = clCreateKernel(d->prog_template_md5sha256,
                                                        "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5sha256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD5SHA256) kernel create failed "
-            "(err=%d) -- MD5SHA256 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md5sha256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5sha256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5sha256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5sha256, d->dev, dev_idx, "md5sha256");
     return 0;
 }
@@ -7525,20 +5821,6 @@ static int gpu_opencl_template_compile_sha1dru(struct gpu_device *d, int dev_idx
     const char *defines = "HASH_WORDS=5,HASH_BLOCK_BYTES=64,BASE_ALGO=sha1,ITER_COUNT=1000000";
     d->prog_template_sha1dru = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_sha1dru || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha1dru) {
-            clGetProgramBuildInfo(d->prog_template_sha1dru, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA1DRU template program build error (err=%d) "
-            "— SHA1DRU template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_sha1dru) clReleaseProgram(d->prog_template_sha1dru);
-        d->prog_template_sha1dru = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7548,13 +5830,9 @@ static int gpu_opencl_template_kernel_lazy_sha1dru(struct gpu_device *d, int dev
     cl_int err;
     d->kern_template_phase0_sha1dru = clCreateKernel(d->prog_template_sha1dru,
                                                      "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1dru) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA1DRU) kernel create failed "
-            "(err=%d) — SHA1DRU template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha1dru = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1dru)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha1dru template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha1dru, d->dev, dev_idx, "sha1dru");
     return 0;
 }
@@ -7590,20 +5868,6 @@ static int gpu_opencl_template_compile_md6256(struct gpu_device *d, int dev_idx)
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64,BASE_ALGO=md6";
     d->prog_template_md6256 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_md6256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md6256) {
-            clGetProgramBuildInfo(d->prog_template_md6256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD6256 template program build error (err=%d) "
-            "— MD6256 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_md6256) clReleaseProgram(d->prog_template_md6256);
-        d->prog_template_md6256 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7613,13 +5877,9 @@ static int gpu_opencl_template_kernel_lazy_md6256(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_md6256 = clCreateKernel(d->prog_template_md6256,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md6256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD6256) kernel create failed "
-            "(err=%d) — MD6256 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md6256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md6256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md6256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md6256, d->dev, dev_idx, "md6256");
     return 0;
 }
@@ -7645,20 +5905,6 @@ static int gpu_opencl_template_compile_ntlmh(struct gpu_device *d, int dev_idx) 
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_ntlmh = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_ntlmh || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_ntlmh) {
-            clGetProgramBuildInfo(d->prog_template_ntlmh, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: NTLMH template program build error (err=%d) "
-            "— NTLMH template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_ntlmh) clReleaseProgram(d->prog_template_ntlmh);
-        d->prog_template_ntlmh = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7668,13 +5914,9 @@ static int gpu_opencl_template_kernel_lazy_ntlmh(struct gpu_device *d, int dev_i
     cl_int err;
     d->kern_template_phase0_ntlmh = clCreateKernel(d->prog_template_ntlmh,
                                                    "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_ntlmh) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (NTLMH) kernel create failed "
-            "(err=%d) — NTLMH template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_ntlmh = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_ntlmh)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the ntlmh template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_ntlmh, d->dev, dev_idx, "ntlmh");
     return 0;
 }
@@ -7701,20 +5943,6 @@ static int gpu_opencl_template_compile_md4utf16(struct gpu_device *d, int dev_id
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_md4utf16 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_md4utf16 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md4utf16) {
-            clGetProgramBuildInfo(d->prog_template_md4utf16, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD4UTF16 template program build error (err=%d) "
-            "— MD4UTF16 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_md4utf16) clReleaseProgram(d->prog_template_md4utf16);
-        d->prog_template_md4utf16 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7724,13 +5952,9 @@ static int gpu_opencl_template_kernel_lazy_md4utf16(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_md4utf16 = clCreateKernel(d->prog_template_md4utf16,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md4utf16) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD4UTF16) kernel create failed "
-            "(err=%d) — MD4UTF16 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md4utf16 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md4utf16)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md4utf16 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md4utf16, d->dev, dev_idx, "md4utf16");
     return 0;
 }
@@ -7759,20 +5983,6 @@ static int gpu_opencl_template_compile_mysql3(struct gpu_device *d, int dev_idx)
     const char *defines = "HASH_WORDS=4,HASH_BLOCK_BYTES=64";
     d->prog_template_mysql3 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_mysql3 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_mysql3) {
-            clGetProgramBuildInfo(d->prog_template_mysql3, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MYSQL3 template program build error (err=%d) "
-            "— MYSQL3 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_mysql3) clReleaseProgram(d->prog_template_mysql3);
-        d->prog_template_mysql3 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7782,13 +5992,9 @@ static int gpu_opencl_template_kernel_lazy_mysql3(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_mysql3 = clCreateKernel(d->prog_template_mysql3,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_mysql3) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MYSQL3) kernel create failed "
-            "(err=%d) — MYSQL3 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_mysql3 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_mysql3)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the mysql3 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_mysql3, d->dev, dev_idx, "mysql3");
     return 0;
 }
@@ -7830,20 +6036,6 @@ static int gpu_opencl_template_compile_wrl(struct gpu_device *d, int dev_idx) {
     const char *defines = "HASH_WORDS=16,HASH_BLOCK_BYTES=64";
     d->prog_template_wrl = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_wrl || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_wrl) {
-            clGetProgramBuildInfo(d->prog_template_wrl, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: WRL template program build error (err=%d) "
-            "— WRL template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_wrl) clReleaseProgram(d->prog_template_wrl);
-        d->prog_template_wrl = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7853,13 +6045,9 @@ static int gpu_opencl_template_kernel_lazy_wrl(struct gpu_device *d, int dev_idx
     cl_int err;
     d->kern_template_phase0_wrl = clCreateKernel(d->prog_template_wrl,
                                                  "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_wrl) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (WRL) kernel create failed "
-            "(err=%d) — WRL template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_wrl = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_wrl)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the wrl template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_wrl, d->dev, dev_idx, "wrl");
     return 0;
 }
@@ -7877,20 +6065,6 @@ static int gpu_opencl_template_compile_streebog256(struct gpu_device *d, int dev
     const char *defines = "HASH_WORDS=8,HASH_BLOCK_BYTES=64";
     d->prog_template_streebog256 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, "-cl-std=CL1.2", defines, &err);
-    if (!d->prog_template_streebog256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_streebog256) {
-            clGetProgramBuildInfo(d->prog_template_streebog256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: STREEBOG256 template program build error (err=%d) "
-            "— STREEBOG256 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_streebog256) clReleaseProgram(d->prog_template_streebog256);
-        d->prog_template_streebog256 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7900,13 +6074,9 @@ static int gpu_opencl_template_kernel_lazy_streebog256(struct gpu_device *d, int
     cl_int err;
     d->kern_template_phase0_streebog256 = clCreateKernel(d->prog_template_streebog256,
                                                          "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_streebog256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (STREEBOG256) kernel create failed "
-            "(err=%d) — STREEBOG256 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_streebog256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_streebog256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the streebog256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_streebog256, d->dev, dev_idx, "streebog256");
     return 0;
 }
@@ -7963,20 +6133,6 @@ static int gpu_opencl_template_compile_streebog512(struct gpu_device *d, int dev
     }
     d->prog_template_streebog512 = gpu_kernel_cache_build_program_ex(
         d->ctx, d->dev, nsrc, sources, bopts, defines, &err);
-    if (!d->prog_template_streebog512 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_streebog512) {
-            clGetProgramBuildInfo(d->prog_template_streebog512, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: STREEBOG512 template program build error (err=%d) "
-            "— STREEBOG512 template path unavailable:\n%s\n", dev_idx, err, log);
-        if (d->prog_template_streebog512) clReleaseProgram(d->prog_template_streebog512);
-        d->prog_template_streebog512 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -7986,13 +6142,9 @@ static int gpu_opencl_template_kernel_lazy_streebog512(struct gpu_device *d, int
     cl_int err;
     d->kern_template_phase0_streebog512 = clCreateKernel(d->prog_template_streebog512,
                                                          "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_streebog512) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (STREEBOG512) kernel create failed "
-            "(err=%d) — STREEBOG512 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_streebog512 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_streebog512)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the streebog512 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_streebog512, d->dev, dev_idx, "streebog512");
     return 0;
 }
@@ -8045,21 +6197,6 @@ static int gpu_opencl_template_compile_md5salt(struct gpu_device *d, int dev_idx
         d->ctx, d->dev, nsrc, sources,
         build_opts_buf,
         defines_buf, &err);
-    if (!d->prog_template_md5salt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5salt) {
-            clGetProgramBuildInfo(d->prog_template_md5salt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD5SALT template program build error (err=%d) "
-            "— MD5SALT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_md5salt) clReleaseProgram(d->prog_template_md5salt);
-        d->prog_template_md5salt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8069,13 +6206,9 @@ static int gpu_opencl_template_kernel_lazy_md5salt(struct gpu_device *d, int dev
     cl_int err;
     d->kern_template_phase0_md5salt = clCreateKernel(d->prog_template_md5salt,
                                                      "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5salt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD5SALT) kernel create failed "
-            "(err=%d) — MD5SALT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md5salt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5salt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5salt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5salt, d->dev, dev_idx, "md5salt");
     return 0;
 }
@@ -8094,21 +6227,6 @@ static int gpu_opencl_template_compile_md5saltpass(struct gpu_device *d, int dev
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_md5saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5saltpass) {
-            clGetProgramBuildInfo(d->prog_template_md5saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD5SALTPASS template program build error (err=%d) "
-            "— MD5SALTPASS template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_md5saltpass) clReleaseProgram(d->prog_template_md5saltpass);
-        d->prog_template_md5saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8118,13 +6236,9 @@ static int gpu_opencl_template_kernel_lazy_md5saltpass(struct gpu_device *d, int
     cl_int err;
     d->kern_template_phase0_md5saltpass = clCreateKernel(d->prog_template_md5saltpass,
                                                          "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD5SALTPASS) kernel create failed "
-            "(err=%d) — MD5SALTPASS template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md5saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5saltpass, d->dev, dev_idx, "md5saltpass");
     return 0;
 }
@@ -8151,21 +6265,6 @@ static int gpu_opencl_template_compile_sha1saltpass(struct gpu_device *d, int de
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha1saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha1saltpass) {
-            clGetProgramBuildInfo(d->prog_template_sha1saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA1SALTPASS template program build error (err=%d) "
-            "— SHA1SALTPASS template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha1saltpass) clReleaseProgram(d->prog_template_sha1saltpass);
-        d->prog_template_sha1saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8175,13 +6274,9 @@ static int gpu_opencl_template_kernel_lazy_sha1saltpass(struct gpu_device *d, in
     cl_int err;
     d->kern_template_phase0_sha1saltpass = clCreateKernel(d->prog_template_sha1saltpass,
                                                           "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA1SALTPASS) kernel create failed "
-            "(err=%d) — SHA1SALTPASS template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha1saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha1saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha1saltpass, d->dev, dev_idx, "sha1saltpass");
     return 0;
 }
@@ -8208,21 +6303,6 @@ static int gpu_opencl_template_compile_sha256saltpass(struct gpu_device *d, int 
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha256saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha256saltpass) {
-            clGetProgramBuildInfo(d->prog_template_sha256saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA256SALTPASS template program build error (err=%d) "
-            "— SHA256SALTPASS template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha256saltpass) clReleaseProgram(d->prog_template_sha256saltpass);
-        d->prog_template_sha256saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8232,13 +6312,9 @@ static int gpu_opencl_template_kernel_lazy_sha256saltpass(struct gpu_device *d, 
     cl_int err;
     d->kern_template_phase0_sha256saltpass = clCreateKernel(d->prog_template_sha256saltpass,
                                                             "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA256SALTPASS) kernel create failed "
-            "(err=%d) — SHA256SALTPASS template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha256saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha256saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha256saltpass, d->dev, dev_idx, "sha256saltpass");
     return 0;
 }
@@ -8269,21 +6345,6 @@ static int gpu_opencl_template_compile_sha224saltpass(struct gpu_device *d, int 
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha224saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha224saltpass) {
-            clGetProgramBuildInfo(d->prog_template_sha224saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA224SALTPASS template program build error (err=%d) "
-            "— SHA224SALTPASS template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha224saltpass) clReleaseProgram(d->prog_template_sha224saltpass);
-        d->prog_template_sha224saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8293,13 +6354,9 @@ static int gpu_opencl_template_kernel_lazy_sha224saltpass(struct gpu_device *d, 
     cl_int err;
     d->kern_template_phase0_sha224saltpass = clCreateKernel(d->prog_template_sha224saltpass,
                                                             "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha224saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA224SALTPASS) kernel create failed "
-            "(err=%d) — SHA224SALTPASS template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha224saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha224saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha224saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha224saltpass, d->dev, dev_idx, "sha224saltpass");
     return 0;
 }
@@ -8325,21 +6382,6 @@ static int gpu_opencl_template_compile_md5passsalt(struct gpu_device *d, int dev
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_md5passsalt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5passsalt) {
-            clGetProgramBuildInfo(d->prog_template_md5passsalt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD5PASSSALT template program build error (err=%d) "
-            "— MD5PASSSALT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_md5passsalt) clReleaseProgram(d->prog_template_md5passsalt);
-        d->prog_template_md5passsalt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8349,13 +6391,9 @@ static int gpu_opencl_template_kernel_lazy_md5passsalt(struct gpu_device *d, int
     cl_int err;
     d->kern_template_phase0_md5passsalt = clCreateKernel(d->prog_template_md5passsalt,
                                                          "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5passsalt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD5PASSSALT) kernel create failed "
-            "(err=%d) — MD5PASSSALT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md5passsalt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5passsalt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5passsalt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5passsalt, d->dev, dev_idx, "md5passsalt");
     return 0;
 }
@@ -8381,21 +6419,6 @@ static int gpu_opencl_template_compile_sha1passsalt(struct gpu_device *d, int de
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha1passsalt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha1passsalt) {
-            clGetProgramBuildInfo(d->prog_template_sha1passsalt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA1PASSSALT template program build error (err=%d) "
-            "— SHA1PASSSALT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha1passsalt) clReleaseProgram(d->prog_template_sha1passsalt);
-        d->prog_template_sha1passsalt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8405,13 +6428,9 @@ static int gpu_opencl_template_kernel_lazy_sha1passsalt(struct gpu_device *d, in
     cl_int err;
     d->kern_template_phase0_sha1passsalt = clCreateKernel(d->prog_template_sha1passsalt,
                                                           "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1passsalt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA1PASSSALT) kernel create failed "
-            "(err=%d) — SHA1PASSSALT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha1passsalt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha1passsalt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha1passsalt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha1passsalt, d->dev, dev_idx, "sha1passsalt");
     return 0;
 }
@@ -8440,21 +6459,6 @@ static int gpu_opencl_template_compile_sha256passsalt(struct gpu_device *d, int 
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha256passsalt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha256passsalt) {
-            clGetProgramBuildInfo(d->prog_template_sha256passsalt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA256PASSSALT template program build error (err=%d) "
-            "— SHA256PASSSALT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha256passsalt) clReleaseProgram(d->prog_template_sha256passsalt);
-        d->prog_template_sha256passsalt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8464,13 +6468,9 @@ static int gpu_opencl_template_kernel_lazy_sha256passsalt(struct gpu_device *d, 
     cl_int err;
     d->kern_template_phase0_sha256passsalt = clCreateKernel(d->prog_template_sha256passsalt,
                                                             "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256passsalt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA256PASSSALT) kernel create failed "
-            "(err=%d) — SHA256PASSSALT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha256passsalt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256passsalt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha256passsalt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha256passsalt, d->dev, dev_idx, "sha256passsalt");
     return 0;
 }
@@ -8501,21 +6501,6 @@ static int gpu_opencl_template_compile_sha512saltpass(struct gpu_device *d, int 
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha512saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha512saltpass) {
-            clGetProgramBuildInfo(d->prog_template_sha512saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA512SALTPASS template program build error (err=%d) "
-            "— SHA512SALTPASS template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha512saltpass) clReleaseProgram(d->prog_template_sha512saltpass);
-        d->prog_template_sha512saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8525,13 +6510,9 @@ static int gpu_opencl_template_kernel_lazy_sha512saltpass(struct gpu_device *d, 
     cl_int err;
     d->kern_template_phase0_sha512saltpass = clCreateKernel(d->prog_template_sha512saltpass,
                                                             "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA512SALTPASS) kernel create failed "
-            "(err=%d) — SHA512SALTPASS template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha512saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha512saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha512saltpass, d->dev, dev_idx, "sha512saltpass");
     return 0;
 }
@@ -8563,21 +6544,6 @@ static int gpu_opencl_template_compile_sha512passsalt(struct gpu_device *d, int 
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha512passsalt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha512passsalt) {
-            clGetProgramBuildInfo(d->prog_template_sha512passsalt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA512PASSSALT template program build error (err=%d) "
-            "— SHA512PASSSALT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha512passsalt) clReleaseProgram(d->prog_template_sha512passsalt);
-        d->prog_template_sha512passsalt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8587,13 +6553,9 @@ static int gpu_opencl_template_kernel_lazy_sha512passsalt(struct gpu_device *d, 
     cl_int err;
     d->kern_template_phase0_sha512passsalt = clCreateKernel(d->prog_template_sha512passsalt,
                                                             "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512passsalt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA512PASSSALT) kernel create failed "
-            "(err=%d) — SHA512PASSSALT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha512passsalt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512passsalt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha512passsalt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha512passsalt, d->dev, dev_idx, "sha512passsalt");
     return 0;
 }
@@ -8626,21 +6588,6 @@ static int gpu_opencl_template_compile_sha384saltpass(struct gpu_device *d, int 
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha384saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha384saltpass) {
-            clGetProgramBuildInfo(d->prog_template_sha384saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA384SALTPASS template program build error (err=%d) "
-            "— HMAC-SHA384 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha384saltpass) clReleaseProgram(d->prog_template_sha384saltpass);
-        d->prog_template_sha384saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8650,13 +6597,9 @@ static int gpu_opencl_template_kernel_lazy_sha384saltpass(struct gpu_device *d, 
     cl_int err;
     d->kern_template_phase0_sha384saltpass = clCreateKernel(d->prog_template_sha384saltpass,
                                                             "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha384saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA384SALTPASS) kernel create failed "
-            "(err=%d) — HMAC-SHA384 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha384saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha384saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha384saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha384saltpass, d->dev, dev_idx, "sha384saltpass");
     return 0;
 }
@@ -8692,21 +6635,6 @@ static int gpu_opencl_template_compile_ripemd160saltpass(struct gpu_device *d, i
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_ripemd160saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_ripemd160saltpass) {
-            clGetProgramBuildInfo(d->prog_template_ripemd160saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: RIPEMD160SALTPASS template program build error (err=%d) "
-            "— HMAC-RMD160 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_ripemd160saltpass) clReleaseProgram(d->prog_template_ripemd160saltpass);
-        d->prog_template_ripemd160saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8716,13 +6644,9 @@ static int gpu_opencl_template_kernel_lazy_ripemd160saltpass(struct gpu_device *
     cl_int err;
     d->kern_template_phase0_ripemd160saltpass = clCreateKernel(d->prog_template_ripemd160saltpass,
                                                                "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd160saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (RIPEMD160SALTPASS) kernel create failed "
-            "(err=%d) — HMAC-RMD160 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_ripemd160saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd160saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the ripemd160saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_ripemd160saltpass, d->dev, dev_idx, "ripemd160saltpass");
     return 0;
 }
@@ -8757,21 +6681,6 @@ static int gpu_opencl_template_compile_ripemd320saltpass(struct gpu_device *d, i
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_ripemd320saltpass || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_ripemd320saltpass) {
-            clGetProgramBuildInfo(d->prog_template_ripemd320saltpass, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: RIPEMD320SALTPASS template program build error (err=%d) "
-            "— HMAC-RMD320 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_ripemd320saltpass) clReleaseProgram(d->prog_template_ripemd320saltpass);
-        d->prog_template_ripemd320saltpass = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8781,13 +6690,9 @@ static int gpu_opencl_template_kernel_lazy_ripemd320saltpass(struct gpu_device *
     cl_int err;
     d->kern_template_phase0_ripemd320saltpass = clCreateKernel(d->prog_template_ripemd320saltpass,
                                                                "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd320saltpass) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (RIPEMD320SALTPASS) kernel create failed "
-            "(err=%d) — HMAC-RMD320 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_ripemd320saltpass = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_ripemd320saltpass)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the ripemd320saltpass template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_ripemd320saltpass, d->dev, dev_idx, "ripemd320saltpass");
     return 0;
 }
@@ -8824,21 +6729,6 @@ static int gpu_opencl_template_compile_hmac_blake2s(struct gpu_device *d, int de
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_hmac_blake2s || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_hmac_blake2s) {
-            clGetProgramBuildInfo(d->prog_template_hmac_blake2s, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: HMAC-BLAKE2S template program build error (err=%d) "
-            "— HMAC-BLAKE2S template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_hmac_blake2s) clReleaseProgram(d->prog_template_hmac_blake2s);
-        d->prog_template_hmac_blake2s = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8848,13 +6738,9 @@ static int gpu_opencl_template_kernel_lazy_hmac_blake2s(struct gpu_device *d, in
     cl_int err;
     d->kern_template_phase0_hmac_blake2s = clCreateKernel(d->prog_template_hmac_blake2s,
                                                           "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_hmac_blake2s) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (HMAC-BLAKE2S) kernel create failed "
-            "(err=%d) — HMAC-BLAKE2S template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_hmac_blake2s = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_hmac_blake2s)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the hmac_blake2s template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_hmac_blake2s, d->dev, dev_idx, "hmac_blake2s");
     return 0;
 }
@@ -8896,21 +6782,6 @@ static int gpu_opencl_template_compile_hmac_streebog256(struct gpu_device *d, in
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_hmac_streebog256 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_hmac_streebog256) {
-            clGetProgramBuildInfo(d->prog_template_hmac_streebog256, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: HMAC-STREEBOG-256 template program build error (err=%d) "
-            "- HMAC-STREEBOG-256 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_hmac_streebog256) clReleaseProgram(d->prog_template_hmac_streebog256);
-        d->prog_template_hmac_streebog256 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8920,13 +6791,9 @@ static int gpu_opencl_template_kernel_lazy_hmac_streebog256(struct gpu_device *d
     cl_int err;
     d->kern_template_phase0_hmac_streebog256 = clCreateKernel(d->prog_template_hmac_streebog256,
                                                               "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_hmac_streebog256) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (HMAC-STREEBOG-256) kernel create failed "
-            "(err=%d) - HMAC-STREEBOG-256 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_hmac_streebog256 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_hmac_streebog256)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the hmac_streebog256 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_hmac_streebog256, d->dev, dev_idx, "hmac_streebog256");
     return 0;
 }
@@ -8965,21 +6832,6 @@ static int gpu_opencl_template_compile_hmac_streebog512(struct gpu_device *d, in
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_hmac_streebog512 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_hmac_streebog512) {
-            clGetProgramBuildInfo(d->prog_template_hmac_streebog512, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: HMAC-STREEBOG-512 template program build error (err=%d) "
-            "- HMAC-STREEBOG-512 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_hmac_streebog512) clReleaseProgram(d->prog_template_hmac_streebog512);
-        d->prog_template_hmac_streebog512 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -8989,13 +6841,9 @@ static int gpu_opencl_template_kernel_lazy_hmac_streebog512(struct gpu_device *d
     cl_int err;
     d->kern_template_phase0_hmac_streebog512 = clCreateKernel(d->prog_template_hmac_streebog512,
                                                               "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_hmac_streebog512) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (HMAC-STREEBOG-512) kernel create failed "
-            "(err=%d) - HMAC-STREEBOG-512 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_hmac_streebog512 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_hmac_streebog512)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the hmac_streebog512 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_hmac_streebog512, d->dev, dev_idx, "hmac_streebog512");
     return 0;
 }
@@ -9031,21 +6879,6 @@ static int gpu_opencl_template_compile_phpbb3(struct gpu_device *d, int dev_idx)
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_phpbb3 || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_phpbb3) {
-            clGetProgramBuildInfo(d->prog_template_phpbb3, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: PHPBB3 template program build error (err=%d) "
-            "-- PHPBB3 template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_phpbb3) clReleaseProgram(d->prog_template_phpbb3);
-        d->prog_template_phpbb3 = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -9055,13 +6888,9 @@ static int gpu_opencl_template_kernel_lazy_phpbb3(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_phpbb3 = clCreateKernel(d->prog_template_phpbb3,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_phpbb3) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (PHPBB3) kernel create failed "
-            "(err=%d) -- PHPBB3 template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_phpbb3 = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_phpbb3)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the phpbb3 template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_phpbb3, d->dev, dev_idx, "phpbb3");
     return 0;
 }
@@ -9097,21 +6926,6 @@ static int gpu_opencl_template_compile_md5crypt(struct gpu_device *d, int dev_id
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_md5crypt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_md5crypt) {
-            clGetProgramBuildInfo(d->prog_template_md5crypt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: MD5CRYPT template program build error (err=%d) "
-            "-- MD5CRYPT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_md5crypt) clReleaseProgram(d->prog_template_md5crypt);
-        d->prog_template_md5crypt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -9121,13 +6935,9 @@ static int gpu_opencl_template_kernel_lazy_md5crypt(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_md5crypt = clCreateKernel(d->prog_template_md5crypt,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_md5crypt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (MD5CRYPT) kernel create failed "
-            "(err=%d) -- MD5CRYPT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_md5crypt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_md5crypt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the md5crypt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_md5crypt, d->dev, dev_idx, "md5crypt");
     return 0;
 }
@@ -9162,21 +6972,6 @@ static int gpu_opencl_template_compile_sha256crypt(struct gpu_device *d, int dev
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1",
         defines, &err);
-    if (!d->prog_template_sha256crypt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha256crypt) {
-            clGetProgramBuildInfo(d->prog_template_sha256crypt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA256CRYPT template program build error (err=%d) "
-            "-- SHA256CRYPT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha256crypt) clReleaseProgram(d->prog_template_sha256crypt);
-        d->prog_template_sha256crypt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -9186,13 +6981,9 @@ static int gpu_opencl_template_kernel_lazy_sha256crypt(struct gpu_device *d, int
     cl_int err;
     d->kern_template_phase0_sha256crypt = clCreateKernel(d->prog_template_sha256crypt,
                                                          "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256crypt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA256CRYPT) kernel create failed "
-            "(err=%d) -- SHA256CRYPT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha256crypt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha256crypt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha256crypt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha256crypt, d->dev, dev_idx, "sha256crypt");
     return 0;
 }
@@ -9235,21 +7026,6 @@ static int gpu_opencl_template_compile_sha512crypt(struct gpu_device *d, int dev
         d->ctx, d->dev, nsrc, sources,
         "-cl-std=CL1.2 -DGPU_TEMPLATE_HAS_SALT=1 -DHASH_WORDS=16 -DHASH_BLOCK_BYTES=128",
         defines, &err);
-    if (!d->prog_template_sha512crypt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_sha512crypt) {
-            clGetProgramBuildInfo(d->prog_template_sha512crypt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: SHA512CRYPT template program build error (err=%d) "
-            "-- SHA512CRYPT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_sha512crypt) clReleaseProgram(d->prog_template_sha512crypt);
-        d->prog_template_sha512crypt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -9259,13 +7035,9 @@ static int gpu_opencl_template_kernel_lazy_sha512crypt(struct gpu_device *d, int
     cl_int err;
     d->kern_template_phase0_sha512crypt = clCreateKernel(d->prog_template_sha512crypt,
                                                          "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512crypt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (SHA512CRYPT) kernel create failed "
-            "(err=%d) -- SHA512CRYPT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_sha512crypt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_sha512crypt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the sha512crypt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_sha512crypt, d->dev, dev_idx, "sha512crypt");
     return 0;
 }
@@ -9396,21 +7168,6 @@ static int gpu_opencl_template_compile_descrypt(struct gpu_device *d, int dev_id
         d->ctx, d->dev, nsrc, sources,
         build_opts_buf,
         defines, &err);
-    if (!d->prog_template_descrypt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_descrypt) {
-            clGetProgramBuildInfo(d->prog_template_descrypt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: DESCRYPT template program build error (err=%d) "
-            "-- DESCRYPT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_descrypt) clReleaseProgram(d->prog_template_descrypt);
-        d->prog_template_descrypt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -9420,13 +7177,9 @@ static int gpu_opencl_template_kernel_lazy_descrypt(struct gpu_device *d, int de
     cl_int err;
     d->kern_template_phase0_descrypt = clCreateKernel(d->prog_template_descrypt,
                                                       "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_descrypt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (DESCRYPT) kernel create failed "
-            "(err=%d) -- DESCRYPT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_descrypt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_descrypt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the descrypt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_descrypt, d->dev, dev_idx, "descrypt");
     return 0;
 }
@@ -9479,21 +7232,6 @@ static int gpu_opencl_template_compile_bcrypt(struct gpu_device *d, int dev_idx)
         "-DBCRYPT_WG_SIZE=8 "
         "-DHASH_WORDS=6 -DHASH_BLOCK_BYTES=64",
         defines, &err);
-    if (!d->prog_template_bcrypt || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (d->prog_template_bcrypt) {
-            clGetProgramBuildInfo(d->prog_template_bcrypt, d->dev,
-                                  CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "OpenCL GPU[%d]: BCRYPT template program build error (err=%d) "
-            "-- BCRYPT template path unavailable:\n%s\n",
-            dev_idx, err, log);
-        if (d->prog_template_bcrypt) clReleaseProgram(d->prog_template_bcrypt);
-        d->prog_template_bcrypt = NULL;
-        return -1;
-    }
     return 0;
 }
 
@@ -9503,13 +7241,9 @@ static int gpu_opencl_template_kernel_lazy_bcrypt(struct gpu_device *d, int dev_
     cl_int err;
     d->kern_template_phase0_bcrypt = clCreateKernel(d->prog_template_bcrypt,
                                                     "template_phase0", &err);
-    if (err != CL_SUCCESS || !d->kern_template_phase0_bcrypt) {
-        fprintf(stderr,
-            "OpenCL GPU[%d]: template_phase0 (BCRYPT) kernel create failed "
-            "(err=%d) -- BCRYPT template path unavailable\n", dev_idx, err);
-        d->kern_template_phase0_bcrypt = NULL;
-        return -1;
-    }
+    if (err != CL_SUCCESS || !d->kern_template_phase0_bcrypt)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the bcrypt template (err=%d) "
+                  "on device %d", err, dev_idx);
     tpl_kernel_report(d->kern_template_phase0_bcrypt, d->dev, dev_idx, "bcrypt");
     return 0;
 }
@@ -9554,7 +7288,11 @@ static int gpu_opencl_set_rules_ex(int dev_idx,
         return -1;
     }
 
-    if (gpu_opencl_rules_compile(d, dev_idx) < 0) return -1;
+    /* This backend carries the UTF-32 walker (gpu_u32_walker.cl, appended to
+     * every template program under -8), so it may claim the capability.  A
+     * backend that cannot run the walker must NOT -- see
+     * gpu_u32_set_backend_capable. */
+    gpu_u32_set_backend_capable(1);
 
     /* Phase E: time the rule-program + offset upload. */
     struct timespec _ru_t0, _ru_t1;
@@ -9657,38 +7395,6 @@ static int gpu_opencl_set_rules_ex(int dev_idx,
 
     d->gpu_n_rules = n_rules;
 
-    /* Validator env-gated host-side mirror. When MDXFIND_GPU_VALIDATOR=1,
-     * the dispatcher needs to stringify rulebytes=<hex> for each rule_idx
-     * after the kernel returns; cheapest way is to keep a host copy of
-     * the same data we just uploaded. Reallocated/grown idempotently;
-     * never freed within a session (matches the device buffers'
-     * persistence model). When the validator env var is unset the
-     * pointers stay NULL and zero memory is consumed. */
-    /* The UTF-32 path needs this mirror too, and not for validation: the
-     * combined program is built at FIRST DISPATCH (see
-     * gpu_opencl_u32_rules_lazy for the ordering reason), by which time the
-     * byte program mdxfind handed us here is long out of scope.  The mirror is
-     * the only surviving copy.  Gating it on an env var meant to enable a
-     * DIAGNOSTIC would have made the feature silently depend on
-     * MDXFIND_GPU_VALIDATOR=1. */
-    if (gpu_validator_enabled() || gpu_u32_active()) {
-        if (!d->h_rule_program || prog_len > d->h_rule_program_len) {
-            free(d->h_rule_program);
-            d->h_rule_program = (unsigned char *)malloc(prog_len);
-        }
-        if (d->h_rule_program) {
-            memcpy(d->h_rule_program, rule_program, prog_len);
-            d->h_rule_program_len = prog_len;
-        }
-        if (!d->h_rule_offset || n_rules > d->h_rule_offset_n) {
-            free(d->h_rule_offset);
-            d->h_rule_offset = (uint32_t *)malloc((size_t)n_rules * sizeof(uint32_t));
-        }
-        if (d->h_rule_offset) {
-            memcpy(d->h_rule_offset, rule_offset, (size_t)n_rules * sizeof(uint32_t));
-            d->h_rule_offset_n = n_rules;
-        }
-    }
 
     clock_gettime(CLOCK_MONOTONIC, &_ru_t1);
     {
@@ -9810,15 +7516,12 @@ static int gpu_opencl_u32_rules_lazy(struct gpu_device *d, int dev_idx)
  * env var could force a mismatch here, which returned NULL and left the
  * caller running the legacy MD5 kernel against non-MD5 work. It is gone.)
  *
- * Returns NULL only for an op with no template kernel, and for a compile or
- * kernel-create failure.
- *
- * Returns NULL on compile / kernel-create failure (caller falls back to
- * legacy md5_rules_phase0 for MD5; for other ops the dispatch will
- * proceed against md5_rules_phase0 producing wrong digests — but compile
- * failure on a *_core.cl is a hard error already logged by the lazy/
- * compile helpers, so this is a degraded-but-noisy state, not a silent
- * miscompute).
+ * Returns NULL only for an op with no template kernel; a program build or
+ * kernel-create failure exits inside the helpers.  The one
+ * caller treats NULL as fatal.  (Until 2026-11-15 this comment said a NULL
+ * was "a degraded-but-noisy state, not a silent miscompute": the caller in
+ * fact ran the legacy MD5 kernel against any op, and an NTLMH batch whose
+ * template failed to build on fglrx was hashed as MD5, exit 0.)
  *
  * Per-op template handles touched (struct gpu_device fields):
  *   JOB_MD5     -> kern_template_phase0        (gpu_md5_core.cl    + gpu_template.cl)
@@ -10150,6 +7853,7 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
         case JOB_MD5UCSALT:
         case JOB_MD5revMD5SALT:
         case JOB_MD5sub8_24SALT:
+        case JOB_MD5MD5SALT:      /* e347: algo_mode 7 (2026-11-13) */
         case JOB_MD5_MD5SALTMD5PASS:
         /* Family A (2026-05-07): JOB_HMAC_MD5 (e214) + JOB_HMAC_MD5_KPASS
          * (e792) join the SAME GPU template kernel as e31 MD5SALT via
@@ -10419,55 +8123,6 @@ static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, 
  * wanted in the future, add fresh fields and probe
  * kern_kernel_b_codegen inside gpu_opencl_kernelb_codegen_kernel. */
 
-/* Forward declarations for the env-flag accessors defined later in this
- * TU (the build path below consumes the PROFILE_VARIANT + Knob G flags
- * at JIT time; the accessors are grouped with the other experiment
- * gates near the dispatch site for code-locality).
- *
- * 2026-05-31 (auto-dispatch): the prior gpu_experiment_rules_codegen_-
- * md5_enabled() accessor was RETIRED -- the dispatcher now consults
- * gpu/codegen_auto_dispatch.c per (op, iter, rules, mask, bf). The
- * developer-only PROFILE_VARIANT + Knob G env flags below still exist
- * (perf-decomp tooling, not user-facing); they now compose with
- * MDXFIND_GPU_BACKEND=codegen instead of the old env flag. */
-
-/* PROFILE_VARIANT env accessor (2026-05-29 perf decomposition). Returns
- * 0..6 if MDXFIND_PROFILE_VARIANT is set to 0/1/2/3/4/5/6; returns 0 (no
- * variant, byte-identical baseline) if unset or value out of range.
- * Composes with MDXFIND_GPU_BACKEND=codegen (developer FORCE override);
- * if force not codegen, PROFILE_VARIANT is a no-op. Decision cached on
- * first call. V6 (added 2026-05-29 with Knob G) = V0 baseline + Knob G
- * vectorized uint4 candidate write loop forced ON (regardless of
- * KNOBG_VEC_WRITE); closes the V0-vs-V6 prediction-verification loop
- * for Knob G. */
-int gpu_experiment_rules_codegen_profile_variant(void);
-
-/* KNOB G env accessor (2026-05-29 perf experiment). Returns 1 ONLY when
- * BOTH MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1 and developer
- * FORCE override MDXFIND_GPU_BACKEND=codegen are set; returns 0
- * otherwise. Decision cached on first call. Threaded into kernel A1
- * JIT build options as -DKNOBG_VEC_WRITE=1 and into the cache key as
- * ",KNOBG_VEC_WRITE=1". */
-int gpu_experiment_rules_codegen_vec_write_enabled(void);
-
-/* Internal helper: returns 1 iff MDXFIND_GPU_BACKEND=codegen (developer
- * FORCE override). Used by PROFILE_VARIANT + Knob G composition checks
- * below to gate the developer-only stubs to codegen-route runs only.
- * Replaces the historical gpu_experiment_rules_codegen_md5_enabled()
- * parent gate. Per project_codegen_auto_dispatch_spec_2026-05-31.md
- * §15 open-question recommendation: "leave PROFILE_VARIANT's parent-
- * check as-is and document that PROFILE_VARIANT now implicitly
- * requires MDXFIND_GPU_BACKEND=codegen to compose." */
-static int _gpu_backend_force_codegen(void)
-{
-    /* Always 0.  MDXFIND_GPU_BACKEND=codegen was a developer FORCE
-     * override that put the codegen route on the gate so the
-     * developer-only PROFILE_VARIANT and Knob G stubs could compose
-     * with it.  Removed 2026-09-16; codegen_auto_dispatch.c picks the
-     * route. */
-    return 0;
-}
-
 /* Deliverable 2: Lazy-build the kernel A1 (cand_rules_phase0) program.
  *
  * Phase 4 sub-phase 4a.3 (2026-05-22): the kernel B build half was
@@ -10514,38 +8169,14 @@ static int gpu_opencl_kernelb_build_prog(struct gpu_device *d, int dev_idx)
             sources_a[4] = gpu_kernel_a_rules_str;
             nsrc_a = 5;
         }
-        int knobg = gpu_experiment_rules_codegen_vec_write_enabled();
-        int pvariant = gpu_experiment_rules_codegen_profile_variant();
         char opts_buf[320];
         char key_buf[320];
-        /* Build-options precedence:
-         *   1. PROFILE_VARIANT=N (diagnostic; takes precedence)
-         *   2. KNOB G (uint4 coalesced candidate writes)
-         *   3. baseline (legacy byte-identical to gpu_kernel_a_rules.cl rev 1.6)
-         */
-        if (pvariant > 0) {
-            /* PROFILE_VARIANT path: V1..V5 are timing-only stubs that leave
-             * b_kernelA_state at zero so host-side actual_slots=0 makes
-             * kernel B a no-op. V6 (the Knob G micro-benchmark variant)
-             * DOES produce valid candidates and tests Knob G's vectorized
-             * write loop -- see kernel source. */
-            snprintf(opts_buf, sizeof(opts_buf),
-                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1 -DPROFILE_VARIANT=%d",
-                pvariant);
-            snprintf(key_buf, sizeof(key_buf),
-                "KERNEL_A_VARIANT=1,PROFILE_VARIANT=%d", pvariant);
-        } else if (knobg) {
-            snprintf(opts_buf, sizeof(opts_buf),
-                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1 "
-                "-DKNOBG_VEC_WRITE=1");
-            snprintf(key_buf, sizeof(key_buf),
-                "KERNEL_A_VARIANT=1,KNOBG_VEC_WRITE=1");
-        } else {
-            snprintf(opts_buf, sizeof(opts_buf),
-                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1");
-            snprintf(key_buf, sizeof(key_buf),
-                "KERNEL_A_VARIANT=1");
-        }
+        /* One build: the PROFILE_VARIANT timing stubs and the Knob G uint4
+         * writes it used to select between were removed 2026-11-14. */
+        snprintf(opts_buf, sizeof(opts_buf),
+            "-cl-std=CL1.2 -DKERNEL_A_VARIANT=1");
+        snprintf(key_buf, sizeof(key_buf),
+            "KERNEL_A_VARIANT=1,SLOTLEN=2");
         if (gpu_u32_active()) {
             /* The source list is part of the cache key, but make the `-8`
              * shape explicit in the key text too: a byte-mode run and a `-8`
@@ -10558,18 +8189,6 @@ static int gpu_opencl_kernelb_build_prog(struct gpu_device *d, int dev_idx)
         d->prog_kernel_a = gpu_kernel_cache_build_program_ex(
             d->ctx, d->dev, nsrc_a, sources_a,
             opts, key, &err);
-        if (!d->prog_kernel_a || err != CL_SUCCESS) {
-            char log[8192] = {0};
-            if (d->prog_kernel_a)
-                clGetProgramBuildInfo(d->prog_kernel_a, d->dev,
-                                      CL_PROGRAM_BUILD_LOG,
-                                      sizeof(log)-1, log, NULL);
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A1 (rules) build failed "
-                "(err=%d):\n%s\n",
-                __FILE__, __LINE__, dev_idx, err, log);
-            exit(1);
-        }
         d->kern_kernel_a_rules = clCreateKernel(d->prog_kernel_a,
                                                 "cand_rules_phase0", &err);
         if (err != CL_SUCCESS || !d->kern_kernel_a_rules) {
@@ -10677,65 +8296,6 @@ static int gpu_opencl_kernelb_ensure_proto_bufs(
     return 0;
 }
 
-/* Shared cache used by gpu_opencl_kernel_a_proto_enabled() and the
- * sibling gpu_opencl_kernel_a_active_variant(). Single env-var read.
- *
- *   _cached_a_variant == -2 -> not yet computed
- *   _cached_a_variant ==  0 -> MDXFIND_KERNEL_A_PROTO unset or != 1
- *   _cached_a_variant ==  N -> proto enabled, variant N selected (1..4)
- *
- * Sub-phase 1a.2 (2026-05-21) extends the recognized variant set from
- * {1} to {1, 2}. Variant 2 routes JOB_MD5MD5SALT (canary op) to the new
- * cand_masks_phase0 kernel; A1/A2 share the same env-flag gate but
- * different dispatch shapes (see gpu_opencl_kernel_a_masks_dispatch). */
-static int _cached_a_variant = -2;
-
-static void gpu_opencl_kernel_a_variant_compute(void)
-{
-    /* Variant 0 = existing production wiring.  A1-A4 sat behind
-     * MDXFIND_KERNEL_A_PROTO / _VARIANT, removed 2026-09-16; the
-     * sources are retained but unreachable without a native flag. */
-    _cached_a_variant = 0;
-}
-
-/* gpu_opencl_kernel_a_proto_enabled — Phase 1a env-flag gate for kernel A.
- *
- * Returns 1 when the user has opted into the Phase 1a kernel A production
- * path via MDXFIND_KERNEL_A_PROTO=1, AND MDXFIND_KERNEL_A_VARIANT is unset
- * or set to a recognized variant (1 or 2 as of sub-phase 1a.2). Per D9.4.a
- * the function remains binary 0/1; a sibling gpu_opencl_kernel_a_active_-
- * variant() returns the numeric variant (1/2/3/4) for sites that need to
- * route to a specific dispatch.
- *
- * The legacy MDXFIND_KERNEL_B_PROTO env flag continues to work unchanged;
- * either env flag enables the same A1 producer + kernel B consumer wiring
- * (variant=1 path). Variant=2 (masks-only) is the new A2 dispatch wired
- * in sub-phase 1a.2.
- *
- * One-time stderr warning is emitted on first call when the variant is
- * unknown. Decision is cached after first call. */
-int gpu_opencl_kernel_a_proto_enabled(void)
-{
-    gpu_opencl_kernel_a_variant_compute();
-    return _cached_a_variant > 0 ? 1 : 0;
-}
-
-/* gpu_opencl_kernel_a_active_variant — Phase 1a sub-phase 1a.2 (2026-05-21)
- * sibling per D9.4.a. Returns the cached variant int:
- *   0  -> proto disabled (env unset, or unknown variant)
- *   1  -> VARIANT=1 (rules-only, cand_rules_phase0)
- *   2  -> VARIANT=2 (masks-only, cand_masks_phase0)
- *   3  -> VARIANT=3 (rules+masks, cand_rules_masks_phase0; sub-phase 1a.3)
- *   4  -> reserved (1a.4 BF)
- *
- * Shares cache + env-var inspection with gpu_opencl_kernel_a_proto_enabled.
- * Same one-time stderr advisory; safe to call from dispatch hot paths. */
-int gpu_opencl_kernel_a_active_variant(void)
-{
-    gpu_opencl_kernel_a_variant_compute();
-    return _cached_a_variant > 0 ? _cached_a_variant : 0;
-}
-
 /* gpu_opencl_hx_codegen_enabled — Phase 4 sub-phase 4a.1 (2026-05-21)
  * D13.3.a opt-out accessor.
  *
@@ -10764,1717 +8324,12 @@ int gpu_opencl_hx_codegen_enabled(void)
  * deprecation shim is in codegen_auto_dispatch_deprecation_check(),
  * invoked automatically on first codegen_auto_dispatch_pick() call.
  *
- * PROFILE_VARIANT + Knob G composition (below) now uses the
- * static _gpu_backend_force_codegen() helper above. */
-
-/* gpu_experiment_rules_codegen_profile_variant — perf decomposition
- * env-flag gate (2026-05-29). Returns the variant number 1..5 when
- * MDXFIND_PROFILE_VARIANT is set to a valid value AND the developer
- * FORCE override MDXFIND_GPU_BACKEND=codegen is set; returns 0
- * otherwise (legacy byte-identical baseline V0).
- *
- * Variant meanings (also documented in gpu_kernel_a_rules.cl):
- *   V0 (unset / 0)  baseline — full cand_rules_phase0
- *   V1               no atomic claim (per-lane gid*256 offsets, write happens)
- *   V2               no candidate write (atomic happens, byte loop omitted)
- *   V3               stub apply_rule (returns wlen; walker walks but switch gone)
- *   V4               walker-only (read word into buf, then return; no apply_rule)
- *   V5               empty kernel (return immediately; dispatch overhead only)
- *   V6 (2026-05-29)  V0 + Knob G vectorized uint4 write loop FORCED ON
- *                    (D4 in knob_g_spec). Unlike V1..V5, V6 PRODUCES VALID
- *                    CANDIDATES (kernel B runs normally; crack output is
- *                    bit-equivalent to V0+KNOBG_VEC_WRITE=1). The V0-vs-V6
- *                    kernel_a_us delta is the empirical per-byte-write-
- *                    component reduction attributable to Knob G.
- *
- * For variants V1..V5 the kernel A leaves b_kernelA_state at zero
- * (no slot_counter/byte_counter writes), so the host site
- * gpu_opencl_kernelb_dispatch_proto_chunked's
- *   `if (actual_slots == 0) continue;`
- * already-existing gate makes kernel B a no-op for the chunk. kernel_a_us
- * is captured by the per-chunk CL profiling event BEFORE the kernel-B
- * skip, so the V0-vs-VN delta in kernel_a_us attributes the per-component
- * cost share. V6 is the exception: it DOES set the counters and produces
- * valid candidates; the V0-vs-V6 delta measures only the per-byte-write-
- * loop component (the rest of kernel A is identical).
- *
- * Crack-parity is INTENTIONALLY NOT preserved by V1..V5 (timing stubs);
- * V6 DOES preserve crack-parity (it is the Knob G implementation under
- * a different selector). Production e347 path
- * (op = JOB_MD5MD5SALT, not gated by the MD5 flag) is unaffected by
- * the variant flag because PROFILE_VARIANT is only threaded into the
- * kernel A1 build (not into the kernel B codegen or the e347 fused
- * carrier). The JIT cache key disambiguates so different variant runs
- * don't share a cached kernel binary.
- *
- * Decision cached on first call. One-shot stderr advisory when active. */
-int gpu_experiment_rules_codegen_profile_variant(void)
-{
-    return 0;   /* was MDXFIND_PROFILE_VARIANT */
-}
-
-/* gpu_opencl_kernel_a4_profile_variant — A4 (brute-force engine) PROFILE_-
- * VARIANT env-flag gate (2026-05-30, architect spec project_kernel_a_-
- * a4_profile_variant_spec_2026-05-30.md).
- *
- * Returns the variant number 1..5 when MDXFIND_KERNEL_A4_PROFILE_VARIANT
- * is set to a valid value AND the active kernel-A variant is 4 (host
- * gate R5; per-engine env vars are NOT cross-engine pollutable). Returns
- * 0 otherwise (legacy byte-identical baseline V0 = production unchanged).
- *
- * Variant meanings (also documented at gpu_kernel_a_bruteforce.cl
- * file-top A4_PROFILE_VARIANT block):
- *   V0 (unset / 0)  baseline -- full cand_bruteforce_phase0 (uint4
- *                    stores by default post-2026-05-30 A4 C5 default-on
- *                    refactor; the env-gated KNOBG path + V6 cell were
- *                    removed because the A/B measurement was decisive)
- *   V1               no atomic claim (per-lane gid*256 strided offsets;
- *                    write happens) -- CONFOUNDED on NVIDIA/AGX/RDNA
- *                    per spec §9 R1 (atomic-coalescing-coupling)
- *   V2               no candidate write (atomic still runs; byte-loop
- *                    omitted)
- *   V3               stub charset walk (mask_expand_run_into_gpu returns
- *                    fixed-length 'A'-fill) -- EXPECTED A4 DOMINANT;
- *                    V0-V3 = charset-walk (C3) cost share
- *   V4               decode-only (return after absolute_mask_idx ladder)
- *   V5               empty kernel (return immediately)
- *
- * Per spec §4 D1.a: separate env var from A1's MDXFIND_PROFILE_VARIANT
- * (cross-engine pollution avoidance; allows running A1 + A4 in same
- * process with different variants if desired). Macro name in the
- * kernel is A4_PROFILE_VARIANT (distinct from A1's PROFILE_VARIANT)
- * for JIT-context coexistence.
- *
- * Per spec §4 D1.a / §9 R5: HOST GATE returns 0 if KERNEL_A_VARIANT !=
- * 4 (the env var is set but A4 isn't dispatching, so JIT-baking the
- * variant into an unused program is silent waste). Diagnose via one-
- * shot advisory.
- *
- * For variants V1..V5 the kernel A4 leaves b_kernelA_state.slot_counter
- * at zero (V1/V3/V4/V5 never reach the atomic; V2 keeps the atomic but
- * the slot_counter is intentionally not bumped). Host actual_slots == 0
- * causes the harness-mode return path to short-circuit. Crack-parity
- * is INTENTIONALLY NOT preserved by V1..V5 -- timing-only stubs.
- *
- * Decision cached on first call. One-shot stderr advisory when active. */
-int gpu_opencl_kernel_a4_profile_variant(void);
-int gpu_opencl_kernel_a4_profile_variant(void)
-{
-    return 0;   /* was MDXFIND_KERNEL_A4_PROFILE_VARIANT */
-}
-
-/* gpu_experiment_rules_codegen_vec_write_enabled — Knob G env-flag gate
- * (2026-05-29, kernel-A coalesced uint4 candidate write experiment).
- *
- * Returns 1 ONLY when ALL of:
- *   MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE=1   AND
- *   MDXFIND_GPU_BACKEND=codegen   (developer FORCE override; auto-
- *     dispatch retirement of the parent flag, 2026-05-31)
- * are set. UNSET (or set to anything other than "1" / "codegen") =
- * legacy per-byte write loop in cand_rules_phase0 — byte-identical
- * to the chunked-codegen baseline shipped in #343 / gpu_opencl.c
- * 1.200.
- *
- * Composition is intentional: Knob G is meaningful only when codegen
- * is active. Outside a force-codegen route (production e347 path
- * uses codegen but is not gated by either flag) the VEC_WRITE flag is
- * a no-op. We do NOT want a user who sets VEC_WRITE=1 by itself
- * (forgetting the FORCE override) to think they enabled anything.
- *
- * Decision cached on first call. One-shot stderr advisory when active.
- *
- * Consumed by gpu_opencl_kernelb_build_prog (this TU) to (a) thread
- * -DKNOBG_VEC_WRITE=1 into the kernel A1 clBuildProgram options, and
- * (b) disambiguate the JIT cache key. */
-int gpu_experiment_rules_codegen_vec_write_enabled(void)
-{
-    return 0;   /* was MDXFIND_EXPERIMENT_RULES_CODEGEN_VEC_WRITE (Knob G) */
-}
-
-/* gpu_opencl_kernel_a_trace_dump — Phase 1a A1 buffer-quadruple trace.
- *
- * Writes the post-kernel-A buffer quadruple to disk for harness
- * inspection. Gated by MDXFIND_KERNEL_A_TRACE=<prefix> (the env value
- * is the file prefix; e.g. /tmp/kA0 produces /tmp/kA0.state,
- * /tmp/kA0.chunkidx, /tmp/kA0.packed). When the env var is unset or
- * empty this function is a fast no-op (a single getenv call per
- * dispatch).
- *
- * Buffer formats (raw binary, little-endian on supported platforms):
- *   <prefix>.state    : 12 bytes [slot_counter][byte_counter][overflow_flag]
- *   <prefix>.chunkidx : 4 * actual_slots bytes (uint32 byte offsets)
- *   <prefix>.packed   : actual_byte_count bytes ([len][bytes]...
- *                       length-prefixed candidate concatenation)
- *
- * All failures are FATAL per feedback_external_failures_are_fatal.md —
- * if the trace channel is requested it MUST produce a complete record. */
-static void gpu_opencl_kernel_a_trace_dump(int dev_idx,
-    const uint32_t state[3],
-    const void *index_data, size_t index_bytes,
-    const void *packed_data, size_t packed_bytes)
-{
-    const char *prefix = NULL /* was MDXFIND_KERNEL_A_TRACE */;
-    if (!prefix || !*prefix) return;
-
-    char path[1024];
-    FILE *f;
-
-    snprintf(path, sizeof(path), "%s.state", prefix);
-    f = fopen(path, "wb");
-    if (!f) {
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A trace fopen(%s) failed: %s\n",
-                __FILE__, __LINE__, dev_idx, path, strerror(errno));
-        exit(1);
-    }
-    if (fwrite(state, sizeof(uint32_t), 3, f) != 3) {
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A trace state write failed\n",
-                __FILE__, __LINE__, dev_idx);
-        exit(1);
-    }
-    fclose(f);
-
-    snprintf(path, sizeof(path), "%s.chunkidx", prefix);
-    f = fopen(path, "wb");
-    if (!f) {
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A trace fopen(%s) failed: %s\n",
-                __FILE__, __LINE__, dev_idx, path, strerror(errno));
-        exit(1);
-    }
-    if (index_bytes > 0 && fwrite(index_data, 1, index_bytes, f) != index_bytes) {
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A trace chunkidx write failed\n",
-                __FILE__, __LINE__, dev_idx);
-        exit(1);
-    }
-    fclose(f);
-
-    snprintf(path, sizeof(path), "%s.packed", prefix);
-    f = fopen(path, "wb");
-    if (!f) {
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A trace fopen(%s) failed: %s\n",
-                __FILE__, __LINE__, dev_idx, path, strerror(errno));
-        exit(1);
-    }
-    if (packed_bytes > 0 && fwrite(packed_data, 1, packed_bytes, f) != packed_bytes) {
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A trace packed write failed\n",
-                __FILE__, __LINE__, dev_idx);
-        exit(1);
-    }
-    fclose(f);
-
-    fprintf(stderr,
-        "OpenCL GPU[%d]: kernel A1 trace written (prefix=%s, slots=%u, bytes=%u, overflow=%u)\n",
-        dev_idx, prefix, state[0], state[1], state[2]);
-}
-
-/* ====================================================================
- * Phase 1a sub-phase 1a.2 (2026-05-21): kernel A2 (masks-only) dispatch
- * infrastructure. Mirrors the A1 path in this file (build_prog at
- * gpu_opencl_kernelb_build_prog, dispatch at gpu_opencl_kernelb_dispatch_-
- * proto, trace at gpu_opencl_kernel_a_trace_dump) but routes the A2
- * source (gpu_kernel_a_masks_str / cand_masks_phase0) and writes the
- * mask wire-format buffers.
- *
- * Wire format per project_kernel_a_a2_masks_spec_2026-05-20.md D9.2.a:
- *   mask_pattern_prepend / mask_pattern_append:
- *     MAX_MASK_POS x 2 = 32 bytes each. Entry i lives at offset i*2.
- *     byte 0: classid uchar (0..15 builtin/custom; 0xff = MASK_LITERAL)
- *     byte 1: literal uchar (used only when classid == 0xff)
- *   mask_charsets:    MASK_MAX_CLASSES x 256 = 4096 bytes flat
- *                     (class N's bytes live at offset N*256+i, i in
- *                      [0, mask_class_counts[N])).
- *   mask_class_counts: MASK_MAX_CLASSES x uint32 = 64 bytes.
- *
- * MASK_LITERAL encoding (D9.2.a): the CPU stores MaskPos.classid as -1
- * (signed int) for literal slots. The kernel reads uchar. The host
- * upload path translates -1 -> 0xff at upload time; the kernel never
- * sees the signed sentinel.
- *
- * All allocation / upload failures are FATAL per
- * feedback_external_failures_are_fatal.md.
- * ==================================================================== */
-
-/* gpu_opencl_kernel_a2_build_prog -- build the A2 program + extract the
- * cand_masks_phase0 kernel object on first dispatch with variant=2.
- * Idempotent: returns 0 if already built. FATAL on JIT compile errors
- * (per feedback_external_failures_are_fatal.md). */
-static int gpu_opencl_kernel_a2_build_prog(struct gpu_device *d, int dev_idx)
-{
-    if (d->prog_kernel_a2 && d->kern_kernel_a_masks) return 0;
-
-    cl_int err = CL_SUCCESS;
-
-    if (!d->prog_kernel_a2) {
-        const char *sources_a2[2] = {
-            gpu_common_str,
-            gpu_kernel_a_masks_str    /* Phase 1a sub-phase 1a.2 source */
-        };
-        d->prog_kernel_a2 = gpu_kernel_cache_build_program_ex(
-            d->ctx, d->dev, 2, sources_a2,
-            "-cl-std=CL1.2 -DKERNEL_A_VARIANT=2",
-            "KERNEL_A_VARIANT=2", &err);
-        if (!d->prog_kernel_a2 || err != CL_SUCCESS) {
-            char log[8192] = {0};
-            if (d->prog_kernel_a2)
-                clGetProgramBuildInfo(d->prog_kernel_a2, d->dev,
-                                      CL_PROGRAM_BUILD_LOG,
-                                      sizeof(log)-1, log, NULL);
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A2 (masks) build failed "
-                "(err=%d):\n%s\n",
-                __FILE__, __LINE__, dev_idx, err, log);
-            exit(1);
-        }
-        d->kern_kernel_a_masks = clCreateKernel(d->prog_kernel_a2,
-                                                "cand_masks_phase0", &err);
-        if (err != CL_SUCCESS || !d->kern_kernel_a_masks) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: clCreateKernel(cand_masks_phase0) "
-                "failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        GPU_DEBUG_FPRINTF(stderr,
-            "OpenCL GPU[%d]: kernel A2 (masks-only) library JIT-compiled, "
-            "cand_masks_phase0 extracted\n", dev_idx);
-    }
-    return 0;
-}
-
-/* gpu_opencl_kernel_a_upload_mask_buffers -- one-shot lazy mask wire
- * upload. Called from the A2/A3/A4 dispatchers on first invocation per
- * device when gpu_kern_a_mask_eligible is set.
- *
- * 2026-05-30 long-mask amendment (D1.b Design Y): mask_pattern_prepend
- * and mask_pattern_append are now run-descriptor streams sized
- * GPU_MASK_DESC_BYTES_CAP (320 B) each. The host descriptor packing
- * happens in mdxfind.c (gpu_pack_mask_descriptor); the packed buffers
- * are exposed via globals (gpu_kern_a_prep_desc / gpu_kern_a_app_desc
- * / gpu_kern_a_prep_dlen / gpu_kern_a_app_dlen). This helper simply
- * uploads them verbatim.
- *
- * Idempotent: returns 0 immediately on subsequent calls after a
- * successful first upload. NO re-upload when masks change at runtime;
- * the v1 spec scope is one mask configuration per process invocation.
- *
- * Per feedback_external_failures_are_fatal.md: FATAL on any cl error;
- * NEVER returns -1 with partial state. */
-static int gpu_opencl_kernel_a_upload_mask_buffers(struct gpu_device *d, int dev_idx)
-{
-    if (d->b_kern_a_mask_allocated) return 0;
-
-    cl_int err = CL_SUCCESS;
-    /* 2026-05-30 amendment: persistent per-side descriptor buffer is
-     * 320 B (GPU_MASK_DESC_BYTES_CAP). Charsets + counts unchanged. */
-    const size_t pattern_bytes  = 320u;                                   /* GPU_MASK_DESC_BYTES_CAP */
-    const size_t charsets_bytes = (size_t)MASK_MAX_CLASSES_CPU * 256u;    /* 4096 */
-    const size_t counts_bytes   = (size_t)MASK_MAX_CLASSES_CPU * sizeof(uint32_t); /* 64 */
-
-    /* Allocate the four cl_mem buffers. CL_MEM_READ_ONLY since the kernel
-     * only reads them; small enough that USE_HOST_PTR is unnecessary. */
-    d->b_kern_a_mask_prepend = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                              pattern_bytes, NULL, &err);
-    if (!d->b_kern_a_mask_prepend || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_prepend alloc (%zu) failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, pattern_bytes, err);
-        exit(1);
-    }
-    d->b_kern_a_mask_append = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                             pattern_bytes, NULL, &err);
-    if (!d->b_kern_a_mask_append || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_append alloc (%zu) failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, pattern_bytes, err);
-        exit(1);
-    }
-    d->b_kern_a_mask_charsets = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                               charsets_bytes, NULL, &err);
-    if (!d->b_kern_a_mask_charsets || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_charsets alloc (%zu) failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, charsets_bytes, err);
-        exit(1);
-    }
-    d->b_kern_a_mask_counts = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                             counts_bytes, NULL, &err);
-    if (!d->b_kern_a_mask_counts || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_counts alloc (%zu) failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, counts_bytes, err);
-        exit(1);
-    }
-
-    /* 2026-05-30 amendment: descriptor streams come from the global
-     * staging buffers populated by gpu_pack_mask_descriptor() in
-     * mdxfind.c. The host already validated eligibility (per-side var
-     * count <= 16 AND lit_bytes <= 224). We zero-fill the 320 B buffer
-     * tails so any stale bytes past dlen are safe to read (the kernel
-     * walker terminates on END_TAG (0xFF) or desc_bytes exhaustion). */
-    extern unsigned char gpu_kern_a_prep_desc[];
-    extern unsigned char gpu_kern_a_app_desc [];
-    extern int           gpu_kern_a_prep_dlen;
-    extern int           gpu_kern_a_app_dlen;
-
-    unsigned char prepend_wire[320];
-    unsigned char append_wire[320];
-    unsigned char charsets_flat[MASK_MAX_CLASSES_CPU * 256];
-    uint32_t      counts_flat[MASK_MAX_CLASSES_CPU];
-    memset(prepend_wire,  0xFF, sizeof(prepend_wire));  /* END-tag fill */
-    memset(append_wire,   0xFF, sizeof(append_wire));
-    memset(charsets_flat, 0, sizeof(charsets_flat));
-    memset(counts_flat,   0, sizeof(counts_flat));
-
-    if (gpu_kern_a_prep_dlen > 0 && gpu_kern_a_prep_dlen <= 320) {
-        memcpy(prepend_wire, gpu_kern_a_prep_desc, (size_t)gpu_kern_a_prep_dlen);
-    } else {
-        /* Empty side: a single END tag covers it. */
-        prepend_wire[0] = 0xFF;
-    }
-    if (gpu_kern_a_app_dlen > 0 && gpu_kern_a_app_dlen <= 320) {
-        memcpy(append_wire,  gpu_kern_a_app_desc,  (size_t)gpu_kern_a_app_dlen);
-    } else {
-        append_wire[0] = 0xFF;
-    }
-
-    /* Flatten all 16 classes (custom classes 8..15 may be unused; their
-     * count==0 leaves the slot zero, kernel skips them). */
-    for (int c = 0; c < MASK_MAX_CLASSES_CPU; c++) {
-        counts_flat[c] = (uint32_t)MaskClasses[c].count;
-        if (MaskClasses[c].count > 0) {
-            memcpy(charsets_flat + (size_t)c * 256,
-                   MaskClasses[c].chars,
-                   (size_t)MaskClasses[c].count);
-        }
-    }
-
-    /* Upload all four CL_TRUE. Total < 5 KB. */
-    err = clEnqueueWriteBuffer(d->queue, d->b_kern_a_mask_prepend, CL_TRUE,
-                               0, pattern_bytes, prepend_wire,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_prepend write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    err = clEnqueueWriteBuffer(d->queue, d->b_kern_a_mask_append, CL_TRUE,
-                               0, pattern_bytes, append_wire,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_append write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    err = clEnqueueWriteBuffer(d->queue, d->b_kern_a_mask_charsets, CL_TRUE,
-                               0, charsets_bytes, charsets_flat,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_charsets write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    err = clEnqueueWriteBuffer(d->queue, d->b_kern_a_mask_counts, CL_TRUE,
-                               0, counts_bytes, counts_flat,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: b_kern_a_mask_counts write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    d->b_kern_a_mask_allocated = 1;
-
-    fprintf(stderr,
-        "OpenCL GPU[%d]: kernel A2 mask wire-format uploaded "
-        "(prep_dlen=%d app_dlen=%d total=%llu)\n",
-        dev_idx, gpu_kern_a_prep_dlen, gpu_kern_a_app_dlen,
-        (unsigned long long)MaskTotal);
-    return 0;
-}
-
-/* gpu_opencl_kernel_a_masks_dispatch -- A2 (masks-only) top-level dispatch.
- *
- * Per Phase 1a sub-phase 1a.2 Phase 4-5 brief: v1 ships as harness-mode.
- * Runs kernel A2 (cand_masks_phase0), reads back the buffer-quadruple
- * state, optionally dumps the buffer-quadruple via the existing
- * MDXFIND_KERNEL_A_TRACE channel, and returns NULL (no kernel B wired
- * for A2 in this sub-phase; *nhits_out is always 0).
- *
- * Returns NULL when:
- *   - MDXFIND_KERNEL_A_PROTO unset or VARIANT != 2
- *   - No active mask (MaskPrependLen + MaskAppendLen == 0)
- *   - Build / upload failure (kept FATAL upstream; this branch is for
- *     env-gate misses only)
- *   - Device disabled
- *
- * Note re: feedback_proto_dispatch_lazy_alloc_dependency.md: A2 v1
- * does NOT EMIT_HIT, so b_hashes_shown is not required. When A2-with-
- * kernel-B integration lands (sub-phase 1a.5+), that path must extend
- * the lazy-alloc list per the feedback note. */
-uint32_t *gpu_opencl_kernel_a_masks_dispatch(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out)
-{
-    if (nhits_out) *nhits_out = 0;
-
-    /* Variant gate. */
-    if (gpu_opencl_kernel_a_active_variant() != 2) return NULL;
-    if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
-    if (!packed_words || packed_size == 0 || !word_offset || num_words == 0)
-        return NULL;
-
-    struct gpu_device *d = &gpu_devs[dev_idx];
-    if (d->device_disabled) return NULL;
-
-    /* No active mask: nothing to do for A2. (The selector at gpujob_-
-     * opencl.c should not route here when MaskTotal == 0, but defend
-     * anyway.) */
-    if (MaskPrependLen + MaskAppendLen == 0 || MaskTotal == 0) {
-        static int _empty_warned = 0;
-        if (!_empty_warned) {
-            _empty_warned = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A2 dispatch invoked with no active "
-                "mask (MaskPrependLen=%d MaskAppendLen=%d MaskTotal=%llu); "
-                "falling through.\n",
-                dev_idx, MaskPrependLen, MaskAppendLen,
-                (unsigned long long)MaskTotal);
-        }
-        return NULL;
-    }
-
-    /* 2026-05-30 amendment: A2/A3/A4 eligibility flag is computed once
-     * in mdxfind.c (gpu_avail init path) and stashed in
-     * gpu_kern_a_mask_eligible. If the mask exceeded the per-side caps
-     * (vars > 16 or lit_bytes > 224), the descriptor stream was NOT
-     * packed and we must fall back to CPU here. */
-    {
-        extern int gpu_kern_a_mask_eligible;
-        if (!gpu_kern_a_mask_eligible) {
-            static int _ineligible_warned = 0;
-            if (!_ineligible_warned) {
-                _ineligible_warned = 1;
-                fprintf(stderr,
-                    "OpenCL GPU[%d]: kernel A2 mask exceeds per-side cap; "
-                    "falling back to CPU iterator.\n", dev_idx);
-            }
-            return NULL;
-        }
-    }
-
-    /* R5 host-side assert: MaskTotal must fit in uint32_t for kernel A2 v1.
-     * Larger keyspaces are chunked in sub-phase 1a.2.x; the v1 dispatch
-     * stays a single enqueue per call. */
-    if (MaskTotal >= (1ULL << 31)) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: kernel A2 v1 requires MaskTotal "
-            "< 2^31 (current=%llu); chunking not yet implemented (sub-phase "
-            "1a.2.x).\n",
-            __FILE__, __LINE__, dev_idx,
-            (unsigned long long)MaskTotal);
-        exit(1);
-    }
-
-    /* Build kernel A2 program (lazy, once per device). */
-    if (gpu_opencl_kernel_a2_build_prog(d, dev_idx) < 0) {
-        return NULL;
-    }
-
-    /* Upload mask wire-format buffers (lazy, once per device). */
-    if (gpu_opencl_kernel_a_upload_mask_buffers(d, dev_idx) < 0) {
-        return NULL;
-    }
-
-    /* One-shot stderr marker per feedback_verify_gpu_fired_post_build.md.
-     * Mirrors A1's "kernel A1 dispatch fired" marker so the harness can
-     * grep a backend-agnostic shape. */
-    {
-        static int _kernel_a2_first[MAX_GPU_DEVICES] = {0};
-        if (dev_idx < MAX_GPU_DEVICES && !_kernel_a2_first[dev_idx]) {
-            _kernel_a2_first[dev_idx] = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A2 dispatch fired "
-                "(variant=2 op=%d n_words=%u mask_total=%llu)\n",
-                dev_idx, op, num_words,
-                (unsigned long long)MaskTotal);
-        }
-    }
-
-    cl_int err = CL_SUCCESS;
-    uint32_t n_masks = (uint32_t)MaskTotal;
-
-    /* --- 1. Size / (re)allocate prototype buffers ---
-     * Worst-case slot count = num_words * n_masks (no rejection path in A2).
-     * Worst-case packed bytes = slots * 256 (1 len byte + up to 255 bytes). */
-    size_t max_slots  = (size_t)num_words * (size_t)n_masks;
-    size_t max_packed = max_slots * 256u;
-    if (max_packed < MIN_BUFFER_BYTES) max_packed = MIN_BUFFER_BYTES;
-
-    if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, max_packed, max_slots) < 0)
-        return NULL;
-
-    /* --- 2. Zero-init b_proto_kernelA_state before dispatch --- */
-    memset(d->h_proto_kernelA_state, 0, 3u * sizeof(uint32_t));
-    err = clEnqueueWriteBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
-                               0, 3u * sizeof(uint32_t),
-                               d->h_proto_kernelA_state,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A2 state zero-write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-
-    /* --- 3. Assemble payload (same layout as A1) ---
-     *   [OCLParams][hit_count][word_offset[num_words]][packed_words...]
-     * A2 reads params.num_words, params.num_masks, params.n_prepend,
-     * params.n_append, params.packed_size from offset 0.
-     * It does NOT read num_rules (A2 has no rules-axis). */
-    size_t payload_woff_bytes = (size_t)num_words * sizeof(uint32_t);
-    size_t payload_size = 128u + 4u + payload_woff_bytes + (size_t)packed_size;
-
-    if (!d->b_dispatch_payload || payload_size > d->dispatch_payload_cap) {
-        if (d->b_dispatch_payload) clReleaseMemObject(d->b_dispatch_payload);
-        void *new_host = calloc(1, payload_size);
-        if (!new_host) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: A2 dispatch_payload calloc(%zu) failed\n",
-                __FILE__, __LINE__, dev_idx, payload_size);
-            exit(1);
-        }
-        if (d->h_dispatch_payload) free(d->h_dispatch_payload);
-        d->h_dispatch_payload     = new_host;
-        d->h_dispatch_payload_cap = payload_size;
-
-        d->b_dispatch_payload = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
-            payload_size, d->h_dispatch_payload, &err);
-        if (!d->b_dispatch_payload || err != CL_SUCCESS) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: A2 b_dispatch_payload alloc(%zu) failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, payload_size, err);
-            exit(1);
-        }
-        d->dispatch_payload_cap = payload_size;
-    }
-
-    /* Fill payload in host staging. */
-    {
-        extern int gpu_kern_a_prep_dlen;
-        extern int gpu_kern_a_app_dlen;
-        uint8_t *staging = (uint8_t *)d->h_dispatch_payload;
-        OCLParams params;
-        memset(&params, 0, sizeof(params));
-        params.compact_mask   = _compact_mask;
-        params.num_words      = num_words;
-        params.num_masks      = n_masks;            /* MaskTotal */
-        /* 2026-05-30 amendment: n_prepend / n_append carry the
-         * run-descriptor stream BYTE LENGTH post-amendment, NOT the
-         * MaskPrependLen / MaskAppendLen position count. The kernel
-         * uses these as upper-bound safety guards inside the walker. */
-        params.n_prepend      = (uint32_t)gpu_kern_a_prep_dlen;
-        params.n_append       = (uint32_t)gpu_kern_a_app_dlen;
-        params.num_rules      = 0;                  /* A2 has no rules axis */
-        params.max_probe      = 256;
-        params.hash_data_count = _hash_data_count;
-        params.max_hits       = GPU_PACKED_MAX_HITS;
-        params.overflow_count = _overflow_count;
-        params.max_iter       = 1;
-        params.base_word_idx  = 0;
-        params.packed_size    = (uint32_t)max_packed;
-        memcpy(staging, &params, sizeof(params));
-
-        uint32_t zero32 = 0;
-        memcpy(staging + 128, &zero32, 4);
-
-        memcpy(staging + 132, word_offset, payload_woff_bytes);
-        memcpy(staging + 132 + payload_woff_bytes, packed_words, packed_size);
-    }
-
-    err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
-                               0, payload_size, d->h_dispatch_payload,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A2 payload write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-
-    /* --- 4. Set kernel A2 args (8-arg signature per gpu_kernel_a_masks.cl) ---
-     *   arg 0: __global uchar *payload
-     *   arg 1: __global const uchar *mask_pattern_prepend
-     *   arg 2: __global const uchar *mask_pattern_append
-     *   arg 3: __global const uchar *mask_charsets
-     *   arg 4: __global const uint  *mask_class_counts
-     *   arg 5: __global uchar *b_packed_buf
-     *   arg 6: __global uint  *b_chunk_index
-     *   arg 7: __global volatile uint *b_kernelA_state */
-    {
-        cl_kernel ka = d->kern_kernel_a_masks;
-        int a = 0;
-#define KARG2(k, n, s, v) do { cl_int _e = clSetKernelArg(k, n, s, v); \
-    if (_e != CL_SUCCESS) { \
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A2 arg %d failed (err=%d)\n", \
-                __FILE__, __LINE__, dev_idx, n, _e); exit(1); } } while(0)
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_dispatch_payload);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_prepend);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_append);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_charsets);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_counts);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_proto_packed_buf);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_proto_chunk_index);
-        KARG2(ka, a++, sizeof(cl_mem), &d->b_proto_kernelA_state);
-#undef KARG2
-
-        size_t gsize_a = (size_t)num_words * (size_t)n_masks;
-        size_t lsize_a = 64;
-        gsize_a = ((gsize_a + lsize_a - 1) / lsize_a) * lsize_a;
-
-        err = clEnqueueNDRangeKernel(d->queue, ka, 1,
-                                     NULL, &gsize_a, &lsize_a,
-                                     0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A2 enqueue failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-    }
-
-    /* --- 5. Read back state + (optional) packed/chunk_index --- */
-    uint32_t state[3] = {0, 0, 0};
-    err = clEnqueueReadBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
-                              0, 3u * sizeof(uint32_t), state,
-                              0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A2 state readback failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    uint32_t actual_slots      = state[0];
-    uint32_t actual_byte_count = state[1];
-    uint32_t overflow_flag     = state[2];
-
-    if (!overflow_flag && actual_slots > 0) {
-        if (actual_byte_count > d->h_proto_packed_readback_cap) {
-            free(d->h_proto_packed_readback);
-            d->h_proto_packed_readback = calloc(1, actual_byte_count + MIN_BUFFER_BYTES);
-            if (!d->h_proto_packed_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: A2 h_proto_packed_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
-            }
-            d->h_proto_packed_readback_cap = actual_byte_count + MIN_BUFFER_BYTES;
-        }
-        size_t index_bytes = (size_t)actual_slots * sizeof(uint32_t);
-        if (index_bytes > d->h_proto_index_readback_cap) {
-            free(d->h_proto_index_readback);
-            d->h_proto_index_readback = calloc(1, index_bytes + MIN_BUFFER_BYTES);
-            if (!d->h_proto_index_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: A2 h_proto_index_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
-            }
-            d->h_proto_index_readback_cap = index_bytes + MIN_BUFFER_BYTES;
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf, CL_TRUE,
-                                  0, (size_t)actual_byte_count,
-                                  d->h_proto_packed_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: A2 b_proto_packed_buf readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index, CL_TRUE,
-                                  0, index_bytes,
-                                  d->h_proto_index_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: A2 b_proto_chunk_index readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-    }
-
-    /* Trace dump (zero overhead when MDXFIND_KERNEL_A_TRACE unset). Reuses
-     * A1's trace_dump helper: format is variant-agnostic (the .state +
-     * .chunkidx + .packed files have the same buffer-quadruple shape). */
-    gpu_opencl_kernel_a_trace_dump(dev_idx, state,
-        d->h_proto_index_readback,
-        (size_t)actual_slots * sizeof(uint32_t),
-        d->h_proto_packed_readback,
-        (size_t)actual_byte_count);
-
-    if (overflow_flag) {
-        fprintf(stderr,
-            "[kernelA2_proto] OpenCL GPU[%d]: kernel A2 overflow "
-            "(slots=%u bytes=%u packed_cap=%zu) -- A2-only ship; no kernel B retry\n",
-            dev_idx, actual_slots, actual_byte_count, max_packed);
-    }
-
-    /* v1: A2 is harness-mode. Return NULL with nhits=0 so the caller
-     * (gpujob_opencl.c chokepoint selector) falls through to its own
-     * subsequent path or treats this as a no-op for the slot. */
-    if (nhits_out) *nhits_out = 0;
-    return NULL;
-}
-
-/* ====================================================================
- * Phase 1a sub-phase 1a.3 (2026-05-21): kernel A3 (rules + masks)
- * dispatch infrastructure. Compositional product of A1 (rule walker) x
- * A2 (mask expander). Reuses all five buffers already uploaded:
- *   - b_rule_program, b_rule_offset (uploaded by A1 path via
- *     gpu_opencl_set_rules)
- *   - b_kern_a_mask_prepend, b_kern_a_mask_append, b_kern_a_mask_charsets,
- *     b_kern_a_mask_counts (uploaded by A2 path via
- *     gpu_opencl_kernel_a_upload_mask_buffers)
- *
- * Per D10.1.a: host sets params.num_rules = Numrules (source count),
- * kernel computes n_total_rules = num_rules + 1u and treats rule_idx==0
- * as the implicit no-rule pass (feedback_no_rule_pass.md).
- *
- * Per D10.2.a: slot order is producer-defined; harness multiset-
- * compares against Python oracle (Phase 6-7 territory).
- *
- * v1 ship: single-shot dispatch (no chunking loop). Cursor-restart
- * machinery (input_cursor_start/rule_cursor_start/mask_start) is honored
- * by the kernel side but host sets all three to 0; overflow_flag firing
- * raises a stderr warning. Multi-dispatch cursor-restart is sub-phase
- * 1a.3.x territory.
- *
- * All allocation / upload failures are FATAL per
- * feedback_external_failures_are_fatal.md.
- * ==================================================================== */
-
-/* gpu_opencl_kernel_a3_build_prog -- build the A3 program + extract the
- * cand_rules_masks_phase0 kernel object on first dispatch with variant=3.
- * Idempotent: returns 0 if already built. FATAL on JIT compile errors. */
-static int gpu_opencl_kernel_a3_build_prog(struct gpu_device *d, int dev_idx)
-{
-    if (d->prog_kernel_a3 && d->kern_kernel_a_rules_masks) return 0;
-
-    cl_int err = CL_SUCCESS;
-
-    if (!d->prog_kernel_a3) {
-        const char *sources_a3[2] = {
-            gpu_common_str,
-            gpu_kernel_a_rules_masks_str   /* Phase 1a sub-phase 1a.3 source */
-        };
-        d->prog_kernel_a3 = gpu_kernel_cache_build_program_ex(
-            d->ctx, d->dev, 2, sources_a3,
-            "-cl-std=CL1.2 -DKERNEL_A_VARIANT=3",
-            "KERNEL_A_VARIANT=3", &err);
-        if (!d->prog_kernel_a3 || err != CL_SUCCESS) {
-            char log[8192] = {0};
-            if (d->prog_kernel_a3)
-                clGetProgramBuildInfo(d->prog_kernel_a3, d->dev,
-                                      CL_PROGRAM_BUILD_LOG,
-                                      sizeof(log)-1, log, NULL);
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A3 (rules+masks) build "
-                "failed (err=%d):\n%s\n",
-                __FILE__, __LINE__, dev_idx, err, log);
-            exit(1);
-        }
-        d->kern_kernel_a_rules_masks = clCreateKernel(d->prog_kernel_a3,
-                                                      "cand_rules_masks_phase0",
-                                                      &err);
-        if (err != CL_SUCCESS || !d->kern_kernel_a_rules_masks) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: clCreateKernel"
-                "(cand_rules_masks_phase0) failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        GPU_DEBUG_FPRINTF(stderr,
-            "OpenCL GPU[%d]: kernel A3 (rules+masks) library JIT-compiled, "
-            "cand_rules_masks_phase0 extracted\n", dev_idx);
-    }
-    return 0;
-}
-
-/* gpu_opencl_kernel_a_rules_masks_dispatch -- A3 top-level dispatch.
- *
- * Per Phase 1a sub-phase 1a.3 Phase 4-5 brief: v1 ships as harness-mode.
- * Runs kernel A3 (cand_rules_masks_phase0), reads back the buffer-
- * quadruple state, optionally dumps via MDXFIND_KERNEL_A_TRACE, and
- * returns NULL (no kernel B wired for A3 in this sub-phase; *nhits_out
- * is always 0).
- *
- * Returns NULL when:
- *   - MDXFIND_KERNEL_A_PROTO unset or VARIANT != 3
- *   - No active rules (Numrules == 0)
- *   - No active mask (MaskTotal == 0)
- *   - Build / upload failure (kept FATAL upstream; this branch is for
- *     env-gate misses only)
- *   - Device disabled
- *
- * Per D10.1.a: params.num_rules is set to Numrules (the source rule
- * count). The kernel internally computes n_total_rules = num_rules + 1u
- * and routes rule_idx==0 to the implicit no-rule pass; rule_idx in
- * [1, num_rules] indexes rule_offset[rule_idx - 1u].
- *
- * Note re: feedback_proto_dispatch_lazy_alloc_dependency.md: A3 v1
- * does NOT EMIT_HIT, so b_hashes_shown is not required. When A3-with-
- * kernel-B integration lands, that path must extend the lazy-alloc
- * list per the feedback note. */
-uint32_t *gpu_opencl_kernel_a_rules_masks_dispatch(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out)
-{
-    if (nhits_out) *nhits_out = 0;
-
-    /* Variant gate. */
-    if (gpu_opencl_kernel_a_active_variant() != 3) return NULL;
-    if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
-    if (!packed_words || packed_size == 0 || !word_offset || num_words == 0)
-        return NULL;
-
-    struct gpu_device *d = &gpu_devs[dev_idx];
-    if (d->device_disabled) return NULL;
-
-    /* Rules + masks both required for A3. */
-    if (d->gpu_n_rules <= 0) return NULL;
-    if (MaskPrependLen + MaskAppendLen == 0 || MaskTotal == 0) {
-        static int _empty_warned = 0;
-        if (!_empty_warned) {
-            _empty_warned = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A3 dispatch invoked with no active "
-                "mask (MaskPrependLen=%d MaskAppendLen=%d MaskTotal=%llu); "
-                "falling through.\n",
-                dev_idx, MaskPrependLen, MaskAppendLen,
-                (unsigned long long)MaskTotal);
-        }
-        return NULL;
-    }
-
-    /* v1 host-side cap: MaskTotal must fit in uint32_t (passes to
-     * params.num_masks). Chunking handles larger keyspaces in sub-phase
-     * 1a.3.x via cursor-restart. */
-    if (MaskTotal >= (1ULL << 31)) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: kernel A3 v1 requires MaskTotal "
-            "< 2^31 (current=%llu); cursor-restart chunking not yet "
-            "implemented (sub-phase 1a.3.x).\n",
-            __FILE__, __LINE__, dev_idx,
-            (unsigned long long)MaskTotal);
-        exit(1);
-    }
-
-    /* Build kernel A3 program (lazy, once per device). */
-    if (gpu_opencl_kernel_a3_build_prog(d, dev_idx) < 0) {
-        return NULL;
-    }
-
-    /* Upload mask wire-format buffers (lazy, once per device). Reuses
-     * the same helper as A2 -- the four cl_mems live in struct
-     * gpu_device and are shared across A2 + A3. */
-    if (gpu_opencl_kernel_a_upload_mask_buffers(d, dev_idx) < 0) {
-        return NULL;
-    }
-
-    /* One-shot stderr marker per feedback_verify_gpu_fired_post_build.md. */
-    {
-        static int _kernel_a3_first[MAX_GPU_DEVICES] = {0};
-        if (dev_idx < MAX_GPU_DEVICES && !_kernel_a3_first[dev_idx]) {
-            _kernel_a3_first[dev_idx] = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A3 dispatch fired "
-                "(variant=3 op=%d n_words=%u n_rules=%d mask_total=%llu)\n",
-                dev_idx, op, num_words, d->gpu_n_rules,
-                (unsigned long long)MaskTotal);
-        }
-    }
-
-    cl_int err = CL_SUCCESS;
-    /* gpu_n_rules includes the synthetic ':' prepend rule that
-     * gpu_opencl_set_rules() adds to rule_program. Per D10.1.a the kernel
-     * implements the no-rule pass internally via rule_idx==0; we pass
-     * num_rules = gpu_n_rules - 1 so the kernel's [1, num_rules] iteration
-     * exercises rule_offset[0..num_rules-1] which (with synth ':' at
-     * rule_offset[0]) hits the source rules once. The synth ':' at
-     * rule_offset[0] still gets visited at rule_idx=1 but the kernel's
-     * no-op detector ('if rule_len == wlen and unchanged: return') skips
-     * it, so the multiset matches Numrules + 1 unique candidates per
-     * (word, mask) -- one no-rule + Numrules source rules. */
-    uint32_t n_rules = (uint32_t)(d->gpu_n_rules > 0 ? d->gpu_n_rules - 1 : 0);
-    uint32_t n_masks = (uint32_t)MaskTotal;
-
-    /* --- 1. Size / (re)allocate prototype buffers ---
-     * Worst-case slot count = num_words * (n_rules + 1) * n_masks
-     * (the +1 is the implicit no-rule pass; rejection further trims).
-     * Worst-case packed bytes = slots * 256 (1 len byte + up to 255). */
-    size_t max_slots  = (size_t)num_words * (size_t)(n_rules + 1u)
-                         * (size_t)n_masks;
-    size_t max_packed = max_slots * 256u;
-    if (max_packed < MIN_BUFFER_BYTES) max_packed = MIN_BUFFER_BYTES;
-
-    if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, max_packed, max_slots) < 0)
-        return NULL;
-
-    /* --- 2. Zero-init b_proto_kernelA_state before dispatch --- */
-    memset(d->h_proto_kernelA_state, 0, 3u * sizeof(uint32_t));
-    err = clEnqueueWriteBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
-                               0, 3u * sizeof(uint32_t),
-                               d->h_proto_kernelA_state,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A3 state zero-write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-
-    /* --- 3. Assemble payload (same layout as A1 / A2) ---
-     *   [OCLParams][hit_count][word_offset[num_words]][packed_words...]
-     * A3 reads params.num_words, params.num_rules, params.num_masks,
-     * params.n_prepend, params.n_append, params.packed_size,
-     * params.input_cursor_start, params.rule_cursor_start,
-     * params.mask_start. */
-    size_t payload_woff_bytes = (size_t)num_words * sizeof(uint32_t);
-    size_t payload_size = 128u + 4u + payload_woff_bytes + (size_t)packed_size;
-
-    if (!d->b_dispatch_payload || payload_size > d->dispatch_payload_cap) {
-        if (d->b_dispatch_payload) clReleaseMemObject(d->b_dispatch_payload);
-        void *new_host = calloc(1, payload_size);
-        if (!new_host) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: A3 dispatch_payload calloc(%zu) failed\n",
-                __FILE__, __LINE__, dev_idx, payload_size);
-            exit(1);
-        }
-        if (d->h_dispatch_payload) free(d->h_dispatch_payload);
-        d->h_dispatch_payload     = new_host;
-        d->h_dispatch_payload_cap = payload_size;
-
-        d->b_dispatch_payload = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
-            payload_size, d->h_dispatch_payload, &err);
-        if (!d->b_dispatch_payload || err != CL_SUCCESS) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: A3 b_dispatch_payload alloc(%zu) failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, payload_size, err);
-            exit(1);
-        }
-        d->dispatch_payload_cap = payload_size;
-    }
-
-    /* Fill payload in host staging. */
-    {
-        uint8_t *staging = (uint8_t *)d->h_dispatch_payload;
-        OCLParams params;
-        memset(&params, 0, sizeof(params));
-        params.compact_mask   = _compact_mask;
-        params.num_words      = num_words;
-        params.num_rules      = n_rules;            /* D10.1.a: source rule count
-                                                     * (NOT +1; kernel adds +1 for
-                                                     * implicit no-rule pass) */
-        params.num_masks      = n_masks;            /* MaskTotal */
-        /* 2026-05-30 amendment: descriptor stream byte length. See
-         * gpu_kernel_a_masks.cl walker docs. */
-        {
-            extern int gpu_kern_a_prep_dlen;
-            extern int gpu_kern_a_app_dlen;
-            params.n_prepend  = (uint32_t)gpu_kern_a_prep_dlen;
-            params.n_append   = (uint32_t)gpu_kern_a_app_dlen;
-        }
-        params.max_probe      = 256;
-        params.hash_data_count = _hash_data_count;
-        params.max_hits       = GPU_PACKED_MAX_HITS;
-        params.overflow_count = _overflow_count;
-        params.max_iter       = 1;
-        params.base_word_idx  = 0;
-        params.packed_size    = (uint32_t)max_packed;
-        /* Cursor axes -- single-shot v1; all start at 0. */
-        params.input_cursor_start = 0;
-        params.rule_cursor_start  = 0;
-        params.mask_start         = 0;
-        memcpy(staging, &params, sizeof(params));
-
-        uint32_t zero32 = 0;
-        memcpy(staging + 128, &zero32, 4);
-
-        memcpy(staging + 132, word_offset, payload_woff_bytes);
-        memcpy(staging + 132 + payload_woff_bytes, packed_words, packed_size);
-    }
-
-    err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
-                               0, payload_size, d->h_dispatch_payload,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A3 payload write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-
-    /* --- 4. Set kernel A3 args (10-arg signature per gpu_kernel_a_rules_masks.cl) ---
-     *   arg 0: __global uchar *payload
-     *   arg 1: __global const uchar *rule_program
-     *   arg 2: __global const uint  *rule_offset
-     *   arg 3: __global const uchar *mask_pattern_prepend
-     *   arg 4: __global const uchar *mask_pattern_append
-     *   arg 5: __global const uchar *mask_charsets
-     *   arg 6: __global const uint  *mask_class_counts
-     *   arg 7: __global uchar *b_packed_buf
-     *   arg 8: __global uint  *b_chunk_index
-     *   arg 9: __global volatile uint *b_kernelA_state */
-    {
-        cl_kernel ka = d->kern_kernel_a_rules_masks;
-        int a = 0;
-#define KARG3(k, n, s, v) do { cl_int _e = clSetKernelArg(k, n, s, v); \
-    if (_e != CL_SUCCESS) { \
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A3 arg %d failed (err=%d)\n", \
-                __FILE__, __LINE__, dev_idx, n, _e); exit(1); } } while(0)
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_dispatch_payload);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_rule_program);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_rule_offset);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_prepend);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_append);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_charsets);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_counts);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_proto_packed_buf);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_proto_chunk_index);
-        KARG3(ka, a++, sizeof(cl_mem), &d->b_proto_kernelA_state);
-#undef KARG3
-
-        /* Grid: num_words * (n_rules + 1). The +1 is the implicit no-rule
-         * pass; the kernel computes n_total_rules = num_rules + 1u internally
-         * (D10.1.a). Mask axis is iterated inline per thread. */
-        size_t gsize_a = (size_t)num_words * (size_t)(n_rules + 1u);
-        size_t lsize_a = 64;
-        gsize_a = ((gsize_a + lsize_a - 1) / lsize_a) * lsize_a;
-
-        err = clEnqueueNDRangeKernel(d->queue, ka, 1,
-                                     NULL, &gsize_a, &lsize_a,
-                                     0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A3 enqueue failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-    }
-
-    /* --- 5. Read back state + (optional) packed/chunk_index --- */
-    uint32_t state[3] = {0, 0, 0};
-    err = clEnqueueReadBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
-                              0, 3u * sizeof(uint32_t), state,
-                              0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A3 state readback failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    uint32_t actual_slots      = state[0];
-    uint32_t actual_byte_count = state[1];
-    uint32_t overflow_flag     = state[2];
-
-    if (!overflow_flag && actual_slots > 0) {
-        if (actual_byte_count > d->h_proto_packed_readback_cap) {
-            free(d->h_proto_packed_readback);
-            d->h_proto_packed_readback = calloc(1, actual_byte_count + MIN_BUFFER_BYTES);
-            if (!d->h_proto_packed_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: A3 h_proto_packed_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
-            }
-            d->h_proto_packed_readback_cap = actual_byte_count + MIN_BUFFER_BYTES;
-        }
-        size_t index_bytes = (size_t)actual_slots * sizeof(uint32_t);
-        if (index_bytes > d->h_proto_index_readback_cap) {
-            free(d->h_proto_index_readback);
-            d->h_proto_index_readback = calloc(1, index_bytes + MIN_BUFFER_BYTES);
-            if (!d->h_proto_index_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: A3 h_proto_index_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
-            }
-            d->h_proto_index_readback_cap = index_bytes + MIN_BUFFER_BYTES;
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf, CL_TRUE,
-                                  0, (size_t)actual_byte_count,
-                                  d->h_proto_packed_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: A3 b_proto_packed_buf readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index, CL_TRUE,
-                                  0, index_bytes,
-                                  d->h_proto_index_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: A3 b_proto_chunk_index readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-    }
-
-    /* Trace dump (zero overhead when MDXFIND_KERNEL_A_TRACE unset). Reuses
-     * A1/A2's trace_dump helper: format is variant-agnostic. */
-    gpu_opencl_kernel_a_trace_dump(dev_idx, state,
-        d->h_proto_index_readback,
-        (size_t)actual_slots * sizeof(uint32_t),
-        d->h_proto_packed_readback,
-        (size_t)actual_byte_count);
-
-    if (overflow_flag) {
-        fprintf(stderr,
-            "[kernelA3_proto] OpenCL GPU[%d]: kernel A3 overflow "
-            "(slots=%u bytes=%u packed_cap=%zu) -- A3 v1 single-shot; "
-            "cursor-restart chunking is sub-phase 1a.3.x\n",
-            dev_idx, actual_slots, actual_byte_count, max_packed);
-    }
-
-    /* v1: A3 is harness-mode. Return NULL with nhits=0 so the caller
-     * falls through to the legacy path for this slot. */
-    if (nhits_out) *nhits_out = 0;
-    return NULL;
-}
-
-/* ---- A4 PROFILE_VARIANT timing harness (2026-05-30) ------------------
- * Per architect spec project_kernel_a_a4_profile_variant_spec_2026-05-30.md
- * D5.a + spec §6 rows 17-19 + R7: A4 standalone dispatcher does NOT
- * route through the A1 two-kernel proto's kernel_a_us harness (that
- * harness lives inside gpu_opencl_kernelb_dispatch_proto and only fires
- * on the A1 path). PROFILE_VARIANT-for-A4 therefore requires NEW
- * timing-capture sites at the A4 NDRange + a dedicated accumulator
- * with [ocl-kA4] prefix (distinct from A1's [disp] / kernel_a_us
- * channels per feedback_check_existing_traces_first.md).
- *
- * Auto-enabled whenever MDXFIND_KERNEL_A4_PROFILE_VARIANT is set (queue
- * creation already opted into CL_QUEUE_PROFILING_ENABLE -- see the
- * gate above the queue-creation site). The accumulator emits per-
- * dispatch [ocl-kA4] line + atexit aggregate. Independent of the A1
- * statics (_kb_last_kernel_a_us etc.) to avoid cross-engine pollution.
- *
- * Thread-safety: A4 dispatcher runs from the GPU host thread (single
- * dispatch per chunk via the BF servo); accumulator updates are
- * serialized by virtue of single-call-per-process-per-chunk. No locks
- * required. */
-static double  _ka4_total_us = 0.0;
-static double  _ka4_min_us   = 1e18;
-static double  _ka4_max_us   = 0.0;
-static unsigned long _ka4_count = 0;
-static int     _ka4_atexit_armed = 0;
-
-static void gpu_opencl_kernel_a4_timing_dump(void)
-{
-    if (_ka4_count == 0) return;
-    double mean = _ka4_total_us / (double)_ka4_count;
-    fprintf(stderr,
-        "[ocl-kA4] AGGREGATE dispatches=%lu total_us=%.1f mean_us=%.1f "
-        "min_us=%.1f max_us=%.1f\n",
-        _ka4_count, _ka4_total_us, mean, _ka4_min_us, _ka4_max_us);
-}
-
-static void gpu_opencl_kernel_a4_timing_record(int dev_idx, int op, double dt_us)
-{
-    if (!_ka4_atexit_armed) {
-        _ka4_atexit_armed = 1;
-        atexit(gpu_opencl_kernel_a4_timing_dump);
-    }
-    _ka4_total_us += dt_us;
-    if (dt_us < _ka4_min_us) _ka4_min_us = dt_us;
-    if (dt_us > _ka4_max_us) _ka4_max_us = dt_us;
-    _ka4_count++;
-    int variant = gpu_opencl_kernel_a4_profile_variant();
-    fprintf(stderr,
-        "[ocl-kA4] dev=%d dispatch=%lu kernel_a4_us=%.1f op=%d variant=%d\n",
-        dev_idx, _ka4_count, dt_us, op, variant);
-}
-
-/* Phase 1a sub-phase 1a.4 (2026-05-21): A4 brute-force build_prog + dispatch.
- *
- * gpu_opencl_kernel_a4_build_prog -- build the A4 program + extract the
- * cand_bruteforce_phase0 kernel object on first dispatch with variant=4.
- * Idempotent: returns 0 if already built. FATAL on JIT compile errors. */
-static int gpu_opencl_kernel_a4_build_prog(struct gpu_device *d, int dev_idx)
-{
-    if (d->prog_kernel_a4 && d->kern_kernel_a_bruteforce) return 0;
-
-    cl_int err = CL_SUCCESS;
-
-    if (!d->prog_kernel_a4) {
-        const char *sources_a4[2] = {
-            gpu_common_str,
-            gpu_kernel_a_bruteforce_str   /* Phase 1a sub-phase 1a.4 source */
-        };
-        /* PROFILE_VARIANT-for-A4 (2026-05-30 architect spec
-         * project_kernel_a_a4_profile_variant_spec_2026-05-30.md D5.a):
-         * thread -DA4_PROFILE_VARIANT=N + cache key when active. Macro
-         * name disambiguates from A1's PROFILE_VARIANT so A1 + A4
-         * programs can coexist in the same JIT context if both env
-         * vars are set. The accessor returns 0 unless VARIANT=4 active
-         * (R5 host gate).
-         *
-         * 2026-05-30 A4 C5 DEFAULT-ON REFACTOR: the env-gated
-         * -DKNOBG_A4_VEC_WRITE=1 threading was REMOVED here. The uint4
-         * (16-byte) device-store write path is now the unconditional
-         * V0 production path in the kernel; no JIT macro is needed to
-         * select it. The accessor function gpu_experiment_kernel_a4_-
-         * vec_write_enabled() was also removed. */
-        int a4pv  = gpu_opencl_kernel_a4_profile_variant();
-        char opts_buf_a4[320];
-        char key_buf_a4[320];
-        if (a4pv > 0) {
-            snprintf(opts_buf_a4, sizeof(opts_buf_a4),
-                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=4 -DA4_PROFILE_VARIANT=%d",
-                a4pv);
-            snprintf(key_buf_a4, sizeof(key_buf_a4),
-                "KERNEL_A_VARIANT=4,A4_PROFILE_VARIANT=%d", a4pv);
-        } else {
-            snprintf(opts_buf_a4, sizeof(opts_buf_a4),
-                "-cl-std=CL1.2 -DKERNEL_A_VARIANT=4");
-            snprintf(key_buf_a4, sizeof(key_buf_a4),
-                "KERNEL_A_VARIANT=4");
-        }
-        d->prog_kernel_a4 = gpu_kernel_cache_build_program_ex(
-            d->ctx, d->dev, 2, sources_a4,
-            opts_buf_a4, key_buf_a4, &err);
-        if (!d->prog_kernel_a4 || err != CL_SUCCESS) {
-            char log[8192] = {0};
-            if (d->prog_kernel_a4)
-                clGetProgramBuildInfo(d->prog_kernel_a4, d->dev,
-                                      CL_PROGRAM_BUILD_LOG,
-                                      sizeof(log)-1, log, NULL);
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 (bruteforce) build "
-                "failed (err=%d):\n%s\n",
-                __FILE__, __LINE__, dev_idx, err, log);
-            exit(1);
-        }
-        d->kern_kernel_a_bruteforce = clCreateKernel(d->prog_kernel_a4,
-                                                     "cand_bruteforce_phase0",
-                                                     &err);
-        if (err != CL_SUCCESS || !d->kern_kernel_a_bruteforce) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: clCreateKernel"
-                "(cand_bruteforce_phase0) failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        GPU_DEBUG_FPRINTF(stderr,
-            "OpenCL GPU[%d]: kernel A4 (bruteforce) library JIT-compiled, "
-            "cand_bruteforce_phase0 extracted\n", dev_idx);
-    }
-    return 0;
-}
-
-/* gpu_opencl_kernel_a_bruteforce_dispatch -- A4 (brute-force) top-level
- * dispatch.
- *
- * Per Phase 1a sub-phase 1a.4 Phase 4-5 brief: v1 ships as harness-mode.
- * Runs kernel A4 (cand_bruteforce_phase0), reads back the buffer-quadruple
- * state, optionally dumps via MDXFIND_KERNEL_A_TRACE, and returns NULL
- * (no kernel B wired for A4 in this sub-phase; *nhits_out is always 0).
- *
- * Signature differs from A1/A2/A3: takes struct jobg *g directly (no
- * packed_words / word_offset / num_words args), because BF chunk state
- * lives on the jobg (g->bf_chunk, g->bf_mask_start, g->bf_offset_per_word,
- * g->bf_num_masks). Dispatcher reads these + global MaskAppendLen /
- * MaskAppendPattern / MaskClasses[] to populate payload + params.
- *
- * Returns NULL when:
- *   - MDXFIND_KERNEL_A_PROTO unset or VARIANT != 4
- *   - !g->bf_chunk
- *   - MaskAppendLen == 0 (no append mask)
- *   - Build / upload failure (FATAL upstream); device disabled
- *
- * FATAL when:
- *   - MaskPrependLen != 0 (BF invariant violation per spec R2)
- *   - max_packed > MAX_KERNEL_A_PACKED cap (spec R5)
- *
- * Single-shot per dispatch (no cursor-restart loop -- chunk pre-sized by
- * host adaptive_bf_chunk_size servo). 8-arg kernel binding with
- * mask_pattern_prepend slot bound to the zeroed b_kern_a_mask_prepend
- * buffer (BF invariant: this buffer is all-zeros at upload). */
-#define MAX_KERNEL_A_PACKED ((size_t)256 * 1024u * 1024u)   /* 256 MB host cap per spec R5 */
-uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
-    struct jobg *g, int *nhits_out)
-{
-    /* PROFILE_VARIANT-for-A4 timing capture state (2026-05-30). Hoisted
-     * to function scope so it survives across the NDRange site and the
-     * post-readback profiling read at the bottom. evt_a4_for_timing is
-     * non-NULL only when a4pv_timing_active && variant > 0. */
-    cl_event evt_a4_for_timing = NULL;
-    int      a4pv_timing_active = 0;
-
-    if (nhits_out) *nhits_out = 0;
-
-    /* Variant gate. */
-    if (gpu_opencl_kernel_a_active_variant() != 4) return NULL;
-    if (!ocl_ready || dev_idx < 0 || dev_idx >= num_gpu_devs) return NULL;
-    if (!g) return NULL;
-
-    /* BF chunk gate. */
-    if (!g->bf_chunk) return NULL;
-
-    /* Append-mask must be present (BF candidate IS the mask expansion). */
-    if (MaskAppendLen == 0) {
-        static int _empty_warned = 0;
-        if (!_empty_warned) {
-            _empty_warned = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A4 dispatch invoked with no active "
-                "append mask (MaskAppendLen=0); falling through.\n",
-                dev_idx);
-        }
-        return NULL;
-    }
-
-    /* BF invariant: prepend mask MUST be zero (per spec R2 + chunk-producer
-     * fast-path gate at mdxfind.c:49032). Violation = FATAL per
-     * feedback_external_failures_are_fatal.md. */
-    if (MaskPrependLen != 0) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 BF invariant violation: "
-            "MaskPrependLen=%d (must be 0 for BF chunks)\n",
-            __FILE__, __LINE__, dev_idx, MaskPrependLen);
-        exit(1);
-    }
-
-    struct gpu_device *d = &gpu_devs[dev_idx];
-    if (d->device_disabled) return NULL;
-
-    /* Build kernel A4 program (lazy, once per device). */
-    if (gpu_opencl_kernel_a4_build_prog(d, dev_idx) < 0) {
-        return NULL;
-    }
-
-    /* Upload mask wire-format buffers (lazy, once per device). Reuses the
-     * same helper as A2/A3 -- the 4 cl_mems live in struct gpu_device and
-     * are shared across A2 / A3 / A4. Per spec D11.2.a: ZERO new persistent
-     * buffers. For BF, only the append pattern carries data; the prepend
-     * buffer is zeroed at upload (BF invariant MaskPrependLen == 0). */
-    if (gpu_opencl_kernel_a_upload_mask_buffers(d, dev_idx) < 0) {
-        return NULL;
-    }
-
-    /* Synthetic lane count: pre-sized by the BF chunk producer
-     * (mdxfind.c:10498-10506). For BF chunks, g->packed_count is the
-     * synthetic lane count (== ceil(MaskCount / bf_offset_per_word));
-     * each lane points at the same zero-byte plaintext slot in
-     * packed_buf[0]. A4 reuses packed_count as "synthetic lane count"
-     * per spec §3 ("params.num_words is synthetic"). */
-    cl_int err = CL_SUCCESS;
-    uint32_t num_words    = g->packed_count;
-    uint32_t bf_num_masks = g->bf_num_masks;
-
-    /* One-shot stderr marker per feedback_verify_gpu_fired_post_build.md. */
-    {
-        static int _kernel_a4_first[MAX_GPU_DEVICES] = {0};
-        if (dev_idx < MAX_GPU_DEVICES && !_kernel_a4_first[dev_idx]) {
-            _kernel_a4_first[dev_idx] = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A4 dispatch fired "
-                "(variant=4 op=%d num_words=%u bf_mask_start=%llu "
-                "bf_num_masks=%u bf_offset_per_word=%u app_len=%d)\n",
-                dev_idx, g->op, num_words,
-                (unsigned long long)g->bf_mask_start,
-                bf_num_masks, g->bf_offset_per_word,
-                MaskAppendLen);
-        }
-    }
-
-    /* Defensive: must have a non-zero lane count + mask range. */
-    if (num_words == 0 || bf_num_masks == 0) return NULL;
-
-    /* Worst-case slot count = num_words * bf_num_masks. Per spec §6
-     * "max_packed = slots * (1 + MaskAppendLen) <= 256 MB". Host caps and
-     * FATAL-exits per R5 + feedback_external_failures_are_fatal.md.
-     *
-     * Per-slot reservation is rounded UP to a 16-byte multiple
-     * unconditionally post-2026-05-30 A4 C5 default-on refactor: the
-     * kernel A4 write path now ALWAYS uses uint4 (16-byte) device
-     * stores via atomic_add(need_aligned), so the host must size the
-     * buffer to match. Without the round-up the kernel's atomic_add
-     * would overrun the host cap, latching overflow_flag and tripping
-     * a downstream NULL-deref in the trace dump path. */
-    size_t max_slots = (size_t)num_words * (size_t)bf_num_masks;
-    size_t per_slot_bytes = (size_t)(1u + (uint32_t)MaskAppendLen);
-    per_slot_bytes = (per_slot_bytes + 15u) & ~(size_t)15u;
-    size_t max_packed = max_slots * per_slot_bytes;
-    if (max_packed > MAX_KERNEL_A_PACKED) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 max_packed=%zu B exceeds "
-            "cap=%zu B (num_words=%u bf_num_masks=%u app_len=%d); "
-            "host-side adaptive_bf_chunk_size produced an oversize chunk\n",
-            __FILE__, __LINE__, dev_idx, max_packed, MAX_KERNEL_A_PACKED,
-            num_words, bf_num_masks, MaskAppendLen);
-        exit(1);
-    }
-    if (max_packed < MIN_BUFFER_BYTES) max_packed = MIN_BUFFER_BYTES;
-
-    if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, max_packed, max_slots) < 0)
-        return NULL;
-
-    /* Zero-init b_proto_kernelA_state before dispatch. */
-    memset(d->h_proto_kernelA_state, 0, 3u * sizeof(uint32_t));
-    err = clEnqueueWriteBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
-                               0, 3u * sizeof(uint32_t),
-                               d->h_proto_kernelA_state,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A4 state zero-write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-
-    /* Assemble payload (132 bytes; no word_offset/packed_words tail per
-     * spec §6). Per spec R1: payload_size = 132 verbatim; trailing zero
-     * (offset 128 = hit_count, reserved). */
-    size_t payload_size = 132u;
-
-    if (!d->b_dispatch_payload || payload_size > d->dispatch_payload_cap) {
-        if (d->b_dispatch_payload) clReleaseMemObject(d->b_dispatch_payload);
-        void *new_host = calloc(1, payload_size);
-        if (!new_host) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: A4 dispatch_payload calloc(%zu) failed\n",
-                __FILE__, __LINE__, dev_idx, payload_size);
-            exit(1);
-        }
-        if (d->h_dispatch_payload) free(d->h_dispatch_payload);
-        d->h_dispatch_payload     = new_host;
-        d->h_dispatch_payload_cap = payload_size;
-
-        d->b_dispatch_payload = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
-            payload_size, d->h_dispatch_payload, &err);
-        if (!d->b_dispatch_payload || err != CL_SUCCESS) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: A4 b_dispatch_payload alloc(%zu) failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, payload_size, err);
-            exit(1);
-        }
-        d->dispatch_payload_cap = payload_size;
-    }
-
-    /* Fill payload in host staging. */
-    {
-        uint8_t *staging = (uint8_t *)d->h_dispatch_payload;
-        memset(staging, 0, payload_size);
-
-        OCLParams params;
-        memset(&params, 0, sizeof(params));
-        params.compact_mask        = _compact_mask;
-        params.mask_start          = g->bf_mask_start;
-        params.num_words           = num_words;                  /* synthetic lane count */
-        params.num_masks           = bf_num_masks;
-        /* 2026-05-30 amendment: A4's prebuf is now a 1-byte END descriptor.
-         * Walker sees END at offset 0 and returns 0-length prebuf. The
-         * append side uses the standard descriptor stream byte length. */
-        params.n_prepend           = 1u;                         /* 1-byte END descriptor */
-        {
-            extern int gpu_kern_a_app_dlen;
-            params.n_append        = (uint32_t)gpu_kern_a_app_dlen;
-        }
-        params.max_probe           = 256u;
-        params.hash_data_count     = _hash_data_count;
-        params.max_hits            = GPU_PACKED_MAX_HITS;
-        params.overflow_count      = _overflow_count;
-        params.max_iter            = 1u;
-        params.base_word_idx       = 0u;
-        params.packed_size         = (uint32_t)max_packed;
-        params.input_cursor_start  = 0u;
-        params.rule_cursor_start   = 0u;
-        params.inner_iter          = 1u;                         /* v1: ignored by kernel */
-        params.mask_offset_per_word = g->bf_offset_per_word;
-        memcpy(staging, &params, sizeof(params));
-
-        /* offset 128: hit_count reserved (zeroed above). */
-    }
-
-    err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
-                               0, payload_size, d->h_dispatch_payload,
-                               0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A4 payload write failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-
-    /* Set kernel A4 args (8-arg signature byte-identical to A2):
-     *   arg 0: __global uchar *payload
-     *   arg 1: __global const uchar *mask_pattern_prepend (zeroed; BF invariant)
-     *   arg 2: __global const uchar *mask_pattern_append
-     *   arg 3: __global const uchar *mask_charsets
-     *   arg 4: __global const uint  *mask_class_counts
-     *   arg 5: __global uchar *b_packed_buf
-     *   arg 6: __global uint  *b_chunk_index
-     *   arg 7: __global volatile uint *b_kernelA_state */
-    {
-        cl_kernel ka = d->kern_kernel_a_bruteforce;
-        int a = 0;
-#define KARG4(k, n, s, v) do { cl_int _e = clSetKernelArg(k, n, s, v); \
-    if (_e != CL_SUCCESS) { \
-        fprintf(stderr, "FATAL: %s:%d GPU[%d]: kernel A4 arg %d failed (err=%d)\n", \
-                __FILE__, __LINE__, dev_idx, n, _e); exit(1); } } while(0)
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_dispatch_payload);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_prepend);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_append);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_charsets);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_kern_a_mask_counts);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_proto_packed_buf);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_proto_chunk_index);
-        KARG4(ka, a++, sizeof(cl_mem), &d->b_proto_kernelA_state);
-#undef KARG4
-
-        /* Grid: num_words * bf_num_masks (host-side pre-sized chunk). */
-        size_t gsize_a = (size_t)num_words * (size_t)bf_num_masks;
-        size_t lsize_a = 64;
-        gsize_a = ((gsize_a + lsize_a - 1) / lsize_a) * lsize_a;
-
-        /* PROFILE_VARIANT-for-A4 (2026-05-30) timing capture: when the
-         * A4 PROFILE_VARIANT env is set (even to "0", so the operator
-         * can collect the V0 baseline alongside V1..V5), queue is
-         * opted into CL_QUEUE_PROFILING_ENABLE up-front; capture a
-         * cl_event so we can read CL_PROFILING_COMMAND_START/END
-         * after the existing blocking readback below. Independent
-         * from the A1 two-kernel proto kernel_a_us harness (which
-         * never fires for A4). When env var is UNSET we pass NULL
-         * like the production path -- byte-identical baseline. The
-         * event lives across the readback; released after profiling
-         * read. */
-        evt_a4_for_timing = NULL;
-            a4pv_timing_active = 0;   /* was MDXFIND_KERNEL_A4_PROFILE_VARIANT */
-        err = clEnqueueNDRangeKernel(d->queue, ka, 1,
-                                     NULL, &gsize_a, &lsize_a,
-                                     0, NULL,
-                                     a4pv_timing_active ? &evt_a4_for_timing : NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr,
-                "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 enqueue failed (err=%d)\n",
-                __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-    }
-
-    /* Read back state + (optional) packed/chunk_index. */
-    uint32_t state[3] = {0, 0, 0};
-    err = clEnqueueReadBuffer(d->queue, d->b_proto_kernelA_state, CL_TRUE,
-                              0, 3u * sizeof(uint32_t), state,
-                              0, NULL, NULL);
-    if (err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: A4 state readback failed (err=%d)\n",
-            __FILE__, __LINE__, dev_idx, err);
-        exit(1);
-    }
-    /* PROFILE_VARIANT-for-A4 timing readout: blocking readback above
-     * guarantees the NDRange event is complete by this point. Query
-     * profiling info, accumulate, release the event. */
-    if (a4pv_timing_active && evt_a4_for_timing != NULL) {
-        cl_ulong t_start = 0, t_end = 0;
-        cl_int p_err1 = clGetEventProfilingInfo(evt_a4_for_timing,
-            CL_PROFILING_COMMAND_START, sizeof(t_start), &t_start, NULL);
-        cl_int p_err2 = clGetEventProfilingInfo(evt_a4_for_timing,
-            CL_PROFILING_COMMAND_END,   sizeof(t_end),   &t_end,   NULL);
-        if (p_err1 == CL_SUCCESS && p_err2 == CL_SUCCESS && t_end >= t_start) {
-            double dt_us = (double)(t_end - t_start) / 1000.0;  /* ns -> us */
-            gpu_opencl_kernel_a4_timing_record(dev_idx, g->op, dt_us);
-        } else {
-            /* Queue lacks CL_QUEUE_PROFILING_ENABLE on this device.
-             * Per feedback_external_failures_are_fatal.md this is an
-             * instrumentation gap, not a correctness failure -- the
-             * dispatch + readback already succeeded. Warn once. */
-            static int _warned = 0;
-            if (!_warned) {
-                _warned = 1;
-                fprintf(stderr,
-                    "OpenCL GPU[%d]: A4 PROFILE_VARIANT timing requested "
-                    "but clGetEventProfilingInfo failed (err1=%d err2=%d) "
-                    "-- queue may lack CL_QUEUE_PROFILING_ENABLE; "
-                    "[ocl-kA4] lines will be suppressed\n",
-                    dev_idx, p_err1, p_err2);
-            }
-        }
-        clReleaseEvent(evt_a4_for_timing);
-        evt_a4_for_timing = NULL;
-    }
-    uint32_t actual_slots      = state[0];
-    uint32_t actual_byte_count = state[1];
-    uint32_t overflow_flag     = state[2];
-
-    if (!overflow_flag && actual_slots > 0) {
-        if (actual_byte_count > d->h_proto_packed_readback_cap) {
-            free(d->h_proto_packed_readback);
-            d->h_proto_packed_readback = calloc(1, actual_byte_count + MIN_BUFFER_BYTES);
-            if (!d->h_proto_packed_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: A4 h_proto_packed_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
-            }
-            d->h_proto_packed_readback_cap = actual_byte_count + MIN_BUFFER_BYTES;
-        }
-        size_t index_bytes = (size_t)actual_slots * sizeof(uint32_t);
-        if (index_bytes > d->h_proto_index_readback_cap) {
-            free(d->h_proto_index_readback);
-            d->h_proto_index_readback = calloc(1, index_bytes + MIN_BUFFER_BYTES);
-            if (!d->h_proto_index_readback) {
-                fprintf(stderr, "FATAL: %s:%d GPU[%d]: A4 h_proto_index_readback calloc failed\n",
-                        __FILE__, __LINE__, dev_idx);
-                exit(1);
-            }
-            d->h_proto_index_readback_cap = index_bytes + MIN_BUFFER_BYTES;
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf, CL_TRUE,
-                                  0, (size_t)actual_byte_count,
-                                  d->h_proto_packed_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: A4 b_proto_packed_buf readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index, CL_TRUE,
-                                  0, index_bytes,
-                                  d->h_proto_index_readback,
-                                  0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            fprintf(stderr, "FATAL: %s:%d GPU[%d]: A4 b_proto_chunk_index readback failed (err=%d)\n",
-                    __FILE__, __LINE__, dev_idx, err);
-            exit(1);
-        }
-    }
-
-    /* Trace dump (zero overhead when MDXFIND_KERNEL_A_TRACE unset). */
-    gpu_opencl_kernel_a_trace_dump(dev_idx, state,
-        d->h_proto_index_readback,
-        (size_t)actual_slots * sizeof(uint32_t),
-        d->h_proto_packed_readback,
-        (size_t)actual_byte_count);
-
-    if (overflow_flag) {
-        fprintf(stderr,
-            "FATAL: %s:%d OpenCL GPU[%d]: kernel A4 overflow "
-            "(slots=%u bytes=%u packed_cap=%zu); A4 v1 host-side cap should "
-            "have caught this -- check adaptive_bf_chunk_size sizing\n",
-            __FILE__, __LINE__, dev_idx, actual_slots, actual_byte_count,
-            max_packed);
-        exit(1);
-    }
-
-    /* v1: A4 is harness-mode. Return NULL with nhits=0 so the caller
-     * falls through to the legacy path for this slot. */
-    if (nhits_out) *nhits_out = 0;
-    return NULL;
-}
+ */
+
+/* The kernel-A harness dispatchers A2 (masks), A3 (rules+masks) and A4
+ * (brute force), their programs, the A2/A3/A4 mask-wire upload and the
+ * trace dump were removed 2026-11-14 (checklist 72): the variant that
+ * selected them was hardwired 0, so none could run.  RCS holds them. */
 
 /* Phase 4 sub-phase 4a.1 (2026-05-21): hx codegen kernel B lazy-init
  * helper for JOB_MD5MD5SALT production dispatch.
@@ -12618,39 +8473,24 @@ gpu_opencl_kernelb_codegen_kernel_for(struct gpu_device *d, int dev_idx,
         exit(1);
     }
 
-    /* 5. Source dump per-job for post-mortem.
-     *
-     * Written next to the kernel cache, i.e. under the directory the
-     * user named via MDXFIND_CACHE. This used to hardcode /tmp, which
-     * is a POSIX-only convention that does not exist on Windows: every
-     * dump on a Windows rig failed with ENOENT and logged a warning
-     * per device per job (2026-08-05). MDXFIND_CACHE is the one
-     * location mdxfind is allowed to assume, on any platform.
-     *
-     * If the cache is disabled there is nowhere correct to put this,
-     * so the dump is skipped. Do NOT add a fallback path here.
-     *
-     * Failure to write is SILENT -- no warning, on any platform. This
-     * is a post-mortem convenience artifact, and its absence is a
-     * non-event: nothing downstream reads it and no result changes.
-     * Announcing it once per device per job is pure clutter in the
-     * output of a multi-GPU run. Whether the dump exists is already
-     * reported, accurately, by the dump= field of the JIT line below. */
+    /* 5. Source dump per-job for post-mortem: debug only, off unless
+     * MDXFIND_HX_CODEGEN_DUMP names a directory (codegen/hx_dump.c, shared
+     * with the Metal sites).  The user names the place, so nothing here
+     * assumes /tmp or any other platform path.  A requested dump that
+     * fails is FATAL, as on Metal: the user asked for the file. */
     char dump_path[4096];
-    int  dumped = 0;
     {
         char dump_name[128];
         snprintf(dump_name, sizeof(dump_name),
                  "codegen-e%d-%d-dev%d.cl",
                  job_enum, (int)getpid(), dev_idx);
-        if (gpu_kernel_cache_path(dump_path, sizeof(dump_path),
-                                  dump_name) == 0) {
-            FILE *df = fopen(dump_path, "w");
-            if (df) {
-                size_t slen = strlen(src);
-                if (fwrite(src, 1, slen, df) == slen) dumped = 1;
-                fclose(df);
-            }
+        if (hx_dump_source(src, "MDXFIND_HX_CODEGEN_DUMP", dump_name,
+                           dump_path, sizeof(dump_path)) < 0) {
+            fprintf(stderr,
+                "FATAL: %s:%d hx codegen e%d: requested source dump failed "
+                "on %s dev[%d]\n",
+                __FILE__, __LINE__, job_enum, hostname, dev_idx);
+            exit(1);
         }
     }
 
@@ -12663,22 +8503,6 @@ gpu_opencl_kernelb_codegen_kernel_for(struct gpu_device *d, int dev_idx,
         "-cl-std=CL1.2 -DSALT_BATCH=64 -DKERNELB_WG_SIZE=64",
         sentinel,
         &err);
-    if (!prog || err != CL_SUCCESS) {
-        char log[8192] = {0};
-        if (prog) {
-            clGetProgramBuildInfo(prog, d->dev, CL_PROGRAM_BUILD_LOG,
-                                  sizeof(log) - 1, log, NULL);
-        }
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen e%d JIT failed on %s dev[%d] "
-            "(err=%d sentinel=%s) -- source dumped to %s\n%s\n",
-            __FILE__, __LINE__, job_enum, hostname, dev_idx,
-            err, sentinel, dump_path,
-            log[0] ? log : "(no build log)");
-        if (prog) clReleaseProgram(prog);
-        free(src);
-        exit(1);
-    }
 
     /* 7. Extract kernel by per-family entry-point name. */
     const char *entry_name = codegen_entry_point_for_job(job_enum);
@@ -12733,7 +8557,7 @@ gpu_opencl_kernelb_codegen_kernel_for(struct gpu_device *d, int dev_idx,
         "OpenCL GPU[%d]: hx codegen e%d kernel B JIT'd via cache "
         "(source %zu bytes, entry=%s sentinel=%s slot=%d dump=%s) on %s\n",
         dev_idx, job_enum, strlen(src), entry_name, sentinel,
-        placed_slot, dumped ? dump_path : "(none)", hostname);
+        placed_slot, dump_path, hostname);
 
     free(src);
     return kern;
@@ -12789,6 +8613,135 @@ static size_t gpu_opencl_proto_cand_cap_bytes(struct gpu_device *d, int dev_idx)
         }
     }
     return cap;
+}
+
+/* Bytes one kernel-A slot can take: the 2-byte length plus the longest
+ * candidate cand_rules_phase0 can emit (KA_BUF_BYTES in gpu_kernel_a_rules.cl:
+ * RULE_BUF_MAX 2048, or U32_OUT_BYTES 8192 under -8), rounded up to 16.  The
+ * buffer was sized at 256 per slot when the length was one byte clamped at 255;
+ * that bound is what made overflow "impossible by construction", and with
+ * whole-length slots it has to be this one instead (2026-11-14, the OpenCL twin
+ * of mtl_proto_slot_bytes() in gpu_metal.m). */
+static size_t gpu_opencl_proto_slot_bytes(void)
+{
+    return gpu_u32_active() ? (size_t)(2u + 8192u + 14u)
+                            : (size_t)(2u + 2048u + 14u);
+}
+
+/* Set per proto dispatch: the -n/-N mask is bound for kernel B's args 16/17
+ * and params.n_prepend/n_append (MAKE_MD5PASS family only).  Read by the
+ * gpujob_opencl.c replay to rebuild the candidate.  Per device, because each
+ * device's gpujob thread dispatches and replays its own batches. */
+int gpu_opencl_proto_mask_on[GPUJOB_MAX_DEVS];
+/* This job's slice of the mask (checklist 70): set from the jobg range at
+ * gpu_opencl_kernelb_dispatch_proto entry, resolved below, written into the
+ * kernel-B params (mask_start = first index, mask_base0 = count). */
+static uint64_t gpu_opencl_proto_mfirst[GPUJOB_MAX_DEVS];
+static uint64_t gpu_opencl_proto_mcount[GPUJOB_MAX_DEVS];
+
+/* Resolve whether this family dispatch applies the mask on the device, and
+ * FATAL when a masked run's mask did not reach the device: kernel B would hash
+ * the bare candidates and the CPU has already skipped them.  Mirrors the gate
+ * in gpu_metal_kernelb_dispatch_proto. */
+static int gpu_opencl_proto_mask_resolve(struct gpu_device *d, int dev_idx, int op)
+{
+    int fam = gpu_codegen_kernelb_family_md5pass_eligible(op);
+    int on = fam && gpu_mask_total > 0
+             && (gpu_mask_n_prepend + gpu_mask_n_append) >= 1
+             && d->b_template_mask_charsets != NULL
+             && d->b_template_mask_sizes != NULL;
+    if (fam && MaskTotal > 0
+        && (!on || (unsigned long long)gpu_mask_total != MaskTotal)) {
+        char hn[256];
+        mdx_gethostname(hn, sizeof(hn));
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d]: op=%d runs with a %llu-candidate "
+            "mask, but the device mask is %s (%llu combinations, %d+%d "
+            "positions) on %s -- kernel B would hash the bare candidates\n",
+            __FILE__, __LINE__, dev_idx, op, MaskTotal,
+            on ? "a different size" : "not bound",
+            (unsigned long long)gpu_mask_total, gpu_mask_n_prepend,
+            gpu_mask_n_append, hn);
+        exit(1);
+    }
+    if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES) {
+        /* The job's range: a count of 0 means the whole mask (an unchunked
+         * job), as for the template dispatch. */
+        uint64_t first = on ? gpu_opencl_proto_mfirst[dev_idx] : 0u;
+        uint64_t cnt   = on ? gpu_opencl_proto_mcount[dev_idx] : 1u;
+        if (on && cnt == 0u) { first = 0u; cnt = (uint64_t)gpu_mask_total; }
+        if (on && (first >= (uint64_t)gpu_mask_total
+                   || cnt > (uint64_t)gpu_mask_total - first)) {
+            char hn[256];
+            mdx_gethostname(hn, sizeof(hn));
+            fprintf(stderr,
+                "FATAL: %s:%d OpenCL GPU[%d]: op=%d family mask range "
+                "[%llu, +%llu) lies outside the %llu-candidate mask on %s\n",
+                __FILE__, __LINE__, dev_idx, op, (unsigned long long)first,
+                (unsigned long long)cnt, (unsigned long long)gpu_mask_total, hn);
+            exit(1);
+        }
+        gpu_opencl_proto_mfirst[dev_idx] = first;
+        gpu_opencl_proto_mcount[dev_idx] = cnt;
+        gpu_opencl_proto_mask_on[dev_idx] = on;
+        /* The mask size this dispatch iterates, for the gpujob hash
+         * accounting (gpujob.h): without it a masked family batch was
+         * counted at mask 1, or at whatever a template dispatch on this
+         * device published last.  This job's slice, not the whole mask. */
+        gpu_dispatch_mask_size[dev_idx] = on ? cnt : 1u;
+    }
+    return on;
+}
+
+/* Bind the family kernel's two extra args (16/17, the -n/-N tables).  When no
+ * mask is bound the hit buffer stands in: n_prepend + n_append are 0, so the
+ * kernel never reads them. */
+static void gpu_opencl_proto_bind_mask_args(struct gpu_device *d, int dev_idx,
+                                            cl_kernel kb, int mask_on)
+{
+    cl_mem mc = mask_on ? d->b_template_mask_charsets : d->b_hits;
+    cl_mem ms = mask_on ? d->b_template_mask_sizes    : d->b_hits;
+    cl_int e1 = clSetKernelArg(kb, 16, sizeof(cl_mem), &mc);
+    cl_int e2 = clSetKernelArg(kb, 17, sizeof(cl_mem), &ms);
+    if (e1 != CL_SUCCESS || e2 != CL_SUCCESS) {
+        char hn[256];
+        mdx_gethostname(hn, sizeof(hn));
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d]: family kernel B mask args 16/17 "
+            "failed (err=%d/%d) on %s\n",
+            __FILE__, __LINE__, dev_idx, e1, e2, hn);
+        exit(1);
+    }
+}
+
+/* Read the B3 overflow flag kernel B sets at payload offset 100 when its hit
+ * buffer is full.  The OpenCL hit buffer is already GPU_PACKED_MAX_HITS, the
+ * most a batch may return (the Metal twin re-dispatches up to that bound and
+ * FATALs past it), so a set flag means hits this batch cannot hold: FATAL
+ * rather than the old silent drop. */
+static void gpu_opencl_proto_check_ovr(struct gpu_device *d, int dev_idx,
+                                       int op, const char *where)
+{
+    uint32_t ovr = 0;
+    cl_int err = clEnqueueReadBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
+                                     100, sizeof(ovr), &ovr, 0, NULL, NULL);
+    char hn[256];
+    if (err != CL_SUCCESS) {
+        mdx_gethostname(hn, sizeof(hn));
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d]: %s kernel B overflow-flag read "
+            "failed (err=%d, op=%d) on %s\n",
+            __FILE__, __LINE__, dev_idx, where, err, op, hn);
+        exit(1);
+    }
+    if (ovr != 0u) {
+        mdx_gethostname(hn, sizeof(hn));
+        fprintf(stderr,
+            "FATAL: %s:%d OpenCL GPU[%d]: %s kernel B hits exceed %d in one "
+            "batch (op=%d) on %s\n",
+            __FILE__, __LINE__, dev_idx, where, (int)GPU_PACKED_MAX_HITS, op, hn);
+        exit(1);
+    }
 }
 
 /* RULE-AXIS CHUNKING (Option A, 2026-05-29) — multi-chunk proto dispatch.
@@ -12848,11 +8801,13 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
     }
 
     /* --- A. One-time word-payload upload (Option A payoff) ------------- *
-     * Largest chunk's candidate buffer = num_words * K * 256 (<= cap). The
+     * Largest chunk's candidate buffer = num_words * K * slot bytes
+     * (gpu_opencl_proto_slot_bytes(): 2-byte length + candidate + pad). The
      * last chunk may be smaller but sizing to K's worst case once avoids
      * realloc churn. */
     size_t cap_slots  = (size_t)num_words * K;
-    size_t cap_packed = cap_slots * 256u;
+    size_t cap_packed = cap_slots * gpu_opencl_proto_slot_bytes();
+    int mask_on = gpu_opencl_proto_mask_resolve(d, dev_idx, op);
     if (cap_packed < MIN_BUFFER_BYTES) cap_packed = MIN_BUFFER_BYTES;
     if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, cap_packed, cap_slots) < 0)
         return NULL;
@@ -12872,8 +8827,9 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
         if (d->h_dispatch_payload) free(d->h_dispatch_payload);
         d->h_dispatch_payload = new_host;
         d->h_dispatch_payload_cap = payload_size;
+        /* READ_WRITE: kernel B sets the overflow flag at offset 100. */
         d->b_dispatch_payload = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+            CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
             payload_size, d->h_dispatch_payload, &err);
         if (!d->b_dispatch_payload || err != CL_SUCCESS) {
             fprintf(stderr,
@@ -12989,7 +8945,8 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
     }
 
     /* --- C. Accumulation arena sizing (lazy, grown to caps) ------------ *
-     * Worst case GPU_PACKED_MAX_HITS hits, each up to 256 packed bytes. */
+     * Up to GPU_PACKED_MAX_HITS hits, each up to gpu_opencl_proto_slot_bytes();
+     * the arena grows on demand. */
     {
         size_t off_cap_need = (size_t)GPU_PACKED_MAX_HITS;
         if (!d->h_proto_resolved_off || off_cap_need > d->h_proto_resolved_off_cap) {
@@ -13063,7 +9020,7 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
             size_t this_count = (rule_start + rule_count - sub_start < this_K)
                               ? (rule_start + rule_count - sub_start) : this_K;
             size_t sub_slots  = (size_t)num_words * this_count;
-            size_t sub_packed = sub_slots * 256u;
+            size_t sub_packed = sub_slots * gpu_opencl_proto_slot_bytes();
             if (sub_packed < MIN_BUFFER_BYTES) sub_packed = MIN_BUFFER_BYTES;
             if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, sub_packed, sub_slots) < 0)
                 return NULL;
@@ -13156,31 +9113,18 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
             uint32_t overflow_flag     = state[2];
 
             if (overflow_flag) {
-                /* Overflow should be impossible (sub_packed <= cap by K
-                 * formula). If it ever fires, halve this_K and re-issue the
-                 * remaining span. FATAL only at this_K==1 (a single (word,rule)
-                 * producing > sub_packed bytes — impossible since one record
-                 * <= 256 bytes). NEVER silently drop the chunk. */
-                if (this_K <= 1) {
-                    fprintf(stderr,
-                        "FATAL: %s:%d GPU[%d] on %s: chunked kernel A overflow at "
-                        "K==1 (chunk=%zu sub_start=%zu slots=%u bytes=%u cap=%zu) — "
-                        "a single (word,rule) exceeds the candidate cap; pathological\n",
-                        __FILE__, __LINE__, dev_idx, hostname, c, sub_start,
-                        actual_slots, actual_byte_count, sub_packed);
-                    exit(1);
-                }
-                this_K = this_K / 2;
-                if (this_K < 1) this_K = 1;
+                /* The buffer holds gpu_opencl_proto_slot_bytes() per (word,
+                 * rule), so this cannot happen.  It used to halve K and
+                 * re-issue, a path no run could reach; fatal now, as the
+                 * Metal twin (2026-11-14). */
                 fprintf(stderr,
-                    "[kernelb_proto_chunked] GPU[%d]: kernel A overflow (chunk=%zu "
-                    "sub_start=%zu) — halving K to %zu and re-issuing\n",
-                    dev_idx, c, sub_start, this_K);
-                /* Release the kernel-A event before re-issuing the span (we
-                 * don't accumulate its timing into the retry — the retry
-                 * issues a fresh _ev_a). */
+                    "FATAL: %s:%d GPU[%d] on %s: chunked kernel A overflow "
+                    "(chunk=%zu sub_start=%zu slots=%u bytes=%u cap=%zu op=%d) "
+                    "-- the candidate buffer is sized so this cannot happen\n",
+                    __FILE__, __LINE__, dev_idx, hostname, c, sub_start,
+                    actual_slots, actual_byte_count, sub_packed, op);
                 if (_ev_a && p_clReleaseEvent) p_clReleaseEvent(_ev_a);
-                continue;   /* re-issue this span with smaller this_K */
+                exit(1);
             }
 
             if (actual_slots == 0) {
@@ -13211,6 +9155,16 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
                 p->num_words   = actual_slots;
                 p->packed_size = actual_byte_count;
                 p->salt_start  = 0;
+                p->n_prepend   = mask_on ? (uint32_t)gpu_mask_n_prepend : 0u;
+                p->n_append    = mask_on ? (uint32_t)gpu_mask_n_append  : 0u;
+                p->mask_start  = gpu_opencl_proto_mfirst[dev_idx];
+                p->mask_base0  = gpu_opencl_proto_mcount[dev_idx];
+                /* Mask lanes per slot (checklist 76, gpujob.h); 0 = none. */
+                p->mask_base1  = mask_on ? gpu_mask_lanes(actual_slots,
+                                     gpu_opencl_proto_mcount[dev_idx],
+                                     GPU_MASK_LANE_TARGET) : 0u;
+                p->overflow_first_set  = 0u;
+                p->overflow_first_word = 0xFFFFFFFFu;
                 err = clEnqueueWriteBuffer(d->queue, d->b_dispatch_payload, CL_TRUE,
                                            0, sizeof(OCLParams), d->h_dispatch_payload,
                                            0, NULL, NULL);
@@ -13275,12 +9229,19 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
                 KBC(a++, sizeof(cl_mem), &d->b_overflow_offsets);
                 KBC(a++, sizeof(cl_mem), &d->b_hashes_shown);
 #undef KBC
+                if (gpu_codegen_kernelb_family_md5pass_eligible(op))
+                    gpu_opencl_proto_bind_mask_args(d, dev_idx, kb, mask_on);
                 uint32_t nsalts_packed = (uint32_t)d->salts_count;
                 uint32_t num_salt_chunks = (nsalts_packed + wg_size - 1u) / wg_size;
                 if (num_salt_chunks == 0u) num_salt_chunks = 1u;
                 size_t gsize_b, lsize_b = (size_t)wg_size;
-                if (exp_md5) {
-                    gsize_b = ((size_t)actual_slots + wg_size - 1u) / wg_size;
+                /* One lane per candidate for the unsalted kernels (the family
+                 * loops masks and rounds inside the lane, as on Metal). */
+                if (exp_md5 || gpu_codegen_kernelb_family_md5pass_eligible(op)) {
+                    /* x the family's mask lanes per slot (checklist 76). */
+                    uint64_t fl = ((OCLParams *)d->h_dispatch_payload)->mask_base1;
+                    if (fl == 0u) fl = 1u;
+                    gsize_b = ((size_t)actual_slots * (size_t)fl + wg_size - 1u) / wg_size;
                     gsize_b *= wg_size;
                 } else {
                     gsize_b = (size_t)actual_slots * (size_t)num_salt_chunks
@@ -13313,6 +9274,7 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
             }
             if (hcount > (uint32_t)GPU_PACKED_MAX_HITS)
                 hcount = (uint32_t)GPU_PACKED_MAX_HITS;
+            gpu_opencl_proto_check_ovr(d, dev_idx, op, "chunked");
 
             /* Phase 1 (UNCOMMITTED) per-chunk stage timing. The b_hit_count
              * CL_TRUE readback above has drained the queue (in-order, no
@@ -13351,8 +9313,8 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
             _chunk_ev_b = NULL;
 
             /* Slot-waste counters: aggregate post-rule emit byte traffic so the
-             * report can compute average emit_len (= (sum_bytes-sum_slots) /
-             * sum_slots, the 1-byte length header subtracted). */
+             * report can compute average emit_len (= (sum_bytes-2*sum_slots) /
+             * sum_slots, the 2-byte length header subtracted). */
             _slot_sum_slots += (uint64_t)actual_slots;
             _slot_sum_bytes += (uint64_t)actual_byte_count;
             if (actual_byte_count > _slot_max_bytes_per_chunk)
@@ -13389,7 +9351,16 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
                     uint32_t *he = chunk_hits + (size_t)hi * GPU_HIT_STRIDE;
                     uint32_t slot = he[0];
 
-                    if (G >= (uint32_t)GPU_PACKED_MAX_HITS) break;
+                    /* Was `break`: every later hit of the batch was dropped
+                     * with nothing printed (2026-11-14, as the Metal twin). */
+                    if (G >= (uint32_t)GPU_PACKED_MAX_HITS) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d] on %s: chunked proto hits "
+                            "exceed %d in one batch (chunk=%zu op=%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname,
+                            (int)GPU_PACKED_MAX_HITS, c, op);
+                        exit(1);
+                    }
                     if (!warned_90 &&
                         G >= (uint32_t)((double)GPU_PACKED_MAX_HITS * 0.9)) {
                         warned_90 = 1;
@@ -13400,8 +9371,18 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
                             G, GPU_PACKED_MAX_HITS);
                     }
 
-                    /* Read this slot's byte offset (wpos) from b_proto_chunk_index. */
-                    if ((size_t)slot >= sub_slots) continue;  /* corrupt slot */
+                    /* A hit whose slot cannot be resolved is a hit the replay
+                     * would drop with nothing printed; the CPU skipped the
+                     * candidate, so that is a lost recovery.  Fatal
+                     * (2026-11-14), like the rest of this path. */
+                    if ((size_t)slot >= sub_slots) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d] on %s: chunked proto hit names "
+                            "slot %u outside kernel A's %zu (chunk=%zu op=%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname, slot,
+                            sub_slots, c, op);
+                        exit(1);
+                    }
                     uint32_t wpos = 0;
                     err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index,
                                               CL_TRUE,
@@ -13414,28 +9395,35 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
                             __FILE__, __LINE__, dev_idx, hostname, c, slot, err);
                         exit(1);
                     }
-                    if (wpos >= actual_byte_count) continue;
-
-                    /* Read the [len][bytes] record (<=256 B). */
-                    size_t avail = (size_t)actual_byte_count - (size_t)wpos;
-                    size_t want  = avail < 256u ? avail : 256u;
-                    uint8_t recbuf[256];
-                    err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
-                                              CL_TRUE, (size_t)wpos, want,
-                                              recbuf, 0, NULL, NULL);
-                    if (err != CL_SUCCESS) {
+                    /* [len lo][len hi][bytes]: read the length, then the bytes. */
+                    uint8_t lenb[2] = {0, 0};
+                    if ((size_t)wpos + 2u <= (size_t)actual_byte_count) {
+                        err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
+                                                  CL_TRUE, (size_t)wpos, 2u,
+                                                  lenb, 0, NULL, NULL);
+                        if (err != CL_SUCCESS) {
+                            fprintf(stderr,
+                                "FATAL: %s:%d GPU[%d] on %s: chunked targeted length "
+                                "readback (chunk=%zu slot=%u wpos=%u) failed (err=%d)\n",
+                                __FILE__, __LINE__, dev_idx, hostname, c, slot,
+                                wpos, err);
+                            exit(1);
+                        }
+                    }
+                    uint32_t plen = (uint32_t)lenb[0] | ((uint32_t)lenb[1] << 8);
+                    if ((size_t)wpos + 2u > (size_t)actual_byte_count
+                        || (size_t)wpos + 2u + plen > (size_t)actual_byte_count) {
                         fprintf(stderr,
-                            "FATAL: %s:%d GPU[%d] on %s: chunked targeted packed_buf "
-                            "readback (chunk=%zu slot=%u wpos=%u want=%zu) failed (err=%d)\n",
-                            __FILE__, __LINE__, dev_idx, hostname, c, slot,
-                            wpos, want, err);
+                            "FATAL: %s:%d GPU[%d] on %s: chunked proto hit names "
+                            "slot %u (wpos=%u plen=%u) outside kernel A's output "
+                            "(bytes=%u chunk=%zu op=%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname, slot, wpos,
+                            plen, actual_byte_count, c, op);
                         exit(1);
                     }
-                    uint32_t plen = recbuf[0];
-                    if ((size_t)1u + plen > want) continue;  /* truncated; skip */
 
-                    /* Grow arena if needed. */
-                    size_t rec_bytes = (size_t)1u + plen;
+                    /* Grow arena if needed. [len lo][len hi][bytes] */
+                    size_t rec_bytes = (size_t)2u + plen;
                     if (d->h_proto_resolved_buf_used + rec_bytes
                             > d->h_proto_resolved_buf_cap) {
                         size_t newcap = d->h_proto_resolved_buf_cap * 2u;
@@ -13455,7 +9443,19 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
 
                     /* Store record at arena offset; record offset keyed by G. */
                     size_t arena_off = d->h_proto_resolved_buf_used;
-                    memcpy(d->h_proto_resolved_buf + arena_off, recbuf, rec_bytes);
+                    err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
+                                              CL_TRUE, (size_t)wpos, rec_bytes,
+                                              d->h_proto_resolved_buf + arena_off,
+                                              0, NULL, NULL);
+                    if (err != CL_SUCCESS) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d] on %s: chunked targeted packed_buf "
+                            "readback (chunk=%zu slot=%u wpos=%u bytes=%zu) failed "
+                            "(err=%d)\n",
+                            __FILE__, __LINE__, dev_idx, hostname, c, slot,
+                            wpos, rec_bytes, err);
+                        exit(1);
+                    }
                     d->h_proto_resolved_buf_used += rec_bytes;
                     d->h_proto_resolved_off[G] = (uint32_t)arena_off;
 
@@ -13513,8 +9513,8 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
             _bw_first[dev_idx] = 1;
             double avg_emit_len = 0.0;
             if (_slot_sum_slots > 0) {
-                /* sum_bytes = sum_slots * (1 + avg_emit_len). */
-                avg_emit_len = ((double)_slot_sum_bytes / (double)_slot_sum_slots) - 1.0;
+                /* sum_bytes = sum_slots * (2 + avg_emit_len). */
+                avg_emit_len = ((double)_slot_sum_bytes / (double)_slot_sum_slots) - 2.0;
             }
             uint64_t span_us = (uint64_t)(_last_b_end - _first_a_start) / 1000ULL;
             uint64_t kernels_us = _ka_us_sum + _kb_us_sum;
@@ -13561,9 +9561,13 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
 uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out)
+    int op, uint64_t mask_start, uint32_t mask_count, int *nhits_out)
 {
     *nhits_out = 0;
+    if (dev_idx >= 0 && dev_idx < GPUJOB_MAX_DEVS) {
+        gpu_opencl_proto_mfirst[dev_idx] = mask_start;
+        gpu_opencl_proto_mcount[dev_idx] = mask_count;
+    }
 
     /* Phase 4 sub-phase 4a.1 (2026-05-21): production gate for
      * JOB_MD5MD5SALT. Codegen-via-this-dispatcher is the new production
@@ -13632,7 +9636,7 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * rules dispatch and carries the `-8` swap itself. */
     if (gpu_u32_active()) (void)gpu_opencl_u32_rules_lazy(d, dev_idx);
 
-    if (d->gpu_n_rules <= 0 || !d->prog_md5_rules) return NULL;
+    if (d->gpu_n_rules <= 0) return NULL;
 
     /* Build kernel A + B programs (lazy, once per device). */
     if (gpu_opencl_kernelb_build_prog(d, dev_idx) < 0) {
@@ -13663,30 +9667,13 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         }
     }
 
-    /* Phase 1a A1 first-dispatch marker per Phase 1a spec §7 exit gate:
-     * harness greps this to confirm the A1 producer fired (and was not
-     * silently bypassed). Only emitted when the Phase 1a env-flag gate
-     * was used — when the legacy MDXFIND_KERNEL_B_PROTO=1 alone is in
-     * effect this is silent (preserves legacy stderr footprint). */
-    if (gpu_opencl_kernel_a_proto_enabled()) {
-        static int _kernel_a1_first[MAX_GPU_DEVICES] = {0};
-        if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES
-            && !_kernel_a1_first[dev_idx]) {
-            _kernel_a1_first[dev_idx] = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: kernel A1 dispatch fired "
-                "(variant=1 op=%d n_words=%u n_rules=%d)\n",
-                dev_idx, op, num_words, d->gpu_n_rules);
-        }
-    }
-
     cl_int err;
     uint32_t n_rules  = (uint32_t)d->gpu_n_rules;
 
     /* RULE-AXIS CHUNKING (Option A, 2026-05-29). Decide whether the full
      * (word x rule) candidate buffer fits the per-device cap in ONE dispatch.
-     *   max_packed_full = num_words * n_rules * 256
-     *   K (rules/chunk)  = max(1, cap_bytes / (num_words * 256))
+     *   max_packed_full = num_words * n_rules * gpu_opencl_proto_slot_bytes()
+     *   K (rules/chunk)  = max(1, cap_bytes / (num_words * slot bytes))
      *   num_rule_chunks  = ceil(n_rules / K)
      * If num_rule_chunks <= 1 the dispatch degenerates to the EXISTING single-
      * dispatch body below — bit-identical to the pre-chunking path (e347 /
@@ -13695,7 +9682,7 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * resolved-plaintext arena), which fully owns the dispatch and returns. */
     {
         size_t cap_bytes = gpu_opencl_proto_cand_cap_bytes(d, dev_idx);
-        size_t per_word_rule_bytes = (size_t)num_words * 256u;
+        size_t per_word_rule_bytes = (size_t)num_words * gpu_opencl_proto_slot_bytes();
         size_t K = (per_word_rule_bytes > 0)
                  ? (cap_bytes / per_word_rule_bytes) : (size_t)n_rules;
         if (K == 0) K = 1;
@@ -13728,13 +9715,12 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      *
      * Worst-case slot count = num_words * n_rules (all (word,rule) pairs
      * emit a candidate — rejection-free, no-op-free upper bound).
-     * Worst-case packed bytes = slot_count * (1 + MAX_RULE_OUTPUT_LEN).
-     * Per design §7.4, size to worst-case at session start.
-     * MAX_RULE_OUTPUT_LEN = 255 (clamped to uchar in kernel A).
-     * Per feedback_min_buffer_bytes_discipline.md: use create_min_buf,
-     * no hardcoded literals. */
+     * Worst-case packed bytes = slot_count * gpu_opencl_proto_slot_bytes()
+     * (2-byte length + the longest candidate kernel A can emit), so kernel
+     * A cannot overflow. */
     size_t max_slots       = (size_t)num_words * (size_t)n_rules;
-    size_t max_packed      = max_slots * 256u;  /* 1 len byte + up to 255 bytes */
+    size_t max_packed      = max_slots * gpu_opencl_proto_slot_bytes();
+    int mask_on = gpu_opencl_proto_mask_resolve(d, dev_idx, op);
     if (max_packed < MIN_BUFFER_BYTES) max_packed = MIN_BUFFER_BYTES;
 
     if (gpu_opencl_kernelb_ensure_proto_bufs(d, dev_idx, max_packed, max_slots) < 0)
@@ -13780,8 +9766,9 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         d->h_dispatch_payload = new_host;
         d->h_dispatch_payload_cap = payload_size;
 
+        /* READ_WRITE: kernel B sets the overflow flag at offset 100. */
         d->b_dispatch_payload = clCreateBuffer(d->ctx,
-            CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR,
+            CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR,
             payload_size, d->h_dispatch_payload, &err);
         if (!d->b_dispatch_payload || err != CL_SUCCESS) {
             fprintf(stderr,
@@ -13965,12 +9952,9 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      *   (b) populate them with a TARGETED, hits-only readback AFTER kernel B
      *       (below, just past the hit-count read) — a handful of small reads
      *       (KB, not GB) instead of the full buffer.
-     * The full whole-buffer readback is retained ONLY for the
-     * MDXFIND_KERNEL_A_TRACE validation-dump channel (it needs every slot),
-     * gated behind that env flag so the normal path never pays for it.
+     * The whole-buffer readback for the MDXFIND_KERNEL_A_TRACE dump channel
+     * was removed with that env var's last reader (2026-11-14).
      * Skip if overflow or zero-slot (no hits possible). */
-    const char *_ka_trace = NULL /* was MDXFIND_KERNEL_A_TRACE */;
-    int _want_full_readback = (_ka_trace && *_ka_trace);
     {
         if (!overflow_flag && actual_slots > 0) {
             /* Ensure host staging is large enough (allocation only — no copy). */
@@ -13996,57 +9980,25 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
                 d->h_proto_index_readback_cap = index_bytes + MIN_BUFFER_BYTES;
             }
 
-            if (_want_full_readback) {
-                /* TRACE ONLY: copy the entire candidate buffer + chunk index so
-                 * the validation dump below has every slot. This is the old hot-
-                 * path cost, now confined to the diagnostic flag. */
-                err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf, CL_TRUE,
-                                          0, (size_t)actual_byte_count,
-                                          d->h_proto_packed_readback,
-                                          0, NULL, NULL);
-                if (err != CL_SUCCESS) {
-                    fprintf(stderr, "FATAL: %s:%d GPU[%d]: b_proto_packed_buf trace readback failed (err=%d)\n",
-                            __FILE__, __LINE__, dev_idx, err);
-                    exit(1);
-                }
-                err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index, CL_TRUE,
-                                          0, index_bytes,
-                                          d->h_proto_index_readback,
-                                          0, NULL, NULL);
-                if (err != CL_SUCCESS) {
-                    fprintf(stderr, "FATAL: %s:%d GPU[%d]: b_proto_chunk_index trace readback failed (err=%d)\n",
-                            __FILE__, __LINE__, dev_idx, err);
-                    exit(1);
-                }
-            }
         }
 
-        /* Phase 1a A1 buffer-quadruple trace channel (Phase 1a spec §10 q7):
-         * harness reads the dumped files to byte-exact validate the A1 output
-         * shape. Zero overhead when MDXFIND_KERNEL_A_TRACE is unset. The host
-         * buffers are fully populated only in _want_full_readback mode, so the
-         * dump is gated on the same flag (otherwise it would dump uninitialized
-         * staging). */
-        if (_want_full_readback) {
-            gpu_opencl_kernel_a_trace_dump(dev_idx, state,
-                d->h_proto_index_readback,
-                (size_t)actual_slots * sizeof(uint32_t),
-                d->h_proto_packed_readback,
-                (size_t)actual_byte_count);
-        }
     }
 
     if (overflow_flag) {
-        /* Kernel A overflowed the candidate buffer. For the prototype,
-         * log and skip kernel B for this chunk (no re-dispatch retry).
-         * A production implementation would retry with a smaller chunk or
-         * larger buffer. */
+        /* The buffer holds gpu_opencl_proto_slot_bytes() per (word, rule), so
+         * this cannot happen.  It used to print a line and skip kernel B,
+         * which dropped every candidate of the batch: the CPU had already
+         * skipped them (C2.3), so the run ended clean with them unhashed.
+         * Fatal, per external-failures-are-fatal (2026-11-14, as Metal). */
+        char hn[256];
+        mdx_gethostname(hn, sizeof(hn));
         fprintf(stderr,
-            "[kernelb_proto] OpenCL GPU[%d]: kernel A overflow "
-            "(slots=%u bytes=%u packed_cap=%zu) — skipping kernel B for this chunk\n",
-            dev_idx, actual_slots, actual_byte_count, max_packed);
-        *nhits_out = 0;
-        return d->h_hits;
+            "FATAL: %s:%d OpenCL GPU[%d]: kernel A overflow "
+            "(slots=%u bytes=%u packed_cap=%zu op=%d) on %s -- the "
+            "candidate buffer is sized so this cannot happen\n",
+            __FILE__, __LINE__, dev_idx, actual_slots, actual_byte_count,
+            max_packed, op, hn);
+        exit(1);
     }
 
     if (actual_slots == 0) {
@@ -14069,6 +10021,19 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         /* salt_start: use 0 for single-salt prototype dispatch. A multi-salt
          * loop would issue one kernel B per salt, incrementing salt_start. */
         p->salt_start  = 0;
+        /* -n/-N positions for the family kernel (0 = no mask). */
+        p->n_prepend   = mask_on ? (uint32_t)gpu_mask_n_prepend : 0u;
+        p->n_append    = mask_on ? (uint32_t)gpu_mask_n_append  : 0u;
+        /* This job's mask slice (checklist 70); mask_base0 is the count. */
+        p->mask_start  = gpu_opencl_proto_mfirst[dev_idx];
+        p->mask_base0  = gpu_opencl_proto_mcount[dev_idx];
+        /* Mask lanes per slot (checklist 76, gpujob.h); 0 = none. */
+        p->mask_base1  = mask_on ? gpu_mask_lanes(actual_slots,
+                             gpu_opencl_proto_mcount[dev_idx],
+                             GPU_MASK_LANE_TARGET) : 0u;
+        /* B3 overflow ledger, read back after kernel B. */
+        p->overflow_first_set  = 0u;
+        p->overflow_first_word = 0xFFFFFFFFu;
     }
 
     /* Re-upload the updated OCLParams section (only first 128 bytes changed). */
@@ -14262,6 +10227,9 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         KB_ARG(a++, sizeof(cl_mem), &d->b_hashes_shown);
 #undef KB_ARG
         (void)a;
+        /* args 16/17: the family kernel's -n/-N tables. */
+        if (gpu_codegen_kernelb_family_md5pass_eligible(op))
+            gpu_opencl_proto_bind_mask_args(d, dev_idx, kb, mask_on);
     }
 
     /* --- 8. Enqueue kernel B ---
@@ -14309,8 +10277,13 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
          * op we launch exactly actual_slots lanes, padded up to a wg_size
          * multiple to honor the reqd_work_group_size(64,1,1) attribute.
          * The salted e347 / family path keeps the salt-fanned formula. */
-        if (_exp_md5) {
-            gsize_b = ((size_t)actual_slots + wg_size - 1u) / wg_size;
+        /* The MAKE_MD5PASS family kernel is one lane per candidate too (it
+         * loops masks and rounds inside the lane, as on Metal). */
+        if (_exp_md5 || gpu_codegen_kernelb_family_md5pass_eligible(op)) {
+            /* x the family's mask lanes per slot (checklist 76). */
+            uint64_t fl = ((OCLParams *)d->h_dispatch_payload)->mask_base1;
+            if (fl == 0u) fl = 1u;
+            gsize_b = ((size_t)actual_slots * (size_t)fl + wg_size - 1u) / wg_size;
             gsize_b *= wg_size;
         } else {
             gsize_b =
@@ -14347,6 +10320,7 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
 
         if (hcount > (uint32_t)GPU_PACKED_MAX_HITS)
             hcount = (uint32_t)GPU_PACKED_MAX_HITS;
+        gpu_opencl_proto_check_ovr(d, dev_idx, op, "single");
 
         if (hcount > 0) {
             err = clEnqueueReadBuffer(d->queue, d->b_hits, CL_TRUE,
@@ -14371,22 +10345,26 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
              *     plaintext = &h_proto_packed_readback[wpos + 1];
              * so for each hit we (1) read the single uint32 chunk_index[slot]
              * from the GPU to learn wpos, store it at h_proto_index_readback[slot];
-             * (2) read the length byte + plaintext (kernel A clamps emit_len to
-             * 255, so the record is at most 1+255 = 256 bytes; we read
-             * min(256, remaining)) from b_proto_packed_buf at
-             * wpos, store at h_proto_packed_readback[wpos]. Skip when the host
-             * staging already holds the full buffer (trace mode) — no point
-             * re-reading. A duplicate hit slot is harmless (idempotent rewrite). */
-            if (!_want_full_readback && d->h_proto_index_readback &&
+             * (2) read the 2-byte length, then the whole [len lo][len hi][bytes]
+             * record from b_proto_packed_buf at wpos into
+             * h_proto_packed_readback[wpos].  Skip when the host staging already
+             * holds the full buffer (trace mode) -- no point re-reading.  A
+             * duplicate hit slot is harmless (idempotent rewrite).  A slot that
+             * does not resolve is FATAL: the replay would drop it silently
+             * (2026-11-14). */
+            if (d->h_proto_index_readback &&
                 d->h_proto_packed_readback) {
                 for (uint32_t _hi = 0; _hi < hcount; _hi++) {
                     uint32_t _slot = d->h_hits[(size_t)_hi * GPU_HIT_STRIDE + 0];
                     size_t _idx_off = (size_t)_slot * sizeof(uint32_t);
-                    /* Slot must be within the index staging we allocated
-                     * (actual_slots entries). Out-of-range = corrupt hit; the
-                     * accessor will also reject it, but skip the read here. */
-                    if (_idx_off + sizeof(uint32_t) > d->h_proto_index_readback_cap)
-                        continue;
+                    if (_slot >= actual_slots
+                        || _idx_off + sizeof(uint32_t) > d->h_proto_index_readback_cap) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d]: proto hit names slot %u "
+                            "outside kernel A's %u (op=%d)\n",
+                            __FILE__, __LINE__, dev_idx, _slot, actual_slots, op);
+                        exit(1);
+                    }
                     /* (1) Read this slot's byte offset into the packed buffer. */
                     uint32_t _wpos = 0;
                     err = clEnqueueReadBuffer(d->queue, d->b_proto_chunk_index,
@@ -14400,15 +10378,32 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
                             __FILE__, __LINE__, dev_idx, _slot, err);
                         exit(1);
                     }
-                    if (_wpos >= (uint32_t)actual_byte_count) continue;
-                    /* (2) Read the length byte + plaintext at wpos (clamped). */
-                    size_t _avail = (size_t)actual_byte_count - (size_t)_wpos;
-                    size_t _want  = _avail < 256u ? _avail : 256u;
-                    if ((size_t)_wpos + _want > d->h_proto_packed_readback_cap)
-                        _want = (d->h_proto_packed_readback_cap > (size_t)_wpos)
-                              ? (d->h_proto_packed_readback_cap - (size_t)_wpos)
-                              : 0;
-                    if (_want == 0) continue;
+                    /* (2) The 2-byte length, then the whole record. */
+                    uint8_t _lb[2] = {0, 0};
+                    if ((size_t)_wpos + 2u <= (size_t)actual_byte_count) {
+                        err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
+                                                  CL_TRUE, (size_t)_wpos, 2u, _lb,
+                                                  0, NULL, NULL);
+                        if (err != CL_SUCCESS) {
+                            fprintf(stderr,
+                                "FATAL: %s:%d GPU[%d]: targeted length readback "
+                                "(slot=%u wpos=%u) failed (err=%d)\n",
+                                __FILE__, __LINE__, dev_idx, _slot, _wpos, err);
+                            exit(1);
+                        }
+                    }
+                    size_t _want = 2u + ((size_t)_lb[0] | ((size_t)_lb[1] << 8));
+                    if ((size_t)_wpos + 2u > (size_t)actual_byte_count
+                        || (size_t)_wpos + _want > (size_t)actual_byte_count
+                        || (size_t)_wpos + _want > d->h_proto_packed_readback_cap) {
+                        fprintf(stderr,
+                            "FATAL: %s:%d GPU[%d]: proto hit slot %u record "
+                            "(wpos=%u bytes=%zu) is outside kernel A's output "
+                            "(%u bytes, op=%d)\n",
+                            __FILE__, __LINE__, dev_idx, _slot, _wpos, _want,
+                            actual_byte_count, op);
+                        exit(1);
+                    }
                     err = clEnqueueReadBuffer(d->queue, d->b_proto_packed_buf,
                                               CL_TRUE, (size_t)_wpos, _want,
                                               (uint8_t *)d->h_proto_packed_readback
@@ -14476,19 +10471,12 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
                                        ? (uint64_t)(a_start - a_submit) / 1000ULL
                                        : 0;
             _kb_last_stage_valid = 1;
-        } else {
-            static __thread int _warned = 0;
-            if (!_warned) {
-                _warned = 1;
-                fprintf(stderr,
-                    "WARN: %s:%d GPU[%d]: kernel B PROTO stage-timing readback "
-                    "failed (pe1=%d pe2=%d pe3=%d pe4=%d pe5=%d) — likely "
-                    "queue created without CL_QUEUE_PROFILING_ENABLE. Trace "
-                    "fields kernel_a_us/host_gap_us/kernel_b_us/queue_wait_a_us "
-                    "will be 0.\n",
-                    __FILE__, __LINE__, dev_idx, pe1, pe2, pe3, pe4, pe5);
-            }
         }
+        /* else: no profiling on this queue -- the normal case since the
+         * MDXFIND_DISPATCH_TRACE / MDXFIND_KERNEL_TRACE switches that enabled it
+         * went (2026-09-16).  The stage fields stay 0.  This used to print a
+         * WARN on every proto run, a false alarm once the MAKE_MD5PASS family
+         * reached this path on OpenCL (2026-11-14). */
     } else if (!p_clGetEventProfilingInfo) {
         static __thread int _warned = 0;
         if (!_warned) {
@@ -14559,11 +10547,13 @@ const char *gpu_opencl_kernelb_proto_plaintext(
         uint32_t G = hit_widx;
         if ((size_t)G >= d->h_proto_resolved_off_cap) return NULL;
         size_t arena_off = d->h_proto_resolved_off[G];
-        if (arena_off + 1 > d->h_proto_resolved_buf_used) return NULL;
-        uint8_t plen = d->h_proto_resolved_buf[arena_off];
-        if (arena_off + 1 + plen > d->h_proto_resolved_buf_used) return NULL;
+        /* [len lo][len hi][bytes] -- kernel A's 2-byte length (2026-11-14). */
+        if (arena_off + 2 > d->h_proto_resolved_buf_used) return NULL;
+        uint32_t plen = (uint32_t)d->h_proto_resolved_buf[arena_off]
+                      | ((uint32_t)d->h_proto_resolved_buf[arena_off + 1] << 8);
+        if (arena_off + 2 + plen > d->h_proto_resolved_buf_used) return NULL;
         if (plen_out) *plen_out = (int)plen;
-        return (const char *)(d->h_proto_resolved_buf + arena_off + 1);
+        return (const char *)(d->h_proto_resolved_buf + arena_off + 2);
     }
 
     if (!d->h_proto_index_readback || !d->h_proto_packed_readback) return NULL;
@@ -14576,15 +10566,15 @@ const char *gpu_opencl_kernelb_proto_plaintext(
     if (index_byte_off + sizeof(uint32_t) > d->h_proto_index_readback_cap) return NULL;
 
     uint32_t wpos = ((const uint32_t *)d->h_proto_index_readback)[slot_idx];
-    if (wpos >= d->h_proto_packed_readback_cap) return NULL;
-    if (wpos + 1 > d->h_proto_packed_readback_cap) return NULL;
+    if ((size_t)wpos + 2 > d->h_proto_packed_readback_cap) return NULL;
 
+    /* [len lo][len hi][bytes] -- kernel A's 2-byte length (2026-11-14). */
     const uint8_t *packed = (const uint8_t *)d->h_proto_packed_readback;
-    uint8_t plen = packed[wpos];
-    if (wpos + 1 + plen > d->h_proto_packed_readback_cap) return NULL;
+    uint32_t plen = (uint32_t)packed[wpos] | ((uint32_t)packed[wpos + 1] << 8);
+    if ((size_t)wpos + 2 + plen > d->h_proto_packed_readback_cap) return NULL;
 
     if (plen_out) *plen_out = (int)plen;
-    return (const char *)(packed + wpos + 1);
+    return (const char *)(packed + wpos + 2);
 }
 
 /* Dispatch md5_rules_phase0 against a packed words batch. Validator
@@ -14711,6 +10701,7 @@ int gpu_opencl_op_supported(int op)
          * algo_mode=4 — outer MD5 over (hex32(MD5(salt)) || hex32(MD5(pass))).
          * Salt-hex pre-computed by host (saltsnap[].hashsalt). */
         op != JOB_MD5UCSALT && op != JOB_MD5revMD5SALT && op != JOB_MD5sub8_24SALT &&
+        op != JOB_MD5MD5SALT &&   /* e347: algo_mode 7 */
         op != JOB_MD5_MD5SALTMD5PASS &&
         /* Family A (2026-05-07): JOB_HMAC_MD5 (e214) + JOB_HMAC_MD5_KPASS
          * (e792) — sixth + seventh MD5SALT-template-kernel-sharing
@@ -14881,17 +10872,12 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
      * early-return is a defensive last line of defense rather than the
      * primary gate — but we keep it so the function is safe in isolation. */
     if (d->device_disabled) return NULL;
-    if (d->gpu_n_rules <= 0 || !d->prog_md5_rules) {
+    if (d->gpu_n_rules <= 0) {
         fprintf(stderr, "OpenCL GPU[%d]: dispatch_md5_rules called before "
-                "set_rules (prog=%p, n_rules=%d)\n",
-                dev_idx, (void *)d->prog_md5_rules, d->gpu_n_rules);
+                "set_rules (n_rules=%d)\n",
+                dev_idx, d->gpu_n_rules);
         return NULL;
     }
-    /* Lazy kernel creation. Deferred from set_rules to here so the kernel
-     * object only exists once we have args to bind to it — avoids the
-     * NVIDIA-driver CL_INVALID_KERNEL_ARGS at process finalize when the
-     * dispatch path is never reached in this session. */
-    if (gpu_opencl_rules_kernel_lazy(d, dev_idx) < 0) return NULL;
     /* B5 chokepoint widening (2026-05-04 sub-batch 1; 2026-05-05 sub-batch 2):
      * the gate at mdxfind.c (around the gpu_rules_engine_active condition)
      * now permits {MD5, MD4, SHA1, SHA224, SHA256, SHA384, SHA512, RMD160,
@@ -14933,246 +10919,6 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
         }
     }
 
-    /* ----------------------------------------------------------------
-     * Validator branch (env-gated, fully additive).
-     *
-     * MDXFIND_GPU_VALIDATOR=1 swaps the production walker for the
-     * md5_rules_phase0_validate kernel — emits per-(word, rule) buffer
-     * state on stderr in the same format as ruleproc.c's CPU validator
-     * (MDXFIND_RULE_VALIDATOR=1). Returns NULL (no hits) so the
-     * chokepoint caller sees the same shape as a "no cracks" pass.
-     * Does NOT mutate the production walker's code path.
-     *
-     * Slot layout matches gpu/gpu_md5_rules.cl md5_rules_phase0_validate
-     * (rev 1.23+ widened wire format):
-     *   per (word, rule) slot, RECORD_SZ = 4 + RULE_BUF_MAX_HOST bytes
-     *   slot[0..1] = retlen (int16 little-endian),
-     *   slot[2..3] = outlen (uint16 little-endian),
-     *   slot[4..3+outlen] = post-rule buffer bytes.
-     * Storage is word-major: slot_idx = word_idx * n_rules + rule_idx.
-     *
-     * Sized cap (defensive): n_words * n_rules * RECORD_SZ must be <=
-     * 1 GB. With RULE_BUF_MAX_HOST=40960 the per-slot payload is much
-     * larger than the prior 258 B, so the cap is raised proportionally.
-     * Beyond that, fall back to the production walker (bail with warning).
-     * ---------------------------------------------------------------- */
-    if (gpu_validator_enabled()) {
-        const size_t RECORD_SZ = (size_t)GPU_VALIDATE_RECORD_SZ_HOST;
-        const size_t MAX_RECORDS_BYTES = (size_t)1024 * 1024 * 1024;
-        size_t total_slots = (size_t)num_words * (size_t)d->gpu_n_rules;
-        size_t records_bytes = total_slots * RECORD_SZ;
-        if (records_bytes > MAX_RECORDS_BYTES) {
-            static int _warned = 0;
-            if (!_warned) {
-                _warned = 1;
-                GPU_DEBUG_FPRINTF(stderr,
-                    "OpenCL GPU[%d]: validator buffer %.1f MB exceeds 256 MB cap "
-                    "(n_words=%u, n_rules=%d, RECORD_SZ=%zu) — falling through to "
-                    "production walker without validator output for this dispatch. "
-                    "Reduce per-batch words or rule-set size.\n",
-                    dev_idx, records_bytes / (1024.0 * 1024.0),
-                    num_words, d->gpu_n_rules, RECORD_SZ);
-            }
-            /* Skip validator path; fall through to production dispatch below. */
-            goto validator_skip;
-        }
-        if (gpu_opencl_validate_kernel_lazy(d, dev_idx) < 0) {
-            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator kernel unavailable; "
-                    "falling through to production walker\n", dev_idx);
-            goto validator_skip;
-        }
-        if (!d->h_rule_program || !d->h_rule_offset) {
-            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator host-side rule mirror not "
-                    "populated (set_rules called before the validator was "
-                    "set?); cannot stringify rulebytes — bypassing validator\n",
-                    dev_idx);
-            goto validator_skip;
-        }
-
-        /* (Re)allocate the records buffer if needed. */
-        if (!d->b_validate_records || records_bytes > d->validate_records_cap) {
-            if (d->b_validate_records) clReleaseMemObject(d->b_validate_records);
-            d->b_validate_records = clCreateBuffer(d->ctx, CL_MEM_WRITE_ONLY,
-                                                   records_bytes, NULL, &err);
-            if (err != CL_SUCCESS || !d->b_validate_records) {
-                GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator records buf alloc "
-                        "failed (%zu bytes, err=%d)\n",
-                        dev_idx, records_bytes, err);
-                d->b_validate_records = NULL;
-                d->validate_records_cap = 0;
-                goto validator_skip;
-            }
-            d->validate_records_cap = records_bytes;
-        }
-
-        /* Reuse the packed_buf / chunk_index buffers (same upload path as
-         * the production dispatch — same packed [len][bytes] format). */
-        if ((size_t)packed_size > d->packed_buf_cap) {
-            if (d->b_packed_buf) clReleaseMemObject(d->b_packed_buf);
-            d->b_packed_buf = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                             packed_size, NULL, &err);
-            d->packed_buf_cap = packed_size;
-        }
-        size_t wo_size_v = (size_t)num_words * sizeof(uint32_t);
-        if (wo_size_v > d->chunk_index_cap) {
-            if (d->b_chunk_index) clReleaseMemObject(d->b_chunk_index);
-            d->b_chunk_index = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY,
-                                              wo_size_v, NULL, &err);
-            d->chunk_index_cap = wo_size_v;
-        }
-        clEnqueueWriteBuffer(d->queue, d->b_packed_buf, CL_TRUE, 0,
-                             packed_size, packed_words, 0, NULL, NULL);
-        clEnqueueWriteBuffer(d->queue, d->b_chunk_index, CL_TRUE, 0,
-                             wo_size_v, word_offset, 0, NULL, NULL);
-
-        OCLParams vparams;
-        memset(&vparams, 0, sizeof(vparams));
-        vparams.compact_mask = _compact_mask;
-        vparams.num_words = num_words;
-        vparams.num_masks = (uint32_t)d->gpu_n_rules;
-        vparams.max_probe = 256;
-        vparams.hash_data_count = _hash_data_count;
-        vparams.max_hits = GPU_PACKED_MAX_HITS;
-        vparams.overflow_count = _overflow_count;
-        vparams.max_iter = d->max_iter < 1 ? 1 : d->max_iter;
-        clEnqueueWriteBuffer(d->queue, d->b_params, CL_TRUE, 0,
-                             sizeof(vparams), &vparams, 0, NULL, NULL);
-
-        cl_kernel kvk = d->kern_md5_rules_phase0_validate;
-        {
-            int a = 0;
-            clSetKernelArg(kvk, a++, sizeof(cl_mem), &d->b_packed_buf);
-            clSetKernelArg(kvk, a++, sizeof(cl_mem), &d->b_chunk_index);
-            clSetKernelArg(kvk, a++, sizeof(cl_mem), &d->b_rule_program);
-            clSetKernelArg(kvk, a++, sizeof(cl_mem), &d->b_rule_offset);
-            clSetKernelArg(kvk, a++, sizeof(cl_mem), &d->b_params);
-            clSetKernelArg(kvk, a++, sizeof(cl_mem), &d->b_validate_records);
-        }
-
-        size_t local_v = 64;
-        size_t total_v = total_slots;
-        size_t global_v = ((total_v + local_v - 1) / local_v) * local_v;
-        err = clEnqueueNDRangeKernel(d->queue, kvk, 1, NULL,
-                                     &global_v, &local_v, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            /* Fail-fast: validator (env-gated MDXFIND_GPU_VALIDATOR=1)
-             * is a diagnostic path; if dispatch fails, the diagnostic
-             * is invalid and silent return would mask the failure. */
-            GPU_FATAL("validator dispatch error %d on dev %d "
-                      "(global=%zu, n_words=%u, n_rules=%d)",
-                      err, dev_idx, global_v, num_words, d->gpu_n_rules);
-        }
-        {
-            cl_int _e = clFinish(d->queue);
-            if (_e != CL_SUCCESS) GPU_FATAL("validator clFinish dev=%d global=%zu err=%d", dev_idx, global_v, _e);
-        }
-
-        /* Read full records buffer back. For 200 words × 41 rules
-         * × 258 B ≈ 2 MB — trivial. */
-        unsigned char *host_records = (unsigned char *)malloc(records_bytes);
-        if (!host_records) {
-            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator host buffer malloc "
-                    "(%zu bytes) failed\n", dev_idx, records_bytes);
-            return NULL;
-        }
-        err = clEnqueueReadBuffer(d->queue, d->b_validate_records, CL_TRUE, 0,
-                                  records_bytes, host_records, 0, NULL, NULL);
-        if (err != CL_SUCCESS) {
-            /* Fail-fast: see validator dispatch comment above. */
-            GPU_FATAL("validator records readback err=%d on dev %d "
-                      "(%zu bytes)", err, dev_idx, records_bytes);
-        }
-
-        /* Emit stderr in the same word-major (word_idx, rule_idx) order
-         * the CPU validator should produce. Hex-encoded fields match the
-         * ruleproc.c rev 1.24 format:
-         *   VALIDATE word=<hex> rulebytes=<hex> retlen=<int> outlen=<int> output=<hex>
-         *
-         * Field widening rev 1.72 (2026-05-02): retlen/outlen are int16/
-         * uint16 little-endian on the wire. word_hex / rule_hex / out_hex
-         * are heap-allocated once at RULE_BUF_MAX_HOST sizing because
-         * stack-allocating 3 × (2*40960+1) ≈ 245 KB risks overflow on
-         * deeply nested call stacks. The decimal stderr text format is
-         * unchanged (validate_diff.py regex already accepts wider ints).
-         */
-        static const char hex_lc_chars[] = "0123456789abcdef";
-        size_t hex_buf_sz = (size_t)RULE_BUF_MAX_HOST * 2u + 1u;
-        char *word_hex = (char *)malloc(hex_buf_sz);
-        char *rule_hex = (char *)malloc(hex_buf_sz);
-        char *out_hex  = (char *)malloc(hex_buf_sz);
-        if (!word_hex || !rule_hex || !out_hex) {
-            GPU_DEBUG_FPRINTF(stderr, "OpenCL GPU[%d]: validator hex-buf malloc "
-                    "(3 × %zu bytes) failed\n", dev_idx, hex_buf_sz);
-            free(word_hex); free(rule_hex); free(out_hex);
-            free(host_records);
-            return NULL;
-        }
-        for (uint32_t wi = 0; wi < num_words; wi++) {
-            /* Pull word from packed_words. Format is [len][bytes]; word_offset
-             * points at the [len] byte. */
-            uint32_t wpos = word_offset[wi];
-            unsigned char wlen = (unsigned char)packed_words[wpos];
-            const unsigned char *wbytes =
-                (const unsigned char *)(packed_words + wpos + 1);
-            for (int ri = 0; ri < d->gpu_n_rules; ri++) {
-                size_t slot = (size_t)wi * (size_t)d->gpu_n_rules + (size_t)ri;
-                size_t base = slot * RECORD_SZ;
-                /* Decode int16 LE retlen and uint16 LE outlen (rev 1.23 wire). */
-                int16_t retlen16 = (int16_t)((uint16_t)host_records[base + 0] |
-                                             ((uint16_t)host_records[base + 1] << 8));
-                uint16_t outlen16 = (uint16_t)((uint16_t)host_records[base + 2] |
-                                               ((uint16_t)host_records[base + 3] << 8));
-                int retlen = (int)retlen16;
-                int outlen = (int)outlen16;
-                const unsigned char *out_bytes = host_records + base + 4;
-
-                for (int j = 0; j < (int)wlen; j++) {
-                    word_hex[j * 2 + 0] = hex_lc_chars[(wbytes[j] >> 4) & 0xf];
-                    word_hex[j * 2 + 1] = hex_lc_chars[wbytes[j] & 0xf];
-                }
-                word_hex[wlen * 2] = '\0';
-
-                /* Walk the rule bytecode for rule_idx ri to find its byte
-                 * span (NUL-terminated within the program). Rule bytecode
-                 * is bounded short — a 256-byte rule walk cap is plenty. */
-                uint32_t rpos = d->h_rule_offset[ri];
-                uint32_t rlen = 0;
-                while (rpos + rlen < d->h_rule_program_len &&
-                       d->h_rule_program[rpos + rlen] != 0 &&
-                       rlen < 256) {
-                    rlen++;
-                }
-                for (uint32_t j = 0; j < rlen; j++) {
-                    unsigned char rb = d->h_rule_program[rpos + j];
-                    rule_hex[j * 2 + 0] = hex_lc_chars[(rb >> 4) & 0xf];
-                    rule_hex[j * 2 + 1] = hex_lc_chars[rb & 0xf];
-                }
-                rule_hex[rlen * 2] = '\0';
-
-                int outlen_clamped = (outlen < 0) ? 0 :
-                                     (outlen > (int)RULE_BUF_MAX_HOST ?
-                                      (int)RULE_BUF_MAX_HOST : outlen);
-                for (int j = 0; j < outlen_clamped; j++) {
-                    out_hex[j * 2 + 0] = hex_lc_chars[(out_bytes[j] >> 4) & 0xf];
-                    out_hex[j * 2 + 1] = hex_lc_chars[out_bytes[j] & 0xf];
-                }
-                out_hex[outlen_clamped * 2] = '\0';
-
-                GPU_DEBUG_FPRINTF(stderr,
-                    "VALIDATE word=%s rulebytes=%s retlen=%d outlen=%d output=%s\n",
-                    word_hex, rule_hex, retlen, outlen, out_hex);
-            }
-        }
-        free(word_hex);
-        free(rule_hex);
-        free(out_hex);
-        free(host_records);
-        /* Validator path produces no cracks — return NULL like a 0-hit
-         * production dispatch. Caller (chokepoint) handles NULL gracefully. */
-        return NULL;
-    }
-validator_skip:
-    ;
 
     /* ----------------------------------------------------------------
      * Memo B B1 (2026-05-04): coalesced dispatch payload.
@@ -15309,6 +11055,9 @@ validator_skip:
      * named local keeps both arms in sync. */
     uint32_t effective_mask_size = (bf_num_masks > 0u)
         ? bf_num_masks : b71_mask_size;
+    /* The pre-radix axis size when -a multiplies a dot radix in, else 0
+     * (gpujob.h gpu_dispatch_dot_base; checklist 74). */
+    uint32_t dot_base = 0u;
 
     /* -a dot axis (plan sections 5, 15).  The dot sweep rides the mask axis as
      * its OUTERMOST digit, so all the host has to do is multiply 2^N into the
@@ -15376,6 +11125,7 @@ validator_skip:
                 dot_w--;
         }
         if (dot_w > 0u) {
+            dot_base = effective_mask_size;   /* C: the job's slice, pre-radix */
             effective_mask_size <<= dot_w;
             if ((int)dot_w > gpu_dot_width_used) gpu_dot_width_used = (int)dot_w;
         }
@@ -15386,8 +11136,10 @@ validator_skip:
      * dispatch it equals the expression the replay used to compute for itself
      * -- bf_num_masks when chunked, else gpu_mask_total when the mask is
      * eligible, else 1 -- so nothing but `-a` changes. */
-    if (dev_idx >= 0 && dev_idx < GPUJOB_MAX_DEVS)
+    if (dev_idx >= 0 && dev_idx < GPUJOB_MAX_DEVS) {
         gpu_dispatch_mask_size[dev_idx] = (uint64_t)effective_mask_size;
+        gpu_dispatch_dot_base[dev_idx]  = (uint64_t)dot_base;
+    }
 
     /* B6 salt-axis (2026-05-06; §13.2 row 16.5): derive is-salted at the
      * pack site (op-direct). Row 17's `kern_is_salted_template` covers
@@ -15461,6 +11213,7 @@ validator_skip:
                           op == JOB_MD5UCSALT ||
                           op == JOB_MD5revMD5SALT ||
                           op == JOB_MD5sub8_24SALT ||
+                          op == JOB_MD5MD5SALT ||
                           /* B6.8 (2026-05-06): JOB_MD5_MD5SALTMD5PASS
                            * (e367) shares the MD5SALT kernel via
                            * algo_mode=4. Salt-pack geometry identical
@@ -15782,7 +11535,8 @@ validator_skip:
                 spp_default = v;
             } else if (dynsize_is_enabled() &&
                        (op == JOB_MD5SALT || op == JOB_MD5UCSALT ||
-                        op == JOB_MD5revMD5SALT || op == JOB_MD5sub8_24SALT)) {
+                        op == JOB_MD5revMD5SALT || op == JOB_MD5sub8_24SALT ||
+                        op == JOB_MD5MD5SALT)) {
                 /* Dynsize gate at salts_per_page derivation:
                  * `kern` is not in scope at this site (the kernel is
                  * resolved further down). Use op-based gate covering
@@ -15899,6 +11653,9 @@ validator_skip:
         }
         pparams->n_prepend = (uint32_t)gpu_mask_n_prepend;
         pparams->n_append  = (uint32_t)gpu_mask_n_append;
+        /* -a: the dot digit is mask_idx_local / C, not / the full position
+         * product (checklist 74).  Unread by the template when 0. */
+        pparams->mask_base0 = (uint64_t)dot_base;
         /* Tranche 1 BF chunk-as-job (2026-05-09): cursor + per-word stride.
          * Default 0/0 = today's behavior (kernel mask_idx unchanged). The
          * Tranche 2 kernel edit adds these into mask_idx; until then the
@@ -15931,6 +11688,7 @@ validator_skip:
         if (op == JOB_MD5UCSALT || op == JOB_MD5UC) pparams->algo_mode = 1u;
         else if (op == JOB_MD5revMD5SALT)         pparams->algo_mode = 2u;
         else if (op == JOB_MD5sub8_24SALT)        pparams->algo_mode = 3u;
+        else if (op == JOB_MD5MD5SALT)            pparams->algo_mode = 7u;  /* e347 */
         else if (op == JOB_MD5_MD5SALTMD5PASS)    pparams->algo_mode = 4u;
         /* e1063 SHA1PASSUSERPASSUSER rides the SHA1PASSSALT kernel; mode 1
          * makes finalize_append_be hash (pass || salt) twice. */
@@ -16528,78 +12286,33 @@ validator_skip:
      * See gpu/gpu_md5_rules.cl md5_rules_phase0 kernel header for the
      * layout contract. */
 
-    /* Set kernel args. Order MUST match md5_rules_phase0 declaration in
-     * gpu/gpu_md5_rules.cl (B1 signature: payload buffer first, then
-     * everything else; b_packed_buf / b_chunk_index / b_params /
-     * b_hit_count are folded INTO the payload and no longer kernel args).
+    /* Set kernel args. Order MUST match the template_phase0 declaration in
+     * gpu/gpu_template.cl (payload buffer first, then everything else).
      *
-     * Memo B B2: MD5 resolves to the template_phase0 kernel built from
-     * gpu_template.cl + gpu_md5_core.cl. Same signature as the legacy
-     * md5_rules_phase0; the kernel-arg setup below is unchanged.
-     * Template build/lazy is per-device and self-healing: if compile or
-     * kernel create fails, this dispatch falls back to the legacy
-     * kernel (warning already emitted). */
-    /* B5 chokepoint widening (2026-05-04): single resolve helper picks
-     * the per-op template kernel for {MD5, MD4, SHA1, SHA224, SHA256}.
-     * Production path is the template; legacy md5_rules_phase0 only
-     * survives as a fallback for exactly one case: op == JOB_MD5 with
-     * template compile or lazy-create having failed. Nothing can now ask
-     * for it on a non-MD5 op -- the cross-algorithm probe that could,
-     * MDXFIND_GPU_TEMPLATE, was removed 2026-09-16. A non-MD5 op whose
-     * template fails to build is a hard error already logged by the
-     * compile helpers, not a silent miscompute against the MD5 kernel.
-     * See gpu_template_resolve_kernel doc above. */
+     * The op being dispatched picks its template kernel; there is no other
+     * kernel to run instead.  A program that fails to build has already
+     * exited inside gpu_kernel_cache_build_program_at with its build log, and
+     * a kernel-create failure inside its _kernel_lazy helper, so NULL here
+     * means the op has no template arm at all.  Fatal: until 2026-11-15 this
+     * line substituted the legacy MD5 kernel,
+     * and an NTLMH batch whose template failed to build on fglrx was hashed
+     * as MD5 -- 1 line of 830 found, exit 0. */
     cl_kernel kern = gpu_template_resolve_kernel(d, dev_idx, op);
-    if (!kern) kern = d->kern_md5_rules_phase0;
+    if (!kern)
+        GPU_FATAL("op=%d has no arm in gpu_template_resolve_kernel "
+                  "(device %d)", op, dev_idx);
     /* UTF-32 path.  Runs AFTER the template resolver and BEFORE the BF-fast
      * swap below, and it is op-agnostic: every template instantiation carries
      * the UTF-32 arm (gpu_template.cl, #ifdef GPU_U32_WALKER_PRESENT), so the
      * resolved template kernel is already the right kernel and all this block
      * does is make sure the device has the tagged rule program and the case
-     * tables, and refuse the two kernels that cannot serve the mode.
-     *
-     * It used to be MD5-only and fatal for every other op, because the only
-     * device-side UTF-32 body was md5_rules_mixed_phase0, which computes MD5
-     * unconditionally.  That kernel remains in the tree as the T1/T2
-     * benchmark vehicle and as the MD5 fallback below, but it is no longer
-     * the production path for MD5 -- routing MD5 through the mixed kernel and
-     * the other 55 algorithms through the template would have left the
-     * template's UTF-32 arm unexercised on exactly the type we validate
-     * first. */
+     * tables.  (It also used to refuse the legacy byte kernel under -8, or
+     * swap md5_rules_mixed_phase0 in for MD5; the resolver result is now the
+     * only kernel, so that went with the fallback, 2026-11-15.) */
     if (gpu_u32_active()) {
         /* Uploads the combined byte+UTF-32 rule program and the case tables
          * for this device.  Returns 0 or exits; there is no soft failure. */
         (void)gpu_opencl_u32_rules_lazy(d, dev_idx);
-
-        if (kern == d->kern_md5_rules_phase0) {
-            /* The legacy byte kernel masks NOTHING out of word_offset, and
-             * under `-8` the host tags the word class into bits 30-31
-             * (gpu_u32_tag_word_offsets).  The first time the tag was written
-             * while that kernel ran, every word offset carried bit 30: wild
-             * global reads and `md5_rules ovr-state read err=-5`.  It also
-             * has no UTF-32 arm at all, so even a correctly masked offset
-             * would silently run the byte engine on a class-W word.
-             *
-             * We get here only when the per-op template program failed to
-             * build or its kernel failed to create -- a real but recoverable
-             * event on a cold JIT.  For MD5 there is a correct alternative;
-             * for anything else there is not, and a silent byte-engine run
-             * under `-8` is exactly the clean-looking wrong answer this
-             * codebase refuses to produce. */
-            if (op == JOB_MD5 &&
-                gpu_opencl_rules32_kernel_lazy(d, dev_idx) == 0) {
-                kern = d->kern_md5_rules_mixed_phase0;
-            } else {
-                fprintf(stderr,
-                    "FATAL: %s:%d -8 is active but the template program for "
-                    "op=%d did not build on device %d, and the legacy byte "
-                    "kernel cannot serve the UTF-32 path (it neither masks the "
-                    "word-class tag nor carries the UTF-32 walker). The "
-                    "template build error is logged above.\n",
-                    __FILE__, __LINE__, op, dev_idx);
-                exit(1);
-            }
-        }
     }
     /* Phase 1.9 Tranche A1 (2026-05-10): BF-fast MD5 kernel swap. The
      * standard resolver picked the slow MD5 template
@@ -16610,10 +12323,10 @@ validator_skip:
      * d->kern_template_phase0_md5_bf. The two kernels share the
      * "template_phase0" name + signature; A1's BF-fast body is byte-
      * identical to the slow path, so the swap is byte-exact and
-     * provides the integration surface for A2-A4 perf work. If the
-     * BF-fast build fails (transient JIT, low-mem GPU, etc.) the
-     * compile helper emits a one-shot warning and we stay on the slow
-     * kernel — silent self-heal. The swap is gated on
+     * provides the integration surface for A2-A4 perf work. A BF-fast
+     * build failure exits inside the build call; a kernel-create failure
+     * is fatal here (it used to keep the slow kernel silently). The swap
+     * is gated on
      * `kern == d->kern_template_phase0` so we never accidentally
      * displace a salted-op kernel or a non-MD5 algorithm's template.
      * Op==JOB_MD5UC reuses kern_template_phase0 (algo_mode=1) and is
@@ -16622,22 +12335,15 @@ validator_skip:
     if (bf_fast_eligible && op == JOB_MD5 &&
         kern == d->kern_template_phase0)
     {
-        if (gpu_opencl_template_md5_bf_compile(d, dev_idx) == 0 &&
-            gpu_opencl_template_md5_bf_kernel_lazy(d, dev_idx) == 0 &&
-            d->kern_template_phase0_md5_bf != NULL)
-        {
-            kern = d->kern_template_phase0_md5_bf;
-        }
-        /* else: fall through with the slow kernel — warning already
-         * emitted by the compile helper, dispatch correctness intact. */
+        if (gpu_opencl_template_md5_bf_compile(d, dev_idx) != 0 ||
+            gpu_opencl_template_md5_bf_kernel_lazy(d, dev_idx) != 0 ||
+            d->kern_template_phase0_md5_bf == NULL)
+            GPU_FATAL("BF-fast MD5 template kernel unavailable on device %d",
+                      dev_idx);
+        kern = d->kern_template_phase0_md5_bf;
     }
-    /* B6 salt-axis (2026-05-06): if this is a salted op but the salted
-     * kernel didn't resolve (compile/lazy failed — usually transient
-     * NVIDIA cold-JIT err=-9999 on tiny workloads), DO NOT fall back to
-     * the unsalted md5_rules_phase0 kernel — it would silently compute
-     * MD5(p) instead of the salted digest. Skip the GPU dispatch and
-     * return NULL; the host CPU path picks up the work via Typedone[]
-     * fallback. */
+    /* B6 salt-axis (2026-05-06): a salted pack must be served by one of the
+     * salted template kernels below. */
     if (is_salted_pack &&
         kern != d->kern_template_phase0_md5salt &&
         kern != d->kern_template_phase0_md5saltpass &&
@@ -16756,15 +12462,13 @@ validator_skip:
          * salted templates. Phase 6 of the slab-retirement ladder (final
          * major slab kernel). */
         kern != d->kern_template_phase0_bcrypt) {
-        static int _warned[MAX_GPU_DEVICES] = {0};
-        if (dev_idx >= 0 && dev_idx < MAX_GPU_DEVICES && !_warned[dev_idx]) {
-            _warned[dev_idx] = 1;
-            fprintf(stderr,
-                "OpenCL GPU[%d]: WARN salted kernel for op=%d unavailable; "
-                "skipping GPU dispatch (CPU will catch up via Typedone[]).\n",
-                dev_idx, op);
-        }
-        return NULL;
+        /* Build and kernel-create failures exit before this point, so a
+         * salted pack reaching an unsalted kernel is a wiring defect (an
+         * op mapped to the wrong arm, or a salted kernel missing from this
+         * list).  It used to warn once and return NULL -- "CPU will catch
+         * up via Typedone[]" -- which in fact recovered word 0 only. */
+        GPU_FATAL("salted op=%d resolved to an unsalted kernel on device %d",
+                  op, dev_idx);
     }
 
     /* B7.1/B7.2: ensure b_template_mask_charsets and b_template_mask_sizes
@@ -16775,18 +12479,11 @@ validator_skip:
      * read of the sentinel charsets, and mask_sizes sentinel of all-1s
      * makes any stray loop iteration's divmod terminate safely.
      *
-     * NOTE: The legacy md5_rules_phase0 kernel does NOT take these args.
-     * If we fall back to that kernel (kern == d->kern_md5_rules_phase0),
-     * we MUST NOT bind a 15th/16th arg. Detect by comparing kern pointer. */
-    /* md5_rules_mixed_phase0 is ALSO not a template: it has the same 14 shared
-     * arguments plus ONE of its own (the case tables) and takes neither mask
-     * arg.  The test was written as "anything that is not the legacy kernel",
-     * which silently made the UTF-32 kernel a template and bound two mask
-     * buffers past the end of its signature -- CL_INVALID_ARG_INDEX (-49) at
-     * the first dispatch.  Naming both exclusions explicitly is why this is a
-     * list and not a negation. */
-    int kern_is_template = (kern != d->kern_md5_rules_phase0) &&
-                           (kern != d->kern_md5_rules_mixed_phase0);
+     * Every kernel dispatched here is a template_phase0 instantiation, so
+     * the mask args are always bound.  (A kern_is_template flag used to
+     * exclude the legacy md5_rules_phase0 and md5_rules_mixed_phase0
+     * kernels, which take neither; neither can be dispatched since the
+     * resolver fallback was removed, 2026-11-15.) */
     /* B6 salt-axis (2026-05-06; §11 row 17): parallel flag for the salted
      * variants. Compares the resolved kernel handle against the per-device
      * salted-template kernel slots. SETARG block below binds 3 extra args
@@ -16934,7 +12631,7 @@ validator_skip:
          * sites 3+4 ALWAYS appear together for salted templates. Phase
          * 6 of the slab-retirement ladder (final major slab kernel). */
         (kern == d->kern_template_phase0_bcrypt);
-    if (kern_is_template && !d->b_template_mask_charsets) {
+    if (!d->b_template_mask_charsets) {
         /* B7.3+: sentinel widened to 16 rows (8 prepend + 8 append) ×
          * 256 bytes = 4096 bytes, matching the B7.5-capable layout. */
         uint8_t sentinel[16 * 256];
@@ -16948,7 +12645,7 @@ validator_skip:
                       "on dev %d", merr, dev_idx);
         }
     }
-    if (kern_is_template && !d->b_template_mask_sizes) {
+    if (!d->b_template_mask_sizes) {
         /* B7.3+: sentinel widened to 16 entries (8 prepend + 8 append). */
         uint32_t sentinel_sizes[16];
         for (int i = 0; i < 16; i++) sentinel_sizes[i] = 1u;
@@ -16973,16 +12670,8 @@ validator_skip:
          * behavioral change on the success path. See
          * mdx-team-state.md mdx-debug 2026-05-04 entry.
          *
-         * B7.1 (2026-05-05): kernel signature widened from 14 to 15 args
-         * for template_phase0 (mask_charsets at index 14). The legacy
-         * kernel md5_rules_phase0 keeps 14 args; the kern_is_template
-         * gate above selects which arg count to bind.
-         *
-         * B7.2 (2026-05-06): kernel signature widened from 15 to 16 args
-         * for template_phase0 (mask_sizes at index 15). The legacy
-         * md5_rules_phase0 kernel still takes only 14 args; both the 15th
-         * (mask_charsets) and 16th (mask_sizes) args are gated behind
-         * kern_is_template. */
+         * B7.1/B7.2 (2026-05-05/06): template_phase0 takes mask_charsets
+         * and mask_sizes at indices 14 and 15. */
 #define SETARG(K, IDX, SZ, P) do {                                              \
     cl_int _e = clSetKernelArg((K), (IDX), (SZ), (P));                          \
     if (_e != CL_SUCCESS)                                                       \
@@ -17004,17 +12693,8 @@ validator_skip:
         SETARG(kern, a++, sizeof(cl_mem), &d->b_overflow_offsets);
         SETARG(kern, a++, sizeof(cl_mem), &d->b_overflow_lengths);
         SETARG(kern, a++, sizeof(cl_mem), &d->b_hashes_shown);     /* on-GPU dedup */
-        /* UTF-32 path: the 15th argument is the concatenated case tables.
-         * Bound ONLY for the mixed kernel -- md5_rules_phase0 and the
-         * templates have 14 arguments and binding a 15th to them is
-         * CL_INVALID_ARG_INDEX. */
-        if (kern == d->kern_md5_rules_mixed_phase0) {
-            SETARG(kern, a++, sizeof(cl_mem), &d->b_u32_case_tab);
-        }
-        if (kern_is_template) {
-            SETARG(kern, a++, sizeof(cl_mem), &d->b_template_mask_charsets); /* B7.1 */
-            SETARG(kern, a++, sizeof(cl_mem), &d->b_template_mask_sizes);    /* B7.2 */
-        }
+        SETARG(kern, a++, sizeof(cl_mem), &d->b_template_mask_charsets); /* B7.1 */
+        SETARG(kern, a++, sizeof(cl_mem), &d->b_template_mask_sizes);    /* B7.2 */
         if (kern_is_salted_template) {
             /* B6 salt-axis (2026-05-06; §11 row 18): three appended args
              * for the salted template variants. The buffers are uploaded
@@ -17037,7 +12717,7 @@ validator_skip:
          * walker is absent is CL_INVALID_ARG_INDEX; NOT binding it when the
          * walker is present leaves case_tab unbound and every case verb on
          * the UTF-32 arm reads from nowhere. */
-        if (kern_is_template && gpu_u32_active()) {
+        if (gpu_u32_active()) {
             SETARG(kern, a++, sizeof(cl_mem), &d->b_u32_case_tab);
         }
 #undef SETARG
@@ -17154,10 +12834,9 @@ validator_skip:
         local = 8;  /* must match BCRYPT_WG_SIZE in gpu_common.cl */
     } else {
         /* Experiment 2026-09-28 (env MDXFIND_TPL_LOCAL): the template
-         * dispatch has always used a hardcoded work-group size of 64, while
-         * kern_register-ed kernels get an auto-tuned size through
-         * kern_get_local_size(). The md5salt kernel reports max_wg=256, so it
-         * has been running at a quarter of its permitted group size, untuned.
+         * dispatch has always used a hardcoded work-group size of 64. The
+         * md5salt kernel reports max_wg=256, so it has been running at a
+         * quarter of its permitted group size, untuned.
          * Clamped to the kernel's own maximum so an over-large value cannot
          * fail the enqueue. */
         const char *e = getenv("MDXFIND_TPL_LOCAL");
@@ -17304,7 +12983,8 @@ validator_skip:
      * are safe on cold-start and fire normally. */
     int dynsize_target = dynsize_is_enabled() && !dynsize_spp_pinned() &&
                          (op == JOB_MD5SALT || op == JOB_MD5UCSALT ||
-                          op == JOB_MD5revMD5SALT || op == JOB_MD5sub8_24SALT) &&
+                          op == JOB_MD5revMD5SALT || op == JOB_MD5sub8_24SALT ||
+                          op == JOB_MD5MD5SALT) &&
                          (kern == d->kern_template_phase0_md5salt);
     struct timespec t_dispatch_start = {0}, t_dispatch_end = {0};
     if (dynsize_target) {

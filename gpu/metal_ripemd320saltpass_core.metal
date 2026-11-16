@@ -217,84 +217,39 @@ static inline void template_finalize(thread template_state &st,
 
         int klen;
         int mlen;
-        /* Step 1: prepare 64-byte key_block. If key > 64 bytes, replace
-         * with RMD320(key) (40 bytes = 10 LE uint32 words). Else pad to
-         * 64 with zeros. */
-        if (algo_mode == 5u) {
-            /* KSALT: key = salt (global). Slab oracle line 230-252. */
-            klen = (int)slen;
-            mlen = len;
-            if (klen > 64) {
-                uint kstate[10] = {
-                    0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u,
-                    0x76543210u, 0xFEDCBA98u, 0x89ABCDEFu, 0x01234567u, 0x3C2D1E0Fu };
-                uint kM[16];
+        /* Step 1: KSALT (mode 5) keys with the salt and hashes the password;
+         * KPASS (mode 6) keys with the password and hashes the salt. A key
+         * longer than the 64-byte block is replaced by H(key) (RFC 2104).
+         * Both the key hash and the message (Step 2) stream any number of
+         * blocks, so no key or candidate length is capped on the device. */
+        klen = (algo_mode == 5u) ? (int)slen : len;
+        mlen = (algo_mode == 5u) ? len : (int)slen;
+        if (klen > 64) {
+            uint kstate[10] = {
+
+                0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u,
+
+                0x76543210u, 0xFEDCBA98u, 0x89ABCDEFu, 0x01234567u, 0x3C2D1E0Fu };
+
+            uint kM[16];
+            int nb = (klen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
                 for (int i = 0; i < 16; i++) kM[i] = 0u;
-                /* RMD320 = LITTLE-ENDIAN 32-bit (same byte ordering as
-                 * RMD160): byte i shift = (i & 3) * 8, into M[i >> 2]. */
-                for (int i = 0; i < 64; i++) {
-                    uint v = (uint)salt_buf[i];
-                    kM[i >> 2] |= v << ((i & 3) * 8);
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < klen) ? (uint)((algo_mode == 5u) ? salt_buf[i] : data[i])
+                                 : ((i == klen) ? (uint)0x80u : 0u);
+                    kM[j >> 2] |= v << ((j & 3) * 8);
                 }
+                if (b == nb - 1) { kM[14] = (uint)(klen) * 8u; kM[15] = 0u; }
                 rmd320_block(&kstate[0], kM);
-                for (int i = 0; i < 16; i++) kM[i] = 0u;
-                int rem = klen - 64;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        kM[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                kM[rem >> 2] |= ((uint)0x80u) << ((rem & 3) * 8);
-                kM[14] = (uint)((uint)klen * 8u);
-                kM[15] = 0u;
-                rmd320_block(&kstate[0], kM);
-                /* Store hashed key as LE uint words (10 words for 40 bytes
-                 * of RMD320 digest). RMD output is LE-native — no bswap. */
-                for (int i = 0; i < 10; i++) key_block[i] = kstate[i];
-                klen = 40;
-            } else {
-                /* Pack key bytes into key_block[0..15] uint LE words. */
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
             }
+            for (int i = 0; i < 10; i++) key_block[i] = kstate[i];
+            klen = 40;
         } else {
-            /* Mode 6 KPASS: key = data (private = post-rule password).
-             * Slab oracle line 331-353. */
-            klen = len;
-            mlen = (int)slen;
-            if (klen > 64) {
-                uint kstate[10] = {
-                    0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u,
-                    0x76543210u, 0xFEDCBA98u, 0x89ABCDEFu, 0x01234567u, 0x3C2D1E0Fu };
-                uint kM[16];
-                for (int i = 0; i < 16; i++) kM[i] = 0u;
-                for (int i = 0; i < 64; i++) {
-                    uint v = (uint)data[i];
-                    kM[i >> 2] |= v << ((i & 3) * 8);
-                }
-                rmd320_block(&kstate[0], kM);
-                for (int i = 0; i < 16; i++) kM[i] = 0u;
-                int rem = klen - 64;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        kM[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                kM[rem >> 2] |= ((uint)0x80u) << ((rem & 3) * 8);
-                kM[14] = (uint)((uint)klen * 8u);
-                kM[15] = 0u;
-                rmd320_block(&kstate[0], kM);
-                for (int i = 0; i < 10; i++) key_block[i] = kstate[i];
-                klen = 40;
-            } else {
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)data[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
+            for (int i = 0; i < klen; i++) {
+                uint v = (uint)((algo_mode == 5u) ? salt_buf[i] : data[i]);
+                key_block[i >> 2] |= v << ((i & 3) * 8);
             }
         }
 
@@ -312,83 +267,19 @@ static inline void template_finalize(thread template_state &st,
             0x76543210u, 0xFEDCBA98u, 0x89ABCDEFu, 0x01234567u, 0x3C2D1E0Fu };
         rmd320_block(&istate[0], M);
 
-        /* Continue with message bytes + 0x80 + length; total bits =
-         * (64 + mlen) * 8. RMD320 LE byte-pack at 32-bit width. Slab
-         * oracle line 263-279 / 363-379. */
-        if (algo_mode == 5u) {
-            /* msg = data (private). */
-            for (int i = 0; i < 16; i++) M[i] = 0u;
-            if (mlen <= 55) {
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)data[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
-                rmd320_block(&istate[0], M);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (mlen < 64) {
-                    M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                }
-                rmd320_block(&istate[0], M);
-                int rem = mlen - 64;
+        /* Continue with the message, any length: bytes, 0x80, and the
+         * bit length of (64 + mlen) in the last block. */
+        {
+            int nb = (mlen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
                 for (int i = 0; i < 16; i++) M[i] = 0u;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        M[i >> 2] |= v << ((i & 3) * 8);
-                    }
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < mlen) ? (uint)((algo_mode == 5u) ? data[i] : salt_buf[i])
+                                 : ((i == mlen) ? (uint)0x80u : 0u);
+                    M[j >> 2] |= v << ((j & 3) * 8);
                 }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    M[p >> 2] |= ((uint)0x80u) << ((p & 3) * 8);
-                }
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
-                rmd320_block(&istate[0], M);
-            }
-        } else {
-            /* Mode 6 KPASS: msg = salt_buf (global). */
-            for (int i = 0; i < 16; i++) M[i] = 0u;
-            if (mlen <= 55) {
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
-                rmd320_block(&istate[0], M);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (mlen < 64) {
-                    M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                }
-                rmd320_block(&istate[0], M);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) M[i] = 0u;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        M[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    M[p >> 2] |= ((uint)0x80u) << ((p & 3) * 8);
-                }
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
+                if (b == nb - 1) { M[14] = (uint)(64 + mlen) * 8u; M[15] = 0u; }
                 rmd320_block(&istate[0], M);
             }
         }
@@ -438,90 +329,39 @@ static inline void template_finalize(thread template_state &st,
 
         int klen;
         int mlen;
-        /* Step 1: prepare 64-byte key_block. If key > 64 bytes, replace
-         * with RMD160(key) (20 bytes). Else pad to 64 with zeros. */
-        if (algo_mode == 5u) {
-            /* KSALT: key = salt (global). Slab oracle line 52-69. */
-            klen = (int)slen;
-            mlen = len;
-            if (klen > 64) {
-                uint kstate[5] = {
-                    0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
-                    0x10325476u, 0xC3D2E1F0u };
-                uint kM[16];
+        /* Step 1: KSALT (mode 5) keys with the salt and hashes the password;
+         * KPASS (mode 6) keys with the password and hashes the salt. A key
+         * longer than the 64-byte block is replaced by H(key) (RFC 2104).
+         * Both the key hash and the message (Step 2) stream any number of
+         * blocks, so no key or candidate length is capped on the device. */
+        klen = (algo_mode == 5u) ? (int)slen : len;
+        mlen = (algo_mode == 5u) ? len : (int)slen;
+        if (klen > 64) {
+            uint kstate[5] = {
+
+                0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
+
+                0x10325476u, 0xC3D2E1F0u };
+
+            uint kM[16];
+            int nb = (klen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
                 for (int i = 0; i < 16; i++) kM[i] = 0u;
-                /* RMD160 = LITTLE-ENDIAN 32-bit: byte i shift =
-                 * (i & 3) * 8, into M[i >> 2]. Slab oracle line 58
-                 * uses uchar* mb cast over kM[]; equivalent to LE
-                 * byte-pack. */
-                for (int i = 0; i < 64; i++) {
-                    uint v = (uint)salt_buf[i];
-                    kM[i >> 2] |= v << ((i & 3) * 8);
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < klen) ? (uint)((algo_mode == 5u) ? salt_buf[i] : data[i])
+                                 : ((i == klen) ? (uint)0x80u : 0u);
+                    kM[j >> 2] |= v << ((j & 3) * 8);
                 }
+                if (b == nb - 1) { kM[14] = (uint)(klen) * 8u; kM[15] = 0u; }
                 rmd320_block(&kstate[0], kM);
-                for (int i = 0; i < 16; i++) kM[i] = 0u;
-                int rem = klen - 64;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        kM[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                /* 0x80 padding marker (LE byte position rem). */
-                kM[rem >> 2] |= ((uint)0x80u) << ((rem & 3) * 8);
-                /* LE 64-bit length: low 32 bits in M[14], high 32 bits
-                 * in M[15] (= 0 for klen < 2^29 bytes). */
-                kM[14] = (uint)((uint)klen * 8u);
-                kM[15] = 0u;
-                rmd320_block(&kstate[0], kM);
-                /* Store hashed key as LE uint words (slab oracle line 68:
-                 * `key_block[i] = kh[i]` direct, no bswap — RMD output is
-                 * LE-native). 5 words for 20 bytes of RMD160 digest. */
-                for (int i = 0; i < 5; i++) key_block[i] = kstate[i];
-                klen = 20;
-            } else {
-                /* Pack key bytes into key_block[0..15] uint LE words.
-                 * Slab oracle line 71-72. */
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
             }
+            for (int i = 0; i < 5; i++) key_block[i] = kstate[i];
+            klen = 20;
         } else {
-            /* Mode 6 KPASS: key = data (private = post-rule password).
-             * Slab oracle line 168-187. */
-            klen = len;
-            mlen = (int)slen;
-            if (klen > 64) {
-                uint kstate[5] = {
-                    0x67452301u, 0xEFCDAB89u, 0x98BADCFEu,
-                    0x10325476u, 0xC3D2E1F0u };
-                uint kM[16];
-                for (int i = 0; i < 16; i++) kM[i] = 0u;
-                for (int i = 0; i < 64; i++) {
-                    uint v = (uint)data[i];
-                    kM[i >> 2] |= v << ((i & 3) * 8);
-                }
-                rmd320_block(&kstate[0], kM);
-                for (int i = 0; i < 16; i++) kM[i] = 0u;
-                int rem = klen - 64;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        kM[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                kM[rem >> 2] |= ((uint)0x80u) << ((rem & 3) * 8);
-                kM[14] = (uint)((uint)klen * 8u);
-                kM[15] = 0u;
-                rmd320_block(&kstate[0], kM);
-                for (int i = 0; i < 5; i++) key_block[i] = kstate[i];
-                klen = 20;
-            } else {
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)data[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
+            for (int i = 0; i < klen; i++) {
+                uint v = (uint)((algo_mode == 5u) ? salt_buf[i] : data[i]);
+                key_block[i >> 2] |= v << ((i & 3) * 8);
             }
         }
 
@@ -540,89 +380,19 @@ static inline void template_finalize(thread template_state &st,
             0x10325476u, 0xC3D2E1F0u };
         rmd320_block(&istate[0], M);
 
-        /* Continue with message bytes + 0x80 + length; total bits =
-         * (64 + mlen) * 8. RMD160 LE byte-pack at 32-bit width. Slab
-         * oracle line 86-107 / 199-218. */
-        if (algo_mode == 5u) {
-            /* msg = data (private). Slab oracle line 86-107. */
-            for (int i = 0; i < 16; i++) M[i] = 0u;
-            if (mlen <= 55) {
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)data[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
-                rmd320_block(&istate[0], M);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (mlen < 64) {
-                    /* mlen in 56..63: 0x80 lands in this block at byte
-                     * mlen, but length doesn't fit (> 56 byte tail) —
-                     * second block carries length only. */
-                    M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                }
-                rmd320_block(&istate[0], M);
-                int rem = mlen - 64;
+        /* Continue with the message, any length: bytes, 0x80, and the
+         * bit length of (64 + mlen) in the last block. */
+        {
+            int nb = (mlen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
                 for (int i = 0; i < 16; i++) M[i] = 0u;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        M[i >> 2] |= v << ((i & 3) * 8);
-                    }
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < mlen) ? (uint)((algo_mode == 5u) ? data[i] : salt_buf[i])
+                                 : ((i == mlen) ? (uint)0x80u : 0u);
+                    M[j >> 2] |= v << ((j & 3) * 8);
                 }
-                if (mlen >= 64) {
-                    /* 0x80 at byte rem (or 0 if rem==0 which happens when
-                     * mlen==64 exactly). */
-                    int p = (rem > 0) ? rem : 0;
-                    M[p >> 2] |= ((uint)0x80u) << ((p & 3) * 8);
-                }
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
-                rmd320_block(&istate[0], M);
-            }
-        } else {
-            /* Mode 6 KPASS: msg = salt_buf (global). Slab oracle line
-             * 199-218. */
-            for (int i = 0; i < 16; i++) M[i] = 0u;
-            if (mlen <= 55) {
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
-                rmd320_block(&istate[0], M);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    M[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (mlen < 64) {
-                    M[mlen >> 2] |= ((uint)0x80u) << ((mlen & 3) * 8);
-                }
-                rmd320_block(&istate[0], M);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) M[i] = 0u;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        M[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    M[p >> 2] |= ((uint)0x80u) << ((p & 3) * 8);
-                }
-                M[14] = (uint)((uint)(64 + mlen) * 8u);
-                M[15] = 0u;
+                if (b == nb - 1) { M[14] = (uint)(64 + mlen) * 8u; M[15] = 0u; }
                 rmd320_block(&istate[0], M);
             }
         }

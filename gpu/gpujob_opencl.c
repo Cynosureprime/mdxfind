@@ -55,6 +55,9 @@
  * exceeds 16 bytes. Defined in mdxfind.c just above the validate harness
  * (was static prior to 5a.5; de-staticized for cross-TU access). Returns
  * digest length in bytes (16, 20, 28, 32, 48, or 64) or -1 on error. */
+extern int oracle_compute_md5pass_family_iter(int job_enum, const char *pass,
+                                              int plen, int iter,
+                                              unsigned char *out);
 extern int oracle_compute_md5pass_family(int job_enum, const char *pass,
                                          int plen, unsigned char *out);
 
@@ -302,6 +305,9 @@ static int phpbb3_iter_count(const char *salt, int saltlen) {
 extern uint8_t gpu_mask_desc[];
 extern uint8_t gpu_mask_sizes[];
 extern int gpu_mask_n_prepend, gpu_mask_n_append;
+/* gpu_opencl.c: 1 when the last family proto dispatch on that device applied
+ * the -n/-N mask in kernel B, so the replay must rebuild the candidate. */
+extern int gpu_opencl_proto_mask_on[];
 
 /* Reconstruct mask characters from mask_idx into buf.
  * pos_offset = starting position index (0 for prepend, n_prepend for append).
@@ -331,6 +337,13 @@ extern uint64_t gpu_mask_total;
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { \
       _retired = (_old == 1); break; } \
     _old = *(pv); } } _retired; })
+/* match_flags hold the op that last printed a hash: true iff THIS thread
+ * replaced a different op with its own, so two finders cannot both print.
+ * Same macro as mdxfind.c. */
+#define MF_TAKE(mf, op) ({ unsigned short _mo = *(volatile unsigned short *)(mf), \
+  _mn = (unsigned short)(op); int _mw = 0; while (_mo != _mn) { \
+    if (__sync_bool_compare_and_swap((mf), _mo, _mn)) { _mw = 1; break; } \
+    _mo = *(volatile unsigned short *)(mf); } _mw; })
 
 struct saltentry {
     char *salt;
@@ -1051,164 +1064,6 @@ void gpujob(void *arg) {
                 if (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS)
                     gpu_dispatch_hit_salt_n[my_slot] = 0;
 
-                /* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force)
-                 * dispatch arm. Routes BF chunks (g->bf_chunk == 1) to
-                 * cand_bruteforce_phase0 when MDXFIND_KERNEL_A_VARIANT=4.
-                 * Placed BEFORE A3 / A2 / A1 arms per spec R12 ordering.
-                 * A4 gate (g->bf_chunk) is structurally mutually exclusive
-                 * with A2/A3 gates (!g->bf_chunk). v1 ship is harness-mode:
-                 * dispatcher returns NULL with nhits=0; trace dump via
-                 * MDXFIND_KERNEL_A_TRACE. NOTE: A4 fires for ANY GPU_CAT_MASK
-                 * op carrying a BF chunk, not just JOB_MD5MD5SALT (per spec
-                 * §6 "A4 gate is g->bf_chunk, NOT g->op == JOB_MD5MD5SALT"). */
-                if (!_proto_fired
-                    && g->bf_chunk
-                    && gpu_opencl_kernel_a_active_variant() == 4) {
-                    gpu_dispatch_trace_init();
-                    uint64_t _a4_t0 = gpu_now_us();
-                    int _a4_nhits = 0;
-                    uint32_t *_a4_res = gpu_opencl_kernel_a_bruteforce_dispatch(
-                        my_slot, g, &_a4_nhits);
-                    uint64_t _a4_t1 = gpu_now_us();
-                    /* A4 v1 returns NULL even on success; precondition match
-                     * + the stderr "kernel A4 dispatch fired" marker are the
-                     * signals. _proto_fired short-circuits the A3/A2/A1/legacy
-                     * paths below for this slot. */
-                    _proto_fired = 1;
-                    nhits = _a4_nhits;   /* 0 in v1 */
-                    hits  = _a4_res;     /* NULL in v1 */
-                    if (my_slot < MAX_GPU_SLOTS) {
-                        _gpu_batches[my_slot]++;
-                        _gpu_words[my_slot] += g->packed_count;
-                    }
-                    if (gpu_dispatch_trace_enabled == 1) {
-                        possess(gpu_dispatch_trace_lock);
-                        fprintf(gpu_dispatch_trace_fp,
-                            "[disp] dev=%d op=%s(%d) path=kernelA4_bruteforce "
-                            "t_us=%llu bf_mask_start=%llu bf_num_masks=%u "
-                            "bf_offset_per_word=%u num_words=%u hits=%d wall_us=%llu\n",
-                            my_slot, gpu_op_name(g->op), g->op,
-                            (unsigned long long)gpu_dispatch_trace_relative(_a4_t0),
-                            (unsigned long long)g->bf_mask_start,
-                            g->bf_num_masks, g->bf_offset_per_word,
-                            g->packed_count,
-                            _a4_nhits,
-                            (unsigned long long)(_a4_t1 - _a4_t0));
-                        fflush(gpu_dispatch_trace_fp);
-                        release(gpu_dispatch_trace_lock);
-                    }
-                }
-
-                /* Phase 1a sub-phase 1a.3 (2026-05-21): A3 (rules + masks)
-                 * dispatch arm. Routes JOB_MD5MD5SALT to cand_rules_masks_-
-                 * phase0 when MDXFIND_KERNEL_A_VARIANT=3 AND BOTH rules
-                 * and masks are active. Placed BEFORE the A2 + A1 arms per
-                 * spec R5. v1 ship is harness-mode: dispatcher returns
-                 * NULL with nhits=0; trace dump via MDXFIND_KERNEL_A_TRACE. */
-                if (!_proto_fired
-                    && g->op == JOB_MD5MD5SALT && !g->bf_chunk
-                    && gpu_opencl_kernel_a_active_variant() == 3
-                    && gpu_rule_count > 0 && MaskTotal > 0) {
-                    gpu_dispatch_trace_init();
-                    uint64_t _a3_t0 = gpu_now_us();
-                    int _a3_nhits = 0;
-                    uint32_t *_a3_res = gpu_opencl_kernel_a_rules_masks_dispatch(
-                        my_slot,
-                        g->packed_buf, g->packed_pos,
-                        g->word_offset, g->packed_count,
-                        g->op, &_a3_nhits);
-                    uint64_t _a3_t1 = gpu_now_us();
-                    /* A3 v1 returns NULL even on success; precondition match
-                     * + the stderr "kernel A3 dispatch fired" marker are the
-                     * signals. _proto_fired short-circuits the A2/A1/legacy
-                     * paths below for this slot. */
-                    _proto_fired = 1;
-                    nhits = _a3_nhits;   /* 0 in v1 */
-                    hits  = _a3_res;     /* NULL in v1 */
-                    if (my_slot < MAX_GPU_SLOTS) {
-                        _gpu_batches[my_slot]++;
-                        _gpu_words[my_slot] += g->packed_count;
-                    }
-                    if (gpu_dispatch_trace_enabled == 1) {
-                        possess(gpu_dispatch_trace_lock);
-                        fprintf(gpu_dispatch_trace_fp,
-                            "[disp] dev=%d op=%s(%d) path=kernelA3_rules_masks "
-                            "t_us=%llu packed_count=%u packed_pos=%u "
-                            "rule_count=%d mask_total=%llu hits=%d wall_us=%llu\n",
-                            my_slot, gpu_op_name(g->op), g->op,
-                            (unsigned long long)gpu_dispatch_trace_relative(_a3_t0),
-                            g->packed_count, g->packed_pos,
-                            gpu_rule_count,
-                            (unsigned long long)MaskTotal,
-                            _a3_nhits,
-                            (unsigned long long)(_a3_t1 - _a3_t0));
-                        fflush(gpu_dispatch_trace_fp);
-                        release(gpu_dispatch_trace_lock);
-                    }
-                }
-
-                /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only)
-                 * dispatch arm. Routes JOB_MD5MD5SALT to cand_masks_phase0
-                 * when MDXFIND_KERNEL_A_VARIANT=2 AND masks are active.
-                 * v1 ship is harness-mode: dispatcher returns NULL with
-                 * nhits=0; trace dump via MDXFIND_KERNEL_A_TRACE. After
-                 * fire, we set _proto_fired=1 so the legacy rules-engine
-                 * dispatch below is skipped for this slot (the A2 v1
-                 * scope is "kernel fires + buffer-quadruple populated"
-                 * not real cracks; Phase 6-7 will wire validation).
-                 *
-                 * Defensive: if variant=2 is selected but no mask is
-                 * active, gpu_opencl_kernel_a_masks_dispatch returns
-                 * NULL with a one-time stderr warning and we fall
-                 * through to the existing wiring (no surprises). */
-                if (!_proto_fired
-                    && g->op == JOB_MD5MD5SALT && !g->bf_chunk
-                    && gpu_opencl_kernel_a_active_variant() == 2) {
-                    gpu_dispatch_trace_init();
-                    uint64_t _a2_t0 = gpu_now_us();
-                    int _a2_nhits = 0;
-                    uint32_t *_a2_res = gpu_opencl_kernel_a_masks_dispatch(
-                        my_slot,
-                        g->packed_buf, g->packed_pos,
-                        g->word_offset, g->packed_count,
-                        g->op, &_a2_nhits);
-                    uint64_t _a2_t1 = gpu_now_us();
-                    /* A2 v1 returns NULL even on success; the stderr
-                     * "kernel A2 dispatch fired" marker is the signal.
-                     * Treat _a2_res being explicitly NULL as "did the
-                     * dispatcher accept the job?"; we tracked that via
-                     * a single flag in the dispatcher (the env-gate
-                     * miss path also returns NULL but emits no marker).
-                     * Conservatively: when active_variant==2 AND the
-                     * preconditions matched (op+!bf_chunk+masks_active)
-                     * we treat the dispatch as having fired and mark
-                     * _proto_fired so the legacy path skips this slot. */
-                    if (MaskTotal > 0) {
-                        _proto_fired = 1;
-                        nhits = _a2_nhits;  /* 0 in v1 */
-                        hits  = _a2_res;    /* NULL in v1 */
-                        if (my_slot < MAX_GPU_SLOTS) {
-                            _gpu_batches[my_slot]++;
-                            _gpu_words[my_slot] += g->packed_count;
-                        }
-                        if (gpu_dispatch_trace_enabled == 1) {
-                            possess(gpu_dispatch_trace_lock);
-                            fprintf(gpu_dispatch_trace_fp,
-                                "[disp] dev=%d op=%s(%d) path=kernelA2_masks "
-                                "t_us=%llu packed_count=%u packed_pos=%u "
-                                "mask_total=%llu hits=%d wall_us=%llu\n",
-                                my_slot, gpu_op_name(g->op), g->op,
-                                (unsigned long long)gpu_dispatch_trace_relative(_a2_t0),
-                                g->packed_count, g->packed_pos,
-                                (unsigned long long)MaskTotal,
-                                _a2_nhits,
-                                (unsigned long long)(_a2_t1 - _a2_t0));
-                            fflush(gpu_dispatch_trace_fp);
-                            release(gpu_dispatch_trace_lock);
-                        }
-                    }
-                }
-
                 /* Auto-dispatcher route gate (2026-05-31, replaces
                  * env-flag opt-in shipped 2026-05-29). The user-visible
                  * MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5=1 opt-in is
@@ -1281,8 +1136,8 @@ void gpujob(void *arg) {
                      * before. */
                 }
                 if (!_proto_fired
-                    && (g->op == JOB_MD5MD5SALT
-                        || gpu_codegen_kernelb_family_md5pass_eligible(g->op)
+                    /* e347 left this route 2026-11-13: md5salt template, algo_mode 7. */
+                    && (gpu_codegen_kernelb_family_md5pass_eligible(g->op)
                         || _exp_md5_route)
                     && !g->bf_chunk) {
                     /* Phase 4 sub-phase 4a.1 (2026-05-21): codegen kernel
@@ -1365,10 +1220,35 @@ void gpujob(void *arg) {
                         my_slot,
                         g->packed_buf, g->packed_pos,
                         g->word_offset, g->packed_count,
-                        g->op, &nhits);
+                        g->op, g->bf_mask_start, g->bf_num_masks, &nhits);
                     uint64_t _proto_t1 = gpu_now_us();
+                    if (hits == NULL && _is_family && g->packed_count > 0) {
+                        /* The template path below cannot serve this op: falling
+                         * through would drop the batch silently (Metal twin,
+                         * checklist 50). */
+                        char _hn[256];
+                        if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                        _hn[sizeof(_hn) - 1] = 0;
+                        fprintf(stderr,
+                            "FATAL: %s:%d OpenCL: kernel B proto returned NULL "
+                            "for op=%d (%u words withheld from the CPU walk) "
+                            "host=%s operation=gpu_opencl_kernelb_dispatch_proto "
+                            "rules=%d. Re-run this type with -G none.\n",
+                            __FILE__, __LINE__, g->op, (unsigned)g->packed_count,
+                            _hn[0] ? _hn : "(unknown)", gpu_rule_count);
+                        exit(1);
+                    }
                     if (hits != NULL) {
                         _proto_fired = 1;
+                        /* The rule outputs this batch covered: the CPU skips
+                         * these rules (C2.3), so without this the "rule-generated
+                         * passwords tested" line lost them -- and disappeared
+                         * when the run was all GPU.  Same expression as the
+                         * template path below and as the Metal twin, which
+                         * counts every dispatch (2026-11-14). */
+                        atomic_fetch_add(&Totrules_gpu,
+                            (unsigned long long)g->packed_count *
+                            (unsigned long long)(gpu_rule_count > 1 ? gpu_rule_count - 1 : 0));
                         /* Telemetry: count words + hits for the per-device stats. */
                         if (my_slot < MAX_GPU_SLOTS) {
                             _gpu_batches[my_slot]++;
@@ -1571,11 +1451,21 @@ void gpujob(void *arg) {
                  * candidates.  Those two agree exactly when mask_size is 1,
                  * which is every run without a mask or a dot axis -- which is
                  * why it stood until -a put 2^N on that axis and the counter
-                 * under-reported by that whole factor. */
+                 * under-reported by that whole factor.
+                 *
+                 * 2026-11-13: the mask factor is OUT again.  This counter is
+                 * "rule-generated passwords tested", and the CPU walker counts
+                 * one per (word, rule) output -- rulecnt++ once per rule, never
+                 * per mask index or dotting -- so -G none prints the same
+                 * number with and without -n/-N/-a.  With the factor in, an
+                 * `-n ?d` run printed 1,514,362 here against 166,279 on Metal
+                 * and 145,072 under -G none for the same fixture.  Mask and dot
+                 * candidates are HASHES, and Tothash (below) still carries
+                 * them, so the h/s the -a fix was about is unchanged.  This is
+                 * now the Metal twin's expression exactly. */
                 atomic_fetch_add(&Totrules_gpu,
                     (unsigned long long)g->packed_count *
-                    ((unsigned long long)gpu_rule_count
-                       * (unsigned long long)b71_mask_size_acct - 1ULL));
+                    (unsigned long long)(gpu_rule_count > 1 ? gpu_rule_count - 1 : 0));
 
                 } /* !_proto_fired */
 
@@ -1720,7 +1610,23 @@ void gpujob(void *arg) {
                             const char *_ptext =
                                 gpu_opencl_kernelb_proto_plaintext(my_slot,
                                                                    _slot_idx, &_plen);
-                            if (!_ptext || _plen <= 0) continue;
+                            /* _plen == 0 is the empty candidate (rule `]` on a 1-char word):
+                             * a real password, so it is replayed like any other. */
+                            /* A hit whose plaintext cannot be recovered was
+                             * skipped with nothing printed; fatal now
+                             * (checklist 25, 2026-11-13). */
+                            if (!_ptext || _plen < 0 || _plen > MAXLINE) {
+                                char _hn[256];
+                                if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                                _hn[sizeof(_hn) - 1] = 0;
+                                fprintf(stderr,
+                                    "FATAL: %s:%d OpenCL proto hit replay: no "
+                                    "plaintext for kernel-A slot %u (plen=%d, "
+                                    "op=%d) on %s\n",
+                                    __FILE__, __LINE__, _slot_idx, _plen, g->op,
+                                    _hn);
+                                exit(1);
+                            }
                             memcpy(synthetic_job.line, _ptext, (size_t)_plen);
                             synthetic_job.line[_plen] = 0;
                             synthetic_job.clen = _plen;
@@ -1730,32 +1636,71 @@ void gpujob(void *arg) {
                             curin.i[0] = _pe[3]; curin.i[1] = _pe[4];
                             curin.i[2] = _pe[5]; curin.i[3] = _pe[6];
                             if (_is_family) {
-                                /* Unsalted family: route to checkhash (no salt).
-                                 * The family kernel emits only 4 uint32 hash
-                                 * words to the hit record (entry[3..6]),
-                                 * matching the compact_fp probe width. For
-                                 * digest widths > 16 bytes (sha1/rmd160/sha224
-                                 * /sha256/sha384/sha512 outers) the FULL
-                                 * digest is required by checkhash's
-                                 * hybrid_check (memcmp against HashDataBuf
-                                 * for hlen bytes). Recompute the full digest
-                                 * from the matched plaintext via the CPU
-                                 * oracle (oracle_compute_md5pass_family in
-                                 * mdxfind.c). False positives from the
-                                 * 16-byte probe are filtered by the full-
-                                 * width memcmp inside hybrid_check; the
-                                 * recompute is cheap (a single hit per
-                                 * matched word). */
-                                if (_proto_hexlen > 32) {
-                                    unsigned char _fulldigest[64];
-                                    int _fdlen = oracle_compute_md5pass_family(
-                                        g->op, _ptext, _plen, _fulldigest);
-                                    if (_fdlen > 0 && _fdlen <= 64) {
-                                        memcpy(curin.h, _fulldigest, (size_t)_fdlen);
+                                /* MAKE_MD5PASS family (checklist 48, the Metal
+                                 * design of items 24/43/44): the kernel put the
+                                 * mask index in [1] (low) and [7] (high) and the
+                                 * round in [2].  Rebuild the candidate the way the
+                                 * kernel built it, then recompute the digest of
+                                 * THAT round on the CPU and require the kernel's
+                                 * first 16 bytes to match -- a mismatch means
+                                 * device and host disagree about the candidate or
+                                 * the hash, and printing either would be a wrong
+                                 * line. */
+                                int _clen = _plen;
+                                int _round = (int)_pe[2];
+                                if (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
+                                    && gpu_opencl_proto_mask_on[my_slot]) {
+                                    int npre = gpu_mask_n_prepend;
+                                    int napp = gpu_mask_n_append;
+                                    if (npre > 32) npre = 32;
+                                    if (napp > 32) napp = 32;
+                                    uint64_t _mi = (uint64_t)_pe[1]
+                                                 | ((uint64_t)_pe[7] << 32);
+                                    uint64_t append_combos = 1u;
+                                    for (int j = 0; j < napp; j++)
+                                        append_combos *= (uint64_t)
+                                            gpu_mask_wire_size(gpu_mask_sizes[npre + j]);
+                                    char pc[32], ac[32];
+                                    mask_decode(_mi / append_combos, 0, npre, pc);
+                                    mask_decode(_mi % append_combos, npre, napp, ac);
+                                    if (_plen + npre + napp > MAXLINE) {
+                                        fprintf(stderr,
+                                            "FATAL: %s:%d OpenCL proto hit replay: "
+                                            "masked candidate %d bytes exceeds "
+                                            "MAXLINE (op=%d)\n",
+                                            __FILE__, __LINE__, _plen + npre + napp,
+                                            g->op);
+                                        exit(1);
                                     }
+                                    memmove(synthetic_job.line + npre,
+                                            synthetic_job.line, (size_t)_plen);
+                                    memcpy(synthetic_job.line, pc, (size_t)npre);
+                                    memcpy(synthetic_job.line + npre + _plen, ac,
+                                           (size_t)napp);
+                                    _clen = _plen + npre + napp;
+                                    synthetic_job.line[_clen] = 0;
+                                    synthetic_job.clen = _clen;
                                 }
-                                checkhash(&curin, _proto_hexlen,
-                                          (int)_pe[2],  /* iter_num */
+                                unsigned char _fulldigest[64];
+                                int _fdlen = oracle_compute_md5pass_family_iter(
+                                    g->op, synthetic_job.line, _clen,
+                                    _round < 1 ? 1 : _round, _fulldigest);
+                                if (_round < 1 || _fdlen < 16 || _fdlen > 64
+                                    || memcmp(_fulldigest, &_pe[3], 16) != 0) {
+                                    char _hn[256];
+                                    if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                                    _hn[sizeof(_hn) - 1] = 0;
+                                    fprintf(stderr,
+                                        "FATAL: %s:%d OpenCL proto hit replay: "
+                                        "op=%d round %d candidate of %d bytes: "
+                                        "the CPU digest (%d bytes) does not match "
+                                        "the kernel's %08x%08x%08x%08x on %s\n",
+                                        __FILE__, __LINE__, g->op, _round, _clen,
+                                        _fdlen, _pe[3], _pe[4], _pe[5], _pe[6], _hn);
+                                    exit(1);
+                                }
+                                memcpy(curin.h, _fulldigest, (size_t)_fdlen);
+                                checkhash(&curin, _proto_hexlen, _round,
                                           &synthetic_job);
                             } else if (_exp_md5_unsalted) {
                                 /* Experiment (2026-05-29): unsalted JOB_MD5.
@@ -1874,24 +1819,39 @@ void gpujob(void *arg) {
                                  * the GPU hash + recovered plaintext + salt.
                                  * checkhashsalt compares against the loaded hash
                                  * table and outputs found passwords. */
-                                if (_proto_salt_bytes) {
-                                    checkhashsalt(&curin, _proto_hexlen,
-                                                  _proto_salt_bytes, _proto_salt_len,
-                                                  (int)_pe[2],   /* iter_num */
-                                                  &synthetic_job);
+                                /* An unresolvable salt was a silent drop;
+                                 * fatal now (checklist 45, 2026-11-13). */
+                                if (!_proto_salt_bytes) {
+                                    char _hn[256];
+                                    if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                                    _hn[sizeof(_hn) - 1] = 0;
+                                    fprintf(stderr,
+                                        "FATAL: %s:%d OpenCL proto hit replay: "
+                                        "salt index %u does not resolve "
+                                        "(nsalts_packed=%d, op=%d) on %s\n",
+                                        __FILE__, __LINE__, _salt_idx,
+                                        nsalts_packed, g->op, _hn);
+                                    exit(1);
                                 }
+                                checkhashsalt(&curin, _proto_hexlen,
+                                              _proto_salt_bytes, _proto_salt_len,
+                                              (int)_pe[2],   /* iter_num */
+                                              &synthetic_job);
                             }
                         }
-                        /* Flush proto hit output buffer before returning.
-                         * The standard path flushes at line ~2582; the proto
-                         * goto _proto_hits_done skips that site. Flush here
-                         * so Phase 5 hits are not silently dropped. */
+                        /* Flush proto hit output buffer before skipping the
+                         * standard replay (its flush site is bypassed). */
                         if (synthetic_job.outlen > 0) {
                             fwrite(outbuf, synthetic_job.outlen, 1, stdout);
                             fflush(stdout);
                             synthetic_job.outlen = 0;
                         }
-                        goto _proto_hits_done;
+                        /* Skip the standard replay but NOT the hash accounting:
+                         * the old `goto _proto_hits_done` jumped past it, so a
+                         * proto batch with hits added nothing to Tothash or to
+                         * this device's hash count (checklist 58, the OpenCL
+                         * twin of the Metal fix in item 19). */
+                        goto _rules_hash_acct;
                     }
                     /* Standard rules-engine hit processing follows. */
                     /* Precompute a table of rule-bytecode pointers the first time
@@ -2065,6 +2025,7 @@ void gpujob(void *arg) {
                          g->op == JOB_MD5UCSALT ||
                          g->op == JOB_MD5revMD5SALT ||
                          g->op == JOB_MD5sub8_24SALT ||
+                         g->op == JOB_MD5MD5SALT ||   /* e347, algo_mode 7 */
                          /* B6.8 (2026-05-06): JOB_MD5_MD5SALTMD5PASS
                           * (e367) — fifth MD5SALT-family variant on
                           * the unified template path. Hit-replay 32-byte
@@ -2374,6 +2335,19 @@ void gpujob(void *arg) {
                          * the divmod result fits uint32. Cast for clarity. */
                         uint32_t mask_idx        = (uint32_t)((uint64_t)tmp % b71_mask_size);
                         uint32_t ridx            = (uint32_t)((uint64_t)tmp / b71_mask_size);
+                        /* -a: split the dot digit off exactly as the kernel
+                         * does -- axis = dot * C + position, C published by the
+                         * dispatch (gpujob.h gpu_dispatch_dot_base, checklist
+                         * 74).  0 = no dot radix: dot_idx 0, mask_idx as is. */
+                        uint32_t dot_idx = 0u;
+                        {
+                            uint64_t _db = (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS)
+                                ? gpu_dispatch_dot_base[my_slot] : 0u;
+                            if (_db > 0u) {
+                                dot_idx  = (uint32_t)((uint64_t)mask_idx / _db);
+                                mask_idx = (uint32_t)((uint64_t)mask_idx % _db);
+                            }
+                        }
                         /* BF Phase 1.8 (2026-05-10): for BF chunks with
                          * inner_iter > 1 the kernel encoded iter_idx in
                          * the rule slot (combined_ridx =
@@ -2618,32 +2592,20 @@ void gpujob(void *arg) {
                         /* -a dot axis: reproduce the DEVICE's dot insertion,
                          * between the rule and the mask, exactly as the kernel
                          * orders it.  The dot bitmask is the OUTERMOST digit of
-                         * mask_idx, so dividing out the prepend/append position
-                         * product recovers it -- the same arithmetic the kernel
-                         * does, from the same two inputs, so there is no second
-                         * opinion about which dotting ran.
+                         * mask_idx, split off above (dot_idx) by the same
+                         * divide the kernel does, against the same published
+                         * C, so there is no second opinion about which dotting
+                         * ran.
                          *
                          * Getting this wrong does not lose a hit: it emits a
                          * CORRECT digest with a plaintext that does not hash to
                          * it, which is the failure this whole plan is about.
                          *
-                         * Self-gating: with no dot radix multiplied in, mask_idx
-                         * is below the position product, _dot is 0 and nothing
-                         * is inserted. */
+                         * Self-gating: with no dot radix multiplied in, C is
+                         * published as 0, dot_idx is 0 and nothing is
+                         * inserted. */
                         if (Email && out_len > 0) {
-                            unsigned long long _mc = 1ULL;
-                            int _np = gpu_mask_n_prepend, _na = gpu_mask_n_append;
-                            int _k;
-                            if (_np > 32) _np = 32;
-                            if (_na > 32) _na = 32;
-                            for (_k = 0; _k < _np + _na; _k++) {
-                                unsigned _ps = gpu_mask_wire_size(gpu_mask_sizes[_k]);
-                                if (_ps == 0u) _ps = 1u;
-                                _mc *= (unsigned long long)_ps;
-                            }
-                            unsigned long long _dot =
-                                (_mc > 1ULL) ? ((unsigned long long)mask_idx / _mc)
-                                             : (unsigned long long)mask_idx;
+                            unsigned long long _dot = (unsigned long long)dot_idx;
                             if (_dot != 0ULL) {
                                 int _dw = out_len;
                                 int _nd = 0, i, j;
@@ -2866,7 +2828,10 @@ void gpujob(void *arg) {
                             if ((g->op == JOB_MD5SALT ||
                                  g->op == JOB_MD5UCSALT ||
                                  g->op == JOB_MD5revMD5SALT ||
-                                 g->op == JOB_MD5sub8_24SALT) && iter_num == 1) {
+                                 g->op == JOB_MD5sub8_24SALT ||
+                                 /* e347 too: its CPU arm falls into the same
+                                  * MD5SALTstart block (bare round-1 label). */
+                                 g->op == JOB_MD5MD5SALT) && iter_num == 1) {
                                 /* iter==1 CPU path uses checkhashkey
                                  * (no iter suffix in label).
                                  *
@@ -3181,7 +3146,7 @@ void gpujob(void *arg) {
                                     int match_len; unsigned short *match_flags;
                                     int hf = hybrid_check(curin.h, 16,
                                                           &match_len, &match_flags);
-                                    if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
+                                    if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
                                         *match_flags = g->op;
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
@@ -3220,7 +3185,7 @@ void gpujob(void *arg) {
                                     int match_len; unsigned short *match_flags;
                                     int hf = hybrid_check(curin.h, 32,
                                                           &match_len, &match_flags);
-                                    if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
+                                    if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
                                         *match_flags = g->op;
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
@@ -3317,7 +3282,7 @@ void gpujob(void *arg) {
                                     int match_len; unsigned short *match_flags;
                                     int hf = hybrid_check(curin.h, 64,
                                                           &match_len, &match_flags);
-                                    if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
+                                    if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
                                         *match_flags = g->op;
                                         if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                         char *sp = salt_snap_entry->salt;
@@ -3381,11 +3346,11 @@ void gpujob(void *arg) {
                              * applyrule replay arm + optional mask
                              * prepend/append); we re-clamp the LENGTH for
                              * display while preserving the underlying
-                             * buffer (the kernel only saw the first 8
-                             * bytes anyway via the host-side rules-engine
-                             * pack-site clamp at mdxfind.c:11021-11026 +
-                             * the kernel-side `if (plen > 8) plen = 8;`
-                             * defensive cap in template_finalize). Phase
+                             * buffer (the kernel hashed only the first 8
+                             * bytes of the post-rule candidate: its own
+                             * `if (plen > 8) plen = 8;` in template_-
+                             * finalize; the pack site no longer cuts the
+                             * word before the rule). Phase
                              * 5 of the Unix-crypt ladder (FINAL phase). */
                             } else if (g->op == JOB_DESCRYPT) {
                                 hit = 0;
@@ -3557,6 +3522,7 @@ void gpujob(void *arg) {
                     synthetic_job.outlen = 0;
                 }
 
+_rules_hash_acct: ;  /* the proto replay joins here */
                 /* BF chunk-as-job (2026-05-10): for BF chunks the kernel iterates
                  * bf_num_masks per word, NOT the full gpu_mask_total. Using
                  * b71_mask_size_acct (= gpu_mask_total) over-counts Tothash by
@@ -3589,12 +3555,19 @@ void gpujob(void *arg) {
                  * -- dispatch, NDRange, Totrules_gpu, Tothash -- which is the
                  * argument for the published value being the only one anybody
                  * derives from. */
+                /* The published size FIRST (checklist 75): it already is
+                 * bf_num_masks for a chunked job, and it alone carries the -a
+                 * dot radix.  Taking bf_num_masks first -- which every -n/-N
+                 * job sets since checklist 70 -- dropped the dot factor, so an
+                 * -a -n run counted 2,000,000 where -G none counts 64,000,000.
+                 * bf_num_masks stays the fallback for a dispatch that
+                 * published nothing. */
                 uint64_t _mask_size_for_acct =
-                    (g->bf_num_masks > 0u)
-                    ? (uint64_t)g->bf_num_masks * (uint64_t)_ii_acct
-                    : ((my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
-                        && gpu_dispatch_mask_size[my_slot] > 0)
-                       ? gpu_dispatch_mask_size[my_slot]
+                    (my_slot >= 0 && my_slot < GPUJOB_MAX_DEVS
+                     && gpu_dispatch_mask_size[my_slot] > 0)
+                    ? gpu_dispatch_mask_size[my_slot] * (uint64_t)_ii_acct
+                    : ((g->bf_num_masks > 0u)
+                       ? (uint64_t)g->bf_num_masks * (uint64_t)_ii_acct
                        : (uint64_t)b71_mask_size_acct);
                 /* Internal-iter accounting (2026-05-19): for iterated GPU
                  * types (BCRYPT/PHPBB3/DESCRYPT/MD5CRYPT/SHACRYPT/SHA1DRU)
@@ -3633,11 +3606,6 @@ void gpujob(void *arg) {
                  * per_job_time words (acceptable for ETA — small vs total).
                  * Re-evaluate if running with very high rules/masks counts
                  * where the GPU queue depth dominates wallclock. */
-                goto return_jobg;
-                /* Phase 4 proto jump target: skip standard post-hits
-                 * accounting when _proto_fired (proto hits already counted
-                 * in the _proto_fired block above). */
-                _proto_hits_done: ;
                 goto return_jobg;
             } /* end rules_engine */
 
@@ -3792,7 +3760,13 @@ static void opencl_rules_engine_preflight(void)
 
     J1F(RC, Dohash, op);
     while (RC) {
-        if (!gpu_opencl_op_supported((int)op)) {
+        /* The MAKE_MD5PASS family is served by the kernel-A1 + codegen
+         * kernel-B route (gpu_opencl_kernelb_dispatch_proto), not by the
+         * template allowlist, so it is admitted here by its own predicate.
+         * Until 2026-11-14 it was not, which turned the rules engine off for
+         * every family run: "GPU" family cells were CPU-run (checklist 48). */
+        if (!gpu_opencl_op_supported((int)op)
+            && !gpu_codegen_kernelb_family_md5pass_eligible((int)op)) {
             if (nblock == 0)
                 fprintf(stderr, "OpenCL GPU admission: the OpenCL rules engine "
                                 "is DISABLED for this run.\n");
@@ -4722,6 +4696,7 @@ int gpu_op_category(int op) {
     case JOB_MD5UCSALT:
     case JOB_MD5revMD5SALT:
     case JOB_MD5sub8_24SALT:
+    case JOB_MD5MD5SALT:      /* e347: algo_mode 7 (2026-11-13) */
     /* B6.8 (2026-05-06): JOB_MD5_MD5SALTMD5PASS (e367) — fifth
      * MD5SALT-family variant on the unified template path. Shares
      * the MD5SALT GPU kernel via params.algo_mode=4 (no new
@@ -5005,7 +4980,7 @@ int is_gpu_op(int op) {
 int gpu_op_family(int op) {
     switch (op) {
     case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:
-    case JOB_MD5sub8_24SALT:
+    case JOB_MD5sub8_24SALT: case JOB_MD5MD5SALT:
     case JOB_HMAC_MD5: case JOB_HMAC_MD5_KPASS:
         return FAM_MD5SALT;
     case JOB_MD5SALTPASS: case JOB_MD5PASSSALT:

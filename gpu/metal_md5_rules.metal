@@ -168,8 +168,6 @@
 #define RULE_OP_REJ_NHAS    0xc8
 #define RULE_OP_REJ_FIRST   0xc7
 #define RULE_OP_REJ_LAST    0xc6
-#define RULE_OP_S_SPECIAL   0xc5
-#define RULE_OP_HASH_EXIT   0xc4
 #define RULE_OP_HEX_UPPER   0xc3
 #define RULE_OP_HEX_LOWER   0xc2
 #define RULE_OP_DIV_INSERT  0xc1
@@ -966,9 +964,25 @@ static int apply_rule(device const uchar *prog, device uchar *buf, int len)
                 break;
 
             /* ---- Special ops (silent no-ops) ---- */
-            case RULE_OP_S_SPECIAL:  k += 1; break;
-            case RULE_OP_HASH_EXIT:  k += 1; break;
-            case RULE_OP_DIV_INSERT: k += 3; break;
+            case RULE_OP_DIV_INSERT: {
+                /* `vNX`: insert X after every N bytes, after the last one too when
+                 * N divides the length; a word shorter than N is unchanged.  Byte-exact
+                 * with ruleproc.c RULE_OP_DIV_INSERT (fast and slow paths), built
+                 * backwards in place.  N 0 never arrives: the load-time test apply
+                 * refuses the rule.  Past RULE_BUF_LIMIT it is a no-op, as `d` is. */
+                int x = (int)prog[k + 1];
+                uchar ins = prog[k + 2];
+                if (x > 0 && len >= x && len + len / x <= RULE_BUF_LIMIT) {
+                    int w = len + len / x;
+                    for (int j = len - 1; j >= 0; j--) {
+                        if (((j + 1) % x) == 0) buf[--w] = ins;
+                        buf[--w] = buf[j];
+                    }
+                    len += len / x;
+                }
+                k += 3;
+                break;
+            }
 
             /* ---- Rejection ops ---- */
             case RULE_OP_REJ_LEN_NE: {

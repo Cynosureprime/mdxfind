@@ -83,29 +83,6 @@ static void arc4random_buf(void *buf, size_t nbytes) {
 
 #ifdef GPU_ENABLED
 
-/* Phase 1a sub-phase 1a.1b Phase 0 (2026-05-20): backend-shim for the
- * kernel A1 proto enable gate. Rev 1.488 introduced two unconditional
- * call sites that compile on BOTH backends (chokepoint admit at line
- * ~11450, need_gpu override at line ~38077) but call the OpenCL-only
- * symbol gpu_opencl_kernel_a_proto_enabled. This breaks the Metal build
- * at link time. The shim dispatches by backend macro and is the single
- * source of truth for both call sites — keep them lockstep via this
- * helper.
- *
- * On CUDA the legacy MDXFIND_KERNEL_B_PROTO env flag is the only gate;
- * the kernel A1 dispatcher has no CUDA backend (the A1 dispatch lives
- * in gpu/gpu_opencl.c only, with a Metal twin under construction in
- * sub-phase 1a.1b). */
-static inline int mdx_kernel_a_proto_enabled(void)
-{
-#if defined(__APPLE__) && defined(METAL_GPU)
-    return gpu_metal_kernel_a_proto_enabled();
-#elif defined(OPENCL_GPU)
-    return gpu_opencl_kernel_a_proto_enabled();
-#else
-    return 0;
-#endif
-}
 
 
 static inline int mdx_gpu_active_device_count(void)
@@ -222,10 +199,10 @@ int Neon;
 #define bswap_64(x) __builtin_bswap64(x)
 #endif
 
-char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.669 2026/11/13 13:43:25 dlr Exp dlr $";
+char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.677 2026/11/16 12:23:20 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.669 2026/11/13 13:43:25 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.677 2026/11/16 12:23:20 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -243,8 +220,32 @@ __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.677  2026/11/16 12:23:20  dlr
+ * Reword the 1.676 log entry: user in place of customer.
+ *
+ * Revision 1.676  2026/11/15 18:38:04  dlr
+ * mdxfind 1.676: with the GPU active, an -n/-N mask over the per-side GPU limit, with an empty character class, or whose tables do not fit in device memory exits with the positions requested and the limit, instead of hashing bare words on the GPU while the CPU skips the mask.
+ *
+ * Revision 1.675  2026/11/15 12:16:18  dlr
+ * mdxfind 1.675 / hashpipe 1.236: SHA1PASS-TRUNC, SHA1SHA1PASS-TRUNC1SALT and SHA1SHA1TRUNC-SHA1PASS-3 use the first min(len,3) password bytes (PHP substr) instead of reading past a short password. Crypto++ legacy/default records accept an empty site key. ARM SHA-1/256/512 and x86 SHA-1 hardware paths are safe for in-place calls. A 7z CRC confirmation overrides a padding failure when the whole stream is present. -b runs on the CPU. hashpipe KRB5PA23 accepts the empty password. hashcat mode 40026 maps to MD5SALTPASS.
+ *
+ * Revision 1.674  2026/11/15 08:06:24  dlr
+ * mdxfind 1.674 / hashpipe 1.235: 7z loaders read the 13-field (Delta filter) record and use its Delta distance in the CRC check; hashcat and John record forms both load. hashpipe verify_7zip moved to work-space slots. An ill-formed UTF-16 conversion (-b candidate, MSCACHE user) now skips the hash instead of hashing the raw bytes. hashpipe output write failures are fatal.
+ *
+ * Revision 1.673  2026/11/15 05:05:31  dlr
+ * Every type emits a -z line and is found for the empty password: SHA1_xSHA1psubp takes the empty prefix, the DECBASE64 types hash a valid empty decode while a failed decode still emits nothing, and the revBASE64x types accept an empty encoding. hashpipe UTF-16 conversion returns a negative value for ill-formed input, so an empty password verifies and ill-formed input is refused. 7ZIP -z with no archive loaded writes a record the password opens, and the 7z coder check reads the full filter nibble so DELTA plus LZMA streams verify.
+ *
+ * Revision 1.672  2026/11/15 03:53:09  dlr
+ * The Metal template mask kernel and the MAKE_MD5PASS family kernel on both backends spread the mask axis across GPU lanes, instead of walking a whole mask slice in one lane. A valid empty UTF-16 conversion is accepted, so every UTF-16 based type emits a line for the empty password, on the CPU and in the md4utf16 GPU kernels.
+ *
+ * Revision 1.671  2026/11/15 02:13:13  dlr
+ * With -a and a mask split across jobs, the GPU kernels and the hit replay divide the mask axis by the job slice count rather than the full mask, so every dotting is covered at any thread count. The OpenCL hash count includes the -a factor.
+ *
+ * Revision 1.670  2026/11/14 22:14:31  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.669  2026/11/13 13:43:25  dlr
- * Add e1063 SHA1PASSUSERPASSUSER, sha1(pass . user . pass . user), the user from the userid channel: the digest of PHP sha1(str_repeat($password . $username, 2)). tools/hx_dedup_check reported NO MATCH over 1060 catalog entries. Types[] appended at the end, JOB define 1063, TypeOpts NEEDSF|NEEDUSER, TypeDigest 20, default user administrator for -z. The CPU case builds pass.user in the upper part of linebuf, doubles it, and iterates as every SHA1 type does, sha1 of the previous round lowercase hex; a pair whose doubled length passes 2*MAXLINE is skipped. GPU on OpenCL and Metal: the type runs on the SHA1PASSSALT kernels in algo_mode 1, which hashes pass||salt written twice, with the userid as the salt; it joins the rules-engine chokepoint, the salt-snapshot exclusion, and an admission arm beside the HMAC KSALT TYPEUSER arm, so -u and -F hash:user both reach the device. Hits replay through checkhashsalt and USERFIELD_OP, so a GPU line equals a CPU line. Verified: -z and x02 against an independent python computation; real hashes of this construction crack through -F hash:user and -u; on a GTX 1080 (OpenCL) and an Apple M2 Max (Metal), 1400 python-generated hashes over 133 users and 120000 words give GPU output byte-identical to the CPU and to the oracle, with and without rules, at -i 1 and -i 2, through -F and -u; e405 and e413, which share the kernel fragment, are unchanged; wrong-user and wrong-password controls give no hits. Also removes customer-identifying text and three attribution lines from this log, and a customer mask from the parse_mask_into comment.
+ * Add e1063 SHA1PASSUSERPASSUSER, sha1(pass . user . pass . user), the user from the userid channel: the digest of PHP sha1(str_repeat($password . $username, 2)). tools/hx_dedup_check reported NO MATCH over 1060 catalog entries. Types[] appended at the end, JOB define 1063, TypeOpts NEEDSF|NEEDUSER, TypeDigest 20, default user administrator for -z. The CPU case builds pass.user in the upper part of linebuf, doubles it, and iterates as every SHA1 type does, sha1 of the previous round lowercase hex; a pair whose doubled length passes 2*MAXLINE is skipped. GPU on OpenCL and Metal: the type runs on the SHA1PASSSALT kernels in algo_mode 1, which hashes pass||salt written twice, with the userid as the salt; it joins the rules-engine chokepoint, the salt-snapshot exclusion, and an admission arm beside the HMAC KSALT TYPEUSER arm, so -u and -F hash:user both reach the device. Hits replay through checkhashsalt and USERFIELD_OP, so a GPU line equals a CPU line. Verified: -z and x02 against an independent python computation; real hashes of this construction crack through -F hash:user and -u; on a GTX 1080 (OpenCL) and an Apple M2 Max (Metal), 1400 python-generated hashes over 133 users and 120000 words give GPU output byte-identical to the CPU and to the oracle, with and without rules, at -i 1 and -i 2, through -F and -u; e405 and e413, which share the kernel fragment, are unchanged; wrong-user and wrong-password controls give no hits. Also removes user-identifying text and three attribution lines from this log, and a user mask from the parse_mask_into comment.
  *
  * Revision 1.668  2026/11/09 21:46:51  dlr
  * Release with the hashcat N rule and two Metal fixes; no code change in this file. N, RULE_OP_MANGLE_REPLACE_NTH, replaces only the nth occurrence of a character counting from 0 and is a no-op when there is none; it is in both rule engines, ruleproc.c 1.49 and ruleproc32.c 1.20, where -8 also takes quoted strings of any length, and in every GPU rule walker. gpu_metal.m 1.153: the Metal rules dispatch skipped rules whenever its adaptive chunk size grew, losing cracks without a warning on most multi-chunk rule sets, and dropped hits beyond 32,768 per call; it now advances by the chunk dispatched and collects hits per dispatch, rerunning a chunk whose hit buffer overflowed.
@@ -3810,10 +3811,11 @@ static int cppenc_append_key(char *buf, int len, const unsigned char *k, int kle
      a negative klen must still take the else arm and skip the loop rather than
      reach memcpy with (size_t)klen.
      Reachability, since the guards differ between the two call sites: the
-     <record>:<sitekey> site is protected by "if (pl <= 0) continue", but the
-     triple-emitting site passes the CANDIDATE length, which is bounded only
-     from above by CPPENC_MAXPASS -- and mdxfind does process zero-length
-     candidates, as cracking md5("") from a blank wordlist line shows. */
+     <record>:<sitekey> site accepts an empty key too (an empty site key is a
+     valid record), and the triple-emitting site passes the CANDIDATE length,
+     which is bounded only from above by CPPENC_MAXPASS -- mdxfind processes
+     zero-length candidates, as cracking md5("") from a blank wordlist line
+     shows. */
   int i, clean = (klen >= 0);
   for (i = 0; i < klen; i++)
     if (k[i] < '!' || k[i] > '~' || k[i] == ':') { clean = 0; break; }
@@ -4083,10 +4085,14 @@ static int sevenzip_tier2(const struct SevenZipRec *r, const unsigned char key[3
          ? (size_t)r->unpacked : aeslen;
 
   lownib = r->type & 0x0f;
-  prepro = (r->type >> 4) & 0x07;
+  /* the whole upper nibble: John writes DELTA as 8 (0x81 = DELTA+LZMA1), so
+   * masking it to three bits read a filtered stream as unfiltered and a
+   * tier-2 miss as a refutation */
+  prepro = (r->type >> 4) & 0x0f;
   /* We can only call a miss a refutation when the line names a codec we
-   * implement AND declares no filter we would have to undo. */
-  authoritative = (prepro == 0) &&
+   * implement AND declares no filter we cannot undo: none, or a DELTA whose
+   * distance the line carries (John's 13th field, r->delta). */
+  authoritative = (prepro == 0 || (prepro == 8 && r->delta)) &&
                   (lownib == 1 || lownib == 2 || lownib == 6 || lownib == 7);
 
   outcap = r->crc_len > 0 ? (size_t)r->crc_len : SEVENZIP_MAX_UNPACK;
@@ -4136,7 +4142,7 @@ static int sevenzip_tier2(const struct SevenZipRec *r, const unsigned char key[3
         unsigned int c;
         memcpy(work, unp, clen);
         if (fi == 1)      sz_filter_arm64(work, clen);
-        else if (fi == 2) sz_filter_delta(work, clen, 4);
+        else if (fi == 2) sz_filter_delta(work, clen, r->delta ? r->delta : 4);
         c = (unsigned int)crc32(0L, work, (uInt)clen);
         if (c == r->crc) {
           if (how) *how = fi ? (fi == 1 ? "ARM64+codec" : "Delta+codec") : nm[ci];
@@ -4846,6 +4852,7 @@ long Email_cpu_cheap = 0;   /* -a words kept on the CPU: sweep too small to disp
 #ifdef GPU_ENABLED
 /* See gpujob.h for why this lives here and not in a backend. */
 uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
+uint64_t gpu_dispatch_dot_base[GPUJOB_MAX_DEVS];
 uint32_t *gpu_dispatch_hit_salt[GPUJOB_MAX_DEVS];
 uint32_t gpu_dispatch_hit_salt_n[GPUJOB_MAX_DEVS];
 /* -a dot-width clamp, as the DISPATCH actually applied it.  The widest width a
@@ -5847,6 +5854,27 @@ int b64_decode(char *b64src, char *clrdst, int *incount) {
   nbytesdecoded = bufout - (unsigned char *) clrdst;
   *(bufout++) = '\0';
   return nbytesdecoded;
+}
+
+/* Decode a candidate WORD as base64, for the DECBASE64 types: the decoded
+ * length, or -1 when a non-empty word decodes to nothing.
+ *
+ * b64_decode stops at the first character outside the base64 alphabet, so an
+ * ordinary password (' 8981...', '_1898...', anything with ':') yields 0
+ * bytes, and hashing those gives md5("") for EVERY such candidate: a list
+ * holding that digest then matched a flood of unrelated passwords. That is a
+ * failed decode, and it is -1 here. The empty word is base64 of the empty
+ * string, so it decodes to length 0 and is hashed. b64_decode itself is
+ * unchanged: its other callers keep 0 for a failed decode. */
+static int b64_decode_word(char *src, int srclen, char *dst) {
+  int incount, n;
+
+  if (srclen == 0) {
+    dst[0] = 0;
+    return 0;
+  }
+  n = b64_decode(src, dst, &incount);
+  return n > 0 ? n : -1;
 }
 
 void php_encblock(unsigned char in[], char out[], int len) {
@@ -7508,6 +7536,7 @@ struct MapHashcat Maphashcat[] = {
     {35500, 993},  /* 35500 | WordPress bcrypt(hmac-sha384($pass)) */
     {35600, 994},  /* 35600 | gost12512crypt */
     {35800, 992},  /* 35800 | Symfony Legacy SHA256 */
+    {40026, 394},  /* 40026 | PrestaShop - md5($salt.$pass) */
     {46100, 998},  /* 46100 | gost-yescrypt (team-local mode; not upstream hashcat) */
     {67000, 995},  /* 67000 | yescrypt */
     {65535, 65535}}; /*EOF */
@@ -9162,6 +9191,24 @@ char UserTypedone[USERDEF_MAX];
   while (_old > 0) { \
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) break; \
     _old = *(pv); } } }
+/* PV_DEC that says whether THIS thread took the reference: 0 = another
+ * thread already took the last one (it has printed the hit).  Contfound
+ * decrements nothing, so it always wins. */
+#define PV_CLAIM(pv) ({ int _won = 1; if (!Contfound) { Word_t _old = *(pv); \
+  _won = 0; while (_old > 0) { \
+    if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { _won = 1; break; } \
+    _old = *(pv); } } _won; })
+/* Test-and-set of a solved flag (0 = unsolved): true iff THIS thread turned
+ * it 0 -> 1.  A plain test followed by `= 1` lets two threads that find the
+ * same hash at once both print it.  Callers keep `Printall ||` and
+ * `Contfound ||` in front, so neither claims anything. */
+#define PV_TAKE(pv) __sync_bool_compare_and_swap((pv), 0, 1)
+/* The same for a hash's match_flags, which hold the op that last printed it:
+ * true iff THIS thread replaced a different op with its own. */
+#define MF_TAKE(mf, op) ({ unsigned short _mo = *(volatile unsigned short *)(mf), \
+  _mn = (unsigned short)(op); int _mw = 0; while (_mo != _mn) { \
+    if (__sync_bool_compare_and_swap((mf), _mo, _mn)) { _mw = 1; break; } \
+    _mo = *(volatile unsigned short *)(mf); } _mw; })
 
 unsigned short TypeOpts[JOB_DONE] = {
     [1] = TYPEOPT_NEEDSF,  /* MD5 */
@@ -11198,9 +11245,6 @@ unsigned short UserTypeOpts[USERDEF_MAX];
 unsigned long Iter_Count[] = {0, 10, 10, 100, 100, 1000, 1000, 1000, 1000, 10000, 10000, 10000, 10000, 100000, 100000, 100000, 100000};
 
 
-#define GPU_MASK_DESC_TAG_LIT   0x00u
-#define GPU_MASK_DESC_TAG_VAR   0x01u
-#define GPU_MASK_DESC_TAG_END   0xFFu
 #define MASK_CLASS_d 0
 #define MASK_CLASS_l 1
 #define MASK_CLASS_u 2
@@ -11242,15 +11286,6 @@ unsigned long long MaskAppendTotal = 1;
 struct MaskPos   MaskPrependPattern[MAX_MASK_POS];
 int              MaskPrependLen;
 unsigned long long MaskPrependTotal = 1;
-
-/* 2026-05-30 long-mask amendment: A2/A3/A4 dispatcher wire-format
- * staging. Packed once in the gpu_avail init path; consumed by
- * gpu_opencl_kernel_a_upload_mask_descriptors() and Metal twin. */
-unsigned char gpu_kern_a_prep_desc[GPU_MASK_DESC_BYTES_CAP];
-unsigned char gpu_kern_a_app_desc [GPU_MASK_DESC_BYTES_CAP];
-int           gpu_kern_a_prep_dlen     = 0;
-int           gpu_kern_a_app_dlen      = 0;
-int           gpu_kern_a_mask_eligible = 0;
 
 void mask_init_classes(void) {
     int i;
@@ -11428,8 +11463,8 @@ int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out,
             "FATAL: %s:%d mask pattern '%s' exceeds MAX_MASK_POS (%d) -- "
             "consumed %d positions, %d more remain (raise MAX_MASK_POS and "
             "rebuild to handle longer masks; GPU per-side cap is "
-            "MAX_MASK_POS_GPU_SIDE=%d so masks over %d per side fall back "
-            "to CPU only)\n",
+            "MAX_MASK_POS_GPU_SIDE=%d, so a mask over %d per side needs "
+            "-G none)\n",
             __FILE__, __LINE__, orig, MAX_MASK_POS, plen,
             remaining_positions, MAX_MASK_POS_GPU_SIDE,
             MAX_MASK_POS_GPU_SIDE);
@@ -11453,81 +11488,6 @@ static __attribute__((unused)) int parse_mask(const char *s) {
 /* Legacy wrapper */
 static inline int mask_expand(unsigned long long index, char *buf) {
     return mask_expand_into(index, MaskPattern, MaskLen, buf);
-}
-
-/* 2026-05-30 long-mask amendment (D1.b Design Y interleaved run-descriptor
- * stream). Pack a CPU MaskPos[] pattern into the GPU run-descriptor wire
- * format consumed by mask_expand_run_into_gpu() in gpu_kernel_a_masks.cl
- * (and Metal twin metal_kernel_a_masks.metal).
- *
- * Stream layout:
- *   [LIT_TAG=0x00][len_lo:u8][len_hi:u8][bytes...]    coalesced literal run
- *   [VAR_TAG=0x01][classid:u8]                         one placeholder
- *   [END_TAG=0xFF]                                     terminator
- *
- * Consecutive MASK_LITERAL positions are coalesced into a single LIT
- * descriptor (worst-case 17 LIT runs of 1-byte each, alternating with
- * 16 VAR runs, packs to 17*(3+1) + 16*2 + 1 = 101 B; the largest single
- * LIT run is 224 B (3-byte hdr) which alone takes 227 B).
- *
- * Returns:
- *   >= 0  total descriptor byte length (includes the END tag)
- *   < 0   FATAL: descriptor would exceed desc_cap, OR either per-side cap
- *         (GPU_MASK_VAR_CAP, GPU_MASK_LIT_BYTES_CAP) is exceeded.
- *
- * Caller responsibility: pre-check the per-side caps via
- * gpu_mask_count_vars_lit_bytes() so this helper's negative returns are
- * a programming-error signal rather than a normal control-flow path. */
-int gpu_pack_mask_descriptor(const struct MaskPos *pattern, int plen,
-                                    unsigned char *desc_out, int desc_cap)
-{
-    int p = 0;
-    int i = 0;
-    int n_vars = 0, n_lit_bytes = 0;
-    while (i < plen) {
-        if (pattern[i].classid == MASK_LITERAL) {
-            /* Coalesce consecutive literals into one LIT run. */
-            int run_start = i;
-            int run_len = 0;
-            while (i < plen && pattern[i].classid == MASK_LITERAL) {
-                run_len++; i++;
-            }
-            if (run_len > 0xFFFF) return -1;
-            if (p + 3 + run_len > desc_cap) return -1;
-            if (n_lit_bytes + run_len > GPU_MASK_LIT_BYTES_CAP) return -1;
-            desc_out[p++] = (unsigned char)GPU_MASK_DESC_TAG_LIT;
-            desc_out[p++] = (unsigned char)(run_len & 0xFF);
-            desc_out[p++] = (unsigned char)((run_len >> 8) & 0xFF);
-            for (int k = 0; k < run_len; k++)
-                desc_out[p++] = pattern[run_start + k].literal;
-            n_lit_bytes += run_len;
-        } else {
-            if (p + 2 > desc_cap) return -1;
-            if (n_vars + 1 > GPU_MASK_VAR_CAP) return -1;
-            desc_out[p++] = (unsigned char)GPU_MASK_DESC_TAG_VAR;
-            desc_out[p++] = (unsigned char)pattern[i].classid;
-            n_vars++; i++;
-        }
-    }
-    if (p + 1 > desc_cap) return -1;
-    desc_out[p++] = (unsigned char)GPU_MASK_DESC_TAG_END;
-    return p;
-}
-
-/* Count variable positions vs literal bytes for a mask pattern. Used to
- * gate GPU eligibility before invoking gpu_pack_mask_descriptor(). */
-void gpu_mask_count_vars_lit_bytes(const struct MaskPos *pattern,
-                                          int plen,
-                                          int *out_vars,
-                                          int *out_lit_bytes)
-{
-    int v = 0, lb = 0;
-    for (int i = 0; i < plen; i++) {
-        if (pattern[i].classid == MASK_LITERAL) lb++;
-        else                                     v++;
-    }
-    *out_vars      = v;
-    *out_lit_bytes = lb;
 }
 
 struct job *FreeHead, **FreeTail;
@@ -12608,7 +12568,7 @@ struct Hashchain found;
             match_len = len / 2;
             hfound = 1;
           }
-          if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+          if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
             hitcount++;
             *match_flags = job->op;
             key = fmt_saltfield(keybuf, key, keylen, uf);
@@ -12673,7 +12633,7 @@ release(FreeWaiting);
         match_len = len / 2;
         hfound = 1;
       }
-      if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+      if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
         hitcount++;
         *match_flags = job->op;
         key = fmt_saltfield(keybuf, key, keylen, uf);
@@ -12749,7 +12709,7 @@ int checkhashwerkzeug(union HashU *curin, int len, char *key, int keylen,
     match_len = len / 2;
     hfound = 1;
   }
-  if (!hfound || *match_flags == (unsigned short)job->op)
+  if (!hfound || !MF_TAKE(match_flags, job->op))
     return 0;
   *match_flags = job->op;
   /* Binary salt: scan keylen bytes, not to the first NUL. */
@@ -12806,7 +12766,7 @@ int checkhash_netscaler512(union HashU *curin, int len, char *salt, int saltlen,
     match_len = len;
     hfound = 1;
   }
-  if (!hfound || *match_flags == (unsigned short)job->op)
+  if (!hfound || !MF_TAKE(match_flags, job->op))
     return 0;
   *match_flags = job->op;
   /* Build output: "2" + 8-char salt + 128-char hex hash */
@@ -12865,7 +12825,7 @@ int checkhash_netwitness(union HashU *curin, int len, char *salt, int saltlen, s
     match_len = len;
     hfound = 1;
   }
-  if (!hfound || *match_flags == (unsigned short)job->op)
+  if (!hfound || !MF_TAKE(match_flags, job->op))
     return 0;
   *match_flags = job->op;
   prmd5UC(curin->h, newbuf, match_len * 2);
@@ -12921,7 +12881,7 @@ int checkhash_authme(union HashU *curin, int len, char *salt, int saltlen, struc
     match_len = len / 2;
     hfound = 1;
   }
-  if (!hfound || *match_flags == (unsigned short)job->op)
+  if (!hfound || !MF_TAKE(match_flags, job->op))
     return 0;
   *match_flags = job->op;
   prmd5(curin->h, newbuf, match_len * 2);
@@ -13010,7 +12970,7 @@ struct Hashchain found;
         match_len = len / 2;
         hfound = 1;
       }
-      if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+      if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
           hitcount++;
           *match_flags = job->op;
           job->pass[job->clen] = 0;
@@ -13144,7 +13104,7 @@ dorot:
           match_len = len / 2;
           hfound = 1;
         }
-        if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+        if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
           hitcount++;
           *match_flags = job->op;
           job->pass[job->clen] = 0;
@@ -13245,7 +13205,7 @@ struct Hashchain found;
             match_len = len / 2;
             hfound = 1;
           }
-          if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+          if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
             hitcount++;
             *match_flags = job->op;
             fmt_saltfield(saltbuf, salt, saltlen, uf);
@@ -13318,7 +13278,7 @@ release(FreeWaiting);
         match_len = len / 2;
         hfound = 1;
       }
-      if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+      if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
         hitcount++;
         *match_flags = job->op;
         fmt_saltfield(saltbuf, salt, saltlen, uf);
@@ -13412,7 +13372,7 @@ static int checkhashsalt2_f(union HashU *curin, int len,
     match_len = len / 2;
     hfound = 1;
   }
-  if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+  if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
     hitcount++;
     *match_flags = job->op;
     prmd5(curin->h, newbuf2, match_len * 2);
@@ -13487,7 +13447,7 @@ struct Hashchain found;
       match_flags = &found.flags;
       hfound = 1;
     }
-    if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+    if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
       hitcount++;
       *match_flags = job->op;
 
@@ -14488,6 +14448,97 @@ static int ntlm_all_ascii(const unsigned char *s, int len)
   return 1;
 }
 
+#if defined(OPENCL_GPU) || defined(METAL_GPU)
+/* Types whose rules-engine kernel is accepted as covering every GPU-eligible
+ * rule, so the CPU rule walker skips those rules (C2.3).  Any other admitted
+ * type computes them on BOTH sides: correct, but twice the work.  A type
+ * belongs here only after its GPU+rules output is byte-identical to -G none. */
+static int gpu_rules_cover(int op)
+{
+  switch (op) {
+  /* Excluded: NTLM (e369).  It is never admitted to the GPU at all -- no
+   * gpu_ops[] row (mdxmain.c) and no admit-chain clause -- so the skip
+   * cannot fire for it.  No device kernel computes it: the CPU arm hashes up
+   * to three readings of each candidate (UTF-8, CP1251, CP1252 to UTF-16LE,
+   * the code-page ones only when a byte is >= 0x80) and reports a code-page
+   * hit as the UTF-8 form of the converted codepoints, while the template
+   * carries at most one alternate digest and the replay has no reading
+   * index.  Serving it needs a new carrier, not a list entry. */
+  case JOB_MD5: case JOB_MD5UC: case JOB_MD4: case JOB_WRL:
+  case JOB_SHA1: case JOB_SHA256:
+  case JOB_SHA224: case JOB_SHA384: case JOB_SHA512:
+  case JOB_RMD160: case JOB_RMD320: case JOB_MD6256:
+  case JOB_MD5RAW: case JOB_SHA1RAW: case JOB_SHA256RAW: case JOB_SHA384RAW:
+  case JOB_SHA512RAW:
+  case JOB_KECCAK224: case JOB_KECCAK256: case JOB_KECCAK384: case JOB_KECCAK512:
+  case JOB_SHA3_224: case JOB_SHA3_256: case JOB_SHA3_384: case JOB_SHA3_512:
+  case JOB_BLAKE2B256: case JOB_BLAKE2B512: case JOB_BLAKE2S256:
+  case JOB_STREEBOG_32: case JOB_STREEBOG_64:
+  case JOB_MD5SHA256: case JOB_SQL5: case JOB_MYSQL3:
+  case JOB_NTLMH: case JOB_MD4UTF16:
+  case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5MD5SALT:
+  case JOB_MD5_MD5SALTMD5PASS: case JOB_MD5PASSSALT: case JOB_MD5SALTPASS:
+  case JOB_SHA1SALTPASS: case JOB_SHA1PASSSALT: case JOB_SHA224SALTPASS:
+  case JOB_SHA256SALTPASS: case JOB_SHA256PASSSALT: case JOB_SHA384SALTPASS:
+  case JOB_SHA512SALTPASS: case JOB_SHA512PASSSALT: case JOB_SHA1PASSUSERPASSUSER:
+  case JOB_HMAC_BLAKE2S:
+  case JOB_HMAC_STREEBOG256_KPASS: case JOB_HMAC_STREEBOG512_KPASS:
+  case JOB_HMAC_STREEBOG256_KSALT: case JOB_HMAC_STREEBOG512_KSALT:
+  case JOB_HMAC_MD5: case JOB_HMAC_SHA1: case JOB_HMAC_SHA224: case JOB_HMAC_SHA256:
+  case JOB_HMAC_SHA384: case JOB_HMAC_SHA512: case JOB_HMAC_RMD160: case JOB_HMAC_RMD320:
+  case JOB_HMAC_MD5_KPASS: case JOB_HMAC_SHA1_KPASS: case JOB_HMAC_SHA224_KPASS:
+  case JOB_HMAC_SHA256_KPASS: case JOB_HMAC_SHA384_KPASS: case JOB_HMAC_SHA512_KPASS:
+  case JOB_HMAC_RMD160_KPASS: case JOB_HMAC_RMD320_KPASS:
+  case JOB_BCRYPT:
+  case JOB_PHPBB3: case JOB_MD5CRYPT: case JOB_DESCRYPT: case JOB_SHA512CRYPTMD5:
+#if !(defined(__APPLE__) && defined(METAL_GPU))
+  /* CPU-only on Metal (not admitted): 0.10x / 0.17x / 0.20x the CPU (2026-11-13). */
+  case JOB_SHA1DRU: case JOB_SHA256CRYPT: case JOB_SHA512CRYPT:
+#endif
+  /* MAKE_MD5PASS family (2026-11-13): Metal kernel B iterates, applies the
+   * mask and takes any candidate length.  e123 is not GPU-served at all. */
+  case JOB_MD2MD5PASS: case JOB_MD4MD5PASS: case JOB_GOSTMD5PASS:
+  case JOB_HAV128MD5PASS: case JOB_HAV128_4MD5PASS: case JOB_HAV128_5MD5PASS:
+  case JOB_HAV160_3MD5PASS: case JOB_HAV160_4MD5PASS: case JOB_HAV160_5MD5PASS:
+  case JOB_HAV192_3MD5PASS: case JOB_HAV192_4MD5PASS: case JOB_HAV192_5MD5PASS:
+  case JOB_HAV224_3MD5PASS: case JOB_HAV224_4MD5PASS: case JOB_HAV224_5MD5PASS:
+  case JOB_HAV256MD5PASS: case JOB_HAV256_4MD5PASS: case JOB_HAV256_5MD5PASS:
+  case JOB_RMD128MD5PASS: case JOB_RMD160MD5PASS:
+  case JOB_SHA1MD5PASS: case JOB_SHA224MD5PASS: case JOB_SHA256MD5PASS:
+  case JOB_SHA384MD5PASS: case JOB_SHA512MD5PASS:
+  case JOB_TIGERMD5PASS: case JOB_WRLMD5PASS:
+  case JOB_SNE128MD5PASS: case JOB_SNE256MD5PASS:
+    return 1;
+  }
+  return 0;
+}
+#endif
+
+#if defined(NOTINTEL) && (ARM > 6 || defined(POWERPC))
+/* -i rounds x02..Maxiter for one lane of the 4-wide MD5_salt loop (NEON /
+ * AltiVec): md5(hex(previous digest)), the same step the INTEL arm takes.
+ * The SIMD lanes check x01 only, so without this every arm64 and ppc64le
+ * build found MD5SALT, MD5UCSALT and MD5MD5SALT at x01 and nothing deeper.
+ * The digest is kept in h[] because the check routines may rewrite curin. */
+static void md5salt_lane_iter(union HashU *curin, const uint32_t *h0,
+                              char *salt, int saltlen, PWord_t pv,
+                              char *newbuf, unsigned long long *hashcnt,
+                              struct job *job)
+{
+  unsigned char h[16];
+  int x;
+  memcpy(h, h0, 16);
+  for (x = 2; x <= Maxiter; x++) {
+    prmd5_32(h, newbuf);
+    mymd5(newbuf, 32, h);
+    (*hashcnt)++;
+    memcpy(curin->h, h, 16);
+    if (checkhashsalt(curin, 32, salt, saltlen, x, job))
+      PV_DEC(pv);
+  }
+}
+#endif
+
 MDXALIGN void procjob(void *dummy) {
 struct job *job;
 char *d, *s1, *s2, *s, *csalt, *cur, *curkey, eofsalt;
@@ -15350,7 +15401,10 @@ while (1) {
           * category returns GPU_CAT_MASK; gpu_try_pack returns 0 for non-
           * GPU_CAT_SALTED/SALTPASS ops + iter-types whitelist excludes
           * SHA1DRU). */
+#if !(defined(__APPLE__) && defined(METAL_GPU))
+         /* CPU-only on Metal: 0.10x the M2 Max CPU at any list size (2026-11-13). */
          job->op == JOB_SHA1DRU ||
+#endif
         /* B5 sub-batch 6 Tier B (2026-05-03): NTLMH (NT password hash).
          * MD4 over the candidate widened to UTF-16LE by ZERO-EXTENSION,
          * which is what hashcat does and is NOT what Windows does.
@@ -15578,6 +15632,8 @@ while (1) {
          job->op == JOB_MD5UCSALT ||
          job->op == JOB_MD5revMD5SALT ||
          job->op == JOB_MD5sub8_24SALT ||
+         /* e347 MD5MD5SALT = e31 over hex32(md5(pass)): algo_mode 7. */
+         job->op == JOB_MD5MD5SALT ||
          job->op == JOB_MD5_MD5SALTMD5PASS ||
          /* Family A (2026-05-07): JOB_HMAC_MD5 (e214) + JOB_HMAC_MD5_KPASS
           * (e792) join the unified template path via the MD5SALT GPU
@@ -15818,7 +15874,10 @@ while (1) {
           * CPU reference: mdxfind.c JOB_SHA256CRYPT entry at line 12121
           * + shared crypt_round body at 12177-12290. Phase 2 of the
           * Unix-crypt ladder. */
+#if !(defined(__APPLE__) && defined(METAL_GPU))
+         /* CPU-only on Metal: 0.17x the M2 Max CPU at any list size (2026-11-13). */
          job->op == JOB_SHA256CRYPT ||
+#endif
          /* SHA512CRYPT carrier (2026-05-08): JOB_SHA512CRYPT (e513) joins
           * the unified template path via the SHACRYPT shared core
           * (gpu_shacrypt_core.cl at HASH_WORDS=16). 5-step glibc crypt-
@@ -15834,7 +15893,10 @@ while (1) {
           * it). CPU reference: mdxfind.c JOB_SHA512CRYPT entry at line
           * 12183 + shared crypt_round body at 12177-12290 (cryptlen=64
           * branch). Phase 3 of the Unix-crypt ladder. */
+#if !(defined(__APPLE__) && defined(METAL_GPU))
+         /* CPU-only on Metal: 0.20x the M2 Max CPU at any list size (2026-11-13). */
          job->op == JOB_SHA512CRYPT ||
+#endif
          /* SHA512CRYPTMD5 carrier (2026-05-08): JOB_SHA512CRYPTMD5 (e510)
           * joins the unified template path via the SHACRYPT shared core
           * (gpu_shacrypt_core.cl at HASH_WORDS=16). REUSES the SAME
@@ -15928,8 +15990,17 @@ while (1) {
           * lazy-JITs per JOB via the per-JOB slot map established in
           * 5a.2 (OpenCL) and 5a.3 (Metal). e123 MD5MD5PASS is excluded
           * (multi-emit outlier; deferred to a future codegen sub-phase). */
-         (job->op == JOB_MD5MD5SALT
-          || gpu_codegen_kernelb_family_md5pass_eligible(job->op))) &&
+         /* e347 is no longer here: it is the md5salt template's algo_mode 7
+          * (admitted with e541/e542 above), which iterates, applies masks and
+          * takes any candidate length on both backends (2026-11-13). */
+         /* Not under -E or -a: kernel A1 applies the rule to the WHOLE word
+          * (it never reads the head_len in word_offset bits 22-29) and has
+          * no dot axis, so -E mangled the domain too and -a swept nothing.
+          * Measured on Metal with the C2.3 skip on: -E 61 of 142, -a 661 of
+          * 1217 against -G none.  Declined here, the CPU walks every rule.
+          * -k is served (the pack site tags the key as for any type). */
+         (gpu_codegen_kernelb_family_md5pass_eligible(job->op) &&
+          !Email && !EmailLocal)) &&
         mask_b71_eligible && salt_axis_eligible &&
         /* -E is now SERVED on the GPU (plan phase 4, 2026-10-31).  The device
          * learns each word's local-part length from word_offset bits 22-29,
@@ -16529,39 +16600,16 @@ while (1) {
               _kcur += (size_t)_klen + 1;
             }
           my_jobg_rules->word_offset[my_jobg_rules->packed_count] = my_jobg_rules->packed_pos;
-          /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5): host-side
-           * truncation clamp for JOB_DESCRYPT at the rules-engine pack
-           * site. Standard DES uses only the first 8 bytes of the key
-           * (crypt-des.c:626 NUL-terminate-on-first-NUL semantics); post-
-           * rule outputs longer than 8 bytes silently truncate to 8 on
-           * the CPU side. We pre-truncate the packed length here so the
-           * GPU receives the same 8-byte canonical form regardless of
-           * whether the rule produced a 9- or 39-byte output. The kernel
-           * has its own defensive `if (plen > 8) plen = 8;` cap as
-           * belt-and-suspenders; the host-side clamp is the architect-
-           * specified honor of the user's "prior to dispatching" intent
-           * for the no-rule synthetic pass. Two distinct rule outputs
-           * that differ only in bytes 9+ collide on the same DES output
-           * (acceptable -- same as CPU). Phase 5 of the Unix-crypt ladder
-           * (FINAL phase). */
+          /* The WORD is packed whole, for every type.  DESCRYPT uses only
+           * the first 8 bytes of a candidate and BCRYPT the first 72, but
+           * that cut belongs AFTER the rule, which the kernel applies
+           * (template_finalize caps plen at 8 / 72).  Cutting the word here,
+           * before the rule, computed a different candidate whenever a rule
+           * moves bytes toward the front: `r` on "murmurlessly" must hash
+           * "ylsselru", and the pre-cut word "murmurle" reversed is
+           * "elrumrum".  Measured on DESCRYPT with the C2.3 skip on: 2/20
+           * lost, the CPU re-walk having hidden it before. */
           int pack_len = len;
-          if (job->op == JOB_DESCRYPT && pack_len > 8) pack_len = 8;
-          /* BCRYPT carrier (2026-05-08, Unix-crypt Phase 6): host-side
-           * truncation clamp for JOB_BCRYPT at the rules-engine pack site.
-           * Standard bcrypt silently truncates passwords > 72 bytes via
-           * BF_set_key key-cycling natural drop semantics (matches CPU
-           * crypt_blowfish/wrapper.c:288 "chars after 72 are ignored").
-           * We pre-truncate the packed length here so the GPU receives
-           * the same 72-byte canonical form regardless of whether the
-           * rule produced a 73-byte or 200-byte output. The kernel has
-           * its own defensive `if (len > 72) len = 72;` cap as belt-and-
-           * suspenders; the host-side clamp is the architect-specified
-           * honor of the user's "prior to dispatching" intent for the
-           * no-rule synthetic pass. Two distinct rule outputs that
-           * differ only in bytes 73+ collide on the same bcrypt output
-           * (acceptable -- same as CPU). Phase 6 of the slab-retirement
-           * ladder (final major slab kernel). */
-          if (job->op == JOB_BCRYPT && pack_len > 72) pack_len = 72;
           /* 2-BYTE LITTLE-ENDIAN LENGTH HEADER (2026-09-11, operator ruling).
            * This field was ONE byte, while the admission gate at :13469 allows
            * GPU_RULES_MAX_INPUT_LEN (40959).  Any word of 256..40959 bytes was
@@ -16641,8 +16689,28 @@ while (1) {
          * (synthetic empty plaintext, all word_offset zero). Only the range
          * travels.
          */
+        /* The job's chunk BASE, not the live cursor (checklist 70).
+         * job->MaskIndex is not reset per word: the loop bottom has already
+         * advanced it once for every earlier word of this job, so the second
+         * word packed read base+1, the third base+2.  The template kernels
+         * decode the index modulo the mask, so a start that drifted by d
+         * still covered the right SET, wrapped; a kernel that loops exactly
+         * [start, start + count) -- the MAKE_MD5PASS family -- ran off the
+         * end.  The slot is flushed at the end of every job, so one base
+         * describes every word in it. */
         if (job->MaskCount > 0 && my_jobg_rules->bf_chunk == 0) {
-            my_jobg_rules->bf_mask_start = (uint64_t)job->MaskIndex;
+            /* bf_num_masks is 32-bit; both producers chunk below 2^32
+             * (checklist 73), so a larger job is a producer defect. */
+            if ((unsigned long long)job->MaskCount > 0xFFFFFFFFULL) {
+                char _hn[256] = "unknown";
+                mdx_gethostname(_hn, sizeof(_hn));
+                fprintf(stderr, "FATAL %s:%d: op=%d job mask range %llu "
+                    "candidates does not fit the 32-bit GPU mask count on %s\n",
+                    __FILE__, __LINE__, job->op,
+                    (unsigned long long)job->MaskCount, _hn);
+                exit(1);
+            }
+            my_jobg_rules->bf_mask_start = (uint64_t)mask_base;
             my_jobg_rules->bf_num_masks  = (uint32_t)job->MaskCount;
         }
         /* k_nk == 0 means -k is active and this word could not be tagged, so
@@ -17009,7 +17077,7 @@ if ((MaskPrependLen > 0 || (job->flags & JOBFLAG_PREPEND)) && job->MaskCount && 
       if (gpu_rule_membership && word_packed_by_rules_engine &&
           (job->Ruleindex - 1) < (int)Numrules &&
           gpu_rule_membership[job->Ruleindex - 1] &&
-          gpu_rule_count > 0 && job->op == JOB_MD5 &&
+          gpu_rule_count > 0 && gpu_rules_cover(job->op) &&
           b71_mask_skip_ok &&
           /* -E and -a are both served as of phase 4; see the admit gate
            * above.  Neither appears here, because the kernel covers the
@@ -17130,8 +17198,9 @@ if (job->flags & JOBFLAG_NUMBERS) {
      * the unified template / rules-engine path (chokepoint at line ~10299,
      * gpu_rules_engine_active gate). Mask configurations within
      * MaskPrependLen <= 32 + MaskAppendLen <= 32 (B7.9 cap) AND admitted
-     * to the rules-engine OR-chain are GPU-handled there; configurations
-     * outside that scope CPU-fall-back per architect §11 (B9 row).
+     * to the rules-engine OR-chain are GPU-handled there.  A -n/-N mask
+     * over MAX_MASK_POS_GPU_SIDE never gets here with the GPU active: the
+     * upload site in mdxmain.c exits (checklist 96, 2026-11-15).
      * RCS history retains the prior block (mdxfind.c rev 1.420). */
     if (MaskPrependLen > 0 && MaskAppendLen > 0) {
       /* Dual mask: decompose combined index into prepend and append indices */
@@ -17367,6 +17436,11 @@ do {
     if (Unicode) {
       FastRule = 0;
       j = U8TO16LE(cur, len, wline1, MAXLINE*2);
+      /* An ill-formed candidate has no UTF-16 form: skip it, as every other
+       * UTF-16 caller does -- never hash its raw bytes. Empty (j == 0) is
+       * equivalent either way. */
+      if (j < 0)
+	continue;
       if (j > 0) {
 	cur = (char *) wline1;
 	len = j;
@@ -17591,7 +17665,7 @@ do {
                     if (_fl > 0) {
                       Word_t *_FV;
                       JSLG(_FV, JUDYJ(job->op), (unsigned char *)_fb);
-                      if (Printall || (_FV && (Contfound || *_FV == 0))) {
+                      if (Printall || (_FV && (Contfound || PV_TAKE(_FV)))) {
                         if (!Printall) *_FV = 1;
                         prfound(job, _fb);
                       }
@@ -17642,7 +17716,7 @@ do {
          * fixed 36-character tail in a full pass. */
         linebuf[16] = 0;
         JSLG(PV, JUDYJ(JOB_PROGRESSENCODE), (unsigned char *)linebuf);
-        if (Printall || (PV && (Contfound || *PV == 0))) {
+        if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 	  if (!Printall) *PV = 1;
 	  prfound(job,linebuf);
 	}
@@ -17734,7 +17808,7 @@ do {
 	      memcpy(expect, "{PKCS5S2}", 9);
 	      b64_encode(newbuf, expect + 9, 48);
 	      JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
-	      if (Printall || (PV && (Contfound || *PV == 0))) {
+	      if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 		if (!Printall) {
 		  *PV = 1;
 		    PV_DEC(saltsnap[si].PV);
@@ -17790,7 +17864,7 @@ do {
 		  int pfxlen = sprintf(expect, "%s%c", saltsnap[si].salt, sep);
 		  b64_encode((char *)curin.h, expect + pfxlen, 32);
 		  JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
-		  if (Printall || (PV && (Contfound || *PV == 0))) {
+		  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17850,7 +17924,7 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, 16);
 		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
-		  if (Printall || (PV && (Contfound || *PV == 0))) {
+		  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17920,7 +17994,7 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, 16);
 		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
-		  if (Printall || (PV && (Contfound || *PV == 0))) {
+		  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -17980,7 +18054,7 @@ do {
 		    b64_encode((char *)curin.h, expect + pfxlen, 24);
 		    JSLG(PV, JUDYJ(JOB_PKCS5S2),(unsigned char *)expect);
 		  }
-		  if (Printall || (PV && (Contfound || *PV == 0))) {
+		  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 		    if (!Printall) {
 		      *PV = 1;
 			PV_DEC(saltsnap[si].PV);
@@ -18021,7 +18095,7 @@ do {
 	    c8_full[61] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_CISCO8),(unsigned char *)c8_full);
-	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+	      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
 	        if (!Printall) {
 	          *PV2 = 1;
 	          PV_DEC(saltsnap[si].PV);
@@ -18065,7 +18139,7 @@ do {
 	    c9_full[61] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_CISCO9),(unsigned char *)c9_full);
-	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+	      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
 	        if (!Printall) {
 	          *PV2 = 1;
 	          PV_DEC(saltsnap[si].PV);
@@ -18129,7 +18203,7 @@ do {
 	    mdbuf[32] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_DCC2), (unsigned char *)mdbuf);
-	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+	      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
 	        snprintf(linebuf2, MAXLINE*3, "$DCC2$%d#%s#%s", dcc_iter, uname, mdbuf);
 	        if (!Printall) {
 	          *PV2 = 1;
@@ -18181,7 +18255,7 @@ do {
 	    mdbuf[64] = 0;
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(JOB_PWSAFE3), (unsigned char *)mdbuf);
-	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+	      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
 	        /* Reconstruct hex: PWS3 + salt + iter_le + hash */
 	        char pw_out[200];
 	        int po = 0;
@@ -18285,7 +18359,7 @@ do {
 	    }
 	    { Word_t *PV2;
 	      JSLG(PV2, JUDYJ(job->op), (unsigned char *)sl);
-	      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+	      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
 	        if (!Printall) {
 	          *PV2 = 1;
 	          PV_DEC(saltsnap[si].PV);
@@ -18705,7 +18779,7 @@ do {
 	        unsigned char *pk;
 	        pl = saltsnap[cp_kbase + ki].saltlen;
 	        pk = (unsigned char *)saltsnap[cp_kbase + ki].salt;
-	        if (pl <= 0) continue;
+	        if (pl < 0) continue;	/* an empty site key is a valid key */
 	        /* The retired pepper channel capped a key at 127 bytes; a salt
 	         * carries no such cap, and cp_hb is fed CPPENC_HBLEN(pl) =
 	         * pl+138 bytes of a MAXLINE+16 buffer. Counted and REPORTED
@@ -19648,11 +19722,16 @@ do {
                   }
                   if (job->clen > 5 && strncmp(job->pass, "$HEX[", 5) == 0)
                     dohex = 1;
-                  if (Printall == 0)
-                    PV_DEC(saltsnap[si].PV);
-                    if (!Printall && *saltsnap[si].PV == 0) {
+                  if (Printall == 0) {
+                    /* Claim, not just decrement: this snapshot can predate
+                     * another thread's find of the same hash, and both
+                     * would print it. */
+                    int _won = PV_CLAIM(saltsnap[si].PV);
+                    if (*saltsnap[si].PV == 0) {
                       saltsnap[si] = saltsnap[--nsalts_job]; si--;
                     }
+                    if (!_won) continue;
+                  }
 #if ARM < 8
 possess(FreeWaiting);
 #endif
@@ -19776,7 +19855,7 @@ release(FreeWaiting);
                   { int match_len;
                     unsigned short *match_flags;
                     int hfound = hybrid_check(curin.h, 16, &match_len, &match_flags);
-                    if (Printall || (hfound && (Contfound || *match_flags != (unsigned short)job->op))) {
+                    if (Printall || (hfound && (Contfound || MF_TAKE(match_flags, job->op)))) {
                       if (hfound) *match_flags = job->op;
                       PV_DEC(saltsnap[si].PV);
                       if (!Printall && *saltsnap[si].PV == 0) {
@@ -20057,10 +20136,11 @@ crypt_all:
                   if (mdbuf[y-1] != s2[y-1])
                     continue;
                   mdbuf[y] = 0;
-                  PV_DEC(saltsnap[si].PV);
+                  { int _won = PV_CLAIM(saltsnap[si].PV);  /* as crypt_round */
                   if (!Printall && *saltsnap[si].PV == 0) {
                     saltsnap[si] = saltsnap[--nsalts_job]; si--;
                   }
+                  if (!_won) continue; }
                   memmove(mdbuf, s2, saltlen + i + 1);
 crypt_print:
                   job->pass[job->clen] = 0;
@@ -20562,7 +20642,7 @@ nextbb:
 			    /* look up computed hash in JudyJ[JOB_BCRYPT] Judy */
 			    { Word_t *PV2;
 			      JSLG(PV2, JUDYJ(JOB_BCRYPT),(unsigned char *)(linebuf2+MAXLINE*2));
-			      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+			      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
 				if (!Printall) {
 				  *PV2 = 1;
 				  PV_DEC(PV);
@@ -20625,7 +20705,7 @@ nextbb:
 			hashcnt++;
 			crypt_rn(lmac, linebuf, linebuf2, BCRYPT_HASHSIZE);
 			JSLG(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
-			if (Printall || (PV && (Contfound || *PV == 0))) {
+			if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
 			  if (!Printall) {
 			    *PV = 1;
 			    { Word_t *SPV;
@@ -20725,7 +20805,7 @@ nextbb:
                       continue;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_BCRYPTHMACSHA256), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Format output: $bcrypt-sha256$v=2,t=2b,r=NN$SALT22$HASH31 */
                       /* setting[4..5] = rounds, setting[7..28] = salt22 */
                       /* linebuf2 = "$2b$NN$salt22hash31", hash31 = linebuf2 + slen */
@@ -20801,7 +20881,7 @@ BC_Start:
                     hashcnt++;
                     crypt_rn(cur, linebuf, linebuf2, BCRYPT_HASHSIZE);
                     JSLG(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)linebuf2);
-                    if (Printall || (PV && (Contfound || *PV == 0))) {
+                    if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                       if (!Printall) {
                         *PV = 1;
                         { Word_t *SPV;
@@ -20914,7 +20994,7 @@ BC_Start:
                         outstanding++;
                         hashcnt++;
                         if (crypt_rn(mdbuf, linebuf2, newbuf, BCRYPT_HASHSIZE) &&
-                            (Printall || strcmp(newbuf, linebuf2) == 0)) {
+                            (Printall || (strcmp(newbuf, linebuf2) == 0 && (Contfound || PV_TAKE(PV))))) {
                           int bl, j;
                           /* Emit <MCF>:<site salt> as prfound's hash argument, so
                            * the line it writes is TYPE <MCF>:<salt>:<password> and
@@ -21203,7 +21283,7 @@ sha512salt_s:
                   memmove(linebuf + MAXLINE + len, pepper, peplen);
 		  x = U8TO16LE(linebuf+MAXLINE-saltlen, len+saltlen+peplen,
 		               wline, MAXLINE*2);
-		  if (x > 0) {
+		  if (x >= 0) {	/* ill-formed is < 0; all-empty is 0 bytes, hashed */
                   mysha1((char *) wline, x, curin.h);
                   hashcnt++;
                   if (checkhashkey(&curin, 40, s1, job)) {
@@ -22010,7 +22090,7 @@ sha1saltpass:
 		    MD4(cur, len, md5buf.h);
 		} else {
 		  x = U8TO16LE(cur, len, wline, MAXLINE*2);
-		  if (x <= 0) break;
+		  if (x < 0) break;
 		  MD4((char *) wline, x, md5buf.h);
 		}
 
@@ -22039,7 +22119,7 @@ sha1saltpass:
                   break;
 		if (Unicode == 0) {
 		  len = U8TO16LE(cur, len, wline, MAXLINE*2);
-		  if (len <= 0)
+		  if (len < 0)
   		    break;
 		  MD4((char *) wline, len, md5buf.h);
 		} else {
@@ -22059,7 +22139,10 @@ sha1saltpass:
                       i = saltlen = Uklen;
                       memcpy(newbuf, tsalt, i);
 		      x = U8TO16LE(newbuf, i, wline, MAXLINE*2);
-		      if (x > 0) {
+		      /* An ill-formed user has no UTF-16 form: no hash for it
+		       * (hashpipe's compute_mscache refuses it the same way),
+		       * never its raw bytes. x == 0 is the empty user. */
+		      if (x >= 0) {
 		        unsigned short *dest;
                         dest = (unsigned short *) wline;
  		        i = x;
@@ -22069,13 +22152,11 @@ sha1saltpass:
                           if (iswupper(ht)) ht = towlower(ht);
 		          dest[x] = ht;
                         }
-                      } else {
-                        memmove(wline, newbuf, i);
+                        memmove(linebuf + 16, wline, i);
+                        MD4(linebuf, 16 + i, curin.h);
+                        if (checkhashsalt_user(&curin, 32, s1, saltlen, 1, job))
+                          PV_DEC(PV);
                       }
-                      memmove(linebuf + 16, wline, i);
-                      MD4(linebuf, 16 + i, curin.h);
-                      if (checkhashsalt_user(&curin, 32, s1, saltlen, 1, job))
-                        PV_DEC(PV);
                     }
                     UJSLN(PV, ujudy);
                   }
@@ -22087,7 +22168,8 @@ sha1saltpass:
                   break;
                 for (i = 1; i <= Maxniter; i++) {
 		  len = b64_encode(cur, linebuf2, len);
-	          if (len == 0 || len > (MAXLINE*3/4)) break;
+	          /* base64 of the empty string is empty: the empty password is a fixed point, so emit round 1 only */
+		  if ((len == 0 && i > 1) || len > (MAXLINE*3/4)) break;
 		  for (x=0,d=linebuf+len-1;x<len;x++) {
 		    *d-- = linebuf2[x];
 		  }
@@ -22277,7 +22359,7 @@ md4utf16:
 		  MD4(cur,len,md5buf.h);
 		} else {
 		  len = U8TO16LE(cur, len, wline, MAXLINE*2);
-		  if (len <= 0)
+		  if (len < 0)
 		    break;
 		  MD4((char *) wline, len, md5buf.h);
 		}
@@ -22301,7 +22383,7 @@ md4utf16:
 		  MD4(cur,len,md5buf.h);
 		} else {
 		  len = U8TO16LE(cur, len, wline, MAXLINE*2);
-		  if (len <= 0)
+		  if (len < 0)
 		    break;
 		  MD4((char *) wline, len, md5buf.h);
 		}
@@ -23570,7 +23652,7 @@ md4utf16:
                   fastcopy(mdbuf + 40, s1, 20);
                   mdbuf[60] = 0;
                   JSLG(PV, JUDYJ(JOB_ORACLE11), (unsigned char *)mdbuf);
-                  if (Printall || (PV && (Contfound || *PV == 0))) {
+                  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                     if (!Printall) {
                       *PV = 1;
                       PV_DEC(saltsnap[si].PV);
@@ -25724,7 +25806,7 @@ sha11saltmd5:
                 b64_encode((char *)curin.h, linebuf2, 20);
                 linebuf2[28] = 0;
                 JSLG(PV, JUDYJ(JOB_PEOPLESOFT), (unsigned char *)linebuf2);
-                if (Printall || (PV && (Contfound || *PV == 0))) {
+                if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                   if (!Printall)
                     *PV = 1;
 #if ARM < 8
@@ -25804,7 +25886,7 @@ sha11saltmd5:
                         expect[el] = 0;
                       }
                       JSLG(PV, JUDYJ(JOB_EPISERVER), (unsigned char *)expect);
-                      if (Printall || (PV && (Contfound || *PV == 0))) {
+                      if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                         if (!Printall) {
                           *PV = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -25876,7 +25958,7 @@ sha11saltmd5:
                     /* look up in JudyJ[JOB_HMAILSERVER] */
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_HMAILSERVER), (unsigned char *)hm_full);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -25937,7 +26019,7 @@ sha11saltmd5:
                   hashcnt++;
                   juniper_encode(curin.h, linebuf2);
                   JSLG(PV, JUDYJ(JOB_JUNIPERSSG), (unsigned char *)linebuf2);
-                  if (Printall || (PV && (Contfound || *PV == 0))) {
+                  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                     if (!Printall)
                       *PV = 1;
 #if ARM < 8
@@ -25987,7 +26069,7 @@ sha11saltmd5:
                   cisco_pix_encode(curin.h, pix_enc);
                   hashcnt++;
                   JSLG(PV, JUDYJ(JOB_CISCOPIX), (unsigned char *)pix_enc);
-                  if (Printall || (PV && (Contfound || *PV == 0))) {
+                  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                     if (!Printall)
                       *PV = 1;
 #if ARM < 8
@@ -26060,7 +26142,7 @@ sha11saltmd5:
                     hashcnt++;
                     { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_CISCOASA), (unsigned char *)asa_enc);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26136,7 +26218,7 @@ sha11saltmd5:
                         strcpy(linebuf + 41, saltsnap[si].salt);
                         { Word_t *PV2;
                           JSLG(PV2, JUDYJ(JOB_IPMI_SHA1), (unsigned char *)linebuf);
-                          if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                          if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                             /* save salt before compaction may invalidate si */
                             const char *matched_salt = saltsnap[si].salt;
                             if (!Printall) {
@@ -26216,7 +26298,7 @@ sha11saltmd5:
                         strcpy(linebuf + 33, saltsnap[si].salt);
                         { Word_t *PV2;
                           JSLG(PV2, JUDYJ(JOB_IPMI_MD5), (unsigned char *)linebuf);
-                          if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                          if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                             /* save salt before compaction may invalidate si */
                             const char *matched_salt = saltsnap[si].salt;
                             if (!Printall) {
@@ -26308,7 +26390,7 @@ sha11saltmd5:
                       strcpy(linebuf + 33, salt_str);
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_ISCSI_CHAP), (unsigned char *)linebuf);
-                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                        if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                           const char *matched_salt = saltsnap[si].salt;
                           if (!Printall) {
                             *PV2 = 1;
@@ -26545,7 +26627,7 @@ sha11saltmd5:
                       mdbuf[49] = 0;
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_NETSCALER), (unsigned char *)mdbuf);
-                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                        if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -26650,7 +26732,7 @@ sha11saltmd5:
                   mdbuf[129] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_NETSCALER_PBKDF2), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26767,7 +26849,7 @@ sha11saltmd5:
 
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ORACLE7), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -26893,7 +26975,7 @@ sha11saltmd5:
                   /* match — look up in JudyJ */
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_NETNTLMV1), (unsigned char *)sl);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -27030,7 +27112,7 @@ sha11saltmd5:
                   /* match */
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_NETNTLMV2), (unsigned char *)sl);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -27117,7 +27199,7 @@ sha11saltmd5:
                   }
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_LASTPASS), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* reconstruct full format: hash:salt for output */
                       char outkey[256];
                       sprintf(outkey, "%s:%s", mdbuf, sl);
@@ -27175,7 +27257,8 @@ sha11saltmd5:
                               AES_ecb_encrypt(hash_bin, decrypted, aeskey, AES_DECRYPT);
                               for (y = 0; y < 16; y++)
                                 plain[y] = decrypted[y] ^ iv_bin[y];
-                              if (memcmp(plain, email, cmplen) == 0) {
+                              if (memcmp(plain, email, cmplen) == 0 &&
+                                  (Printall || Contfound || PV_TAKE(PV2))) {
                                 char outkey[256];
                                 sprintf(outkey, "%s:%s", mdbuf, sl);
                                 if (!Printall) {
@@ -27257,7 +27340,7 @@ sha11saltmd5:
                   mdbuf[40] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_FORTIGATE), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* reconstruct AK1 + base64(salt + sha1) for output */
                       char fg_raw[32], fg_out[64];
                       memcpy(fg_raw, tsalt, 12);
@@ -27378,7 +27461,7 @@ sha11saltmd5:
 
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_DOMINO8), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct (H...) hash for output */
                       unsigned char d8_enc_raw[36];
                       memcpy(d8_enc_raw, d8_salt16, 16);
@@ -27440,7 +27523,7 @@ sha11saltmd5:
                     hashcnt++;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SIPHASH), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output format: hash:2:4:key */
                       snprintf(linebuf, MAXLINE, "%s:2:4:%s", mdbuf, ts);
                       if (!Printall) {
@@ -27491,7 +27574,7 @@ sha11saltmd5:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_CRAMMD5), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct $cram_md5$challenge$response with new HMAC */
                       /* Decode old response to get username prefix */
                       int cm_resplen;
@@ -27572,7 +27655,7 @@ sha11saltmd5:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct {x-issha, ITER}BASE64(hash+salt) for output */
                       unsigned char sh_raw[280];
                       memcpy(sh_raw, curin.h, 20);
@@ -27630,7 +27713,7 @@ sha11saltmd5:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_REDHAT389DS), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct {PBKDF2_SHA256}BASE64(iter4_BE+salt64+hash256) */
                       unsigned char rh_raw[324];
                       rh_raw[0] = (rh_iter >> 24) & 0xff;
@@ -27695,7 +27778,7 @@ sha11saltmd5:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_POSTGRESCRAM), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: $postgres$user*challenge*hash */
                       snprintf(linebuf2, MAXLINE*3, "$postgres$%.*s*%s*%s",
                                pg_ulen, ts, pg_chal_hex, mdbuf);
@@ -27754,7 +27837,7 @@ sha11saltmd5:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_MYSQLCRAM), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE*3, "$mysqlna$%s*%s", ts, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -27808,7 +27891,7 @@ sha11saltmd5:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SHIRO1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct: $shiro1$SHA-512$iter$b64salt$b64hash */
                       char sh_b64s[32], sh_b64h[100];
                       int sh_b64slen = b64_encode((char *)sh_salt, sh_b64s, 16);
@@ -27862,7 +27945,7 @@ sha11saltmd5:
                     mdbuf[16] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ECRYPTFS), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE*3, "$ecryptfs$0$1$%s$%s", ts, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -27915,7 +27998,7 @@ sha11saltmd5:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ORACLE12), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: 128 UC hex hash + 32 UC hex salt */
                       char or_out[161];
                       for (x = 0; x < 64; x++) {
@@ -27973,7 +28056,7 @@ sha11saltmd5:
                     cf_hex[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_COLDFUSION10), (unsigned char *)cf_hex);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE*3, "%s:%s", cf_hex, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -28032,7 +28115,7 @@ sha11saltmd5:
                     az_hex[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AZURESYNC), (unsigned char *)az_hex);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE*3, "v1;PPH1_MD4,%s,%d,%s", hp, az_iter, az_hex);
                       if (!Printall) {
                         *PV2 = 1;
@@ -28084,7 +28167,7 @@ sha11saltmd5:
                     af_hex[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ANDROIDFDE), (unsigned char *)af_hex);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: salt2(64) + hmac(64) + salt(32) = 160 hex */
                       char af_out[161];
                       memcpy(af_out, ts, 64); /* salt2 */
@@ -28418,7 +28501,7 @@ sha11saltmd5:
                   mdbuf[32] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_AXCRYPTSHA1), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                  if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                     snprintf(linebuf2, MAXLINE*3, "$axcrypt_sha1$%s", mdbuf);
                     if (!Printall) *PV2 = 1;
                     prfound(job, linebuf2);
@@ -28460,7 +28543,7 @@ sha11saltmd5:
                       linebuf2[81] = 0;
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_WBB3), (unsigned char *)linebuf2);
-                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                        if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -28535,7 +28618,7 @@ sha11saltmd5:
                       linebuf[86] = 0;
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_SYBASE_ASE), (unsigned char *)linebuf);
-                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                        if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -29430,7 +29513,7 @@ sha11saltmd5:
                   { int si, u16len;
                     u16len = U8TO16LE(cur, len, wline,
                                       MAXLINE * sizeof(wchar_t));
-                    if (u16len <= 0) break;   /* ill-formed, or nothing to hash */
+                    if (u16len < 0) break;   /* ill-formed; empty is 0 bytes, hashed */
                     for (si = 0; si < nsalts_job; si++) {
                       const char *grp = saltsnap[si].salt;
                       unsigned char sz_key[32], sz_salt[64];
@@ -29503,8 +29586,23 @@ sha11saltmd5:
                           struct SevenZipRec *rp = &SevenZipRecs[r];
                           unsigned char plain[16], hplain[16];
                           const char *how = NULL;
-                          int b, ok, hbits = 0, t2 = 0, evidence;
+                          int b, ok, hbits = 0, t2 = 0, evidence, padok;
                           if (strcmp(rp->group, grp) != 0) continue;
+                          if (rp->zsynth) {
+                            /* -z with no archive: make the placeholder one
+                             * THIS key opens. CBC gives P = D(C1) ^ C0, so
+                             * C1 = E(C0) leaves an all-zero final block: the
+                             * line verifies in hashpipe and loads with -F. */
+                            AES_KEY *sz_ek = (AES_KEY *)(linebuf2 + 1024);
+                            int ll = (int)strlen(rp->line) - 32;
+                            AES_set_encrypt_key(sz_key, 256, sz_ek);
+                            AES_encrypt(rp->tail, plain, sz_ek);
+                            memcpy(mdbuf, rp->line, ll);
+                            prmd5_32(plain, mdbuf + ll);
+                            mdbuf[ll + 32] = 0;
+                            prfound(job, mdbuf);
+                            continue;
+                          }
                           AES_decrypt(rp->tail + 16, plain, sz_ak);
                           for (b = 0; b < 16; b++) plain[b] ^= rp->tail[b];
                           /* ---- tier 0: trailing zero pad. padsize 0 carries
@@ -29513,6 +29611,7 @@ sha11saltmd5:
                           ok = 1;
                           for (b = 16 - rp->padsize; ok && b < 16; b++)
                             if (plain[b]) ok = 0;
+                          padok = ok;
 
                           /* ---- tier 1: does the decrypted head match the
                            * declared type? One extra AES block, and the only
@@ -29525,12 +29624,22 @@ sha11saltmd5:
                           }
 
                           /* ---- tier 2: decompress and compare CRC32. Runs
-                           * only on a tier-0/1 pass, so its cost is off the
-                           * hot path entirely. */
+                           * on a tier-0/1 pass, or on a tier-0 fail when the
+                           * whole stream is present -- off the KDF's hot path
+                           * either way (one stream decrypt per candidate). */
                           if (ok && rp->tier2) {
                             t2 = sevenzip_tier2(rp, sz_key, &how);
                             if (t2 < 0) ok = 0;      /* definitively refuted */
                             else if (t2 == 2) hbits += 32;  /* filter erased */
+                          } else if (!padok && rp->tier2) {
+                            /* Tier 0 failed, but the whole stream is here: a
+                             * CRC confirmation outranks the pad test. hashcat's
+                             * 11600 example pads PKCS#7 (04040404), not with
+                             * zeros, and hashcat accepts on the CRC alone. Only
+                             * t2 == 1 overrides; anything else stays refused. */
+                            t2 = sevenzip_tier2(rp, sz_key, &how);
+                            if (t2 == 1) ok = 1;
+                            else t2 = 0;
                           }
 
                           evidence = 8 * rp->padsize + hbits;
@@ -29713,7 +29822,7 @@ sha11saltmd5:
                     /* look up in JudyJ[JOB_MEDIAWIKI] */
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_MEDIAWIKI), (unsigned char *)mw_full);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -29812,7 +29921,7 @@ sha11saltmd5:
                   c4_enc[43] = 0; /* strip trailing '=' */
                   hashcnt++;
                   JSLG(PV, JUDYJ(JOB_CISCO4), (unsigned char *)c4_enc);
-                  if (Printall || (PV && (Contfound || *PV == 0))) {
+                  if (Printall || (PV && (Contfound || PV_TAKE(PV)))) {
                     if (!Printall)
                       *PV = 1;
 #if ARM < 8
@@ -29880,7 +29989,7 @@ sha11saltmd5:
                       /* look up in JudyJ[JOB_CISCOISE] */
                       { Word_t *PV2;
                         JSLG(PV2, JUDYJ(JOB_CISCOISE), (unsigned char *)mdbuf);
-                        if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                        if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                           if (!Printall) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
@@ -30034,7 +30143,7 @@ sha11saltmd5:
                       snprintf(jkey, sizeof(jkey), "%.*s$%s",
                                saltlen, s1, aix_enc);
                       JSLG(PV2, *aixjudy, (unsigned char *)jkey);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         if (!Printall) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
@@ -30563,6 +30672,11 @@ MD5SALTstart:
                           && checkhashkeylen(&curin, 32, sbuf[i], slen4[i], job)) {
                         PV_DEC(pvbuf[i]);
                       }
+                      if (Maxiter > 1) {
+                        uint32_t lh[4] = { R[0].words[i], R[1].words[i], R[2].words[i], R[3].words[i] };
+                        md5salt_lane_iter(&curin, lh, sbuf[i], slen4[i], pvbuf[i],
+                                          newbuf, &hashcnt, job);
+                      }
                     }
                     /* Clear leftover salt data from SSEBUF lanes */
                     {
@@ -30590,6 +30704,11 @@ MD5SALTstart:
                           && checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                         PV_DEC(pvbuf2[i]);
                       }
+                      if (Maxiter > 1) {
+                        uint32_t lh[4] = { f32[i], f32[4 + i], f32[8 + i], f32[12 + i] };
+                        md5salt_lane_iter(&curin, lh, sbuf2[i], slen2[i], pvbuf2[i],
+                                          newbuf, &hashcnt, job);
+                      }
                     }
                     pcnt2 = 0;
                   }
@@ -30611,6 +30730,11 @@ MD5SALTstart:
                         && checkhashkeylen(&curin, 32, sbuf[i], slen4[i], job)) {
                       PV_DEC(pvbuf[i]);
                     }
+                    if (Maxiter > 1) {
+                      uint32_t lh[4] = { R[0].words[i], R[1].words[i], R[2].words[i], R[3].words[i] };
+                      md5salt_lane_iter(&curin, lh, sbuf[i], slen4[i], pvbuf[i],
+                                        newbuf, &hashcnt, job);
+                    }
                   }
                   pcnt = 0;
                 }
@@ -30626,6 +30750,11 @@ MD5SALTstart:
                     if ((hash_maybe(curin.h, 32) || Printall)
                         && checkhashkeylen(&curin, 32, sbuf2[i], slen2[i], job)) {
                       PV_DEC(pvbuf2[i]);
+                    }
+                    if (Maxiter > 1) {
+                      uint32_t lh[4] = { f32[i], f32[4 + i], f32[8 + i], f32[12 + i] };
+                      md5salt_lane_iter(&curin, lh, sbuf2[i], slen2[i], pvbuf2[i],
+                                        newbuf, &hashcnt, job);
                     }
                   }
                   pcnt2 = 0;
@@ -31274,7 +31403,11 @@ nextsalt1:
                 mysha1(cur, len, curin.h);
                 prmd5_40(curin.h, mdbuf);
                 csalt = cur;
-                for (i = 1; i < 8 && i <= len; i++) {
+                /* sha1(sha1($plain) . substr($plain, 0, N)), N = 1..7. A
+                 * prefix longer than the password is the password itself, so
+                 * N stops at len. For the empty password every N gives the
+                 * empty prefix: one line, N = 0. */
+                for (i = (len == 0) ? 0 : 1; i < 8 && i <= len; i++) {
                   memmove(mdbuf + 40, csalt, i);
                   memmove(newbuf, csalt, i);
                   newbuf[i] = 0;
@@ -31914,7 +32047,7 @@ nextsalt1:
                   s = bsd_crypt_des(cur, s1, linebuf, desblock);
                   if (s) {
                     JSLG(HPV, JUDYJ(JOB_DESCRYPT),(unsigned char *)linebuf);
-                    if (Printall || (HPV && (Contfound || *HPV == 0))) {
+                    if (Printall || (HPV && (Contfound || PV_TAKE(HPV)))) {
                       i = len;
                       if (*s1 != '_' && i > 8) i = 8;
                       for (y = x = 0; x < i; x++) {
@@ -31925,7 +32058,7 @@ nextsalt1:
                       }
   		      possess(FreeWaiting);
                       if (!Printall && HPV) {
-                        if (*HPV == 0) {
+                        if (!Contfound || *HPV == 0) {  /* PV_TAKE above claimed it */
                           *HPV = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (!Printall && *saltsnap[si].PV == 0) {
@@ -32003,7 +32136,7 @@ nextsalt1:
                   s = bsd_crypt_des(cur, s1, linebuf, desblock);
                   if (s) {
                     JSLG(BPVB, JUDYJ(JOB_BSDICRYPT),(unsigned char *)linebuf);
-                    if (Printall || (BPVB && (Contfound || *BPVB == 0))) {
+                    if (Printall || (BPVB && (Contfound || PV_TAKE(BPVB)))) {
                       i = len;
                       for (y = x = 0; x < i; x++) {
                         if ((signed char) cur[x] < ' ') {
@@ -32013,7 +32146,7 @@ nextsalt1:
                       }
   		      possess(FreeWaiting);
                       if (!Printall && BPVB) {
-                        if (*BPVB == 0) {
+                        if (!Contfound || *BPVB == 0) {  /* PV_TAKE above claimed it */
                           *BPVB = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (!Printall && *saltsnap[si].PV == 0) {
@@ -32158,7 +32291,7 @@ nextsalt1:
    		mymd5(cur, len, curin.h);
 	        cur = prmd5_32(curin.h, mdbuf);
 		len = b64_decode(cur, linebuf,&cryptlen);
-		if (len <= 0)		/* defensive: see JOB_MD5DECBASE64 */
+		if (len <= 0)		/* defensive: see b64_decode_word */
 		  break;
 		cur = linebuf;
                 x = 1;
@@ -32171,17 +32304,8 @@ nextsalt1:
               case JOB_MD5DECBASE64:
 	        if (len > MAXLINE/2)
 		  break;
-		len = b64_decode(cur, linebuf,&cryptlen);
-		/* A failed base64 decode yields a zero-length buffer, and
-		 * hashing that produces md5("") = d41d8cd98f00b204e9800998ecf8427e
-		 * for EVERY candidate that fails to decode -- so any hash list
-		 * containing that value matched a flood of unrelated passwords
-		 * and reported them all. b64_decode() stops at the first
-		 * character outside the base64 alphabet, so ordinary passwords
-		 * (' 8981...', '_1898...', '1.0161...', anything with ':') decode
-		 * to nothing. A conversion that produced no output has failed;
-		 * do not proceed to the hash. */
-		if (len <= 0)
+		len = b64_decode_word(cur, len, linebuf);
+		if (len < 0)
 		  break;
 		cur = linebuf;
                 x = 1;
@@ -32190,17 +32314,8 @@ nextsalt1:
               case JOB_SHA1DECBASE64:
 	        if (len > MAXLINE/2)
 		  break;
-		len = b64_decode(cur, linebuf,&cryptlen);
-		/* A failed base64 decode yields a zero-length buffer, and
-		 * hashing that produces md5("") = d41d8cd98f00b204e9800998ecf8427e
-		 * for EVERY candidate that fails to decode -- so any hash list
-		 * containing that value matched a flood of unrelated passwords
-		 * and reported them all. b64_decode() stops at the first
-		 * character outside the base64 alphabet, so ordinary passwords
-		 * (' 8981...', '_1898...', '1.0161...', anything with ':') decode
-		 * to nothing. A conversion that produced no output has failed;
-		 * do not proceed to the hash. */
-		if (len <= 0)
+		len = b64_decode_word(cur, len, linebuf);
+		if (len < 0)
 		  break;
 		cur = linebuf;
                 x = 1;
@@ -34812,7 +34927,8 @@ md5sha256:
                   break;
                 for (i = 1; i <= Maxniter; i++) {
 		  len = b64_encode(cur, linebuf2, len);
-	          if (len == 0 || len > (MAXLINE*3/4)) break;
+	          /* base64 of the empty string is empty: the empty password is a fixed point, so emit round 1 only */
+		  if ((len == 0 && i > 1) || len > (MAXLINE*3/4)) break;
 		  for (x=0,d=linebuf+len-1;x<len;x++) {
 		    *d-- = linebuf2[x];
 		  }
@@ -34996,9 +35112,10 @@ SHA3MD_start:
 	      case JOB_SHA1PASS_TRUNC:
 		mysha1(cur,len,curin.h);
 		prmd5_40(curin.h, linebuf);
-		fastcopy(linebuf+40,cur,3);
+		y = (len < 3) ? len : 3;	/* PHP substr($p,0,3): short pass is whole */
+		fastcopy(linebuf+40,cur,y);
 		cur = linebuf;
-		len = 40+3;
+		len = 40+y;
                 x = 1;
                 goto SHA1_start;
 
@@ -35339,7 +35456,7 @@ sha1md5md5uc:
                       Word_t *PV2;
                       b64_encode((char *)curin.h, yaf_b64, 20);
                       JSLG(PV2, JUDYJ(JOB_YAF_SHA1), (unsigned char *)yaf_b64);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         /* Keep the salt before the swap-remove below: it moves
                          * si, and the print then read saltsnap[-1] (with one
                          * salt) and wrote "(null)" for the salt. */
@@ -35468,9 +35585,10 @@ sha1md5md5uc:
 	      case JOB_SHA1SHA1TRUNC_SHA1PASS_3:
 		mysha1(cur,len,curin.h);
 		prmd5_40(curin.h, linebuf);
-		fastcopy(linebuf+40,cur,3);
+		y = (len < 3) ? len : 3;	/* PHP substr($p,0,3): short pass is whole */
+		fastcopy(linebuf+40,cur,y);
 		cur = linebuf;
-		len = 40+3;
+		len = 40+y;
 	      case JOB_SHA1SHA1UCTRUNC:
 	      case JOB_SHA1SHA1CAPTRUNC:
 	      case JOB_SHA1SHA1TRUNC:
@@ -35859,7 +35977,7 @@ sha1sha256:
 		if (!Unicode) {
 		  wline[0] = 0;
 		  len = U8TO16LE(cur, len, (char *)wline + 1, MAXLINE);
-		  if (len <= 0) break;
+		  if (len < 0) break;
 		  cur = (char *)wline;len++;
 		}
 		x = 1;
@@ -36056,8 +36174,9 @@ sha1sha256:
 	      case JOB_SHA1SHA1PASS_TRUNC1SALT:
 		mysha1(cur,len,curin.h);
 		prmd5_40(curin.h, linebuf);
-		fastcopy(linebuf+40,cur,3);
-		mysha1(linebuf, 40+3, curin.h);
+		y = (len < 3) ? len : 3;	/* PHP substr($p,0,3): short pass is whole */
+		fastcopy(linebuf+40,cur,y);
+		mysha1(linebuf, 40+y, curin.h);
 		prmd5_40(curin.h, linebuf);
 		hashcnt += (128-7) * Maxiter;
 		for (y=9; y < 128; y++) {
@@ -40201,7 +40320,7 @@ HAV256_5_start:
 		      match_flags = &dummy_flags;
 		      hfound = 1;
 		    }
-		    if (hfound && (Contfound || *match_flags != (unsigned short)job->op)) {
+		    if (hfound && (Contfound || MF_TAKE(match_flags, job->op))) {
 		      char outhash[128];
 		      *match_flags = job->op;
 		      /* SHA1_cs = SHA1(UTF16LE(pass) . salt) — for output */
@@ -40453,7 +40572,7 @@ HAV256_5_start:
                   /* Convert password to UTF-16LE once */
                   int u16len = U8TO16LE(cur, len, wline,
                                         MAXLINE * sizeof(wchar_t));
-                  if (u16len <= 0) break;   /* ill-formed, or nothing to hash */
+                  if (u16len < 0) break;   /* ill-formed; empty is 0 bytes, hashed */
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     saltlen = saltsnap[si].saltlen;
@@ -40469,7 +40588,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_PS_TOKEN), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -40501,7 +40620,7 @@ HAV256_5_start:
                   /* Convert password to UTF-16LE once */
                   int u16len = U8TO16LE(cur, len, wline,
                                         MAXLINE * sizeof(wchar_t));
-                  if (u16len <= 0) break;   /* ill-formed, or nothing to hash */
+                  if (u16len < 0) break;   /* ill-formed; empty is 0 bytes, hashed */
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     saltlen = saltsnap[si].saltlen;
@@ -40517,7 +40636,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WINPHONE), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -40825,7 +40944,7 @@ HAV256_5_start:
                     if (valid) {
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_TACACS), (unsigned char *)saltsnap[si].salt);
-                      if (PV2 && (Contfound || *PV2 == 0)) {
+                      if (PV2 && (Contfound || PV_TAKE(PV2))) {
                         snprintf(linebuf, MAXLINE, "$tacacs-plus$0$%.*s$%.*s$%s",
                                  8, ts, ct_hexlen, c1 + 1, c2 + 1);
                         *PV2 = 1;
@@ -40957,7 +41076,7 @@ HAV256_5_start:
                                zpk, iter, 32, c2 + 1, c3 + 1);
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_APPLE_SECURE_NOTES), (unsigned char *)linebuf2);
-                      if (PV2 && (Contfound || *PV2 == 0)) {
+                      if (PV2 && (Contfound || PV_TAKE(PV2))) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -40996,7 +41115,7 @@ HAV256_5_start:
                   mdbuf[32] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                  if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                     snprintf(linebuf, MAXLINE, "{CRAM-MD5}%s00000000000000000000000000000000", mdbuf);
                     if (!Printall) *PV2 = 1;
                     prfound(job, linebuf);
@@ -41080,7 +41199,7 @@ HAV256_5_start:
                     linebuf[hmac_len * 2] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_JWT), (unsigned char *)linebuf);
-                    if (PV2 && (Contfound || *PV2 == 0)) {
+                    if (PV2 && (Contfound || PV_TAKE(PV2))) {
                       /* Output = full JWT string */
                       snprintf(linebuf2, MAXLINE, "%s", jwt);
                         *PV2 = 1;
@@ -41131,7 +41250,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_QNX_MD5), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "@m,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
                         *PV2 = 1;
@@ -41182,7 +41301,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_QNX_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "@s,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
                         *PV2 = 1;
@@ -41235,7 +41354,7 @@ HAV256_5_start:
                     mdbuf[128] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_QNX_SHA512), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "@S,%d@%s@%s", iter, mdbuf, salt_str);
                       if (!Printall) {
                         *PV2 = 1;
@@ -41300,7 +41419,7 @@ HAV256_5_start:
                       /* Try JudyJ with the computed format */
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_QNX7_SHA512), (unsigned char *)linebuf);
-                      if (PV2 && (Contfound || *PV2 == 0)) {
+                      if (PV2 && (Contfound || PV_TAKE(PV2))) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
                         if (*saltsnap[si].PV == 0) {
@@ -41597,7 +41716,7 @@ HAV256_5_start:
                         snprintf(linebuf2, MAXLINE, "$krb5pa$%d$%.*s$%.*s$%s",
                                  is_17 ? 17 : 18, userlen, c1 + 1, realmlen, ts, hexdata);
                         JSLG(PV2, JUDYJ(job->op), (unsigned char *)linebuf2);
-                        if (PV2 && (Contfound || *PV2 == 0)) {
+                        if (PV2 && (Contfound || PV_TAKE(PV2))) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -41663,7 +41782,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WPA_PMKID), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: WPA*01*pmkid*macap*macsta*essid*** */
                       snprintf(linebuf2, MAXLINE, "WPA*01*%s*%.*s*%.*s*%.*s***",
                                mdbuf, 12, c1 + 1, 12, c2 + 1, essid_hexlen, ts);
@@ -41792,7 +41911,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WPA_EAPOL), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: WPA*02*mic*macap*macsta*essid*anonce*eapol*00 */
                       char *hp2 = linebuf2;
                       hp2 += sprintf(hp2, "WPA*02*%s*%.*s*%.*s*%.*s*%.*s*%.*s*00",
@@ -41872,7 +41991,7 @@ HAV256_5_start:
                       mdbuf[32] = 0;
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_WPA_PMK), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         snprintf(linebuf2, MAXLINE, "WPA*01*%s*%.*s*%.*s*%.*s***",
                                  mdbuf, 12, c1 + 1, 12, c2 + 1, essid_hexlen, essid_start);
                         if (!Printall) {
@@ -41953,7 +42072,7 @@ HAV256_5_start:
                       mdbuf[32] = 0;
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_WPA_PMK), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         char *hp2 = linebuf2;
                         hp2 += sprintf(hp2, "WPA*02*%s*%.*s*%.*s*%.*s*%.*s*%.*s*00",
                                  mdbuf,
@@ -42120,7 +42239,7 @@ HAV256_5_start:
                       continue;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WPBCRYPT), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Format output: $wp$2y$NN$SALT22HASH31 */
                       /* setting = "$2b$NN$salt22", linebuf2 = "$2b$NN$salt22hash31" */
                       /* Replace "$2b$" prefix with "$wp$2b$" — but hashcat uses 2y */
@@ -42190,7 +42309,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_ANSIBLE_VAULT), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: $ansible$0*0*salt*ct*hmac */
                       snprintf(linebuf2, MAXLINE, "$ansible$0*0*%.*s*%s*%s",
                                64, ts, ct_start, mdbuf);
@@ -42310,7 +42429,7 @@ HAV256_5_start:
                                32, c1 + 1, iter, c2 + 1);
                       Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_APFS), (unsigned char *)linebuf2);
-                      if (PV2 && (Contfound || *PV2 == 0)) {
+                      if (PV2 && (Contfound || PV_TAKE(PV2))) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -42365,7 +42484,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_OTM_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: otm_sha256:iter:salt:hash_b64 */
                       char *hp2 = linebuf;
                       b64_encode((char *)curin.h, linebuf2, 32);
@@ -42450,7 +42569,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_TELEGRAM_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE, "$telegram$0*%s*%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -42499,7 +42618,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WEB2PY_SHA512), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "pbkdf2(%d,20,sha512)$%s$%s",
                                iter, salt, mdbuf);
                       if (!Printall) {
@@ -42596,7 +42715,7 @@ HAV256_5_start:
                     mdbuf[128] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct output format */
                       if (job->op == JOB_SOLARWINDS) {
                         b64_encode((char *)curin.h, linebuf2, 64);
@@ -42934,7 +43053,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_BITWARDEN), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output: $bitwarden$2*iter1*iter2*salt_b64*hash_b64 */
                       b64_encode(newbuf + 32, linebuf2, 32);
                       snprintf(linebuf, MAXLINE, "$bitwarden$2*%d*%d*%s*%s",
@@ -43005,7 +43124,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_MONGODB_SHA1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Re-encode for output */
                       char user_b64[128], salt_b64[32], hash_b64[32];
                       b64_encode((char *)ts, user_b64, userlen);
@@ -43066,7 +43185,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_MONGODB_SHA256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Re-encode for output */
                       char salt_b64[64], hash_b64[64];
                       b64_encode((char *)mg_salt, salt_b64, 28);
@@ -43123,7 +43242,7 @@ HAV256_5_start:
                   mdbuf[64] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_FORTIGATE256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       char fg_raw[44], fg_out[68];
                       memcpy(fg_raw, tsalt, 12);
                       memcpy(fg_raw + 12, curin.h, 32);
@@ -43182,7 +43301,7 @@ HAV256_5_start:
                   mdbuf[40] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_UMBRACO), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                  if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                     /* Base64 encode for output */
                     b64_encode((char *)curin.h, linebuf2, 20);
                     linebuf2[28] = 0;
@@ -43224,7 +43343,7 @@ HAV256_5_start:
                   mdbuf[8] = 0;
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                  if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                     if (!Printall) *PV2 = 1;
                     prfound(job, mdbuf);
                   }
@@ -43445,7 +43564,7 @@ HAV256_5_start:
                     mdbuf[16] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE*3, "%.*s$%s", sp_slen, ts, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -43517,7 +43636,7 @@ HAV256_5_start:
                     snprintf(linebuf2, MAXLINE*3, "$as400$des$*%.*s*%s", ulen, ts, mdbuf);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AS400_DES), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -43598,7 +43717,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Output format: SALT$HASH */
                       snprintf(linebuf2, MAXLINE*3, "%.*s$%s", sp_slen, ts, mdbuf);
                       if (!Printall) {
@@ -43649,7 +43768,7 @@ HAV256_5_start:
                   mdbuf[40] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_RORAILS_SHA1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", mdbuf, ts);
                       if (!Printall) {
                         *PV2 = 1;
@@ -43715,7 +43834,7 @@ HAV256_5_start:
                   mdbuf[32] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE, "%s:%s", mdbuf, pthex);
                       if (!Printall) {
                         *PV2 = 1;
@@ -43777,7 +43896,7 @@ HAV256_5_start:
                   mdbuf[64] = 0;
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_POSTGRESSCRAM256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct SCRAM format for output */
                       char b64salt_out[128], b64stored_out[64];
                       b64_encode((char *)tsalt, b64salt_out, saltlen);
@@ -43870,7 +43989,7 @@ HAV256_5_start:
                   /* Lookup computed signature in JudyJ */
                   { Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AWSSIGV4), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf((char *)wline, MAXLINE,
                         "$AWS-Sig-v4$0$%.*s$%.*s$%.*s$%s$%s",
                         longdate_len, ts, region_len, c1 + 1,
@@ -43949,7 +44068,7 @@ HAV256_5_start:
                     mdbuf[keylen * 2] = 0;
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         snprintf(linebuf2, MAXLINE, "$krb5db$%d$%.*s$%.*s$%s",
                                  is_17 ? 17 : 18, userlen, c1 + 1, realmlen, ts, mdbuf);
                         if (!Printall) {
@@ -44069,7 +44188,7 @@ HAV256_5_start:
                     hashcnt++;
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_MURMUR3), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         snprintf(linebuf, MAXLINE, "%s:%s", mdbuf, ts);
                         if (!Printall) {
                           *PV2 = 1;
@@ -44130,7 +44249,7 @@ HAV256_5_start:
                     mdbuf[32] = 0;
                     { Word_t *PV2;
                       JSLG(PV2, JUDYJ(JOB_MSSNTP), (unsigned char *)mdbuf);
-                      if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                      if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                         snprintf(linebuf, MAXLINE, "$sntp-ms$%s$%s", mdbuf, ts);
                         if (!Printall) {
                           *PV2 = 1;
@@ -44218,7 +44337,7 @@ HAV256_5_start:
                     prmd5(curin.h, mdbuf, hashlen2 * 2);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       { int stype_out = (job->op == JOB_SSPR_MD5) ? 0 :
                                          (job->op == JOB_SSPR_SHA1) ? 1 :
                                          (job->op == JOB_SSPR_SHA1S) ? 2 :
@@ -44296,7 +44415,7 @@ HAV256_5_start:
                     prmd5_32(curin.h, linebuf2);  /* linebuf2 = final hash */
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_EMPIRECMS), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf, MAXLINE, "%s:%.*s:%.*s", linebuf2, salt1len, ts, salt2len, salt2);
                       if (!Printall) {
                         *PV2 = 1;
@@ -44357,7 +44476,7 @@ HAV256_5_start:
                     b64out[b64len] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_PBKDF1_SHA1), (unsigned char *)b64out);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct PBKDF1:sha1:ITER:B64SALT:B64HASH */
                       char saltb64[400];
                       int saltb64len = b64_encode((char *)tsalt, saltb64, saltbinlen);
@@ -44400,7 +44519,7 @@ HAV256_5_start:
                   unsigned char *u16pass = (unsigned char *)wline;
                   int u16len = U8TO16LE(cur, len, u16pass,
                                         (MAXLINE+16)*sizeof(wchar_t));
-                  if (u16len <= 0) break;
+                  if (u16len < 0) break;
                   for (si = 0; si < nsalts_job; si++) {
                     const char *ts = saltsnap[si].salt;
                     int iter = atoi(ts);
@@ -44440,7 +44559,7 @@ HAV256_5_start:
                         snprintf(mdbuf, MAXLINE+16, "$MSONLINEACCOUNT$0$%d$%.*s", iter,
                           (int)(saltsnap[si].saltlen - (datahex - ts)), datahex);
                         JSLG(PV2, JUDYJ(JOB_MSONLINE), (unsigned char *)mdbuf);
-                        if (PV2 && (Contfound || *PV2 == 0)) {
+                        if (PV2 && (Contfound || PV_TAKE(PV2))) {
                           *PV2 = 1;
                           PV_DEC(saltsnap[si].PV);
                           if (*saltsnap[si].PV == 0) {
@@ -44479,7 +44598,7 @@ HAV256_5_start:
                     crypt_rn(linebuf2, setting, mdbuf, BCRYPT_HASHSIZE);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_WBB4), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -44522,7 +44641,7 @@ HAV256_5_start:
                   snprintf(linebuf2, MAXLINE*3, "$mongodb$0$%.*s$%s", ul, ts, mdbuf);
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_MONGODB), (unsigned char *)linebuf2);
-                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                  if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                     if (!Printall) {
                       *PV2 = 1;
                       PV_DEC(saltsnap[si].PV);
@@ -44563,7 +44682,7 @@ HAV256_5_start:
                     snprintf(linebuf2, MAXLINE*3, "$h$6$%.*s$%.*s", sl, ts, h3l, h3b); }
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_H3C), (unsigned char *)linebuf2);
-                  if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                  if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                     if (!Printall) {
                       *PV2 = 1;
                       PV_DEC(saltsnap[si].PV);
@@ -44644,7 +44763,7 @@ HAV256_5_start:
                              df512 ? '4' : '3', sl, ts, dj, dfb);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)linebuf2);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);
@@ -44695,7 +44814,7 @@ HAV256_5_start:
                     mdbuf[64] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH256), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       unsigned char sh_raw[400];
                       memcpy(sh_raw, curin.h, 32);
                       memcpy(sh_raw + 32, tsalt, sh_saltlen);
@@ -44759,7 +44878,7 @@ HAV256_5_start:
                     mdbuf[96] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH384), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       unsigned char sh_raw[400];
                       memcpy(sh_raw, curin.h, 48);
                       memcpy(sh_raw + 48, tsalt, sh_saltlen);
@@ -44821,7 +44940,7 @@ HAV256_5_start:
                     mdbuf[128] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_SAPCODVNH512), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       /* Reconstruct {x-isSHA512, ITER}BASE64(hash+salt) */
                       unsigned char sh_raw[400];
                       memcpy(sh_raw, curin.h, 64);
@@ -44873,7 +44992,7 @@ HAV256_5_start:
                     mdbuf[40] = 0;
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(JOB_AS400SSHA1), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       snprintf(linebuf2, MAXLINE*3, "$as400$ssha1$*%.*s*%s", userlen, user, mdbuf);
                       if (!Printall) {
                         *PV2 = 1;
@@ -44973,7 +45092,7 @@ HAV256_5_start:
                         { int jj; for (jj = 0; jkey[jj]; jj++) jkey[jj] = tolower(jkey[jj]); }
                         { Word_t *PV2;
                           JSLG(PV2, JUDYJ(JOB_VEEAM_VBK), (unsigned char *)jkey);
-                          if (PV2 && (Contfound || *PV2 == 0)) {
+                          if (PV2 && (Contfound || PV_TAKE(PV2))) {
                             *PV2 = 1;
                             PV_DEC(saltsnap[si].PV);
                             if (*saltsnap[si].PV == 0) {
@@ -45163,7 +45282,7 @@ HAV256_5_start:
                              a2sig, a2ver, a2m, a2t, a2p, b64salt, b64hash);
                     Word_t *PV2;
                     JSLG(PV2, JUDYJ(job->op), (unsigned char *)mdbuf);
-                    if (Printall || (PV2 && (Contfound || *PV2 == 0))) {
+                    if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
                       if (!Printall) {
                         *PV2 = 1;
                         PV_DEC(saltsnap[si].PV);

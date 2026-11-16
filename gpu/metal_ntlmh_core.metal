@@ -493,10 +493,12 @@ static inline void template_finalize(thread template_state &st,
 {
     md4_zeroext_ntlmh(st.h, data, len);
 
-    int non_ascii = 0;
-    for (int i = 0; i < len; i++) {
-        if (data[i] & 0x80u) { non_ascii = 1; break; }
-    }
+    /* No early exit: fglrx 1573.4 (Tahiti) rejects a `break` out of this
+     * scan followed by the `if (non_ascii)` around the decoder loop with
+     * "Error:E010:Irreducible ControlFlow Detected".  OR-reduce instead. */
+    uint hi = 0u;
+    for (int i = 0; i < len; i++) hi |= (uint)data[i];
+    int non_ascii = (hi & 0x80u) != 0u;
     st.have_alt = 0u;
     if (non_ascii) {
         int dropped = 0;

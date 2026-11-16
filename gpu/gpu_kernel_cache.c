@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.11 2026/10/23 13:15:38 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.12 2026/11/15 15:59:03 dlr Exp dlr $
  *
  * Implementation. See gpu_kernel_cache.h for the design overview.
  */
@@ -22,6 +22,8 @@
 #include <sys/types.h>
 
 #include "openssl/evp.h"
+#include <pthread.h>
+#include "../mdxhost.h"   /* mdx_gethostname() for the build-failure FATAL */
 
 #ifdef _WIN32
 #include <io.h>
@@ -724,21 +726,7 @@ static void get_str_info(cl_device_id dev, cl_device_info what, char *out, size_
     out[outlen - 1] = 0;
 }
 
-cl_program gpu_kernel_cache_build_program(
-    cl_context ctx, cl_device_id dev,
-    cl_uint n_sources, const char **sources,
-    const char *build_opts,
-    cl_int *err_out)
-{
-    /* Thin wrapper: pre-B2 callers get NULL defines_str, which means
-     * "no defines" and produces a cache key bit-identical to before
-     * the R3 fix landed. New template-instantiation callers use the
-     * _ex entry point with their own defines_str. */
-    return gpu_kernel_cache_build_program_ex(
-        ctx, dev, n_sources, sources, build_opts, NULL, err_out);
-}
-
-cl_program gpu_kernel_cache_build_program_ex(
+static cl_program build_program_raw(
     cl_context ctx, cl_device_id dev,
     cl_uint n_sources, const char **sources,
     const char *build_opts,
@@ -919,4 +907,97 @@ cl_program gpu_kernel_cache_build_program_ex(
     lock_release(lk);
     if (err_out) *err_out = err;
     return prog;
+}
+
+/* ---- A kernel that does not build is FATAL (2026-11-15) -----------
+ *
+ * Every OpenCL program in mdxfind is built through here, so this is the one
+ * point where a build failure can be made impossible to ignore.  Callers used
+ * to get NULL back and decide for themselves; most "decided" to fall back --
+ * to the legacy MD5 kernel (an NTLMH batch on fglrx was hashed as MD5: 1 line
+ * of 830, exit 0), to the slow MD5 template, to the CPU, or by disabling the
+ * device.  Each of those is a clean-looking run that computed the wrong thing
+ * or nothing.  There is no recoverable build failure: the source is ours and
+ * fixed, so a program that does not build today will not build on retry.
+ *
+ * The caller's file:line and function name arrive through the macros in
+ * gpu_kernel_cache.h; the function name says which kernel (e.g.
+ * gpu_opencl_template_compile_ntlmh).
+ *
+ * A vendor compiler can also END THE PROCESS itself: LLVM's
+ * report_fatal_error ("LLVM ERROR: Cannot select ...") calls exit(1) from
+ * inside clBuildProgram, so control never returns here.  build_site (per
+ * thread, since devices compile in parallel) records what is being built and
+ * an atexit handler names it, so that case also leaves a file:line behind.
+ * A compiler SIGSEGV is not caught; the shell reports it. */
+static __thread const char *build_site_file;
+static __thread int         build_site_line;
+static __thread const char *build_site_func;
+static __thread cl_device_id build_site_dev;
+static pthread_once_t build_site_once = PTHREAD_ONCE_INIT;
+
+static void build_site_atexit(void)
+{
+    char host[256], dname[256];
+    if (!build_site_file) return;
+    mdx_gethostname(host, sizeof host);
+    get_str_info(build_site_dev, CL_DEVICE_NAME, dname, sizeof dname);
+    fflush(stdout);
+    fprintf(stderr,
+        "FATAL: %s:%d (%s): the OpenCL compiler for %s on %s ended the "
+        "process inside clBuildProgram; its own message, if any, is above.\n",
+        build_site_file, build_site_line, build_site_func, dname, host);
+    fflush(stderr);
+}
+
+static void build_site_register(void) { atexit(build_site_atexit); }
+
+cl_program gpu_kernel_cache_build_program_at(
+    cl_context ctx, cl_device_id dev,
+    cl_uint n_sources, const char **sources,
+    const char *build_opts,
+    const char *defines_str,
+    cl_int *err_out,
+    const char *file, int line, const char *func)
+{
+    cl_int err = CL_SUCCESS;
+    cl_program prog;
+
+    pthread_once(&build_site_once, build_site_register);
+    build_site_file = file; build_site_line = line;
+    build_site_func = func; build_site_dev  = dev;
+    prog = build_program_raw(ctx, dev, n_sources, sources, build_opts,
+                             defines_str, &err);
+    build_site_file = NULL;
+    if (prog && err == CL_SUCCESS) {
+        if (err_out) *err_out = CL_SUCCESS;
+        return prog;
+    }
+
+    {
+        char host[256], dname[256];
+        size_t logsz = 0;
+        char *log = NULL;
+        mdx_gethostname(host, sizeof host);
+        get_str_info(dev, CL_DEVICE_NAME, dname, sizeof dname);
+        if (prog &&
+            clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, 0, NULL,
+                                  &logsz) == CL_SUCCESS && logsz > 0 &&
+            (log = (char *)malloc(logsz + 1)) != NULL) {
+            if (clGetProgramBuildInfo(prog, dev, CL_PROGRAM_BUILD_LOG, logsz,
+                                      log, NULL) != CL_SUCCESS)
+                log[0] = 0;
+            log[logsz] = 0;
+        }
+        fflush(stdout);
+        fprintf(stderr,
+            "FATAL: %s:%d (%s): OpenCL kernel build failed on %s, host %s: "
+            "%s err=%d, defines \"%s\", options \"%s\". Build log:\n%s\n",
+            file, line, func, dname, host,
+            prog ? "clBuildProgram" : "clCreateProgramWithSource", (int)err,
+            defines_str ? defines_str : "", build_opts ? build_opts : "",
+            log && log[0] ? log : "(empty)");
+        fflush(stderr);
+        exit(1);
+    }
 }

@@ -41,9 +41,12 @@ int HasSSSE3;
 extern unsigned char trhex[];
 extern int b64_encode(char *clrstr, char *b64dst, int inlen);
 
-static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.49 2026/11/09 21:45:40 dlr Exp dlr $";
+static char *Version __attribute__((unused)) = "$Header: /Users/dlr/src/mdfind/RCS/ruleproc.c,v 1.50 2026/11/14 22:14:32 dlr Exp dlr $";
 /*
  * $Log: ruleproc.c,v $
+ * Revision 1.50  2026/11/14 22:14:32  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.49  2026/11/09 21:45:40  dlr
  * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
  *
@@ -968,8 +971,8 @@ void getcpuinfo() {
  *   0xc8 = '/'  reject if not contains X
  *   0xc7 = '('  reject if first != X
  *   0xc6 = ')'  reject if last != X
- *   0xc5 = 'S'  special: a/A -> 0x0a
- *   0xc4 = '#'  early exit (success)
+ *   0xc5        unused ('S' was removed; it is refused at load)
+ *   0xc4        unused ('#' is a comment, never compiled; do not reuse)
  *   0xc3 = 'H'  hex encode (uppercase)
  *   0xc2 = 'h'  hex encode (lowercase)
  *   0xc1 = 'v'  divide-and-insert
@@ -1040,8 +1043,6 @@ static char format_op_for_error(unsigned char b) {
         case RULE_OP_REJ_NHAS:   return '/';
         case RULE_OP_REJ_FIRST:  return '(';
         case RULE_OP_REJ_LAST:   return ')';
-        case RULE_OP_S_SPECIAL:  return 'S';
-        case RULE_OP_HASH_EXIT:  return '#';
         case RULE_OP_HEX_UPPER:  return 'H';
         case RULE_OP_HEX_LOWER:  return 'h';
         case RULE_OP_CHR_ADD:    return 'B';
@@ -1562,7 +1563,7 @@ int packrules_len(char *line, int *packedlen) {
         /* Map remaining single-byte ASCII opcodes to their high-bit
          * counterparts so applyrule sees only 0x80+ bytes after rev 1.25
          * packrules. Includes whole-string ops (l u r c C t E d f q { } k K)
-         * and the isolated control bytes (M 4 6 Q S # H h). Anything else
+         * and the isolated control bytes (M 4 6 Q H h). Anything else
          * passes through verbatim (preserves legacy default-case no-op). */
         switch (c) {
           case 'l': *d++ = RULE_OP_LOWER;       break;
@@ -1584,8 +1585,6 @@ int packrules_len(char *line, int *packedlen) {
           case '4': *d++ = RULE_OP_MEM_APP;     break;
           case '6': *d++ = RULE_OP_MEM_PRE;     break;
           case 'Q': *d++ = RULE_OP_MEM_REJ;     break;
-          case 'S': *d++ = RULE_OP_S_SPECIAL;   break;
-          case '#': *d++ = RULE_OP_HASH_EXIT;   break;
           case 'H': *d++ = RULE_OP_HEX_UPPER;   break;
           case 'h': *d++ = RULE_OP_HEX_LOWER;   break;
           default:
@@ -2175,21 +2174,20 @@ char * parserules(char *line) {
  *                * (position A, position B; swap)
  *                x (start, length; extract substring)
  *                O (start, count; omit chars)
+ *                v (count, insert byte; insert after every N chars)
  *
  *   variable:    0xff (multi-char append for $X$Y$Z chains, 2+N bytes)
  *                0xfe (multi-char prepend for ^X^Y^Z chains, 2+N bytes)
  *
- * NOT supported (rule routes to CPU).  After the 2026-09-11 promotions this
- * is only four opcodes; M 4 6 X Q and = % are now GPU-eligible and are listed
- * in the switch below, not here:
- *   - S  (0xc5)                     — mdxfind-specific; pending the A2
- *                                     restructure to john CONV_SOURCE/CONV_SHIFT
- *   - v  (0xc1)                     — divide-insert
+ * NOT supported (rule routes to CPU).  Every verb is GPU-eligible except one;
+ * M 4 6 X Q, = %, and v (0xc1, divide-insert, 2026-11-14) are listed in the
+ * switch below, not here.  S (0xc5) is no longer a verb at all: packrules
+ * refuses it as an unknown rule command, so it cannot reach this switch.
  *   - 0x02 (slowrule escape: base64-encode-word) — out of GPU scope by ruling
  *   - Anything else
  *
- * THREE, not four: RULE_OP_HASH_EXIT 0xc4 is NOT reachable and must not be
- * counted here.  '#' IS A COMMENT.  A bare '#' -- one standing where a verb is
+ * ONE, not two: 0xc4 (the old RULE_OP_HASH_EXIT, removed 2026-11-14) was
+ * never emitted and must not be counted here.  '#' IS A COMMENT.  A bare '#' -- one standing where a verb is
  * expected -- comments out the rest of the line, and nothing after it is
  * examined; packrules() says so directly by testing it in the SAME condition as
  * '\r' and '\n', so a bare '#' is treated as end of line.  c#$1 therefore means
@@ -2199,14 +2197,16 @@ char * parserules(char *line) {
  * first.
  *
  * Consequence for this switch: '#' never reaches the packed bytecode, so 0xc4
- * cannot appear here, the 'case' that would emit it is dead code, and '#' CANNOT
- * be used to force a rule onto the CPU.  c#$1 classifies as GPU-eligible because
+ * cannot appear here (the dead 'case' that would have emitted it, and every
+ * engine's arm for it, were removed 2026-11-14), and '#' CANNOT be used to
+ * force a rule onto the CPU.  c#$1 classifies as GPU-eligible because
  * it compiles to a bare c.
  *
- * Those three are the ONLY way to build a mixed GPU/CPU partition now, which is
- * what the FastRule precondition guard at mdxfind.c:13764 needs in order to be
- * exercised at all.  With 0x02 out of scope by ruling and S pending the A2
- * restructure, v is in practice the only usable one.  See the mixguard fixture.
+ * 0x02 is therefore the ONLY opcode that routes a rule to the CPU, and
+ * packrules refuses it in rule text (it is not a verb a rule file can name), so
+ * no rule file builds a mixed GPU/CPU partition any more.  The FastRule
+ * precondition guard in mdxfind.c is exercised only by a word over the device
+ * input gate now; the mixguard fixture used v, which is GPU-eligible.
  *
  * For multi-byte ops we must consume the parameter bytes too, otherwise
  * the next iteration would misinterpret them as ops.
@@ -2298,6 +2298,9 @@ static int gpu_rule_safe_phase0(const char *packed_rule, int len) {
             case 0x3d: case 0x25:
             case RULE_OP_SWAP_AT: case RULE_OP_EXTRACT: case RULE_OP_OMIT:
             case RULE_OP_TOGGLE_SEP:
+            /* `vNX`: count, then the byte to insert.  All six byte walkers
+             * implement it (2026-11-14), byte-exact with applyrule. */
+            case RULE_OP_DIV_INSERT:
                 /* Three-byte op: two operand bytes, any value.
                  * RULE_OP_TOGGLE_SEP is hashcat RULE_OP_MANGLE_TOGGLE_AT_SEP —
                  * same wire shape (op + position-byte + literal-byte) as
@@ -2782,16 +2785,7 @@ if (len < FASTLEN) {
         break;
 
 
-      case RULE_OP_S_SPECIAL:
-      case 'S':
-        for (x = 0; x < clen; x++) {
-          if (cpass[x] == 'a' || cpass[x] == 'A')
-            cpass[x] = 0xa;
-        }
-        break;
-
-      case RULE_OP_HASH_EXIT:
-      case '#':
+      case '#':   /* raw (unpacked) rule text only; packrules drops it */
         goto fast_exit;
         break;
 
@@ -3902,16 +3896,7 @@ slowrule:
         break;
 
 
-      case RULE_OP_S_SPECIAL:
-      case 'S':
-        for (x = 0; x < clen; x++) {
-          if (pass[x] == 'a' || pass[x] == 'A')
-            pass[x] = 0xa;
-        }
-        break;
-
-      case RULE_OP_HASH_EXIT:
-      case '#':
+      case '#':   /* raw (unpacked) rule text only; packrules drops it */
         goto app_exit;
         break;
 

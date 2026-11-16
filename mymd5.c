@@ -1,5 +1,8 @@
 /* 
  * $Log: mymd5.c,v $
+ * Revision 1.38  2026/11/15 12:16:18  dlr
+ * mdxfind 1.675 / hashpipe 1.236: SHA1PASS-TRUNC, SHA1SHA1PASS-TRUNC1SALT and SHA1SHA1TRUNC-SHA1PASS-3 use the first min(len,3) password bytes (PHP substr) instead of reading past a short password. Crypto++ legacy/default records accept an empty site key. ARM SHA-1/256/512 and x86 SHA-1 hardware paths are safe for in-place calls. A 7z CRC confirmation overrides a padding failure when the whole stream is present. -b runs on the CPU. hashpipe KRB5PA23 accepts the empty password. hashcat mode 40026 maps to MD5SALTPASS.
+ *
  * Revision 1.37  2026/09/17 11:45:26  dlr
  * Report the PRESENCE of SHA-256 hardware assist, never its absence. The previous revision printed the dispatch result unconditionally, including "x86 SHA-NI unavailable (CPUID bit clear)" on hosts without the extensions -- which is a line of noise on the majority of hosts and reads like a fault where there is none. SHA-256 computes correctly either way; the portable routine is slower, not wrong. Now mirrors the arm_ce_detect contract: a single line, only when the accelerated arm was actually engaged. ARM is not reported at this site because arm_ce_detect already lists SHA256 in its ARM CE acceleration enabled line, and SHA-1 is not reported although it shares the CPUID bit, because sha1_block_init resolves that pointer lazily on first use so at init time there is nothing truthful to say. Verified both directions on real hardware: fpga Ryzen 1800X with sha_ni prints x86 SHA-NI acceleration enabled: SHA256, while the Broadwell Xeon on mmt and the older Xeon on .205 print nothing, and dev1 arm64 shows only its existing ARM CE line with no duplicate.
  *
@@ -2595,7 +2598,10 @@ static void sha1_block_init(uint32_t *hash, uint32_t *block) {
 #define SHAUP sha1_block_fn
 #endif
 
-void mysha1(unsigned char *message, int len, uint32_t *hash) {
+void mysha1(unsigned char *message, int len, uint32_t *out) {
+  /* State lives in a local, copied to out at the end: out may alias message
+     (an in-place call), and writing the IV there first would hash a constant. */
+  uint32_t hash[8] __attribute__((aligned(16)));
   SVAL block[4];
   __m128i *p, r1;
   int i, rem;
@@ -2640,6 +2646,7 @@ void mysha1(unsigned char *message, int len, uint32_t *hash) {
   hash[2] = bswap_32(hash[2]);
   hash[3] = bswap_32(hash[3]);
   hash[4] = bswap_32(hash[4]);
+  memcpy(out, hash, 20);
 }
 extern int checkhashbb(union HashU *curin, int len, char *salt, struct job *job);
 extern int NoMarkSalt;
@@ -2794,13 +2801,15 @@ void arm_ce_detect(void) {
     }
 }
 
-void mysha1(unsigned char *message, int len, uint32_t *hash) {
+void mysha1(unsigned char *message, int len, uint32_t *out) {
+  /* Local state, copied to out at the end: out may alias message. */
+  uint32_t hash[5];
   uint8_t block[64];
   int i, rem;
 
   if (!sha1_arm_fn) {
       extern void SHA1(unsigned char *, int, uint32_t *);
-      SHA1(message, len, hash);
+      SHA1(message, len, out);
       return;
   }
 
@@ -2834,11 +2843,12 @@ void mysha1(unsigned char *message, int len, uint32_t *hash) {
   hash[2] = bswap_32(hash[2]);
   hash[3] = bswap_32(hash[3]);
   hash[4] = bswap_32(hash[4]);
+  memcpy(out, hash, 20);
 }
 
 void mysha256(char *cur, int len, unsigned char *dest) {
   uint8_t block[64];
-  uint32_t *hash = (uint32_t *)dest;
+  uint32_t hash[8];	/* local state, copied to dest at the end: dest may alias cur */
   int i, rem;
 
   if (!sha256_arm_fn) {
@@ -2872,12 +2882,13 @@ void mysha256(char *cur, int len, unsigned char *dest) {
   }
   sha256_arm_fn(hash, (const uint32_t *)block);
   for (i = 0; i < 8; i++) hash[i] = bswap_32(hash[i]);
+  memcpy(dest, hash, 32);
 }
 
 void mysha512(char *cur, int len, unsigned char *dest) {
 #ifdef HAVE_SHA512_CE
   uint8_t block[128];
-  uint64_t *hash = (uint64_t *)dest;
+  uint64_t hash[8];	/* local state, copied to dest at the end: dest may alias cur */
   int i, rem;
 
   if (!sha512_arm_fn) {
@@ -2913,6 +2924,7 @@ void mysha512(char *cur, int len, unsigned char *dest) {
   }
   sha512_arm_fn(hash, (const uint64_t *)block);
   for (i = 0; i < 8; i++) hash[i] = bswap_64(hash[i]);
+  memcpy(dest, hash, 64);
 #else
   extern void SHA512(char *, int, unsigned char *);
   SHA512(cur, len, dest);

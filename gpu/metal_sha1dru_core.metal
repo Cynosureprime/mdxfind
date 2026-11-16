@@ -206,49 +206,25 @@ static inline void sha1dru_init_finalize(thread template_state &st,
     }
 }
 
-/* SHA1DRU_MAX_PLEN: per-iter staging buffer size cap for hex(40) + pass.
+/* sha1dru_iter_step: one iteration of the SHA1DRU inner loop,
+ * state = SHA1(hex_lc(state) || pass), for a password of ANY length.
  *
- * Sized at 256 bytes to comfortably hold hex(40) + plen up to ~215 bytes
- * (well above typical wordlist passwords). This matches the slab kernel's
- * 256-byte hexhash slot in gpujob.h:156 (`hexhash[GPUBATCH_MAX][256]`).
- * Passwords longer than 215 bytes would truncate at the SHA1DRU iter input
- * — same behavior as the slab path (which capped hexhash at 256 too).
- *
- * R2 (gfx1201 priv_mem): a per-iter alloc of RULE_BUF_LIMIT (~40 KB) blew
- * out the spill region (B6.11 first build measured 82,080 B per work-item
- * on gfx1201). 256 bytes here keeps us comfortably under the 43,024 B
- * HARD GATE — expected reading ~41 KB (in line with SHA1 unsalted's
- * ~41 KB baseline). */
-#define SHA1DRU_MAX_PLEN  216
-#define SHA1DRU_HEXBUF    (40 + SHA1DRU_MAX_PLEN)
-
-/* sha1dru_iter_step: one iteration of the SHA1DRU inner loop:
- *   build hex_lc(state) into bytes 0..39 of a staging buffer;
- *   copy `pass` into bytes 40..40+plen-1 (capped at SHA1DRU_MAX_PLEN);
- *   total = 40 + min(plen, SHA1DRU_MAX_PLEN);
- *   reset state to SHA1 IV; absorb the staged buffer.
+ * The 40 hex bytes are built in hexbuf[40]; the password is read where it
+ * lies, never copied: byte k of the message is SB(k).  Whole 64-byte blocks
+ * are packed word by word into M[] and compressed, then the tail, the 0x80
+ * marker and the 64-bit BE bit length.  This replaces a 256-byte staging
+ * buffer that copied the password into bytes 40.. on every iteration and so
+ * cut it at 216 bytes, where the CPU arm hashes any length.
  *
  * Hex encoding is BIG-ENDIAN per state word, lowercase ('0'..'9','a'..'f').
- * Mirrors the CPU's prmd5 (lowercase hex) over the 20-byte BE state.
- *
- * Block layout:
- *   - For plen <= 14: total <= 54 bytes — single block (40 + plen + 1 + 8 <= 64
- *     when plen <= 14). The 0x80 marker at byte (40+plen), length BE in M[15].
- *   - For plen >= 15: total >= 55 bytes — needs two blocks (one full block
- *     of 64 bytes, then padding+length in second block).
- *   - For plen >= 24: 40 + plen >= 64 — block 1 full, second block holds
- *     remaining tail + 0x80 + zeros + length.
- *   - For plen >= 88 (total >= 128): 2 full blocks + final pad block.
- *   - For plen >= 152 (total >= 192): 3 full blocks + final pad block.
- *
- * The hexbuf staging area lives on the kernel stack (private memory). */
+ * Mirrors the CPU's prmd5 (lowercase hex) over the 20-byte BE state. */
 static inline void sha1dru_iter_step(thread template_state &st,
                                 device const uchar *pass,
                                 int plen)
 {
-    __attribute__((aligned(16))) uchar hexbuf[SHA1DRU_HEXBUF];
+    uchar hexbuf[40];
 
-    /* Encode 20 bytes of state[0..4] as 40 lowercase hex chars in hexbuf[0..39]. */
+    /* Encode 20 bytes of state[0..4] as 40 lowercase hex chars. */
     for (int w = 0; w < 5; w++) {
         uint sv = st.h[w];
         for (int b = 0; b < 4; b++) {
@@ -260,60 +236,41 @@ static inline void sha1dru_iter_step(thread template_state &st,
         }
     }
 
-    /* Append pass at offset 40, capped at SHA1DRU_MAX_PLEN. */
-    int eff_plen = (plen < SHA1DRU_MAX_PLEN) ? plen : SHA1DRU_MAX_PLEN;
-    for (int i = 0; i < eff_plen; i++) {
-        hexbuf[40 + i] = pass[i];
-    }
-    int total = 40 + eff_plen;
-
-    /* Reset state to SHA1 IV. */
+    /* SB(k): message byte k. */
+#define SB(k) ((uint)(((k) < 40) ? hexbuf[(k)] : pass[(k) - 40]))
+    int tot = 40 + plen;
     st.h[0] = 0x67452301u;
     st.h[1] = 0xEFCDAB89u;
     st.h[2] = 0x98BADCFEu;
     st.h[3] = 0x10325476u;
     st.h[4] = 0xC3D2E1F0u;
-
-    /* SHA1(hexbuf, total) — same finalize structure as sha1dru_init_finalize
-     * but inlined to avoid a second function call across 1M iters. */
     uint M[16];
     int pos = 0;
-    while (total - pos >= HASH_BLOCK_BYTES) {
+    while (tot - pos >= HASH_BLOCK_BYTES) {
         for (int j = 0; j < 16; j++) {
             int b = pos + j * 4;
-            M[j] = ((uint)hexbuf[b]     << 24)
-                 | ((uint)hexbuf[b + 1] << 16)
-                 | ((uint)hexbuf[b + 2] << 8)
-                 |  (uint)hexbuf[b + 3];
+            M[j] = (SB(b) << 24) | (SB(b + 1) << 16) | (SB(b + 2) << 8) | SB(b + 3);
         }
         sha1_block(&st.h[0], M);
         pos += HASH_BLOCK_BYTES;
     }
-
-    int rem = total - pos;
+    int rem = tot - pos;
     for (int j = 0; j < 16; j++) M[j] = 0;
-    for (int i = 0; i < rem; i++) {
-        int wi = i >> 2;
-        int bi = 3 - (i & 3);
-        M[wi] |= ((uint)hexbuf[pos + i]) << (bi * 8);
-    }
-    {
-        int wi = rem >> 2;
-        int bi = 3 - (rem & 3);
-        M[wi] |= ((uint)0x80u) << (bi * 8);
-    }
-
+    for (int i = 0; i < rem; i++)
+        M[i >> 2] |= SB(pos + i) << ((3 - (i & 3)) * 8);
+    M[rem >> 2] |= 0x80u << ((3 - (rem & 3)) * 8);
     if (rem < 56) {
         M[14] = 0;
-        M[15] = (uint)((uint)total * 8u);
+        M[15] = (uint)tot * 8u;
         sha1_block(&st.h[0], M);
     } else {
         sha1_block(&st.h[0], M);
         for (int j = 0; j < 16; j++) M[j] = 0;
         M[14] = 0;
-        M[15] = (uint)((uint)total * 8u);
+        M[15] = (uint)tot * 8u;
         sha1_block(&st.h[0], M);
     }
+#undef SB
 }
 
 /* template_finalize: the FULL SHA1DRU chain — initial SHA1(pass) followed

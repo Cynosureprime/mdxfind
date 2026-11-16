@@ -4,8 +4,26 @@
  * The hash engine, procjob and everything it calls, is in mdxfind.c; what
  * the two share is declared in mdxint.h.
  *
- * $Revision: 1.7 $
+ * $Revision: 1.13 $
  * $Log: mdxmain.c,v $
+ * Revision 1.13  2026/11/15 18:38:04  dlr
+ * mdxfind 1.676: with the GPU active, an -n/-N mask over the per-side GPU limit, with an empty character class, or whose tables do not fit in device memory exits with the positions requested and the limit, instead of hashing bare words on the GPU while the CPU skips the mask.
+ *
+ * Revision 1.12  2026/11/15 17:28:53  dlr
+ * A mask table that does not fit in device memory returns -1: brute force falls back to its CPU route, a -n/-N mask is fatal (it has no CPU route). Any other mask allocation failure is fatal on Metal.
+ *
+ * Revision 1.11  2026/11/15 12:16:18  dlr
+ * mdxfind 1.675 / hashpipe 1.236: SHA1PASS-TRUNC, SHA1SHA1PASS-TRUNC1SALT and SHA1SHA1TRUNC-SHA1PASS-3 use the first min(len,3) password bytes (PHP substr) instead of reading past a short password. Crypto++ legacy/default records accept an empty site key. ARM SHA-1/256/512 and x86 SHA-1 hardware paths are safe for in-place calls. A 7z CRC confirmation overrides a padding failure when the whole stream is present. -b runs on the CPU. hashpipe KRB5PA23 accepts the empty password. hashcat mode 40026 maps to MD5SALTPASS.
+ *
+ * Revision 1.10  2026/11/15 08:06:24  dlr
+ * mdxfind 1.674 / hashpipe 1.235: 7z loaders read the 13-field (Delta filter) record and use its Delta distance in the CRC check; hashcat and John record forms both load. hashpipe verify_7zip moved to work-space slots. An ill-formed UTF-16 conversion (-b candidate, MSCACHE user) now skips the hash instead of hashing the raw bytes. hashpipe output write failures are fatal.
+ *
+ * Revision 1.9  2026/11/15 05:05:31  dlr
+ * Every type emits a -z line and is found for the empty password: SHA1_xSHA1psubp takes the empty prefix, the DECBASE64 types hash a valid empty decode while a failed decode still emits nothing, and the revBASE64x types accept an empty encoding. hashpipe UTF-16 conversion returns a negative value for ill-formed input, so an empty password verifies and ill-formed input is refused. 7ZIP -z with no archive loaded writes a record the password opens, and the 7z coder check reads the full filter nibble so DELTA plus LZMA streams verify.
+ *
+ * Revision 1.8  2026/11/14 22:14:32  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.7  2026/11/13 13:43:33  dlr
  * e1063 SHA1PASSUSERPASSUSER joins gpu_ops[], so it carries the GPU tag and starts GPU init, and the FAM_SHA1 compile switch, so the SHA1 kernel family is built when it is selected.
  *
@@ -1861,6 +1879,263 @@ static void hx_e347_validate_run_shared(int backend_id, char *hxsrc,
  * Exits 0 on PASS, 1 on FAIL; never returns. */
 #if defined(OPENCL_GPU) || (defined(__APPLE__) && defined(METAL_GPU))
 
+/* The outer hash of a MAKE_MD5PASS member applied to buf[0..total), with
+ * nothing prepended: the x01 wrapper below supplies hex32(md5(pass)) || pass,
+ * and the iterated recompute supplies hex(previous digest).  Returns the
+ * digest length in bytes. */
+static int
+oracle_outer_md5pass_family(int job_enum, unsigned char *buf, int total,
+                            unsigned char *out)
+{
+    switch (job_enum) {
+    case JOB_SHA1MD5PASS:        /* e161 */
+        mysha1((char *)buf, total, out);
+        return 20;
+    case JOB_MD2MD5PASS:         /* e120 -- 5b.1a Tier 1 */
+        {
+            sph_md2_context cmd2;
+            sph_md2_init(&cmd2);
+            sph_md2(&cmd2, buf, total);
+            sph_md2_close(&cmd2, out);
+        }
+        return 16;
+    case JOB_MD4MD5PASS:         /* e122 */
+        MD4((char *)buf, total, out);
+        return 16;
+    case JOB_RMD128MD5PASS:      /* e157 -- 5b.1b Tier 1 */
+        RIPEMD128((char *)buf, total, out);
+        return 16;
+    case JOB_RMD160MD5PASS:      /* e159 */
+        RIPEMD160((char *)buf, total, out);
+        return 20;
+    case JOB_SHA224MD5PASS:      /* e163 */
+        {
+            sph_sha224_context c224;
+            sph_sha224_init(&c224);
+            sph_sha224(&c224, buf, total);
+            sph_sha224_close(&c224, out);
+        }
+        return 28;
+    case JOB_SHA256MD5PASS:      /* e165 */
+        mysha256((char *)buf, total, out);
+        return 32;
+    case JOB_SHA384MD5PASS:      /* e167 */
+        {
+            sph_sha384_context c384;
+            sph_sha384_init(&c384);
+            sph_sha384(&c384, buf, total);
+            sph_sha384_close(&c384, out);
+        }
+        return 48;
+    case JOB_SHA512MD5PASS:      /* e169 */
+        mysha512((char *)buf, total, out);
+        return 64;
+    case JOB_TIGERMD5PASS:       /* e171 -- 5b.2b Tier 2 */
+        {
+            sph_tiger_context ctiger;
+            sph_tiger_init(&ctiger);
+            sph_tiger(&ctiger, buf, total);
+            sph_tiger_close(&ctiger, out);
+        }
+        return 24;
+    case JOB_WRLMD5PASS:         /* e173 -- 5b.2a Tier 2 */
+        WHIRLPOOL((char *)buf, total, out);
+        return 64;
+    /* Phase 5b Tier 3 sub-phase 5b.3a (2026-05-27): 5 3-pass HAVAL
+     * variants. Each calls the matching sph_haval<W>_3 entry point;
+     * sph_haval is the verified-conformant CPU oracle (R15 pre-flight
+     * test_haval_paper_vectors.c 120/120 cells PASS). */
+    case JOB_HAV128MD5PASS:      /* e127 -- 5b.3a Tier 3 (3-pass, 128-bit) */
+        {
+            sph_haval128_3_context c;
+            sph_haval128_3_init(&c);
+            sph_haval128_3(&c, buf, total);
+            sph_haval128_3_close(&c, out);
+        }
+        return 16;
+    case JOB_HAV160_3MD5PASS:    /* e133 -- 5b.3a Tier 3 (3-pass, 160-bit) */
+        {
+            sph_haval160_3_context c;
+            sph_haval160_3_init(&c);
+            sph_haval160_3(&c, buf, total);
+            sph_haval160_3_close(&c, out);
+        }
+        return 20;
+    case JOB_HAV192_3MD5PASS:    /* e139 -- 5b.3a Tier 3 (3-pass, 192-bit) */
+        {
+            sph_haval192_3_context c;
+            sph_haval192_3_init(&c);
+            sph_haval192_3(&c, buf, total);
+            sph_haval192_3_close(&c, out);
+        }
+        return 24;
+    case JOB_HAV224_3MD5PASS:    /* e145 -- 5b.3a Tier 3 (3-pass, 224-bit) */
+        {
+            sph_haval224_3_context c;
+            sph_haval224_3_init(&c);
+            sph_haval224_3(&c, buf, total);
+            sph_haval224_3_close(&c, out);
+        }
+        return 28;
+    case JOB_HAV256MD5PASS:      /* e151 -- 5b.3a Tier 3 (3-pass, 256-bit) */
+        {
+            sph_haval256_3_context c;
+            sph_haval256_3_init(&c);
+            sph_haval256_3(&c, buf, total);
+            sph_haval256_3_close(&c, out);
+        }
+        return 32;
+    case JOB_HAV128_4MD5PASS:    /* e129 -- 5b.3b Tier 3 (4-pass, 128-bit) */
+        {
+            sph_haval128_4_context c;
+            sph_haval128_4_init(&c);
+            sph_haval128_4(&c, buf, total);
+            sph_haval128_4_close(&c, out);
+        }
+        return 16;
+    case JOB_HAV160_4MD5PASS:    /* e135 -- 5b.3b Tier 3 (4-pass, 160-bit) */
+        {
+            sph_haval160_4_context c;
+            sph_haval160_4_init(&c);
+            sph_haval160_4(&c, buf, total);
+            sph_haval160_4_close(&c, out);
+        }
+        return 20;
+    case JOB_HAV192_4MD5PASS:    /* e141 -- 5b.3b Tier 3 (4-pass, 192-bit) */
+        {
+            sph_haval192_4_context c;
+            sph_haval192_4_init(&c);
+            sph_haval192_4(&c, buf, total);
+            sph_haval192_4_close(&c, out);
+        }
+        return 24;
+    case JOB_HAV224_4MD5PASS:    /* e147 -- 5b.3b Tier 3 (4-pass, 224-bit) */
+        {
+            sph_haval224_4_context c;
+            sph_haval224_4_init(&c);
+            sph_haval224_4(&c, buf, total);
+            sph_haval224_4_close(&c, out);
+        }
+        return 28;
+    case JOB_HAV256_4MD5PASS:    /* e153 -- 5b.3b Tier 3 (4-pass, 256-bit) */
+        {
+            sph_haval256_4_context c;
+            sph_haval256_4_init(&c);
+            sph_haval256_4(&c, buf, total);
+            sph_haval256_4_close(&c, out);
+        }
+        return 32;
+    case JOB_HAV128_5MD5PASS:    /* e131 -- 5b.3c Tier 3 (5-pass, 128-bit) */
+        {
+            sph_haval128_5_context c;
+            sph_haval128_5_init(&c);
+            sph_haval128_5(&c, buf, total);
+            sph_haval128_5_close(&c, out);
+        }
+        return 16;
+    case JOB_HAV160_5MD5PASS:    /* e137 -- 5b.3c Tier 3 (5-pass, 160-bit) */
+        {
+            sph_haval160_5_context c;
+            sph_haval160_5_init(&c);
+            sph_haval160_5(&c, buf, total);
+            sph_haval160_5_close(&c, out);
+        }
+        return 20;
+    case JOB_HAV192_5MD5PASS:    /* e143 -- 5b.3c Tier 3 (5-pass, 192-bit) */
+        {
+            sph_haval192_5_context c;
+            sph_haval192_5_init(&c);
+            sph_haval192_5(&c, buf, total);
+            sph_haval192_5_close(&c, out);
+        }
+        return 24;
+    case JOB_HAV224_5MD5PASS:    /* e149 -- 5b.3c Tier 3 (5-pass, 224-bit) */
+        {
+            sph_haval224_5_context c;
+            sph_haval224_5_init(&c);
+            sph_haval224_5(&c, buf, total);
+            sph_haval224_5_close(&c, out);
+        }
+        return 28;
+    case JOB_HAV256_5MD5PASS:    /* e155 -- 5b.3c Tier 3 (5-pass, 256-bit) */
+        {
+            sph_haval256_5_context c;
+            sph_haval256_5_init(&c);
+            sph_haval256_5(&c, buf, total);
+            sph_haval256_5_close(&c, out);
+        }
+        return 32;
+    /* Phase 5b Tier 4 sub-phase 5b.4a (2026-05-27): the 2 Snefru widths.
+     * Use a FRESH LOCAL rhash handle (NOT the global rhash_con, which is
+     * configured per-op and is not safe for a standalone recompute helper
+     * -- R-Tier4-oracle-rhash-context). librhash is the LIVE CPU oracle
+     * for e175/e177 (matches the JOB_SNE128/256MD5PASS case bodies which
+     * use rhash_init(RHASH_SNEFRU*)). */
+    case JOB_SNE128MD5PASS:      /* e175 -- 5b.4a Tier 4 (Snefru-128) */
+        {
+            rhash rc128 = rhash_init(RHASH_SNEFRU128);
+            if (!rc128) {
+                fprintf(stderr,
+                    "FATAL: %s:%d oracle_compute_md5pass_family: "
+                    "rhash_init(RHASH_SNEFRU128) failed (e175)\n",
+                    __FILE__, __LINE__);
+                exit(1);
+            }
+            rhash_update(rc128, buf, total);
+            rhash_final(rc128, out);
+            rhash_free(rc128);
+        }
+        return 16;
+    case JOB_SNE256MD5PASS:      /* e177 -- 5b.4a Tier 4 (Snefru-256) */
+        {
+            rhash rc256 = rhash_init(RHASH_SNEFRU256);
+            if (!rc256) {
+                fprintf(stderr,
+                    "FATAL: %s:%d oracle_compute_md5pass_family: "
+                    "rhash_init(RHASH_SNEFRU256) failed (e177)\n",
+                    __FILE__, __LINE__);
+                exit(1);
+            }
+            rhash_update(rc256, buf, total);
+            rhash_final(rc256, out);
+            rhash_free(rc256);
+        }
+        return 32;
+    /* Phase 5b Tier 4 sub-phase 5b.4b (2026-05-27): GOST R 34.11-94 (e125),
+     * the FINAL GPU-eligible MAKE_MD5PASS member. Call the in-tree
+     * gosthash() directly (the LIVE CPU oracle; matches the JOB_GOSTMD5PASS
+     * case body at mdxfind.c:29076). TEST S-box set (gosthash_init computes
+     * the derived tables once at startup; NOT CryptoPro -- R-Tier4-gost-sbox
+     * HIGH). 32-byte digest. */
+    case JOB_GOSTMD5PASS:        /* e125 -- 5b.4b Tier 4 (GOST R 34.11-94) */
+        gosthash((char *)buf, total, out);
+        return 32;
+    /* Sub-phase 5c.2 (2026-05-27): e123 MD5MD5PASS multi-emit.
+     *
+     * e123 produces TWO digests per password (variant 0 canonical +
+     * variant 1 colon). This 4-arg oracle returns variant 0 (canonical):
+     *   md5( hex32(md5(pass)) . pass )
+     * which is exactly the `buf` built above (hex32 || pass). The colon
+     * variant is built separately by the validation harness (it injects
+     * a ':' at offset 32). On the gpujob hit-replay path this arm is NOT
+     * reached for e123: the recompute branch only fires for digests > 16
+     * bytes, and e123's MD5 digest is 16 bytes (checkhash re-probes the
+     * loaded table directly from the kernel-emitted fingerprint, which
+     * self-identifies the matched variant -- no recompute needed). So
+     * returning the canonical variant here is sufficient + the signature
+     * stays unchanged for all callers. */
+    case JOB_MD5MD5PASS:         /* e123 -- 5c.2 multi-emit (variant 0) */
+        mymd5((char *)buf, total, out);
+        return 16;
+    default:
+        fprintf(stderr,
+            "FATAL: %s:%d oracle_compute_md5pass_family: e%d not in "
+            "MAKE_MD5PASS family (or in 5b-deferred set).\n",
+            __FILE__, __LINE__, job_enum);
+        exit(1);
+    }
+}
+
 /* Compute oracle digest for a single (pass) per job_enum. Returns
  * digest length in bytes (e161=20). FATAL on unsupported job_enum.
  *
@@ -1897,286 +2172,31 @@ oracle_compute_md5pass_family(int job_enum, const char *pass, int plen,
     prmd5_32(inner, (char *)buf);
     memcpy(buf + 32, pass, plen);
 
-    switch (job_enum) {
-    case JOB_SHA1MD5PASS:        /* e161 */
-        mysha1((char *)buf, total, out);
+    {
+        int r = oracle_outer_md5pass_family(job_enum, buf, total, out);
         free(buf);
-        return 20;
-    case JOB_MD2MD5PASS:         /* e120 -- 5b.1a Tier 1 */
-        {
-            sph_md2_context cmd2;
-            sph_md2_init(&cmd2);
-            sph_md2(&cmd2, buf, total);
-            sph_md2_close(&cmd2, out);
-        }
-        free(buf);
-        return 16;
-    case JOB_MD4MD5PASS:         /* e122 */
-        MD4((char *)buf, total, out);
-        free(buf);
-        return 16;
-    case JOB_RMD128MD5PASS:      /* e157 -- 5b.1b Tier 1 */
-        RIPEMD128((char *)buf, total, out);
-        free(buf);
-        return 16;
-    case JOB_RMD160MD5PASS:      /* e159 */
-        RIPEMD160((char *)buf, total, out);
-        free(buf);
-        return 20;
-    case JOB_SHA224MD5PASS:      /* e163 */
-        {
-            sph_sha224_context c224;
-            sph_sha224_init(&c224);
-            sph_sha224(&c224, buf, total);
-            sph_sha224_close(&c224, out);
-        }
-        free(buf);
-        return 28;
-    case JOB_SHA256MD5PASS:      /* e165 */
-        mysha256((char *)buf, total, out);
-        free(buf);
-        return 32;
-    case JOB_SHA384MD5PASS:      /* e167 */
-        {
-            sph_sha384_context c384;
-            sph_sha384_init(&c384);
-            sph_sha384(&c384, buf, total);
-            sph_sha384_close(&c384, out);
-        }
-        free(buf);
-        return 48;
-    case JOB_SHA512MD5PASS:      /* e169 */
-        mysha512((char *)buf, total, out);
-        free(buf);
-        return 64;
-    case JOB_TIGERMD5PASS:       /* e171 -- 5b.2b Tier 2 */
-        {
-            sph_tiger_context ctiger;
-            sph_tiger_init(&ctiger);
-            sph_tiger(&ctiger, buf, total);
-            sph_tiger_close(&ctiger, out);
-        }
-        free(buf);
-        return 24;
-    case JOB_WRLMD5PASS:         /* e173 -- 5b.2a Tier 2 */
-        WHIRLPOOL((char *)buf, total, out);
-        free(buf);
-        return 64;
-    /* Phase 5b Tier 3 sub-phase 5b.3a (2026-05-27): 5 3-pass HAVAL
-     * variants. Each calls the matching sph_haval<W>_3 entry point;
-     * sph_haval is the verified-conformant CPU oracle (R15 pre-flight
-     * test_haval_paper_vectors.c 120/120 cells PASS). */
-    case JOB_HAV128MD5PASS:      /* e127 -- 5b.3a Tier 3 (3-pass, 128-bit) */
-        {
-            sph_haval128_3_context c;
-            sph_haval128_3_init(&c);
-            sph_haval128_3(&c, buf, total);
-            sph_haval128_3_close(&c, out);
-        }
-        free(buf);
-        return 16;
-    case JOB_HAV160_3MD5PASS:    /* e133 -- 5b.3a Tier 3 (3-pass, 160-bit) */
-        {
-            sph_haval160_3_context c;
-            sph_haval160_3_init(&c);
-            sph_haval160_3(&c, buf, total);
-            sph_haval160_3_close(&c, out);
-        }
-        free(buf);
-        return 20;
-    case JOB_HAV192_3MD5PASS:    /* e139 -- 5b.3a Tier 3 (3-pass, 192-bit) */
-        {
-            sph_haval192_3_context c;
-            sph_haval192_3_init(&c);
-            sph_haval192_3(&c, buf, total);
-            sph_haval192_3_close(&c, out);
-        }
-        free(buf);
-        return 24;
-    case JOB_HAV224_3MD5PASS:    /* e145 -- 5b.3a Tier 3 (3-pass, 224-bit) */
-        {
-            sph_haval224_3_context c;
-            sph_haval224_3_init(&c);
-            sph_haval224_3(&c, buf, total);
-            sph_haval224_3_close(&c, out);
-        }
-        free(buf);
-        return 28;
-    case JOB_HAV256MD5PASS:      /* e151 -- 5b.3a Tier 3 (3-pass, 256-bit) */
-        {
-            sph_haval256_3_context c;
-            sph_haval256_3_init(&c);
-            sph_haval256_3(&c, buf, total);
-            sph_haval256_3_close(&c, out);
-        }
-        free(buf);
-        return 32;
-    case JOB_HAV128_4MD5PASS:    /* e129 -- 5b.3b Tier 3 (4-pass, 128-bit) */
-        {
-            sph_haval128_4_context c;
-            sph_haval128_4_init(&c);
-            sph_haval128_4(&c, buf, total);
-            sph_haval128_4_close(&c, out);
-        }
-        free(buf);
-        return 16;
-    case JOB_HAV160_4MD5PASS:    /* e135 -- 5b.3b Tier 3 (4-pass, 160-bit) */
-        {
-            sph_haval160_4_context c;
-            sph_haval160_4_init(&c);
-            sph_haval160_4(&c, buf, total);
-            sph_haval160_4_close(&c, out);
-        }
-        free(buf);
-        return 20;
-    case JOB_HAV192_4MD5PASS:    /* e141 -- 5b.3b Tier 3 (4-pass, 192-bit) */
-        {
-            sph_haval192_4_context c;
-            sph_haval192_4_init(&c);
-            sph_haval192_4(&c, buf, total);
-            sph_haval192_4_close(&c, out);
-        }
-        free(buf);
-        return 24;
-    case JOB_HAV224_4MD5PASS:    /* e147 -- 5b.3b Tier 3 (4-pass, 224-bit) */
-        {
-            sph_haval224_4_context c;
-            sph_haval224_4_init(&c);
-            sph_haval224_4(&c, buf, total);
-            sph_haval224_4_close(&c, out);
-        }
-        free(buf);
-        return 28;
-    case JOB_HAV256_4MD5PASS:    /* e153 -- 5b.3b Tier 3 (4-pass, 256-bit) */
-        {
-            sph_haval256_4_context c;
-            sph_haval256_4_init(&c);
-            sph_haval256_4(&c, buf, total);
-            sph_haval256_4_close(&c, out);
-        }
-        free(buf);
-        return 32;
-    case JOB_HAV128_5MD5PASS:    /* e131 -- 5b.3c Tier 3 (5-pass, 128-bit) */
-        {
-            sph_haval128_5_context c;
-            sph_haval128_5_init(&c);
-            sph_haval128_5(&c, buf, total);
-            sph_haval128_5_close(&c, out);
-        }
-        free(buf);
-        return 16;
-    case JOB_HAV160_5MD5PASS:    /* e137 -- 5b.3c Tier 3 (5-pass, 160-bit) */
-        {
-            sph_haval160_5_context c;
-            sph_haval160_5_init(&c);
-            sph_haval160_5(&c, buf, total);
-            sph_haval160_5_close(&c, out);
-        }
-        free(buf);
-        return 20;
-    case JOB_HAV192_5MD5PASS:    /* e143 -- 5b.3c Tier 3 (5-pass, 192-bit) */
-        {
-            sph_haval192_5_context c;
-            sph_haval192_5_init(&c);
-            sph_haval192_5(&c, buf, total);
-            sph_haval192_5_close(&c, out);
-        }
-        free(buf);
-        return 24;
-    case JOB_HAV224_5MD5PASS:    /* e149 -- 5b.3c Tier 3 (5-pass, 224-bit) */
-        {
-            sph_haval224_5_context c;
-            sph_haval224_5_init(&c);
-            sph_haval224_5(&c, buf, total);
-            sph_haval224_5_close(&c, out);
-        }
-        free(buf);
-        return 28;
-    case JOB_HAV256_5MD5PASS:    /* e155 -- 5b.3c Tier 3 (5-pass, 256-bit) */
-        {
-            sph_haval256_5_context c;
-            sph_haval256_5_init(&c);
-            sph_haval256_5(&c, buf, total);
-            sph_haval256_5_close(&c, out);
-        }
-        free(buf);
-        return 32;
-    /* Phase 5b Tier 4 sub-phase 5b.4a (2026-05-27): the 2 Snefru widths.
-     * Use a FRESH LOCAL rhash handle (NOT the global rhash_con, which is
-     * configured per-op and is not safe for a standalone recompute helper
-     * -- R-Tier4-oracle-rhash-context). librhash is the LIVE CPU oracle
-     * for e175/e177 (matches the JOB_SNE128/256MD5PASS case bodies which
-     * use rhash_init(RHASH_SNEFRU*)). */
-    case JOB_SNE128MD5PASS:      /* e175 -- 5b.4a Tier 4 (Snefru-128) */
-        {
-            rhash rc128 = rhash_init(RHASH_SNEFRU128);
-            if (!rc128) {
-                fprintf(stderr,
-                    "FATAL: %s:%d oracle_compute_md5pass_family: "
-                    "rhash_init(RHASH_SNEFRU128) failed (e175)\n",
-                    __FILE__, __LINE__);
-                free(buf);
-                exit(1);
-            }
-            rhash_update(rc128, buf, total);
-            rhash_final(rc128, out);
-            rhash_free(rc128);
-        }
-        free(buf);
-        return 16;
-    case JOB_SNE256MD5PASS:      /* e177 -- 5b.4a Tier 4 (Snefru-256) */
-        {
-            rhash rc256 = rhash_init(RHASH_SNEFRU256);
-            if (!rc256) {
-                fprintf(stderr,
-                    "FATAL: %s:%d oracle_compute_md5pass_family: "
-                    "rhash_init(RHASH_SNEFRU256) failed (e177)\n",
-                    __FILE__, __LINE__);
-                free(buf);
-                exit(1);
-            }
-            rhash_update(rc256, buf, total);
-            rhash_final(rc256, out);
-            rhash_free(rc256);
-        }
-        free(buf);
-        return 32;
-    /* Phase 5b Tier 4 sub-phase 5b.4b (2026-05-27): GOST R 34.11-94 (e125),
-     * the FINAL GPU-eligible MAKE_MD5PASS member. Call the in-tree
-     * gosthash() directly (the LIVE CPU oracle; matches the JOB_GOSTMD5PASS
-     * case body at mdxfind.c:29076). TEST S-box set (gosthash_init computes
-     * the derived tables once at startup; NOT CryptoPro -- R-Tier4-gost-sbox
-     * HIGH). 32-byte digest. */
-    case JOB_GOSTMD5PASS:        /* e125 -- 5b.4b Tier 4 (GOST R 34.11-94) */
-        gosthash((char *)buf, total, out);
-        free(buf);
-        return 32;
-    /* Sub-phase 5c.2 (2026-05-27): e123 MD5MD5PASS multi-emit.
-     *
-     * e123 produces TWO digests per password (variant 0 canonical +
-     * variant 1 colon). This 4-arg oracle returns variant 0 (canonical):
-     *   md5( hex32(md5(pass)) . pass )
-     * which is exactly the `buf` built above (hex32 || pass). The colon
-     * variant is built separately by the validation harness (it injects
-     * a ':' at offset 32). On the gpujob hit-replay path this arm is NOT
-     * reached for e123: the recompute branch only fires for digests > 16
-     * bytes, and e123's MD5 digest is 16 bytes (checkhash re-probes the
-     * loaded table directly from the kernel-emitted fingerprint, which
-     * self-identifies the matched variant -- no recompute needed). So
-     * returning the canonical variant here is sufficient + the signature
-     * stays unchanged for all callers. */
-    case JOB_MD5MD5PASS:         /* e123 -- 5c.2 multi-emit (variant 0) */
-        mymd5((char *)buf, total, out);
-        free(buf);
-        return 16;
-    default:
-        fprintf(stderr,
-            "FATAL: %s:%d oracle_compute_md5pass_family: e%d not in "
-            "MAKE_MD5PASS family (or in 5b-deferred set).\n",
-            __FILE__, __LINE__, job_enum);
-        free(buf);
-        exit(1);
+        return r;
     }
+}
+
+/* xNN of a MAKE_MD5PASS member exactly as the CPU computes it: x01 is
+ * outer(hex32(md5(pass)) || pass), and every later round is
+ * outer(lowercase hex of the WHOLE previous digest) -- the *_start loops in
+ * mdxfind.c (xNN iterates the outer hash only).  The GPU hit replay calls
+ * this with the round the kernel reported, so a hit at x03 is verified
+ * against the x03 digest and not the x01 one. */
+int
+oracle_compute_md5pass_family_iter(int job_enum, const char *pass, int plen,
+                                   int iter, unsigned char *out)
+{
+    unsigned char hexbuf[129];
+    int dlen = oracle_compute_md5pass_family(job_enum, pass, plen, out);
+    int it;
+    for (it = 2; it <= iter; it++) {
+        prmd5(out, (char *)hexbuf, dlen * 2);
+        dlen = oracle_outer_md5pass_family(job_enum, hexbuf, dlen * 2, out);
+    }
+    return dlen;
 }
 
 static void hx_family_md5pass_validate_run_shared(
@@ -2666,16 +2686,17 @@ static void hx_family_md5pass_validate_run_shared(
  * legacy-template-path GPU ops are added here ONCE and both sites pick
  * up the change automatically.
  *
- * Codegen-path ops (JOB_MD5MD5SALT e347; MAKE_MD5PASS family e120/e122/
+ * Codegen-path ops (the MAKE_MD5PASS family e120/e122/
  * e157/e159/e161/e163/e165/e167/e169/e171/e173) are intentionally
- * ABSENT from this table -- they are admitted via separate predicates
- * (the JOB_MD5MD5SALT check and gpu_codegen_kernelb_family_md5pass_-
- * eligible) so the legacy template path is not advertised as covering
+ * ABSENT from this table -- they are admitted via a separate predicate
+ * (gpu_codegen_kernelb_family_md5pass_eligible; e347 moved to the
+ * md5salt template on 2026-11-13 and is listed above) so the legacy template path is not advertised as covering
  * them. Both the init preamble and gpu_op_advertise_for_h_listing apply
  * those extra predicates after the gpu_ops[] scan.
  */
 static const int gpu_ops[] = {
     JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT,
+    JOB_MD5MD5SALT,   /* e347: md5salt template, algo_mode 7 (2026-11-13) */
     JOB_MD5SALTPASS, JOB_MD5PASSSALT,
     JOB_SHA256PASSSALT, JOB_SHA256SALTPASS,
     /* B6.3 SHA224 fan-out (2026-05-06): SHA224SALTPASS joins the GPU-init
@@ -2687,7 +2708,11 @@ static const int gpu_ops[] = {
     JOB_MD5CRYPT, JOB_MD5_MD5SALTMD5PASS,
     JOB_SHA1SALTPASS, JOB_SHA1PASSSALT,
     JOB_SHA1PASSUSERPASSUSER,  /* e1063: SHA1PASSSALT kernel, algo_mode 1 */
-    JOB_SHA1DRU, JOB_PHPBB3, JOB_MD5, JOB_MD5UC, JOB_MD4, JOB_SHA1,
+#if !(defined(__APPLE__) && defined(METAL_GPU))
+    /* CPU-only on Metal: 0.10x the M2 Max CPU at any list size (2026-11-13). */
+    JOB_SHA1DRU,
+#endif
+    JOB_PHPBB3, JOB_MD5, JOB_MD5UC, JOB_MD4, JOB_SHA1,
     JOB_SHA224, JOB_SHA256, JOB_SHA384, JOB_SHA512,
     /* JOB_NTLM (e369): permanently CPU-only by design. The rules engine
      * assumes ASCII input bytes; NTLM emits 2-3 UTF-16LE candidate plains
@@ -2715,7 +2740,11 @@ static const int gpu_ops[] = {
      * the need_gpu activation set so Metal init runs when -m e812 is in
      * Dohash. Mirrors B6.9/B6.10 SHA512 sibling admission. */
     JOB_SHA384SALTPASS,
-    JOB_SHA512CRYPT, JOB_SHA256CRYPT, JOB_SHA512CRYPTMD5,
+#if !(defined(__APPLE__) && defined(METAL_GPU))
+    /* CPU-only on Metal: 0.20x / 0.17x the M2 Max CPU (2026-11-13). */
+    JOB_SHA512CRYPT, JOB_SHA256CRYPT,
+#endif
+    JOB_SHA512CRYPTMD5,
     JOB_MD5RAW, JOB_SHA1RAW, JOB_SHA384RAW, JOB_SHA512RAW,
     JOB_SQL5, JOB_MYSQL3, JOB_DESCRYPT,
     /* MD5SHA256 (e179): composite sha256-then-two-block-MD5 template core. */
@@ -3325,6 +3354,11 @@ void build_compact_table(void) {
       fprintf(stderr, "GPU: compact table not ready, GPU disabled\n");
       #if defined(OPENCL_GPU)
       gpu_opencl_disable("compact table not built (no hashes loaded for the selected types)");
+      #elif defined(__APPLE__) && defined(METAL_GPU)
+      /* Same on Metal: a run with nothing to find stays on the CPU.  Without
+       * this a codegen kernel-B dispatch hit its FATAL "kernel B requires
+       * compact-table" check, which stays for a table that should exist. */
+      gpu_metal_shutdown();
       #endif
     }
 #if defined(OPENCL_GPU)
@@ -3332,7 +3366,7 @@ void build_compact_table(void) {
      * env flag is set, drive the in-process P4 state-machine walker
      * with a TRIVIAL HARDCODED SPEC (2-op pass-through:
      * OP_PUSH_PASS + OP_EMIT_DIGEST). Optionally dump emitted source
-     * via MDXFIND_HX_CODEGEN_DUMP=/tmp/...  Then JIT-compile the
+     * via MDXFIND_HX_CODEGEN_DUMP=<directory>.  Then JIT-compile the
      * result against dev[0] (FATAL on any failure per
      * feedback_external_failures_are_fatal.md) and exit(0).
      *
@@ -3420,7 +3454,8 @@ void build_compact_table(void) {
                 entry->job_enum, entry->name);
             exit(1);
         }
-        if (hx_dump_source(hxsrc, "MDXFIND_HX_CODEGEN_DUMP") < 0) {
+        if (hx_dump_source(hxsrc, "MDXFIND_HX_CODEGEN_DUMP",
+                           "mdxfind-codegen-harness.cl", NULL, 0) < 0) {
             fprintf(stderr,
                 "FATAL: %s:%d hx codegen source dump failed on %s\n",
                 __FILE__, __LINE__, hxhost);
@@ -3961,7 +3996,8 @@ void build_compact_table(void) {
                 entry->job_enum, entry->name);
             exit(1);
         }
-        if (hx_dump_source(hxsrc, "MDXFIND_HX_CODEGEN_DUMP") < 0) {
+        if (hx_dump_source(hxsrc, "MDXFIND_HX_CODEGEN_DUMP",
+                           "mdxfind-codegen-harness.metal", NULL, 0) < 0) {
             fprintf(stderr,
                 "FATAL: %s:%d hx codegen Metal source dump failed on %s\n",
                 __FILE__, __LINE__, hxhost);
@@ -9901,6 +9937,7 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
        *   f[0]=type f[1]=log2 f[2]=saltlen f[3]=salt f[4]=ivlen f[5]=iv
        *   f[6]=crc  f[7]=packedlen f[8]=unpackedlen f[9]=data
        *   f[10]=crc_len f[11]=coder_attributes        (types 1..127 only)
+       *   f[12]=preprocessor_props    (John only, when the filter is DELTA)
        *
        * The type field does NOT name the codec directly, and an earlier
        * comment here claiming "type 0 = Deflate64, type 1 = LZMA" was wrong.
@@ -9911,19 +9948,23 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
        * 3 PPMd, 6 BZip2, 7 Deflate) and a BCJ-family preprocessor in the
        * high nibble, and carry the two extra fields. 128 means the data was
        * truncated to its final block, with the penultimate block moved into
-       * the iv field. So the field count is 10 or 12, and both are exact.
+       * the iv field. So the field count is 10 or 12, and both are exact --
+       * except that John (7z2john) adds a 13th field, the Delta filter's
+       * property byte, when the high nibble is 8 (0x81 = DELTA+LZMA1). The
+       * Delta distance is that byte + 1 (John's Delta_Decode call). hashcat
+       * 11600 lines never carry it; both shapes load here.
        *
        * See contest/cmiyc26/challenge/MDXFIND-7Z-SPEC.md sections 2 and 8. */
-      char *f[12];
-      int flen[12];
-      int nf = 0, k;
+      char *f[13];
+      int flen[13];
+      int nf = 0, k, sz_delta = 0;
       char *sp = line + 4;
       const char *why = NULL;         /* non-NULL => reject, and this says why */
       /* MUST be taken before the splitter punches NULs over the separators;
        * afterwards strlen(line) only reaches the first '$'. */
       size_t rawlen = strlen(line);
       f[nf++] = sp;
-      while (*sp && nf < 12) {
+      while (*sp && nf < 13) {
         if (*sp == '$') { *sp = 0; f[nf++] = sp + 1; }
         sp++;
       }
@@ -9943,7 +9984,12 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         if (rawlen >= MAXLINE - 64)
           why = "line exceeds MAXLINE and was read truncated; shorten the data "
                 "field with tools/7z2mdx.py";
-        else if (nf != 10 && nf != 12) why = "field count is not 10 or 12";
+        else if (nf != 10 && nf != 12 && nf != 13)
+          why = "field count is not 10, 12 or 13";
+        else if (nf == 13 && (((strtol(f[0], NULL, 10) >> 4) & 0x0f) != 8 ||
+                              flen[12] != 2 || !isxdigit((unsigned char)f[12][0]) ||
+                              !isxdigit((unsigned char)f[12][1])))
+          why = "13th field is not a Delta property byte (2 hex, type 0x8N)";
         else {
           sz_type     = strtol(f[0], NULL, 10);
           sz_log2     = strtol(f[1], NULL, 10);
@@ -9952,7 +9998,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
           sz_crc      = strtoul(f[6], NULL, 10);
           sz_packed   = strtol(f[7], NULL, 10);
           sz_unpacked = strtol(f[8], NULL, 10);
-          if (nf == 12) sz_crclen = strtol(f[10], NULL, 10);
+          if (nf >= 12) sz_crclen = strtol(f[10], NULL, 10);
+          if (nf == 13) sz_delta = (int)strtol(f[12], NULL, 16) + 1;
           dbytes  = flen[9] / 2;
           padsize = (int)(sz_packed - sz_unpacked);
           /* 7z2john encodes unpackedlen mod 16 when it truncates, so a
@@ -10065,7 +10112,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
             /* whole stream is one block: that block IS the head */
             if (get32(f[9], r->head, 16) == 16) r->havehead = 1;
           }
-          if (nf == 12 && flen[11] > 0 && (flen[11] & 1) == 0 && flen[11] <= 16) {
+          r->delta = sz_delta;
+          if (nf >= 12 && flen[11] > 0 && (flen[11] & 1) == 0 && flen[11] <= 16) {
             r->attrs = malloc(flen[11] / 2);
             if (r->attrs && get32(f[11], r->attrs, flen[11] / 2) == flen[11] / 2)
               r->attrlen = flen[11] / 2;
@@ -11002,8 +11050,8 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
           /* Terminate the key in place. `line` is this function's own buffer
            * and the block always `continue`s once it has claimed, so nothing
            * downstream reads past here. */
-          if (cpe_kl <= 0) { cpe_key = NULL; cpe_kl = 0; }
-          else cpe_key[cpe_kl] = 0;
+          /* <record>: is an EMPTY key, which is a valid site key. */
+          cpe_key[cpe_kl] = 0;
         }
         for (x = 0; x < cpe_hl; x++)
           salttmp[x] = toupper((unsigned char)line[x]);
@@ -11271,6 +11319,33 @@ static int gpu_op_advertise_for_h_listing(int x) {
     return 0;
 }
 
+#ifdef GPU_ENABLED
+/* A -n/-N mask the GPU upload cannot take is FATAL while the GPU is active
+ * (checklist 96, 2026-11-15).  There is no working route for it: the device
+ * would hash the bare words with no mask while the CPU skips the mask, and a
+ * CPU route is no answer for a long mask's keyspace.  -G none runs it on the
+ * CPU.  `why` names the position that could not be packed, or NULL for the
+ * per-side cap. */
+static void mask_gpu_unusable_fatal(const char *file, int line,
+                                    const char *backend, const char *why) {
+  char mhost[256];
+  mdx_gethostname(mhost, sizeof(mhost));
+  if (why)
+    fprintf(stderr, "FATAL: %s:%d: host %s, %s: the -n/-N mask cannot be "
+            "uploaded to the GPU (%s; -N %d positions, -n %d positions). "
+            "Run with -G none to use the CPU.\n",
+            file, line, mhost, backend, why, MaskPrependLen, MaskAppendLen);
+  else
+    fprintf(stderr, "FATAL: %s:%d: host %s, %s: the -n/-N mask has %d "
+            "prepend (-N) and %d append (-n) positions; the GPU mask limit "
+            "is %d positions per side, literals included. Shorten the mask, "
+            "or run with -G none to use the CPU.\n",
+            file, line, mhost, backend, MaskPrependLen, MaskAppendLen,
+            MAX_MASK_POS_GPU_SIDE);
+  exit(1);
+}
+#endif
+
 int main(int argc, char **argv) {
   struct stat sb;
   struct job *job;
@@ -11300,6 +11375,10 @@ int HashesLoaded = 0;
   char line[MAXLINE + 16], last[MAXLINE + 16], *cur;
   char workline[MAXLINE + 16];
   struct rule_workspace main_rule_ws;
+  /* -r/-R files, loaded after option parsing; see case 'r'. */
+  static int Rule_defer_ch[256];
+  static char *Rule_defer_path[256];
+  static int Rule_defer_n, Rule_defer_i;
 char *infilename;
   char *Prog = argv[0];
 union HashU curin;
@@ -12083,6 +12162,18 @@ union HashU curin;
 
       case 'r':
       case 'R':
+        /* Deferred: compiled after the last option is read, so a later -8
+         * or -L still applies to this file.  Order among -r/-R is kept,
+         * since -R forms a product with what came before it. */
+        if (Rule_defer_n >= (int)(sizeof(Rule_defer_ch) / sizeof(Rule_defer_ch[0]))) {
+          fprintf(stderr, "%s:%d: too many -r/-R options (max %d)\n", __FILE__,
+                  __LINE__, (int)(sizeof(Rule_defer_ch) / sizeof(Rule_defer_ch[0])));
+          exit(1);
+        }
+        Rule_defer_ch[Rule_defer_n] = ch;
+        Rule_defer_path[Rule_defer_n++] = optarg;
+        break;
+
       case 's':
       case 'u':
       case 'k':
@@ -12289,6 +12380,7 @@ badrule:
         }
 
         fprintf(stderr, "%d %s read from %s\n", x, tok, optarg);
+        if (Rule_defer_i) goto Keys_deferred_next;
         break;
 
       case 'F':
@@ -13001,6 +13093,15 @@ badrule:
         goto usage;
     }
   }
+  /* Now the deferred -r/-R files, in command-line order.  Each one runs the
+   * Keys_start loader above and returns here; Rule_defer_i is non-zero only
+   * during this replay, so the getopt pass leaves that loader with break. */
+Keys_deferred_next:
+  if (Rule_defer_i < Rule_defer_n) {
+    ch = Rule_defer_ch[Rule_defer_i];
+    optarg = Rule_defer_path[Rule_defer_i++];
+    goto Keys_start;
+  }
   /* -L tr/az and the GPU do not compose yet, so take the CPU and say so.
    *
    * The device UTF-32 walker carries the `turkish` parameter but every call
@@ -13624,8 +13725,8 @@ usage:
   /* Extended matching and the pre-check.  Minhashlen is now the shortest
    * loaded hash in hex characters.  A selected type whose compare length is
    * longer than that is matched through the extended windows, which only the
-   * CPU implements -- as are the XOR key and rotation -- so any of the three
-   * keeps the run off the GPU. */
+   * CPU implements -- as are the XOR key, rotation and -b's UTF-16 expansion
+   * -- so any of them keeps the run off the GPU. */
   {
     unsigned maxdig = 0, maxop = 0, op, d;
     int ext_active;
@@ -13642,11 +13743,13 @@ usage:
               "search is slower; -e 0 matches whole hashes only.\n",
               Minhashlen, 2 * maxdig, TYPENAME(maxop));
     Precheck_off = (XOR_key_len || Rotatehash || Printall);
-    if (ext_active || XOR_key_len || Rotatehash) {
+    /* -b too: the device hashes the raw word, never its UTF-16 expansion. */
+    if (ext_active || XOR_key_len || Rotatehash || Unicode) {
 #ifdef GPU_ENABLED
       if (!NoMetal)
         fprintf(stderr, "GPU disabled (%s is CPU-only)\n",
-                XOR_key_len ? "the XOR key" : Rotatehash ? "hash rotation" : "extended matching");
+                XOR_key_len ? "the XOR key" : Rotatehash ? "hash rotation" :
+                Unicode ? "-b Unicode expansion" : "extended matching");
 #endif
       NoMetal = 1;
     }
@@ -16877,10 +16980,11 @@ usage:
         if (RC && Printall) {
           /* -z also needs a synthetic ARCHIVE record: the compute loop walks
            * SevenZipRecs, which is empty with no hash file, so a Typesalt
-           * group alone produced no output at all. Tail bytes are arbitrary
-           * (stage 1 cannot pass against them) -- under Printall the key and
-           * decrypted final block are reported regardless, which is the point
-           * of -z for this type. */
+           * group alone produced no output at all. procjob re-encrypts its
+           * final block under each candidate's key (zsynth), so every -z line
+           * is a record that candidate opens: hashpipe verifies it and -F
+           * loads it back. A LOADED archive under -z still reports the key
+           * and the decrypted final block instead. */
           static const unsigned char sz_ztail[32] = {
             0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
             0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff,
@@ -16897,6 +17001,7 @@ usage:
             zr->padsize = 16;
             zr->bits = 128;
             zr->packed = 16; zr->unpacked = 0;
+            zr->zsynth = 1;
             zr->line = strdup("$7z$0$19$0$$16$00000000000000000000000000000000$0$16$0$"
                               "00112233445566778899aabbccddeeff0f1e2d3c4b5a69788796a5b4c3d2e1f0");
             if (!zr->line) { fprintf(stderr, "Failed to store 7zip hash line\n"); exit(1); }
@@ -17709,78 +17814,16 @@ usage:
       gpujob_init(maxt * 2 + maxt / 2);
       gpu_batch_lines = gpujob_batch_max();
 
-      /* 2026-05-30 long-mask amendment: pack the per-side run-descriptor
-       * streams for the A2/A3/A4 dispatchers ONCE here. Both OpenCL and
-       * Metal A2/A3/A4 dispatchers consult the globals below
-       * (gpu_kern_a_prep_desc[], gpu_kern_a_app_desc[],
-       * gpu_kern_a_prep_dlen, gpu_kern_a_app_dlen,
-       * gpu_kern_a_mask_eligible) to decide whether to upload + dispatch.
-       *
-       * The template/slab kernel path uses a separate upload wire
-       * (gpu_opencl_set_mask / gpu_metal_set_mask) and a separate
-       * eligibility flag (MAX_MASK_POS_GPU_SIDE check) -- those live
-       * in the backend-specific blocks below. */
-      if (MaskPrependLen > 0 || MaskAppendLen > 0) {
-        int prep_vars = 0, prep_lit = 0;
-        int app_vars  = 0, app_lit  = 0;
-        gpu_mask_count_vars_lit_bytes(MaskPrependPattern, MaskPrependLen,
-                                      &prep_vars, &prep_lit);
-        gpu_mask_count_vars_lit_bytes(MaskAppendPattern,  MaskAppendLen,
-                                      &app_vars,  &app_lit);
-        int kern_a_mask_ok = (prep_vars <= GPU_MASK_VAR_CAP) &&
-                             (prep_lit  <= GPU_MASK_LIT_BYTES_CAP) &&
-                             (app_vars  <= GPU_MASK_VAR_CAP) &&
-                             (app_lit   <= GPU_MASK_LIT_BYTES_CAP);
-        if (!kern_a_mask_ok) {
-          fprintf(stderr,
-            "Mask exceeds A2/A3/A4 per-side cap "
-            "(prep vars=%d/%d lit=%d/%d  app vars=%d/%d lit=%d/%d). "
-            "A2/A3/A4 GPU path falls back to CPU; template-path "
-            "eligibility checked separately. Gate fixture for the "
-            "long-mask amendment: -N \"This is triumph, I'm making a "
-            "note here: ?a?a?a?a?a?d?d\" (42 lit + 7 var) fits.\n",
-            prep_vars, GPU_MASK_VAR_CAP, prep_lit, GPU_MASK_LIT_BYTES_CAP,
-            app_vars,  GPU_MASK_VAR_CAP, app_lit,  GPU_MASK_LIT_BYTES_CAP);
-        }
-        gpu_kern_a_mask_eligible = 0;
-        gpu_kern_a_prep_dlen     = 0;
-        gpu_kern_a_app_dlen      = 0;
-        if (kern_a_mask_ok) {
-          int dprep = gpu_pack_mask_descriptor(MaskPrependPattern, MaskPrependLen,
-                                               gpu_kern_a_prep_desc,
-                                               GPU_MASK_DESC_BYTES_CAP);
-          int dapp  = gpu_pack_mask_descriptor(MaskAppendPattern,  MaskAppendLen,
-                                               gpu_kern_a_app_desc,
-                                               GPU_MASK_DESC_BYTES_CAP);
-          if (dprep < 0 || dapp < 0) {
-            fprintf(stderr,
-              "FATAL: %s:%d gpu_pack_mask_descriptor overflow despite cap "
-              "check passed (dprep=%d dapp=%d). Host/kernel buffer-sizing "
-              "skew bug; report to mdxfind maintainer.\n",
-              __FILE__, __LINE__, dprep, dapp);
-            exit(1);
-          }
-          gpu_kern_a_prep_dlen     = dprep;
-          gpu_kern_a_app_dlen      = dapp;
-          gpu_kern_a_mask_eligible = 1;
-          fprintf(stderr,
-            "GPU A2/A3/A4 mask wire-format packed (prep dlen=%d, app dlen=%d, "
-            "prep vars=%d lit=%d, app vars=%d lit=%d)\n",
-            dprep, dapp, prep_vars, prep_lit, app_vars, app_lit);
-        }
-      }
 #ifdef OPENCL_GPU
       /* Compile GPU kernel families for active hash types */
       { unsigned int fam = 0, finalfam = 0;
-        int probe_first_op = -1;
         lsi = 0;
         J1F(RC, Dohash, lsi);
         while (RC) {
-	  if (probe_first_op < 0) probe_first_op = (int)lsi;
 	  fam = 0;
           switch ((int)lsi) {
             case JOB_MD5SALT: case JOB_MD5UCSALT: case JOB_MD5revMD5SALT:
-            case JOB_MD5sub8_24SALT: fam |= 1u << FAM_MD5SALT; break;
+            case JOB_MD5sub8_24SALT: case JOB_MD5MD5SALT: fam |= 1u << FAM_MD5SALT; break;
             case JOB_MD5SALTPASS: case JOB_MD5PASSSALT: fam |= 1u << FAM_MD5SALTPASS; break;
             /* B12 (2026-05-08): FAM_MD5ITER + FAM_MD5MASK slab kernels retired.
              * FAM_MD5UNSALTED also retired in B9 — kept here as no-op for ABI
@@ -17874,40 +17917,18 @@ usage:
           J1N(RC, Dohash, lsi);
         }
         if (finalfam) gpu_opencl_compile_families(finalfam);
-        /* Phase 6.2: kick the multi-GPU warm-probe as early as possible.
-         * gpu_opencl_warm_probe_async uses a synthetic compact table and
-         * synthetic ?l^8 mask when the real ones aren't uploaded yet, so
-         * the probe runs concurrently with the rest of mdxfind setup
-         * (mask parse, BF detection, set_mask). bf_partition_setup waits
-         * via gpu_opencl_warm_probe_wait() before polling rates. */
-        if (finalfam && probe_first_op >= 0)
-          gpu_opencl_warm_probe_async(probe_first_op);
       }
       /* Upload mask descriptor to GPU if mask mode is active (OpenCL).
-       *
-       * 2026-05-30 long-mask amendment: A2/A3/A4 eligibility + run-
-       * descriptor pack is performed ABOVE this block (in the common
-       * gpu_avail branch) so both OpenCL and Metal blocks see the same
-       * gpu_kern_a_{prep,app}_desc + gpu_kern_a_mask_eligible globals.
-       * This block remains the template/slab-path uploader; that path
-       * has its own MAX_MASK_POS_GPU_SIDE=16 cap and is unaffected by
-       * the amendment. */
+       * The template/slab-path uploader; MAX_MASK_POS_GPU_SIDE=16 per side. */
       if ((MaskPrependLen > 0 || MaskAppendLen > 0 || MaskLen > 0) && gpujob_available()) {
         int gpu_mask_ok = 1;
         if (MaskPrependLen > MAX_MASK_POS_GPU_SIDE ||
             MaskAppendLen > MAX_MASK_POS_GPU_SIDE ||
-            MaskLen > MAX_MASK_POS_GPU_SIDE) {
-          fprintf(stderr,
-            "Mask exceeds template-path per-side cap (MaskPrependLen=%d "
-            "MaskAppendLen=%d MaskLen=%d, template cap=%d). Template/slab "
-            "GPU path skipped; A2/A3/A4 eligibility computed separately.\n",
-            MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
-          gpu_mask_ok = 0;
-        }
+            MaskLen > MAX_MASK_POS_GPU_SIDE)
+          mask_gpu_unusable_fatal(__FILE__, __LINE__, "OpenCL", NULL);
         static uint8_t mask_sizes[MAX_MASK_POS_GPU_SIDE * 2];
         static uint8_t mask_tables[MAX_MASK_POS_GPU_SIDE * 2][256];
         int npre = 0, napp = 0;
-        if (gpu_mask_ok) {
 
         /* Build prepend tables from MaskClasses */
         for (int mi = 0; mi < MaskPrependLen; mi++) {
@@ -17966,12 +17987,17 @@ usage:
             }
           }
         }
-        if (gpu_mask_ok && (npre > 0 || napp > 0)) {
+        if (!gpu_mask_ok)
+          mask_gpu_unusable_fatal(__FILE__, __LINE__, "OpenCL",
+                                  "a position has an empty character class");
 #if defined(OPENCL_GPU)
-          gpu_opencl_set_mask(mask_sizes, mask_tables, npre, napp);
+        /* -1 = the tables did not fit in device memory: fatal too, for the
+         * same reason (no working route). */
+        if ((npre > 0 || napp > 0) &&
+            gpu_opencl_set_mask(mask_sizes, mask_tables, npre, napp) != 0)
+          mask_gpu_unusable_fatal(__FILE__, __LINE__, "gpu_opencl_set_mask",
+                                  "out of device memory, or the reason printed above");
 #endif
-        }
-        }  /* end if (gpu_mask_ok) — 2026-05-26 outer guard for GPU per-side cap */
       }
 #endif
 #if defined(__APPLE__) && defined(METAL_GPU)
@@ -18008,14 +18034,8 @@ usage:
         int m_gpu_ok = 1;
         if (MaskPrependLen > MAX_MASK_POS_GPU_SIDE ||
             MaskAppendLen > MAX_MASK_POS_GPU_SIDE ||
-            MaskLen > MAX_MASK_POS_GPU_SIDE) {
-          fprintf(stderr,
-            "Mask exceeds Metal template-path per-side cap (MaskPrependLen=%d "
-            "MaskAppendLen=%d MaskLen=%d, template cap=%d). Template/slab "
-            "GPU path skipped; A2/A3/A4 eligibility computed separately.\n",
-            MaskPrependLen, MaskAppendLen, MaskLen, MAX_MASK_POS_GPU_SIDE);
-          m_gpu_ok = 0;
-        }
+            MaskLen > MAX_MASK_POS_GPU_SIDE)
+          mask_gpu_unusable_fatal(__FILE__, __LINE__, "Metal", NULL);
         /* Per-position charset sizes cross to the GPU as uint8_t, so a
          * 256-member class -- ?b, the only built-in with 256 -- is sent as 0
          * and the reader restores it via gpu_mask_wire_size(). The truncation
@@ -18063,146 +18083,17 @@ usage:
             } else { m_gpu_ok = 0; break; }
           }
         }
-        if (m_gpu_ok && (npre > 0 || napp > 0)) {
-          gpu_metal_set_mask(m_sizes, m_tables, npre, napp);
-        }
+        if (!m_gpu_ok)
+          mask_gpu_unusable_fatal(__FILE__, __LINE__, "Metal",
+                                  "a position has an empty character class");
+        /* -1 = the tables did not fit in device memory: fatal too, for the
+         * same reason (no working route). */
+        if ((npre > 0 || napp > 0) &&
+            gpu_metal_set_mask(m_sizes, m_tables, npre, napp) != 0)
+          mask_gpu_unusable_fatal(__FILE__, __LINE__, "gpu_metal_set_mask",
+                                  "out of device memory, or the reason printed above");
       }
 #endif
-    }
-  }
-#endif
-
-  /* Phase 1a sub-phase 1a.4 (2026-05-21): kernel A4 (brute-force)
-   * harness fixture env-mode. Per feedback_metal_bf_chunk_producer_gap.md,
-   * the BF chunk producer at line 48890 is gated #if defined(OPENCL_GPU),
-   * so the normal `mdxfind -n "?d?d"` CLI invocation cannot exercise A4
-   * end-to-end on Metal builds (g->bf_chunk never gets set). This shim
-   * synthesizes a jobg with bf_chunk=1 + geometry, then calls the
-   * backend dispatcher DIRECTLY. Bypasses the producer entirely so the
-   * Python harness sees identical behavior on both backends.
-   *
-   * Env var: MDXFIND_KERNEL_A_FIXTURE_BF=<num_words>,<bf_mask_start>,
-   *          <bf_offset_per_word>,<bf_num_masks>
-   *
-   * Preconditions when this fires:
-   *   - MDXFIND_KERNEL_A_PROTO=1 + MDXFIND_KERNEL_A_VARIANT=4
-   *   - -n "<mask>" was parsed during getopt -> MaskAppendPattern + Mask-
-   *     Classes[] populated
-   *   - GPU subsystem initialized (build_compact_table ran during getopt
-   *     processing)
-   *   - gpu_*_set_mask uploaded MaskAppendPattern to the slab-style
-   *     buffers (used by template kernels, not by A4; A4 uses its own
-   *     b_kern_a_mask_* buffers via gpu_opencl_kernel_a_upload_mask_buffers
-   *     which lazy-uploads from MaskAppendPattern directly)
-   *
-   * Behavior: synthesize jobg, dispatch, exit. NO wordlist reading, NO
-   * hash file parsing, NO procjob threads. The kernel writes to the
-   * MDXFIND_KERNEL_A_TRACE files; harness picks up from there. */
-#ifdef GPU_ENABLED
-  {
-    const char *bf_fixture = NULL;   /* was MDXFIND_KERNEL_A_FIXTURE_BF */
-    if (bf_fixture != NULL && *bf_fixture != '\0') {
-      uint32_t fx_num_words = 0;
-      uint64_t fx_bf_start  = 0;
-      uint32_t fx_bf_off    = 0;
-      uint32_t fx_bf_nmasks = 0;
-      if (sscanf(bf_fixture, "%u,%llu,%u,%u",
-                 &fx_num_words,
-                 (unsigned long long *)&fx_bf_start,
-                 &fx_bf_off, &fx_bf_nmasks) != 4) {
-        fprintf(stderr,
-            "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF parse error: '%s' "
-            "(expected num_words,bf_mask_start,bf_offset_per_word,bf_num_masks)\n",
-            __FILE__, __LINE__, bf_fixture);
-        exit(1);
-      }
-      if (MaskAppendLen == 0) {
-        fprintf(stderr,
-            "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF requires -n <mask> "
-            "(MaskAppendLen=0)\n",
-            __FILE__, __LINE__);
-        exit(1);
-      }
-      fprintf(stderr,
-          "[fixture-bf] env-mode: num_words=%u bf_mask_start=%llu "
-          "bf_offset_per_word=%u bf_num_masks=%u MaskAppendLen=%d\n",
-          fx_num_words, (unsigned long long)fx_bf_start,
-          fx_bf_off, fx_bf_nmasks, MaskAppendLen);
-
-      /* Acquire a jobg slot. gpujob_get_free_rules blocks until the
-       * pool has a free slot; called once here so no contention. */
-      struct jobg *fxg = gpujob_get_free_rules("fixture-bf", 0);
-      if (fxg == NULL) {
-        fprintf(stderr,
-            "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF: gpujob_get_free_rules "
-            "returned NULL\n",
-            __FILE__, __LINE__);
-        exit(1);
-      }
-      if (fxg->packed_buf == NULL) {
-        fxg->packed_buf = (char *)calloc(1, fxg->packed_buf_size);
-        if (fxg->packed_buf == NULL) {
-          fprintf(stderr, "FATAL: %s:%d fixture-bf packed_buf calloc failed\n",
-                  __FILE__, __LINE__);
-          exit(1);
-        }
-        fxg->word_offset = (uint32_t *)calloc(fxg->word_offset_entries,
-                                              sizeof(uint32_t));
-        if (fxg->word_offset == NULL) {
-          fprintf(stderr, "FATAL: %s:%d fixture-bf word_offset calloc failed\n",
-                  __FILE__, __LINE__);
-          exit(1);
-        }
-      }
-      /* Synthetic single empty plaintext (mirrors procjob short-circuit
-       * at mdxfind.c:10487). All lanes point at the same zero-length
-       * slot; A4 ignores packed_buf/word_offset entirely (BF candidate
-       * IS the mask expansion). */
-      fxg->packed_buf[0]    = 0;   /* plen = 0, low byte  */
-      fxg->packed_buf[1]    = 0;   /* plen = 0, high byte (2-byte header) */
-      if (fx_num_words > fxg->word_offset_entries) {
-        fprintf(stderr,
-            "FATAL: %s:%d fixture-bf num_words=%u exceeds word_offset_entries=%u\n",
-            __FILE__, __LINE__, fx_num_words, fxg->word_offset_entries);
-        exit(1);
-      }
-      for (uint32_t i = 0; i < fx_num_words; i++) fxg->word_offset[i] = 0;
-      fxg->packed_count     = fx_num_words;
-      /* Two bytes, per the 2-byte plen=0 header written above; see the
-       * BF chunk producer's note on why packed_pos must cover the whole
-       * header or the hit replay discards every hit. */
-      fxg->packed_pos       = 2;
-      fxg->op               = JOB_MD5;          /* arbitrary; A4 ignores */
-      fxg->filename         = "fixture-bf";
-      fxg->flags            = JOBFLAG_NUMBERS | JOBFLAG_BRUTEFORCE | JOBFLAG_BF_CHUNK;
-      fxg->doneprint        = &doneprint;
-      fxg->packed           = 1;
-      fxg->rules_engine     = 1;
-      fxg->bf_chunk            = 1;
-      fxg->bf_mask_start       = fx_bf_start;
-      fxg->bf_offset_per_word  = fx_bf_off;
-      fxg->bf_num_masks        = fx_bf_nmasks;
-      fxg->bf_inner_iter       = 1;             /* A4 v1 invariant */
-      fxg->bf_fast_eligible    = 0;             /* A4 path, not BF-fast */
-
-      int fx_nhits = 0;
-      uint32_t *fx_res = NULL;
-#if defined(__APPLE__) && defined(METAL_GPU)
-      fx_res = gpu_metal_kernelA_bruteforce_dispatch(0, fxg, &fx_nhits);
-#elif defined(OPENCL_GPU)
-      fx_res = gpu_opencl_kernel_a_bruteforce_dispatch(0, fxg, &fx_nhits);
-#else
-      fprintf(stderr, "FATAL: %s:%d MDXFIND_KERNEL_A_FIXTURE_BF: no GPU backend compiled in\n",
-              __FILE__, __LINE__);
-      exit(1);
-#endif
-      fprintf(stderr,
-          "[fixture-bf] dispatch returned res=%p nhits=%d (trace=%s)\n",
-          (void *)fx_res, fx_nhits,
-          "(removed)");
-      /* Clean exit. The trace files have been written by the dispatcher's
-       * gpu_*_kernel_a_trace_dump() call. */
-      exit(0);
     }
   }
 #endif
@@ -18312,9 +18203,11 @@ usage:
          *      answers -- the same shape of silent GPU-ate-the-keyspace
          *      failure that BfMaskGpuUsable exists to prevent.
          *
-         * Lifting this needs BF chunks dispatched to the A4 kernel
-         * (cand_bruteforce_phase0) rather than the rules-engine kernel, on
-         * both backends.  That is a dispatcher change, not a host gate. */
+         * Lifting this needs BF chunks dispatched to a kernel that reads a
+         * run descriptor rather than the rules-engine kernel, on both
+         * backends.  That is a dispatcher change, not a host gate.  (The A4
+         * harness kernel that had such a walker was removed 2026-11-14,
+         * checklist 72; RCS holds it.) */
 #ifdef GPU_ENABLED
         if (gpujob_available()) {
           static uint8_t bf_mask_sizes[GPU_MASK_SLOT_CAP * 2];
@@ -18329,10 +18222,9 @@ usage:
              * placeholders a reader counts, and shortening the variable
              * part will not help.
              *
-             * This is NOT the A2/A3/A4 descriptor wire, which does decouple
-             * the two budgets (16 placeholders + 224 literal bytes) and
-             * which accepts this very mask under -n / -N. Brute force
-             * cannot reach it: the BF chunk short-circuit submits through
+             * A run-descriptor wire would decouple the two budgets (the
+             * removed A2/A3/A4 harness kernels had one: 16 placeholders +
+             * 224 literal bytes), but the BF chunk short-circuit submits through
              * the RULES-ENGINE slot (gpujob_get_free_rules), and the
              * rules-engine kernel reads the per-position tables uploaded
              * by gpu_opencl_set_mask / gpu_metal_set_mask. Packing a
@@ -18340,10 +18232,10 @@ usage:
              * is actively dangerous -- measured on dev1 M1, 2026-10-26:
              * the GPU accepted the job, hashed all 81,453,056 candidates
              * of a 4-var/13-lit mask and returned 0 hits while the CPU
-             * found all three planted answers. Moving BF onto the
-             * descriptor wire means dispatching BF chunks to the A4 kernel
-             * (cand_bruteforce_phase0) instead of the rules-engine kernel,
-             * on both backends. Until then this gate stands. */
+             * found all three planted answers. Moving BF onto a
+             * descriptor wire means dispatching BF chunks to a descriptor
+             * kernel instead of the rules-engine kernel, on both backends.
+             * Until then this gate stands. */
             fprintf(stderr,
               "Brute-force mask exceeds the brute-force GPU mask-slot cap "
               "(%d slots needed, one per position incl. literals; cap %d). "
@@ -18367,12 +18259,13 @@ usage:
           BfMaskGpuUsable = (bf_ok && bf_napp > 0) ? 1 : 0;
           if (bf_ok && bf_napp > 0) {
 #if defined(OPENCL_GPU)
-            gpu_opencl_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp);
-            /* Warm-probe was already kicked off right after
-             * gpu_opencl_compile_families (Phase 6.2). It is running with
-             * a synthetic mask; bf_partition_setup waits for it. */
+            /* -1 = the device had no memory for the tables: the CPU-only
+             * brute-force route below, as for a mask it cannot be given. */
+            if (gpu_opencl_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp) != 0)
+              BfMaskGpuUsable = 0;
 #elif defined(__APPLE__) && defined(METAL_GPU)
-            gpu_metal_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp);
+            if (gpu_metal_set_mask(bf_mask_sizes, bf_mask_tables, 0, bf_napp) != 0)
+              BfMaskGpuUsable = 0;
 #endif
           }
         }
@@ -18681,12 +18574,12 @@ usage:
                  *     capable", the FRAGILE block's fan-out case.
                  * A GPU-capable non-MASK category reaching this arm with a
                  * short mask keeps the single job, so its behaviour is
-                 * unchanged: on Metal the mask-iterating path ignores the
-                 * chunk range and uses the full gpu_mask_total, which is
-                 * why 1.600 confined the NDRange cap to OPENCL_GPU, and
-                 * chunking into it would multiply the work by the chunk
-                 * count instead of dividing it.  Widening to that case
-                 * needs a Metal host to validate on, not an argument. */
+                 * unchanged.  (1.600 kept it single because Metal's
+                 * mask-iterating path then ignored the chunk range; it
+                 * honours it now, but widening this case still needs a
+                 * Metal host to validate on, not an argument.  A single
+                 * job too large for the 32-bit device range is refused at
+                 * the pack site in mdxfind.c.) */
                 int bf_fanout_ok = 1;
 #if defined(GPU_BF_CHUNK_PRODUCER)
                 bf_fanout_ok = (!gpujob_available() || !BfMaskGpuUsable ||
@@ -19129,13 +19022,11 @@ usage:
              * (gpu_metal.m ~6856 sizes it num_words or num_words * n_rules)
              * and walks rules and masks in an inner double loop per thread
              * (gpu/metal_template.metal ~390 and ~494), so it cannot overflow
-             * on the mask axis and gains nothing here.  Worse,
-             * Metal ignores the chunk range entirely -- gpujob_metal.m passes
-             * literal 0 for mask_start and bf_num_masks and uses the full
-             * gpu_mask_total -- so every extra chunk recomputes the WHOLE
-             * mask.  Measured on an M1, 1 word x ?l^4: one chunk 456,976
-             * hashes, two chunks 913,952.  Applying the cap there multiplies
-             * the work by the chunk count rather than dividing it. */
+             * on the mask axis and gains nothing from this cap.  Metal does
+             * honour the chunk range (gpujob_metal.m passes g->bf_mask_start
+             * and g->bf_num_masks to both the template and the family
+             * kernel), so a chunk there costs only its own slice; its own
+             * 32-bit bound is the METAL_GPU block after this one. */
             /* Applies to rules+mask too, now that the rule-advance block
              * restarts the mask cursor at mask_base instead of 0.  1.602 gated
              * this on Numrules <= 1 because without that restart a chunked
@@ -19170,6 +19061,24 @@ usage:
               }
             }
 #endif  /* OPENCL_GPU */
+#if defined(METAL_GPU)
+            /* Metal: no grid ceiling, but the job's mask range still crosses
+             * to the device in 32 bits -- jobg bf_num_masks, the template's
+             * mask_size (params.num_salts) and its hit index rule_idx *
+             * mask_size + mask_idx_local are all uint32.  An unchunked job of
+             * 2^32 or more candidates was truncated to its low 32 bits and
+             * the rest of the mask silently never tried (checklist 73).
+             * Chunk so (rules + 1) x chunk stays representable; salts are
+             * covered by the salt-axis gate in mdxfind.c. */
+            if (MaskLen || MaskPrependLen || MaskAppendLen) {
+              unsigned long long _masks_cap =
+                  0xFFFFFFFFULL / ((unsigned long long)Numrules + 1ULL);
+              unsigned long long _need =
+                  (MaskTotal + _masks_cap - 1ULL) / _masks_cap;
+              if (_need > _chunks)
+                _chunks = _need;
+            }
+#endif  /* METAL_GPU */
             unsigned long long _base_size = MaskTotal / _chunks;
             unsigned long long _remainder = MaskTotal - (_base_size * _chunks);
             unsigned long long _chunk_start = 0ULL;
@@ -19220,16 +19129,6 @@ usage:
               job->readbuf = readbuf;
               { lock *rl = readbuf_lock(readbuf); possess(rl); twist(rl, BY, +1); }
               if (ThreadCount < maxt) {
-                /* Experimental: stagger second procjob() startup so the first
-                 * thread fills jobg with line-ordered buffers before sibling
-                 * threads start consuming. Env-gated, fires once when
-                 * launching the second worker, gpu-active only. See
-                 * project_launch_delay_experiment.md. */
-#ifdef GPU_ENABLED
-                if (ThreadCount == 1 && gpujob_available()) {
-                  sleep(2);
-                }
-#endif
                 launch(procjob, NULL);
                 ThreadCount++;
               }

@@ -1,6 +1,9 @@
-/* $Revision: 1.5 $
+/* $Revision: 1.6 $
  *
  * $Log: rule_ops.h,v $
+ * Revision 1.6  2026/11/14 22:14:32  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.5  2026/11/09 21:45:40  dlr
  * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
  *
@@ -199,8 +202,11 @@
 #define RULE_OP_REJ_NHAS    0xc8
 #define RULE_OP_REJ_FIRST   0xc7
 #define RULE_OP_REJ_LAST    0xc6
-#define RULE_OP_S_SPECIAL   0xc5
-#define RULE_OP_HASH_EXIT   0xc4
+/* 0xc5 was RULE_OP_S_SPECIAL (`S`, a/A -> 0x0A), removed 2026-11-14: `S` is
+ * refused at load as an unknown rule command.  Do not reuse the value. */
+/* 0xc4 was RULE_OP_HASH_EXIT (`#` early exit), removed 2026-11-14: `#` is a
+ * comment in both rule compilers, so 0xc4 was never emitted.  Do not reuse
+ * the value. */
 #define RULE_OP_HEX_UPPER   0xc3
 #define RULE_OP_HEX_LOWER   0xc2
 #define RULE_OP_DIV_INSERT  0xc1

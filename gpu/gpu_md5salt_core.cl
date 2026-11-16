@@ -127,6 +127,8 @@ typedef struct {
  *           mdxfind.c:29423 (KPASS via mhash_hmac with key=pass).
  *           Slab oracle: gpu_md5salt.cl hmac_md5_ksalt_batch (line 33) +
  *           hmac_md5_kpass_batch (line 154).
+ *      - 7 (MD5MD5SALT, e347): one extra MD5 over hex32(digest1) first, then
+ *           exactly mode 0 (also hoisted by template_pre_salt).
  *   3. Append salt bytes at byte offset inner_len in M[], add 0x80 padding,
  *      set M[14] = (inner_len+slen)*8 length bits, run a fresh-IV md5_block
  *      to produce the outer digest in st->h[0..3].
@@ -228,7 +230,7 @@ static inline void template_finalize(template_state *st,
      * HMAC(K, M) = MD5((K^opad) || MD5((K^ipad) || M)). Block size = 64
      * bytes; ipad = 0x36, opad = 0x5c. MD5 is little-endian — no bswap
      * needed for key/ipad/opad blocks. */
-    if (algo_mode >= 5u) {
+    if (algo_mode == 5u || algo_mode == 6u) {   /* HMAC only; 7 = e347 */
         /* Resolve key and message per mode, then build a 64-byte key_block
          * (uint LE words) for the ipad/opad XOR. The earlier draft used
          * uchar-pointer cast `(uchar *)key_block` to write key bytes; on
@@ -242,97 +244,36 @@ static inline void template_finalize(template_state *st,
 
         int klen;
         int mlen;
-        /* Step 1: prepare 64-byte key_block. If key > 64 bytes, replace
-         * with MD5(key) (16 bytes). Else pad to 64 with zeros. */
-        if (algo_mode == 5u) {
-            /* KSALT: key = salt (global). */
-            klen = (int)slen;
-            mlen = len;
-            if (klen > 64) {
-                /* Hash global key into key_block[0..3] (4 uint LE words). */
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    kM[i >> 2] |= v << ((i & 3) * 8);
+        /* Step 1: KSALT (mode 5) keys with the salt and hashes the password;
+         * KPASS (mode 6) keys with the password and hashes the salt. A key
+         * longer than the 64-byte block is replaced by H(key) (RFC 2104).
+         * Both the key hash and the message (Step 2) stream any number of
+         * blocks, so no key or candidate length is capped on the device. */
+        klen = (algo_mode == 5u) ? (int)slen : len;
+        mlen = (algo_mode == 5u) ? len : (int)slen;
+        if (klen > 64) {
+            uint kx = 0x67452301u, ky = 0xEFCDAB89u,
+                 kz = 0x98BADCFEu, kw = 0x10325476u;
+            uint kM[16];
+            int nb = (klen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) kM[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < klen) ? (uint)((algo_mode == 5u) ? salt_buf[i] : data[i])
+                                 : ((i == klen) ? (uint)0x80u : 0u);
+                    kM[j >> 2] |= v << ((j & 3) * 8);
                 }
-                if (klen <= 55) {
-                    kM[klen >> 2] |= (uint)0x80u << ((klen & 3) * 8);
-                    kM[14] = (uint)klen * 8u;
-                }
-                uint kx = 0x67452301u, ky = 0xEFCDAB89u,
-                     kz = 0x98BADCFEu, kw = 0x10325476u;
+                if (b == nb - 1) { kM[14] = (uint)(klen) * 8u; kM[15] = 0u; }
                 md5_block(&kx, &ky, &kz, &kw, kM);
-                if (klen > 55) {
-                    int rem = klen - 64;
-                    for (int i = 0; i < 16; i++) kM[i] = 0;
-                    if (rem > 0) {
-                        for (int i = 0; i < rem; i++) {
-                            uint v = (uint)salt_buf[64 + i];
-                            kM[i >> 2] |= v << ((i & 3) * 8);
-                        }
-                    }
-                    {
-                        int p = (rem > 0) ? rem : 0;
-                        kM[p >> 2] |= (uint)0x80u << ((p & 3) * 8);
-                    }
-                    kM[14] = (uint)klen * 8u;
-                    md5_block(&kx, &ky, &kz, &kw, kM);
-                }
-                key_block[0] = kx; key_block[1] = ky;
-                key_block[2] = kz; key_block[3] = kw;
-                klen = 16;
-            } else {
-                /* Pack key bytes into key_block[0..15] uint LE words. */
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
             }
+            key_block[0] = kx; key_block[1] = ky;
+            key_block[2] = kz; key_block[3] = kw;
+            klen = 16;
         } else {
-            /* Mode 6 KPASS: key = data (private = post-rule password). */
-            klen = len;
-            mlen = (int)slen;
-            if (klen > 64) {
-                uint kM[16];
-                int copy1 = (klen < 64) ? klen : 64;
-                for (int i = 0; i < 16; i++) kM[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    kM[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (klen <= 55) {
-                    kM[klen >> 2] |= (uint)0x80u << ((klen & 3) * 8);
-                    kM[14] = (uint)klen * 8u;
-                }
-                uint kx = 0x67452301u, ky = 0xEFCDAB89u,
-                     kz = 0x98BADCFEu, kw = 0x10325476u;
-                md5_block(&kx, &ky, &kz, &kw, kM);
-                if (klen > 55) {
-                    int rem = klen - 64;
-                    for (int i = 0; i < 16; i++) kM[i] = 0;
-                    if (rem > 0) {
-                        for (int i = 0; i < rem; i++) {
-                            uint v = (uint)data[64 + i];
-                            kM[i >> 2] |= v << ((i & 3) * 8);
-                        }
-                    }
-                    {
-                        int p = (rem > 0) ? rem : 0;
-                        kM[p >> 2] |= (uint)0x80u << ((p & 3) * 8);
-                    }
-                    kM[14] = (uint)klen * 8u;
-                    md5_block(&kx, &ky, &kz, &kw, kM);
-                }
-                key_block[0] = kx; key_block[1] = ky;
-                key_block[2] = kz; key_block[3] = kw;
-                klen = 16;
-            } else {
-                for (int i = 0; i < klen; i++) {
-                    uint v = (uint)data[i];
-                    key_block[i >> 2] |= v << ((i & 3) * 8);
-                }
+            for (int i = 0; i < klen; i++) {
+                uint v = (uint)((algo_mode == 5u) ? salt_buf[i] : data[i]);
+                key_block[i >> 2] |= v << ((i & 3) * 8);
             }
         }
 
@@ -353,78 +294,19 @@ static inline void template_finalize(template_state *st,
              ihz = 0x98BADCFEu, ihw = 0x10325476u;
         md5_block(&ihx, &ihy, &ihz, &ihw, hm);
 
-        /* Continue with message + 0x80 + length; total = 64 (ipad block)
-         * + mlen. mlen may exceed 64 — slab oracle handles only up to
-         * the second message block; we mirror that exactly. */
-        if (algo_mode == 5u) {
-            /* msg = data (private). */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((i & 3) * 8);
+        /* Continue with the message, any length: bytes, 0x80, and the
+         * bit length of (64 + mlen) in the last block. */
+        {
+            int nb = (mlen + 72) >> 6;
+            for (int b = 0; b < nb; b++) {
+                for (int i = 0; i < 16; i++) hm[i] = 0u;
+                for (int j = 0; j < 64; j++) {
+                    int i = (b << 6) + j;
+                    uint v = (i < mlen) ? (uint)((algo_mode == 5u) ? data[i] : salt_buf[i])
+                                 : ((i == mlen) ? (uint)0x80u : 0u);
+                    hm[j >> 2] |= v << ((j & 3) * 8);
                 }
-                hm[mlen >> 2] |= (uint)0x80u << ((mlen & 3) * 8);
-                hm[14] = (uint)(64 + mlen) * 8u;
-                md5_block(&ihx, &ihy, &ihz, &ihw, hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)data[i];
-                    hm[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (mlen < 64) hm[mlen >> 2] |= (uint)0x80u << ((mlen & 3) * 8);
-                md5_block(&ihx, &ihy, &ihz, &ihw, hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)data[64 + i];
-                        hm[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= (uint)0x80u << ((p & 3) * 8);
-                }
-                hm[14] = (uint)(64 + mlen) * 8u;
-                md5_block(&ihx, &ihy, &ihz, &ihw, hm);
-            }
-        } else {
-            /* Mode 6 KPASS: msg = salt_buf (global). Same M[i>>2] |= v
-             * pattern; only the source pointer changes. */
-            if (mlen <= 55) {
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < mlen; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((i & 3) * 8);
-                }
-                hm[mlen >> 2] |= (uint)0x80u << ((mlen & 3) * 8);
-                hm[14] = (uint)(64 + mlen) * 8u;
-                md5_block(&ihx, &ihy, &ihz, &ihw, hm);
-            } else {
-                int copy1 = (mlen < 64) ? mlen : 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                for (int i = 0; i < copy1; i++) {
-                    uint v = (uint)salt_buf[i];
-                    hm[i >> 2] |= v << ((i & 3) * 8);
-                }
-                if (mlen < 64) hm[mlen >> 2] |= (uint)0x80u << ((mlen & 3) * 8);
-                md5_block(&ihx, &ihy, &ihz, &ihw, hm);
-                int rem = mlen - 64;
-                for (int i = 0; i < 16; i++) hm[i] = 0;
-                if (rem > 0) {
-                    for (int i = 0; i < rem; i++) {
-                        uint v = (uint)salt_buf[64 + i];
-                        hm[i >> 2] |= v << ((i & 3) * 8);
-                    }
-                }
-                if (mlen >= 64) {
-                    int p = (rem > 0) ? rem : 0;
-                    hm[p >> 2] |= (uint)0x80u << ((p & 3) * 8);
-                }
-                hm[14] = (uint)(64 + mlen) * 8u;
+                if (b == nb - 1) { hm[14] = (uint)(64 + mlen) * 8u; hm[15] = 0u; }
                 md5_block(&ihx, &ihy, &ihz, &ihw, hm);
             }
         }
@@ -481,6 +363,20 @@ static inline void template_finalize(template_state *st,
         for (int j = 0; j < 16; j++) M[j] = 0;
         M[14] = (uint)(len * 8);
         M[15] = 0;
+        md5_block(&h0, &h1, &h2, &h3, M);
+    }
+
+    /* Mode 7 (e347 MD5MD5SALT): one more MD5, over hex32 of the first,
+     * so the rest is mode 0 on md5(hex32(md5(pass))).  CPU: JOB_MD5MD5SALT
+     * hashes and hex-encodes once, then falls into MD5SALTstart. */
+    if (algo_mode == 7u) {
+        md5_to_hex_lc(h0, h1, h2, h3, M);
+        M[8] = 0x80u;
+        for (int j = 9; j < 14; j++) M[j] = 0u;
+        M[14] = 32u * 8u;
+        M[15] = 0u;
+        h0 = 0x67452301u; h1 = 0xEFCDAB89u;
+        h2 = 0x98BADCFEu; h3 = 0x10325476u;
         md5_block(&h0, &h1, &h2, &h3, M);
     }
 
@@ -650,7 +546,7 @@ static inline void template_pre_salt(const uchar *data, int len,
                                      uint algo_mode,
                                      template_pre_salt_state *pre)
 {
-    if (algo_mode != 0u) {
+    if (algo_mode != 0u && algo_mode != 7u) {
         pre->inner_len = TEMPLATE_PRE_SALT_SENTINEL;
         return;
     }
@@ -698,6 +594,16 @@ static inline void template_pre_salt(const uchar *data, int len,
 
     /* Hex-encode digest1 into pre->M[0..7] (Phase 2h-A: M[8..15] dropped
      * from the carrier; template_finalize_post writes them from scratch). */
+    if (algo_mode == 7u) {   /* e347: md5(hex32(md5(pass))), see template_finalize */
+        md5_to_hex_lc(h0, h1, h2, h3, Mi);
+        Mi[8] = 0x80u;
+        for (int j = 9; j < 14; j++) Mi[j] = 0u;
+        Mi[14] = 32u * 8u;
+        Mi[15] = 0u;
+        h0 = 0x67452301u; h1 = 0xEFCDAB89u;
+        h2 = 0x98BADCFEu; h3 = 0x10325476u;
+        md5_block(&h0, &h1, &h2, &h3, Mi);
+    }
     md5_to_hex_lc(h0, h1, h2, h3, pre->M);
 
     /* Phase 2h-A pre-roll: run outer MD5's first 8 FF rounds (rounds

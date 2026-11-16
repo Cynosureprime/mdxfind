@@ -394,7 +394,13 @@ static inline void template_finalize(thread template_state &st,
 {
     int dropped;
     uint nunits = md4_over_utf16le(st.h, data, len, dropped);
-    st.live = (!dropped && nunits != 0u) ? 1u : 0u;
+    /* An EMPTY candidate is hashed (checklist 76 session, 2026-11-14):
+     * the CPU guard is now `len < 0`, so only an ill-formed candidate
+     * (dropped) has no digest; the empty password is MD4 of nothing,
+     * 31d6cfe0d16ae931b73c59d7e0c089c0, exactly as e369 NTLM reports it.
+     * The "two reasons" note above describes the guard before that. */
+    st.live = (!dropped) ? 1u : 0u;
+    (void)nunits;
 }
 
 /* template_iterate: -i loop step. CPU reference at mdxfind.c:15059-15066:

@@ -47,11 +47,11 @@
  *     the kernel's outer iter loop runs exactly once and never calls
  *     template_iterate (which is a stub).
  *
- * Truncation strategy (HYBRID host+kernel, per architect §1):
- *   - HOST-side at the rules-engine pack site (mdxfind.c ~11082): when
- *     family is BCRYPT and pack_len > 72, clamp pack_len = 72 before
- *     the (char)len write + memcpy. Honors user's "prior to dispatching"
- *     intent for the no-rule synthetic pass.
+ * Truncation strategy (kernel only; it was host+kernel until 2026-11-13):
+ *   - HOST-side: none.  The rules-engine pack site used to cut the WORD
+ *     to 72 bytes before the rule ran, so a rule that moves bytes forward
+ *     on a longer word computed a different candidate.  The word now
+ *     reaches the kernel whole and the cap is applied after the rule.
  *   - KERNEL-side IMPLICIT via BF_set_key cycling: post-rule outputs >
  *     72 bytes get silently dropped because the inner cycling pointer
  *     reads pw[0..keylen-1] cyclically, where keylen is clamped <= 72

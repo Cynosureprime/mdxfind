@@ -323,6 +323,14 @@ static inline int gpu_email_normalize(const char *src, int srclen,
  * mdxfind.c is common to all of them. */
 #define GPUJOB_MAX_DEVS 64
 extern uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
+/* The same axis BEFORE the -a dot radix was multiplied in: the job's mask
+ * count C (its chunk under -n/-N, 1 with no mask), or 0 when no radix was
+ * applied.  The axis is dot * C + position, so the dot digit is index / C and
+ * the position is index % C.  The kernels get the same C in params.mask_base0.
+ * Dividing by the FULL position product instead (checklist 74) was right only
+ * when the job was the whole mask: a job of 1/k of it swept 2^N/k dottings
+ * and wrapped the positions over the whole mask instead. */
+extern uint64_t gpu_dispatch_dot_base[GPUJOB_MAX_DEVS];
 /* The global salt index of each hit of a salted template dispatch, parallel to
  * the returned hit records, and how many of them are valid for the dispatch the
  * replay is decoding (0 = this dispatch published none; decode slot[1] as
@@ -339,6 +347,34 @@ extern uint64_t gpu_dispatch_mask_size[GPUJOB_MAX_DEVS];
 extern uint32_t *gpu_dispatch_hit_salt[GPUJOB_MAX_DEVS];
 extern uint32_t gpu_dispatch_hit_salt_n[GPUJOB_MAX_DEVS];
 #endif
+
+/* Lanes per word (or per kernel-A slot) for a kernel that walks its mask
+ * axis inside the lane: the Metal template and the MAKE_MD5PASS family kernel
+ * B on both backends (checklist 76).  With few words and a deep mask, one lane
+ * per word left the device nearly idle -- 178k candidates/s for e1 on an M2
+ * Max.  The kernel splits its local mask axis [0, mask_count) among L lanes
+ * per word and decodes word = gid / L, lane = gid % L; L travels in
+ * params.mask_base1, which no kernel on these routes read before (0 = 1).
+ *
+ * L grows the grid toward `target` lanes and never past the mask count, so a
+ * batch already that wide keeps L = 1 and its old shape.  The Metal template
+ * passes GPU_MASK_LANE_TARGET_POOL: the 16,384-word batch its per-lane scratch
+ * pools are already sized for, so spreading a short batch costs no memory a
+ * full one does not.  Family kernel B has no scratch pool and passes the
+ * wider GPU_MASK_LANE_TARGET.  ponytail: fixed targets for every device; size
+ * them from the device's thread capacity if a GPU is found that they starve. */
+#define GPU_MASK_LANE_TARGET_POOL 16384u
+#define GPU_MASK_LANE_TARGET      262144u
+static inline uint32_t gpu_mask_lanes(uint32_t units, uint64_t mask_count,
+                                      uint32_t target)
+{
+    uint64_t l;
+    if (units == 0u || mask_count <= 1u || units >= target)
+        return 1u;
+    l = ((uint64_t)target + units - 1u) / units;
+    if (l > mask_count) l = mask_count;
+    return (uint32_t)l;
+}
 static inline int gpu_email_dot_width(const char *src, int srclen)
 {
     int i, n = 0;

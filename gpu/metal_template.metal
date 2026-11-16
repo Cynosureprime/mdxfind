@@ -408,7 +408,9 @@ kernel void template_phase0(
      * the same candidate count.
      *
      * Implications:
-     *   - Outer grid = n_words (was n_words * n_rules * mask_size).
+     *   - Outer grid = n_words x mask lanes (was n_words * n_rules *
+     *     mask_size; then n_words alone until checklist 76 put a block of
+     *     the mask axis on each of up to L lanes per word -- see below).
      *   - Per-lane buf pool slot = buf_scratch_pool[gid * RULE_BUF_MAX].
      *     Reused across the inner double-loop iterations; the original
      *     word must be re-staged from `words[]` at the top of each rule
@@ -418,8 +420,29 @@ kernel void template_phase0(
      *     from the prior grid layout (per-word clustering instead of
      *     interleaved), but gpujob_metal.m's hit-replay does not depend
      *     on order; CPU-side sort + dedup absorbs any reshuffling. */
-    if (gid >= n_words) return;
-    uint word_idx = gid;
+    /* Mask lanes per word (checklist 76, gpujob.h gpu_mask_lanes): lane
+     * `mlane` of word `word_idx` walks the contiguous block [mlo, mhi) of the
+     * local mask axis, so a short batch over a deep mask fills the device
+     * instead of walking the whole mask in one lane per word (178k e1
+     * candidates/s on an M2 Max).  L = params.mask_base1, 0 = 1 = the old
+     * shape.  The scratch slots are per LANE; the host sizes both pools at
+     * n_words x L.  Every hit still carries word_idx and the LOCAL mask
+     * index, so the replay and combined_ridx are unchanged. */
+    uint mlanes = (uint)params.mask_base1;
+    if (mlanes == 0u) mlanes = 1u;
+    if ((ulong)gid >= (ulong)n_words * (ulong)mlanes) return;
+    uint word_idx = gid / mlanes;
+    uint mlane = gid - word_idx * mlanes;
+    uint mlo, mhi;
+    {
+        ulong per = ((ulong)mask_size + (ulong)mlanes - 1ul) / (ulong)mlanes;
+        ulong lo = (ulong)mlane * per;
+        ulong hi = lo + per;
+        if (hi > (ulong)mask_size) hi = (ulong)mask_size;
+        if (lo >= hi) return;
+        mlo = (uint)lo;
+        mhi = (uint)hi;
+    }
 
     /* B3 cursor protocol read-only in Phase 1/2a. The kernel reads the
      * fields so the wire format stays the same; never advances past
@@ -445,7 +468,7 @@ kernel void template_phase0(
      * — see signature comment for buf_scratch_pool). Each lane owns
      * RULE_BUF_MAX contiguous bytes starting at slot[word_idx]. */
     device uchar *buf =
-        buf_scratch_pool + (ulong)word_idx * (ulong)RULE_BUF_MAX;
+        buf_scratch_pool + (ulong)gid * (ulong)RULE_BUF_MAX;
 
 #ifdef GPU_TEMPLATE_HAS_RULES32
     /* The UTF-32 lane's three working regions, carved out of one slot so the
@@ -467,7 +490,7 @@ kernel void template_phase0(
      * on exactly the long-candidate cases hardest to notice.  The BYTE arm is
      * unaffected: apply_rule bounds itself at RULE_BUF_LIMIT regardless. */
     device uchar *u32slot =
-        u32_scratch_pool + (ulong)word_idx * (ulong)U32_SLOT_BYTES;
+        u32_scratch_pool + (ulong)gid * (ulong)U32_SLOT_BYTES;
     device uint  *u32buf  = (device uint *)(u32slot);
     device uint  *u32mem  = (device uint *)(u32slot + (ulong)U32_BUF_ELEMS * 4u);
     buf = u32slot + (ulong)U32_BUF_ELEMS * 8u;
@@ -547,18 +570,6 @@ kernel void template_phase0(
         mask_append_combos_h *= (ulong)sz;
     }
     if (mask_append_combos_h == 0u) mask_append_combos_h = 1u;
-    /* -a dot axis: the product over ALL positions, prepend and append, which
-     * is the radix the dot bitmask sits above.  Hoisted rather than recomputed
-     * per candidate because on this backend the mask is an inner LOOP, not a
-     * grid axis, so a per-candidate 32-iteration multiply chain would be paid
-     * mask_size times per word instead of once. */
-    ulong mask_all_combos_h = 1u;
-    for (uint j = 0u; j < mask_npre_h + mask_napp_h; j++) {
-        uint sz = mask_sizes[j];
-        if (sz == 0u) sz = 1u;
-        mask_all_combos_h *= (ulong)sz;
-    }
-    if (mask_all_combos_h == 0u) mask_all_combos_h = 1u;
     ushort mdig[32];
     for (uint i = 0u; i < 32u; i++) mdig[i] = 0u;
 #endif
@@ -579,7 +590,7 @@ kernel void template_phase0(
     for (uint rule_idx = rule_base; rule_idx < rule_end; rule_idx++) {
         (void)rule_idx;  /* silence -Wunused when neither axis defined */
 
-        for (uint mask_idx_local = 0u; mask_idx_local < mask_size; mask_idx_local++) {
+        for (uint mask_idx_local = mlo; mask_idx_local < mhi; mask_idx_local++) {
             (void)mask_idx_local;
 
             /* Re-stage the input word into buf[0..wlen). Previous inner-
@@ -666,15 +677,13 @@ kernel void template_phase0(
 
             /* -a dot axis (plan sections 5 and 15), the Metal twin of the
              * block in gpu_template.cl.  The dot sweep is the OUTERMOST digit
-             * of the mask axis: divide the absolute mask index by the product
-             * of the position sizes and what remains IS the dot bitmask.  The
-             * odometer below is unaffected, because it carries the position
-             * digits only and wraps every _dcomb candidates --
-             * which is exactly the remainder the OpenCL arm takes explicitly.
+             * of the mask axis: the local index divided by the job's mask
+             * count C IS the dot bitmask, and the odometer below restarts from
+             * mask_start at the head of every dot block.
              *
-             * SELF-GATING: with no dot radix multiplied in, the quotient is 0,
-             * the popcount is 0 and nothing is inserted, so a run without -a is
-             * bit-identical and needs no test.
+             * SELF-GATING: with no dot radix multiplied in, the host sends
+             * C = 0, dot_idx stays 0 and nothing is inserted, so a run without
+             * -a is bit-identical.
              *
              * Bit x inserts a dot AFTER character x, matching the CPU
              * (mdxfind.c) and the OpenCL kernel.  Inserted in place walking
@@ -684,25 +693,23 @@ kernel void template_phase0(
              * new_len here is the LOCAL PART: the rule has run and the domain
              * is appended only after this block, so the dots land inside the
              * local exactly as the -E split requires. */
+            /* The local axis is dot * C + position, C = the job's mask count
+             * (params.mask_base0, 0 when no dot radix was applied).  Dividing
+             * by the FULL position product instead (checklist 74) was right
+             * only when the job was the whole mask: a chunk of 1/k swept
+             * 2^N/k dottings and its odometer wrapped over the whole mask.
+             * The LOCAL coordinate, never the absolute index: that carries
+             * mask_start, which belongs to the POSITION digits. */
+            uint dot_base = (uint)params.mask_base0;
+            uint dot_idx = 0u;
+            uint mask_pos_local = mask_idx_local;
+            if (dot_base != 0u) {
+                dot_idx        = mask_idx_local / dot_base;
+                mask_pos_local = mask_idx_local - dot_idx * dot_base;
+            }
+            (void)mask_pos_local;
             {
-#ifdef GPU_TEMPLATE_HAS_MASK
-                ulong _dcomb = mask_all_combos_h;
-#else
-                ulong _dcomb = 1u;   /* no positions: the whole index is dots */
-#endif
-                /* The LOCAL mask coordinate, not the absolute index.  The
-                 * absolute index carries mask_start and the per-word offset,
-                 * which belong to the POSITION digits; mixing them into the
-                 * dot bitmask broke every GPU mask run on the OpenCL twin
-                 * (200 known answers -> 0) before it was caught.  The host
-                 * multiplies the dot radix into mask_size, and
-                 * mask_idx_local is the coordinate on that axis, so the local
-                 * value decomposes as dot * _dcomb + position_index. */
-                /* No guard on _dcomb: it is an empty product of 1 when there
-                 * are no mask positions, which is the -a-with-no--n case, so
-                 * a `> 1` test would zero the dot digit for the only
-                 * configuration that needs it.  It can never be 0. */
-                ulong _dot = (ulong)mask_idx_local / _dcomb;
+                ulong _dot = (ulong)dot_idx;
                 if (_dot != 0u && new_len > 0) {
                     /* Bounded by WOFF_DOT_WIDTH_MAX: new_len reaches 40960 and
                      * a 1-shift past 63 is undefined.  The cap equals the
@@ -749,10 +756,16 @@ kernel void template_phase0(
                  * first and then the last prepend through the first -- i.e.
                  * descending row order, which is exactly what the two
                  * decompose loops here already produce. */
-                if (mask_idx_local == 0u) {
+                /* Decompose at the start of every dot block, not only at
+                 * index 0: each block re-walks the job's positions from
+                 * mask_start (checklist 74).  And at the first index of this
+                 * lane's block, which need not be a block start (checklist
+                 * 76): the position there is mask_start + mask_pos_local. */
+                if (mask_pos_local == 0u || mask_idx_local == mlo) {
                     ulong mask_idx_abs = (ulong)params.mask_start
                                        + (ulong)word_idx
-                                         * (ulong)params.mask_offset_per_word;
+                                         * (ulong)params.mask_offset_per_word
+                                       + (ulong)mask_pos_local;
                     ulong prepend_idx = mask_idx_abs / mask_append_combos_h;
                     ulong append_idx  = mask_idx_abs % mask_append_combos_h;
                     ulong rem = append_idx;

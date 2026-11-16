@@ -1197,8 +1197,6 @@ static const char gpu_u32_walker_str[] =
     "            case RULE_OP_NOOP:\n"
     "            case RULE_OP_NOOP_SP:\n"
     "            case RULE_OP_NOOP_TAB:\n"
-    "            case RULE_OP_HASH_EXIT:\n"
-    "            case RULE_OP_S_SPECIAL:\n"
     "                break;\n"
     "\n"
     "            /* ---- collapsed affix runs -------------------------------\n"

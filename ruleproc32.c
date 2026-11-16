@@ -1,6 +1,9 @@
-/* $Revision: 1.20 $
+/* $Revision: 1.21 $
  *
  * $Log: ruleproc32.c,v $
+ * Revision 1.21  2026/11/14 22:14:33  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.20  2026/11/09 21:45:40  dlr
  * Add hashcat N, RULE_OP_MANGLE_REPLACE_NTH (hashcat PR 5071): NnXY replaces only the nth occurrence of X, counting from 0, with Y; if there is no such occurrence the word is unchanged, exactly as mangle_replace_nth in hashcat rp_cpu.c and inc_rp.cl. Byte engine: RULE_OP_REPLACE_NTH 0x8a, the first free value after the class band, packed as op, position, X, Y; parsed, validated, shown in diagnostics, applied on both the fast and the slow path, and listed with the four-byte ops for GPU eligibility. Bytes of 0x80 and above match, the compare being unsigned. UTF-32 engine under -8: a single character each way packs as RULE_OP_REPLACE_NTH with a 0-based position; a quoted operand on either side packs as RULE32_OP_NTH_STR 0x100D, needle then replacement, so N1 "this" "that" replaces the second this, the needle is matched whole and counted left to right without overlap as s counts, and the replacement may be longer, shorter or empty. A space after the position is skipped when a quoted operand follows; an empty needle is refused; a rule that fails with quoted operands is retried with quotes as plain characters, as for every verb. Verified: the device byte walker against applyrule 9,867 of 9,867 N pairs and 1,089,055 of 1,089,055 for dive.rule; the device UTF-32 walker against applyrule32 315 of 315; OpenCL on an RTX 4070 Ti SUPER 8,413 of 8,413 and 62 of 62 under -8, identical to the CPU; Metal on an M2 Max likewise.
  *
@@ -873,10 +876,8 @@ static int packrule32_pass(const uint32_t *line, int linelen,
             case ']': EMIT(RULE_OP_DROP_LAST);  i++; break;
             case 'k': EMIT(RULE_OP_SWAP_FRONT); i++; break;
             case 'K': EMIT(RULE_OP_SWAP_BACK);  i++; break;
-            case 'S': EMIT(RULE_OP_S_SPECIAL); i++; break;
             case 'H': EMIT(RULE_OP_HEX_UPPER); i++; break;
             case 'h': EMIT(RULE_OP_HEX_LOWER); i++; break;
-            case '#': EMIT(RULE_OP_HASH_EXIT); i++; break;
             case ' ':  EMIT(RULE_OP_NOOP_SP);  i++; break;
             case '\t': EMIT(RULE_OP_NOOP_TAB); i++; break;
 
@@ -2395,23 +2396,6 @@ int applyrule32(const uint32_t *rule, const uint32_t *in, int inlen,
              * between verbs processes rather than failing. */
             case RULE_OP_NOOP_SP:
             case RULE_OP_NOOP_TAB:
-                break;
-
-            /* `#` stops rule processing and emits the buffer as it stands.
-             * ruleproc.c reaches this by `goto fast_exit`, which skips the
-             * remainder of the rule but still copies the word out -- it is an
-             * early return, not a rejection. */
-            case RULE_OP_HASH_EXIT:
-                goto rule_done;
-
-            /* `S`. Not hashcat's; an mdxfind extension that replaces every
-             * 'a'/'A' with a literal newline (0x0A). ASCII-only in ruleproc.c
-             * and deliberately left ASCII-only here: the verb names a byte
-             * value, so widening it to every codepoint that looks like an `a`
-             * would change which words it fires on. */
-            case RULE_OP_S_SPECIAL:
-                for (i = 0; i < len; i++)
-                    if (buf[i] == 'a' || buf[i] == 'A') buf[i] = 0x0a;
                 break;
 
             /* `vXc` -- insert c after every X codepoints. ruleproc.c writes

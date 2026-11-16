@@ -25,11 +25,14 @@
  * partial state. stdout is flushed first so any cracks emitted before
  * the failure are preserved on the consumer's side.
  *
+ * A kernel that does not BUILD is never a capability result: every OpenCL
+ * program build and every Metal library/function/PSO creation is fatal
+ * (2026-11-15), including the eager init-time PSO build that used to
+ * prune a failed variant to the CPU.
+ *
  * Distinct from "graceful capability check at init":
  *   - INIT: gpu_opencl_available / gpu_metal_available returning 0/1 --
  *     a deliberate query, not a failure.
- *   - INIT: gpu_metal_compile_families eager-PSO prune-on-failure --
- *     deliberate admission selection per architect Task #281 §6 Option B.
  *   - RUNTIME: any error code from API call MUST be fatal.
  * Capability checks happen BEFORE the operation is committed; failures
  * happen AFTER. Capability returning "not supported" -> fine, route
@@ -41,6 +44,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>   /* _Exit */
+#include "../mdxhost.h" /* mdx_gethostname(): every FATAL names its host */
 
 /* Generic fail-fast macro for GPU errors that do not carry an NSError.
  * Used by OpenCL host code (cl_int errcode-ret), the Metal newBuffer
@@ -58,9 +62,12 @@
  * terminates the process without stack unwinding -- the driver's
  * internal state never gets a chance to corrupt anything else. */
 #define GPU_FATAL(fmt, ...) do {                                      \
+    char _gf_host[256];                                               \
+    mdx_gethostname(_gf_host, sizeof _gf_host);                       \
     fflush(stdout);                                                   \
     fprintf(stderr, "FATAL: GPU error: " fmt "\n", ##__VA_ARGS__);    \
-    fprintf(stderr, "FATAL: at %s:%d\n", __FILE__, __LINE__);         \
+    fprintf(stderr, "FATAL: at %s:%d on %s\n", __FILE__, __LINE__,    \
+            _gf_host);                                                \
     fflush(stderr);                                                   \
     _Exit(1);                                                         \
 } while (0)
@@ -73,11 +80,13 @@
  * driver-supplied diagnostic. */
 #ifdef __OBJC__
 #define MTL_FATAL_NSERR(nserr, fmt, ...) do {                                \
+    char _gf_host[256];                                                      \
+    mdx_gethostname(_gf_host, sizeof _gf_host);                              \
     fflush(stdout);                                                          \
     fprintf(stderr, "FATAL: GPU error: " fmt " :: %s\n",                     \
         ##__VA_ARGS__,                                                       \
         (nserr) ? [[(nserr) localizedDescription] UTF8String] : "(no error)"); \
-    fprintf(stderr, "FATAL: at %s:%d\n", __FILE__, __LINE__);                \
+    fprintf(stderr, "FATAL: at %s:%d on %s\n", __FILE__, __LINE__, _gf_host); \
     fflush(stderr);                                                          \
     _Exit(1);                                                                \
 } while (0)

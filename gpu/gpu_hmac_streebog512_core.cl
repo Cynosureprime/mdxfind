@@ -107,20 +107,20 @@
  * fix in gpu_streebog512_core.cl R1 mitigation.
  *
  * R1 mitigation (AMD ROCm comgr addrspace fragility): same as
- * gpu_streebog512_core.cl — the only remaining private-pointer cast
- * is at the n-XOR site in streebog_g and the IV/output uchar fills.
- * The HMAC body adds NO new addrspace casts; all HMAC scratch buffers
- * (key_block, ibuf, obuf, inner, hash) are __private and read salt_-
- * bytes (__global) into private staging before hashing — same shape
- * as Family J (gpu_hmac_streebog256_core.cl).
+ * the unsalted Streebog-512 core -- the only private-pointer cast is at
+ * the n-XOR site in streebog_g and the IV/output uchar fills.  The HMAC
+ * body adds NO addrspace casts and stages nothing: the key and the
+ * message are streamed byte by byte (sbg_init/sbg_byte/sbg_final) from
+ * where they lie, salt_bytes or the candidate, so no length is capped.
  *
- * R2 (register pressure): HMAC body adds K_priv[64] + msg_priv[256] +
- * ibuf[320] + obuf[128] + inner[64] + hash[64] = ~896 B over the
- * unsalted Streebog-512 finalize. Larger than Family J's HMAC-STREEBOG-
- * 256 footprint by ~+352 B (inner/hash are 64 bytes vs 32; obuf is 128
- * bytes vs 96). Comparable to slab oracle's footprint (the slab uses
- * identical scratch sizes for STREEBOG-512 HMAC). Expected priv_mem on
- * GTX 1080 Pascal in line with Family J's reading + ~+352 B.
+ *
+ * R2 (register pressure): HMAC scratch is K_priv[64] + the stream
+ * state sx[27] (216 B) + kh[64] (digest of a key over 64 bytes) +
+ * inner[64] + obuf[128] + hash[64], ~600 B over the unsalted finalize.
+ *
+ *
+ *
+ *
  */
 
 #ifndef HASH_WORDS
@@ -844,6 +844,65 @@ static inline void hmac_streebog512_run(uchar *out,
     streebog_hash_priv(out, 64, data, datalen);
 }
 
+/* Streaming STREEBOG over any number of bytes, fed one byte at a time, so
+ * the HMAC key and message are hashed where they lie (data private,
+ * salt_bytes __global) with no staging copy and no length cap.  The same
+ * operations as streebog_hash_priv, split so a block is compressed as soon
+ * as it fills.  State in one array, s[27]: h = s[0..7], e = s[8..15],
+ * m = s[16..23], n = s[24] (bits compressed), pos = s[25] (bytes in m),
+ * total = s[26] (bytes fed). */
+static inline void sbg_init(ulong s[27], int hlen)
+{
+    uchar *hb = (uchar *)s;
+    for (int i = 0; i < 64; i++) hb[i] = (hlen == 32) ? 0x01 : 0x00;
+    for (int i = 8; i < 27; i++) s[i] = 0;
+}
+
+/* e += m, then m = 0 */
+static inline void sbg_sigma(ulong s[27])
+{
+    int c = 0;
+    uchar *eb = (uchar *)(s + 8);
+    uchar *mb = (uchar *)(s + 16);
+    for (int i = 63; i >= 0; i--) {
+        c += eb[i] + mb[i];
+        eb[i] = c & 0xFF;
+        c >>= 8;
+    }
+    for (int i = 16; i < 24; i++) s[i] = 0;
+}
+
+static inline void sbg_byte(ulong s[27], uchar b)
+{
+    uchar *mb = (uchar *)(s + 16);
+    mb[63 - (int)s[25]] = b;
+    s[25] += 1;
+    s[26] += 1;
+    if (s[25] == 64) {
+        streebog_g(s, s + 16, s[24]);
+        s[24] += 0x200;
+        sbg_sigma(s);
+        s[25] = 0;
+    }
+}
+
+static inline void sbg_final(ulong s[27], uchar *out, int hlen)
+{
+    uchar *mb = (uchar *)(s + 16);
+    mb[63 - (int)s[25]] = 0x01;
+    streebog_g(s, s + 16, s[24]);
+    sbg_sigma(s);
+    ulong total_bits = s[26] * 8;
+    for (int i = 63; total_bits > 0; i--) {
+        mb[i] = total_bits & 0xFF;
+        total_bits >>= 8;
+    }
+    streebog_g(s, s + 16, 0);
+    streebog_g(s, s + 8, 0);
+    uchar *hb = (uchar *)s;
+    for (int i = 0; i < hlen; i++) out[i] = hb[i];
+}
+
 /* template_finalize: dual-mode entry.
  *
  * Argument convention from gpu_template.cl GPU_TEMPLATE_HAS_SALT signature:
@@ -896,75 +955,37 @@ static inline void template_finalize(template_state *st,
 {
 #ifdef GPU_TEMPLATE_HAS_SALT
     if (algo_mode >= 5u) {
-        /* Stage the message into a private buffer up-front. salt_bytes
-         * is __global; private staging matches the slab oracle pattern
-         * (gpu_streebog.cl line 901 copies __global msg into private
-         * ibuf). For KPASS, msg comes from salt_bytes; for KSALT, msg
-         * comes from data (already private — direct copy is a no-op
-         * for the message arm). Net: one private staging buffer holds
-         * the message in either mode.
-         *
-         * R1 mitigation: no __private/__global addrspace mixing inside
-         * streebog_hash_priv; the staged buffers are private, matching
-         * every other HMAC body in the template family. */
+        /* Nothing is staged: the key and the message are streamed from
+         * where they lie, so neither length is capped.
+         * KSALT (5): key = salt_bytes, msg = data.
+         * KPASS (6): key = data, msg = salt_bytes. */
         uchar K_priv[64];               /* HMAC key, zero-padded to 64 */
-        uchar msg_priv[256];            /* private msg staging */
-        int   key_len_priv = 0;
-        int   msg_len_priv = 0;
+        int   key_len_priv = (algo_mode == 5u) ? (int)salt_len : len;
+        int   msg_len_priv = (algo_mode == 5u) ? len : (int)salt_len;
+        ulong sx[27];
 
         for (int i = 0; i < 64; i++) K_priv[i] = 0;
-
-        if (algo_mode == 6u) {
-            /* KPASS: key=data (password), msg=salt_bytes. */
-            key_len_priv = len;
-            if (key_len_priv > 64) {
-                /* Long key: hash to 64, write to K_priv (full 64 bytes). */
-                uchar kh[64];
-                uchar ktmp[256];
-                int klen = key_len_priv;
-                if (klen > 256) klen = 256;
-                for (int i = 0; i < klen; i++) ktmp[i] = data[i];
-                hmac_streebog512_run(kh, ktmp, klen);
-                for (int i = 0; i < 64; i++) K_priv[i] = kh[i];
-            } else {
-                for (int i = 0; i < key_len_priv; i++) K_priv[i] = data[i];
-            }
-            uint slen = salt_len;
-            if (slen > 256u) slen = 256u;
-            for (uint i = 0; i < slen; i++) msg_priv[i] = salt_bytes[i];
-            msg_len_priv = (int)slen;
+        if (key_len_priv > 64) {
+            /* Long key: K = streebog(key) byte-reversed, zero-padded to
+             * 64, as the CPU does (mdxfind.c JOB_HMAC_STREEBOG512_*). */
+            uchar kh[64];
+            sbg_init(sx, 64);
+            for (int i = 0; i < key_len_priv; i++)
+                sbg_byte(sx, (algo_mode == 5u) ? salt_bytes[i] : data[i]);
+            sbg_final(sx, kh, 64);
+            for (int i = 0; i < 64; i++) K_priv[i] = kh[63 - i];
         } else {
-            /* algo_mode == 5u, KSALT: key=salt_bytes, msg=data. */
-            uint slen = salt_len;
-            if (slen > 256u) slen = 256u;
-            key_len_priv = (int)slen;
-            if (key_len_priv > 64) {
-                /* Long key: stage __global salt into private, hash, pad. */
-                uchar kh[64];
-                uchar ktmp[256];
-                for (int i = 0; i < key_len_priv; i++) ktmp[i] = salt_bytes[i];
-                hmac_streebog512_run(kh, ktmp, key_len_priv);
-                for (int i = 0; i < 64; i++) K_priv[i] = kh[i];
-            } else {
-                for (int i = 0; i < key_len_priv; i++) K_priv[i] = salt_bytes[i];
-            }
-            int dlen = len;
-            if (dlen > 256) dlen = 256;
-            for (int i = 0; i < dlen; i++) msg_priv[i] = data[i];
-            msg_len_priv = dlen;
+            for (int i = 0; i < key_len_priv; i++)
+                K_priv[i] = (algo_mode == 5u) ? salt_bytes[i] : data[i];
         }
 
-        /* Step 2: inner = STREEBOG-512((K XOR ipad) || msg).
-         *
-         * 64 + 256 = same shape as slab oracle's ibuf[320] bound
-         * (gpu_streebog.cl line 899). */
+        /* Step 2: inner = STREEBOG-512((K XOR ipad) || msg), streamed. */
         uchar inner[64];
-        {
-            uchar ibuf[320];
-            for (int i = 0; i < 64; i++) ibuf[i] = K_priv[i] ^ 0x36u;
-            for (int i = 0; i < msg_len_priv; i++) ibuf[64 + i] = msg_priv[i];
-            hmac_streebog512_run(inner, ibuf, 64 + msg_len_priv);
-        }
+        sbg_init(sx, 64);
+        for (int i = 0; i < 64; i++) sbg_byte(sx, K_priv[i] ^ 0x36u);
+        for (int i = 0; i < msg_len_priv; i++)
+            sbg_byte(sx, (algo_mode == 5u) ? data[i] : salt_bytes[i]);
+        sbg_final(sx, inner, 64);
 
         /* CPU-parity reversal: mdxfind.c CPU path (lines 30955 / 31012)
          * BYTE-REVERSES inner[0..63] before XOR-ing into the opad'd key.
@@ -1033,7 +1054,35 @@ static inline void template_iterate(template_state *st)
         hex_buf[i*2]     = (uchar)(hi + ((hi < 10u) ? '0' : ('a' - 10)));
         hex_buf[i*2 + 1] = (uchar)(lo + ((lo < 10u) ? '0' : ('a' - 10)));
     }
-    streebog_hash_priv(st->last_digest, 64, hex_buf, 128);
+    /* Straight-line two-block Streebog-512 of hex_buf[0..128): the same
+     * operations as streebog_hash_priv(.., 64, hex_buf, 128) -- block 1 at
+     * N=0, block 2 at N=512, the pad block 0x01 at N=1024, then g(N) and
+     * g(Sigma) -- with the block loop written out.  AMD fglrx 1573.4 (Tahiti)
+     * crashed compiling the looped call here in a kernel that also carries
+     * the streamed HMAC finalize (2026-11-15). */
+    {
+        ulong h8[8], e8[8], m8[8];
+        uchar *hb = (uchar *)h8;
+        uchar *eb = (uchar *)e8;
+        uchar *mb = (uchar *)m8;
+        int c;
+        for (int i = 0; i < 8; i++) { h8[i] = 0; e8[i] = 0; }
+        for (int i = 0; i < 64; i++) mb[63 - i] = hex_buf[i];
+        streebog_g(h8, m8, 0);
+        c = 0; for (int i = 63; i >= 0; i--) { c += eb[i] + mb[i]; eb[i] = c & 0xFF; c >>= 8; }
+        for (int i = 0; i < 64; i++) mb[63 - i] = hex_buf[64 + i];
+        streebog_g(h8, m8, 0x200);
+        c = 0; for (int i = 63; i >= 0; i--) { c += eb[i] + mb[i]; eb[i] = c & 0xFF; c >>= 8; }
+        for (int i = 0; i < 8; i++) m8[i] = 0;
+        mb[63] = 0x01;
+        streebog_g(h8, m8, 0x400);
+        c = 0; for (int i = 63; i >= 0; i--) { c += eb[i] + mb[i]; eb[i] = c & 0xFF; c >>= 8; }
+        for (int i = 0; i < 8; i++) m8[i] = 0;
+        mb[62] = 0x04;
+        streebog_g(h8, m8, 0);
+        streebog_g(h8, e8, 0);
+        for (int i = 0; i < 64; i++) st->last_digest[i] = hb[i];
+    }
     template_digest_to_h(st);
 }
 

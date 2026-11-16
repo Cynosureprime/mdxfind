@@ -39,8 +39,8 @@
 #
 #   2. skip_line_ranges:
 #      a) Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around
-#         the template_finalize signature (lines 903, 907) and inside the
-#         body (lines 910, 1027). Metal JIT always defines HAS_SALT for
+#         the template_finalize signature (lines 962, 966) and inside the
+#         body (lines 969, 1048). Metal JIT always defines HAS_SALT for
 #         this carrier; the bare preproc directives confuse the Metal
 #         parser (translator output produces `#ifdef ...,` extra-tokens
 #         warning then signature parse failure).
@@ -63,24 +63,24 @@ skip_line_ranges:
   # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around
   # template_finalize signature. After strip, salt args are unconditional
   # signature args -- matches sha1passsalt et al pattern.
-  - start: 903
-    end:   903
+  - start: 962
+    end:   962
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
-  - start: 907
-    end:   907
+  - start: 966
+    end:   966
     expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close"
 
   # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards inside the
   # template_finalize body (HMAC algo_mode>=5u branch). HMAC body is always
   # live on Metal; defensive fallback runs only if algo_mode != 5u.
-  - start: 910
-    end:   910
+  - start: 969
+    end:   969
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
-  - start: 1027
-    end:   1027
+  - start: 1048
+    end:   1048
     expect_first: "#endif"
     reason: "preproc guard around HMAC body -- close"
 

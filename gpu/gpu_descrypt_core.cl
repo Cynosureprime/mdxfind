@@ -49,11 +49,11 @@
  *     so the kernel's outer iter loop runs exactly once and never
  *     calls template_iterate (which is a stub).
  *
- * Truncation strategy (HYBRID host+kernel, per architect §4):
- *   - HOST-side at the rules-engine pack site (mdxfind.c:11021-11026):
- *     when job->op == JOB_DESCRYPT && len > 8, clamp pack_len = 8 before
- *     the (char)len write + memcpy. Honors user's "prior to dispatching"
- *     intent for the no-rule synthetic pass.
+ * Truncation strategy (kernel only; it was host+kernel until 2026-11-13):
+ *   - HOST-side: none.  The rules-engine pack site used to cut the WORD
+ *     to 8 bytes before the rule ran, so a rule such as `r` worked on the
+ *     wrong bytes.  The word now reaches the kernel whole and the 8-byte
+ *     cap is applied after the rule, where the CPU applies it.
  *   - KERNEL-side IMPLICIT via DES key schedule: the standard 8-byte DES
  *     key buffer below fills with zero-padding past first NUL so bytes
  *     9+ of post-rule outputs are ignored automatically. Defensive
@@ -487,7 +487,7 @@ static inline void template_transform(template_state *st,
 /* descrypt_build_key: 8-byte DES key from data[0..min(len,8)) with the
  * crypt-des.c:626-630 left-shift-by-1, zero padded.  The 8-byte clamp is
  * the CPU's truncation semantics (bytes 9+ of a rule output are dropped);
- * the host clamps too, at mdxfind.c:14261. */
+ * the hit replay clamps the displayed password the same way. */
 static inline void descrypt_build_key(const uchar *data, int len,
                                       uint *khi, uint *klo)
 {

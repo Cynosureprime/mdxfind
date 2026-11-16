@@ -44,12 +44,12 @@ skip_line_ranges:
   # template_finalize signature (lines 251, 255). The Metal JIT always
   # compiles this carrier with GPU_TEMPLATE_HAS_SALT defined. Mirrors
   # phpbb3.yaml / hmac_blake2s.yaml Phase 2d pattern.
-  - start: 251
-    end:   251
+  - start: 285
+    end:   285
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
-  - start: 255
-    end:   255
+  - start: 289
+    end:   289
     expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close"
 
@@ -60,12 +60,12 @@ skip_line_ranges:
   # defensive !HAS_SALT fallback (computes plain MD5(data)) and is
   # structurally unreachable in production -- we drop it entirely so the
   # kernel keeps only the salted chain body.
-  - start: 258
-    end:   258
+  - start: 292
+    end:   292
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around BSD $1$ body -- Metal always has HAS_SALT"
-  - start: 370
-    end:   409
+  - start: 445
+    end:   484
     expect_first: "#else"
     expect_last:  "#endif"
     reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"

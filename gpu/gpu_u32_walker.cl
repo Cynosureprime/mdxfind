@@ -1195,8 +1195,6 @@ U32_SI int apply_rule32(U32_GLOBAL const uint *prog,
             case RULE_OP_NOOP:
             case RULE_OP_NOOP_SP:
             case RULE_OP_NOOP_TAB:
-            case RULE_OP_HASH_EXIT:
-            case RULE_OP_S_SPECIAL:
                 break;
 
             /* ---- collapsed affix runs -------------------------------

@@ -75,19 +75,19 @@ skip_line_ranges:
   # strip the salt args become unconditional, matching the Metal signature
   # shape of phpbb3 / md5crypt / hmac_blake2s. Mirrors phpbb3.yaml /
   # md5crypt.yaml, the Phase 2d.8a pattern.
-  - start: 404
-    end:   404
+  - start: 474
+    end:   474
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
-  - start: 408
-    end:   408
+  - start: 478
+    end:   478
     expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close"
 
   # Strip the `#ifdef GPU_TEMPLATE_HAS_SALT` at the body start. The salted
   # chain body is always live on Metal.
-  - start: 411
-    end:   411
+  - start: 481
+    end:   481
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around SHA-crypt body -- Metal always has HAS_SALT"
 
@@ -97,8 +97,8 @@ skip_line_ranges:
   # dropped entirely so the kernel keeps only the salted chain body. The
   # trailing `#endif` closes the `#ifdef GPU_TEMPLATE_HAS_SALT` stripped
   # above; with that `#ifdef` gone the `#endif` must go too, to stay balanced.
-  - start: 886
-    end:   909
+  - start: 950
+    end:   973
     expect_first: "#else"
     expect_last:  "#endif"
     reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"

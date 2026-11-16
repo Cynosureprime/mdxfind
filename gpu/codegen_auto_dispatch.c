@@ -20,8 +20,11 @@
  * triggers a one-shot stderr WARNING; flag value is IGNORED (matrix
  * decision fires). One-version retention; remove in v1.50x.
  *
- * $Revision: 1.3 $
+ * $Revision: 1.4 $
  * $Log: codegen_auto_dispatch.c,v $
+ * Revision 1.4  2026/11/14 22:14:33  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.3  2026/09/17 05:24:07  dlr
  * Remove MDXFIND_GPU_BACKEND, MDXFIND_GPU_BACKEND_QUIET and the MDXFIND_EXPERIMENT_RULES_CODEGEN_MD5 deprecation shim. The FORCE override bypassed the capability table for every eligible cell, which could produce 0 cracks where legacy is broken or FATAL where codegen is unsupported; the table decides now, always. The three dead branches are deleted rather than left unreachable, because codegen_auto_dispatch_dump_matrix -- the -V output -- was advertising all three variables to the user as though they still worked. It now says selection is automatic with no override.
  *
@@ -110,17 +113,12 @@ static const char *_reason_text(
     if (bf_chunk > 0 && pick == GPU_BACKEND_LEGACY) {
         return "brute-force active: codegen BF path is v2/v3 future work";
     }
-    if (op == JOB_MD5MD5SALT && pick == GPU_BACKEND_CODEGEN) {
-        return "legacy kernel B retired Phase 4a.2b: codegen is production";
+    if (op == JOB_MD5MD5SALT && pick == GPU_BACKEND_LEGACY) {
+        return "md5salt template, algo_mode 7";
     }
     if (gpu_codegen_kernelb_family_md5pass_eligible(op)
         && pick == GPU_BACKEND_CODEGEN) {
         return "MAKE_MD5PASS family: no legacy hand-tuned kernel; codegen is production";
-    }
-    if (backend_kind == GPU_BACKEND_KIND_METAL
-        && (op == JOB_MD5 || op == JOB_MD4) && max_iter > 1
-        && pick == GPU_BACKEND_CODEGEN) {
-        return "Apple Metal legacy template iter>1 broken: codegen is the correct path";
     }
     if (backend_kind == GPU_BACKEND_KIND_OPENCL
         && (op == JOB_MD5 || op == JOB_MD4)
@@ -135,11 +133,6 @@ static const char *_reason_text(
     if ((op == JOB_SHA1RAW || op == JOB_SHA256RAW)
         && max_iter > 1 && pick == GPU_BACKEND_LEGACY) {
         return "SHA*RAW iter>1: codegen uses hex feedback; CPU oracle uses binary feedback (divergence)";
-    }
-    if (backend_kind == GPU_BACKEND_KIND_METAL
-        && (op == JOB_SHA1 || op == JOB_SHA256) && max_iter > 1
-        && pick == GPU_BACKEND_CODEGEN) {
-        return "Apple Metal legacy template_iterate intentionally not called (metal_template.metal:684); codegen is the correct path";
     }
     if (backend_kind == GPU_BACKEND_KIND_METAL
         && (op == JOB_SHA1 || op == JOB_SHA256) && max_iter == 1
@@ -216,13 +209,13 @@ static gpu_backend_pick_t _auto_pick(
     int backend_kind, int op, int max_iter, int rule_count,
     unsigned long long mask_total, unsigned int bf_chunk)
 {
-    /* Cell 1: JOB_MD5MD5SALT (e347).
-     * Legacy hand-tuned kernel B was retired Phase 4a.2b (2026-05-22).
-     * Codegen is the only path on both backends. (Wired-by-construction:
-     * gpu_opencl_kernelb_dispatch_proto / gpu_metal_kernelb_dispatch_-
-     * proto have no legacy branch for this op.) */
+    /* Cell 1: JOB_MD5MD5SALT (e347) -> LEGACY (2026-11-13).  It is the
+     * md5salt template's algo_mode 7 on both backends (e31 over
+     * hex32(md5(pass))), which iterates, applies masks and takes any
+     * candidate length; the kernel A1 + codegen kernel B route did none of
+     * those.  The route gates in gpujob_*.c no longer send e347 there. */
     if (op == JOB_MD5MD5SALT) {
-        return GPU_BACKEND_CODEGEN;
+        return GPU_BACKEND_LEGACY;
     }
 
     /* Cell 2: MAKE_MD5PASS family (e122/e159/e161/e163/e165/e167/e169
@@ -248,31 +241,16 @@ static gpu_backend_pick_t _auto_pick(
         return GPU_BACKEND_LEGACY;
     }
 
-    /* Cell 5: Apple Metal flagship correctness fix (MD5 + MD4).
-     * Legacy template_phase0 iter==1 is correct; template_iterate iter>1
-     * is BROKEN for ALL primitives sharing the template path -- returns
-     * 0 cracks (#377 Gate D + spec §8 file-header comment: "Phase 2
-     * promised to re-add"). Codegen iter-v1 produces correct cracks at
-     * iter ∈ {1,2,5,10,100} (#377). The (Metal, JOB_MD5, iter>1) cell is
-     * the flagship; the (Metal, JOB_MD4, iter>1) cell shares the same
-     * broken-legacy fate per the user-direction brief 2026-05-31:
-     *   "Apple Metal x MD5/MD4 x iter>1 x rules -> CODEGEN (legacy broken)"
-     *
-     * MD4 codegen uses HEX feedback matching CPU JOB_MD4 (which also
-     * uses HEX feedback per mdxfind.c:27048-27057). Iter>1 byte-exact
-     * vs CPU oracle verified by #379 cross-arch matrix (md4 i=2/5/10
-     * sorted-md5 codegen-on-Pascal == codegen-on-Maxwell == codegen-
-     * on-Metal-M1).
-     *
-     * Post-Metal-chunking-ship (gpu_metal.m 1.128, 2026-05-31): the
-     * spec's FATAL escape at large rule counts is GONE -- chunked
-     * dispatcher handles 99K rules cleanly (Gate A 99,074 rules at
-     * dev1 M1 verified). These cells are CODEGEN unconditionally. */
-    if (backend_kind == GPU_BACKEND_KIND_METAL
-        && (op == JOB_MD5 || op == JOB_MD4)
-        && max_iter > 1) {
-        return GPU_BACKEND_CODEGEN;
-    }
+    /* Cell 5 (2026-11-13): Apple Metal MD5 / MD4 + iter>1 + rules -> LEGACY.
+     * This cell used to pick CODEGEN because metal_template.metal never
+     * called template_iterate().  That call is in place now, and the codegen
+     * route it pointed to (kernel A1 + kernelb_hx_codegen_phase0) lost
+     * candidates: kernel A then packed [uchar len][bytes], so a candidate over
+     * 255 bytes was truncated and hashed wrong (the slot length is two bytes
+     * now), and the proto hit replay dropped the empty candidate.  With the C2.3 CPU rule skip the CPU no longer redoes
+     * them, so the loss became visible (MD5 -i 3: the empty password and a
+     * 268-byte candidate).  The legacy template handles both, as it does on
+     * OpenCL; it falls through to the catch-all below. */
 
     /* Cell 6: Apple Metal JOB_MD5 / JOB_MD4 + iter==1 + rules.
      * Legacy template_phase0 is correct (#377 Gate D + small-fixture
@@ -307,34 +285,9 @@ static gpu_backend_pick_t _auto_pick(
         return GPU_BACKEND_LEGACY;
     }
 
-    /* Cell 9b: Apple Metal flagship correctness fix (SHA1 + SHA256
-     * hex-feedback siblings of SHA1RAW/SHA256RAW). Per #379 v1.1
-     * widen option a (2026-05-31):
-     *
-     * Metal legacy template_phase0 at iter>1 has the SAME
-     * "template_iterate() intentionally NOT called" gap as MD5/MD4
-     * (metal_template.metal:684 "Phase 1: template_iterate() is
-     * intentionally NOT called. Phase 2 re-adds it inside
-     * `if (iter < max_iter) { ... }`"). The gap is in template_-
-     * phase0 itself, not the per-primitive cores -- so it affects
-     * ALL primitives sharing the Metal template path including
-     * SHA1 and SHA256. Empirically: Metal -m e8 -i 10 with rules
-     * via legacy returns 0 cracks (same as MD5 iter>1).
-     *
-     * Codegen iter-v1 (codegen/hx_emit_opencl.c:4195+ + Metal twin)
-     * emits per-primitive hex-feedback helpers for SHA1 (40-char
-     * hex + 0x80 + len=320 -> single block) and SHA256 (64-char hex
-     * + 0x80 + len=512 -> two blocks). Matches CPU JOB_SHA1
-     * (mdxfind.c:28666-28679 using prmd5 lower-case hex) and CPU
-     * JOB_SHA256 (mdxfind.c:29088-29097).
-     *
-     * Therefore: Metal × (SHA1, SHA256) × iter>1 × rules -> CODEGEN
-     * (flagship class). */
-    if (backend_kind == GPU_BACKEND_KIND_METAL
-        && (op == JOB_SHA1 || op == JOB_SHA256)
-        && max_iter > 1) {
-        return GPU_BACKEND_CODEGEN;
-    }
+    /* Cell 9b (2026-11-13): Apple Metal SHA1 / SHA256 + iter>1 + rules ->
+     * LEGACY, for the reason given at Cell 5; it falls through to the
+     * catch-all below. */
 
     /* Cell 9c: Apple Metal SHA1 / SHA256 + iter==1 + rules.
      * Legacy template_phase0 is correct at iter==1 (the iter loop body
@@ -434,17 +387,17 @@ void codegen_auto_dispatch_dump_matrix(FILE *out)
         { GPU_BACKEND_KIND_OPENCL, JOB_SHA256,     10, 100, 0, 0, "OpenCL SHA256 iter=10 rules>0" },
         { GPU_BACKEND_KIND_OPENCL, JOB_MD5MD5SALT,  1, 100, 0, 0, "OpenCL MD5MD5SALT (e347)" },
         { GPU_BACKEND_KIND_METAL,  JOB_MD5,         1, 100, 0, 0, "Metal MD5 iter=1 rules>0" },
-        { GPU_BACKEND_KIND_METAL,  JOB_MD5,         5, 100, 0, 0, "Metal MD5 iter=5 rules>0 (FLAGSHIP)" },
-        { GPU_BACKEND_KIND_METAL,  JOB_MD5,        10, 100, 0, 0, "Metal MD5 iter=10 rules>0 (FLAGSHIP)" },
+        { GPU_BACKEND_KIND_METAL,  JOB_MD5,         5, 100, 0, 0, "Metal MD5 iter=5 rules>0" },
+        { GPU_BACKEND_KIND_METAL,  JOB_MD5,        10, 100, 0, 0, "Metal MD5 iter=10 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_MD5,         1,   0, 0, 0, "Metal MD5 iter=1 rules=0" },
         { GPU_BACKEND_KIND_METAL,  JOB_MD4,         1, 100, 0, 0, "Metal MD4 iter=1 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_MD4,        10, 100, 0, 0, "Metal MD4 iter=10 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_SHA1RAW,     1, 100, 0, 0, "Metal SHA1RAW iter=1 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_SHA256RAW,   1, 100, 0, 0, "Metal SHA256RAW iter=1 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_SHA1,        1, 100, 0, 0, "Metal SHA1 iter=1 rules>0" },
-        { GPU_BACKEND_KIND_METAL,  JOB_SHA1,       10, 100, 0, 0, "Metal SHA1 iter=10 rules>0 (FLAGSHIP)" },
+        { GPU_BACKEND_KIND_METAL,  JOB_SHA1,       10, 100, 0, 0, "Metal SHA1 iter=10 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_SHA256,      1, 100, 0, 0, "Metal SHA256 iter=1 rules>0" },
-        { GPU_BACKEND_KIND_METAL,  JOB_SHA256,     10, 100, 0, 0, "Metal SHA256 iter=10 rules>0 (FLAGSHIP)" },
+        { GPU_BACKEND_KIND_METAL,  JOB_SHA256,     10, 100, 0, 0, "Metal SHA256 iter=10 rules>0" },
         { GPU_BACKEND_KIND_METAL,  JOB_MD5MD5SALT,  1, 100, 0, 0, "Metal MD5MD5SALT (e347)" },
     };
     int nprobes = (int)(sizeof(probes) / sizeof(probes[0]));

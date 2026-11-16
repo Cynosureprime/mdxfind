@@ -378,6 +378,76 @@ static inline void sc_oneshot(const uchar *data, int len, uchar *out)
     sc_final(state, buf, bp, counter, out);
 }
 
+/* Streaming MD5, fed one byte at a time, for the SHA512CRYPTMD5 password
+ * preprocess (algo_mode 1), which may be any length.  A block is compressed as soon as it fills, so
+ * nothing caps the message length.  h[4] chain, m[16] the block being
+ * filled (kept zero beyond the bytes written), n[0] bytes fed so far. */
+static inline void md5s_init(uint *h, uint *m, uint *n)
+{
+    h[0] = 0x67452301u; h[1] = 0xEFCDAB89u;
+    h[2] = 0x98BADCFEu; h[3] = 0x10325476u;
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    n[0] = 0;
+}
+
+static inline void md5s_byte(uint *h, uint *m, uint *n, uint b)
+{
+    uint p = n[0] & 63u;
+    m[p >> 2] |= (b & 0xffu) << ((p & 3u) * 8u);
+    n[0] += 1u;
+    if ((n[0] & 63u) == 0u) {
+        md5_block(&h[0], &h[1], &h[2], &h[3], m);
+        for (int i = 0; i < 16; i++) m[i] = 0;
+    }
+}
+
+static inline void md5s_final(uint *h, uint *m, uint *n)
+{
+    uint bits = n[0] * 8u;
+    md5s_byte(h, m, n, 0x80u);
+    if ((n[0] & 63u) > 56u) {
+        md5_block(&h[0], &h[1], &h[2], &h[3], m);
+        for (int i = 0; i < 16; i++) m[i] = 0;
+    }
+    m[14] = bits;
+    md5_block(&h[0], &h[1], &h[2], &h[3], m);
+}
+
+/* Pack the final digest into st->h for compare/emit.
+ *
+ * The compact-table probe + EMIT_HIT_8 (SHA-256) / EMIT_HIT_16
+ * (SHA-512) read st->h[i] as LE uint32 words. The slab oracle packs
+ * the first 4 uint32 words via LE-byte-read of curin[0..15]. We
+ * mirror exactly: pack curin[i*4 .. i*4+3] LE -> st->h[i].
+ *
+ * Loop bound + st->h[] write is width-dependent (8 vs 16 iterations).
+ * st->h has HASH_WORDS slots. A runtime gate would have a dead-branch
+ * OOB write at HASH_WORDS=8 (st->h[15] doesn't exist). Use #if for
+ * the same reason as the compression call site (TYPE/STORAGE
+ * discipline). */
+static inline void sc_store(template_state *st, const uchar *curin)
+{
+#if HASH_WORDS == 16
+    for (int i = 0; i < 16; i++) {
+        uint w = ((uint)curin[i*4 + 0])
+               | ((uint)curin[i*4 + 1] << 8)
+               | ((uint)curin[i*4 + 2] << 16)
+               | ((uint)curin[i*4 + 3] << 24);
+        /* Phase 3's EMIT_HIT_16 will re-extract 16 LE uint32 words via
+         * (uint)st->h[i] (lower 32 bits of each ulong). */
+        st->h[i] = (sc_word_t)w;
+    }
+#else
+    for (int i = 0; i < 8; i++) {
+        uint w = ((uint)curin[i*4 + 0])
+               | ((uint)curin[i*4 + 1] << 8)
+               | ((uint)curin[i*4 + 2] << 16)
+               | ((uint)curin[i*4 + 3] << 24);
+        st->h[i] = (sc_word_t)w;
+    }
+#endif
+}
+
 /* template_finalize: full SHACRYPT chain (5 steps + rounds-iter loop).
  *
  * algo_mode dispatch (Phase 4 will use this):
@@ -409,108 +479,39 @@ static inline void template_finalize(template_state *st,
                                      )
 {
 #ifdef GPU_TEMPLATE_HAS_SALT
-    /* Defensive: clamp plen to a reasonable upper bound. mdxfind default
-     * passwords <= 39 bytes; HASH_BLOCK_BYTES = 64 (SHA-256) or 128
-     * (SHA-512). Working buffer inside the bit loop / step 1 grows with
-     * plen; keep buf[256] for the worst-case temp construction. */
+    /* Passwords of up to 64 bytes are staged in pw[64] for the fast path
+     * below (p_bytes[64], the at-most-two-block rounds message).  A longer
+     * one -- a rule output can be any length, and the CPU arm hashes any
+     * length -- takes the streaming path after the salt is parsed, reading
+     * the password where it lies.  Nothing is cut. */
     int plen = len;
-    if (plen > 64) plen = 64;  /* cap; won't happen in practice */
-
-    /* Copy password into private memory (data is post-rule buffer). */
     uchar pw[64];
-    for (int i = 0; i < plen; i++) pw[i] = data[i];
 
     /* SHA512CRYPTMD5 carrier (2026-05-08): algo_mode == 1u selects MD5-
-     * preprocess of the password (data[0..plen]) BEFORE the SHA-crypt
-     * chain runs. CPU semantics at mdxfind.c:12199-12212 substitutes
-     * the password with the 32-char ASCII-hex representation of MD5
-     * (original_password) -- the rest of crypt_round (which is the
-     * cryptlen=64 / SHA-512 branch) runs on this 32-byte string.
-     *
-     * Mirror that exactly here, INSIDE template_finalize so rules-engine
-     * post-rule plaintexts get the substitution AFTER rule application
-     * (matches CPU semantics: rules apply to the original word, MD5 of
-     * the post-rule word feeds the SHA-crypt chain).
-     *
-     * Using runtime `if` per feedback_runtime_gate_for_template_branches
-     * .md (NEVER `#if`; rev 1.7 Pascal NVIDIA ABORT lesson). The branch
-     * compiles unconditionally; on non-mode-1 paths NVCC's DCE strips
-     * it. SHA256CRYPT instantiation (HASH_WORDS=8, BASE_ALGO=sha256-
-     * crypt) hits a different cache key and never executes this branch
-     * (host sets algo_mode=0u for it).
-     *
-     * MD5-of-pw (≤ 64 bytes input): 1 block if plen ≤ 55; 2 blocks if
-     * 56 ≤ plen ≤ 64 (since MD5 padding requires 9 trailing bytes:
-     * 0x80 + 8-byte length). md5_block from gpu_common takes the
-     * h0..h3 state + M[16] message buffer. Output: 32-byte ASCII hex
-     * written back into pw[]; plen reset to 32. */
+     * preprocess of the password BEFORE the SHA-crypt chain runs: the
+     * password is replaced by the 32-char lowercase hex of MD5(password),
+     * as the CPU does (case JOB_SHA512CRYPTMD5).  Done INSIDE
+     * template_finalize so rules apply to the original word and the MD5 is
+     * of the post-rule candidate.  Streamed, so the candidate may be any
+     * length; the result is 32 bytes and always takes the fast path.
+     * Runtime `if`, never `#if` (feedback_runtime_gate_for_template_-
+     * branches.md). */
     if (algo_mode == 1u) {
-        /* Build MD5 message buffer with standard padding. msg_len = plen.
-         * Use uchar mb[128] = 2 blocks, zero-init via local-scope var.
-         * Single block path (plen <= 55):
-         *   mb[plen] = 0x80; mb[56..63] = bit-length LE (uint64).
-         * Two block path (56 <= plen <= 64):
-         *   mb[plen] = 0x80 (could land in block 0 or block 1);
-         *   mb[120..127] = bit-length LE (uint64).
-         */
-        uchar mb[128];
-        for (int i = 0; i < 128; i++) mb[i] = 0;
-        for (int i = 0; i < plen; i++) mb[i] = pw[i];
-        mb[plen] = 0x80;
-        ulong bitlen = (ulong)plen * 8u;
-        int n_blocks = (plen <= 55) ? 1 : 2;
-        int len_off = (n_blocks == 1) ? 56 : 120;
-        mb[len_off + 0] = (uchar)(bitlen & 0xff);
-        mb[len_off + 1] = (uchar)((bitlen >>  8) & 0xff);
-        mb[len_off + 2] = (uchar)((bitlen >> 16) & 0xff);
-        mb[len_off + 3] = (uchar)((bitlen >> 24) & 0xff);
-        mb[len_off + 4] = (uchar)((bitlen >> 32) & 0xff);
-        mb[len_off + 5] = (uchar)((bitlen >> 40) & 0xff);
-        mb[len_off + 6] = (uchar)((bitlen >> 48) & 0xff);
-        mb[len_off + 7] = (uchar)((bitlen >> 56) & 0xff);
-
-        /* MD5 IV */
-        uint h0 = 0x67452301u;
-        uint h1 = 0xefcdab89u;
-        uint h2 = 0x98badcfeu;
-        uint h3 = 0x10325476u;
-
-        /* Pack first block as 16 LE uint32 from mb[0..63]. */
-        uint M[16];
-        for (int j = 0; j < 16; j++) {
-            int k = j * 4;
-            M[j] = (uint)mb[k]
-                 | ((uint)mb[k+1] << 8)
-                 | ((uint)mb[k+2] << 16)
-                 | ((uint)mb[k+3] << 24);
-        }
-        md5_block(&h0, &h1, &h2, &h3, M);
-        if (n_blocks == 2) {
-            for (int j = 0; j < 16; j++) {
-                int k = 64 + j * 4;
-                M[j] = (uint)mb[k]
-                     | ((uint)mb[k+1] << 8)
-                     | ((uint)mb[k+2] << 16)
-                     | ((uint)mb[k+3] << 24);
-            }
-            md5_block(&h0, &h1, &h2, &h3, M);
-        }
-
-        /* Render MD5 digest as 32-char lowercase hex into pw[0..31]. The
-         * digest in (h0,h1,h2,h3) is stored LE byte-per-byte; CPU
-         * semantics (mymd5 + prmd5 in mdxfind.c) emits it as 32 lower-
-         * case ASCII hex chars in the natural byte order h0[0..3] then
-         * h1[0..3] then h2[0..3] then h3[0..3]. */
+        uint mh[4], mm[16], mn[1];
+        md5s_init(mh, mm, mn);
+        for (int i = 0; i < len; i++) md5s_byte(mh, mm, mn, data[i]);
+        md5s_final(mh, mm, mn);
         const char hex_digits[] = "0123456789abcdef";
-        uint hh[4]; hh[0] = h0; hh[1] = h1; hh[2] = h2; hh[3] = h3;
         for (int j = 0; j < 4; j++) {
             for (int k = 0; k < 4; k++) {
-                uchar by = (uchar)((hh[j] >> (k * 8)) & 0xff);
+                uchar by = (uchar)((mh[j] >> (k * 8)) & 0xff);
                 pw[j * 8 + k * 2 + 0] = (uchar)hex_digits[(by >> 4) & 0x0f];
                 pw[j * 8 + k * 2 + 1] = (uchar)hex_digits[by & 0x0f];
             }
         }
         plen = 32;
+    } else if (plen <= 64) {
+        for (int i = 0; i < plen; i++) pw[i] = data[i];
     }
 
     /* ---- Salt prefix parsing ---- */
@@ -550,6 +551,98 @@ static inline void template_finalize(template_state *st,
         /* Defensive: zero state and return — saltlen 0 is invalid. */
         for (int i = 0; i < HASH_WORDS; i++) st->h[i] = 0;
         return;
+    }
+
+    /* ---- Long password (> 64 bytes, mode 0): the same five steps, every
+     * message streamed with no staging buffer, so there is no length cap.
+     * The password is read from `data` where it lies and the P-bytes
+     * (digest_p repeated to plen bytes) are regenerated on the fly.
+     *
+     * LB_PUT packs bytes into a REGISTER word (lacc) and stores one whole
+     * word per SC_WB bytes; the block is compressed when it fills.  All
+     * state is in scalars of this function: a helper taking bufpos /
+     * counter by pointer forces them into private memory
+     * (feedback_private_array_pointer_forces_local_mem).  Taken only past 64
+     * bytes; measured on a GTX 1080: two 600-byte candidates, 0.86 s busy. */
+    if (plen > 64) {
+#if HASH_WORDS == 16
+#define SC_WB 8
+#define SC_LB_COMPRESS() sha512_block(ls, lb)
+#else
+#define SC_WB 4
+#define SC_LB_COMPRESS() sha256_block(ls, lb)
+#endif
+#define LB_BEGIN() { sc_init(ls); lpos = 0; lacc = 0; }
+#define LB_PUT(b) { lacc = (lacc << 8) | (sc_word_t)(uchar)(b); lpos++; \
+        if ((lpos & (SC_WB - 1)) == 0) { lb[((lpos - 1) / SC_WB) & 15] = lacc; lacc = 0; \
+            if ((lpos & (SC_BLOCK_BYTES - 1)) == 0) { SC_LB_COMPRESS(); } } }
+#define LB_END(out) { ulong _bits = (ulong)lpos * 8UL; LB_PUT(0x80); \
+        while ((lpos & (SC_BLOCK_BYTES - 1)) != SC_BLOCK_BYTES - 2 * SC_WB) LB_PUT(0); \
+        for (int _k = 2 * SC_WB - 1; _k >= 0; _k--) LB_PUT((_k < 8) ? (uchar)(_bits >> (8 * _k)) : (uchar)0); \
+        for (int _i = 0; _i < SC_DIGEST_BYTES; _i++) \
+            (out)[_i] = (uchar)(ls[_i / SC_WB] >> (8 * (SC_WB - 1 - (_i % SC_WB)))); }
+        sc_word_t ls[8], lb[16];
+        sc_word_t lacc;
+        int lpos;
+        uchar la[64], lpd[64], lsd[64], lcur[64];
+        int cl = SC_DIGEST_BYTES;
+
+        /* STEP 1: la = HASH(pass || salt || pass) */
+        LB_BEGIN();
+        for (int i = 0; i < plen; i++)    LB_PUT(data[i]);
+        for (int i = 0; i < saltlen; i++) LB_PUT(raw_salt[i]);
+        for (int i = 0; i < plen; i++)    LB_PUT(data[i]);
+        LB_END(la);
+
+        /* STEP 2: lcur = HASH(pass || salt || la-chunks || bit loop) */
+        LB_BEGIN();
+        for (int i = 0; i < plen; i++)    LB_PUT(data[i]);
+        for (int i = 0; i < saltlen; i++) LB_PUT(raw_salt[i]);
+        {
+            int x = plen;
+            while (x > cl) {
+                for (int i = 0; i < cl; i++) LB_PUT(la[i]);
+                x -= cl;
+            }
+            for (int i = 0; i < x; i++) LB_PUT(la[i]);
+        }
+        for (int x = plen; x != 0; x >>= 1) {
+            if (x & 1) { for (int i = 0; i < cl; i++)   LB_PUT(la[i]); }
+            else       { for (int i = 0; i < plen; i++) LB_PUT(data[i]); }
+        }
+        LB_END(lcur);
+
+        /* STEP 3: lpd = HASH(pass repeated plen times) */
+        LB_BEGIN();
+        for (int x = 0; x < plen; x++)
+            for (int i = 0; i < plen; i++) LB_PUT(data[i]);
+        LB_END(lpd);
+
+        /* STEP 4: lsd = HASH(salt repeated 16 + lcur[0] times) */
+        LB_BEGIN();
+        for (int x = 0; x < 16 + (int)(uint)lcur[0]; x++)
+            for (int i = 0; i < saltlen; i++) LB_PUT(raw_salt[i]);
+        LB_END(lsd);
+
+        /* STEP 5: rounds.  P-bytes = lpd[i % cl] for i < plen; S-bytes =
+         * lsd[0..saltlen). */
+        for (int r = 0; r < rounds; r++) {
+            LB_BEGIN();
+            if (r & 1) { for (int i = 0, k = 0; i < plen; i++) { LB_PUT(lpd[k]); if (++k == cl) k = 0; } }
+            else       { for (int i = 0; i < cl; i++) LB_PUT(lcur[i]); }
+            if (r % 3) { for (int i = 0; i < saltlen; i++) LB_PUT(lsd[i]); }
+            if (r % 7) { for (int i = 0, k = 0; i < plen; i++) { LB_PUT(lpd[k]); if (++k == cl) k = 0; } }
+            if (r & 1) { for (int i = 0; i < cl; i++) LB_PUT(lcur[i]); }
+            else       { for (int i = 0, k = 0; i < plen; i++) { LB_PUT(lpd[k]); if (++k == cl) k = 0; } }
+            LB_END(lcur);
+        }
+        sc_store(st, lcur);
+        return;
+#undef LB_END
+#undef LB_PUT
+#undef LB_BEGIN
+#undef SC_LB_COMPRESS
+#undef SC_WB
     }
 
     /* ---- Working buffers ---- */
@@ -851,37 +944,8 @@ static inline void template_finalize(template_state *st,
     }
 #endif
 
-    /* ---- Pack final digest into st->h for compare/emit ----
-     *
-     * The compact-table probe + EMIT_HIT_8 (SHA-256) / EMIT_HIT_16
-     * (SHA-512) read st->h[i] as LE uint32 words. The slab oracle packs
-     * the first 4 uint32 words via LE-byte-read of curin[0..15]. We
-     * mirror exactly: pack curin[i*4 .. i*4+3] LE -> st->h[i].
-     *
-     * Loop bound + st->h[] write is width-dependent (8 vs 16 iterations).
-     * st->h has HASH_WORDS slots. A runtime gate would have a dead-branch
-     * OOB write at HASH_WORDS=8 (st->h[15] doesn't exist). Use #if for
-     * the same reason as the compression call site (TYPE/STORAGE
-     * discipline). */
-#if HASH_WORDS == 16
-    for (int i = 0; i < 16; i++) {
-        uint w = ((uint)curin[i*4 + 0])
-               | ((uint)curin[i*4 + 1] << 8)
-               | ((uint)curin[i*4 + 2] << 16)
-               | ((uint)curin[i*4 + 3] << 24);
-        /* Phase 3's EMIT_HIT_16 will re-extract 16 LE uint32 words via
-         * (uint)st->h[i] (lower 32 bits of each ulong). */
-        st->h[i] = (sc_word_t)w;
-    }
-#else
-    for (int i = 0; i < 8; i++) {
-        uint w = ((uint)curin[i*4 + 0])
-               | ((uint)curin[i*4 + 1] << 8)
-               | ((uint)curin[i*4 + 2] << 16)
-               | ((uint)curin[i*4 + 3] << 24);
-        st->h[i] = (sc_word_t)w;
-    }
-#endif
+    /* ---- Pack final digest into st->h for compare/emit (sc_store) ---- */
+    sc_store(st, curin);
     return;
 #else
     /* No-salt build: defensive fall-through. SHA-crypt always needs salt;

@@ -26,8 +26,8 @@
 #
 #   2. skip_line_ranges:
 #      a) `#ifdef GPU_TEMPLATE_HAS_SALT` / `#endif` guards around
-#         template_finalize signature (lines 890, 894) + body
-#         (lines 897, 1015).
+#         template_finalize signature (lines 949, 953) + body
+#         (lines 956, 1036).
 #      b) template_emit_hit (simple) macro definition + comment header
 #         at lines 1061-1065. (Note: source file has the macro body on a
 #         single physical line ending with `} while (0)`; comment header
@@ -43,22 +43,22 @@ algo: hmac_streebog512
 
 skip_line_ranges:
   # Strip preproc guards around template_finalize signature.
-  - start: 890
-    end:   890
+  - start: 949
+    end:   949
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
-  - start: 894
-    end:   894
+  - start: 953
+    end:   953
     expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close"
 
   # Strip preproc guards around HMAC body.
-  - start: 897
-    end:   897
+  - start: 956
+    end:   956
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
-  - start: 1015
-    end:   1015
+  - start: 1036
+    end:   1036
     expect_first: "#endif"
     reason: "preproc guard around HMAC body -- close"
 

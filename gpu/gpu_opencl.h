@@ -26,38 +26,6 @@
 extern "C" {
 #endif
 
-/* Forward declaration: gpu_opencl_kernel_a_bruteforce_dispatch takes a
- * `struct jobg *` to read BF chunk fields (bf_chunk, bf_mask_start,
- * bf_offset_per_word, bf_num_masks). Full definition lives in gpujob.h
- * (which gpu_opencl.c #includes). Forward-decl here keeps gpu_opencl.h
- * usable from call sites that haven't pulled gpujob.h. */
-struct jobg;
-
-/* Host-side mirror of the kernel's RULE_BUF_MAX. MUST match it exactly.
- *
- * The kernel does not get its value from the #define in gpu/gpu_md5_rules.cl
- * -- that is only an out-of-band fallback. The host INJECTS -D RULE_BUF_MAX
- * from GPU_RULES_WALKER_BUF_ELEMS (gpujob.h), so THAT is the constant this
- * has to track. It was 40960u here from 2026-05-02, when the buffer tracked
- * CPU MAXLINE; on 2026-09-12 the walker buffer became 2 x the 1024-byte
- * input-word gate and this was not updated with it, leaving the validator
- * reading 4+40960 byte records where the kernel writes 4+2048 -- a 20x
- * stride mismatch on an env-gated diagnostic path. gpu_opencl.c carries a
- * _Static_assert against GPU_RULES_WALKER_BUF_ELEMS so it cannot drift
- * silently again. Bumping requires updating BOTH files
- * (gpu_opencl.h and gpu/gpu_md5_rules.cl) in the same commit. The
- * validator path uses this for record-buffer sizing and stack/heap
- * allocations; mismatch would cause stride mismatch and corrupted reads.
- *
- * Wire format for md5_rules_phase0_validate records (rev 1.23+):
- *   slot[0..1] = retlen as int16 little-endian
- *   slot[2..3] = outlen as uint16 little-endian
- *   slot[4..3+RULE_BUF_MAX_HOST] = post-rule buffer bytes
- * Total slot size = GPU_VALIDATE_RECORD_SZ_HOST = 4 + RULE_BUF_MAX_HOST. */
-#define RULE_BUF_MAX_HOST           2048u
-#define GPU_VALIDATE_RECORD_SZ_HOST (4u + RULE_BUF_MAX_HOST)
-
-
 int gpu_opencl_init(void);
 
 /* Memo C parallel device init (default on). Set to 1 by `-G serial`
@@ -184,26 +152,6 @@ void gpu_opencl_disable(const char *why);
  * time the words have been withheld from the CPU walk and computed by nobody. */
 int gpu_opencl_op_supported(int op);
 
-/* Phase 1a sub-phase 1a.1 env-flag gate. Returns 1 when the operator has
- * opted into the kernel A production path via MDXFIND_KERNEL_A_PROTO=1
- * (with MDXFIND_KERNEL_A_VARIANT unset or set to a supported value).
- * Used at chokepoint-admit, GPU-init, and per-dispatch sites alongside
- * the legacy MDXFIND_KERNEL_B_PROTO env flag; the two flags are union'd
- * (per project_kernel_a_variants_phase1a_spec_2026-05-20.md decision
- * D3.b). Decision is cached after first call; unknown variant values
- * produce a one-time stderr warning and 0.
- *
- * Sub-phase 1a.2 (2026-05-21) extends accepted variants to {1, 2}: V1 =
- * rules-only A1, V2 = masks-only A2. */
-int gpu_opencl_kernel_a_proto_enabled(void);
-
-/* Phase 1a sub-phase 1a.2 (2026-05-21): sibling of _proto_enabled per
- * spec decision D9.4.a. Returns the numeric variant int (1/2/3/4) when
- * proto is enabled, 0 otherwise. Use this at sites that route to a
- * variant-specific dispatch (vs just the binary gate). Shares cache
- * + env-var inspection with gpu_opencl_kernel_a_proto_enabled. */
-int gpu_opencl_kernel_a_active_variant(void);
-
 /* Phase 4 sub-phase 4a.1 (2026-05-21): centralized MDXFIND_HX_CODEGEN
  * opt-out predicate. Returns 1 when the env is unset or anything other
  * than the literal string "0"; returns 0 when MDXFIND_HX_CODEGEN=0.
@@ -221,55 +169,6 @@ int gpu_opencl_hx_codegen_enabled(void);
  * RETIRED; the dispatcher now consults gpu/codegen_auto_dispatch.c
  * per (op, iter, rules, mask, bf, backend_kind). Developer FORCE
  * override: MDXFIND_GPU_BACKEND={auto|legacy|codegen}. */
-
-/* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only) top-level
- * dispatch entry. Mirrors gpu_opencl_kernelb_dispatch_proto shape but
- * routes to cand_masks_phase0 instead of cand_rules_phase0 + kernel B.
- * Returns NULL when variant != 2, no active mask, build/upload fails,
- * or device disabled. *nhits_out is always 0 in this v1 ship (no
- * kernel B wired for A2 yet; harness mode via MDXFIND_KERNEL_A_TRACE). */
-uint32_t *gpu_opencl_kernel_a_masks_dispatch(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
-
-/* Phase 1a sub-phase 1a.3 (2026-05-21): A3 (rules + masks) top-level
- * dispatch entry. Compositional product of A1 + A2. Routes to
- * cand_rules_masks_phase0 (10-arg kernel) when variant=3 and BOTH
- * gpu_n_rules > 0 AND MaskTotal > 0. Reuses all five buffers already
- * uploaded by A1 (rule_program/rule_offset) and A2 (mask prepend/append/
- * charsets/counts); no new persistent buffers. Per D10.1.a the host
- * passes num_rules = gpu_n_rules - 1 (source count); the kernel adds the
- * implicit no-rule pass via rule_idx==0 fast path. v1 ship is single-
- * shot (no cursor-restart chunking; sub-phase 1a.3.x); returns NULL
- * on success and *nhits_out is 0 in harness mode. */
-uint32_t *gpu_opencl_kernel_a_rules_masks_dispatch(int dev_idx,
-    const char *packed_words, uint32_t packed_size,
-    const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
-
-/* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force) top-level
- * dispatch entry. Pure BF; no rule axis, no prepend mask axis (BF
- * invariant MaskPrependLen == 0 enforced). Routes to cand_bruteforce_-
- * phase0 (8-arg kernel byte-identical to A2 signature; mask_pattern_-
- * prepend slot bound to a zeroed buffer) when variant=4 AND g->bf_chunk
- * AND MaskAppendLen > 0.
- *
- * Signature differs from A1/A2/A3: takes struct jobg *g directly (no
- * packed_words / word_offset / num_words args). Reads g->bf_chunk,
- * g->bf_mask_start, g->bf_offset_per_word, g->bf_num_masks, g->num_words
- * + global MaskAppendLen + MaskAppendPattern + MaskClasses[]. Reuses the
- * 4 mask buffers already uploaded by A2/A3 (D11.2.a); zero new persistent
- * buffers.
- *
- * Single-shot per dispatch (host pre-sized chunk via adaptive_bf_chunk_-
- * size servo; no kernel-side cursor-restart). Host caps max_packed at
- * MAX_KERNEL_A_PACKED (256 MB) and FATAL-exits on overflow.
- *
- * v1 ship is harness-mode: returns NULL on success and *nhits_out is 0
- * (no kernel B wired for A4). */
-uint32_t *gpu_opencl_kernel_a_bruteforce_dispatch(int dev_idx,
-    struct jobg *g, int *nhits_out);
 
 /* Per-device APIs — dev_idx from 0 to num_devices-1 */
 int gpu_opencl_set_compact_table(int dev_idx,
@@ -315,6 +214,10 @@ static inline unsigned gpu_mask_wire_size(unsigned char v)
     return v ? (unsigned)v : 256u;
 }
 
+/* Returns 0, or -1 when a device had no memory for the mask tables: the mask
+ * state is then that of a run that never called this (the brute-force caller
+ * hands the mask to the CPU; the -n/-N caller is FATAL).  Any other failure is
+ * FATAL. */
 int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
                         int npre, int napp);
 
@@ -325,18 +228,6 @@ int gpu_opencl_set_mask(const uint8_t *sizes, const uint8_t tables[][256],
  * project_bf_chunk_as_job.md Phase 3. RCS history retains the prior API
  * (gpu_opencl.h rev 1.22). */
 
-/* Surviving accessor: per-(device, family) autotune rate. */
-double gpu_opencl_fam_rate(int dev_idx, int fam);
-
-/* Phase 6.1: warm-probe — eager, parallel autotune of all devices for op
- * family. Lets bf_partition_setup poll real fam_rate values instead of
- * always seeing zeros (autotune is normally lazy, runs on first dispatch).
- * gpu_opencl_warm_probe is the synchronous unit; the async pair below
- * spawns one pthread per device so the probe wall time = max device
- * probe time (~250-400ms) regardless of device count. */
-void gpu_opencl_warm_probe(int dev_idx, int op);
-void gpu_opencl_warm_probe_async(int op);
-void gpu_opencl_warm_probe_wait(void);
 
 /* BF Phase 3b Tranche B (2026-05-10): gpu_opencl_dispatch_batch declaration
  * retired. Function body deleted from gpu/gpu_opencl.c in same commit; sole
@@ -393,7 +284,10 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
 uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
     const char *packed_words, uint32_t packed_size,
     const uint32_t *word_offset, uint32_t num_words,
-    int op, int *nhits_out);
+    int op, uint64_t mask_start, uint32_t mask_count, int *nhits_out);
+/* mask_start/mask_count: the job's slice of the -n/-N mask (jobg
+ * bf_mask_start/bf_num_masks); count 0 = the whole mask.  Read only by the
+ * MAKE_MD5PASS family kernel. */
 
 /* Accessor for post-kernel-A plaintext readback. Returns the post-rule
  * plaintext bytes for slot hit_widx (= entry[0] from the hit buffer).

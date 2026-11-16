@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.h,v 1.5 2026/08/09 20:13:37 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.h,v 1.6 2026/11/15 15:59:03 dlr Exp dlr $
  *
  * gpu_kernel_cache — bare-files cache for OpenCL device-binary programs.
  *
@@ -100,33 +100,34 @@ int gpu_kernel_cache_path(char *out, size_t outlen, const char *name);
  * binary. Failure to write the source file does NOT abort the cache
  * store — only .bin and .meta are load-bearing.
  *
- * On any failure (including disabled cache), falls back to plain
- * clCreateProgramWithSource + clBuildProgram. The caller can then
- * retrieve build log via clGetProgramBuildInfo if program is NULL.
+ * On any cache failure (including disabled cache), falls back to plain
+ * clCreateProgramWithSource + clBuildProgram. A failure of THAT build is
+ * fatal (see below).
  *
- * Returns the cl_program on success (caller owns), or NULL on failure.
- * `*err_out` (if non-NULL) receives the last cl_int error code seen.
+ * Returns the cl_program (caller owns); `*err_out` (if non-NULL) receives
+ * CL_SUCCESS.
  *
  * Only declared when cl.h has already been included by the caller. */
 #if defined(CL_VERSION_1_0) || defined(CL_PLATFORM_H) || defined(__OPENCL_CL_H)
-cl_program gpu_kernel_cache_build_program(
-    cl_context ctx, cl_device_id dev,
-    cl_uint n_sources, const char **sources,
-    const char *build_opts,
-    cl_int *err_out);
-
-/* Same as above but with an explicit defines_str included in the cache
- * key. The plain build_program() above is implemented as a thin wrapper
- * passing defines_str=NULL so existing call sites keep their current
- * cache keys. New template-instantiation call sites use this entry
- * point with their HASH_WORDS / HASH_BLOCK_BYTES defines string.
- * Both variants write the source dump (<key>.cl) on cache-miss compile. */
-cl_program gpu_kernel_cache_build_program_ex(
+/* A build failure never returns: the call prints the caller's file:line and
+ * function, the device, the host, the error and the full build log, and
+ * exits 1.  So a returned program is always built; there is nothing for the
+ * caller to check.  The two names below are macros so that the caller's
+ * __FILE__/__LINE__/__func__ reach the message.  _ex adds defines_str to the
+ * cache key; the plain form passes NULL, keeping its pre-B2 cache key. */
+cl_program gpu_kernel_cache_build_program_at(
     cl_context ctx, cl_device_id dev,
     cl_uint n_sources, const char **sources,
     const char *build_opts,
     const char *defines_str,
-    cl_int *err_out);
+    cl_int *err_out,
+    const char *file, int line, const char *func);
+#define gpu_kernel_cache_build_program(ctx, dev, n, src, opts, err) \
+    gpu_kernel_cache_build_program_at((ctx), (dev), (n), (src), (opts), NULL, \
+                                      (err), __FILE__, __LINE__, __func__)
+#define gpu_kernel_cache_build_program_ex(ctx, dev, n, src, opts, defs, err) \
+    gpu_kernel_cache_build_program_at((ctx), (dev), (n), (src), (opts), (defs), \
+                                      (err), __FILE__, __LINE__, __func__)
 #endif
 
 #ifdef __cplusplus

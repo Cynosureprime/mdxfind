@@ -126,6 +126,10 @@
  * exceeds 16 bytes (probe width). Defined in mdxfind.c just above the
  * validate harness (was static prior to 5a.5; de-staticized for
  * cross-TU access). Returns digest length in bytes or -1 on error. */
+extern int oracle_compute_md5pass_family_iter(int job_enum, const char *pass,
+                                              int plen, int iter,
+                                              unsigned char *out);
+extern int gpu_metal_proto_mask_on;   /* gpu_metal.m: kernel B applied -n/-N */
 extern int oracle_compute_md5pass_family(int job_enum, const char *pass,
                                          int plen, unsigned char *out);
 
@@ -622,6 +626,7 @@ static int metal_gpu_hash_words(int op)
     case JOB_HMAC_MD5:            /* e214 KSALT = 4 uint32 */
     case JOB_MD5revMD5SALT:    /* e541: md5salt carrier, algo_mode=2 */
     case JOB_MD5sub8_24SALT:   /* e542: md5salt carrier, algo_mode=3 */
+    case JOB_MD5MD5SALT:       /* e347: md5salt carrier, algo_mode=7 */
     case JOB_MD5_MD5SALTMD5PASS:/* e367: md5salt carrier, algo_mode=4 */
     case JOB_MYSQL3:           /* e456: HASH_WORDS=4, matching the OpenCL
                                 * carrier's defines_str. Listed explicitly per
@@ -683,6 +688,13 @@ extern int     gpu_rules_engine_active;
     if (__sync_bool_compare_and_swap((pv), _old, _old - 1)) { \
       _retired = (_old == 1); break; } \
     _old = *(pv); } } _retired; })
+/* match_flags hold the op that last printed a hash: true iff THIS thread
+ * replaced a different op with its own, so two finders cannot both print.
+ * Same macro as mdxfind.c. */
+#define MF_TAKE(mf, op) ({ unsigned short _mo = *(volatile unsigned short *)(mf), \
+  _mn = (unsigned short)(op); int _mw = 0; while (_mo != _mn) { \
+    if (__sync_bool_compare_and_swap((mf), _mo, _mn)) { _mw = 1; break; } \
+    _mo = *(volatile unsigned short *)(mf); } _mw; })
 
 /* struct saltentry mirror. The original lives in mdxfind.c at line 2763;
  * gpu/gpujob_opencl.c carries a redeclaration at line 270 (same layout
@@ -1301,105 +1313,13 @@ static void gpujob_metal_worker(void *arg) {
             uint64_t _disp_t0 = gpu_now_us();
             if (_gpu_first_us == 0) _gpu_first_us = _disp_t0;
 
-            /* Phase 1a sub-phase 1a.1b-continued (2026-05-20): A1 proto
-             * branch. Mirrors gpu/gpujob_opencl.c:983-1075 but A1-only
-             * (kernel B not wired in this Metal sub-phase). Gated on
-             * JOB_MD5MD5SALT + (MDXFIND_KERNEL_B_PROTO env OR
-             * gpu_metal_kernel_a_proto_enabled() == 1).
-             *
-             * On proto fire: dispatcher writes the buffer-quadruple to
-             * MDXFIND_KERNEL_A_TRACE files (zero overhead when unset),
-             * returns non-NULL with nhits=0; we set _proto_fired so the
-             * standard dispatch is skipped (no real cracks emitted in
-             * this sub-phase; harness validates via trace files). */
+            /* _proto_fired: a kernel-A/B route served this batch, so the
+             * standard dispatch is skipped. */
             int _proto_fired = 0;
 
-            /* Phase 1a sub-phase 1a.4 (2026-05-21): A4 (brute-force)
-             * dispatch arm. Mirrors gpu/gpujob_opencl.c twin. Routes BF
-             * chunks (g->bf_chunk == 1) to cand_bruteforce_phase0 when
-             * MDXFIND_KERNEL_A_VARIANT=4. Placed BEFORE A3/A2/A1 arms
-             * per spec R12 ordering. A4 gate (g->bf_chunk) is structurally
-             * mutually exclusive with A2/A3 gates (!g->bf_chunk). v1
-             * ship: harness-mode (dispatcher dumps the buffer-quadruple
-             * via MDXFIND_KERNEL_A_TRACE; no real cracks; _proto_fired
-             * short-circuits the A3/A2/A1 paths below). NOTE: A4 fires
-             * for ANY op carrying a BF chunk, not just JOB_MD5MD5SALT. */
-            if (g->bf_chunk &&
-                gpu_metal_kernel_a_active_variant() == 4) {
-                int _a4n = 0;
-                uint32_t *_a4res = gpu_metal_kernelA_bruteforce_dispatch(
-                    0 /* dev_idx */, g, &_a4n);
-                if (_a4res != NULL) {
-                    _proto_fired = 1;
-                    nhits = _a4n;       /* always 0 in A4 v1 ship */
-                    hits  = _a4res;     /* non-NULL signal only */
-                }
-            }
-
-            /* Phase 1a sub-phase 1a.3 (2026-05-21): A3 (rules + masks)
-             * dispatch arm. Mirrors gpu/gpujob_opencl.c twin. Routes
-             * JOB_MD5MD5SALT to cand_rules_masks_phase0 when
-             * MDXFIND_KERNEL_A_VARIANT=3 AND BOTH rules and masks are
-             * active. Placed BEFORE the A2 + A1 arms per spec R5. v1
-             * ship: harness-mode (dispatcher dumps the buffer-quadruple
-             * via MDXFIND_KERNEL_A_TRACE; no real cracks; _proto_fired
-             * short-circuits the A2/A1 paths below). */
-            if (g->op == JOB_MD5MD5SALT &&
-                gpu_metal_kernel_a_active_variant() == 3 &&
-                gpu_rule_count > 0 && MaskTotal > 0) {
-                int _a3n = 0;
-                uint32_t *_a3res = gpu_metal_kernelA_rules_masks_dispatch(
-                    0 /* dev_idx */,
-                    g->packed_buf, g->packed_pos,
-                    g->word_offset, g->packed_count,
-                    g->op, &_a3n);
-                if (_a3res != NULL) {
-                    _proto_fired = 1;
-                    nhits = _a3n;       /* always 0 in A3 v1 ship */
-                    hits  = _a3res;     /* non-NULL signal only */
-                }
-            }
-
-            /* Phase 1a sub-phase 1a.2 (2026-05-21): A2 (masks-only)
-             * dispatch arm. Mirrors gpu/gpujob_opencl.c twin (rev 1.148
-             * post-Phase-4-5). Routes JOB_MD5MD5SALT to
-             * cand_masks_phase0 when MDXFIND_KERNEL_A_VARIANT=2 AND
-             * masks are active. v1 ship: harness-mode (dispatcher dumps
-             * the buffer-quadruple via MDXFIND_KERNEL_A_TRACE; no real
-             * cracks; _proto_fired short-circuits the A1 path below). */
-            if (!_proto_fired &&
-                g->op == JOB_MD5MD5SALT &&
-                gpu_metal_kernel_a_active_variant() == 2 &&
-                MaskTotal > 0) {
-                int _a2n = 0;
-                uint32_t *_a2res = gpu_metal_kernelA_masks_dispatch(
-                    0 /* dev_idx */,
-                    g->packed_buf, g->packed_pos,
-                    g->word_offset, g->packed_count,
-                    g->op, &_a2n);
-                if (_a2res != NULL) {
-                    _proto_fired = 1;
-                    nhits = _a2n;       /* always 0 in A2 v1 ship */
-                    hits  = _a2res;     /* non-NULL signal only */
-                }
-            }
-
-            /* MDXFIND_KERNEL_B_PROTO used to force this too; removed
-             * 2026-09-16. */
-            if (!_proto_fired && g->op == JOB_MD5MD5SALT &&
-                gpu_metal_kernel_a_proto_enabled()) {
-                int _pn = 0;
-                uint32_t *_pres = gpu_metal_kernelA_dispatch_proto(
-                    0 /* dev_idx */,
-                    g->packed_buf, g->packed_pos,
-                    g->word_offset, g->packed_count,
-                    g->op, &_pn);
-                if (_pres != NULL) {
-                    _proto_fired = 1;
-                    nhits = _pn;        /* always 0 in A1-only ship */
-                    hits  = _pres;      /* non-NULL signal only */
-                }
-            }
+            /* The kernel-A harness arms (A1 alone, A2 masks, A3 rules+masks,
+             * A4 brute force) were removed 2026-11-14 (checklists 59, 72):
+             * their gates had been constant 0 since 2026-09-16. */
             /* Phase 4 sub-phase 4a.2b (2026-05-22): Metal kernel-B
              * production dispatcher. Routes default JOB_MD5MD5SALT
              * traffic through gpu_metal_kernelb_dispatch_proto which
@@ -1409,12 +1329,6 @@ static void gpujob_metal_worker(void *arg) {
              * to consume those candidates and emit hits. Mirrors the
              * OpenCL twin's gpujob_opencl.c JOB_MD5MD5SALT route which
              * calls gpu_opencl_kernelb_dispatch_proto unconditionally.
-             *
-             * This branch fires AFTER the harness-mode A1/A2/A3/A4
-             * arms above so developer-set MDXFIND_KERNEL_A_VARIANT=N
-             * harness invocations still take precedence (they short-
-             * circuit via _proto_fired and skip both the new kernel-B
-             * production path and the standard dispatch fallback).
              *
              * No env-flag gate: the codegen path IS production for
              * e347 on Metal post-4a.2b. MDXFIND_HX_CODEGEN=0 opt-out
@@ -1429,26 +1343,13 @@ static void gpujob_metal_worker(void *arg) {
              * (op, iter, rules, mask, bf, backend_kind). Per spec
              * project_codegen_auto_dispatch_spec_2026-05-31.md.
              *
-             * FLAGSHIP CORRECTNESS FIX (Apple Metal):
-             *   (Metal, JOB_MD5, iter>1, rules>0) auto-picks CODEGEN.
-             *   Legacy template_phase0 / template_iterate at iter>1
-             *   returns 0 cracks (broken; #377 Gate D + spec §8). The
-             *   dispatcher now routes through codegen iter-v1 which
-             *   produces correct cracks. NO env flag required.
-             *
-             * Post-Metal-chunking-ship (gpu_metal.m 1.128, metal_kernel_-
-             * a_rules.metal 1.6, 2026-05-31): the dispatcher's "FATAL at
-             * large rules" cell is gone -- Metal chunked dispatcher
-             * handles 99K+ rules cleanly. The auto-dispatcher cell for
-             * (Metal, JOB_MD5, iter>1, large-rules) auto-picks CODEGEN
-             * unconditionally.
-             *
-             * FORCE-override for diagnostics:
-             *   MDXFIND_GPU_BACKEND=legacy on Metal iter>1 -> 0 cracks
-             *     (developer-acknowledged consequence; the matrix would
-             *     have picked CODEGEN otherwise).
-             *   MDXFIND_GPU_BACKEND=codegen forces codegen everywhere
-             *     even where legacy is faster. */
+             * Since 2026-11-13 no cell routes these ops here on Metal:
+             * metal_template.metal iterates, and this route truncated
+             * candidates over 255 bytes and dropped the empty one, so
+             * codegen_auto_dispatch.c Cells 5 and 9b pick LEGACY for iter>1
+             * as well as iter==1.  The gate stays so a CODEGEN pick would
+             * still be served.  There is no override: the
+             * MDXFIND_GPU_BACKEND variable it once described is gone. */
             int _exp_md5_route = 0;
             if (!_proto_fired
                 && gpu_rule_count > 0
@@ -1480,8 +1381,8 @@ static void gpujob_metal_worker(void *arg) {
                  * Metal template path below (no flag set). */
             }
             if (!_proto_fired
-                && (g->op == JOB_MD5MD5SALT
-                    || gpu_codegen_kernelb_family_md5pass_eligible(g->op)
+                /* e347 left this route 2026-11-13: md5salt template, algo_mode 7. */
+                && (gpu_codegen_kernelb_family_md5pass_eligible(g->op)
                     || _exp_md5_route)) {
                 /* Phase 4 sub-phase 4a.2b (2026-05-22) salt snapshot:
                  * JOB_MD5MD5SALT has op_cat == GPU_CAT_NONE on Metal
@@ -1536,11 +1437,24 @@ static void gpujob_metal_worker(void *arg) {
                         0 /* dev_idx */,
                         g->packed_buf, g->packed_pos,
                         g->word_offset, g->packed_count,
-                        g->op, &_kbn);
+                        g->op, g->bf_mask_start, g->bf_num_masks, &_kbn);
                     if (_kbres != NULL) {
                         _proto_fired = 1;
                         nhits = _kbn;
                         hits  = _kbres;
+                    } else if (g->packed_count > 0) {
+                        /* The standard path below cannot serve this op and
+                         * the backstop exempts it: falling through would
+                         * drop the batch silently. */
+                        char _hn[256];
+                        if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                        _hn[sizeof(_hn) - 1] = 0;
+                        GPU_FATAL("Metal: kernel B proto returned NULL for "
+                                  "op=%d (%u words withheld from the CPU walk) "
+                                  "host=%s operation=gpu_metal_kernelb_dispatch_proto "
+                                  "rules=%d. Re-run this type with -G none.",
+                                  g->op, (unsigned)g->packed_count,
+                                  _hn[0] ? _hn : "(unknown)", gpu_rule_count);
                     }
                 }
                 /* If nsalts_packed == 0: no salts available; skip proto
@@ -1585,13 +1499,12 @@ static void gpujob_metal_worker(void *arg) {
              * question -- the capability question was already answered
              * (and acted on) at init.
              *
-             * Route-gate ops are exempt: JOB_MD5MD5SALT and the
-             * MAKE_MD5PASS family are served on Metal by the codegen
+             * Route-gate ops are exempt: the
+             * MAKE_MD5PASS family is served on Metal by the codegen
              * kernel-B proto path above, not by a registered family, and
              * they legitimately fall through here when nsalts_packed == 0
              * (see the comment immediately above). */
             if (gpu_metal_lookup_family(g->op) == NULL
-                && g->op != JOB_MD5MD5SALT
                 && !gpu_codegen_kernelb_family_md5pass_eligible(g->op)
                 && !_exp_md5_route) {
                 char _hn[256];
@@ -1682,8 +1595,10 @@ static void gpujob_metal_worker(void *arg) {
 
             /* Simulated candidate count (Totrules_gpu): packed_count *
              * (gpu_rule_count - 1) — minus 1 for the synthetic `:`
-             * no-rule pass that mdxfind.c prepends; matches the OpenCL
-             * twin at line 993. */
+             * no-rule pass that mdxfind.c prepends.  No mask or dot factor:
+             * like the CPU's rulecnt this counts rule outputs, not hashes
+             * (Tothash carries those).  The OpenCL twin uses the same
+             * expression since 2026-11-13. */
             atomic_fetch_add(&Totrules_gpu,
                 (unsigned long long)g->packed_count *
                 (unsigned long long)(gpu_rule_count > 1 ? gpu_rule_count - 1 : 0));
@@ -1787,13 +1702,111 @@ static void gpujob_metal_worker(void *arg) {
                         const char *_ptext =
                             gpu_metal_kernelb_proto_plaintext(
                                 0 /* dev_idx */, _slot_idx, &_plen);
-                        if (!_ptext || _plen <= 0) continue;
-                        if (_plen > MAXLINE) _plen = MAXLINE;
+                        /* _plen == 0 is the empty candidate (rule `]` on a 1-char word):
+                         * a real password, so it is replayed like any other.
+                         * A hit whose plaintext cannot be recovered used to be
+                         * skipped with nothing printed -- a lost recovery, since
+                         * the CPU skipped that candidate.  Fatal (2026-11-13). */
+                        if (!_ptext || _plen < 0 || _plen > MAXLINE) {
+                            char _hn[256];
+                            if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                            _hn[sizeof(_hn) - 1] = 0;
+                            fprintf(stderr,
+                                "FATAL: %s:%d Metal proto hit replay: no "
+                                "plaintext for kernel-A slot %u (plen=%d, "
+                                "op=%d, hit %d of %d) on %s\n",
+                                __FILE__, __LINE__, _slot_idx, _plen, g->op,
+                                _ph, _proto_stored, _hn);
+                            exit(1);
+                        }
                         memcpy(synthetic_job.line, _ptext, (size_t)_plen);
                         synthetic_job.line[_plen] = 0;
                         synthetic_job.clen = _plen;
                         synthetic_job.pass = synthetic_job.line;
                         synthetic_job.Ruleindex = 0;
+                        if (_is_family) {
+                            /* MAKE_MD5PASS family (checklist 24, 43, 44): the
+                             * kernel put the mask index in [1] (low) and [7]
+                             * (high) and the round in [2].  Rebuild the
+                             * candidate the way the kernel built it, then
+                             * recompute the digest of THAT round on the CPU
+                             * and require the kernel's first 16 bytes to
+                             * match -- a mismatch means device and host
+                             * disagree about the candidate or the hash, and
+                             * printing either would be a wrong line. */
+                            int _clen = _plen;
+                            int _round = (int)_pe[2];
+                            if (gpu_metal_proto_mask_on) {
+                                int npre = gpu_mask_n_prepend;
+                                int napp = gpu_mask_n_append;
+                                if (npre > 32) npre = 32;
+                                if (napp > 32) napp = 32;
+                                uint64_t _mi = (uint64_t)_pe[1]
+                                             | ((uint64_t)_pe[7] << 32);
+                                uint64_t append_combos = 1u;
+                                for (int j = 0; j < napp; j++) {
+                                    int sz = MASK_WIRE_SZ(gpu_mask_sizes[npre + j]);
+                                    if (sz <= 0) sz = 1;
+                                    append_combos *= (uint64_t)sz;
+                                }
+                                uint64_t rem = _mi / append_combos;
+                                char pc[32], ac[32];
+                                for (int k = 0; k < npre; k++) {
+                                    int i = npre - 1 - k;
+                                    int sz = MASK_WIRE_SZ(gpu_mask_sizes[i]);
+                                    if (sz <= 0) sz = 1;
+                                    pc[i] = (char)gpu_mask_charsets_host[i][rem % (uint64_t)sz];
+                                    rem /= (uint64_t)sz;
+                                }
+                                rem = _mi % append_combos;
+                                for (int k = 0; k < napp; k++) {
+                                    int i = napp - 1 - k;
+                                    int sz = MASK_WIRE_SZ(gpu_mask_sizes[npre + i]);
+                                    if (sz <= 0) sz = 1;
+                                    ac[i] = (char)gpu_mask_charsets_host[npre + i][rem % (uint64_t)sz];
+                                    rem /= (uint64_t)sz;
+                                }
+                                if (_plen + npre + napp > MAXLINE) {
+                                    fprintf(stderr,
+                                        "FATAL: %s:%d Metal proto hit replay: "
+                                        "masked candidate %d bytes exceeds "
+                                        "MAXLINE (op=%d)\n",
+                                        __FILE__, __LINE__, _plen + npre + napp,
+                                        g->op);
+                                    exit(1);
+                                }
+                                memmove(synthetic_job.line + npre,
+                                        synthetic_job.line, (size_t)_plen);
+                                memcpy(synthetic_job.line, pc, (size_t)npre);
+                                memcpy(synthetic_job.line + npre + _plen, ac,
+                                       (size_t)napp);
+                                _clen = _plen + npre + napp;
+                                synthetic_job.line[_clen] = 0;
+                                synthetic_job.clen = _clen;
+                            }
+                            unsigned char _fulldigest[64];
+                            int _fdlen = oracle_compute_md5pass_family_iter(
+                                g->op, synthetic_job.line, _clen,
+                                _round < 1 ? 1 : _round, _fulldigest);
+                            if (_round < 1 || _fdlen < 16 || _fdlen > 64
+                                || memcmp(_fulldigest, &_pe[3], 16) != 0) {
+                                char _hn[256];
+                                if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                                _hn[sizeof(_hn) - 1] = 0;
+                                fprintf(stderr,
+                                    "FATAL: %s:%d Metal proto hit replay: "
+                                    "op=%d round %d candidate of %d bytes: "
+                                    "the CPU digest (%d bytes) does not match "
+                                    "the kernel's %08x%08x%08x%08x on %s\n",
+                                    __FILE__, __LINE__, g->op, _round, _clen,
+                                    _fdlen, _pe[3], _pe[4], _pe[5], _pe[6], _hn);
+                                exit(1);
+                            }
+                            memcpy(curin.h, _fulldigest, (size_t)_fdlen);
+                            checkhash(&curin, _proto_hexlen, _round,
+                                      &synthetic_job);
+                            continue;
+                        }
                         /* Decode first 4 hash words from hit entry; the
                          * EMIT_HIT_4 family carries exactly h0..h3. */
                         curin.i[0] = _pe[3];
@@ -1911,13 +1924,25 @@ static void gpujob_metal_worker(void *arg) {
                                 _proto_salt_bytes = _pse->salt;
                                 _proto_salt_len   = _pse->saltlen;
                             }
-                            if (_proto_salt_bytes) {
-                                checkhashsalt(&curin, _proto_hexlen,
-                                              _proto_salt_bytes,
-                                              _proto_salt_len,
-                                              (int)_pe[2],  /* iter_num */
-                                              &synthetic_job);
+                            /* An unresolvable salt was a silent drop;
+                             * fatal now (checklist 45, 2026-11-13). */
+                            if (!_proto_salt_bytes) {
+                                char _hn[256];
+                                if (gethostname(_hn, sizeof(_hn)) != 0) _hn[0] = 0;
+                                _hn[sizeof(_hn) - 1] = 0;
+                                fprintf(stderr,
+                                    "FATAL: %s:%d Metal proto hit replay: salt "
+                                    "index %u does not resolve (nsalts_packed=%d, "
+                                    "op=%d) on %s\n",
+                                    __FILE__, __LINE__, _salt_idx, nsalts_packed,
+                                    g->op, _hn);
+                                exit(1);
                             }
+                            checkhashsalt(&curin, _proto_hexlen,
+                                          _proto_salt_bytes,
+                                          _proto_salt_len,
+                                          (int)_pe[2],  /* iter_num */
+                                          &synthetic_job);
                         }
                     }
                     /* Flush proto hit output buffer before bypassing the
@@ -1931,8 +1956,10 @@ static void gpujob_metal_worker(void *arg) {
                     /* Skip standard rules-engine replay entirely; mirror
                      * OpenCL twin's `goto _proto_hits_done`. The label
                      * return_jobg is the existing post-dispatch cleanup
-                     * site at gpujob_metal.m:return_jobg. */
-                    goto return_jobg;
+                     * site at gpujob_metal.m:return_jobg.  Go through the
+                     * hash accounting first: skipping it left the GPU work
+                     * out of Tothash and the summary line said "0 hashes". */
+                    goto _rules_hash_acct;
                 }
                 /* Standard rules-engine hit-replay continues below. */
                 static __thread char  **_rule_ptr_cache  = NULL;
@@ -2025,6 +2052,7 @@ static void gpujob_metal_worker(void *arg) {
                     g->op == JOB_MD5UCSALT            || /* e350 */
                     g->op == JOB_MD5revMD5SALT        || /* e541 */
                     g->op == JOB_MD5sub8_24SALT       || /* e542 */
+                    g->op == JOB_MD5MD5SALT           || /* e347 */
                     g->op == JOB_MD5_MD5SALTMD5PASS   || /* e367 */
                                     g->op == JOB_MD5PASSSALT ||
                                     g->op == JOB_MD5SALTPASS ||
@@ -2195,6 +2223,17 @@ static void gpujob_metal_worker(void *arg) {
                     }
                     uint32_t mask_idx = (uint32_t)((uint64_t)tmp % b71_mask_size);
                     uint32_t ridx     = (uint32_t)((uint64_t)tmp / b71_mask_size);
+                    /* -a: split the dot digit off exactly as the kernel does
+                     * -- axis = dot * C + position, C published by the dispatch
+                     * (gpujob.h gpu_dispatch_dot_base, checklist 74).  0 = no
+                     * dot radix: dot_idx 0, mask_idx as is. */
+                    uint32_t dot_idx = 0u;
+                    if (gpu_dispatch_dot_base[0] > 0u) {
+                        dot_idx  = (uint32_t)((uint64_t)mask_idx
+                                              / gpu_dispatch_dot_base[0]);
+                        mask_idx = (uint32_t)((uint64_t)mask_idx
+                                              % gpu_dispatch_dot_base[0]);
+                    }
 
                     if (widx >= g->packed_count) continue;
                     if ((int)ridx >= gpu_rule_count) continue;
@@ -2403,10 +2442,10 @@ static void gpujob_metal_worker(void *arg) {
                     /* -a dot axis: reproduce the DEVICE's dot insertion,
                      * between the rule and the mask, exactly as the kernel
                      * orders it.  The dot bitmask is the OUTERMOST digit of
-                     * mask_idx, so dividing out the position product recovers
-                     * it -- the same arithmetic the kernel does, from the same
-                     * inputs, so there is no second opinion about which dotting
-                     * ran.  Metal twin of gpu/gpujob_opencl.c.
+                     * mask_idx, split off above (dot_idx) by the divide the
+                     * kernel does against the same published C, so there is no
+                     * second opinion about which dotting ran.  Metal twin of
+                     * gpu/gpujob_opencl.c.
                      *
                      * Getting this wrong does not lose a hit: it emits a
                      * CORRECT digest with a plaintext that does not hash to it.
@@ -2415,18 +2454,7 @@ static void gpujob_metal_worker(void *arg) {
                      * no mask positions of its own, which is the whole reason
                      * the position test was the wrong gate here. */
                     if (Email && out_len > 0) {
-                        uint64_t _mc = 1ULL;
-                        int _np = gpu_mask_n_prepend, _na = gpu_mask_n_append;
-                        int _k;
-                        if (_np > 32) _np = 32;
-                        if (_na > 32) _na = 32;
-                        for (_k = 0; _k < _np + _na; _k++) {
-                            int _ps = MASK_WIRE_SZ(gpu_mask_sizes[_k]);
-                            if (_ps <= 0) _ps = 1;
-                            _mc *= (uint64_t)_ps;
-                        }
-                        uint64_t _dot = (_mc > 1ULL)
-                            ? ((uint64_t)mask_idx / _mc) : (uint64_t)mask_idx;
+                        uint64_t _dot = (uint64_t)dot_idx;
                         if (_dot != 0ULL) {
                             int _dw = out_len;
                             int _nd = 0, i, j;
@@ -2564,7 +2592,9 @@ static void gpujob_metal_worker(void *arg) {
                         if ((g->op == JOB_MD5SALT ||
                              g->op == JOB_MD5UCSALT ||
                              g->op == JOB_MD5revMD5SALT ||
-                             g->op == JOB_MD5sub8_24SALT) && iter_num == 1) {
+                             g->op == JOB_MD5sub8_24SALT ||
+                             /* e347 too: same MD5SALTstart block on the CPU. */
+                             g->op == JOB_MD5MD5SALT) && iter_num == 1) {
                             /* 2026-10-14: mirrors gpujob_opencl.c 1.172.
                              * e350 / e541 / e542 were missing from this test
                              * although they share both the kernel (algo_mode
@@ -2667,7 +2697,7 @@ static void gpujob_metal_worker(void *arg) {
                                 int hf = hybrid_check((const unsigned char *)curin.h,
                                                       16,
                                                       &match_len, &match_flags);
-                                if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
+                                if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
                                     *match_flags = g->op;
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
@@ -2714,7 +2744,7 @@ static void gpujob_metal_worker(void *arg) {
                                 int hf = hybrid_check((const unsigned char *)curin.h,
                                                       32,
                                                       &match_len, &match_flags);
-                                if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
+                                if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
                                     *match_flags = g->op;
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
@@ -2776,7 +2806,7 @@ static void gpujob_metal_worker(void *arg) {
                                 int hf = hybrid_check((const unsigned char *)curin.h,
                                                       64,
                                                       &match_len, &match_flags);
-                                if (hf && (Contfound || *match_flags != (unsigned short)g->op)) {
+                                if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
                                     *match_flags = g->op;
                                     if (MTL_PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                                     char *sp = salt_snap_entry->salt;
@@ -2924,11 +2954,11 @@ static void gpujob_metal_worker(void *arg) {
                              * replay arm + optional mask prepend/append);
                              * we re-clamp the LENGTH for display while
                              * preserving the underlying buffer (the
-                             * kernel only saw the first 8 bytes anyway
-                             * via the host-side rules-engine pack-site
-                             * clamp at mdxfind.c:11780 + the kernel-side
-                             * `if (plen > 8) plen = 8;` defensive cap in
-                             * template_finalize). Phase 5 of Unix-crypt
+                             * kernel hashed only the first 8 bytes of the
+                             * post-rule candidate: its own `if (plen > 8)
+                             * plen = 8;` in template_finalize; the pack
+                             * site no longer cuts the word before the
+                             * rule). Phase 5 of Unix-crypt
                              * ladder on Metal -- LAST Unix-crypt op. */
                             hit = 0;
                             if (salt_snap_entry) {
@@ -3001,6 +3031,7 @@ static void gpujob_metal_worker(void *arg) {
                 synthetic_job.outlen = 0;
             }
 
+_rules_hash_acct: ;  /* the proto replay joins here */
             /* Hash accounting: packed_count * gpu_rule_count * mask_size
              * * iter_sum * Maxiter. Phase 2c adds the nsalts fan-out.
              * 2026-05-19: replace bare _nsalt_acct with _iter_sum_acct
@@ -3169,12 +3200,11 @@ return_jobg:
  *     | sort -u > /tmp/fams
  *   comm -23 /tmp/choke /tmp/fams
  *
- * That recipe reports ONE FALSE POSITIVE: JOB_MD5MD5SALT (e347).  It is
- * served on Metal through the codegen kernel-B proto path
- * (gpu_metal_kernelb_dispatch_proto, this file), not through a registered
- * gpu_metal_family, so the `.op =` grep cannot see it.  Do NOT add it to
- * the table -- that would veto the Metal rules engine for a type Metal
- * computes correctly.  Any future codegen-routed op has the same shape.
+ * (Until 2026-11-13 e347 was a false positive of that recipe, served by the
+ * codegen kernel-B proto path.  It is now a registered md5salt-carrier
+ * family, algo_mode 7, and has a row below like e541/e542.)  A
+ * codegen-routed op (the MAKE_MD5PASS family) is not seen by the `.op =`
+ * grep -- do NOT add those, that would veto ops Metal computes.
  *
  * needs_salt mirrors the chokepoint's second conjunct: the salted ops are
  * in the `job->op != JOB_*` negation list at mdxfind.c:13815-14047 and are
@@ -3186,9 +3216,7 @@ return_jobg:
  * produce no GPU batch at all, while their eight *_KPASS siblings load
  * 1 salt, are admitted, and report "1 batches | 1 words | 0 hits".
  *
- * JOB_MD5MD5SALT (e347) is deliberately ABSENT: Metal serves it through
- * the codegen kernel-B proto path in the worker above, not through a
- * registered family.  So are the MAKE_MD5PASS family ops, which are
+ * The MAKE_MD5PASS family ops are deliberately ABSENT: which are
  * admitted by predicate rather than by an `==` literal and are likewise
  * codegen-served.
  * ====================================================================== */
@@ -3276,6 +3304,7 @@ static const struct metal_unserved_op metal_unserved_ops[] = {
     { JOB_HMAC_SHA384,           1, "HMAC-SHA384"       },  /* e543 */
     { JOB_MD5revMD5SALT,         1, "MD5revMD5SALT"     },  /* e541 */
     { JOB_MD5sub8_24SALT,        1, "MD5sub8_24SALT"    },  /* e542 */
+    { JOB_MD5MD5SALT,            1, "MD5MD5SALT"        },  /* e347, algo_mode 7 */
     { JOB_HMAC_MD5_KPASS,        1, "HMAC-MD5-KPASS"    },  /* e792 */
     { JOB_HMAC_SHA1_KPASS,       1, "HMAC-SHA1-KPASS"   },  /* e793 */
     { JOB_HMAC_SHA224_KPASS,     1, "HMAC-SHA224-KPASS" },  /* e794 */

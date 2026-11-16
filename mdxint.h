@@ -4,8 +4,17 @@
  * statistics).  Definitions live in exactly one .c file; this header carries
  * only includes, macros, types, static inline helpers and extern declarations.
  *
- * $Revision: 1.4 $
+ * $Revision: 1.7 $
  * $Log: mdxint.h,v $
+ * Revision 1.7  2026/11/15 08:06:24  dlr
+ * mdxfind 1.674 / hashpipe 1.235: 7z loaders read the 13-field (Delta filter) record and use its Delta distance in the CRC check; hashcat and John record forms both load. hashpipe verify_7zip moved to work-space slots. An ill-formed UTF-16 conversion (-b candidate, MSCACHE user) now skips the hash instead of hashing the raw bytes. hashpipe output write failures are fatal.
+ *
+ * Revision 1.6  2026/11/15 05:05:32  dlr
+ * Every type emits a -z line and is found for the empty password: SHA1_xSHA1psubp takes the empty prefix, the DECBASE64 types hash a valid empty decode while a failed decode still emits nothing, and the revBASE64x types accept an empty encoding. hashpipe UTF-16 conversion returns a negative value for ill-formed input, so an empty password verifies and ill-formed input is refused. 7ZIP -z with no archive loaded writes a record the password opens, and the 7z coder check reads the full filter nibble so DELTA plus LZMA streams verify.
+ *
+ * Revision 1.5  2026/11/14 22:14:32  dlr
+ * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
+ *
  * Revision 1.4  2026/11/09 23:00:16  dlr
  * Include md6.h in mdxfind.c only. md6.h defines compression_hook instead of declaring it, and since the split both mdxfind.c and mdxmain.c included it through mdxint.h. gcc merges the two as a common symbol, so Linux, FreeBSD and macOS linked; llvm-mingw compiles with -fno-common and the Windows link failed with duplicate symbol compression_hook. mdxint.h now includes md6.h unless MDX_NO_MD6 is defined, and mdxmain.c, which uses only the JOB_MD6 constants, defines it. Verified with the Windows x86_64 release objects: mdxmain.o no longer defines the symbol and the release link line produces a 13,590,528-byte PE32+ executable.
  *
@@ -218,7 +227,7 @@ extern int Extmatch, Precheck_off, Precheck_maxlen;
  * being OpenCL-only. The producer was never OpenCL-specific in its
  * logic -- it had been gated on OPENCL_GPU because these were the only
  * backend-bound calls inside it. The Metal kernel side
- * (metal_kernel_a_bruteforce, mask_start / mask_offset_per_word /
+ * (mask_start / mask_offset_per_word /
  * bf_num_masks / bf_inner_iter honoured in dispatch, chunk base re-added
  * in the hit decode) was already complete and correct.
  *
@@ -308,6 +317,9 @@ struct SevenZipRec {
   int bits;                  /* tier-0 evidence strength, 8 * padsize */
   int havehead;              /* head[] is populated */
   int tier2;                 /* whole stream retained -> decompress+CRC possible */
+  int zsynth;                /* the -z placeholder record, not a loaded archive */
+  int delta;                 /* Delta filter distance (John's 13th field + 1),
+                              * 0 when the line does not carry it */
 };
 extern struct SevenZipRec *SevenZipRecs;
 extern int SevenZipCount , SevenZipCap;
@@ -772,65 +784,16 @@ static inline unsigned short *typeopts_ref(unsigned op) {
  * negligible: each struct MaskPos is 8 bytes; the 3 pattern arrays
  * grow from 128 B to 2 KB total.
  *
- * GPU per-side caps (2026-05-30 long-mask amendment, supersedes the
- * single MAX_MASK_POS_GPU_SIDE=16 cap):
- *
- *   GPU_MASK_VAR_CAP       16   maximum variable (placeholder ?d/?l/?a
- *                                /?[abc]) positions per side. Matches
- *                                pre-amendment cap; per-thread private
- *                                scratch arrays for placeholder expansion
- *                                stay at 16 entries.
- *
- *   GPU_MASK_LIT_BYTES_CAP 224  maximum literal bytes per side. Decoupled
- *                                from variable count. Lifts the 2026-05-30
- *                                gate fixture
- *                                  -N "This is triumph, I'm making a note here: ?a?a?a?a?a?d?d"
- *                                (42 literal + 7 variable = 49 positions)
- *                                onto the GPU path. Total per-side <=
- *                                lit_bytes_cap + var_cap = 240; combined
- *                                with input word <=15 stays under
- *                                RULE_BUF_LIMIT=255.
- *
- *   GPU_MASK_DESC_BYTES_CAP 320 sizing for the wire-format run-descriptor
- *                                stream (see below). Per-side persistent
- *                                cl_mem allocation is 320 B.
- *
- * Wire format (Design Y, amendment D1.b): the prepend / append mask
- * buffers are interleaved run-descriptor streams of:
- *
- *   GPU_MASK_DESC_TAG_LIT  (0x00) lit_len:u16 (little-endian) bytes[lit_len]
- *   GPU_MASK_DESC_TAG_VAR  (0x01) classid:u8     (one placeholder position)
- *   GPU_MASK_DESC_TAG_END  (0xFF) terminator (no payload)
- *
- * Worst-case packing per side (16 var + 17 lit + END): 308 B (well under
- * the 320 B persistent allocation). gpu_pack_mask_descriptor() in this
- * file is the host-side encoder; mask_expand_run_into_gpu() in
- * gpu_kernel_a_masks.cl is the GPU walker.
- *
- * Backward compat: MAX_MASK_POS_GPU_SIDE retained as a deprecated alias
- * for GPU_MASK_VAR_CAP (16). Pre-amendment short-mask workloads (e.g.
- * -n ?d?d, 0 lit + 2 var) take the same unified walker as long-mask
- * workloads, producing byte-identical multisets.
- *
- * Backend coverage: the OpenCL A2/A3/A4 dispatchers consume the
- * descriptor wire format. The Metal twins follow per amendment §9.
- * The template/slab kernel path (gpu_template.cl / metal_template.metal)
- * is on a separate upload wire (gpu_opencl_set_mask /
- * gpu_metal_set_mask) and is UNAFFECTED by this amendment; that path
- * retains its own MASK_POS_CAP=16 per-side gate.
- *
- * The GPU upload sites (mdxfind.c, the OpenCL+Metal A2/A3/A4 family
- * blocks below) now check (var_count <= GPU_MASK_VAR_CAP &&
- * lit_bytes <= GPU_MASK_LIT_BYTES_CAP) per side; on overflow they
- * fall back to CPU iteration. The template/slab path still emits its
- * own MAX_MASK_POS_GPU_SIDE warning. */
+ * MAX_MASK_POS_GPU_SIDE (16) is the template/slab-path per-side cap; the
+ * template / rules-engine path has its own GPU_MASK_SLOT_CAP below.  (The
+ * 2026-05-30 long-mask run-descriptor wire -- GPU_MASK_VAR_CAP,
+ * GPU_MASK_LIT_BYTES_CAP, GPU_MASK_DESC_BYTES_CAP, gpu_pack_mask_descriptor()
+ * -- fed only the A2/A3/A4 kernel-A harnesses and was removed with them,
+ * 2026-11-14, checklist 72.) */
 #define MAX_MASK_POS 256
-#define MAX_MASK_POS_GPU_SIDE 16        /* deprecated alias for GPU_MASK_VAR_CAP */
-#define GPU_MASK_VAR_CAP        16      /* placeholder positions per side */
+#define MAX_MASK_POS_GPU_SIDE 16        /* template/slab-path positions per side */
 /* Template / rules-engine mask SLOT cap per side (B7.9, 2026-10-26: 16 -> 32).
- * Distinct from GPU_MASK_VAR_CAP above, which bounds the kernel-A descriptor
- * walker's PLACEHOLDER count and is backed by per-thread private scratch.
- * This one bounds the template path's per-position charset rows, which live in
+ * This bounds the template path's per-position charset rows, which live in
  * a shared __global buffer (gpu_template.cl mask_charsets), so widening it
  * costs global memory and divmod iterations rather than registers. Literals
  * occupy a row each here -- that is why "?a?a?a?a?a?a@gmail10p.com" needs 19.
@@ -838,8 +801,6 @@ static inline unsigned short *typeopts_ref(unsigned op) {
  * gpu_metal.m METAL_MASK_POS_CAP, gpujob_metal.m prepend_chars/append_chars,
  * and the 32u clamps in gpu_template.cl + metal_template.metal. */
 #define GPU_MASK_SLOT_CAP       32      /* template-path positions per side */
-#define GPU_MASK_LIT_BYTES_CAP  224     /* literal bytes per side */
-#define GPU_MASK_DESC_BYTES_CAP 320     /* run-descriptor stream cap per side */
 #define MASK_LITERAL -1
 #define MASK_MAX_CLASSES 16
 struct MaskClass { unsigned char chars[256]; int count; };
@@ -856,11 +817,6 @@ extern unsigned long long MaskAppendTotal;
 extern struct MaskPos MaskPrependPattern[MAX_MASK_POS];
 extern int MaskPrependLen;
 extern unsigned long long MaskPrependTotal;
-extern unsigned char gpu_kern_a_prep_desc[GPU_MASK_DESC_BYTES_CAP];
-extern unsigned char gpu_kern_a_app_desc [GPU_MASK_DESC_BYTES_CAP];
-extern int gpu_kern_a_prep_dlen;
-extern int gpu_kern_a_app_dlen;
-extern int gpu_kern_a_mask_eligible;
 void mask_init_classes(void);
 int parse_mask_into(const char *s, struct MaskPos *pattern, int *len_out, unsigned long long *total_out);
 /* Expand a mask pattern at a given index into buf. Returns pattern length. */
@@ -879,8 +835,6 @@ static inline int mask_expand_into(unsigned long long index,
     }
     return patlen;
 }
-int gpu_pack_mask_descriptor(const struct MaskPos *pattern, int plen, unsigned char *desc_out, int desc_cap);
-void gpu_mask_count_vars_lit_bytes(const struct MaskPos *pattern, int plen, int *out_vars, int *out_lit_bytes);
 extern struct job *FreeHead, **FreeTail;
 extern struct job *WorkHead, **WorkTail;
 extern lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;

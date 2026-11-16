@@ -52,9 +52,9 @@
  *   first 4 LE words probed = 16 bytes).
  *
  *   Truncation: BCRYPT silently truncates passwords > 72 bytes via
- *   BF_set_key key-cycling natural drop semantics. Host-side rules-engine
- *   pack site (mdxfind.c:11796) clamps for the synthetic no-rule pass;
- *   kernel-side defensive cap at plen > 72 covers post-rule outputs.
+ *   BF_set_key key-cycling natural drop semantics. The cap is applied in
+ *   the kernel after the rule (plen > 72); the pack site no longer cuts
+ *   the word before the rule, as it did until 2026-11-13.
  *
  * Local memory layout (Metal threadgroup; matches OpenCL __local):
  *   - sbox_pool[BCRYPT_WG_SIZE * 1024] declared at template_phase0 scope

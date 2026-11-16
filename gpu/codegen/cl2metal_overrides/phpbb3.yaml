@@ -46,12 +46,12 @@ skip_line_ranges:
   # After strip, the salt-arg lines become unconditional signature args,
   # matching the metal signature shape of sha1passsalt et al. Mirrors
   # hmac_blake2s.yaml Phase 2d.7d.1 pattern.
-  - start: 172
-    end:   172
+  - start: 205
+    end:   205
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around template_finalize salt args -- Metal always has HAS_SALT"
-  - start: 176
-    end:   176
+  - start: 209
+    end:   209
     expect_first: "#endif"
     reason: "preproc guard around template_finalize salt args -- close"
 
@@ -62,12 +62,12 @@ skip_line_ranges:
   # !HAS_SALT fallback (computes plain MD5(data)) and is structurally
   # unreachable in production -- we drop it entirely so the kernel keeps
   # only the salted chain body.
-  - start: 179
-    end:   179
+  - start: 212
+    end:   212
     expect_first: "#ifdef GPU_TEMPLATE_HAS_SALT"
     reason: "preproc guard around HMAC body -- Metal always has HAS_SALT"
-  - start: 275
-    end:   314
+  - start: 325
+    end:   364
     expect_first: "#else"
     expect_last:  "#endif"
     reason: "defensive !HAS_SALT fallback -- structurally unreachable on Metal"
