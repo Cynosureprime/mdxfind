@@ -1,5 +1,8 @@
 /*
  * $Log: mdxfind.h,v $
+ * Revision 1.32  2026/11/18 04:07:48  dlr
+ * JOBFLAG_CONFIRM marks a CPU confirm job for a generic hx walker GPU hit.
+ *
  * Revision 1.31  2026/09/24 15:28:32  dlr
  * Add JOBFLAG_MASK_SUBCHUNK on the free bit 8, marking the sub-chunks of a mask job split across threads so the retirement path can credit their shared seed lines once. See mdxfind.c 1.601. This revision also carries a working-file edit that was already present and is not mine: a historical log entry now reads Waffle where it read a personal name.
  *
@@ -369,6 +372,11 @@ struct job {
 #define JOBFLAG_GPU 32
 #define JOBFLAG_BRUTEFORCE 64
 #define JOBFLAG_BF_CHUNK 128  /* BF chunk-as-job: produced by main thread for procjob short-circuit fill */
+/* A GPU hit handed back to the type's own CPU code to confirm and print: one
+ * already-built plaintext, no rules, no masks, no candidate transforms, no
+ * line accounting, never sent to the GPU, run by the confirm thread from its
+ * own queue and pool (cpu_confirm_enqueue, mdxfind.c). */
+#define JOBFLAG_CONFIRM 256
 
 union HashU {
     unsigned char h[256];

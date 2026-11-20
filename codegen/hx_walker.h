@@ -37,8 +37,11 @@
  * for callers without an entry (test harnesses); patterns that need the
  * sidecar FATAL on NULL.
  *
- * $Revision: 1.5 $
+ * $Revision: 1.6 $
  * $Log: hx_walker.h,v $
+ * Revision 1.6  2026/11/16 21:05:07  dlr
+ * Document that hx_emit_kernel refuses any program no pattern emitter recognises; there is no per-opcode fallback.
+ *
  * Revision 1.5  2026/11/14 22:14:35  dlr
  * The GPU rules engine now covers every GPU type on OpenCL and Metal, including the crypt types, MD5MD5SALT and the MD5PASS family, with masks and iteration. The S rule is removed and the v rule runs on the GPU. Each GPU job covers exactly its own slice of the mask, and Metal mask jobs are chunked below 2^32. Unused Kernel-A test code and profiling knobs are removed. GPU dispatch and replay failures are fatal, and hash counts are accounted on every GPU path.
  *
@@ -74,12 +77,10 @@ extern "C" {
  *
  * Caller is responsible for free()ing *out.
  *
- * Sub-phase 2a.2 supports a minimum-viable opcode set:
- *   OP_PUSH_VAR, OP_PUSH_STR, OP_PUSH_INT, OP_STORE, OP_CALL (md5 only),
- *   OP_CONCAT, OP_HALT. Control-flow ops (OP_JUMP*, OP_INC, OP_DUP,
- *   OP_POP) and CALL targets other than md5 return -1 with an embedded
- *   `// hx: ... not yet implemented` comment in the emitted source so
- *   the failure is visible on dump. Real impl arrives in 2a.3+.
+ * Only programs a pattern emitter recognises (E347, FAMILY_MD5PASS,
+ * UNSALTED_SINGLE) produce a kernel. Any other program returns -1 with a
+ * one-line reason on stderr, and the caller exits; there is no
+ * per-opcode fallback.
  */
 /* Sub-phase 5a.2 (2026-05-22): signature now takes `entry` so family
  * emitters can reach the per-program _hx_callnames_NNN[] sidecar via

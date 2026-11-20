@@ -4,8 +4,41 @@
  * The hash engine, procjob and everything it calls, is in mdxfind.c; what
  * the two share is declared in mdxint.h.
  *
- * $Revision: 1.13 $
+ * $Revision: 1.24 $
  * $Log: mdxmain.c,v $
+ * Revision 1.24  2026/11/20 15:45:11  dlr
+ * Generic hx walker stages 3b and 4a. New walker bodies: MySQL 3 OLD_PASSWORD as a byte-wise accumulator in the dialect, BLAKE2b-512 and -256 and BLAKE2s-256 over the common b2b and b2s compress functions, and SHA3 and Keccak at 224, 256, 384 and 512 bits over keccakf1600; a final digest shorter than 16 bytes is compared as four words with the upper ones zero. User-defined types may now name mdxfind own hash functions: sha224, sha384, rmd128, rmd160, tiger, wrl, md2, gost, sne128, sne256, the fifteen HAVAL forms, mysql3, blake2b512, blake2b256, blake2s256, sha3_224 to sha3_512 and keccak224 to keccak512, each the call its catalog type makes. hashpipe registers its BLAKE2 digests as hx functions, which the verify registration had hidden. The drift check reads a NAME-prefixed hex digest and the bare digest as one value. 11 more catalog types run on the GPU: e410 e416 e449 e474 e478 e548 e711 e842 e843 e846 e847. Verified: each new user function agrees with its catalog type at x01 to x03 on the CPU and with hashpipe -X; the C mirror agrees for 567 of 567 cores and every earlier core changed only by the added dialect text; on dev3 (M2 Max, Metal) all new catalog types and 42 user types match -G none, and on gp1 (Tahiti, OpenCL) all do except the md2 user type, whose kernel the Tahiti compiler crashes on, which is FATAL there as for any such kernel.
+ *
+ * Revision 1.23  2026/11/20 05:22:12  dlr
+ * Generic hx walker stage 1c: user-defined types run on the GPU through the generated walker. A user type is served when it takes no salt or user, declares no stored form, and its result is the hex of its final digest; rounds past x01 re-run the whole program on the previous round's hex text, keeping its case, as the userdef CPU arm does. The selected user type's status line says whether it runs on the GPU, or why not, in place of the former not-yet-enabled line. Verified: the C mirror agrees for 529 of 529 cores, including 10 user cores whose later rounds are checked against the hx VM re-running the program, and a planted case defect is caught in exactly the 8 case-sensitive ones; the 519 catalog cores are byte-identical; on dev3 (M2 Max, Metal) and gp1 (Tahiti, OpenCL) 10 user types match -G none at x01 and x02 and deeper with rules, a -n mask and a mixed run with a catalog type, except one type whose kernel the Tahiti compiler crashes on, which is FATAL there as for any such kernel.
+ *
+ * Revision 1.22  2026/11/20 04:20:19  dlr
+ * SHA1MD5DSALT e590 and SHA1MD5MD5DSALT e591 keep sha1(md5hex . ":" . salt without its last byte) as an alternate beside sha1(salt . ":" . md5hex . ":" . salt). Real stored hashes take that form: 30 distinct e591 hashes in the archive, all with 3-byte salts, which a construction stripping punctuation from the outer salt does not explain. -j and -P report the peppers they ignore: Warning: N peppers ignored: a pepper is at most 80 bytes, or 1 to 126 bytes as $HEX[], and the peppers in use count only those kept. Verified: the 30 archive hashes are found, as by 1.677; hashpipe verifies 3551 of 3551 archived e591 lines and 9090 of 9090 e590 and e591 lines from mdxfind -z; an 81-byte plain and a 127-byte $HEX[] pepper are reported and the other three are used.
+ *
+ * Revision 1.21  2026/11/20 02:52:02  dlr
+ * Generic hx walker stage 2 eligibility, the -u long-userid warning and per-type -P peppers. A walker type may now carry a salt or user channel matching its NEEDSALT or NEEDUSER flag, and a type whose CPU code reports x01 only (ledger no-iter, drift_ok 3) is generated to compare round 1 only; a type also needs a stored digest width equal to its TypeDigest and must not be NEEDSJ. gpu_hx_generic_channel reports the channel to the GPU host. -u still ignores a userid of 80 bytes or more and now says so: Warning: N userids of 80 bytes or more ignored. -P after -M stored a JudySL in Typepepper[] while every pepper arm reads Typepepper as a length-prefixed byte list, so the arms walked Judy memory as peppers and printed heap bytes in the salt field (ab EPR, then $HEX[61622002bcc27f]). -P per type is now collected apart and encoded by pepper_encode, the encoder -j and global -P already used, before anything reads Typepepper. Verified: -M e611 -P with PEPR and $HEX[70c3a470] prints ab PEPR and the decoded second pepper on the CPU, and gp1 finds 1847 of 1847 for -M e607 -P against -G none.
+ *
+ * Revision 1.20  2026/11/19 15:03:13  dlr
+ * SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5 key Typesalt by setting. Each distinct setting, the type prefix, any rounds=N field and the salt through its closing dollar sign, exactly as written, is one salt whose count is the number of distinct hash lines carrying it; the lines stay in JudyJ. A candidate is hashed once per setting rather than once per line, on the CPU and on both GPU backends; the kernels are unchanged. One salt at different rounds values is different settings. A computed line is matched by shacrypt_claim, which looks it up in JudyJ, claims it once and decrements its setting in every type sharing the lines, SHA512CRYPT and SHA512CRYPTMD5 sharing theirs, so a line found by two rules, two devices, or a device and the CPU is printed and counted once, and a setting retires exactly when its last line is solved. A bare -z setting and the setting of a loaded line are one key, and with hash lines loaded -z generates once per setting. The SHA crypts hash at most 16 salt characters, as crypt(3) and the GPU kernel do; a bare -z setting with a longer salt generates with its first 16, so the printed line is the one crypt(3) produces. BCRYPT counts a repeated input line once, so its setting retires when its lines are solved. Verified: -f /dev/null -z identical to the previous revision and to openssl passwd; lines generated at rounds 6000 and 10000 verify with passlib; a 450-line passlib list with shared settings, one salt at two rounds values, repeated lines, and SHA512CRYPT and SHA512CRYPTMD5 on one setting gives 420 of 420 exact on the CPU, OpenCL on a GTX 1080 with 420 device hits, and Metal on an M2 Max, the GTX 1080 run in 421M hash calculations where the previous revision took 13.2G; GPU self-test 7 of 7 for all three types; -z to -F round trip identical; regress/test-F-salted.sh 29 passed, 0 failed.
+ *
+ * Revision 1.19  2026/11/19 13:08:34  dlr
+ * GPU self-test phase 2. The test now runs under -k, -E, -a and -8 and in brute-force runs, and covers SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5. Under -E and -a each test word carries an @ after a two-byte local part and the expected plaintext is prepend, local part, append, domain, the order the CPU forms it in; under -8 one test word carries a two-byte UTF-8 character so the UTF-32 engine runs; -k needs nothing, as an untagged word is hashed bare on both sides. A brute-force run is known only once its mask is parsed, after the expectations were formed, so selftest_bf rebuilds them as mask indexes 0 to 6 over one empty word, the shape of a brute-force chunk, and the test runs on the first chunk through the kernel that chunk uses, the fast MD5 kernel included. The SHA-crypt types capture the first 16 bytes of the raw digest in crypt_round, which is the form build_compact_table gives the device. BCRYPT and DESCRYPT remain uncovered.
+ *
+ * Revision 1.18  2026/11/19 02:29:16  dlr
+ * GPU self-test: the oracle runs before gpujob_init. confirm_start runs after salt preparation, since the confirm thread sizes its salt snapshot from the salt counts.
+ *
+ * Revision 1.17  2026/11/18 04:07:48  dlr
+ * Generic hx walker stage 1a routing. A drift-checked catalog type with no hand-built kernel runs on the GPU through a template core generated from its hx program; a hand kernel always wins. hx_generic_capable plans each type once; hx_generic_setup fixes the run set before the GPU starts, leaving out x01-silent types when -i is below 2, and turns on the confirm thread. The [GPU] tag in the type listing comes from the same predicate, as do need_gpu and op_can_reach_gpu.
+ *
+ * Revision 1.16  2026/11/17 02:21:44  dlr
+ * -c (XML escaping) and -l (NUL/CR/LF variants) disable the GPU, as -b does. The device hashes each word as read and applies neither, so with the GPU active those runs hashed different candidates from a CPU run: under -c a GPU-handled word was hashed unescaped, and under -l its line-ending variants were computed on neither side.
+ *
+ * Revision 1.15  2026/11/17 01:08:31  dlr
+ * CRAMMD5-DOVECOT (e932): keep each loaded record in CramDovecot, keyed by its opad state, so a hit prints the line as loaded.
+ *
+ * Revision 1.14  2026/11/16 21:05:20  dlr
+ * User-defined types without a form line can match again. The loader commits their digest to the compact table, which is where checkhash and checkhashsalt look, instead of filing the line into JUDYJ, where nothing looked: the run read the hash, reported Searching through 0 unique hex hashes, and found nothing. Types with a form are unchanged. Under -J, which has no compact table, such a line is no longer claimed, so the load receipt shows it was not loaded. Verified on unsalted, salted and user-only types, at -i 2, against a non-matching hash, and on the existing form types.
+ *
  * Revision 1.13  2026/11/15 18:38:04  dlr
  * mdxfind 1.676: with the GPU active, an -n/-N mask over the per-side GPU limit, with an empty character class, or whose tables do not fit in device memory exits with the positions requested and the limit, instead of hashing bare words on the GPU while the CPU skips the mask.
  *
@@ -48,6 +81,9 @@
  */
 #define MDX_NO_MD6 1    /* see mdxint.h: only mdxfind.c may include md6.h */
 #include "mdxint.h"
+#include "codegen/hx_spec_entry.h"
+#include "codegen/hx_plan.h"   /* the generic hx walker */
+#include "codegen/hx_gen.h"
 
 static int Extmatch_set;   /* -e was given explicitly */
 
@@ -2694,6 +2730,10 @@ static void hx_family_md5pass_validate_run_shared(
  * them. Both the init preamble and gpu_op_advertise_for_h_listing apply
  * those extra predicates after the gpu_ops[] scan.
  */
+/* The generic hx walker's routing (defined beside gpu_op_advertise_for_h_listing). */
+static int hx_generic_capable(int op);
+static void hx_generic_setup(void);
+
 static const int gpu_ops[] = {
     JOB_MD5SALT, JOB_MD5UCSALT, JOB_MD5revMD5SALT, JOB_MD5sub8_24SALT,
     JOB_MD5MD5SALT,   /* e347: md5salt template, algo_mode 7 (2026-11-13) */
@@ -2772,7 +2812,7 @@ static int op_can_reach_gpu(int op) {
     int i;
     for (i = 0; gpu_ops[i] >= 0; i++)
         if (gpu_ops[i] == op) return 1;
-    return 0;
+    return gpu_hx_generic(op);
 }
 #else
 static int op_can_reach_gpu(int op) { (void)op; return 0; }
@@ -3210,6 +3250,9 @@ void build_compact_table(void) {
    * 11-JOB family override table replaced with a J1F/J1N walk over
    * Dohash calling gpu_codegen_kernelb_family_md5pass_eligible. */
   { int need_gpu = 0;
+    /* The generic hx walker's types start the GPU too. */
+    for (int gi = 0; gi < JOB_DONE && !need_gpu; gi++)
+      if (gpu_hx_generic(gi)) need_gpu = 1;
     for (int gi = 0; gpu_ops[gi] >= 0; gi++) {
       Word_t grc;
       J1T(grc, Dohash, gpu_ops[gi]);
@@ -5440,21 +5483,16 @@ static long typesalt_entries(int job) {
     return n;
 }
 
-/* $5$/$6$ file a full hash in Typesalt as the whole line, and a bare
- * setting as the setting alone, so the same salt supplied both ways would
- * be generated twice under -z.  Given a full line, drop the bare setting it
- * already carries. */
-static void drop_bare_setting(int job, const char *full) {
-    char set[256];
-    const char *e = strrchr(full, '$');
-    int n, rc;
-    if (!e) return;
-    n = (int)(e - full) + 1;
-    if (n >= (int)sizeof(set) || full[n] == 0) return;
-    memcpy(set, full, (size_t)n);
-    set[n] = 0;
-    JSLD(rc, TYPESALT(job), (unsigned char *)set);
-    (void)rc;
+/* The setting of a $5$/$6$ line, "$5$[rounds=N$]salt$": its length through
+ * the '$' that ends it, which is the Typesalt key these types use (see
+ * shacrypt_claim in mdxfind.c).  0 when nothing follows that '$': a setting
+ * alone has no hash to match.  A bare setting loaded under -z is normalised
+ * to the same form by crypt_setting_only, so a salt supplied both ways is
+ * one key and is generated once. */
+static int shacrypt_setting_len(const char *l) {
+    const char *e = strrchr(l, '$');
+    int n = e ? (int)(e - l) + 1 : 0;
+    return (n > 3 && l[n]) ? n : 0;
 }
 
 /* Load structured hash formats from a file into Judy arrays.
@@ -5657,13 +5695,20 @@ static int crypt_setting_only(const char *s, int len, char *out, int outsz)
       return 0;
     p++;
   }
-  if (p == salt0 || p - salt0 > 64) return 0;  /* crypt() uses the first 16 */
+  if (p == salt0 || p - salt0 > 64) return 0;
   if (p < len && p + 1 != len) return 0;   /* a hash follows: not bare */
-  n = p + 1;
-  if (n >= outsz) return 0;
-  memcpy(out, s, (size_t)p);
-  out[p] = '$';
-  out[n] = 0;
+  /* crypt() uses the first 16 salt characters and writes only those into
+   * the hash it returns, so a longer salt generates as its first 16: the
+   * line -z prints is then the one crypt(3) produces.  Only this, the
+   * input to generation, is cut; a loaded hash line is never altered. */
+  {
+    int keep = (p - salt0 > 16) ? salt0 + 16 : p;
+    n = keep + 1;
+    if (n >= outsz) return 0;
+    memcpy(out, s, (size_t)keep);
+    out[keep] = '$';
+    out[n] = 0;
+  }
   return n;
 }
 
@@ -6134,7 +6179,24 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
         }
         if (_dgl != _ut->diglen_hex) continue;
 
-        JSLI(PV, JUDYJ(_uop), (unsigned char *)line);
+        /* Where the digest goes follows where the matcher looks. A type with a
+         * form is matched by rebuilding the whole stored line and looking it up
+         * in JUDYJ, so the line goes there. A type without one is matched by
+         * checkhash/checkhashsalt against the compact table, so its digest has
+         * to be committed there: filed into JUDYJ instead, it was read, counted
+         * and then never comparable, and the run reported "Searching through 0
+         * unique hex hashes" and found nothing. Without a compact table (-J)
+         * the line is not claimed, so the file's receipt shows it was not
+         * loaded rather than accepting a hash that can never match. */
+        if (_ut->form.npieces) {
+          JSLI(PV, JUDYJ(_uop), (unsigned char *)line);
+        } else {
+          int _hl;
+          if (!inhashbuf || _dgl > 512) continue;
+          _hl = get32((char *)_dg, inhashbuf + 2, _dgl / 2);
+          if (_hl * 2 != _dgl) continue;               /* digest is not hex */
+          commit_compact(_hl);
+        }
         if (_sl && _sll > 0)
           Saltloaded[_uop] += store_typesalt(_uop, (char *)_sl, _sll);
         if (_us && _usl > 0 && user_canon((char *)_us, _usl, Ucanon) > 0) {
@@ -6725,6 +6787,15 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
             dc_key[y] = tolower(line[10 + y]);
           dc_key[32] = 0;
           JSLI(PV, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)dc_key);
+          /* keep the record as loaded, so a hit prints the line it matched */
+          JSLI(PV, CramDovecot, (unsigned char *)dc_key);
+          if (*PV == 0) {
+            char *orig = malloc(10 + 64 + 1);
+            if (!orig) { fprintf(stderr, "Out of memory\n"); exit(1); }
+            memcpy(orig, line, 10 + 64);
+            orig[10 + 64] = 0;
+            *PV = (Word_t)orig;
+          }
           Foundcnt[JOB_CRAMMD5_DOVECOT]++;
           continue;
         }
@@ -7880,10 +7951,18 @@ static void load_hash_file(gzFile gi, const char *filename, Pvoid_t *pDoload,
          * tail, so e577 BCRYPT256 loaded a hash that could never match. */
         { int bclen = (line[2] == 'k') ? 59 : 60;
           if (len > bclen) line[bclen] = 0; }
+        /* The setting's Typesalt value counts the distinct LINES under it; a
+         * find claims its line once (CAS on the JudyJ value) and decrements
+         * once.  So a line repeated in the input must not count again, or its
+         * setting can never reach 0 and is hashed for the rest of the run. */
+        int bc_new;
+        { Word_t *BPV0;
+          JSLG(BPV0, JUDYJ(JOB_BCRYPT), (unsigned char *)line);
+          bc_new = (BPV0 == NULL); }
         JSLI(PV, JUDYJ(JOB_BCRYPT),(unsigned char *)line);
         /* extract salt prefix into Typesalt[job->op] */
         /* $2k$ has 21-char salt (28 prefix), others have 22 (29 prefix) */
-        { char bc_salt[30];
+        if (bc_new) { char bc_salt[30];
           int pfx = (line[2] == 'k') ? 28 : 29;
           memcpy(bc_salt, line, pfx);
           bc_salt[pfx] = 0;
@@ -11302,7 +11381,7 @@ void *Stack;
  * Non-GPU builds (GPU_ENABLED undefined) unconditionally return 0,
  * preserving the prior iMac listing behavior.
  */
-static int gpu_op_advertise_for_h_listing(int x) {
+static int gpu_op_hand_served(int x) {
 #ifdef GPU_ENABLED
     /* Predicate 1: shared file-scope gpu_ops[] linear scan. */
     for (int i = 0; gpu_ops[i] >= 0; i++) {
@@ -11313,6 +11392,163 @@ static int gpu_op_advertise_for_h_listing(int x) {
     if (x == JOB_MD5MD5SALT) return 1;
     /* Predicate 3: Phase 5a/5b MAKE_MD5PASS family codegen entries. */
     if (gpu_codegen_kernelb_family_md5pass_eligible(x)) return 1;
+#else
+    (void)x;
+#endif
+    return 0;
+}
+
+/* ---- generic hx walker (stage 1a) ----
+ *
+ * A catalog type with no hand-built kernel runs on the GPU through a template
+ * core generated from its hx program (codegen/hx_plan.c, codegen/hx_gen.c)
+ * when its hx.8 expression has been checked against this program's own CPU
+ * code (drift_ok, tools/hx_drift_check.py). A hand-built kernel always wins.
+ * drift_ok == 2 marks a type that reports nothing at x01 (its round-1 digest
+ * is another type's, as MD5CAP's is MD5's): its core compares from round 2
+ * only, and it is not put on the GPU at all when -i is below 2.
+ *
+ * Every host site asks gpu_hx_generic(op), which reads Hxg_run, filled once by
+ * hx_generic_setup() before the GPU starts and never written again. */
+static unsigned char Hxg_state[JOB_DONE];   /* 0 not asked, 1 capable, 2 not */
+static unsigned char Hxg_run[JOB_DONE];     /* served in this run */
+static unsigned char Hxg_words[JOB_DONE];
+static unsigned char Hxg_chan[JOB_DONE];    /* enum hx_plan_channel */
+static char *Hxg_core[JOB_DONE];
+static const char *Hxg_why[JOB_DONE];       /* user types: why not, for the status line */
+
+/* A user-defined type (stage 1c): hx IS its definition, so there is no drift
+ * check. Served when it is unsalted, has no stored form (its hashes are then
+ * in the compact table, as the device probe needs), and its result is the hex
+ * of its final digest; rounds past x01 re-run the whole program on the
+ * previous round's text, as its CPU arm does (decision D5). */
+static int hx_generic_capable_user(int op) {
+    struct userdef_type *u = userdef_get(op);
+    static struct hx_plan plan;     /* main thread only */
+    static char why[160];
+    const char *r = NULL;
+    if (!u || !u->prog) r = "its expression did not compile";
+    else if (u->slot_mask) r = "it takes a salt or user, which user types do not have on the GPU yet";
+    else if (u->form.npieces) r = "it declares a stored form";
+    else if (TYPEDIGEST_LEN(typedigest(op)) == 0) r = "its digest width is not known";
+    else {
+        hx_plan_build(u->prog, NULL, 2048, &plan);
+        if (!plan.eligible) r = plan.reason;
+        else if (!(Hxg_core[op] = hx_gen_core_whole(&plan, why, sizeof why))) r = why;
+        else if (hx_gen_digest_bytes(&plan) != (int)TYPEDIGEST_LEN(typedigest(op))) {
+            free(Hxg_core[op]);
+            Hxg_core[op] = NULL;
+            r = "its result is not as wide as its digest";
+        }
+    }
+    if (!Hxg_core[op]) {
+        Hxg_why[op] = strdup(r);
+        return 0;
+    }
+    Hxg_words[op] = (unsigned char)hx_gen_words(&plan);
+    Hxg_chan[op] = HXC_NONE;
+    return 1;
+}
+
+static int hx_generic_capable(int op) {
+    if (op < 0 || op >= JOB_DONE) return 0;
+    if (!Hxg_state[op] && op_is_user(op))
+        Hxg_state[op] = hx_generic_capable_user(op) ? 1 : 2;
+    if (!Hxg_state[op]) {
+        const struct hx_spec_entry *e = hx_specs_lookup(op);
+        static struct hx_plan plan;     /* main thread only */
+        char why[160];
+        Hxg_state[op] = 2;
+        /* A compact-table type (not JudyJ), so the device probe can see
+         * its hashes; spec 3.5 rule 3. */
+        if (e && e->program && e->drift_ok && !gpu_op_hand_served(op) &&
+            !(TYPEOPTS(op) & TYPEOPT_NEEDSJ) && TYPEDIGEST_LEN(typedigest(op)) > 0) {
+            int want_salt, want_user;
+            hx_plan_build(e->program, e->call_names, 2048, &plan);
+            want_salt = (TYPEOPTS(op) & TYPEOPT_NEEDSALT) != 0;
+            want_user = (TYPEOPTS(op) & TYPEOPT_NEEDUSER) != 0;
+            /* The channel the expression uses must be the one the type
+             * loads, and the digest it computes exactly as wide as the one
+             * the table compares (rule 4): a salt the CPU reads from
+             * elsewhere, or a shorter compare, is not something the device
+             * can reproduce from the snapshot and the table. */
+            /* A core that cannot iterate (an HMAC, whose CPU code does not)
+             * serves only a type the ledger marks no-iter. */
+            if (plan.eligible &&
+                (plan.iter_body >= 0 || e->drift_ok == 3) &&
+                (plan.channel == HXC_SALT) == want_salt &&
+                (plan.channel == HXC_USER) == want_user &&
+                hx_gen_digest_bytes(&plan) == (int)TYPEDIGEST_LEN(typedigest(op)))
+                Hxg_core[op] = e->drift_ok == 3
+                    ? hx_gen_core_x01(&plan, why, sizeof why)
+                    : hx_gen_core(&plan, e->drift_ok == 2, why, sizeof why);
+            if (Hxg_core[op]) {
+                Hxg_state[op] = 1;
+                Hxg_words[op] = (unsigned char)hx_gen_words(&plan);
+                Hxg_chan[op] = (unsigned char)plan.channel;
+            }
+        }
+    }
+    return Hxg_state[op] == 1;
+}
+
+#ifdef GPU_ENABLED
+/* Fill Hxg_run from Dohash. Called once, after the -m and -i options are
+ * read and before the GPU starts. */
+static void hx_generic_setup(void) {
+    Word_t op = 0;
+    int rc;
+    if (NoMetal) return;            /* -G none: the GPU serves nothing */
+    J1F(rc, Dohash, op);
+    while (rc) {
+        if ((int)op < JOB_DONE && hx_generic_capable((int)op)) {
+            const struct hx_spec_entry *e = hx_specs_lookup((int)op);
+            /* a user type has no catalog entry, and is never x01-silent */
+            if (!e || e->drift_ok != 2 || Maxiter >= 2) {
+                Hxg_run[op] = 1;
+                Confirm_enabled = 1;    /* every GPU hit is confirmed on the CPU */
+            }
+        }
+        J1N(rc, Dohash, op);
+    }
+}
+#endif
+
+int gpu_hx_generic(int op) {
+    return op >= 0 && op < JOB_DONE && Hxg_run[op];
+}
+
+/* The status line for a selected user type. */
+static const char *hx_generic_user_status(int op) {
+    static char line[256];
+    if (!hx_generic_capable(op)) {
+        snprintf(line, sizeof line, "not on the GPU: %s; running on CPU.",
+                 Hxg_why[op] ? Hxg_why[op] : "?");
+        return line;
+    }
+#ifdef GPU_ENABLED
+    if (!NoMetal && !Printall) return "runs on the GPU through a generated kernel.";
+#endif
+    return "GPU-capable through a generated kernel; this run is on the CPU.";
+}
+
+const char *gpu_hx_generic_core(int op) {
+    return gpu_hx_generic(op) ? Hxg_core[op] : NULL;
+}
+
+int gpu_hx_generic_words(int op) {
+    return gpu_hx_generic(op) ? Hxg_words[op] : 0;
+}
+
+int gpu_hx_generic_channel(int op) {
+    return gpu_hx_generic(op) ? Hxg_chan[op] : 0;
+}
+
+static int gpu_op_advertise_for_h_listing(int x) {
+#ifdef GPU_ENABLED
+    if (gpu_op_hand_served(x)) return 1;
+    /* Predicate 4: the generic hx walker. */
+    if (hx_generic_capable(x)) return 1;
 #else
     (void)x;
 #endif
@@ -11345,6 +11581,59 @@ static void mask_gpu_unusable_fatal(const char *file, int line,
   exit(1);
 }
 #endif
+
+/* -P files given after -M, per type, until pepper_encode turns them into
+ * Typepepper[] lists. */
+static Pvoid_t *PepperJ;
+
+/* A pepper Judy as the byte list every pepper arm reads: each entry a signed
+ * length byte and its bytes plus a NUL, the list ended by two 0xff. $HEX[]
+ * is decoded (1..126 bytes); a plain pepper over 80 bytes is not kept.
+ * *n counts the keys. NULL for an empty Judy. */
+static char *pepper_encode(Pvoid_t J, int *n)
+{
+  char line[MAXLINE + 16], *list, *s;
+  Word_t *PV;
+  size_t mem = 0;
+  int x, y, dropped = 0;
+  *n = 0;
+  line[0] = 0;
+  JSLF(PV, J, (unsigned char *)line);
+  while (PV) {
+    (*n)++;
+    mem += strlen(line) + 2;
+    JSLN(PV, J, (unsigned char *)line);
+  }
+  if (!*n) return NULL;
+  s = list = malloc_lock(mem + 4, "Peppers");
+  line[0] = 0;
+  JSLF(PV, J, (unsigned char *)line);
+  while (PV) {
+    x = (int)strlen(line);
+    if (x > 5 && strncmp(line, "$HEX[", 5) == 0) {
+      y = get32(line + 5, (unsigned char *)(s + 1), (x - 6));
+      if (y > 0 && y < 127) {
+        *s++ = y;
+        s += y;
+        *s++ = 0;
+      } else
+        dropped++;
+    } else if (x <= 80) {
+      *s++ = x;
+      strcpy(s, line);
+      s += x + 1;
+    } else
+      dropped++;
+    JSLN(PV, J, (unsigned char *)line);
+  }
+  if (dropped)
+    fprintf(stderr, "Warning: %d pepper%s ignored: a pepper is at most 80 bytes, "
+            "or 1 to 126 bytes as $HEX[]\n", dropped, dropped == 1 ? "" : "s");
+  *n -= dropped;      /* the peppers in use */
+  *s++ = (char)255;
+  *s = (char)255;
+  return list;
+}
 
 int main(int argc, char **argv) {
   struct stat sb;
@@ -11547,6 +11836,8 @@ union HashU curin;
   Dodigits = 0;
   infilename = "<STDIN>";
   Maxniter = 1;
+  /* before any userdef_load() below: the functions a user type may name */
+  mdx_hx_register();
   if (argc == 2 && strncmp(argv[1],"-h",2) == 0) {
         /* User-defined types are registered by userdef_load(), which runs
          * further down main() -- AFTER this block, which exits. Without this
@@ -13056,15 +13347,19 @@ badrule:
               {
                 char tline[MAXLINE + 16];
                 Word_t *TPV;
-                Pvoid_t pjudy = (Pvoid_t)Typepepper[ti];
+                /* Collected here and encoded into Typepepper[] with the -j
+                 * list (pepper_encode): the arms read Typepepper as that
+                 * byte list, never as a Judy. */
+                if (!PepperJ)
+                  PepperJ = (Pvoid_t *)calloc(JOB_DONE, sizeof(Pvoid_t));
+                if (!PepperJ) { fprintf(stderr, "FATAL %s:%d: out of memory for -P\n", __FILE__, __LINE__); exit(1); }
                 tline[0] = 0;
                 JSLF(PV, TmpPepper, (unsigned char *)tline);
                 while (PV) {
-                  JSLI(TPV, pjudy, (unsigned char *)tline);
+                  JSLI(TPV, PepperJ[ti], (unsigned char *)tline);
                   if (TPV) (*TPV)++;
                   JSLN(PV, TmpPepper, (unsigned char *)tline);
                 }
-                Typepepper[ti] = (char *)pjudy;
               }
               J1N(RC, Doload, ti);
             }
@@ -13208,14 +13503,8 @@ Keys_deferred_next:
         y++;
         fprintf(stderr, "%s ", userdef_name(_uop));
         TOTALFOUND(_uop - 1) = malloc_lock(sizeof(unsigned long long)*(Maxiter + 1),"totalfound");
-        /*
-         * Sub-phase D4: honest GPU-eligibility status for the SELECTED
-         * user type.  Enum-agnostic shape detection on the compiled
-         * hx_program (no new flag -- piggybacks the invoke-time output).
-         * GPU dispatch for user types is phase 2, so a supported shape
-         * still reports "running on CPU".
-         */
-        _gs = userdef_gpu_status(_uop);
+        /* Whether the SELECTED user type runs on the GPU, and why not. */
+        _gs = hx_generic_user_status(_uop);
         _ut = userdef_get(_uop);
         if (_gs && _ut)
           fprintf(stderr, "\n-m u%s: %s\n", _ut->idstr, _gs);
@@ -13228,43 +13517,22 @@ Keys_deferred_next:
     exit(0);
   }
 
-  line[0] = 0;
-  JSLF(PV, PepperArray, (unsigned char *)line);
-  MemSize = y = x = 0;
-  while (PV) {
-    x++;
-    MemSize += mystrlen(line) + 2;
-    JSLN(PV, PepperArray, (unsigned char *)line);
-  }
-  Numpeppers = x;
-  if (Numpeppers) {
-    char *s;
-    s = combo_pepper = malloc_lock(MemSize + 4,"Peppers");
-    line[0] = 0;
-    JSLF(PV, PepperArray, (unsigned char *)line);
-    while (PV) {
-      x = mystrlen(line);
-      if (x > 5 && strncmp(line, "$HEX[", 5) == 0) {
-        y = get32(line + 5, (unsigned char *)(s + 1), (x - 6));
-        if (y > 0 && y < 127) {
-          *s++ = y;
-          s += y;
-          *s++ = 0;
-        }
-      } else {
-        if (x <= 80) {
-          *s++ = x;
-          strcpy(s, line);
-          s += x + 1;
-        }
-      }
-      JSLN(PV, PepperArray, (unsigned char *)line);
-    }
-    *s++ = (char)255;
-    *s = (char)255;
+  Numpeppers = 0;
+  combo_pepper = pepper_encode(PepperArray, (int *)&Numpeppers);
+  if (combo_pepper) {
     fprintf(stderr, "%d total peppers in use\n", Numpeppers);
     Totsalts = Numsalts;
     JSLFA(RC, PepperArray);
+  }
+  if (PepperJ) {
+    for (x = 0; x < JOB_DONE; x++)
+      if (PepperJ[x]) {
+        int n;
+        Typepepper[x] = pepper_encode(PepperJ[x], &n);
+        JSLFA(RC, PepperJ[x]);
+      }
+    free(PepperJ);
+    PepperJ = NULL;
   }
 
 
@@ -13295,6 +13563,7 @@ Keys_deferred_next:
   if (x) {
     Word_t *UPV;
     /* Build UseridJudy from UserArray with PV=1000000 */
+    int ulongids = 0;
     line[0] = 0;
     JSLF(PV, UserArray, (unsigned char *)line);
     while (PV) {
@@ -13302,9 +13571,13 @@ Keys_deferred_next:
       if (x > 0 && x < 80) {
         JSLI(UPV, UseridJudy, (unsigned char *)line);
         if (UPV) *UPV = 1000000;
-      }
+      } else if (x >= 80)
+        ulongids++;
       JSLN(PV, UserArray, (unsigned char *)line);
     }
+    if (ulongids)
+      fprintf(stderr, "Warning: %d userid%s of 80 bytes or more ignored\n",
+              ulongids, ulongids == 1 ? "" : "s");
     /* Count userids in UseridJudy */
     { int ucnt = 0;
       char uline[MAXLINE]; uline[0] = 0;
@@ -13707,6 +13980,14 @@ usage:
   ToAdd.length = -1;
   twist(HashWaiting, BY, +1);
   x = join_all();
+  /* After the hash loader is joined, before any worker or GPU thread starts:
+   * join_all waits for every thread, and the confirm thread runs to the end.
+   * The generic hx walker's GPU types are known here (the hashes are loaded,
+   * -m and -i are read), and they need the confirm thread. */
+#ifdef GPU_ENABLED
+  hx_generic_setup();
+#endif
+  /* confirm_start() runs below, after the salts are counted. */
 
   Minhashlen *= 2;
   /* -e 2 steps the extended windows one byte (two hex characters) at a time.
@@ -13743,13 +14024,16 @@ usage:
               "search is slower; -e 0 matches whole hashes only.\n",
               Minhashlen, 2 * maxdig, TYPENAME(maxop));
     Precheck_off = (XOR_key_len || Rotatehash || Printall);
-    /* -b too: the device hashes the raw word, never its UTF-16 expansion. */
-    if (ext_active || XOR_key_len || Rotatehash || Unicode) {
+    /* -b, -c and -l too: the device hashes the word as read, never its UTF-16
+     * expansion, its XML escaping or its NUL/CR/LF variants, so a GPU run
+     * would hash different candidates from a CPU run. */
+    if (ext_active || XOR_key_len || Rotatehash || Unicode || XMLchar || Addlf) {
 #ifdef GPU_ENABLED
       if (!NoMetal)
         fprintf(stderr, "GPU disabled (%s is CPU-only)\n",
                 XOR_key_len ? "the XOR key" : Rotatehash ? "hash rotation" :
-                Unicode ? "-b Unicode expansion" : "extended matching");
+                Unicode ? "-b Unicode expansion" : XMLchar ? "-c XML escaping" :
+                Addlf ? "-l NUL/CR/LF variants" : "extended matching");
 #endif
       NoMetal = 1;
     }
@@ -17178,23 +17462,29 @@ usage:
         J1U(RC, Dohash, JOB_JUNIPERIVE);
       }
     }
-    /* SHA256CRYPT: insert JudyJ[JOB_SHA256CRYPT] entries into Typesalt */
+    /* SHA256CRYPT: Typesalt holds each distinct SETTING, its value the
+     * number of distinct lines carrying it; the lines stay in JudyJ for the
+     * match (shacrypt_claim in mdxfind.c).  One candidate is then hashed
+     * once per setting, not once per line.  The JudyJ walk visits each
+     * distinct line once, so a line repeated in the input counts once and
+     * its setting can still retire.  The key is the setting exactly as
+     * written -- never normalised -- so every printed line is the stored
+     * line, byte for byte. */
     { long sha256cryptcnt = 0;
       line[0] = 0;
       JSLF(PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)line);
       while (PV) {
-        Word_t *SPV;
-        JSLI(SPV, TYPESALT(JOB_SHA256CRYPT), (unsigned char *)line);
-        if (SPV && *SPV == 0) *SPV = 1;
-        drop_bare_setting(JOB_SHA256CRYPT, (char *)line);
-        sha256cryptcnt++;
+        int sn = shacrypt_setting_len((char *)line);
+        if (sn) {
+          store_typesalt(JOB_SHA256CRYPT, (char *)line, sn);
+          sha256cryptcnt++;
+        }
         JSLN(PV, JUDYJ(JOB_SHA256CRYPT), (unsigned char *)line);
       }
-      JSLFA(RC, JUDYJ(JOB_SHA256CRYPT));
       if (sha256cryptcnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = sha256cryptcnt;
-        Numsalts += sha256cryptcnt;
+        Numsalts += typesalt_entries(JOB_SHA256CRYPT);
         fprintf(stderr, "Searching through %ld unique SHA256CRYPT hashes\n", sha256cryptcnt);
       } else {
         J1T(RC, Dohash, JOB_SHA256CRYPT);
@@ -17216,30 +17506,28 @@ usage:
         }
       }
     }
-    /* SHA512CRYPT: insert JudyJ[JOB_SHA512CRYPT] entries into Typesalt */
-    /* Also insert into Typesalt[JOB_SHA512CRYPTMD5] since it falls through to crypt_round */
+    /* SHA512CRYPT: as SHA256CRYPT above, the settings into Typesalt and the
+     * lines left in JudyJ.  SHA512CRYPTMD5 reads the same $6$ lines, so its
+     * Typesalt gets the same settings and counts; a line solved under
+     * either type retires it from both. */
     { long sha512cryptcnt = 0;
       line[0] = 0;
+      J1T(RC, Dohash, JOB_SHA512CRYPTMD5);
+      int s6md5 = (int)RC;
       JSLF(PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)line);
       while (PV) {
-        Word_t *SPV;
-        JSLI(SPV, TYPESALT(JOB_SHA512CRYPT), (unsigned char *)line);
-        if (SPV && *SPV == 0) *SPV = 1;
-        drop_bare_setting(JOB_SHA512CRYPT, (char *)line);
-        J1T(RC, Dohash, JOB_SHA512CRYPTMD5);
-        if (RC) {
-          JSLI(SPV, TYPESALT(JOB_SHA512CRYPTMD5), (unsigned char *)line);
-          if (SPV && *SPV == 0) *SPV = 1;
-          drop_bare_setting(JOB_SHA512CRYPTMD5, (char *)line);
+        int sn = shacrypt_setting_len((char *)line);
+        if (sn) {
+          store_typesalt(JOB_SHA512CRYPT, (char *)line, sn);
+          if (s6md5) store_typesalt(JOB_SHA512CRYPTMD5, (char *)line, sn);
+          sha512cryptcnt++;
         }
-        sha512cryptcnt++;
         JSLN(PV, JUDYJ(JOB_SHA512CRYPT), (unsigned char *)line);
       }
-      JSLFA(RC, JUDYJ(JOB_SHA512CRYPT));
       if (sha512cryptcnt) {
         if (Bcryptcnt == 0)
           Bcryptcnt = sha512cryptcnt;
-        Numsalts += sha512cryptcnt;
+        Numsalts += typesalt_entries(JOB_SHA512CRYPT);
         fprintf(stderr, "Searching through %ld unique SHA512CRYPT hashes\n", sha512cryptcnt);
       } else {
         J1T(RC, Dohash, JOB_SHA512CRYPT);
@@ -17800,6 +18088,12 @@ usage:
 
   Curfile = "<Unknown>";
   LowSkip = Lowline = 0;
+  /* The confirm thread sizes its salt snapshot from Typesaltcnt[] and
+   * Typesaltbytes[] when it starts, and those are counted above, so it starts
+   * here rather than straight after the hash load: started there it held no
+   * snapshot buffer at all, and the first confirm of a salted type wrote
+   * through NULL.  No hit can reach it before the workers below exist. */
+  confirm_start();
 #ifdef GPU_ENABLED
   {
     int gpu_avail = 0;
@@ -17811,6 +18105,25 @@ usage:
     gpu_avail = gpu_opencl_available();
 #endif
     if (gpu_avail) {
+      /* GPU self-test: capture what each selected GPU type's own CPU code
+       * computes for the test words, now that every salt structure exists
+       * and before any worker runs (gpujob.h, mdxfind.c selftest_oracle). */
+      if (!Printall) {
+        int *stops = malloc(JOB_DONE * sizeof(int)), nst = 0, sop;
+        if (!stops) {
+          fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test\n", __FILE__, __LINE__);
+          exit(1);
+        }
+        for (sop = 1; sop < JOB_DONE; sop++) {
+          Word_t src;
+          J1T(src, Dohash, sop);
+          if (src && (op_can_reach_gpu(sop) || sop == JOB_MD5MD5SALT ||
+                      gpu_codegen_kernelb_family_md5pass_eligible(sop)))
+            stops[nst++] = sop;
+        }
+        selftest_oracle(stops, nst);
+        free(stops);
+      }
       gpujob_init(maxt * 2 + maxt / 2);
       gpu_batch_lines = gpujob_batch_max();
 
@@ -18268,6 +18581,8 @@ usage:
               BfMaskGpuUsable = 0;
 #endif
           }
+          /* The self-test's expectations, in the shape BF chunks have. */
+          if (BfMaskGpuUsable) selftest_bf();
         }
 #endif
 
@@ -19179,6 +19494,9 @@ bf_done:
     /* BF Phase 3 (2026-05-10): gpu_opencl_bf_stop retired alongside the
      * atomic-cursor BF machinery. Nothing to signal at shutdown anymore. */
 #endif
+    /* The GPU has replayed every hit, and the workers are done, so every
+     * confirm is queued: stop the confirm thread behind them. */
+    confirm_stop();
     possess(HashWaiting);
     twist(HashWaiting, TO, 1);  /* now signal ReportStats to exit */
     stats_wake();

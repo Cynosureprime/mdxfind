@@ -104,6 +104,15 @@ struct hx_spec_entry {
      */
     int                 emit_class;     /* enum hx_emit_class */
     int                 note_ref;       /* hx.8 Note [N] ref; 0 = none */
+    /*
+     * Generic GPU walker, stage 0 (2026-11-16): 1 when this type's hx.8
+     * expression has been checked against mdxfind's own CPU code for the
+     * type (tools/hx_drift_check.py) and the fingerprint of what was checked
+     * -- the expression, the type's procjob case and the helpers it calls --
+     * still matches tools/hx_drift_ledger.txt. tools/hx8_to_c sets it. A type
+     * with drift_ok == 0 is never routed to the generic GPU walker.
+     */
+    uint8_t             drift_ok;
 };
 
 /* Auto-generated table + count -- emitted into codegen/hx_specs_data.c. */

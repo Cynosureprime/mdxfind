@@ -980,8 +980,21 @@ kernel void template_phase0(
                 /* --- Iterated probe loop — Phase 1 fires it exactly once. --- */
                 uint max_iter = params.max_iter;
                 if (max_iter < 1u) max_iter = 1u;
+#ifdef HX_NO_ITERATE
+                /* A generic-walker core for a type whose CPU code reports
+                 * round 1 only, whatever -i says: compare round 1 and stop.
+                 * Twin of gpu_template.cl. */
+                max_iter = 1u;
+#endif
                 for (uint iter = 1u; iter <= max_iter; iter++) {
                     uint matched_idx = 0u;
+#ifdef HX_X01_SILENT
+                    /* A generic-walker core for a type that reports nothing
+                     * at x01 (MD5UC, MD5CAP: round 1 is plain MD5's digest,
+                     * which mdxfind leaves to MD5): compare from round 2
+                     * only.  Twin of gpu_template.cl. */
+                    if (iter >= 2u)
+#endif
                     if (template_digest_compare(st,
                                                 compact_fp, compact_idx,
                                                 params.compact_mask, params.max_probe,

@@ -16,8 +16,14 @@
 # pattern detector that recognizes hand-tuned bytecode shapes (currently
 # HX_PATTERN_E347_MD5MD5MD5SALT only). Walker now depends on hx_patterns.h.
 #
-# $Revision: 1.4 $
+# $Revision: 1.6 $
 # $Log: Makefile.frag,v $
+# Revision 1.6  2026/11/18 04:08:20  dlr
+# Build hx_plan.o and hx_gen.o, the generic hx walker plan builder and emitter, into CODEGEN_OBJS.
+#
+# Revision 1.5  2026/11/17 01:53:31  dlr
+# codegen/hx_dump.o and codegen/hx_patterns.o depend on codegen/hx_spec_entry.h, which they include through hx_walker.h and hx_patterns.h, so a change to that struct rebuilds them.
+#
 # Revision 1.4  2026/05/23 02:02:50  dlr
 # sub-phase 5a.2 add hx_emit_primitives object and header to CODEGEN_OBJS and CODEGEN_HDRS; new compile rule for the per-primitive emit dispatch table
 #
@@ -28,7 +34,8 @@
 CODEGEN_OBJS = codegen/hx_walker.o codegen/hx_emit_opencl.o \
                codegen/hx_emit_metal.o codegen/hx_dump.o \
                codegen/hx_specs_data.o codegen/hx_patterns.o \
-               codegen/hx_emit_primitives.o
+               codegen/hx_emit_primitives.o \
+               codegen/hx_plan.o codegen/hx_gen.o
 
 CODEGEN_HDRS = codegen/hx_spec.h codegen/hx_walker.h codegen/hx_emit.h \
                codegen/hx_spec_entry.h codegen/hx_patterns.h \
@@ -43,13 +50,13 @@ codegen/hx_emit_opencl.o: codegen/hx_emit_opencl.c $(CODEGEN_HDRS) hx_vm.h
 codegen/hx_emit_metal.o: codegen/hx_emit_metal.c $(CODEGEN_HDRS) hx_vm.h
 	cc -O3 -Wall -I. -Icodegen -c codegen/hx_emit_metal.c -o codegen/hx_emit_metal.o
 
-codegen/hx_dump.o: codegen/hx_dump.c codegen/hx_walker.h
+codegen/hx_dump.o: codegen/hx_dump.c codegen/hx_walker.h codegen/hx_spec_entry.h
 	cc -O3 -Wall -I. -Icodegen -c codegen/hx_dump.c -o codegen/hx_dump.o
 
 # hx codegen sub-phase 2a.3 (2026-05-21): pattern detector. Recognizes
 # bytecode shapes that warrant a hand-tuned tp0 emitter rather than the
 # generic per-opcode dispatch. Currently only the e347 7-op shape.
-codegen/hx_patterns.o: codegen/hx_patterns.c codegen/hx_patterns.h hx_vm.h
+codegen/hx_patterns.o: codegen/hx_patterns.c codegen/hx_patterns.h codegen/hx_spec_entry.h hx_vm.h
 	cc -O3 -Wall -I. -Icodegen -c codegen/hx_patterns.c -o codegen/hx_patterns.o
 
 # hx codegen sub-phase 2a.2 (2026-05-21): hx_specs_data.o compiled from
@@ -63,3 +70,11 @@ codegen/hx_specs_data.o: codegen/hx_specs_data.c codegen/hx_spec_entry.h hx_vm.h
 # table shared by family emitters. Pure data; no JIT, no kernel emission.
 codegen/hx_emit_primitives.o: codegen/hx_emit_primitives.c codegen/hx_emit_primitives.h
 	cc -O3 -Wall -I. -Icodegen -c codegen/hx_emit_primitives.c -o codegen/hx_emit_primitives.o
+
+# Generic hx walker (stage 1a): the plan an hx program is read into, and the
+# template core emitted from it in the per-backend macro dialect.
+codegen/hx_plan.o: codegen/hx_plan.c codegen/hx_plan.h hx_vm.h
+	cc -O3 -Wall -I. -Icodegen -c codegen/hx_plan.c -o codegen/hx_plan.o
+
+codegen/hx_gen.o: codegen/hx_gen.c codegen/hx_gen.h codegen/hx_plan.h hx_vm.h
+	cc -O3 -Wall -I. -Icodegen -c codegen/hx_gen.c -o codegen/hx_gen.o

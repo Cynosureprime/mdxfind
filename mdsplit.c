@@ -28,9 +28,12 @@
 
 #endif
 
-static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdsplit.c,v 1.31 2026/09/11 01:56:37 dlr Exp dlr $";
+static char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdsplit.c,v 1.32 2026/11/20 04:19:29 dlr Exp dlr $";
 /*
  * $Log: mdsplit.c,v $
+ * Revision 1.32  2026/11/20 04:19:29  dlr
+ * Decide full-vs-chop by the line hash field, not the whole line. A NAMED solved file line "hash16:salt:pass" under 32 bytes took the chop branch, was filed as TYPEchopN by its whole-line length, cut to that even length (odd lines lost their last byte) and had the result tail appended, doubling the solution. Measure the field to the first Sep, as hlen is for results; a field under 8 keeps the whole-line length, as the result parser does. Reverse path already measured the field. .txt inputs are unchanged.
+ *
  * Revision 1.31  2026/09/11 01:56:37  dlr
  * Restore shortest-solution-wins when one hash has several type solutions. Lost in 1.26 when the hex path moved from the JudySL chain to the compact table: duplicates were kept in adjacent probe slots and match_compact returned whichever was inserted first, making the result depend on record order in the result file. Now collapsed at table build, keeping the shortest total solution INCLUDING the type tag, so encodings that differ only by tag (NTLMx01 vs MD4UTF16UCx01 over identical plaintext) resolve to the shorter tag. Ties: higher iteration count, then strcmp on type name for determinism across table sizes. Entries with a different hash length are left alone, so prefix/chopped matching is unchanged. Reports the collapse count.
  *
@@ -1177,11 +1180,20 @@ unsigned long long process(char *initfi, int Procall, int Simulate) {
       tline[len1] = 0;
       resi1 = match(tline, line, len);
       if (resi1) {
+        int hfl;
         gothit++;
         hitcount++;
         curfn = resi1->hashtype;
         curfn->hitcount++;
-        if (len >= resi1->hlen) {
+        /* Full-vs-chop is decided by the line's HASH FIELD, not the whole line:
+         * a solved line "hash16:salt:pass" is a chopped hash however long its
+         * solution.  Measured to the first Sep, as hlen is for results; a field
+         * under 8 falls back to the whole line, as the result parser does. */
+        for (hfl = 0; hfl < len && line[hfl] != Sep; hfl++)
+          ;
+        if (hfl < 8)
+          hfl = len;
+        if (hfl >= resi1->hlen) {
 	  if (strlen(prefix)) {
 	    strcpy(hashname,prefix);
 	    safecat(hashname, stripprefix(basename));
@@ -1231,7 +1243,7 @@ unsigned long long process(char *initfi, int Procall, int Simulate) {
             }
           }
         } else {
-          len &= -2;
+          len = hfl & -2;
           sprintf(tline, "%schop%d", resi1->hashtype->type, len);
           line[len] = 0;
 	  if (strlen(prefix)) {

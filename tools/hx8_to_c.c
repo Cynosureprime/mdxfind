@@ -300,6 +300,464 @@ static int dedup_ok_try_line(const char *line)
     return 1;
 }
 
+/* ---------- per-type drift fingerprint (generic GPU walker, stage 0) ----------
+ *
+ * A catalog type may run on the GPU only after its hx.8 expression has been
+ * checked against mdxfind's own CPU code for that type (tools/hx_drift_check.py).
+ * The check is recorded in tools/hx_drift_ledger.txt with a FINGERPRINT of what
+ * was checked; the entry gets .drift_ok = 1 (2 when the type reports nothing
+ * at x01) only while that fingerprint still
+ * matches. Changing the hx.8 line or the type's code therefore takes that one
+ * type off the GPU until it is checked again, and changing unrelated code
+ * re-checks nothing.
+ *
+ * The fingerprint is SHA-256 over, in order:
+ *   - the cleaned hx expression;
+ *   - every procjob segment the type's code runs through: from each
+ *     `case JOB_X:` label to the next case label that follows a break,
+ *     continue, return or goto (a fallthrough continues into the next case),
+ *     and, transitively, the segment at every `goto` label named inside;
+ *   - one level of helpers: the text of every function or macro defined in
+ *     mdxfind.c or mdxint.h and called from those segments, sorted by name.
+ *     Reporting and bookkeeping helpers (checkhash*, prfound, hybrid_check, the
+ *     salt-snapshot builders, the PV and MF macros) are left out: they decide
+ *     what is printed, not what is computed.
+ * Comments are removed and whitespace collapsed first, so an edit to a comment
+ * does not count as a code change. Code in other files (the hash libraries)
+ * is not covered. Over-inclusion only causes an extra re-check; that is the
+ * direction the rules above err in.
+ */
+#include <openssl/sha.h>
+
+static char  *fp_src = NULL;       /* normalized mdxfind.c + mdxint.h */
+static size_t fp_srclen = 0;
+static size_t fp_pj0 = 0, fp_pj1 = 0;  /* procjob body range in fp_src */
+static int    fp_ready = 0;
+
+/* JOB_ names by number, from the original mdxfind.c #defines. */
+#define FP_MAXJOB 4096
+static char  *fp_jobname[FP_MAXJOB];
+
+/* Top-level function and macro definitions: name -> [start,end) in fp_src
+ * (functions) or a malloc'd normalized text (macros). */
+struct fp_def { char *name; size_t a, b; char *mtext; };
+static struct fp_def *fp_defs = NULL;
+static int fp_ndefs = 0, fp_capdefs = 0;
+
+static void fp_def_add(const char *name, size_t nlen, size_t a, size_t b,
+                       char *mtext)
+{
+    if (fp_ndefs == fp_capdefs) {
+        fp_capdefs = fp_capdefs ? fp_capdefs * 2 : 1024;
+        fp_defs = realloc(fp_defs, (size_t)fp_capdefs * sizeof(*fp_defs));
+        if (!fp_defs) { WARN("FATAL: hx8_to_c: OOM fp_defs\n"); exit(2); }
+    }
+    fp_defs[fp_ndefs].name = strndup(name, nlen);
+    fp_defs[fp_ndefs].a = a; fp_defs[fp_ndefs].b = b;
+    fp_defs[fp_ndefs].mtext = mtext;
+    fp_ndefs++;
+}
+
+static const struct fp_def *fp_def_find(const char *name)
+{
+    for (int i = 0; i < fp_ndefs; i++)
+        if (strcmp(fp_defs[i].name, name) == 0) return &fp_defs[i];
+    return NULL;
+}
+
+/* Remove comments (each becomes one space) and collapse whitespace runs to one
+ * space, leaving string and character literals intact. */
+static char *fp_normalize(const char *in, size_t n, size_t *outn)
+{
+    char *o = malloc(n + 1);
+    size_t j = 0;
+    int sp = 0;
+    if (!o) { WARN("FATAL: hx8_to_c: OOM normalize\n"); exit(2); }
+    for (size_t i = 0; i < n; i++) {
+        char c = in[i];
+        if (c == '/' && i + 1 < n && in[i+1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(in[i] == '*' && in[i+1] == '/')) i++;
+            i++;
+            c = ' ';
+        } else if (c == '/' && i + 1 < n && in[i+1] == '/') {
+            while (i < n && in[i] != '\n') i++;
+            c = ' ';
+        } else if (c == '"' || c == '\'') {
+            char q = c;
+            o[j++] = c; sp = 0;
+            for (i++; i < n && in[i] != q; i++) {
+                o[j++] = in[i];
+                if (in[i] == '\\' && i + 1 < n) o[j++] = in[++i];
+            }
+            if (i < n) o[j++] = q;
+            continue;
+        }
+        if (isspace((unsigned char)c)) {
+            if (!sp && j) { o[j++] = ' '; sp = 1; }
+            continue;
+        }
+        o[j++] = c; sp = 0;
+    }
+    o[j] = 0;
+    *outn = j;
+    return o;
+}
+
+/* Index of the brace matching the '{' at p, string-aware; n on failure. */
+static size_t fp_match_brace(const char *s, size_t n, size_t p)
+{
+    int d = 0;
+    for (size_t i = p; i < n; i++) {
+        char c = s[i];
+        if (c == '"' || c == '\'') {
+            char q = c;
+            for (i++; i < n && s[i] != q; i++) if (s[i] == '\\') i++;
+            continue;
+        }
+        if (c == '{') d++;
+        else if (c == '}' && --d == 0) return i;
+    }
+    return n;
+}
+
+static int fp_isid(int c) { return isalnum(c) || c == '_'; }
+
+/* #define NAME ... lines from the ORIGINAL text (they need line structure). */
+static void fp_scan_macros(const char *t, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        size_t ls = i, le = i;
+        while (le < n && t[le] != '\n') le++;
+        const char *p = t + ls;
+        while (p < t + le && (*p == ' ' || *p == '\t')) p++;
+        if (p + 7 < t + le && strncmp(p, "#define", 7) == 0) {
+            const char *q = p + 7;
+            while (q < t + le && (*q == ' ' || *q == '\t')) q++;
+            const char *nm = q;
+            while (q < t + le && fp_isid((unsigned char)*q)) q++;
+            size_t nl = (size_t)(q - nm);
+            /* extend over continuation lines */
+            size_t e = le;
+            while (e > ls && e < n && t[e-1] == '\\') {
+                e++;
+                while (e < n && t[e] != '\n') e++;
+            }
+            if (nl) {
+                size_t mn;
+                char *mt = fp_normalize(t + ls, e - ls, &mn);
+                fp_def_add(nm, nl, 0, 0, mt);
+            }
+            le = e;
+        }
+        i = le + 1;
+    }
+}
+
+/* Top-level function definitions in the normalized text: at brace depth 0, a
+ * '{' preceded by ')' whose '(' is preceded by an identifier. */
+static void fp_scan_functions(void)
+{
+    const char *s = fp_src;
+    size_t n = fp_srclen;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '"' || c == '\'') {
+            char q = c;
+            for (i++; i < n && s[i] != q; i++) if (s[i] == '\\') i++;
+            continue;
+        }
+        if (c != '{') continue;
+        size_t e = fp_match_brace(s, n, i);
+        size_t k = i;
+        while (k > 0 && s[k-1] == ' ') k--;
+        if (k > 0 && s[k-1] == ')') {
+            int d = 0;
+            size_t m = k - 1;
+            for (;; m--) {
+                if (s[m] == ')') d++;
+                else if (s[m] == '(' && --d == 0) break;
+                if (m == 0) break;
+            }
+            size_t ne = m;
+            while (ne > 0 && s[ne-1] == ' ') ne--;
+            size_t nb = ne;
+            while (nb > 0 && fp_isid((unsigned char)s[nb-1])) nb--;
+            if (ne > nb && !isdigit((unsigned char)s[nb]))
+                fp_def_add(s + nb, ne - nb, nb, e + 1, NULL);
+        }
+        i = e;   /* skip the body: only depth-0 definitions are wanted */
+    }
+}
+
+static char *fp_slurp_text(const char *path, size_t *n)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = malloc((size_t)sz + 1);
+    if (!b || fread(b, 1, (size_t)sz, f) != (size_t)sz) {
+        WARN("FATAL: hx8_to_c: read %s failed\n", path); exit(2);
+    }
+    fclose(f);
+    b[sz] = 0;
+    *n = (size_t)sz;
+    return b;
+}
+
+/* Load mdxfind.c and mdxint.h (paths relative to the project root, where make
+ * runs, as for tools/dedup_ok.txt). Returns 0 when mdxfind.c is absent. */
+static int fp_init(void)
+{
+    size_t n1, n2 = 0;
+    char *t1 = fp_slurp_text("mdxfind.c", &n1);
+    if (!t1) return 0;
+    char *t2 = fp_slurp_text("mdxint.h", &n2);
+    /* JOB_ names */
+    for (size_t i = 0; i + 12 < n1; i++) {
+        if ((i == 0 || t1[i-1] == '\n') && strncmp(t1 + i, "#define JOB_", 12) == 0) {
+            const char *p = t1 + i + 8, *q = p;
+            while (fp_isid((unsigned char)*q)) q++;
+            const char *r = q;
+            while (*r == ' ' || *r == '\t') r++;
+            if (isdigit((unsigned char)*r)) {
+                int v = atoi(r);
+                if (v >= 0 && v < FP_MAXJOB && !fp_jobname[v])
+                    fp_jobname[v] = strndup(p, (size_t)(q - p));
+            }
+        }
+    }
+    fp_scan_macros(t1, n1);
+    if (t2) fp_scan_macros(t2, n2);
+    /* normalized text: mdxfind.c, then mdxint.h */
+    size_t a, b;
+    char *na = fp_normalize(t1, n1, &a);
+    char *nb = t2 ? fp_normalize(t2, n2, &b) : strdup("");
+    if (!t2) b = 0;
+    fp_src = malloc(a + b + 2);
+    memcpy(fp_src, na, a); fp_src[a] = ' ';
+    memcpy(fp_src + a + 1, nb, b); fp_srclen = a + 1 + b; fp_src[fp_srclen] = 0;
+    free(na); free(nb); free(t1); free(t2);
+    /* procjob body */
+    char *pj = strstr(fp_src, " procjob(void *dummy) {");
+    if (!pj) { WARN("FATAL: hx8_to_c: procjob not found in mdxfind.c\n"); exit(2); }
+    fp_pj0 = (size_t)(strchr(pj, '{') - fp_src);
+    fp_pj1 = fp_match_brace(fp_src, fp_srclen, fp_pj0);
+    fp_scan_functions();
+    fp_ready = 1;
+    return 1;
+}
+
+/* Does the text before position p (within the segment) end a statement that
+ * leaves the case: break; continue; return ...; goto X; */
+static int fp_terminated(const char *s, size_t seg0, size_t p)
+{
+    size_t k = p;
+    while (k > seg0 && s[k-1] == ' ') k--;
+    if (k == seg0 || s[k-1] != ';') return 0;
+    size_t st = k - 1;                      /* start of the last statement */
+    while (st > seg0 && s[st-1] != ';' && s[st-1] != '{' && s[st-1] != '}' &&
+           s[st-1] != ':') st--;
+    while (st < k && s[st] == ' ') st++;
+    return strncmp(s + st, "break", 5) == 0 || strncmp(s + st, "continue", 8) == 0 ||
+           strncmp(s + st, "return", 6) == 0 || strncmp(s + st, "goto ", 5) == 0;
+}
+
+/* Segment from position p0 (a label) to its end, as described above. */
+static size_t fp_segment_end(size_t p0)
+{
+    const char *s = fp_src;
+    int d = 0, body = 0;
+    size_t i = p0;
+    while (i < fp_pj1 && s[i] != ':') i++;  /* past the label's colon */
+    i++;
+    for (; i < fp_pj1; i++) {
+        char c = s[i];
+        if (c == '"' || c == '\'') {
+            char q = c;
+            for (i++; i < fp_pj1 && s[i] != q; i++) if (s[i] == '\\') i++;
+            body = 1;
+            continue;
+        }
+        if (c == '{') { d++; body = 1; continue; }
+        if (c == '}') { if (--d < 0) return i; continue; }
+        if (c == ' ') continue;
+        if (d == 0 && (s[i-1] == ' ' || s[i-1] == ';' || s[i-1] == '{' ||
+                       s[i-1] == '}' || s[i-1] == ':') &&
+            (strncmp(s + i, "case ", 5) == 0 || strncmp(s + i, "default:", 8) == 0 ||
+             strncmp(s + i, "default :", 9) == 0)) {
+            if (body && fp_terminated(s, p0, i)) return i;
+            /* adjacent label, or a fallthrough: keep going past the label */
+            while (i < fp_pj1 && s[i] != ':') i++;
+            continue;
+        }
+        body = 1;
+    }
+    return fp_pj1;
+}
+
+static const char *fp_skip_names[] = {
+    "if", "for", "while", "switch", "return", "sizeof", "do", "else", "case",
+    "prfound", "hybrid_check", "build_salt_snapshot", "build_hashsalt_snapshot",
+    "store_typesalt", "PV_DEC", "PV_TAKE", "MF_TAKE", NULL
+};
+
+static int fp_skip(const char *nm)
+{
+    if (strncmp(nm, "checkhash", 9) == 0) return 1;
+    for (int i = 0; fp_skip_names[i]; i++)
+        if (strcmp(nm, fp_skip_names[i]) == 0) return 1;
+    return 0;
+}
+
+static int fp_strcmp(const void *a, const void *b)
+{
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* Fingerprint one type. Returns 0 and fills hex[65], or -1 when the type has
+ * no case in procjob (then it cannot be checked, and never becomes drift_ok). */
+static int fp_compute(int en, const char *expr, char hex[65])
+{
+    if (!fp_ready || en < 0 || en >= FP_MAXJOB || !fp_jobname[en] || !expr)
+        return -1;
+    const char *s = fp_src;
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, "hx:", 3);
+    SHA256_Update(&ctx, expr, strlen(expr));
+    SHA256_Update(&ctx, "\n", 1);
+
+    /* segment worklist: case labels first, then goto targets */
+    size_t segs[64][2];
+    int nseg = 0;
+    char *gotos[64];
+    int ngoto = 0;
+    char pat[160];
+    snprintf(pat, sizeof(pat), "case %s", fp_jobname[en]);
+    size_t pl = strlen(pat);
+    for (const char *p = strstr(s + fp_pj0, pat); p && (size_t)(p - s) < fp_pj1;
+         p = strstr(p + 1, pat)) {
+        char nx = p[pl];
+        if (fp_isid((unsigned char)p[-1])) continue;          /* "xcase JOB_X" */
+        if (!(nx == ':' || (nx == ' ' && p[pl+1] == ':'))) continue;  /* JOB_XY */
+        if (nseg < 64) {
+            segs[nseg][0] = (size_t)(p - s);
+            segs[nseg][1] = fp_segment_end((size_t)(p - s));
+            nseg++;
+        }
+    }
+    if (nseg == 0) return -1;
+    for (int si = 0; si < nseg; si++) {
+        /* goto targets named in this segment */
+        for (size_t i = segs[si][0]; i + 5 < segs[si][1]; i++) {
+            if (strncmp(s + i, "goto ", 5) != 0 || (i && fp_isid((unsigned char)s[i-1])))
+                continue;
+            const char *q = s + i + 5, *r = q;
+            while (fp_isid((unsigned char)*r)) r++;
+            char lab[128];
+            size_t ll = (size_t)(r - q);
+            if (!ll || ll >= sizeof(lab)) continue;
+            memcpy(lab, q, ll); lab[ll] = 0;
+            int seen = 0;
+            for (int g = 0; g < ngoto; g++) if (strcmp(gotos[g], lab) == 0) seen = 1;
+            if (seen || ngoto >= 64 || nseg >= 64) continue;
+            gotos[ngoto++] = strdup(lab);
+            /* find "lab:" (not "lab::"), at a statement start, inside procjob */
+            char lp[136];
+            snprintf(lp, sizeof(lp), "%s:", lab);
+            for (const char *t = strstr(s + fp_pj0, lp); t && (size_t)(t - s) < fp_pj1;
+                 t = strstr(t + 1, lp)) {
+                char pc = t[-1];
+                if (fp_isid((unsigned char)pc) || t[strlen(lp)] == ':') continue;
+                if (pc != ' ' && pc != ';' && pc != '{' && pc != '}') continue;
+                segs[nseg][0] = (size_t)(t - s);
+                segs[nseg][1] = fp_segment_end((size_t)(t - s));
+                nseg++;
+                break;
+            }
+        }
+    }
+    /* hash segments, collect called names */
+    char *names[512];
+    int nn = 0;
+    for (int si = 0; si < nseg; si++) {
+        SHA256_Update(&ctx, "seg:", 4);
+        SHA256_Update(&ctx, s + segs[si][0], segs[si][1] - segs[si][0]);
+        SHA256_Update(&ctx, "\n", 1);
+        for (size_t i = segs[si][0]; i < segs[si][1]; i++) {
+            if (!fp_isid((unsigned char)s[i]) || (i && fp_isid((unsigned char)s[i-1])) ||
+                isdigit((unsigned char)s[i])) continue;
+            size_t j = i;
+            while (j < segs[si][1] && fp_isid((unsigned char)s[j])) j++;
+            size_t k = j;
+            while (k < segs[si][1] && s[k] == ' ') k++;
+            if (k < segs[si][1] && s[k] == '(' && j - i < 128 && nn < 512) {
+                char nm[128];
+                memcpy(nm, s + i, j - i); nm[j - i] = 0;
+                int dup = 0;
+                for (int x = 0; x < nn; x++) if (strcmp(names[x], nm) == 0) dup = 1;
+                if (!dup && !fp_skip(nm) && fp_def_find(nm)) names[nn++] = strdup(nm);
+            }
+            i = j;
+        }
+    }
+    qsort(names, (size_t)nn, sizeof(char *), fp_strcmp);
+    for (int x = 0; x < nn; x++) {
+        const struct fp_def *d = fp_def_find(names[x]);
+        SHA256_Update(&ctx, "fn:", 3);
+        SHA256_Update(&ctx, names[x], strlen(names[x]));
+        SHA256_Update(&ctx, ":", 1);
+        if (d->mtext) SHA256_Update(&ctx, d->mtext, strlen(d->mtext));
+        else          SHA256_Update(&ctx, s + d->a, d->b - d->a);
+        SHA256_Update(&ctx, "\n", 1);
+        free(names[x]);
+    }
+    for (int g = 0; g < ngoto; g++) free(gotos[g]);
+    unsigned char md[32];
+    SHA256_Final(md, &ctx);
+    for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02x", md[i]);
+    hex[64] = 0;
+    return 0;
+}
+
+/* tools/hx_drift_ledger.txt: "eN<TAB>fingerprint<TAB>date<TAB>vectors<TAB>NAME",
+ * then optionally "<TAB>x01-silent" for a type that reports nothing at x01
+ * (drift_ok = 2: the GPU compares from round 2 only) or "<TAB>no-iter" for a
+ * type whose CPU code reports x01 only, whatever -i says (drift_ok = 3: the
+ * GPU compares round 1 only). '#' comments. A later line for the same eN
+ * replaces an earlier one. */
+static char *fp_ledger[FP_MAXJOB];
+static uint8_t fp_ledger_silent[FP_MAXJOB];
+static uint8_t fp_ledger_noiter[FP_MAXJOB];
+static int   fp_ledger_n = 0;
+
+static void fp_ledger_load(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    char buf[1024];
+    if (!f) return;                          /* absent: no type is drift_ok */
+    while (fgets(buf, sizeof(buf), f)) {
+        if (buf[0] != 'e') continue;
+        int en = atoi(buf + 1);
+        char *t = strchr(buf, '\t');
+        if (en < 0 || en >= FP_MAXJOB || !t || strlen(t + 1) < 64) continue;
+        if (!fp_ledger[en]) fp_ledger_n++;
+        free(fp_ledger[en]);
+        fp_ledger[en] = strndup(t + 1, 64);
+        {
+            char *nl = strchr(t + 1, '\n');
+            if (nl) *nl = 0;
+            fp_ledger_silent[en] = strstr(t + 1, "\tx01-silent") != NULL;
+            fp_ledger_noiter[en] = strstr(t + 1, "\tno-iter") != NULL;
+        }
+    }
+    fclose(f);
+}
+
 /* ---------- input buffer ---------- */
 
 static char *slurp(const char *path, size_t *out_len)
@@ -369,9 +827,14 @@ static int has_metavariable_iteration(const char *s)
 {
 	const char *p;
 
+	int quoted = 0;
+
 	if (!s) return 0;
-	for (p = s; (p = strchr(p, '^')) != NULL; p++) {
-		if (p == s) continue;
+	/* A caret inside a string literal is a byte of the literal, not an
+	 * iteration: EMPIRECMS hashes the constant "E!m^p-i(r#e.C:M?S". */
+	for (p = s; *p; p++) {
+		if (*p == '"') { quoted = !quoted; continue; }
+		if (quoted || *p != '^' || p == s) continue;
 		if (!isalnum((unsigned char)p[-1]) && p[-1] != '_') continue;
 		if (p[1] && !isdigit((unsigned char)p[1])) return 1;
 	}
@@ -711,23 +1174,60 @@ static int parse_row(const char *line,
 
 /* ---------- main ---------- */
 
+/* -F list: "all", or eN / N tokens separated by commas. */
+static int fp_wanted(const char *list, int en)
+{
+    if (strcmp(list, "all") == 0) return 1;
+    for (const char *p = list; *p; ) {
+        if (*p == 'e' || *p == 'E') p++;
+        if (atoi(p) == en && isdigit((unsigned char)*p)) return 1;
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        WARN("usage: %s path/to/hx.8 > codegen/hx_specs_data.c\n",
-             argv[0]);
+    /* hx8_to_c hx.8 > codegen/hx_specs_data.c    normal build
+     * hx8_to_c -F e1,e31|all hx.8                 print "eN fp NAME expr" for
+     *                                             tools/hx_drift_check.py, emit
+     *                                             no C */
+    const char *fp_only = NULL;
+    int ai = 1;
+    if (argc == 4 && strcmp(argv[1], "-F") == 0) {
+        fp_only = argv[2];
+        ai = 3;
+    } else if (argc != 2) {
+        WARN("usage: %s path/to/hx.8 > codegen/hx_specs_data.c\n"
+             "       %s -F eN[,eM...]|all path/to/hx.8\n",
+             argv[0], argv[0]);
         return 2;
     }
 
+    int have_src = fp_init();
+    if (!have_src) {
+        if (fp_only) {
+            WARN("FATAL: hx8_to_c -F: mdxfind.c not found in the current "
+                 "directory; run from the project root\n");
+            return 2;
+        }
+        WARN("hx8_to_c: mdxfind.c not in the current directory: no drift "
+             "fingerprints, every entry gets .drift_ok = 0\n");
+    }
+    fp_ledger_load("tools/hx_drift_ledger.txt");
+
     size_t inlen = 0;
-    char *input = slurp(argv[1], &inlen);
+    char *input = slurp(argv[ai], &inlen);
     if (!input) {
         WARN("FATAL: hx8_to_c: read failed\n");
         return 2;
     }
 
-    /* Output to stdout. */
-    FILE *out = stdout;
+    /* Output to stdout; in -F mode the C is discarded. */
+    FILE *out = fp_only ? fopen("/dev/null", "w") : stdout;
+    if (!out) { WARN("FATAL: hx8_to_c: open /dev/null failed\n"); return 2; }
+    int fp_ok_n = 0, fp_stale_n = 0, fp_nocase_n = 0;
 
     fprintf(out,
 "/*\n"
@@ -1006,6 +1506,31 @@ int main(int argc, char **argv)
 "const struct hx_spec_entry hx_specs_data[] = {\n");
     for (int i = 0; i < meta_n; i++) {
         struct entry_meta *m = &meta[i];
+        int drift_ok = 0;
+        if (have_src && !m->is_outlier && !m->compile_failed && m->expr_cleaned) {
+            char fph[65];
+            if (fp_compute(m->type, m->expr_cleaned, fph) == 0) {
+                if (fp_ledger[m->type]) {
+                    if (strcmp(fp_ledger[m->type], fph) == 0) {
+                        drift_ok = fp_ledger_silent[m->type] ? 2
+                                 : fp_ledger_noiter[m->type] ? 3 : 1;
+                        fp_ok_n++;
+                    } else {
+                        fp_stale_n++;
+                        WARN("hx8_to_c: drift ledger: e%d %s is STALE (its hx.8 "
+                             "line or code changed since the check): not GPU-"
+                             "eligible until re-checked\n", m->type, m->name);
+                    }
+                }
+                if (fp_only && fp_wanted(fp_only, m->type))
+                    printf("e%d\t%s\t%s\t%s\n", m->type, fph, m->name,
+                           m->expr_cleaned);
+            } else {
+                fp_nocase_n++;
+                if (fp_only && fp_wanted(fp_only, m->type))
+                    printf("e%d\t-\t%s\t%s\n", m->type, m->name, m->expr_cleaned);
+            }
+        }
         fprintf(out, "    { .job_enum = %d, .name = \"%s\", .expression = ",
                 m->type, m->name);
         if (m->expr_cleaned)
@@ -1025,14 +1550,18 @@ int main(int argc, char **argv)
          * carries the hx.8 "(see Note [N])" reference number (0 = none).*/
         if (m->is_outlier || m->compile_failed)
             fprintf(out, ".program = NULL, .call_names = NULL, "
-                         ".emit_class = %d, .note_ref = %d },\n",
+                         ".emit_class = %d, .note_ref = %d, .drift_ok = 0 },\n",
                     m->emit_class, m->note_ref);
         else
             fprintf(out, ".program = &_hx_program_%d, "
                          ".call_names = _hx_callnames_%d, "
-                         ".emit_class = %d, .note_ref = %d },\n",
-                    m->eidx, m->eidx, m->emit_class, m->note_ref);
+                         ".emit_class = %d, .note_ref = %d, .drift_ok = %d },\n",
+                    m->eidx, m->eidx, m->emit_class, m->note_ref, drift_ok);
     }
+    if (have_src)
+        WARN("hx8_to_c: drift ledger: %d of %d checked types current, %d stale; "
+             "%d entries have no procjob case\n",
+             fp_ok_n, fp_ledger_n, fp_stale_n, fp_nocase_n);
     fprintf(out, "};\n"
                  "const int hx_specs_count = %d;\n\n", meta_n);
 

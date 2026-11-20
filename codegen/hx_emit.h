@@ -37,8 +37,11 @@
  * per the feedback memo. 5a.3 ships SHA1 only (e161); 5a.4 adds the
  * other 7 5a-supported primitives across both backends symmetrically.
  *
- * $Revision: 1.7 $
+ * $Revision: 1.8 $
  * $Log: hx_emit.h,v $
+ * Revision 1.8  2026/11/16 21:05:07  dlr
+ * Remove the skeleton and per-opcode emit helpers. Their only caller was the placeholder walk removed from hx_walker.c in the same change.
+ *
  * Revision 1.7  2026/05/28 14:32:03  dlr
  * Phase 1b Batch 1: add hx_emit_unsalted_single_opencl + hx_emit_unsalted_single_metal one-shot hash of pass emitters for HX_PATTERN_UNSALTED_SINGLE; reuse md5 md4 sha1 sha256 block from gpu_common.cl and metal_common.metal; strictly simpler than family no inner md5 no hex32 no concat; per-primitive usp buf-global helpers reproduce the family MD SHA padding applied to raw pass; SHA1 SHA256 BE to LE state byte-swap for the compact_fp probe; kernel signature mirrors kernelb_hx_codegen_phase0 salt args ignored; reqd work group size 64; C-mirror validated 80 of 80 byte-exact before GPU JIT; FATAL on callname not in wired set md5 md4 sha1 sha256
  *
@@ -66,66 +69,6 @@ struct hx_spec_entry;
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* ---- skeleton emit helpers (2a.1) ---- */
-
-int hx_emit_kernel_attribute_opencl(char **out, size_t *out_cap,
-                                    size_t *out_len);
-int hx_emit_address_space_global_opencl(char **out, size_t *out_cap,
-                                        size_t *out_len);
-int hx_emit_thread_id_load_opencl(char **out, size_t *out_cap,
-                                  size_t *out_len,
-                                  const char *var_name);
-int hx_emit_atomic_inc_opencl(char **out, size_t *out_cap, size_t *out_len,
-                              const char *counter_expr);
-int hx_emit_payload_load_opencl(char **out, size_t *out_cap, size_t *out_len);
-
-int hx_emit_kernel_attribute_metal(char **out, size_t *out_cap,
-                                   size_t *out_len);
-int hx_emit_address_space_global_metal(char **out, size_t *out_cap,
-                                       size_t *out_len);
-int hx_emit_thread_id_load_metal(char **out, size_t *out_cap,
-                                 size_t *out_len,
-                                 const char *var_name);
-int hx_emit_atomic_inc_metal(char **out, size_t *out_cap, size_t *out_len,
-                             const char *counter_expr);
-int hx_emit_payload_load_metal(char **out, size_t *out_cap, size_t *out_len);
-
-/* ---- per-opcode emit helpers (2a.2) ---- */
-
-/* Opcode emit signature: append source for a single opcode's effect.
- * Returns 0 on success, negative on emit error.
- *
- * For 2a.2, helpers emit minimum-viable scaffolding -- a comment
- * recording the opcode and operand plus a placeholder C declaration
- * sufficient for the JIT compiler to accept the file. Real semantics
- * arrive in 2a.3 (tp0 pattern for e347).
- */
-int hx_emit_push_var_opencl(char **out, size_t *cap, size_t *len,
-                            int slot, const char *varname);
-int hx_emit_push_str_opencl(char **out, size_t *cap, size_t *len,
-                            int stridx, const char *literal, int literal_len);
-int hx_emit_push_int_opencl(char **out, size_t *cap, size_t *len,
-                            int64_t ival);
-int hx_emit_store_opencl(char **out, size_t *cap, size_t *len,
-                         int slot, const char *varname);
-int hx_emit_call_opencl(char **out, size_t *cap, size_t *len,
-                        const char *fn_name, int nargs, uint8_t role);
-int hx_emit_concat_opencl(char **out, size_t *cap, size_t *len);
-int hx_emit_halt_opencl(char **out, size_t *cap, size_t *len);
-
-int hx_emit_push_var_metal(char **out, size_t *cap, size_t *len,
-                           int slot, const char *varname);
-int hx_emit_push_str_metal(char **out, size_t *cap, size_t *len,
-                           int stridx, const char *literal, int literal_len);
-int hx_emit_push_int_metal(char **out, size_t *cap, size_t *len,
-                           int64_t ival);
-int hx_emit_store_metal(char **out, size_t *cap, size_t *len,
-                        int slot, const char *varname);
-int hx_emit_call_metal(char **out, size_t *cap, size_t *len,
-                       const char *fn_name, int nargs, uint8_t role);
-int hx_emit_concat_metal(char **out, size_t *cap, size_t *len);
-int hx_emit_halt_metal(char **out, size_t *cap, size_t *len);
 
 /* ---- pattern-recognized fast paths (2a.3) ----
  *

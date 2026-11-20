@@ -32,6 +32,7 @@
  * and build through gpu_kernel_cache_build_program_ex. */
 #include "../codegen/hx_spec.h"
 #include "../codegen/hx_spec_entry.h"
+#include "../codegen/hx_gen.h"   /* the generic hx walker's dialect */
 #include "../codegen/hx_walker.h"
 /* Sub-phase 5a.5 (2026-05-22): family admit-predicate helper. Used by
  * gpu_opencl_kernelb_dispatch_proto early gate to accept the seven 5a
@@ -909,6 +910,21 @@ struct gpu_device {
      * project_bf_chunk_as_job.md Phase 3. */
 
     /* Per-device dispatch state (was global — races with multi-GPU) */
+    /* The compact table's shape as last uploaded to THIS device.  These were
+     * file globals shared by every device; the self-test swaps a private
+     * table into one device while the others keep running on the real one,
+     * so they have to live with the buffers they describe. */
+    uint64_t compact_mask;
+    uint32_t hash_data_count;
+    int overflow_count;
+    /* The real table while a self-test's private one is bound
+     * (gpu_opencl_selftest_begin/end). */
+    int st_on;
+    cl_mem st_fp, st_idx, st_data, st_off, st_len, st_shown;
+    size_t st_shown_count;
+    uint64_t st_mask;
+    uint32_t st_count;
+    int st_overflow;
     int gpu_op;
     int max_iter;
     uint64_t mask_resume;
@@ -986,6 +1002,13 @@ struct gpu_device {
         cl_program prog;
         cl_kernel  kern;
     } hx_codegen_slots[64];
+    /* Generic hx walker (stage 1a): one template program per walker type,
+     * its core generated from the type's hx program (codegen/hx_gen.c). */
+    struct hxg_slot {
+        int        op;         /* 0 = empty slot */
+        cl_program prog;
+        cl_kernel  kern;
+    } hxg_slots[64];
     /* Phase 4 sub-phase 4a.3 (2026-05-22): Gate 6 register-pressure probe
      * fields removed (kernelb_priv_mem, kernelb_max_wg, kernelb_pref_wg,
      * kernelb_unavailable). The probe + soft-gate fallback to
@@ -1351,9 +1374,6 @@ static uint32_t dynsize_compile_time_N(struct gpu_device *d, int dev_idx) {
 }
 
 /* Shared state (same across all devices) */
-static uint64_t _compact_mask = 0;
-static uint32_t _hash_data_count = 0;
-static int _overflow_count = 0;
 /* gpu_op, max_iter, mask_resume, salt_resume, last_mask_start are
  * per-device fields in struct gpu_device for multi-GPU safety */
 
@@ -3134,29 +3154,10 @@ int gpu_opencl_jit_compile_source(int dev_idx, const char *src,
     struct gpu_device *d = &gpu_devs[dev_idx];
     cl_int err = CL_SUCCESS;
     const char *sources[1] = { src };
-    cl_program prog = clCreateProgramWithSource(d->ctx, 1, sources,
-                                                NULL, &err);
-    if (!prog || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen clCreateProgramWithSource failed "
-            "on %s dev[%d] (err=%d)\n",
-            __FILE__, __LINE__, hostname, dev_idx, err);
-        exit(1);
-    }
-    err = clBuildProgram(prog, 1, &d->dev,
-                         build_opts ? build_opts : "-cl-std=CL1.2",
-                         NULL, NULL);
-    if (err != CL_SUCCESS) {
-        char log[8192] = {0};
-        clGetProgramBuildInfo(prog, d->dev, CL_PROGRAM_BUILD_LOG,
-                              sizeof(log) - 1, log, NULL);
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen clBuildProgram failed on %s dev[%d] "
-            "(err=%d):\n%s\n",
-            __FILE__, __LINE__, hostname, dev_idx, err, log);
-        clReleaseProgram(prog);
-        exit(1);
-    }
+    /* The shared builder makes any compiler failure fatal, with the
+     * "OpenCL compiler failure" message (gpu_kernel_cache.c). */
+    cl_program prog = gpu_kernel_cache_build_program(d->ctx, d->dev, 1, sources,
+                          build_opts ? build_opts : "-cl-std=CL1.2", &err);
     fprintf(stderr,
             "hx codegen: trivial-spec JIT succeeded on %s dev[%d]\n",
             hostname, dev_idx);
@@ -3206,37 +3207,10 @@ int gpu_opencl_jit_compile_source_with_common(int dev_idx, const char *src,
     struct gpu_device *d = &gpu_devs[dev_idx];
     cl_int err = CL_SUCCESS;
     const char *sources[2] = { gpu_common_str, src };
-    cl_program prog = clCreateProgramWithSource(d->ctx, 2, sources,
-                                                NULL, &err);
-    if (!prog || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen clCreateProgramWithSource(with_common) "
-            "failed on %s dev[%d] (err=%d)\n",
-            __FILE__, __LINE__, hostname, dev_idx, err);
-        exit(1);
-    }
-    err = clBuildProgram(prog, 1, &d->dev,
-                         build_opts ? build_opts : "-cl-std=CL1.2",
-                         NULL, NULL);
-    if (err != CL_SUCCESS) {
-        size_t log_size = 0;
-        clGetProgramBuildInfo(prog, d->dev, CL_PROGRAM_BUILD_LOG,
-                              0, NULL, &log_size);
-        char *log = (char *)malloc(log_size + 1);
-        if (log) {
-            clGetProgramBuildInfo(prog, d->dev, CL_PROGRAM_BUILD_LOG,
-                                  log_size, log, NULL);
-            log[log_size] = '\0';
-        }
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen clBuildProgram(with_common) failed "
-            "on %s dev[%d] (err=%d):\n%s\n",
-            __FILE__, __LINE__, hostname, dev_idx, err,
-            log ? log : "(no log)");
-        if (log) free(log);
-        clReleaseProgram(prog);
-        exit(1);
-    }
+    /* The shared builder makes any compiler failure fatal, with the
+     * "OpenCL compiler failure" message (gpu_kernel_cache.c). */
+    cl_program prog = gpu_kernel_cache_build_program(d->ctx, d->dev, 2, sources,
+                          build_opts ? build_opts : "-cl-std=CL1.2", &err);
     fprintf(stderr,
             "hx codegen: e347 tp0 JIT (with gpu_common_str) succeeded on "
             "%s dev[%d]\n",
@@ -3287,37 +3261,10 @@ int gpu_opencl_jit_compile_source_with_common_keep(
     struct gpu_device *d = &gpu_devs[dev_idx];
     cl_int err = CL_SUCCESS;
     const char *sources[2] = { gpu_common_str, src };
-    cl_program prog = clCreateProgramWithSource(d->ctx, 2, sources,
-                                                NULL, &err);
-    if (!prog || err != CL_SUCCESS) {
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen (keep) clCreateProgramWithSource "
-            "failed on %s dev[%d] (err=%d)\n",
-            __FILE__, __LINE__, hostname, dev_idx, err);
-        exit(1);
-    }
-    err = clBuildProgram(prog, 1, &d->dev,
-                         build_opts ? build_opts : "-cl-std=CL1.2",
-                         NULL, NULL);
-    if (err != CL_SUCCESS) {
-        size_t log_size = 0;
-        clGetProgramBuildInfo(prog, d->dev, CL_PROGRAM_BUILD_LOG,
-                              0, NULL, &log_size);
-        char *log = (char *)malloc(log_size + 1);
-        if (log) {
-            clGetProgramBuildInfo(prog, d->dev, CL_PROGRAM_BUILD_LOG,
-                                  log_size, log, NULL);
-            log[log_size] = '\0';
-        }
-        fprintf(stderr,
-            "FATAL: %s:%d hx codegen (keep) clBuildProgram failed on %s "
-            "dev[%d] (err=%d):\n%s\n",
-            __FILE__, __LINE__, hostname, dev_idx, err,
-            log ? log : "(no log)");
-        if (log) free(log);
-        clReleaseProgram(prog);
-        exit(1);
-    }
+    /* The shared builder makes any compiler failure fatal, with the
+     * "OpenCL compiler failure" message (gpu_kernel_cache.c). */
+    cl_program prog = gpu_kernel_cache_build_program(d->ctx, d->dev, 2, sources,
+                          build_opts ? build_opts : "-cl-std=CL1.2", &err);
 
     cl_kernel kern = clCreateKernel(prog, entry_point_name, &err);
     if (err != CL_SUCCESS || !kern) {
@@ -3441,12 +3388,12 @@ int gpu_opencl_e347_validate_dispatch(
      * exists (created during normal dispatch); else allocate a temp. */
     OCLParams params;
     memset(&params, 0, sizeof(params));
-    params.compact_mask     = _compact_mask;
+    params.compact_mask     = d->compact_mask;
     params.num_words        = num_words;
     params.num_salts        = num_salts;
     params.salt_start       = 0;
     params.max_probe        = 128;          /* harness probe depth */
-    params.hash_data_count  = (uint32_t)_hash_data_count;
+    params.hash_data_count  = (uint32_t)d->hash_data_count;
     params.max_hits         = (uint32_t)max_hits;
     params.overflow_count   = 0;
     params.max_iter         = 1;
@@ -3512,9 +3459,9 @@ int gpu_opencl_e347_validate_dispatch(
      * For the validation harness, the number of distinct plant slots ==
      * hash_data_count; allocate that many and zero them. */
     {
-        size_t hs_bytes = (size_t)_hash_data_count * sizeof(uint32_t);
+        size_t hs_bytes = (size_t)d->hash_data_count * sizeof(uint32_t);
         if (hs_bytes < 64) hs_bytes = 64;        /* MIN_BUFFER guard */
-        if (!d->b_hashes_shown || d->hashes_shown_count < _hash_data_count) {
+        if (!d->b_hashes_shown || d->hashes_shown_count < d->hash_data_count) {
             if (d->b_hashes_shown) clReleaseMemObject(d->b_hashes_shown);
             d->b_hashes_shown = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE,
                                                hs_bytes, NULL, &err);
@@ -3525,7 +3472,7 @@ int gpu_opencl_e347_validate_dispatch(
                     __FILE__, __LINE__, hs_bytes, hostname, dev_idx, err);
                 exit(1);
             }
-            d->hashes_shown_count = _hash_data_count;
+            d->hashes_shown_count = d->hash_data_count;
         }
         unsigned char *hz = (unsigned char *)calloc(1, hs_bytes);
         if (hz) {
@@ -3759,12 +3706,12 @@ int gpu_opencl_kernelb_family_validate_dispatch(
      * keep any driver-internal assertions on salt-table args happy). */
     OCLParams params;
     memset(&params, 0, sizeof(params));
-    params.compact_mask     = _compact_mask;
+    params.compact_mask     = d->compact_mask;
     params.num_words        = num_words;
     params.num_salts        = 1;
     params.salt_start       = 0;
     params.max_probe        = 128;
-    params.hash_data_count  = (uint32_t)_hash_data_count;
+    params.hash_data_count  = (uint32_t)d->hash_data_count;
     params.max_hits         = (uint32_t)max_hits;
     params.overflow_count   = 0;
     params.max_iter         = 1;
@@ -3819,9 +3766,9 @@ int gpu_opencl_kernelb_family_validate_dispatch(
         }
     }
     {
-        size_t hs_bytes = (size_t)_hash_data_count * sizeof(uint32_t);
+        size_t hs_bytes = (size_t)d->hash_data_count * sizeof(uint32_t);
         if (hs_bytes < 64) hs_bytes = 64;
-        if (!d->b_hashes_shown || d->hashes_shown_count < _hash_data_count) {
+        if (!d->b_hashes_shown || d->hashes_shown_count < d->hash_data_count) {
             if (d->b_hashes_shown) clReleaseMemObject(d->b_hashes_shown);
             d->b_hashes_shown = clCreateBuffer(d->ctx, CL_MEM_READ_WRITE,
                                                hs_bytes, NULL, &err);
@@ -3832,7 +3779,7 @@ int gpu_opencl_kernelb_family_validate_dispatch(
                     __FILE__, __LINE__, hs_bytes, hostname, dev_idx, err);
                 exit(1);
             }
-            d->hashes_shown_count = _hash_data_count;
+            d->hashes_shown_count = d->hash_data_count;
         }
         unsigned char *hz = (unsigned char *)calloc(1, hs_bytes);
         if (hz) {
@@ -4018,8 +3965,8 @@ int gpu_opencl_set_compact_table(int dev_idx,
         return -1;
     }
 
-    _compact_mask = compact_mask;
-    _hash_data_count = hash_data_count;
+    d->compact_mask = compact_mask;
+    d->hash_data_count = hash_data_count;
 
     /* Phase C: time the compact-table upload (CL_MEM_COPY_HOST_PTR is
      * implicit synchronous-ish copy, but timing the buffer-creates lets
@@ -4106,6 +4053,82 @@ alloc_fail:
     return -1;
 }
 
+/* GPU self-test: bind a private compact table to one device, run one dispatch
+ * against it, and put the real one back.  Nothing in the dispatch paths
+ * changes: they read the table, its shape and the dedup buffer from the
+ * device, and all three are swapped here.  b_hashes_shown is left NULL so
+ * the dispatch allocates and zeroes a fresh one -- the real one holds the
+ * run's dedup state and must not be touched.  The overflow buffers stay
+ * bound; overflow_count 0 means the kernel never reads them. */
+void gpu_opencl_selftest_begin(int dev_idx,
+    const uint32_t *cfp, const uint32_t *cidx, uint64_t csize, uint64_t cmask,
+    const unsigned char *hbuf, size_t hbuf_size,
+    const size_t *hoff, size_t count, const unsigned short *hlen)
+{
+    if (dev_idx < 0 || dev_idx >= num_gpu_devs)
+        GPU_FATAL("self-test begin: device %d out of range", dev_idx);
+    struct gpu_device *d = &gpu_devs[dev_idx];
+    if (d->st_on)
+        GPU_FATAL("self-test begin: GPU[%d] already holds a private table", dev_idx);
+    cl_int err = CL_SUCCESS;
+    uint64_t off64[256];
+    if (count == 0 || count > 256)
+        GPU_FATAL("self-test begin: GPU[%d] table of %zu entries", dev_idx, count);
+    for (size_t i = 0; i < count; i++) off64[i] = hoff[i];
+    d->st_fp = d->b_compact_fp;      d->st_idx = d->b_compact_idx;
+    d->st_data = d->b_hash_data;     d->st_off = d->b_hash_data_off;
+    d->st_len = d->b_hash_data_len;  d->st_shown = d->b_hashes_shown;
+    d->st_shown_count = d->hashes_shown_count;
+    d->st_mask = d->compact_mask;    d->st_count = d->hash_data_count;
+    d->st_overflow = d->overflow_count;
+    d->st_on = 1;
+    d->b_compact_fp = create_min_buf(d->ctx, d->queue, CL_MEM_READ_ONLY,
+                                     csize * sizeof(uint32_t), cfp, &err);
+    if (err == CL_SUCCESS)
+        d->b_compact_idx = create_min_buf(d->ctx, d->queue, CL_MEM_READ_ONLY,
+                                          csize * sizeof(uint32_t), cidx, &err);
+    if (err == CL_SUCCESS)
+        d->b_hash_data = create_min_buf(d->ctx, d->queue, CL_MEM_READ_ONLY,
+                                        hbuf_size, hbuf, &err);
+    if (err == CL_SUCCESS)
+        d->b_hash_data_off = create_min_buf(d->ctx, d->queue, CL_MEM_READ_ONLY,
+                                            count * sizeof(uint64_t), off64, &err);
+    if (err == CL_SUCCESS)
+        d->b_hash_data_len = create_min_buf(d->ctx, d->queue, CL_MEM_READ_ONLY,
+                                            count * sizeof(uint16_t), hlen, &err);
+    if (err != CL_SUCCESS)
+        GPU_FATAL("self-test begin: GPU[%d] private table upload failed (err=%d)",
+                  dev_idx, err);
+    d->b_hashes_shown = NULL;
+    d->hashes_shown_count = 0;
+    d->compact_mask = cmask;
+    d->hash_data_count = (uint32_t)count;
+    d->overflow_count = 0;
+}
+
+void gpu_opencl_selftest_end(int dev_idx)
+{
+    if (dev_idx < 0 || dev_idx >= num_gpu_devs || !gpu_devs[dev_idx].st_on)
+        GPU_FATAL("self-test end: GPU[%d] holds no private table", dev_idx);
+    struct gpu_device *d = &gpu_devs[dev_idx];
+    cl_int e = clFinish(d->queue);
+    if (e != CL_SUCCESS)
+        GPU_FATAL("self-test end: GPU[%d] clFinish err=%d", dev_idx, e);
+    clReleaseMemObject(d->b_compact_fp);
+    clReleaseMemObject(d->b_compact_idx);
+    clReleaseMemObject(d->b_hash_data);
+    clReleaseMemObject(d->b_hash_data_off);
+    clReleaseMemObject(d->b_hash_data_len);
+    if (d->b_hashes_shown) clReleaseMemObject(d->b_hashes_shown);
+    d->b_compact_fp = d->st_fp;      d->b_compact_idx = d->st_idx;
+    d->b_hash_data = d->st_data;     d->b_hash_data_off = d->st_off;
+    d->b_hash_data_len = d->st_len;  d->b_hashes_shown = d->st_shown;
+    d->hashes_shown_count = d->st_shown_count;
+    d->compact_mask = d->st_mask;    d->hash_data_count = d->st_count;
+    d->overflow_count = d->st_overflow;
+    d->st_on = 0;
+}
+
 int gpu_opencl_set_salts(int dev_idx,
     const char *salts, const uint32_t *salt_offsets,
     const uint16_t *salt_lens, int num_salts)
@@ -4188,7 +4211,7 @@ int gpu_opencl_set_overflow(int dev_idx,
             CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, MIN_BUFFER_BYTES,
             _ovfl_placeholder_zero, &err);
         free(_ovfl_placeholder_zero);
-        _overflow_count = 0;
+        d->overflow_count = 0;
         GPU_DEBUG_FPRINTF(stderr,
             "OpenCL GPU[%d]: overflow set to %dB zero-fill placeholder (count=0)\n",
             dev_idx, MIN_BUFFER_BYTES);
@@ -4227,7 +4250,7 @@ int gpu_opencl_set_overflow(int dev_idx,
                                            count * sizeof(uint32_t), (void*)offsets, &err);
     d->b_overflow_lengths = clCreateBuffer(d->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                             count * sizeof(uint16_t), (void*)lengths, &err);
-    _overflow_count = count;
+    d->overflow_count = count;
     clock_gettime(CLOCK_MONOTONIC, &_ov_t1);
     {
         double _ov_ms = (_ov_t1.tv_sec - _ov_t0.tv_sec) * 1e3
@@ -7533,7 +7556,68 @@ static int gpu_opencl_u32_rules_lazy(struct gpu_device *d, int dev_idx)
  *   JOB_SHA512  -> kern_template_phase0_sha512 (gpu_sha512_core.cl + gpu_template.cl) [B5]
  *   JOB_RMD160  -> kern_template_phase0_ripemd160 (gpu_ripemd160_core.cl + gpu_template.cl) [B5 sb2]
  *   JOB_RMD320  -> kern_template_phase0_ripemd320 (gpu_ripemd320_core.cl + gpu_template.cl) [B5 sb2] */
+/* The generic hx walker's template kernel for op on this device, built on
+ * first use: the OpenCL dialect, then the type's generated core, as the core
+ * source of an ordinary template program. The kernel cache keys on the
+ * source text, so a rebuilt program is cached like any other. */
+static cl_kernel gpu_hxg_kernel(struct gpu_device *d, int dev_idx, int op) {
+    const char *core = gpu_hx_generic_core(op), *dia = hx_gen_dialect(HXG_OPENCL);
+    const char *sources[6];
+    struct hxg_slot *sl = NULL;
+    char defines[64], lean[160], *src;
+    size_t a, b;
+    cl_uint nsrc;
+    cl_int err = CL_SUCCESS;
+    int i;
+    for (i = 0; i < 64; i++) {
+        if (d->hxg_slots[i].op == op) return d->hxg_slots[i].kern;
+        if (!sl && d->hxg_slots[i].op == 0) sl = &d->hxg_slots[i];
+    }
+    if (!core) GPU_FATAL("op %d is not a generic hx walker type", op);
+    if (!sl) GPU_FATAL("more than 64 generic hx walker types on device %d", dev_idx);
+    a = strlen(dia); b = strlen(core);
+    src = malloc(a + b + 1);
+    if (!src) GPU_FATAL("out of memory for the generic hx core of op %d", op);
+    memcpy(src, dia, a);
+    memcpy(src + a, core, b + 1);
+    nsrc = gpu_template_sources(sources, src);
+    /* The lean common file drops the Tiger, Snefru and GOST tables; a body
+     * that needs one asks for it back (GPU_COMMON_WANT_* in gpu_common.cl). */
+    {
+        static const char *want[][2] = {
+            { "HXB_TIGER", "#define GPU_COMMON_WANT_TIGER 1\n" },
+            { "HXB_SNE",   "#define GPU_COMMON_WANT_SNEFRU 1\n" },
+            { "HXB_GOST",  "#define GPU_COMMON_WANT_GOST 1\n" },
+        };
+        int w, any = 0;
+        lean[0] = 0;
+        for (w = 0; w < 3; w++)
+            if (strstr(core, want[w][0])) {
+                if (!any) snprintf(lean, sizeof lean, "#define GPU_COMMON_LEAN 1\n");
+                strncat(lean, want[w][1], sizeof lean - strlen(lean) - 1);
+                any = 1;
+            }
+        if (any) {
+            if (sources[0] != gpu_common_lean_str)
+                GPU_FATAL("gpu_template_sources no longer starts with the lean define (op %d)", op);
+            sources[0] = lean;
+        }
+    }
+    snprintf(defines, sizeof defines, "HXG_OP=%d", op);
+    sl->prog = gpu_kernel_cache_build_program_ex(d->ctx, d->dev, nsrc, sources,
+                                                 "-cl-std=CL1.2", defines, &err);
+    free(src);
+    sl->kern = clCreateKernel(sl->prog, "template_phase0", &err);
+    if (err != CL_SUCCESS || !sl->kern)
+        GPU_FATAL("clCreateKernel(template_phase0) failed for the generic hx core of "
+                  "op %d (err=%d) on device %d", op, err, dev_idx);
+    tpl_kernel_report(sl->kern, d->dev, dev_idx, "hx");
+    sl->op = op;
+    return sl->kern;
+}
+
 static cl_kernel gpu_template_resolve_kernel(struct gpu_device *d, int dev_idx, int op) {
+    if (gpu_hx_generic(op)) return gpu_hxg_kernel(d, dev_idx, op);
     switch (op) {
         case JOB_MD5:
         /* B7.7a (2026-05-07): JOB_MD5UC reuses the MD5 template kernel.
@@ -8847,13 +8931,13 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
         uint8_t *staging = (uint8_t *)d->h_dispatch_payload;
         OCLParams params;
         memset(&params, 0, sizeof(params));
-        params.compact_mask     = _compact_mask;
+        params.compact_mask     = d->compact_mask;
         params.num_words        = num_words;
         params.num_rules        = (uint32_t)K;   /* per-chunk; set per chunk below */
         params.max_probe        = 256;
-        params.hash_data_count  = _hash_data_count;
+        params.hash_data_count  = d->hash_data_count;
         params.max_hits         = GPU_PACKED_MAX_HITS;
-        params.overflow_count   = _overflow_count;
+        params.overflow_count   = d->overflow_count;
         /* Iter v1 (2026-05-31): see gpu_opencl_kernelb_dispatch_proto
          * (non-chunked path above) for rationale. */
         params.max_iter         = (d->max_iter < 1) ? 1u : (uint32_t)d->max_iter;
@@ -8904,7 +8988,7 @@ static uint32_t *gpu_opencl_kernelb_dispatch_proto_chunked(
      * Zeroed ONCE for the whole word-batch so a hash cracked in chunk c is
      * not re-emitted in chunk c' (matches single-dispatch dedup). */
     {
-        size_t _hs_need = (size_t)_hash_data_count + (size_t)_overflow_count;
+        size_t _hs_need = (size_t)d->hash_data_count + (size_t)d->overflow_count;
         if (_hs_need == 0) _hs_need = 1;
         size_t _hs_bytes = _hs_need * sizeof(uint32_t);
         if (_hs_bytes < MIN_BUFFER_BYTES) _hs_bytes = MIN_BUFFER_BYTES;
@@ -9787,13 +9871,13 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
         /* OCLParams at offset 0. */
         OCLParams params;
         memset(&params, 0, sizeof(params));
-        params.compact_mask     = _compact_mask;
+        params.compact_mask     = d->compact_mask;
         params.num_words        = num_words;
         params.num_rules        = n_rules;         /* sub-phase 1a.2 rename */
         params.max_probe        = 256;
-        params.hash_data_count  = _hash_data_count;
+        params.hash_data_count  = d->hash_data_count;
         params.max_hits         = GPU_PACKED_MAX_HITS;
-        params.overflow_count   = _overflow_count;
+        params.overflow_count   = d->overflow_count;
         /* Iter v1 (2026-05-31, project_codegen_iteration_v1_spec_-
          * 2026-05-31.md): thread the user's -i value from the device-
          * resident d->max_iter (set by gpu_opencl_set_max_iter from
@@ -10086,11 +10170,11 @@ uint32_t *gpu_opencl_kernelb_dispatch_proto(int dev_idx,
      * The EMIT_HIT_4_DEDUP_OR_OVERFLOW macro accesses hashes_shown[matched_idx]
      * when probe_compact_idx finds a match. Without this, passing NULL causes a
      * GPU crash (CL_OUT_OF_RESOURCES on the subsequent readback).
-     * Sized to _hash_data_count + _overflow_count, same discipline as
+     * Sized to d->hash_data_count + d->overflow_count, same discipline as
      * dispatch_md5_rules. Uses MIN_BUFFER_BYTES floor per
      * feedback_min_buffer_bytes_discipline.md. */
     {
-        size_t _hs_need = (size_t)_hash_data_count + (size_t)_overflow_count;
+        size_t _hs_need = (size_t)d->hash_data_count + (size_t)d->overflow_count;
         if (_hs_need == 0) _hs_need = 1;
         if (!d->b_hashes_shown || _hs_need > d->hashes_shown_count) {
             if (d->b_hashes_shown) clReleaseMemObject(d->b_hashes_shown);
@@ -10607,6 +10691,7 @@ const char *gpu_opencl_kernelb_proto_plaintext(
  */
 int gpu_opencl_op_supported(int op)
 {
+    if (gpu_hx_generic(op)) return 1;   /* the generic hx walker */
     if (op != JOB_MD5 && op != JOB_MD5UC && op != JOB_MD4 &&
         op != JOB_SHA1 && op != JOB_SHA224 && op != JOB_SHA256 &&
         op != JOB_SHA384 && op != JOB_SHA512 &&
@@ -11491,7 +11576,10 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
                            * the 5th sibling-site is load-bearing). Phase
                            * 6 of the slab-retirement ladder (final
                            * major slab kernel). */
-                          op == JOB_BCRYPT);
+                          op == JOB_BCRYPT ||
+                          /* a generic hx walker type with a salt or user:
+                           * the same salt-page geometry */
+                          gpu_hx_generic_channel(op) != 0);
 
     /* B6 salt-axis (2026-05-06; §13.4 row 27): derive salts_per_page +
      * n_pages for the outer salt-page loop. Initial cap of 1024 per
@@ -11607,7 +11695,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
         unsigned char *p = (unsigned char *)d->h_dispatch_payload;
         OCLParams *pparams = (OCLParams *)p;
         memset(pparams, 0, sizeof(*pparams));
-        pparams->compact_mask = _compact_mask;
+        pparams->compact_mask = d->compact_mask;
         pparams->num_words = num_words;
         pparams->num_masks = (uint32_t)d->gpu_n_rules;
         /* B7.1: num_salts repurposed as mask_size for the template path.
@@ -11867,9 +11955,9 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
         else if (op == JOB_BCRYPT)                pparams->algo_mode = 8u;
         else                                      pparams->algo_mode = 0u;
         pparams->max_probe = 256;
-        pparams->hash_data_count = _hash_data_count;
+        pparams->hash_data_count = d->hash_data_count;
         pparams->max_hits = b3_max_hits_cap;
-        pparams->overflow_count = _overflow_count;
+        pparams->overflow_count = d->overflow_count;
         /* Iteration count threaded through from the per-device max_iter
          * (set by gpu_opencl_set_max_iter at gpujob_init from Maxiter). */
         pparams->max_iter = d->max_iter < 1 ? 1 : d->max_iter;
@@ -12201,7 +12289,7 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
      * OpenCL 1.2 atomic_inc requires uint (32-bit). Hashcat's hashes_shown
      * is also u32 per slot; we follow the same convention. */
     {
-        size_t need_slots = (size_t)_hash_data_count + (size_t)_overflow_count;
+        size_t need_slots = (size_t)d->hash_data_count + (size_t)d->overflow_count;
         if (need_slots == 0) need_slots = 1;   /* avoid 0-byte buffer */
         if (!d->b_hashes_shown || need_slots > d->hashes_shown_count) {
             /* MDXFIND_PIN_TRACE=1 enables the per-device hashes_shown
@@ -12461,7 +12549,9 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
          * host_wiring_reflex.md sites 3+4 ALWAYS appear together for
          * salted templates. Phase 6 of the slab-retirement ladder (final
          * major slab kernel). */
-        kern != d->kern_template_phase0_bcrypt) {
+        kern != d->kern_template_phase0_bcrypt &&
+        /* a salted generic hx walker core carries the salted signature */
+        !gpu_hx_generic_channel(op)) {
         /* Build and kernel-create failures exit before this point, so a
          * salted pack reaching an unsalted kernel is a wiring defect (an
          * op mapped to the wrong arm, or a salted kernel missing from this
@@ -12630,7 +12720,10 @@ uint32_t *gpu_opencl_dispatch_md5_rules(int dev_idx,
          * allowlist above; per feedback_architect_host_wiring_reflex.md
          * sites 3+4 ALWAYS appear together for salted templates. Phase
          * 6 of the slab-retirement ladder (final major slab kernel). */
-        (kern == d->kern_template_phase0_bcrypt);
+        (kern == d->kern_template_phase0_bcrypt) ||
+        /* the generic hx walker: its kernel is per op, and a salted core is
+         * compiled with GPU_TEMPLATE_HAS_SALT (codegen/hx_gen.c) */
+        (gpu_hx_generic_channel(op) != 0);
     if (!d->b_template_mask_charsets) {
         /* B7.3+: sentinel widened to 16 rows (8 prepend + 8 append) ×
          * 256 bytes = 4096 bytes, matching the B7.5-capable layout. */

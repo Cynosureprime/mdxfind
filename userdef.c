@@ -1,8 +1,11 @@
 /*
  * userdef.c - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.12 $
+ * $Revision: 1.13 $
  * $Log: userdef.c,v $
+ * Revision 1.13  2026/11/20 05:22:13  dlr
+ * Generic hx walker stage 1c: user-defined types run on the GPU through the generated walker. A user type is served when it takes no salt or user, declares no stored form, and its result is the hex of its final digest; rounds past x01 re-run the whole program on the previous round's hex text, keeping its case, as the userdef CPU arm does. The selected user type's status line says whether it runs on the GPU, or why not, in place of the former not-yet-enabled line. Verified: the C mirror agrees for 529 of 529 cores, including 10 user cores whose later rounds are checked against the hx VM re-running the program, and a planted case defect is caught in exactly the 8 case-sensitive ones; the 519 catalog cores are byte-identical; on dev3 (M2 Max, Metal) and gp1 (Tahiti, OpenCL) 10 user types match -G none at x01 and x02 and deeper with rules, a -n mask and a mixed run with a catalog type, except one type whose kernel the Tahiti compiler crashes on, which is FATAL there as for any such kernel.
+ *
  * Revision 1.12  2026/10/20 12:12:01  dlr
  * Split an explicit-path entry point out of userdef_load. userdef_load_file takes the path outright and userdef_load keeps its MDXFIND_CACHE derivation by calling it, so mdxfind and hashpipe are unchanged. mdindex -C needs this: a search path for a file that decides what an index means is the wrong shape, and a second parser in mdindex would be a second behaviour over the same file format. The named argument distinguishes a file the operator asked for, where failing to open it returns -1 and the caller can refuse, from the derived path, where absence still means no user types and is not an error. Verified: mdxfind -z -m u47 and hashpipe both still load and compute from MDXFIND_CACHE userdef.txt after the split.
  *
@@ -503,20 +506,6 @@ static void dedup_advisory(const struct userdef_type *u)
 	free(ucn);
 }
 
-const char *userdef_gpu_status(int op)
-{
-	struct userdef_type *u = userdef_get(op);
-	hx_pattern_id pid;
-
-	if (!u || !u->prog) return NULL;
-
-	pid = hx_detect_pattern(u->prog);
-	if (pid == HX_PATTERN_UNKNOWN)
-		return "GPU not available for this expression shape; "
-		       "running on CPU.";
-	return "GPU-eligible shape, but GPU dispatch for user-defined types "
-	       "is not yet enabled; running on CPU.";
-}
 #endif /* USERDEF_HAVE_CODEGEN */
 
 /* finalize one accumulated stanza into the registry */

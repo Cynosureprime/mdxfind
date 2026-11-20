@@ -570,6 +570,49 @@ void gpujob_print_share_line(FILE *fp);
  * run straight into the silent wrap. */
 #define GPU_SALT_PACK_MAX 4294967286u   /* 2^32 - 10 */
 
+/* ---- GPU self-test (mdxfind.c) ----
+ *
+ * Before a device runs its first real batch of a type, it runs a handful of
+ * test words through the same dispatch against a private compact table that
+ * holds what the type's own CPU code computed for them at start-up.  Every
+ * one must come back.  A miss means the kernel this device built computes
+ * the wrong answer -- a silent miscompile -- and is FATAL, as a failed build
+ * is: the user bypasses that device for that type with -G. */
+#define SELFTEST_WORDS  7
+#define SELFTEST_EXP    64      /* expected stored forms per type */
+#define SELFTEST_DLEN   128     /* longest stored form covered */
+#define SELFTEST_SLOTS  256     /* private compact table slots */
+struct selftest_op {
+    int op;
+    uint32_t nwords, packed_pos;
+    uint32_t woff[SELFTEST_WORDS];
+    unsigned short wlen[SELFTEST_WORDS];
+    char packed[1024];
+    int nexp, dlen;
+    unsigned char exp[SELFTEST_EXP][SELFTEST_DLEN];
+    unsigned char expword[SELFTEST_EXP];    /* test word it came from */
+    unsigned char expiter[SELFTEST_EXP];    /* 1 = first captured for that word */
+    uint32_t cfp[SELFTEST_SLOTS], cidx[SELFTEST_SLOTS];
+    unsigned char hbuf[SELFTEST_EXP * SELFTEST_DLEN];
+    size_t hbuf_used, hoff[SELFTEST_EXP];
+    unsigned short hlen[SELFTEST_EXP];
+    int keykind, keylen, hashlen;           /* keykind: 0 none, 1 salt, 2 user */
+    char *key, *hashsalt;
+    uint32_t nbf;   /* brute force: mask indexes 0..nbf-1 over one empty word; 0 = words */
+};
+void selftest_oracle(const int *ops, int nops);
+void selftest_bf(void);
+struct selftest_op *selftest_due(int dev, int op, const struct jobg *g);
+void selftest_jobg(const struct selftest_op *st, struct jobg *t, const struct jobg *g);
+/* SHA256CRYPT / SHA512CRYPT / SHA512CRYPTMD5 hit claim, shared with the CPU's
+ * crypt_round (mdxfind.c).  line = setting + computed trailer.  0 = not a
+ * loaded line, or already printed; 1 = this caller prints it; 2 = as 1, and
+ * a setting it belonged to is now fully solved. */
+int  shacrypt_claim(int op, const char *line);
+int  selftest_check(const struct selftest_op *st, const uint32_t *hits, int nhits,
+                    int nhits_max, const char *backend, int dev, const char *devname);
+void selftest_skip(int op, int dev, const char *backend, const char *why);
+
 #ifdef __cplusplus
 }
 #endif

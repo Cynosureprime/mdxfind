@@ -1,4 +1,4 @@
-/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.12 2026/11/15 15:59:03 dlr Exp dlr $
+/* $Header: /Users/dlr/src/mdfind/gpu/RCS/gpu_kernel_cache.c,v 1.13 2026/11/18 13:53:51 dlr Exp dlr $
  *
  * Implementation. See gpu_kernel_cache.h for the design overview.
  */
@@ -929,7 +929,18 @@ static cl_program build_program_raw(
  * inside clBuildProgram, so control never returns here.  build_site (per
  * thread, since devices compile in parallel) records what is being built and
  * an atexit handler names it, so that case also leaves a file:line behind.
- * A compiler SIGSEGV is not caught; the shell reports it. */
+ *
+ * A vendor compiler can also CRASH inside clBuildProgram (fglrx 1573.4:
+ * SIGSEGV in aclCompile, SIGABRT under -cl-opt-disable; see
+ * bugs/AMD-fglrx-compiler-bugs.md).  Ruling 2026-11-18: any of these means
+ * the kernel cannot work on that GPU.  It is an "OpenCL compiler failure",
+ * fatal, carrying whatever the compiler said, and the user bypasses that GPU
+ * for that algorithm with -G.  The signal handler below turns a crash into
+ * that message.  It is installed once and stays installed; a signal raised
+ * while no build is in progress gets the previous disposition back and is
+ * re-delivered, so an ordinary crash still dumps core as before. */
+#define CC_FAIL_HINT \
+    "This GPU cannot run this kernel; bypass it for this algorithm with -G.\n"
 static __thread const char *build_site_file;
 static __thread int         build_site_line;
 static __thread const char *build_site_func;
@@ -944,13 +955,98 @@ static void build_site_atexit(void)
     get_str_info(build_site_dev, CL_DEVICE_NAME, dname, sizeof dname);
     fflush(stdout);
     fprintf(stderr,
-        "FATAL: %s:%d (%s): the OpenCL compiler for %s on %s ended the "
-        "process inside clBuildProgram; its own message, if any, is above.\n",
+        "FATAL: OpenCL compiler failure: %s:%d (%s): the OpenCL compiler for "
+        "%s on %s ended the process inside clBuildProgram; its own message, "
+        "if any, is above. " CC_FAIL_HINT,
         build_site_file, build_site_line, build_site_func, dname, host);
     fflush(stderr);
 }
 
-static void build_site_register(void) { atexit(build_site_atexit); }
+#ifndef _WIN32
+#include <signal.h>
+/* The message is formatted BEFORE the build, because a signal handler may
+ * not call stdio.  Per thread, since devices compile in parallel.  A crash
+ * on some other thread (one the compiler made itself) while any build is in
+ * progress gets the generic form. */
+static __thread volatile sig_atomic_t build_site_armed;
+static __thread char build_site_msg[1024];
+static volatile sig_atomic_t build_site_active;
+static const int build_site_sigs[4] = { SIGSEGV, SIGBUS, SIGILL, SIGABRT };
+static struct sigaction build_site_old[4];
+
+static void build_site_write(const char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0) {
+        ssize_t w = write(2, s, n);
+        if (w <= 0) return;
+        s += w; n -= (size_t)w;
+    }
+}
+
+static void build_site_signal(int sig)
+{
+    int i;
+    if (build_site_armed || build_site_active > 0) {
+        char num[8]; int k = 0, v = sig, d = 100;
+        for (; d > 0; d /= 10) if (v >= d || k || d == 1) num[k++] = (char)('0' + (v / d) % 10);
+        num[k] = 0;
+        build_site_write(build_site_armed ? build_site_msg
+            : "FATAL: OpenCL compiler failure: the OpenCL compiler crashed "
+              "while a kernel was being built");
+        build_site_write(" (signal ");
+        build_site_write(num);
+        build_site_write(") inside clBuildProgram; its own message, if any, "
+                         "is above. " CC_FAIL_HINT);
+        _exit(1);
+    }
+    for (i = 0; i < 4; i++)
+        if (build_site_sigs[i] == sig) sigaction(sig, &build_site_old[i], NULL);
+    raise(sig);   /* pending until return; a fault re-faults under the old disposition */
+}
+
+static void build_site_arm(void)
+{
+    char host[256], dname[256];
+    mdx_gethostname(host, sizeof host);
+    get_str_info(build_site_dev, CL_DEVICE_NAME, dname, sizeof dname);
+    snprintf(build_site_msg, sizeof build_site_msg,
+        "FATAL: OpenCL compiler failure: %s:%d (%s): the OpenCL compiler for "
+        "%s on %s crashed",
+        build_site_file, build_site_line, build_site_func, dname, host);
+    __sync_fetch_and_add(&build_site_active, 1);
+    build_site_armed = 1;
+}
+
+static void build_site_disarm(void)
+{
+    build_site_armed = 0;
+    __sync_fetch_and_sub(&build_site_active, 1);
+}
+#else
+static void build_site_arm(void) {}
+static void build_site_disarm(void) {}
+#endif
+
+static void build_site_register(void)
+{
+    atexit(build_site_atexit);
+#ifndef _WIN32
+    {
+        struct sigaction sa;
+        int i;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = build_site_signal;
+        sigemptyset(&sa.sa_mask);
+        for (i = 0; i < 4; i++)
+            if (sigaction(build_site_sigs[i], &sa, &build_site_old[i]) != 0) {
+                fprintf(stderr, "FATAL: %s:%d sigaction(%d) failed: %s\n",
+                        __FILE__, __LINE__, build_site_sigs[i], strerror(errno));
+                exit(1);
+            }
+    }
+#endif
+}
 
 cl_program gpu_kernel_cache_build_program_at(
     cl_context ctx, cl_device_id dev,
@@ -966,8 +1062,10 @@ cl_program gpu_kernel_cache_build_program_at(
     pthread_once(&build_site_once, build_site_register);
     build_site_file = file; build_site_line = line;
     build_site_func = func; build_site_dev  = dev;
+    build_site_arm();
     prog = build_program_raw(ctx, dev, n_sources, sources, build_opts,
                              defines_str, &err);
+    build_site_disarm();
     build_site_file = NULL;
     if (prog && err == CL_SUCCESS) {
         if (err_out) *err_out = CL_SUCCESS;
@@ -991,8 +1089,9 @@ cl_program gpu_kernel_cache_build_program_at(
         }
         fflush(stdout);
         fprintf(stderr,
-            "FATAL: %s:%d (%s): OpenCL kernel build failed on %s, host %s: "
-            "%s err=%d, defines \"%s\", options \"%s\". Build log:\n%s\n",
+            "FATAL: OpenCL compiler failure: %s:%d (%s): OpenCL kernel build "
+            "failed on %s, host %s: %s err=%d, defines \"%s\", options \"%s\". "
+            "Build log:\n%s\n" CC_FAIL_HINT,
             file, line, func, dname, host,
             prog ? "clBuildProgram" : "clCreateProgramWithSource", (int)err,
             defines_str ? defines_str : "", build_opts ? build_opts : "",

@@ -17,8 +17,14 @@
  * tiger, wrl, sne128, sne256 outers) ship in Phase 5b once their block
  * primitives land in gpu_common.cl.
  *
- * $Revision: 1.3 $
+ * $Revision: 1.5 $
  * $Log: gpu_codegen_eligible.h,v $
+ * Revision 1.5  2026/11/20 02:52:14  dlr
+ * Generic hx walker stage 2 on both GPU backends: salted, user-keyed, HMAC and peppered walker types. A walker type with a channel is a salted op everywhere the host lists salted kernels, takes its salt snapshot from Typesalt or, for a user op, TYPEUSER or the -u pool, never uses the precomputed md5(salt), and replays each hit to cpu_confirm_enqueue with the raw salt. The worker sizes its snapshot for each selected op key set: more than 1024 users from -u overran saltsnap and crashed the worker, the hand-built e1063 included. A pepper op packs one entry per salt and pepper, salt . pepper . the pepper length in 2 bytes, with pack_map naming the snapshot salt, and the pack arrays are sized for the pairs. The templates clamp max_iter to 1 under HX_NO_ITERATE; without the define they preprocess identically. Verified on gp1 (Tahiti, OpenCL) and dev3 (M2 Max, Metal) against -G none: all new types SAME at x01 and x02 and deeper, rules and mask, -F and -s or -u, 2911 salts or users over several pages, 2911 salts by 3 peppers at 161270 hits, built-in, -j and -M -P peppers, and a 300-byte embedded pepper.
+ *
+ * Revision 1.4  2026/11/18 04:08:00  dlr
+ * Generic hx walker stage 1a. OpenCL builds each walker type template program from the hx_gen dialect plus that type generated core, in per-device slots, cached on the source text; a build or slot overflow is FATAL. Both hit replays send walker hits to cpu_confirm_enqueue for the CPU to confirm. The template kernels compare from round 2 only under HX_X01_SILENT. Walker defaults for category and hash words; gpu_hx_generic declarations.
+ *
  * Revision 1.3  2026/05/28 14:32:26  dlr
  * Phase 1b Batch 1: add gpu_codegen_unsalted_eligible admit predicate SEPARATE from the family predicate not overloaded; table-driven via hx_primitive_for_unsalted_job plus hx_primitive_is_supported_5a; Batch-1 set e1 MD5 e3 MD4 e33 MD5RAW e34 SHA1RAW e36 SHA256RAW; COVERAGE-GAP CAVEAT a 1 here means the no-rule no-mask iter==1 compute is codegen-correct but does NOT authorize removing the op from the legacy rules-engine path which GPU-accelerates rules masks iter; cutover BLOCKED pending architect resolution; consumed only behind MDXFIND_HX_CODEGEN_UNSALTED env-flag gate not the default chokepoint admit
  *
@@ -82,6 +88,33 @@ int gpu_codegen_kernelb_family_md5pass_eligible(int op);
  * MDXFIND_HX_CODEGEN_UNSALTED env-flag gate (validation), not the default
  * chokepoint admit. See Phase 1b Batch 1 handoff in mdx-team-state.md. */
 int gpu_codegen_unsalted_eligible(int op);
+
+/* Generic hx walker (stage 1a, mdxmain.c): 1 iff `op` is served in THIS run
+ * by a template core generated from its hx program (codegen/hx_gen.c) --
+ * a drift-checked catalog type, no hand-built kernel, and for a type that
+ * reports nothing at x01 only when -i is 2 or more. Decided once at load
+ * time; safe with any int from any thread. One term `|| gpu_hx_generic(op)`
+ * per host site, never a per-type edit. */
+int gpu_hx_generic(int op);
+
+/* mdxfind.c: the pepper list op hashes with, and where its pepper comes
+ * from (0 none, 1 that list, 2 the salt after a space, 3 after a colon).
+ * A walker op with a pepper packs salt . pepper . plen (2 bytes LE). */
+const char *type_pepper_list(int op);
+int type_pepper_mode(int op);
+
+/* The generated core text for a gpu_hx_generic op (backend-independent;
+ * hx_gen_dialect() supplies the backend's macros), or NULL. */
+const char *gpu_hx_generic_core(int op);
+
+/* Its stored-form words (HASH_WORDS), 0 when not a walker op. */
+int gpu_hx_generic_words(int op);
+
+/* Its one variable channel besides the password (stage 2): 0 none, 1 salt
+ * (Typesalt), 2 user (Typeuser, else the -u pool), and 0 when not a walker
+ * op. A non-zero channel is a salted template program: the salt axis, the
+ * salt snapshot and the salted hit replay, as for the hand salted types. */
+int gpu_hx_generic_channel(int op);
 
 #ifdef __cplusplus
 }

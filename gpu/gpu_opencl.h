@@ -178,6 +178,14 @@ int gpu_opencl_set_compact_table(int dev_idx,
     size_t *hash_data_off, size_t hash_data_count,
     unsigned short *hash_data_len);
 
+/* GPU self-test: swap a private compact table (and a fresh dedup buffer)
+ * into one device for one dispatch, then restore the real one. */
+void gpu_opencl_selftest_begin(int dev_idx,
+    const uint32_t *cfp, const uint32_t *cidx, uint64_t csize, uint64_t cmask,
+    const unsigned char *hbuf, size_t hbuf_size,
+    const size_t *hoff, size_t count, const unsigned short *hlen);
+void gpu_opencl_selftest_end(int dev_idx);
+
 int gpu_opencl_set_salts(int dev_idx,
     const char *salts, const uint32_t *salt_offsets,
     const uint16_t *salt_lens, int num_salts);

@@ -122,6 +122,11 @@ extern int checkhashkey(union HashU *curin, int len, char *key, struct job *job)
 extern int checkhashkeylen(union HashU *curin, int len, char *key,
     int keylen, struct job *job);
 extern int checkhashsalt(union HashU *curin, int len, char *salt, int saltlen, int x, struct job *job);
+/* mdxfind.c: hand one GPU hit to the type's own CPU code (the generic hx
+ * walker's replay). */
+extern void cpu_confirm_enqueue(int op, const char *plain, int plen, int ruleindex,
+                                const unsigned char *key, int keylen, int keykind,
+                                const unsigned char *digest, int dlen, int iter);
 extern int build_salt_snapshot(void *snap, char *pool,
                 void *judy, char *keybuf, int printall);
 extern int *Typesaltcnt;
@@ -286,8 +291,78 @@ static void *gpu_salt_judy(int op) {
     case JOB_SHA1PASSUSERPASSUSER:
         return (Typeuser && Typeuser[op]) ? Typeuser[op] : (void *)UseridJudy;
     default:
+        /* A generic hx walker type with a user channel takes its users as
+         * the CPU's user arms do: TYPEUSER, else the -u pool. */
+        if (gpu_hx_generic_channel(op) == 2)
+            return (Typeuser && Typeuser[op]) ? Typeuser[op] : (void *)UseridJudy;
         return Typesalt ? Typesalt[op] : NULL;
     }
+}
+
+/* A walker op with a pepper packs one entry per salt and pepper, each 2
+ * bytes longer (gpu_pack_pepper): size the pack arrays for it. */
+static void gpu_pepper_bounds(int *cnt, int *bytes)
+{
+    Word_t op = 0;
+    int rc;
+    J1F(rc, Dohash, op);
+    while (rc) {
+        int pm = (op < JOB_DONE && gpu_hx_generic((int)op)) ? type_pepper_mode((int)op) : 0;
+        if (pm) {
+            long long n = 1, pb = 0, c, b;
+            if (pm == 1) {
+                const char *pp = type_pepper_list((int)op);
+                n = 0;
+                while ((unsigned char)*pp != 0xff) {
+                    int pl = (signed char)*pp++;
+                    if (pl <= 0) continue;
+                    n++; pb += pl; pp += pl;
+                }
+            }
+            c = (long long)Typesaltcnt[op] * n;
+            b = (long long)Typesaltbytes[op] * n + (long long)Typesaltcnt[op] * (2 * n + pb);
+            if (c > 0x7fffffffLL || b > 0x7fffffffLL) {
+                fprintf(stderr, "FATAL %s:%d: %lld salt and pepper pairs (%lld bytes) for e%d "
+                        "exceed the GPU snapshot\n", __FILE__, __LINE__, c, b, (int)op);
+                exit(1);
+            }
+            if (c > *cnt) *cnt = (int)c;
+            if (b > *bytes) *bytes = (int)b;
+        }
+        J1N(rc, Dohash, op);
+    }
+}
+
+/* A user-keyed op snapshots its user Judy (gpu_salt_judy), and -u fills that
+ * without counting into Typesaltcnt / Typesaltbytes: size the worker's salt
+ * snapshot for every selected op's actual key set. Before this, more than
+ * 1024 users overran saltsnap and the worker crashed (measured: e1063 on
+ * dev3 with 2,911 users, 1.682 as well). */
+static void gpu_user_snapshot_bounds(int *cnt, int *bytes)
+{
+    Word_t op = 0;
+    int rc;
+    char *k = (char *)malloc(MAXLINE + 1);
+    if (!k) { fprintf(stderr, "FATAL %s:%d: out of memory\n", __FILE__, __LINE__); exit(1); }
+    J1F(rc, Dohash, op);
+    while (rc) {
+        void *j = (op < JOB_DONE) ? gpu_salt_judy((int)op) : NULL;
+        if (j && j != (Typesalt ? Typesalt[op] : NULL)) {
+            Word_t *pv;
+            int n = 0, b = 0;
+            k[0] = 0;
+            JSLF(pv, (Pvoid_t)j, (unsigned char *)k);
+            while (pv) {
+                n++;
+                b += (int)strlen(k) + 1;    /* a decoded key is never longer */
+                JSLN(pv, (Pvoid_t)j, (unsigned char *)k);
+            }
+            if (n > *cnt) *cnt = n;
+            if (b > *bytes) *bytes = b;
+        }
+        J1N(rc, Dohash, op);
+    }
+    free(k);
 }
 
 /* Decode phpass iteration count from salt[3] */
@@ -682,6 +757,66 @@ static void bf_encode_23(const unsigned char *raw, char *out) {
 #define GPU_MAX_RETURN 32768
 #define OUTBUFSIZE (1024 * 1024)
 
+/* A walker op with a pepper (type_pepper_mode): one packed entry per salt
+ * and pepper, salt . pepper . pepper length (2 bytes LE), which the
+ * generated core splits. pack_map still names the snapshot salt, so a hit
+ * replays with the raw salt and the CPU arm confirms it over its own peppers. */
+static int gpu_pack_one(char *salts_packed, uint32_t *soff, uint16_t *slen,
+                        int *pack_map, int packed, uint32_t *gsp, int i,
+                        const char *s, int sl, const char *p, int pl)
+{
+    int tl = sl + pl + 2;
+    if ((uint64_t)*gsp + (uint64_t)tl > (uint64_t)GPU_SALT_PACK_MAX || tl > 65535) {
+        fprintf(stderr, "FATAL: %s:%d gpu_pack_one: packed salt and pepper of %d bytes "
+                "at offset %u exceed GPU_SALT_PACK_MAX (%u) or the 16-bit length\n",
+                __FILE__, __LINE__, tl, (unsigned)*gsp, (unsigned)GPU_SALT_PACK_MAX);
+        exit(1);
+    }
+    soff[packed] = *gsp;
+    slen[packed] = (uint16_t)tl;
+    pack_map[packed] = i;
+    memcpy(salts_packed + *gsp, s, sl);
+    memcpy(salts_packed + *gsp + sl, p, pl);
+    salts_packed[*gsp + sl + pl] = (char)(pl & 255);
+    salts_packed[*gsp + sl + pl + 1] = (char)(pl >> 8);
+    *gsp += tl;
+    return packed + 1;
+}
+
+static int gpu_pack_pepper(struct saltentry *saltsnap, int nsalts,
+                           char *salts_packed, uint32_t *soff, uint16_t *slen,
+                           int *pack_map, int op, int pm)
+{
+    int packed = 0;
+    uint32_t gsp = 0;
+    const char *list = pm == 1 ? type_pepper_list(op) : NULL;
+    for (int i = 0; i < nsalts; i++) {
+        const char *s = saltsnap[i].salt;
+        int sl = saltsnap[i].saltlen;
+        if (!Printall && *saltsnap[i].PV == 0) continue;
+        if (pm == 1) {
+            /* the CPU arms' walk: a 0 length is skipped, 0xff ends it */
+            const char *pp = list;
+            while ((unsigned char)*pp != 0xff) {
+                int pl = (signed char)*pp++;
+                if (pl <= 0) continue;
+                packed = gpu_pack_one(salts_packed, soff, slen, pack_map, packed, &gsp,
+                                      i, s, sl, pp, pl);
+                pp += pl;
+            }
+        } else {
+            /* the pepper is the salt after its first space (2) or colon (3);
+             * the colon form needs one, as its CPU arm does */
+            const char *sep = memchr(s, pm == 2 ? ' ' : ':', sl);
+            int kl = sep ? (int)(sep - s) : sl;
+            if (!sep && pm == 3) continue;
+            packed = gpu_pack_one(salts_packed, soff, slen, pack_map, packed, &gsp,
+                                  i, s, kl, sep ? sep + 1 : s + sl, sep ? sl - kl - 1 : 0);
+        }
+    }
+    return packed;
+}
+
 /* gpu_pack_salts_op: caller-supplies the op so type-specific filters can
  * be applied (e.g., DESCRYPT skips saltlen != 2 to fall extended-DES
  * `_CCCCSSSS` 9-char salts back to CPU via bsd_crypt_des). For callers
@@ -691,6 +826,9 @@ static int gpu_pack_salts_op(struct saltentry *saltsnap, int nsalts,
                              char *salts_packed, uint32_t *soff, uint16_t *slen,
                              int *pack_map, int use_hashsalt, int op) {
     int packed = 0;
+    int pm = (op > 0 && gpu_hx_generic(op)) ? type_pepper_mode(op) : 0;
+    if (pm)
+        return gpu_pack_pepper(saltsnap, nsalts, salts_packed, soff, slen, pack_map, op, pm);
     uint32_t gsp = 0;
     for (int i = 0; i < nsalts; i++) {
         if (!Printall && *saltsnap[i].PV == 0) continue;
@@ -829,6 +967,22 @@ void gpujob_overflow_preload_all(void) {
     gpu_overflow_preloaded = 1;
 }
 
+/* GPU self-test: the one salt or user its expectations were computed with,
+ * as a snapshot.  pv is the worker's own nonzero counter: the real salt's may
+ * already be 0, and gpu_pack_salts_op skips a found salt. */
+static int st_snapshot(const struct selftest_op *st, struct saltentry *snap,
+                       unsigned long *pv)
+{
+    if (!st->keykind) return 0;
+    snap[0].salt = st->key;
+    snap[0].saltlen = st->keylen;
+    snap[0].PV = pv;
+    snap[0].hashsalt = st->hashsalt;
+    snap[0].hashlen = st->hashlen;
+    snap[0].iter = 0;
+    return 1;
+}
+
 void gpujob(void *arg) {
     int my_slot = (int)(intptr_t)arg;
     union HashU curin;
@@ -865,6 +1019,19 @@ void gpujob(void *arg) {
     int _salts_at_last_refresh       = 0;
     int _salts_retired_since_refresh = 0;
     int my_overflow_loaded = 0;
+    /* GPU self-test (gpujob.h): st_cur is set while the test batch st_slot
+     * stands in for the real batch st_real. */
+    struct jobg *st_slot = (struct jobg *)calloc(1, sizeof(struct jobg));
+    struct jobg *st_real = NULL;
+    const struct selftest_op *st_cur = NULL;
+    int st_dispatched = 0;
+    unsigned long st_pv = 1;
+    uint64_t st_tel[8];
+    if (!st_slot) {
+        fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test slot\n",
+                __FILE__, __LINE__);
+        exit(1);
+    }
 
     while (1) {
         possess(GPUWorkWaiting);
@@ -922,6 +1089,32 @@ void gpujob(void *arg) {
             }
         }
 
+        /* First batch of this type on this device: run the self-test through
+         * this same body first.  The real batch waits in st_real; return_jobg
+         * puts it back and comes here again. */
+st_resume:
+        if (!st_cur) {
+            const struct selftest_op *st = selftest_due(my_slot, g->op, g);
+            if (st) {
+                st_cur = st;
+                st_real = g;
+                st_dispatched = 0;
+                selftest_jobg(st, st_slot, g);
+                g = st_slot;
+                gpu_opencl_selftest_begin(my_slot, st->cfp, st->cidx,
+                    SELFTEST_SLOTS, SELFTEST_SLOTS - 1,
+                    st->hbuf, st->hbuf_used, st->hoff, (size_t)st->nexp, st->hlen);
+                current_op = -1;        /* upload the test's salt */
+                nsalts_packed = 0;
+                if (my_slot < MAX_GPU_SLOTS) {
+                    st_tel[0] = _gpu_words[my_slot];   st_tel[1] = _gpu_rules_hashes[my_slot];
+                    st_tel[2] = _gpu_hits[my_slot];    st_tel[3] = _gpu_batches[my_slot];
+                    st_tel[4] = _gpu_busy_us[my_slot]; st_tel[5] = _gpu_first_us[my_slot];
+                    st_tel[6] = _gpu_last_us[my_slot]; st_tel[7] = _gpu_h2d_bytes[my_slot];
+                }
+            }
+        }
+
         int op_cat = gpu_op_category(g->op);
 
         /* B6 salt-axis (2026-05-06; §11 row 20): widen the salt-snapshot
@@ -956,11 +1149,16 @@ void gpujob(void *arg) {
                 }
                 batch_count = 0;
                 tsalt[0] = 0;
+                /* A generic hx walker core hashes md5(salt) itself, from the
+                 * raw salt: never hand it the precomputed one. */
                 { int use_hs = (g->op == JOB_MD5_MD5SALTMD5PASS ||
                                 g->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
                                 g->op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
-                                g->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS);
-                  if (use_hs && Typehashsalt[g->op])
+                                g->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) &&
+                               !gpu_hx_generic(g->op);
+                  if (st_cur)
+                    nsalts = st_snapshot(st_cur, saltsnap, &st_pv);
+                  else if (use_hs && Typehashsalt[g->op])
                     nsalts = build_hashsalt_snapshot(saltsnap, saltpool,
                                     Typehashsalt[g->op], tsalt, Printall);
                   else
@@ -971,7 +1169,8 @@ void gpujob(void *arg) {
                     int use_hs = (g->op == JOB_MD5_MD5SALTMD5PASS ||
                                   g->op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
                                   g->op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
-                                  g->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS);
+                                  g->op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) &&
+                                 !gpu_hx_generic(g->op);
                     /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5):
                      * pass g->op so gpu_pack_salts_op can apply the
                      * saltlen != 2 filter for JOB_DESCRYPT (extended-DES
@@ -985,7 +1184,7 @@ void gpujob(void *arg) {
                     nsalts_packed = 0;
                 if (nsalts_packed > 0)
                     gpu_opencl_set_salts(my_slot, salts_packed, soff, slen, nsalts_packed);
-                else
+                else if (!st_cur)
                     Typedone[g->op] = 1;
                 /* Phase 2g: reset retirement counter at refresh boundary;
                  * bookmark just-uploaded snapshot size for next cycle's 5% test. */
@@ -1008,7 +1207,8 @@ void gpujob(void *arg) {
         if (needs_salt_snapshot && nsalts_packed == 0) {
             /* Stale nsalts_packed — force a fresh rebuild before giving up.
              * Words in this batch were packed when salts were still active. */
-            int nsalts = build_salt_snapshot(saltsnap, saltpool,
+            int nsalts = st_cur ? st_snapshot(st_cur, saltsnap, &st_pv)
+                       : build_salt_snapshot(saltsnap, saltpool,
                             gpu_salt_judy(g->op), tsalt, Printall);
             if (nsalts > 0) {
                 /* DESCRYPT carrier (2026-05-08, Unix-crypt Phase 5):
@@ -1189,7 +1389,9 @@ void gpujob(void *arg) {
                         if (g->op != current_op || nsalts_packed == 0) {
                             current_op = g->op;
                             tsalt[0] = 0;
-                            int _pnsalts = build_salt_snapshot(saltsnap, saltpool,
+                            int _pnsalts = st_cur
+                                ? st_snapshot(st_cur, saltsnap, &st_pv)
+                                : build_salt_snapshot(saltsnap, saltpool,
                                             gpu_salt_judy(g->op), tsalt, Printall);
                             if (_pnsalts > 0) {
                                 nsalts_packed = gpu_pack_salts_op(saltsnap, _pnsalts,
@@ -1468,6 +1670,14 @@ void gpujob(void *arg) {
                     (unsigned long long)(gpu_rule_count > 1 ? gpu_rule_count - 1 : 0));
 
                 } /* !_proto_fired */
+
+                /* The self-test reads the raw hits and never replays them. */
+                if (st_cur) {
+                    st_dispatched = 1;
+                    selftest_check(st_cur, hits, nhits, GPU_PACKED_MAX_HITS, "OpenCL",
+                                   my_slot, gpu_opencl_device_name(my_slot));
+                    goto return_jobg;
+                }
 
                 if (hits && nhits > 0) {
                     /* Phase 4 proto (2026-05-19): two-kernel pipeline hit replay.
@@ -2301,7 +2511,9 @@ void gpujob(void *arg) {
                           * category default fall-through (NOT in this
                           * is_salted_op chain). Phase 6 of the slab-
                           * retirement ladder (final major slab kernel). */
-                         g->op == JOB_BCRYPT);
+                         g->op == JOB_BCRYPT ||
+                         /* a generic hx walker type with a salt or user */
+                         gpu_hx_generic_channel(g->op) != 0);
                     uint32_t nsalts_for_decode =
                         is_salted_op ? (uint32_t)nsalts_packed : 1u;
                     if (nsalts_for_decode == 0u) nsalts_for_decode = 1u;
@@ -3180,45 +3392,26 @@ void gpujob(void *arg) {
                              * replay_vars.md (rules-engine context, NOT slab
                              * `sidx`). Phase 2 of the Unix-crypt ladder. */
                             } else if (g->op == JOB_SHA256CRYPT) {
+                                /* Typesalt[JOB_SHA256CRYPT] holds the SETTING
+                                 * "$5$[rounds=N$]<salt>$", one entry per
+                                 * distinct setting, so the device hashed it
+                                 * once for every line that carries it.  The
+                                 * compact-table probe said only that the
+                                 * digest is SOME loaded line's: the setting +
+                                 * trailer is looked up and claimed in JudyJ
+                                 * by shacrypt_claim (mdxfind.c), the same call
+                                 * crypt_round makes, which also retires the
+                                 * setting exactly once per line.  The line
+                                 * buffer holds the loader's 254-byte cap. */
                                 hit = 0;
-                                if (salt_snap_entry) {
-                                    int match_len; unsigned short *match_flags;
-                                    int hf = hybrid_check(curin.h, 32,
-                                                          &match_len, &match_flags);
-                                    if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
-                                        *match_flags = g->op;
-                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
-                                        char *sp = salt_snap_entry->salt;
-                                        int splen = salt_snap_entry->saltlen;
-                                        /* Typesalt[JOB_SHA256CRYPT] holds the
-                                         * FULL hash line "$5$[rounds=N$]<salt>$
-                                         * <43-b64>" (loader at mdxfind.c:47013-
-                                         * 47041 inserts the line verbatim with
-                                         * no b64-tail strip; sibling consumers
-                                         * in crypt_round at mdxfind.c:12217-
-                                         * 12290 rely on the b64 tail for early-
-                                         * out comparisons, so the schema must
-                                         * not change).  Derive the salt-prefix
-                                         * length by scanning back to the last
-                                         * '$':  the b64 alphabet phpitoa64
-                                         * (./0-9A-Za-z, mdxfind.c:2811) excludes
-                                         * '$', so the final '$' reliably
-                                         * terminates "$5$[rounds=N$]<salt>$".
-                                         * Without this scan we'd write the b64
-                                         * AFTER the existing tail, producing
-                                         * "<full-line><freshly-computed-b64>:
-                                         * <password>" instead of the expected
-                                         * "<full-line>:<password>".
-                                         * Output buffer: salt prefix (up to
-                                         * ~30 bytes incl rounds=N$) + 43-char
-                                         * b64 + NUL.  128 is comfortably
-                                         * oversized. */
-                                        char mdbuf[128];
-                                        int prefix_len = splen;
-                                        while (prefix_len > 0 && sp[prefix_len - 1] != '$')
-                                            prefix_len--;
-                                        memcpy(mdbuf, sp, prefix_len);
-                                        sha256crypt_b64encode(curin.h, mdbuf + prefix_len);
+                                if (salt_snap_entry && salt_snap_entry->saltlen + 44 <= 256) {
+                                    char mdbuf[256];
+                                    int c;
+                                    memcpy(mdbuf, salt_snap_entry->salt, salt_snap_entry->saltlen);
+                                    sha256crypt_b64encode(curin.h, mdbuf + salt_snap_entry->saltlen);
+                                    c = shacrypt_claim(g->op, mdbuf);
+                                    if (c) {
+                                        if (c == 2) _salts_retired_since_refresh++;
                                         prfound(&synthetic_job, mdbuf);
                                     }
                                 }
@@ -3277,34 +3470,21 @@ void gpujob(void *arg) {
                              * Unix-crypt ladder (final phase). */
                             } else if (g->op == JOB_SHA512CRYPT ||
                                        g->op == JOB_SHA512CRYPTMD5) {
+                                /* As JOB_SHA256CRYPT above: Typesalt[op]
+                                 * holds the setting "$6$[rounds=N$]<salt>$";
+                                 * shacrypt_claim finds and claims the line in
+                                 * the JudyJ[JOB_SHA512CRYPT] both types share,
+                                 * so a line solved as either is printed once
+                                 * and retired from both. */
                                 hit = 0;
-                                if (salt_snap_entry) {
-                                    int match_len; unsigned short *match_flags;
-                                    int hf = hybrid_check(curin.h, 64,
-                                                          &match_len, &match_flags);
-                                    if (hf && (Contfound || MF_TAKE(match_flags, g->op))) {
-                                        *match_flags = g->op;
-                                        if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
-                                        char *sp = salt_snap_entry->salt;
-                                        int splen = salt_snap_entry->saltlen;
-                                        /* Typesalt[op] (where op is either
-                                         * JOB_SHA512CRYPT or JOB_SHA512-
-                                         * CRYPTMD5) holds the FULL hash
-                                         * line "$6$[rounds=N$]<salt>$<86-
-                                         * b64>" (loader at mdxfind.c:
-                                         * 47049-47062 + 47077-47087
-                                         * inserts the same line into BOTH
-                                         * Judy arrays). Output buffer:
-                                         * salt prefix (up to ~30 bytes
-                                         * incl rounds=N$) + 86-char b64 +
-                                         * NUL = up to 117 bytes. mdbuf
-                                         * [128] is comfortably oversized. */
-                                        char mdbuf[128];
-                                        int prefix_len = splen;
-                                        while (prefix_len > 0 && sp[prefix_len - 1] != '$')
-                                            prefix_len--;
-                                        memcpy(mdbuf, sp, prefix_len);
-                                        sha512crypt_b64encode(curin.h, mdbuf + prefix_len);
+                                if (salt_snap_entry && salt_snap_entry->saltlen + 87 <= 256) {
+                                    char mdbuf[256];
+                                    int c;
+                                    memcpy(mdbuf, salt_snap_entry->salt, salt_snap_entry->saltlen);
+                                    sha512crypt_b64encode(curin.h, mdbuf + salt_snap_entry->saltlen);
+                                    c = shacrypt_claim(g->op, mdbuf);
+                                    if (c) {
+                                        if (c == 2) _salts_retired_since_refresh++;
                                         prfound(&synthetic_job, mdbuf);
                                     }
                                 }
@@ -3500,6 +3680,21 @@ void gpujob(void *arg) {
                                         prfound(&synthetic_job, fullhash);
                                     }
                                 }
+                            } else if (gpu_hx_generic(g->op)) {
+                                /* The generic hx walker: the device only
+                                 * filters; the type's own CPU code confirms
+                                 * this candidate for this one salt or user,
+                                 * prints it and retires what it solves
+                                 * (spec D2). hit stays 0 so the salt is
+                                 * not decremented twice. */
+                                hit = 0;
+                                if (salt_snap_entry)
+                                    cpu_confirm_enqueue(g->op, synthetic_job.line, out_len,
+                                                        synthetic_job.Ruleindex,
+                                                        (const unsigned char *)salt_bytes, salt_len_b,
+                                                        gpu_hx_generic_channel(g->op),
+                                                        (const unsigned char *)&curin.i[0],
+                                                        hexlen / 2, (int)iter_num);
                             } else {
                                 hit = checkhashsalt(&curin, hexlen,
                                                     salt_bytes, salt_len_b,
@@ -3509,6 +3704,15 @@ void gpujob(void *arg) {
                             if (hit && salt_snap_entry) {
                                 if (PV_DEC(salt_snap_entry->PV)) _salts_retired_since_refresh++;
                             }
+                        } else if (gpu_hx_generic(g->op)) {
+                            /* The generic hx walker: the device only filters.
+                             * The type's own CPU code confirms the candidate
+                             * and prints it (spec D2); a hit it cannot
+                             * confirm is FATAL there. */
+                            cpu_confirm_enqueue(g->op, synthetic_job.line, out_len,
+                                                synthetic_job.Ruleindex, NULL, 0, 0,
+                                                (const unsigned char *)&curin.i[0],
+                                                hexlen / 2, (int)iter_num);
                         } else {
                             checkhash(&curin, hexlen, iter_num, &synthetic_job);
                         }
@@ -3655,6 +3859,27 @@ _rules_hash_acct: ;  /* the proto replay joins here */
          * deletion (Tranche B). */
 
 return_jobg:
+        if (st_cur) {
+            if (!st_dispatched)
+                selftest_skip(g->op, my_slot, "OpenCL", "the test batch was not dispatched");
+            gpu_opencl_selftest_end(my_slot);
+            if (st_dispatched)
+                atomic_fetch_sub(&Totrules_gpu,
+                    (unsigned long long)st_slot->packed_count *
+                    (unsigned long long)(gpu_rule_count > 1 ? gpu_rule_count - 1 : 0));
+            if (my_slot < MAX_GPU_SLOTS) {
+                _gpu_words[my_slot] = st_tel[0];   _gpu_rules_hashes[my_slot] = st_tel[1];
+                _gpu_hits[my_slot] = st_tel[2];    _gpu_batches[my_slot] = st_tel[3];
+                _gpu_busy_us[my_slot] = st_tel[4]; _gpu_first_us[my_slot] = st_tel[5];
+                _gpu_last_us[my_slot] = st_tel[6]; _gpu_h2d_bytes[my_slot] = st_tel[7];
+            }
+            g = st_real;
+            st_real = NULL;
+            st_cur = NULL;
+            current_op = -1;        /* re-upload the real salts */
+            nsalts_packed = 0;
+            goto st_resume;
+        }
         g->t_return_start = gpu_now_us();
         if (gpu_pipe_trace_enabled == 1 && g->t_dispatched != 0) {
             GPU_DEBUG_FPRINTF(stderr, "[pipe] g=%p disp_us=%llu dev=%d\n",
@@ -3749,6 +3974,9 @@ return_jobg:
  * populated) and before any procjob thread exists -- the only window where the
  * decision can still be taken without having already lost words.
  */
+/* user ops start here; Types[] holds the built-in names only */
+extern unsigned Userdef_base;
+
 static void opencl_rules_engine_preflight(void)
 {
     if (!gpu_rules_engine_active) return;   /* engine not armed */
@@ -3775,7 +4003,7 @@ static void opencl_rules_engine_preflight(void)
                 "OpenCL GPU admission:   e%d %s -- admitted by the mdxfind.c "
                 "activation set, not served by the dispatch allowlist\n",
                 (int)op,
-                (Types && Types[op]) ? Types[op] : "(unnamed)");
+                (Types && op < Userdef_base && Types[op]) ? Types[op] : "(user type)");
         }
         J1N(RC, Dohash, op);
     }
@@ -3814,6 +4042,8 @@ int gpujob_init(int num_jobg) {
         if (Typesaltbytes[sti] > _max_salt_bytes)
             _max_salt_bytes = Typesaltbytes[sti];
     }
+    gpu_user_snapshot_bounds(&_max_salt_count, &_max_salt_bytes);
+    gpu_pepper_bounds(&_max_salt_count, &_max_salt_bytes);
     if (_max_salt_count < 1024) _max_salt_count = 1024;
     if (_max_salt_bytes < 8192) _max_salt_bytes = 8192;
 
@@ -4967,7 +5197,8 @@ int gpu_op_category(int op) {
      * attempting a kernel selection that has no FAM_ entry — the chokepoint
      * widening (mdxfind.c rules-engine gate) handles GPU dispatch. */
     default:
-        return GPU_CAT_NONE;
+        /* The generic hx walker's types are template-routed. */
+        return gpu_hx_generic(op) ? GPU_CAT_MASK : GPU_CAT_NONE;
     }
 }
 
@@ -5133,6 +5364,8 @@ int gpu_hash_words(int op) {
         return 5;
     /* 128-bit output = 4 words (MD5, MD4, NTLM, etc.) */
     default:
+        /* The generic hx walker: its stored form's words. */
+        if (gpu_hx_generic(op)) return gpu_hx_generic_words(op);
         return 4;
     }
 }

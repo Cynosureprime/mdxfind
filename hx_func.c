@@ -3608,6 +3608,37 @@ static void fn_cisco_pix_encode(hx_func_entry *self, hx_val *args, int nargs,
 	result->len  = 16;
 }
 
+/* ---- cisco4_encode (Cisco IOS type 4) ----
+ * Base64 bit order (each 3 bytes, most significant first, to 4 characters)
+ * in the alphabet ./0-9A-Za-z, with no padding: a final 1 or 2 bytes give
+ * 2 or 3 characters. SHA-256's 32 bytes give the 43 characters of a type 4
+ * hash, as mdxfind's CISCO4 writes them. */
+static void fn_cisco4_encode(hx_func_entry *self, hx_val *args, int nargs,
+                             hx_val *result, hx_arena *arena, uint8_t role)
+{
+	static const char itoa64[] =
+	    "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+	const unsigned char *in = (const unsigned char *)args[0].data;
+	int inlen = args[0].len, i, o = 0;
+	char *out;
+	(void)self; (void)nargs; (void)role;
+
+	out = hx_arena_alloc(arena, ((inlen + 2) / 3) * 4 + 1);
+	for (i = 0; i < inlen; i += 3) {
+		int n = inlen - i < 3 ? inlen - i : 3;
+		unsigned int v = (unsigned int)in[i] << 16;
+		if (n > 1) v |= (unsigned int)in[i + 1] << 8;
+		if (n > 2) v |= in[i + 2];
+		out[o++] = itoa64[(v >> 18) & 0x3f];
+		out[o++] = itoa64[(v >> 12) & 0x3f];
+		if (n > 1) out[o++] = itoa64[(v >> 6) & 0x3f];
+		if (n > 2) out[o++] = itoa64[v & 0x3f];
+	}
+	out[o] = '\0';
+	result->data = out;
+	result->len  = o;
+}
+
 /* ---- progress_encode (Progress OpenEdge ENCODE) ---- */
 
 extern void myprogress(char *cur, int len, char *dest);
@@ -4042,6 +4073,7 @@ hx_func_entry hx_func_table[HX_MAX_FUNCS] = {
 	{ "progress_encode", fn_progress_encode, 0, NULL, 0, ROLES_NONE, ROLE_DEFAULT },
 	{ "juniper_encode",  fn_juniper_encode,  0, NULL, 0, ROLES_NONE, ROLE_DEFAULT },
 	{ "cisco_pix_encode", fn_cisco_pix_encode, 0, NULL, 0, ROLES_NONE, ROLE_DEFAULT },
+	{ "cisco4_encode", fn_cisco4_encode, 0, NULL, 0, ROLES_NONE, ROLE_DEFAULT },
 	{ "ebcdic",        fn_ebcdic,         0, NULL, 0, ROLES_NONE, ROLE_DEFAULT },
 	{ "racf_encrypt",  fn_racf_encrypt,   0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
 	{ "domino5",       fn_domino5,        0, NULL, 0, ROLES_DIGEST, ROLE_HEX },
@@ -4120,16 +4152,16 @@ hx_func_entry hx_func_table[HX_MAX_FUNCS] = {
  * argon2-alias) and a hashpipe-only set of 6 entries (pomelo,
  * rc4_hmac_md5, aes128/256_cts_hmac_sha1, sm3crypt, gost12_512crypt).
  *
- *   tools/hx8_to_c (standalone, no HX_HAS_KDF): 7 + 38 + 21 + 3
- *   mdxfind        (standalone, HX_HAS_KDF):    7 + 38 + 21 + 13 + 3
- *   hashpipe       (non-standalone):            38 + 21 + 13 + 6 + 3
+ *   tools/hx8_to_c (standalone, no HX_HAS_KDF): 7 + 39 + 21 + 3
+ *   mdxfind        (standalone, HX_HAS_KDF):    7 + 39 + 21 + 13 + 3
+ *   hashpipe       (non-standalone):            39 + 21 + 13 + 6 + 3
  */
 #if defined(HX_STANDALONE) && defined(HX_HAS_KDF)
-int hx_func_count = 7 + 38 + 21 + 13 + 3;
+int hx_func_count = 7 + 39 + 21 + 13 + 3;
 #elif defined(HX_STANDALONE)
-int hx_func_count = 7 + 38 + 21 + 3;
+int hx_func_count = 7 + 39 + 21 + 3;
 #else
-int hx_func_count = 38 + 21 + 13 + 6 + 3;
+int hx_func_count = 39 + 21 + 13 + 6 + 3;
 #endif
 
 hx_func_entry *hx_func_lookup(const char *name)

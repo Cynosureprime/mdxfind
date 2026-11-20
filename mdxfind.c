@@ -199,10 +199,10 @@ int Neon;
 #define bswap_64(x) __builtin_bswap64(x)
 #endif
 
-char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.677 2026/11/16 12:23:20 dlr Exp dlr $";
+char *Version = "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.686 2026/11/20 18:28:36 dlr Exp dlr $";
 
 /* Parse the RCS revision out of Version[] for use as the GPU kernel cache
- * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.677 2026/11/16 12:23:20 dlr Exp dlr $".
+ * version stamp. Layout: "$Header: /Users/dlr/src/mdfind/RCS/mdxfind.c,v 1.686 2026/11/20 18:28:36 dlr Exp dlr $".
  * Returns a pointer to a static buffer; safe to call multiple times. */
 __attribute__((unused)) const char *mdxfind_rev_string(void) {
     static char rev[32] = {0};
@@ -220,8 +220,35 @@ __attribute__((unused)) const char *mdxfind_rev_string(void) {
 }
 /*
  * $Log: mdxfind.c,v $
+ * Revision 1.686  2026/11/20 18:28:36  dlr
+ * Correct the EMPIRECMS comment to the construction the code computes: md5(salt2 + E!m^p-i(r#e.C:M?S + md5hex(md5hex(pass) + salt1) + d)i.g^o-d + salt1). No change to the code.
+ *
+ * Revision 1.685  2026/11/20 15:45:10  dlr
+ * Generic hx walker stages 3b and 4a. New walker bodies: MySQL 3 OLD_PASSWORD as a byte-wise accumulator in the dialect, BLAKE2b-512 and -256 and BLAKE2s-256 over the common b2b and b2s compress functions, and SHA3 and Keccak at 224, 256, 384 and 512 bits over keccakf1600; a final digest shorter than 16 bytes is compared as four words with the upper ones zero. User-defined types may now name mdxfind own hash functions: sha224, sha384, rmd128, rmd160, tiger, wrl, md2, gost, sne128, sne256, the fifteen HAVAL forms, mysql3, blake2b512, blake2b256, blake2s256, sha3_224 to sha3_512 and keccak224 to keccak512, each the call its catalog type makes. hashpipe registers its BLAKE2 digests as hx functions, which the verify registration had hidden. The drift check reads a NAME-prefixed hex digest and the bare digest as one value. 11 more catalog types run on the GPU: e410 e416 e449 e474 e478 e548 e711 e842 e843 e846 e847. Verified: each new user function agrees with its catalog type at x01 to x03 on the CPU and with hashpipe -X; the C mirror agrees for 567 of 567 cores and every earlier core changed only by the added dialect text; on dev3 (M2 Max, Metal) all new catalog types and 42 user types match -G none, and on gp1 (Tahiti, OpenCL) all do except the md2 user type, whose kernel the Tahiti compiler crashes on, which is FATAL there as for any such kernel.
+ *
+ * Revision 1.684  2026/11/20 04:20:18  dlr
+ * SHA1MD5DSALT e590 and SHA1MD5MD5DSALT e591 keep sha1(md5hex . ":" . salt without its last byte) as an alternate beside sha1(salt . ":" . md5hex . ":" . salt). Real stored hashes take that form: 30 distinct e591 hashes in the archive, all with 3-byte salts, which a construction stripping punctuation from the outer salt does not explain. -j and -P report the peppers they ignore: Warning: N peppers ignored: a pepper is at most 80 bytes, or 1 to 126 bytes as $HEX[], and the peppers in use count only those kept. Verified: the 30 archive hashes are found, as by 1.677; hashpipe verifies 3551 of 3551 archived e591 lines and 9090 of 9090 e590 and e591 lines from mdxfind -z; an 81-byte plain and a 127-byte $HEX[] pepper are reported and the other three are used.
+ *
+ * Revision 1.683  2026/11/20 02:52:01  dlr
+ * Generic hx walker stage 2: salted, user-keyed, HMAC and peppered types run on the GPU through the generated walker, and five CPU defects are fixed. A walker type with a salt or user takes it from the same snapshot the hand-built salted kernels use, its user ops from TYPEUSER or else the -u pool; every GPU hit is confirmed by the type's own CPU arm. The confirm path keeps a per-thread TYPEDONE sink, so a one-salt confirm that exhausts its salt no longer marks the whole type done: before, e282 found 1477 of 1847 with no error. It also keeps refcount shadows for the salts it hands an arm, so the 73 salted arms that retire a salt mid -i loop no longer index saltsnap[-1] in a one-salt confirm (segfault on e1010). selftest_pick_key takes a user op's keys from TYPEUSER or UseridJudy. New type_pepper_list and type_pepper_mode: one lookup of the pepper list an op hashes with (-P for that type, else -j or -P, else the type's built-in default), used by all five pepper sites and by the GPU host, and where a type's pepper comes from (that list, or the salt after its first space or colon). HMAC-WRL e228 compares 64 bytes, the width its CPU arm prints, so it is GPU-served. SHA1MD5DSALT e590 hashes the 32-character MD5 hex where it used the password length, so only 32-character passwords matched; its third form is sha1(salt . ":" . h . ":" . salt), built clear of newbuf, which holds the e591 candidate. SHA1-MD5MD5SALT e470, e670, e741 and the pepper type e611 wrote their MD5 hex into tline, the rule engine input, so under -r every rule after the first was applied to that hex: 3 words by 5 rules found 3 of 15, now 15 of 15, -z unchanged, other types in the run unaffected. SHA1-PEPPER-MD5SALT e677 loops over every pepper like its three siblings; it hashed only the first entry of the -j list in sort order. Verified: GPU against -G none on gp1 (Tahiti, OpenCL) and dev3 (M2 Max, Metal) for every new type at x01 and x02 and deeper, with rules, a mask pass, -F and -s or -u loading, 2911 salts or users over several pages, a 77-byte HMAC key, three -j peppers, the built-in peppers, -M -P per-type peppers, and salt:pepper salts carrying a 300-byte pepper; the e677 target made with its second pepper is found on both and previously stopped the GPU run with an unconfirmed hit. hashpipe verifies 9000 of 9000 e590 and e591 lines.
+ *
+ * Revision 1.682  2026/11/19 15:03:12  dlr
+ * SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5 key Typesalt by setting. Each distinct setting, the type prefix, any rounds=N field and the salt through its closing dollar sign, exactly as written, is one salt whose count is the number of distinct hash lines carrying it; the lines stay in JudyJ. A candidate is hashed once per setting rather than once per line, on the CPU and on both GPU backends; the kernels are unchanged. One salt at different rounds values is different settings. A computed line is matched by shacrypt_claim, which looks it up in JudyJ, claims it once and decrements its setting in every type sharing the lines, SHA512CRYPT and SHA512CRYPTMD5 sharing theirs, so a line found by two rules, two devices, or a device and the CPU is printed and counted once, and a setting retires exactly when its last line is solved. A bare -z setting and the setting of a loaded line are one key, and with hash lines loaded -z generates once per setting. The SHA crypts hash at most 16 salt characters, as crypt(3) and the GPU kernel do; a bare -z setting with a longer salt generates with its first 16, so the printed line is the one crypt(3) produces. BCRYPT counts a repeated input line once, so its setting retires when its lines are solved. Verified: -f /dev/null -z identical to the previous revision and to openssl passwd; lines generated at rounds 6000 and 10000 verify with passlib; a 450-line passlib list with shared settings, one salt at two rounds values, repeated lines, and SHA512CRYPT and SHA512CRYPTMD5 on one setting gives 420 of 420 exact on the CPU, OpenCL on a GTX 1080 with 420 device hits, and Metal on an M2 Max, the GTX 1080 run in 421M hash calculations where the previous revision took 13.2G; GPU self-test 7 of 7 for all three types; -z to -F round trip identical; regress/test-F-salted.sh 29 passed, 0 failed.
+ *
+ * Revision 1.681  2026/11/19 13:08:34  dlr
+ * GPU self-test phase 2. The test now runs under -k, -E, -a and -8 and in brute-force runs, and covers SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5. Under -E and -a each test word carries an @ after a two-byte local part and the expected plaintext is prepend, local part, append, domain, the order the CPU forms it in; under -8 one test word carries a two-byte UTF-8 character so the UTF-32 engine runs; -k needs nothing, as an untagged word is hashed bare on both sides. A brute-force run is known only once its mask is parsed, after the expectations were formed, so selftest_bf rebuilds them as mask indexes 0 to 6 over one empty word, the shape of a brute-force chunk, and the test runs on the first chunk through the kernel that chunk uses, the fast MD5 kernel included. The SHA-crypt types capture the first 16 bytes of the raw digest in crypt_round, which is the form build_compact_table gives the device. BCRYPT and DESCRYPT remain uncovered.
+ *
+ * Revision 1.680  2026/11/19 02:29:16  dlr
+ * GPU self-test: on first use of each GPU type on each device, a known-answer batch runs before the first real one. The expected stored forms come from the type own CPU code, run as confirm jobs and captured at hybrid_check, for seven words of lengths 7 to 128 with the first mask prefix and suffix and one real salt or user, at x01 and x02. A missing or unexpected digest is FATAL as a compiler failure naming the type, device and missed lengths, with the -G bypass; a pass is silent. Crypt types, -k, -E, -a and -8 are not yet covered.
+ *
+ * Revision 1.679  2026/11/18 04:07:47  dlr
+ * Generic hx walker stage 1a, host side. A CPU confirm thread re-runs every walker GPU hit through procjob itself: a one-candidate, one-key confirm job on its own queue and pool, with the type case doing the confirming; a hit the CPU does not confirm is FATAL. Confirm jobs skip pause, progress, the Email and XML rewrites, the GPU pack paths and the -k key walk. The walker predicate is one term in the GPU admit chokepoint and in gpu_rules_cover.
+ *
+ * Revision 1.678  2026/11/17 01:08:31  dlr
+ * CRAMMD5-DOVECOT (e932): a found line is the record as loaded, kept in the CramDovecot side table keyed by the opad state, instead of the opad state followed by 32 zeros; -z computes and writes the ipad state, so its line is the full stored form. Only the opad half is compared, as before and as in hashcat 16400. HMAC-WRL: hmac_len is 128.
+ *
  * Revision 1.677  2026/11/16 12:23:20  dlr
- * Reword the 1.676 log entry: user in place of customer.
+ * Reword the 1.676 log entry.
  *
  * Revision 1.676  2026/11/15 18:38:04  dlr
  * mdxfind 1.676: with the GPU active, an -n/-N mask over the per-side GPU limit, with an empty character class, or whose tables do not fit in device memory exits with the positions requested and the limit, instead of hashing bare words on the GPU while the CPU skips the mask.
@@ -4584,6 +4611,7 @@ char *Curfile;
 unsigned long long int Lowline, LowSkip, TotLines, Fileline;
 Pvoid_t HashL;
 Pvoid_t JuniperIVE;  /* secondary mapping: md5crypt hash → original Juniper IVE base64 */
+Pvoid_t CramDovecot; /* secondary mapping: CRAMMD5-DOVECOT opad key → record as loaded */
 /* Phase A: DoUser is the SEPARATE selection bitfield for user-defined types,
  * keyed by user id (0..userdef_count()-1), NOT by synthetic op. It is the
  * authoritative record of "which user types did the operator select".
@@ -4928,6 +4956,7 @@ void **UserTypeuser;
 
 Pvoid_t UseridJudy;
 char **Typepepper;
+
 int XOR_key_len;
 /* -e: 0 = match at offset 0 only, 1 = standard extended windows (the
  * default), 2 = byte-by-byte windows.  Precheck_off is set in main once the
@@ -6458,6 +6487,96 @@ char *mysql3(char *pass, int len, char *outbuf) {
   }
   sprintf(outbuf, "%08x%08x", nr & 0x7fffffff, nr2 & 0x7fffffff);
   return (outbuf);
+}
+
+/*
+ * The hash functions of mdxfind's own types, for hx user-defined types.
+ * The standalone hx registry carries md4, md5, sha1, sha256 and sha512 and
+ * little else; each function here is the call the named type's CPU arm
+ * makes, so a user type means what the catalog type of that name means.
+ * Registered by mdx_hx_register(), before userdef_load(). Every one is
+ * reentrant: a local context, rhash_msg, or a pure function.
+ */
+#include "hx_vm.h"
+
+#define HXW_SPH(nm, pfx) \
+static void hxw_##nm(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d) \
+{ pfx##_context c; (void)s; (void)sl; pfx##_init(&c); pfx(&c, p, l); pfx##_close(&c, d); }
+HXW_SPH(sha224, sph_sha224)
+HXW_SPH(sha384, sph_sha384)
+HXW_SPH(tiger, sph_tiger)
+HXW_SPH(md2, sph_md2)
+HXW_SPH(hav128_3, sph_haval128_3) HXW_SPH(hav128_4, sph_haval128_4) HXW_SPH(hav128_5, sph_haval128_5)
+HXW_SPH(hav160_3, sph_haval160_3) HXW_SPH(hav160_4, sph_haval160_4) HXW_SPH(hav160_5, sph_haval160_5)
+HXW_SPH(hav192_3, sph_haval192_3) HXW_SPH(hav192_4, sph_haval192_4) HXW_SPH(hav192_5, sph_haval192_5)
+HXW_SPH(hav224_3, sph_haval224_3) HXW_SPH(hav224_4, sph_haval224_4) HXW_SPH(hav224_5, sph_haval224_5)
+HXW_SPH(hav256_3, sph_haval256_3) HXW_SPH(hav256_4, sph_haval256_4) HXW_SPH(hav256_5, sph_haval256_5)
+HXW_SPH(keccak224, sph_keccak224) HXW_SPH(keccak256, sph_keccak256)
+HXW_SPH(keccak384, sph_keccak384) HXW_SPH(keccak512, sph_keccak512)
+#undef HXW_SPH
+
+#define HXW_RH(nm, id) \
+static void hxw_##nm(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d) \
+{ (void)s; (void)sl; rhash_msg(id, p, l, d); }
+HXW_RH(sne128, RHASH_SNEFRU128) HXW_RH(sne256, RHASH_SNEFRU256)
+HXW_RH(sha3_224, RHASH_SHA3_224) HXW_RH(sha3_256, RHASH_SHA3_256)
+HXW_RH(sha3_384, RHASH_SHA3_384) HXW_RH(sha3_512, RHASH_SHA3_512)
+#undef HXW_RH
+
+static void hxw_rmd128(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; RIPEMD128((char *)p, l, d); }
+static void hxw_rmd160(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; RIPEMD160((char *)p, l, d); }
+static void hxw_wrl(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; WHIRLPOOL((char *)p, l, d); }
+static void hxw_gost(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; gosthash((char *)p, l, d); }
+static void hxw_blake2b512(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; blake2b_hash(d, 64, p, l); }
+static void hxw_blake2b256(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; blake2b_hash(d, 32, p, l); }
+static void hxw_blake2s256(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{ (void)s; (void)sl; blake2s(d, 32, p, l, NULL, 0); }
+/* mysql3() writes "%08x%08x"; the digest is those 8 bytes */
+static void hxw_mysql3(const unsigned char *p, int l, const unsigned char *s, int sl, unsigned char *d)
+{
+  char h[17];
+  int i;
+  (void)s; (void)sl;
+  mysql3((char *)p, l, h);
+  for (i = 0; i < 8; i++) {
+    int a = h[2 * i], b = h[2 * i + 1];
+    d[i] = (unsigned char)((((a & 15) + (a > '9' ? 9 : 0)) << 4) | ((b & 15) + (b > '9' ? 9 : 0)));
+  }
+}
+
+void mdx_hx_register(void)
+{
+  static const struct { const char *name; hx_bridge_fn fn; int len; } t[] = {
+    { "sha224", hxw_sha224, 28 }, { "sha384", hxw_sha384, 48 },
+    { "rmd128", hxw_rmd128, 16 }, { "rmd160", hxw_rmd160, 20 },
+    { "tiger", hxw_tiger, 24 }, { "wrl", hxw_wrl, 64 }, { "md2", hxw_md2, 16 },
+    { "gost", hxw_gost, 32 }, { "sne128", hxw_sne128, 16 }, { "sne256", hxw_sne256, 32 },
+    /* the catalog's HAVAL names: hav128 and hav256 are the 3-pass forms */
+    { "hav128", hxw_hav128_3, 16 }, { "hav128_4", hxw_hav128_4, 16 }, { "hav128_5", hxw_hav128_5, 16 },
+    { "hav160_3", hxw_hav160_3, 20 }, { "hav160_4", hxw_hav160_4, 20 }, { "hav160_5", hxw_hav160_5, 20 },
+    { "hav192_3", hxw_hav192_3, 24 }, { "hav192_4", hxw_hav192_4, 24 }, { "hav192_5", hxw_hav192_5, 24 },
+    { "hav224_3", hxw_hav224_3, 28 }, { "hav224_4", hxw_hav224_4, 28 }, { "hav224_5", hxw_hav224_5, 28 },
+    { "hav256", hxw_hav256_3, 32 }, { "hav256_4", hxw_hav256_4, 32 }, { "hav256_5", hxw_hav256_5, 32 },
+    { "mysql3", hxw_mysql3, 8 },
+    { "blake2b512", hxw_blake2b512, 64 }, { "blake2b256", hxw_blake2b256, 32 },
+    { "blake2s256", hxw_blake2s256, 32 },
+    { "sha3_224", hxw_sha3_224, 28 }, { "sha3_256", hxw_sha3_256, 32 },
+    { "sha3_384", hxw_sha3_384, 48 }, { "sha3_512", hxw_sha3_512, 64 },
+    { "keccak224", hxw_keccak224, 28 }, { "keccak256", hxw_keccak256, 32 },
+    { "keccak384", hxw_keccak384, 48 }, { "keccak512", hxw_keccak512, 64 },
+  };
+  int i;
+  for (i = 0; i < (int)(sizeof t / sizeof t[0]); i++)
+    if (!hx_func_lookup(t[i].name))
+      hx_func_register(t[i].name, hx_bridge_hash, t[i].len, t[i].fn, t[i].len,
+                       ROLE_CAP_BIN | ROLE_CAP_HEX | ROLE_CAP_B64 | ROLE_CAP_UC,
+                       ROLE_HEX);
 }
 
 
@@ -9210,6 +9329,50 @@ char UserTypedone[USERDEF_MAX];
     if (__sync_bool_compare_and_swap((mf), _mo, _mn)) { _mw = 1; break; } \
     _mo = *(volatile unsigned short *)(mf); } _mw; })
 
+/* SHA256CRYPT, SHA512CRYPT and SHA512CRYPTMD5 key Typesalt by SETTING,
+ * "$5$[rounds=N$]salt$" through its closing '$', so one candidate is hashed
+ * once per distinct setting rather than once per line.  Each setting's
+ * value counts the distinct lines carrying it; the lines themselves stay in
+ * JudyJ[JOB_SHA256CRYPT] or, for both $6$ types, JudyJ[JOB_SHA512CRYPT],
+ * value 0 until solved.
+ *
+ * line is a computed setting + trailer.  Returns 0 when it is no loaded
+ * line, or another thread or type already printed it; otherwise this
+ * caller owns the print, and every count holding the line's setting has
+ * been decremented once -- both $6$ types share their lines, so a line
+ * solved under either retires it from both.  2 = one of those counts
+ * reached 0.  The claim on the LINE is what makes the counts exact: a
+ * line found twice, by two rules, two devices, or a device and the CPU,
+ * decrements once.  Contfound prints every find and decrements nothing.
+ * Called by crypt_round and by both GPU hit replays. */
+int shacrypt_claim(int op, const char *line)
+{
+  static const int fam5[] = { JOB_SHA256CRYPT, -1 };
+  static const int fam6[] = { JOB_SHA512CRYPT, JOB_SHA512CRYPTMD5, -1 };
+  const int *fam = (op == JOB_SHA256CRYPT) ? fam5 : fam6;
+  char set[256];                    /* the loader caps these lines at 254 */
+  const char *e;
+  Word_t *HPV, *SPV;
+  int n, k, ret = 1;
+
+  JSLG(HPV, JUDYJ(fam[0]), (const uint8_t *)line);
+  if (!HPV) return 0;
+  if (Contfound) return 1;
+  if (!__sync_bool_compare_and_swap(HPV, 0, 1)) return 0;
+  e = strrchr(line, '$');
+  n = (int)(e - line) + 1;          /* a loaded line always has its '$' */
+  if (n >= (int)sizeof(set)) return 1;
+  memcpy(set, line, (size_t)n);
+  set[n] = 0;
+  for (k = 0; fam[k] >= 0; k++) {
+    JSLG(SPV, TYPESALT(fam[k]), (const uint8_t *)set);
+    if (!SPV) continue;
+    PV_DEC(SPV);
+    if (*SPV == 0) ret = 2;
+  }
+  return ret;
+}
+
 unsigned short TypeOpts[JOB_DONE] = {
     [1] = TYPEOPT_NEEDSF,  /* MD5 */
     [2] = TYPEOPT_NEEDSF,  /* MD5UC */
@@ -10566,7 +10729,7 @@ unsigned int TypeDigest[JOB_DONE] = {
     [225] = 20,  /* HMAC-TIGER160 */
     [226] = 24,  /* HMAC-TIGER192 */
     [227] = 32,  /* HMAC-GOST */
-    [228] = 32,  /* HMAC-WRL */
+    [228] = 64,  /* HMAC-WRL */
     [229] = 16,  /* HMAC-SNE128 */
     [230] = 32,  /* HMAC-SNE256 */
     [231] = 16,  /* RMD128MD5MD5 */
@@ -11493,6 +11656,66 @@ static inline int mask_expand(unsigned long long index, char *buf) {
 struct job *FreeHead, **FreeTail;
 struct job *WorkHead, **WorkTail;
 lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;
+
+/* ---- CPU confirmation of GPU hits ----
+ *
+ * The generic hx walker's GPU kernels only FILTER: each hit is rebuilt into
+ * its exact plaintext (rules, masks, -E/-a/-k already applied) and handed to
+ * one extra procjob thread as a JOBFLAG_CONFIRM job, so the type's own case
+ * recomputes it and prints and counts it exactly as a CPU run does. The
+ * thread has its own queue and pool: a GPU worker that enqueues while main
+ * pool jobs wait on the GPU would otherwise deadlock, and shutdown counts the
+ * main pool exactly.
+ *
+ * A hit is restricted to its one salt or user at the shared choke points
+ * (build_salt_snapshot, build_hashsalt_snapshot, UJSLF/UJSLN). A confirm that
+ * finds nothing is FATAL unless the GPU's digest is already claimed by this
+ * type, which is the one legitimate silence: a hash found earlier from
+ * another candidate. */
+#define CONFIRM_POOL 64
+struct confirm_extra {
+  char plain[MAXLINE + 16];
+  struct LineInfo li;
+  unsigned char key[MAXLINE + 16];
+  int keylen, keykind;            /* keykind: 0 none, 1 salt, 2 user */
+  unsigned char digest[64];
+  int dlen, iter;
+  int oracle;                     /* a self-test capture, not a GPU hit */
+};
+static struct job *ConfirmJobs;
+static struct confirm_extra *ConfirmExtra;
+static struct job *ConfirmHead, **ConfirmTail = &ConfirmHead;
+static struct job *ConfirmFreeHead, **ConfirmFreeTail = &ConfirmFreeHead;
+static lock *ConfirmWaiting, *ConfirmFreeWaiting;
+static char Confirm_queue_tag;   /* procjob(&Confirm_queue_tag) serves the confirm queue */
+int Confirm_enabled;
+static __thread int Confirm_thread;
+static __thread int Confirm_hits;
+static __thread int Confirm_keyon;           /* 1 salt, 2 user */
+static __thread const unsigned char *Confirm_key;
+static __thread int Confirm_keylen;
+#define CONFIRM_KEY_IS(b, l) ((l) == Confirm_keylen && memcmp((b), Confirm_key, (l)) == 0)
+#ifdef GPU_ENABLED
+/* GPU self-test capture.  While the start-up oracle runs a type's own code on
+ * a test word, every stored form that code asks hybrid_check about is
+ * recorded here instead of looked up; the device must later find each one.
+ * Set only in the single-threaded window before the workers start, when the
+ * confirm thread is the one thread hashing. */
+static struct selftest_op *Selftest_cap;
+static int Selftest_cap_word, Selftest_cap_seq, Selftest_cap_over;
+static void selftest_capture(const unsigned char *h)
+{
+  struct selftest_op *st = Selftest_cap;
+  int i;
+  for (i = 0; i < st->nexp; i++)
+    if (memcmp(st->exp[i], h, st->dlen) == 0) return;
+  if (st->nexp >= SELFTEST_EXP) { Selftest_cap_over = 1; return; }
+  memcpy(st->exp[st->nexp], h, st->dlen);
+  st->expword[st->nexp] = (unsigned char)Selftest_cap_word;
+  st->expiter[st->nexp] = (unsigned char)++Selftest_cap_seq;
+  st->nexp++;
+}
+#endif
 lock *ReadBufL[NREADBUF], *HashWaiting;
 lock *ServerState;
 /* Tothash and Totfound are accumulated from the GPU dispatch hot path
@@ -12284,6 +12507,12 @@ int hybrid_check(const unsigned char *hashbytes, int len,
     uint64_t pos;
     int p;
 
+#ifdef GPU_ENABLED
+    if (__builtin_expect(Selftest_cap != NULL, 0)) {
+        selftest_capture(hashbytes);
+        return 0;
+    }
+#endif
     if (!CompactFP) return 0;
 
     key = *(const uint64_t *)hashbytes;
@@ -12300,6 +12529,7 @@ int hybrid_check(const unsigned char *hashbytes, int len,
             if (memcmp(hashbytes, HashDataBuf + HashDataOff[idx], hlen) == 0) {
                 *out_len = HashDataLen[idx];
                 *out_flagptr = &HashDataFlags[idx];
+                Confirm_hits++;
                 return 1;
             }
         }
@@ -12320,6 +12550,7 @@ int hybrid_check(const unsigned char *hashbytes, int len,
                 if (ret == 0) {
                     *out_len = chain->len;
                     *out_flagptr = &chain->flags;
+                    Confirm_hits++;
                     return 1;
                 }
                 if (ret < 0) break;
@@ -12465,9 +12696,13 @@ int user_decode(const char *key, char *dst)
  * its length in Uklen. Compute arms keep using tsalt as the user bytes; they
  * must take the length from Uklen, never from mystrlen(tsalt). */
 #define UJSLF(PV, J) do { ukey[0] = 0; JSLF(PV, J, (unsigned char *)ukey); \
-                          if (PV) Uklen = user_decode(ukey, tsalt); } while (0)
+                          UJ_CONFIRM(PV, J); } while (0)
 #define UJSLN(PV, J) do { JSLN(PV, J, (unsigned char *)ukey); \
-                          if (PV) Uklen = user_decode(ukey, tsalt); } while (0)
+                          UJ_CONFIRM(PV, J); } while (0)
+/* Decode the user; a confirm job skips every user but its own. */
+#define UJ_CONFIRM(PV, J) while (PV) { Uklen = user_decode(ukey, tsalt); \
+                          if (Confirm_keyon != 2 || CONFIRM_KEY_IS(tsalt, Uklen)) break; \
+                          JSLN(PV, J, (unsigned char *)ukey); }
 
 /* C-string wrapper, for callers whose key genuinely is one (a hex digest, a
  * userid). A caller holding a BINARY salt must use checkhashkeylen and pass
@@ -13552,6 +13787,82 @@ release(FreeWaiting);
     job->outlen += sprintf(&job->outbuf[job->outlen],"%s %s:%s\n", TYPENAME(job->op), hash, job->pass);
 }
 
+/* A confirm job's snapshot holds only its own salt, whose real refcount may
+ * already be 0 or reach 0 inside the job.  The salted arms retire an
+ * exhausted salt by swapping it out of the snapshot (si--) and some keep
+ * iterating afterwards, which with one entry indexes saltsnap[-1].  So the
+ * job counts against a private shadow that cannot reach 0 while it runs, and
+ * confirm_finish passes on to the real refcount exactly the decrements the
+ * job made.  At most CONFIRM_SHADOWS entries (a salt stored both bare and as
+ * $HEX[] decodes to the same bytes); beyond that the real refcount is used. */
+#define CONFIRM_SHADOWS 4
+#define CONFIRM_SHADOW_BIAS ((Word_t)1 << 30)
+static __thread Word_t Confirm_shadow[CONFIRM_SHADOWS];
+static __thread Word_t Confirm_shadow_start[CONFIRM_SHADOWS];
+static __thread Word_t *Confirm_shadow_real[CONFIRM_SHADOWS];
+static __thread int Confirm_nshadow;
+
+static Word_t *confirm_shadow_pv(Word_t *real)
+{
+  int i;
+  for (i = 0; i < Confirm_nshadow; i++)
+    if (Confirm_shadow_real[i] == real) return &Confirm_shadow[i];
+  if (Confirm_nshadow >= CONFIRM_SHADOWS) return real;
+  Confirm_shadow_real[Confirm_nshadow] = real;
+  Confirm_shadow_start[Confirm_nshadow] = *real + CONFIRM_SHADOW_BIAS;
+  Confirm_shadow[Confirm_nshadow] = Confirm_shadow_start[Confirm_nshadow];
+  return &Confirm_shadow[Confirm_nshadow++];
+}
+
+/* Pass the job's decrements on to the real refcounts. */
+static void confirm_shadow_settle(void)
+{
+  int i;
+  for (i = 0; i < Confirm_nshadow; i++) {
+    Word_t n = Confirm_shadow_start[i] > Confirm_shadow[i]
+             ? Confirm_shadow_start[i] - Confirm_shadow[i] : 0;
+    while (n--) PV_DEC(Confirm_shadow_real[i]);
+  }
+  Confirm_nshadow = 0;
+}
+
+/* The pepper list op hashes with, as the CPU arm and the GPU host both read
+ * it: -P for that type, else -j / -P, else the type's built-in default.
+ * Length-prefixed entries, ended by 0xff. */
+const char *type_pepper_list(int op)
+{
+    const char *pep = (op >= 0 && op < JOB_DONE) ? Typepepper[op] : NULL;
+    if (!pep) pep = combo_pepper;
+    if (pep) return pep;
+    switch (op) {
+    case JOB_DAHUA:
+        return "\x09""182719643\0\xff";
+    case JOB_SHA1MD5SALTPASSPEPPER:
+    case JOB_SHA1SALTSHA1PASSPEPPER:
+    case JOB_SHA1SALTMD5SHA1PASSPEPPER:
+    case JOB_SHA1SALTMD5MD5PASSPEPPER:
+    case JOB_SHA1SALTMD5UCPASSPEPPER:
+    case JOB_SHA1SALTMD5PASSPEPPER:
+        return "\x01:\x00\xff";
+    default:
+        return "\x08@gmail.c\x00\xff";
+    }
+}
+
+int type_pepper_mode(int op)
+{
+    switch (op) {
+    case JOB_SHA1_SALT_UTF16_PEPPER:
+        return 2;
+    case JOB_MD5_MD5MD5PASSSALT_PEP:
+    case JOB_MD5_MD5MD5PASSSALT_PEP2:
+    case JOB_MD5_SALT_SHA1PEPPASS:
+        return 3;
+    default:
+        return (op > 0 && op < JOB_DONE && (TypeOpts[op] & TYPEOPT_NEEDPEPPER)) ? 1 : 0;
+    }
+}
+
 int build_salt_snapshot(struct saltentry *snap, char *pool,
                                Pvoid_t judy, char *keybuf, int printall) {
     Word_t *lpv;
@@ -13561,7 +13872,9 @@ int build_salt_snapshot(struct saltentry *snap, char *pool,
     keybuf[0] = 0;
     JSLF(lpv, judy, (unsigned char *)keybuf);
     while (lpv) {
-        if (printall || *lpv > 0) {
+        /* A confirm job takes its own salt even when its hashes are all found,
+         * so the CPU still computes it, and no other. */
+        if (printall || *lpv > 0 || Confirm_keyon == 1) {
             int slen = mystrlen(keybuf);
             if (slen > 5 && strncmp(keybuf, "$HEX[", 5) == 0) {
                 int hexlen = slen - 6;
@@ -13571,14 +13884,23 @@ int build_salt_snapshot(struct saltentry *snap, char *pool,
             } else {
                 memcpy(p, keybuf, slen + 1);
             }
+            if (Confirm_keyon == 1 && !CONFIRM_KEY_IS(p, slen)) {
+                JSLN(lpv, judy, (unsigned char *)keybuf);
+                continue;
+            }
             snap[n].salt = p;
-            snap[n].PV = lpv;
+            snap[n].PV = Confirm_keyon == 1 ? confirm_shadow_pv(lpv) : lpv;
             snap[n].saltlen = slen;
             snap[n].hashsalt = NULL;
             p += slen + 1;
             n++;
         }
         JSLN(lpv, judy, (unsigned char *)keybuf);
+    }
+    if (Confirm_keyon == 1 && n == 0) {
+        fprintf(stderr, "FATAL %s:%d: confirming a GPU hit: its salt is not loaded\n",
+                __FILE__, __LINE__);
+        exit(1);
     }
     return n;
 }
@@ -13595,9 +13917,13 @@ int build_hashsalt_snapshot(struct saltentry *snap, char *pool,
     JSLF(lpv, judy, (unsigned char *)keybuf);
     while (lpv) {
         se = (struct saltentry *)*lpv;
-        if (printall || *(se->PV) > 0) {
+        if (Confirm_keyon == 1 && !CONFIRM_KEY_IS((unsigned char *)se->salt, se->saltlen)) {
+            JSLN(lpv, judy, (unsigned char *)keybuf);
+            continue;
+        }
+        if (printall || *(se->PV) > 0 || Confirm_keyon == 1) {
             snap[n].salt = se->salt;
-            snap[n].PV = se->PV;
+            snap[n].PV = Confirm_keyon == 1 ? confirm_shadow_pv(se->PV) : se->PV;
             snap[n].saltlen = se->saltlen;
             snap[n].hashsalt = se->hashsalt;
             snap[n].hashlen = se->hashlen;
@@ -13607,6 +13933,11 @@ int build_hashsalt_snapshot(struct saltentry *snap, char *pool,
             n++;
         }
         JSLN(lpv, judy, (unsigned char *)keybuf);
+    }
+    if (Confirm_keyon == 1 && n == 0) {
+        fprintf(stderr, "FATAL %s:%d: confirming a GPU hit: its salt is not loaded\n",
+                __FILE__, __LINE__);
+        exit(1);
     }
     return n;
 }
@@ -14510,7 +14841,10 @@ static int gpu_rules_cover(int op)
   case JOB_SNE128MD5PASS: case JOB_SNE256MD5PASS:
     return 1;
   }
-  return 0;
+  /* The generic hx walker's types run in the template carrier, whose rules
+   * the hand types above already prove.  Each type is checked GPU against
+   * -G none with rules before its stage ships. */
+  return gpu_hx_generic(op);
 }
 #endif
 
@@ -14539,7 +14873,624 @@ static void md5salt_lane_iter(union HashU *curin, const uint32_t *h0,
 }
 #endif
 
+/* Start the confirm thread and its pool. Called once, before any procjob or
+ * GPU worker runs, when the generic walker has a GPU type. */
+void confirm_start(void)
+{
+  int i;
+  if (!Confirm_enabled) return;
+  ConfirmJobs = calloc(CONFIRM_POOL + 1, sizeof(struct job));
+  ConfirmExtra = calloc(CONFIRM_POOL + 1, sizeof(struct confirm_extra));
+  if (!ConfirmJobs || !ConfirmExtra) {
+    fprintf(stderr, "FATAL %s:%d: out of memory for the confirm pool\n", __FILE__, __LINE__);
+    exit(1);
+  }
+  ConfirmWaiting = new_lock(0);
+  ConfirmFreeWaiting = new_lock(CONFIRM_POOL + 1);
+  for (i = 0; i <= CONFIRM_POOL; i++) {
+    *ConfirmFreeTail = &ConfirmJobs[i];
+    ConfirmFreeTail = &ConfirmJobs[i].next;
+  }
+  launch(procjob, &Confirm_queue_tag);
+}
+
+static struct job *confirm_take(void)
+{
+  struct job *job;
+  possess(ConfirmFreeWaiting);
+  wait_for(ConfirmFreeWaiting, NOT_TO_BE, 0);
+  job = ConfirmFreeHead;
+  ConfirmFreeHead = job->next;
+  if (ConfirmFreeHead == NULL) ConfirmFreeTail = &ConfirmFreeHead;
+  job->next = NULL;
+  twist(ConfirmFreeWaiting, BY, -1);
+  return job;
+}
+
+static void confirm_post(struct job *job)
+{
+  possess(ConfirmWaiting);
+  *ConfirmTail = job;
+  ConfirmTail = &job->next;
+  twist(ConfirmWaiting, BY, +1);
+}
+
+/* Stop it: after the GPU has finished, so every replay has enqueued, and
+ * before join_all. JOB_DONE stays at the head of its queue, so the confirms
+ * ahead of it all run first. */
+void confirm_stop(void)
+{
+  struct job *job;
+  if (!Confirm_enabled) return;
+  job = confirm_take();
+  job->op = JOB_DONE;
+  job->flags = 0;
+  confirm_post(job);
+}
+
+/* Hand one GPU hit to the type's own CPU code. plain is the exact candidate
+ * the device hashed; key is the hit's salt or user (keykind 1 or 2), or
+ * none; digest is the stored form the device matched, for the check at the
+ * end; iter is the depth it matched at. Blocks only on the confirm pool, which
+ * the confirm thread drains without ever waiting on the GPU. */
+static void confirm_enqueue_x(int op, const char *plain, int plen, int ruleindex,
+                              const unsigned char *key, int keylen, int keykind,
+                              const unsigned char *digest, int dlen, int iter,
+                              int oracle);
+void cpu_confirm_enqueue(int op, const char *plain, int plen, int ruleindex,
+                         const unsigned char *key, int keylen, int keykind,
+                         const unsigned char *digest, int dlen, int iter)
+{
+  confirm_enqueue_x(op, plain, plen, ruleindex, key, keylen, keykind,
+                    digest, dlen, iter, 0);
+}
+
+static void confirm_enqueue_x(int op, const char *plain, int plen, int ruleindex,
+                              const unsigned char *key, int keylen, int keykind,
+                              const unsigned char *digest, int dlen, int iter,
+                              int oracle)
+{
+  struct job *job;
+  struct confirm_extra *x;
+  if (plen < 0 || plen > MAXLINE || keylen < 0 || keylen > MAXLINE ||
+      dlen < 0 || dlen > (int)sizeof x->digest) {
+    fprintf(stderr, "FATAL %s:%d: confirm of a GPU hit for %s: plaintext %d, key %d "
+            "or digest %d bytes is out of range\n", __FILE__, __LINE__,
+            TYPENAME(op), plen, keylen, dlen);
+    exit(1);
+  }
+  job = confirm_take();
+  x = &ConfirmExtra[job - ConfirmJobs];
+  memcpy(x->plain, plain, plen);
+  x->plain[plen] = 0;
+  memset(&x->li, 0, sizeof x->li);
+  x->li.len = plen;
+  x->keykind = key ? keykind : 0;
+  x->keylen = key ? keylen : 0;
+  if (key) memcpy(x->key, key, keylen);
+  x->dlen = digest ? dlen : 0;
+  if (digest) memcpy(x->digest, digest, dlen);
+  x->iter = iter;
+  x->oracle = oracle;
+  job->op = op;
+  job->flags = JOBFLAG_CONFIRM;
+  job->readbuf = x->plain;
+  job->readindex = &x->li;
+  job->filename = NULL;
+  job->doneprint = NULL;
+  job->startline = 0;
+  job->numline = 1;
+  job->Numbers = job->MaskIndex = job->MaskCount = 0;
+  job->digits = 0;
+  job->Ruleindex = ruleindex;
+  job->bf_offset_per_word = job->bf_num_masks = job->bf_inner_iter = 0;
+  job->bf_fast_eligible = 0;
+  confirm_post(job);
+}
+
+__thread char *Typedone_sink;
+__thread unsigned Typedone_sink_op;
+static __thread char Typedone_sink_val;
+
+static void confirm_begin(struct job *job)
+{
+  struct confirm_extra *x = &ConfirmExtra[job - ConfirmJobs];
+  Typedone_sink = NULL;
+  Typedone_sink_val = TYPEDONE(job->op);
+  Typedone_sink_op = (unsigned)job->op;
+  Typedone_sink = &Typedone_sink_val;
+  Confirm_nshadow = 0;
+  Confirm_hits = 0;
+  Confirm_keyon = x->keykind;
+  Confirm_key = x->key;
+  Confirm_keylen = x->keylen;
+}
+
+/* A confirm that matched nothing is a GPU fault, unless this type already
+ * holds the hash the device matched: found earlier from another candidate. */
+static void confirm_finish(struct job *job, unsigned int nfound)
+{
+  struct confirm_extra *x = &ConfirmExtra[job - ConfirmJobs];
+  int hits = Confirm_hits, fatal = 0;
+  Typedone_sink = NULL;     /* the real flag again */
+  confirm_shadow_settle();  /* the salt's real refcount, as the job left it */
+  Confirm_keyon = 0;
+  if (x->oracle) goto give_back;   /* a capture matches nothing by design */
+  if (!hits && !TYPEDONE(job->op)) {
+    if (x->dlen) {
+      int hl;
+      unsigned short *fl;
+      int present = hybrid_check(x->digest, x->dlen, &hl, &fl);
+      fatal = !present || *fl != (unsigned short)job->op;
+    } else {
+      fatal = 1;   /* no digest to check against: an unconfirmed hit */
+    }
+  }
+  if (fatal) {
+    int i;
+    fprintf(stderr, "FATAL %s:%d: the GPU reported a hit for %s that its CPU code "
+            "does not confirm: candidate $HEX[", __FILE__, __LINE__, TYPENAME(job->op));
+    for (i = 0; i < x->li.len; i++) fprintf(stderr, "%02x", (unsigned char)x->plain[i]);
+    fprintf(stderr, "]");
+    if (x->keykind) {
+      fprintf(stderr, " %s $HEX[", x->keykind == 1 ? "salt" : "user");
+      for (i = 0; i < x->keylen; i++) fprintf(stderr, "%02x", x->key[i]);
+      fprintf(stderr, "]");
+    }
+    fprintf(stderr, " x%02d digest ", x->iter);
+    for (i = 0; i < x->dlen; i++) fprintf(stderr, "%02x", x->digest[i]);
+    fprintf(stderr, "\n");
+    exit(1);
+  }
+  if (nfound) {
+    possess(FreeWaiting);
+    Totfound += nfound;
+    release(FreeWaiting);
+  }
+give_back:
+  job->op = 0;
+  job->next = NULL;
+  possess(ConfirmFreeWaiting);
+  *ConfirmFreeTail = job;
+  ConfirmFreeTail = &job->next;
+  twist(ConfirmFreeWaiting, BY, +1);
+}
+
+#ifdef GPU_ENABLED
+/* ---- GPU self-test (gpujob.h) ----
+ *
+ * Hashcat's model: every kernel carries a test vector and runs it on every
+ * device before real work, and a device that misses it is not used.  Here the
+ * expected answers come from mdxfind's own CPU code rather than from a table
+ * kept by hand: at start-up each type that can reach the GPU runs its procjob
+ * case, on the confirm thread, on SELFTEST_WORDS test words -- with one real
+ * loaded salt or user when it has them, and the -n/-N mask at index 0 -- and
+ * hybrid_check records each stored form it is asked about.  Each device then
+ * runs the same words through its real dispatch, against a private compact
+ * table holding exactly those forms, before its first real batch of that
+ * type; every form must come back.
+ *
+ * The CPU is the authority because the drift checks already tie the GPU
+ * code to it, and because a hand-kept vector for each of a thousand types
+ * would drift on its own. */
+static struct selftest_op *Selftest[JOB_DONE];
+static const char *Selftest_why[JOB_DONE];
+static unsigned char *Selftest_done[GPUJOB_MAX_DEVS];
+static int Selftest_on;
+#define SELFTEST_LOCAL 2        /* local-part length of a test word under -E, -a */
+
+static void selftest_wait_idle(void)
+{
+  possess(ConfirmFreeWaiting);
+  wait_for(ConfirmFreeWaiting, TO_BE, CONFIRM_POOL + 1);
+  release(ConfirmFreeWaiting);
+}
+
+/* The salt or user the device would be handed for this op: the same choice
+ * gpu_salt_judy() makes in the workers, and the same $HEX[] decoding
+ * build_salt_snapshot() applies.  Returns 0 when the type has none. */
+static int selftest_pick_key(int op, struct selftest_op *st, char *keybuf)
+{
+  Pvoid_t J;
+  Word_t *PV;
+  int kind = 1;
+  /* the precomputed md5(salt), for the hand kernels that take it; a generic
+   * hx walker core hashes the raw salt itself */
+  if ((op == JOB_MD5_MD5SALTMD5PASS || op == JOB_SHA1_MD5_MD5SALTMD5PASS ||
+       op == JOB_SHA1_MD5_MD5SALTMD5PASS_SALT ||
+       op == JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS) && Typehashsalt && Typehashsalt[op] &&
+      !gpu_hx_generic(op)) {
+    struct saltentry *se;
+    keybuf[0] = 0;
+    JSLF(PV, Typehashsalt[op], (unsigned char *)keybuf);
+    if (!PV) return 0;
+    se = (struct saltentry *)*PV;
+    st->key = malloc(se->saltlen + 1);
+    st->hashsalt = malloc(se->hashlen + 1);
+    if (!st->key || !st->hashsalt) goto oom;
+    memcpy(st->key, se->salt, se->saltlen);
+    st->key[se->saltlen] = 0;
+    memcpy(st->hashsalt, se->hashsalt, se->hashlen);
+    st->hashsalt[se->hashlen] = 0;
+    st->keylen = se->saltlen;
+    st->hashlen = se->hashlen;
+    st->keykind = 1;
+    return 1;
+  }
+  switch (op) {
+  case JOB_HMAC_MD5: case JOB_HMAC_SHA1: case JOB_HMAC_SHA224:
+  case JOB_HMAC_SHA256: case JOB_HMAC_SHA384: case JOB_HMAC_SHA512:
+  case JOB_HMAC_RMD160: case JOB_HMAC_RMD320:
+    J = Typeuser ? TYPEUSER(op) : NULL; kind = 2; break;
+  case JOB_SHA1PASSUSERPASSUSER:
+    J = (Typeuser && TYPEUSER(op)) ? TYPEUSER(op) : UseridJudy; kind = 2; break;
+  default:
+    if (gpu_hx_generic_channel(op) == 2) {
+      J = (Typeuser && TYPEUSER(op)) ? TYPEUSER(op) : UseridJudy; kind = 2;
+    } else
+      J = Typesalt ? TYPESALT(op) : NULL;
+    break;
+  }
+  if (!J) return 0;
+  keybuf[0] = 0;
+  JSLF(PV, J, (unsigned char *)keybuf);
+  if (!PV) return 0;
+  {
+    int slen = mystrlen(keybuf);
+    st->key = malloc(slen + 1);
+    if (!st->key) goto oom;
+    if (slen > 5 && strncmp(keybuf, "$HEX[", 5) == 0) {
+      int hexlen = slen - 6;
+      if (hexlen < 0) hexlen = 0;
+      slen = get32(keybuf + 5, (unsigned char *)st->key, hexlen / 2 + 1);
+    } else {
+      memcpy(st->key, keybuf, slen);
+    }
+    st->key[slen] = 0;
+    st->keylen = slen;
+    st->keykind = kind;
+  }
+  return 1;
+oom:
+  fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test\n", __FILE__, __LINE__);
+  exit(1);
+}
+
+/* Start-up oracle.  ops[] are the selected types that can reach a GPU.  Runs
+ * after every salt structure is built (Typesaltcnt, Typehashsalt) and before
+ * any worker starts, so the confirm thread is the one thread hashing.  The
+ * pre-check is held off for the duration: it would skip hybrid_check for any
+ * stored form whose home slot in the REAL table is empty, which is all of
+ * them. */
+static int *Selftest_ops, Selftest_nops;
+
+/* nbf 0 tests the words; nbf > 0 tests brute force, whose chunks carry one
+ * empty word and a mask range: the candidates are mask indexes 0..nbf-1. */
+static void selftest_build(const int *ops, int nops, int nbf)
+{
+  static const unsigned short lens[SELFTEST_WORDS] = { 7, 31, 55, 56, 64, 119, 128 };
+  static const char abc[] =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#%&*+-./=?^_~";
+  char words[SELFTEST_WORDS][130];
+  char pre[MAX_MASK_POS + 1], app[MAX_MASK_POS + 1];
+  char *plain, *keybuf;
+  int prelen = 0, applen = 0, i, w, saved_maxiter = Maxiter;
+  int saved_precheck = Precheck_maxlen;
+  uint32_t r = 0x5eed1234u;
+
+  if (nops <= 0) return;
+  plain = malloc(MAXLINE + 16);
+  keybuf = malloc(MAXLINE + 16);
+  if (!plain || !keybuf) {
+    fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test\n", __FILE__, __LINE__);
+    exit(1);
+  }
+  for (w = 0; w < SELFTEST_WORDS; w++) {
+    for (i = 0; i < lens[w]; i++) {
+      r = r * 1103515245u + 12345u;
+      words[w][i] = abc[(r >> 16) % (sizeof abc - 1)];
+    }
+    words[w][lens[w]] = 0;
+    /* -E and -a split a word at its first '@': the rules, the mask and the
+     * -a dots act on the local part, and the domain is appended after them.
+     * A two-byte local keeps the -a dot sweep to four dottings. */
+    if (Email || EmailLocal) words[w][SELFTEST_LOCAL] = '@';
+  }
+  /* -8 routes a word by its content: one that is not all ASCII runs on the
+   * UTF-32 engine, so one test word carries a two-byte character. */
+  if (Utf32Rules) { words[1][0] = (char)0xc3; words[1][1] = (char)0xa9; }
+  /* The device applies the mask after rule 0, the no-op pass, so mask
+   * index 0 is the candidate it forms from each word. */
+  if (MaskPrependLen || MaskAppendLen) {
+    prelen = mask_expand_into(0, MaskPrependPattern, MaskPrependLen, pre);
+    applen = mask_expand_into(0, MaskAppendPattern, MaskAppendLen, app);
+  } else if (MaskLen > 0) {
+    if (MaskPrepend) prelen = mask_expand_into(0, MaskPattern, MaskLen, pre);
+    else applen = mask_expand_into(0, MaskPattern, MaskLen, app);
+  }
+  if (!Confirm_enabled) {
+    Confirm_enabled = 1;
+    confirm_start();
+  }
+  /* x01 and x02 cover both the finalize and the iterate code; deeper
+   * levels add nothing, and a large -i would multiply the capture. */
+  if (Maxiter > 2) Maxiter = 2;
+  Precheck_maxlen = -1;
+  for (i = 0; i < nops; i++) {
+    int op = ops[i], d;
+    struct selftest_op *st;
+    if (op <= 0 || op >= JOB_DONE) continue;
+    d = TYPEDIGEST_LEN(typedigest(op));
+    /* SHA-crypt: the CPU matches the stored line as text, but the device
+     * probes the compact table with the first 16 bytes of the raw digest
+     * (build_compact_table), and crypt_round captures exactly those. */
+    if (d == 0 && (op == JOB_SHA256CRYPT || op == JOB_SHA512CRYPT ||
+                   op == JOB_SHA512CRYPTMD5))
+      d = 16;
+    if (d == 0) { Selftest_why[op] = "it has no fixed-length stored form"; continue; }
+    if (d > SELFTEST_DLEN) { Selftest_why[op] = "its stored form is too long"; continue; }
+    st = calloc(1, sizeof *st);
+    if (!st) {
+      fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test\n", __FILE__, __LINE__);
+      exit(1);
+    }
+    st->op = op;
+    st->dlen = d;
+    if (!selftest_pick_key(op, st, keybuf) &&
+        (TYPEOPTS(op) & (TYPEOPT_NEEDSALT | TYPEOPT_NEEDUSER))) {
+      Selftest_why[op] = "no salt or user is loaded for it";
+      free(st);
+      continue;
+    }
+    Selftest_cap = st;
+    Selftest_cap_over = 0;
+    for (w = 0; w < (nbf ? nbf : SELFTEST_WORDS); w++) {
+      int plen;
+      if (nbf) {
+        plen = mask_expand_into((unsigned long long)w, MaskAppendPattern,
+                                MaskAppendLen, plain);
+      } else {
+        /* The CPU's order: prepend, local part, append, then the domain.
+         * Without -E or -a the whole word is the local part. */
+        int head = (Email || EmailLocal) ? SELFTEST_LOCAL : lens[w];
+        plen = prelen + lens[w] + applen;
+        memcpy(plain, pre, prelen);
+        memcpy(plain + prelen, words[w], head);
+        memcpy(plain + prelen + head, app, applen);
+        memcpy(plain + prelen + head + applen, words[w] + head, lens[w] - head);
+      }
+      st->wlen[w] = (unsigned short)plen;
+      Selftest_cap_word = w;
+      Selftest_cap_seq = 0;
+      confirm_enqueue_x(op, plain, plen, 0,
+                        st->keykind ? (const unsigned char *)st->key : NULL,
+                        st->keylen, st->keykind, NULL, 0, 0, 1);
+      selftest_wait_idle();
+    }
+    Selftest_cap = NULL;
+    if (Selftest_cap_over) {
+      Selftest_why[op] = "its CPU code compares more stored forms than the test holds";
+      free(st->key); free(st->hashsalt); free(st);
+      continue;
+    }
+    if (st->nexp == 0) {
+      Selftest_why[op] = "its CPU code matches by string, not through the compact table";
+      free(st->key); free(st->hashsalt); free(st);
+      continue;
+    }
+    /* The words in the rules-engine wire format: 2-byte little-endian
+     * length, then the bytes.  Brute force packs one empty word, as its
+     * chunks do. */
+    if (nbf) {
+      st->woff[0] = 0;
+      st->packed[0] = st->packed[1] = 0;
+      st->packed_pos = 2;
+      st->nwords = 1;
+      st->nbf = (uint32_t)nbf;
+    } else {
+      for (w = 0; w < SELFTEST_WORDS; w++) {
+        st->woff[w] = st->packed_pos;
+        st->packed[st->packed_pos++] = (char)(lens[w] & 0xff);
+        st->packed[st->packed_pos++] = (char)(lens[w] >> 8);
+        memcpy(st->packed + st->packed_pos, words[w], lens[w]);
+        st->packed_pos += lens[w];
+      }
+      st->nwords = SELFTEST_WORDS;
+    }
+    /* The private compact table, laid out exactly as the real one is
+     * (build_compact_table, load_hash_file): length recorded as is, the
+     * entry padded to a 4-byte boundary and at least 16 bytes. */
+    for (w = 0; w < st->nexp; w++) {
+      size_t pad = ((size_t)d + 3) & ~(size_t)3;
+      uint64_t key, pos;
+      uint32_t fp;
+      int p;
+      if (pad < 16) pad = 16;
+      st->hoff[w] = st->hbuf_used;
+      st->hlen[w] = (unsigned short)d;
+      memcpy(st->hbuf + st->hbuf_used, st->exp[w], d);
+      st->hbuf_used += pad;
+      key = *(uint64_t *)st->exp[w];
+      fp = (uint32_t)(key >> 32);
+      if (!fp) fp = 1;
+      pos = compact_mix(key) & (SELFTEST_SLOTS - 1);
+      for (p = 0; p < SELFTEST_SLOTS && st->cfp[pos]; p++)
+        pos = (pos + 1) & (SELFTEST_SLOTS - 1);
+      st->cfp[pos] = fp;
+      st->cidx[pos] = (uint32_t)w;
+    }
+    Selftest[op] = st;
+    Selftest_on = 1;
+  }
+  Maxiter = saved_maxiter;
+  Precheck_maxlen = saved_precheck;
+  free(plain);
+  free(keybuf);
+}
+
+void selftest_oracle(const int *ops, int nops)
+{
+  if (nops <= 0) return;
+  Selftest_ops = malloc(nops * sizeof *ops);
+  if (!Selftest_ops) {
+    fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test\n", __FILE__, __LINE__);
+    exit(1);
+  }
+  memcpy(Selftest_ops, ops, nops * sizeof *ops);
+  Selftest_nops = nops;
+  selftest_build(ops, nops, 0);
+}
+
+/* A brute-force run, known only once its mask argument is parsed, which is
+ * after selftest_oracle: its chunks never carry words, so the expectations
+ * are rebuilt in the shape the chunks have.  Called before any worker. */
+void selftest_bf(void)
+{
+  int i, n = SELFTEST_WORDS;
+  for (i = 1; i < JOB_DONE; i++) {
+    if (Selftest[i]) { free(Selftest[i]->key); free(Selftest[i]->hashsalt); free(Selftest[i]); }
+    Selftest[i] = NULL;
+    Selftest_why[i] = NULL;
+  }
+  Selftest_on = 0;
+  if (MaskAppendLen <= 0 || !Selftest_ops) return;
+  if (MaskTotal < (unsigned long long)n) n = (int)MaskTotal;
+  selftest_build(Selftest_ops, Selftest_nops, n);
+}
+
+void selftest_skip(int op, int dev, const char *backend, const char *why)
+{
+#ifdef MDXFIND_GPU_DEBUG
+  fprintf(stderr, "%s GPU[%d]: self-test e%d %s skipped: %s\n",
+          backend, dev, op, TYPENAME(op), why);
+#else
+  (void)op; (void)dev; (void)backend; (void)why;
+#endif
+}
+
+/* Called by a worker for each batch it takes.  Returns the test to run first,
+ * once per (device, type), or NULL. */
+struct selftest_op *selftest_due(int dev, int op, const struct jobg *g)
+{
+  if (!Selftest_on) return NULL;
+  if (dev < 0 || dev >= GPUJOB_MAX_DEVS || op <= 0 || op >= JOB_DONE) return NULL;
+  if (!g->packed || !g->rules_engine || g->packed_count == 0) return NULL;
+  /* A test runs only on a batch of its own shape: words or brute force. */
+  if ((g->bf_chunk || g->bf_fast_eligible) != (Selftest[op] && Selftest[op]->nbf))
+    return NULL;
+  if (!Selftest_done[dev]) {
+    Selftest_done[dev] = calloc(JOB_DONE, 1);   /* this device's worker only */
+    if (!Selftest_done[dev]) {
+      fprintf(stderr, "FATAL %s:%d: out of memory for the GPU self-test\n", __FILE__, __LINE__);
+      exit(1);
+    }
+  }
+  if (Selftest_done[dev][op]) return NULL;
+  Selftest_done[dev][op] = 1;
+  /* -k needs nothing of its own: an untagged word carries no key, and the
+   * device hashes it bare, as the oracle did. */
+  if (!Selftest[op]) {
+    selftest_skip(op, dev, "GPU", Selftest_why[op] ? Selftest_why[op] : "it was not captured");
+    return NULL;
+  }
+  return Selftest[op];
+}
+
+/* Fill a worker's private slot t with the test words, keeping everything else
+ * the real batch g would dispatch with. */
+void selftest_jobg(const struct selftest_op *st, struct jobg *t, const struct jobg *g)
+{
+  t->next = NULL;
+  t->filename = g->filename;
+  t->doneprint = g->doneprint;
+  t->packed_buf = (char *)st->packed;
+  t->word_offset = (uint32_t *)st->woff;
+  t->packed_buf_size = sizeof st->packed;
+  t->word_offset_entries = st->nwords;
+  t->op = g->op;
+  t->flags = g->flags;
+  t->count = 0;
+  t->packed = 1;
+  t->rules_engine = 1;
+  t->packed_count = st->nwords;
+  t->packed_pos = st->packed_pos;
+  t->slot_kind = g->slot_kind;
+  t->bf_inner_iter = 0;
+  t->bf_mask_start = 0;
+  if (st->nbf) {
+    /* One empty word sweeping mask indexes 0..nbf-1, on the kernel the real
+     * chunk would use. */
+    t->bf_chunk = 1;
+    t->bf_fast_eligible = g->bf_fast_eligible;
+    t->bf_offset_per_word = st->nbf;
+    t->bf_num_masks = st->nbf;
+  } else {
+    /* Mask index 0 only: the expectations were formed with it, and the
+     * whole mask would multiply the test by the keyspace. */
+    t->bf_chunk = 0;
+    t->bf_fast_eligible = 0;
+    t->bf_offset_per_word = 0;
+    t->bf_num_masks = (MaskTotal > 1) ? 1u : 0u;
+  }
+}
+
+/* Every expected stored form must be in the hit list, and nothing else.  The
+ * hit record carries the digest the device matched from word 3; the private
+ * table holds nothing but expectations, so any hit is one of them or a
+ * defect.  Returns 1 on a pass. */
+int selftest_check(const struct selftest_op *st, const uint32_t *hits, int nhits,
+                   int nhits_max, const char *backend, int dev, const char *devname)
+{
+  unsigned char got[SELFTEST_EXP];
+  int stored = nhits < nhits_max ? nhits : nhits_max;
+  int cmp = st->dlen < 16 ? st->dlen : 16;
+  int h, i, n = 0, stray = 0;
+  char host[256];
+  memset(got, 0, sizeof got);
+  if (!hits) stored = 0;
+  for (h = 0; h < stored; h++) {
+    const unsigned char *dg = (const unsigned char *)(hits + (size_t)h * GPU_HIT_STRIDE + 3);
+    for (i = 0; i < st->nexp; i++)
+      if (memcmp(dg, st->exp[i], cmp) == 0) break;
+    if (i < st->nexp) got[i] = 1;
+    else stray++;
+  }
+  for (i = 0; i < st->nexp; i++) n += got[i];
+  if (n == st->nexp && !stray) {
+#ifdef MDXFIND_GPU_DEBUG
+    fprintf(stderr, "%s GPU[%d]: self-test e%d %s: %d of %d\n",
+              backend, dev, st->op, TYPENAME(st->op), n, st->nexp);
+#endif
+    return 1;
+  }
+  mdx_gethostname(host, sizeof host);
+  fflush(stdout);
+  fprintf(stderr, "%s: %s compiler failure: self-test of e%d %s on GPU[%d] %s on %s "
+          "failed: %d of %d expected digests found, %d unexpected.",
+          "FATAL", backend, st->op, TYPENAME(st->op),
+          dev, devname ? devname : "", host, n, st->nexp, stray);
+  {
+    int shown = 0;
+    for (i = 0; i < st->nexp && shown < 6; i++)
+      if (!got[i]) {
+        fprintf(stderr, "%s length %d x%02d", shown ? "," : " Missed:",
+                st->wlen[st->expword[i]], st->expiter[i]);
+        shown++;
+      }
+  }
+  fprintf(stderr, "\nThis GPU computes wrong results for this type. "
+          "Bypass it for this algorithm with -G.\n");
+  fflush(stderr);
+  exit(1);
+}
+#endif /* GPU_ENABLED */
+
 MDXALIGN void procjob(void *dummy) {
+/* The confirm thread serves its own queue; every other worker the main one. */
+int confirm_q = (dummy == (void *)&Confirm_queue_tag);
+lock *Qwork = confirm_q ? ConfirmWaiting : WorkWaiting;
+struct job **Qhead = confirm_q ? &ConfirmHead : &WorkHead;
+struct job ***Qtail = confirm_q ? &ConfirmTail : &WorkTail;
 struct job *job;
 char *d, *s1, *s2, *s, *csalt, *cur, *curkey, eofsalt;
 char *pep = NULL, *p1 = NULL, *Outbuf;
@@ -14740,10 +15691,11 @@ int this_dot_w = -1;
 unsigned int gpu_reacquire = 0;
 #endif
 
+Confirm_thread = confirm_q;
 while (1) {
-  possess(WorkWaiting);
-  wait_for(WorkWaiting, NOT_TO_BE, 0);
-  job = WorkHead;
+  possess(Qwork);
+  wait_for(Qwork, NOT_TO_BE, 0);
+  job = *Qhead;
   if (!job || job->op == 0) {
     fprintf(stderr, "Job null in procjob\n");
     exit(1);
@@ -14760,17 +15712,18 @@ while (1) {
       my_jobg_rules = NULL;
     }
 #endif
-    release(WorkWaiting);
+    release(Qwork);
     return;
   }
 
-  WorkHead = job->next;
-  if (WorkHead == NULL)
-    WorkTail = &WorkHead;
-  twist(WorkWaiting, BY, -1);
+  *Qhead = job->next;
+  if (*Qhead == NULL)
+    *Qtail = Qhead;
+  twist(Qwork, BY, -1);
+  if (job->flags & JOBFLAG_CONFIRM) confirm_begin(job);
 
 
-  if (MDXpause) {
+  if (MDXpause && !Confirm_thread) {
     __sync_fetch_and_add(&MDXpaused_count, 1);
     while (MDXpause) sleep(2);
     __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -15138,7 +16091,7 @@ while (1) {
   }
 
   /* Track lowest active line at job start */
-  { char *fn = job->filename;
+  if (!(job->flags & JOBFLAG_CONFIRM)) { char *fn = job->filename;
     unsigned long long sl = job->startline;
     if (MDXlowest_file == NULL || fn < MDXlowest_file) {
       MDXlowest_file = fn;
@@ -15160,9 +16113,10 @@ while (1) {
       /* Sub-chunks of a split mask job share the seed lines of chunk 0, which
        * already counted them.  Line retirement is credited once; hash, found
        * and rule counts accrue per sub-job because that is real work. */
-      int _subchunk = (job->flags & JOBFLAG_MASK_SUBCHUNK) != 0;
+      /* A confirm job retires no line, and its hashes were counted on the GPU. */
+      int _subchunk = (job->flags & (JOBFLAG_MASK_SUBCHUNK | JOBFLAG_CONFIRM)) != 0;
       if (lineproc && !_subchunk) TotLines += lineproc;
-      if (hashcnt) {
+      if (hashcnt && !(job->flags & JOBFLAG_CONFIRM)) {
         Tothash += hashcnt;
         if (linehints && job->op < linehints_count)
           __sync_fetch_and_add(&LINEHINTS(job->op).hashes_accum, hashcnt);
@@ -15177,7 +16131,7 @@ while (1) {
       ltime = current;
       release(FreeWaiting);
       /* Update lowest active line and check for pause (once per second) */
-      { char *fn = job->filename;
+      if (!(job->flags & JOBFLAG_CONFIRM)) { char *fn = job->filename;
         if (MDXlowest_file == NULL || fn < MDXlowest_file) {
           MDXlowest_file = fn;
           atomic_store_explicit(&MDXlowest_line, curline, memory_order_relaxed);
@@ -15186,7 +16140,7 @@ while (1) {
           atomic_store_explicit(&MDXlowest_line, curline, memory_order_relaxed);
         }
       }
-      if (MDXpause) {
+      if (MDXpause && !Confirm_thread) {
         __sync_fetch_and_add(&MDXpaused_count, 1);
         while (MDXpause) sleep(2);
         __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -15215,8 +16169,14 @@ while (1) {
     number_iter = 0;
     rule_base_len = -1;  /* Phase 4: invalidate per-word so first rule pass takes if-branch */
     job->pass = job->line;
-    currule = Rules;
-    job->Ruleindex = 0;
+    /* A confirm job's plaintext already carries its rule; it keeps the hit's
+     * rule slot so the per-rule counts credit the rule that found it. */
+    if (job->flags & JOBFLAG_CONFIRM) {
+      currule = NULL;
+    } else {
+      currule = Rules;
+      job->Ruleindex = 0;
+    }
 #if defined(OPENCL_GPU) || defined(METAL_GPU)
     /* -k row 6: set when every (word, key) pair for this word reached the
      * device AND every rule did, which is the only case where the CPU may skip
@@ -15348,7 +16308,7 @@ while (1) {
        a high rule count overflowed and failed the enqueue with
        CL_INVALID_GLOBAL_WORK_SIZE. See the salts_per_page guard in
        gpu/gpu_opencl.c. */
-    if (gpu_rules_engine_active &&
+    if (!(job->flags & JOBFLAG_CONFIRM) && gpu_rules_engine_active &&
         (job->op == JOB_MD5 || job->op == JOB_MD5UC || job->op == JOB_MD4 ||
          job->op == JOB_SHA1 || job->op == JOB_SHA224 ||
          job->op == JOB_SHA256 ||
@@ -16000,7 +16960,10 @@ while (1) {
           * 1217 against -G none.  Declined here, the CPU walks every rule.
           * -k is served (the pack site tags the key as for any type). */
          (gpu_codegen_kernelb_family_md5pass_eligible(job->op) &&
-          !Email && !EmailLocal)) &&
+          !Email && !EmailLocal) ||
+         /* The generic hx walker: a template core like the hand types
+          * above, so -E, -a, -k, masks and rules are the template's. */
+         gpu_hx_generic(job->op)) &&
         mask_b71_eligible && salt_axis_eligible &&
         /* -E is now SERVED on the GPU (plan phase 4, 2026-10-31).  The device
          * learns each word's local-part length from word_offset bits 22-29,
@@ -16276,7 +17239,9 @@ while (1) {
           job->op != JOB_BCRYPT &&
           /* Phase 4 proto (2026-05-19): JOB_MD5MD5SALT has TYPEOPT_NEEDSALT;
            * require nsalts_job > 0 or dispatch is a structural no-op. */
-          job->op != JOB_MD5MD5SALT
+          job->op != JOB_MD5MD5SALT &&
+          /* a generic hx walker type with a salt or user channel */
+          !gpu_hx_generic_channel(job->op)
           /* Sub-phase 5a.5 (2026-05-22): the seven MAKE_MD5PASS family
            * JOBs are UNSALTED; they are NATURALLY admitted by this
            * negation list (family enums don't match any of the salted-op
@@ -16313,6 +17278,11 @@ while (1) {
          /* e1063 takes its users the way its CPU arm does: TYPEUSER, else
           * the -u pool in UseridJudy.  gpu_salt_judy() resolves the same. */
          (job->op == JOB_SHA1PASSUSERPASSUSER &&
+          (TYPEUSER(job->op) != NULL || UseridJudy != NULL)) ||
+         /* A walker type with a user channel reads the users as the
+          * CPU's user arms do (TYPEUSER, else the -u pool); its GPU worker
+          * builds the snapshot from the same place (gpu_salt_judy). */
+         (gpu_hx_generic_channel(job->op) == 2 &&
           (TYPEUSER(job->op) != NULL || UseridJudy != NULL))) &&
         len > 0 && len <= GPU_RULES_MAX_INPUT_LEN) {
       /* Maxiter > 1 is now handled by the iter loop inside
@@ -16836,7 +17806,7 @@ while (1) {
      * with no '@' to find, so el_tail would be 0 and the domain lost. With
      * both flags the -a block governs, which is the right semantics: -a
      * already implies local-part scoping. */
-    if (EmailLocal && !Email) {
+    if (EmailLocal && !Email && !(job->flags & JOBFLAG_CONFIRM)) {
       char *atp = memchr(cur, '@', len);
       el_head = atp ? (int)(atp - cur) : len;
       el_tail = len - el_head;              /* includes the '@' itself */
@@ -16896,7 +17866,11 @@ while (1) {
      * normalized LOCAL PART, and the domain is restored by the one -E rejoin
      * at the key-axis seam.  The dot axis inserts into whatever the rule left
      * in job->line. */
-    if (Email) {
+    if (job->flags & JOBFLAG_CONFIRM) {
+      /* the plaintext is final: no dot axis, and nothing to rejoin */
+      emailpow = emaillen = 0;
+      el_head = len; el_tail = 0;
+    } else if (Email) {
       int nl = 0;
       emailpow = emaillen = 0;
       d = Origline;
@@ -17291,6 +18265,8 @@ curkey = keys_packed_by_gpu ? Keys_end : Keys;
 #else
 curkey = Keys;
 #endif
+/* A confirm job's plaintext already carries its key: hash it bare. */
+if (job->flags & JOBFLAG_CONFIRM) curkey = NULL;
 
 do {
   if (curkey) {
@@ -17389,7 +18365,7 @@ do {
       }
       job->clen = len;
     }
-    if (XMLchar) {
+    if (XMLchar && !(job->flags & JOBFLAG_CONFIRM)) {
       char c;
       FastRule = 0;
       d = XMLline;
@@ -17448,7 +18424,8 @@ do {
 	job->clen = len;
       }
     }
-    if (len > 12 && cur[0] == '$' && strncmp(cur, "$TESTVEC[", 9) == 0) {
+    if (len > 12 && cur[0] == '$' && strncmp(cur, "$TESTVEC[", 9) == 0 &&
+        !(job->flags & JOBFLAG_CONFIRM)) {
       i = get32(cur + 9, (unsigned char *) linebuf, (len - 9));
       if (i > 0 && i < (MAXLINE - 12)) {
 	s = cur + 9 + (2 * i);
@@ -18936,9 +19913,16 @@ do {
 	}
 	if (!nsalts_job) { TYPEDONE(job->op) = 1; break; }
 	{ int si;
+	/* The SHA crypts key Typesalt by setting (shacrypt_claim), so s2 has
+	 * no trailer to compare against: the whole trailer is built and the
+	 * line is looked up instead.  The other types here still key by the
+	 * full line and keep the early-out compare. */
+	int shaset = (job->op == JOB_SHA256CRYPT || job->op == JOB_SHA512CRYPT ||
+	              job->op == JOB_SHA512CRYPTMD5);
+	int cmp = (Printall == 0 && !shaset);
 	for (si = 0; si < nsalts_job; si++) {
 	  unsigned int cas;
-	  int dohex;
+	  int dohex, setlen;
 	  s2 = saltsnap[si].salt;
 	  if (s2[0] != '$') continue;
 	  s1 = saltsnap[si].salt;
@@ -18967,6 +19951,16 @@ do {
 	    continue;
 	  }
 	  saltlen = x;
+	  /* setlen: the setting printed in front of the trailer.  saltlen: the
+	   * salt characters hashed.  For the SHA crypts the key IS the setting,
+	   * through its closing '$', printed as written; crypt(3) hashes only
+	   * its first 16 salt characters, as the GPU kernel does. */
+	  setlen = saltlen + i + 1;
+	  if (shaset) {
+	    setlen = saltsnap[si].saltlen;
+	    saltlen = setlen - i - 1;
+	    if (saltlen > 16) saltlen = 16;
+	  }
 	  memmove(linebuf, cur, len);
 	  memmove(linebuf + len, s1, saltlen);
 	  memmove(linebuf + len + saltlen, cur, len);
@@ -19028,458 +20022,467 @@ do {
 	  }
 #endif
 	  hashcnt += rounds;
-	  y = saltlen + i + 1;
+#ifdef GPU_ENABLED
+	  /* GPU self-test: the device probes with the first 16 bytes of this
+	   * raw digest, which is what build_compact_table decodes a stored
+	   * trailer back to. */
+	  if (__builtin_expect(Selftest_cap != NULL, 0)) {
+	    selftest_capture(curin.h);
+	    continue;
+	  }
+#endif
+	  y = setlen;
 	  if (cryptlen == 64) {
 	    cas = (curin.h[0] << 16) | (curin.h[21] << 8) | curin.h[42];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[22] << 16) | (curin.h[43] << 8) | curin.h[1];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[44] << 16) | (curin.h[2] << 8) | curin.h[23];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[3] << 16) | (curin.h[24] << 8) | curin.h[45];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[25] << 16) | (curin.h[46] << 8) | curin.h[4];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[47] << 16) | (curin.h[5] << 8) | curin.h[26];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[6] << 16) | (curin.h[27] << 8) | curin.h[48];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[28] << 16) | (curin.h[49] << 8) | curin.h[7];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    cas = (curin.h[50] << 16) | (curin.h[8] << 8) | curin.h[29];
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-	    if (Printall == 0 && mdbuf[y] != s2[y])
+	    if (cmp && mdbuf[y] != s2[y])
 	      continue;
 	    y++;
 	    mdbuf[y] = phpitoa64[cas & 0x3f];
 	    cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[9] << 16) | (curin.h[30] << 8) | curin.h[51];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[31] << 16) | (curin.h[52] << 8) | curin.h[10];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[53] << 16) | (curin.h[11] << 8) | curin.h[32];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[12] << 16) | (curin.h[33] << 8) | curin.h[54];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[34] << 16) | (curin.h[55] << 8) | curin.h[13];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[56] << 16) | (curin.h[14] << 8) | curin.h[35];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[15] << 16) | (curin.h[36] << 8) | curin.h[57];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[37] << 16) | (curin.h[58] << 8) | curin.h[16];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[59] << 16) | (curin.h[17] << 8) | curin.h[38];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[18] << 16) | (curin.h[39] << 8) | curin.h[60];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[40] << 16) | (curin.h[61] << 8) | curin.h[19];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[62] << 16) | (curin.h[20] << 8) | curin.h[41];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = curin.h[63];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                   }
@@ -19487,232 +20490,240 @@ do {
                     cas = (curin.h[0] << 16) | (curin.h[10] << 8) | curin.h[20];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[21] << 16) | (curin.h[1] << 8) | curin.h[11];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[12] << 16) | (curin.h[22] << 8) | curin.h[2];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[3] << 16) | (curin.h[13] << 8) | curin.h[23];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[24] << 16) | (curin.h[4] << 8) | curin.h[14];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[15] << 16) | (curin.h[25] << 8) | curin.h[5];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[6] << 16) | (curin.h[16] << 8) | curin.h[26];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[27] << 16) | (curin.h[7] << 8) | curin.h[17];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[18] << 16) | (curin.h[28] << 8) | curin.h[8];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[9] << 16) | (curin.h[19] << 8) | curin.h[29];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     cas = (curin.h[31] << 8) | curin.h[30];
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                     mdbuf[y] = phpitoa64[cas & 0x3f];
                     cas >>= 6;
-                    if (Printall == 0 && mdbuf[y] != s2[y])
+                    if (cmp && mdbuf[y] != s2[y])
                       continue;
                     y++;
                   }
                   mdbuf[y] = 0;
-                  memmove(mdbuf, s2, saltlen + i + 1);
+                  memmove(mdbuf, s2, setlen);
+                  /* SHA crypts: the built line is a find only if it was
+                   * loaded, and a print only if this caller claims it. */
+                  if (shaset && Printall == 0) {
+                    if (!shacrypt_claim(job->op, mdbuf)) continue;
+                    if (*saltsnap[si].PV == 0) {
+                      saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                    }
+                  }
                   job->pass[job->clen] = 0;
                   for (dohex = j = 0; j < job->clen; j++) {
                     if ((signed char) (job->pass[j]+1) < '!' || job->pass[j] == ':') {
@@ -19722,7 +20733,7 @@ do {
                   }
                   if (job->clen > 5 && strncmp(job->pass, "$HEX[", 5) == 0)
                     dohex = 1;
-                  if (Printall == 0) {
+                  if (cmp) {
                     /* Claim, not just decrement: this snapshot can predate
                      * another thread's find of the same hash, and both
                      * would print it. */
@@ -21353,7 +22364,7 @@ sha512salt_s:
                   linebuf[40] = cur[0];
                   mysha1((char *)linebuf, len + 40, curin.h);
                 }
-                if (MDXpause) {
+                if (MDXpause && !Confirm_thread) {
                   __sync_fetch_and_add(&MDXpaused_count, 1);
                   while (MDXpause) sleep(2);
                   __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -23994,14 +25005,28 @@ md4utf16:
 		  linebuf[32] = ':';
 		  memmove(s,s1,i);
 		  s[i] = 0;
-                  mysha1(linebuf, len + i+1, mdcur[0].h);
-                  mysha1(linebuf, len + i, mdcur[2].h);
-                  mysha1(linebuf, len + 1, mdcur[3].h);
+                  mysha1(linebuf, 32 + i + 1, mdcur[0].h);
+                  /* sha1(md5hex . ":" . salt without its last byte): real
+                   * stored hashes take this form (30 distinct in the archive,
+                   * 3-byte salts, outer salt cut by one), so it stays as an
+                   * alternate beside the others. */
+                  mysha1(linebuf, 32 + i, mdcur[5].h);
+                  /* sha1(salt . ":" . md5hex . ":" . salt).  Not newbuf: for
+                   * e591 cur IS newbuf and is re-read for the next salt. */
+                  { char *ds = linebuf + MAXLINE;
+                  fastcopy(ds, s1, i);
+                  ds[i] = ':';
+                  fastcopy(ds + i + 1, linebuf, 32);
+                  ds[i + 33] = ':';
+                  fastcopy(ds + i + 34, s1, i);
+                  mysha1(ds, 2 * i + 34, mdcur[2].h);
+                  }
+                  mysha1(linebuf, 32 + 1, mdcur[3].h);
 		  s = linebuf+32;
 		  memmove(s,s1,i);
 		  s[i] = 0;
-                  mysha1(linebuf, len + i, mdcur[1].h);
-                  hashcnt += 5;
+                  mysha1(linebuf, 32 + i, mdcur[1].h);
+                  hashcnt += 6;
                   for (x = 1; x <= Maxiter; x++) {
                     hashcnt++;
                     if (checkhashsalt(&mdcur[0], 40, s1, saltlen, x, job)) {
@@ -24028,7 +25053,15 @@ md4utf16:
                         saltsnap[si] = saltsnap[--nsalts_job]; si--;
                       }
                     }
+		    if (checkhashsalt(&mdcur[5], 40, s1, saltlen, x, job)) {
+                      PV_DEC(saltsnap[si].PV);
+                      if (!Printall && *saltsnap[si].PV == 0) {
+                        saltsnap[si] = saltsnap[--nsalts_job]; si--;
+                      }
+                    }
                     if (x < Maxiter) {
+                      prmd5_40(mdcur[5].h, linebuf2);
+                      mysha1((char *)linebuf2, 40, mdcur[5].h);
                       prmd5_40(mdcur[0].h, linebuf2);
                       mysha1((char *)linebuf2, 40, mdcur[0].h);
                       prmd5_40(mdcur[1].h, linebuf2);
@@ -24042,7 +25075,7 @@ md4utf16:
                   for (y = 9; y < 127; y++) {
                     if (y == 10) y = ' ';
 		    s[0] = y;
-                    mysha1(linebuf, len + 1, mdcur[4].h);
+                    mysha1(linebuf, 32 + 1, mdcur[4].h);
 		    for (x = 1; x <= Maxiter; x++) {
 		      hashcnt++;
 		      if (checkhashsalt(&mdcur[4], 40, s1, saltlen, x, job)) {
@@ -24677,9 +25710,7 @@ sha1_truncsalt:
 
 	      case JOB_SHA1MD5SALTPASSPEPPER:
 	      if (TYPEDONE(job->op)) break;
-	      pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
-	      if (!pep)
-	        pep = "\x01:\x00\xff";
+	      pep = (char *)type_pepper_list(job->op);
 	      while (*pep != eofsalt) {
 	        peplen = (signed char)(*pep++);
 		p1 = pep;
@@ -24758,9 +25789,7 @@ sha1_truncsalt:
               y = 32;
 SHA1_saltpepper:
 	      if (TYPEDONE(job->op)) break;
-	      pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
-	      if (!pep) 
-	        pep = "\x01:\x00\xff";
+	      pep = (char *)type_pepper_list(job->op);
 	      while (*pep != eofsalt) {
 	        peplen = (signed char)(*pep++);
 		p1 = pep;
@@ -24807,9 +25836,7 @@ SHA1_saltpepper:
 	        
 
               case JOB_SHA1_MD5PEPPER_MD5SALTMD5PASS:
-	      pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
-	      if (!pep)
-	        pep = "\x08@gmail.c\x00\xff";
+	      pep = (char *)type_pepper_list(job->op);
 morepep:
 		if (*pep == eofsalt)
 		   break;
@@ -29867,9 +30894,7 @@ sha11saltmd5:
                 /* md5($salt1.strtoupper(md5($salt2.$pass))) */
                 if (len > MAXLINE)
                   break;
-                pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
-                if (!pep)
-                  pep = "\x09""182719643\0\xff";
+                pep = (char *)type_pepper_list(job->op);
                 while (*pep != eofsalt) {
                   peplen = (signed char)(*pep++);
                   p1 = pep;
@@ -30257,16 +31282,14 @@ sha11saltmd5:
               case JOB_SHA1_MD5MD5SALT:
               case JOB_SHA1_MD5MD5SALT_CR:
                 mymd5(cur, len, curin.h);
-                cur = prmd5_32(curin.h, tline );
+                cur = prmd5_32(curin.h, (char *)wline);  /* NOT tline: that is the rule engine input */
                 len = 32;
 
               case JOB_SHA1_MD5CAPPEPPER_MD5SALT:
 	      case JOB_SHA1_MD5PEPPER_MD5SALT:
 	      case JOB_SHA1_PEPPER_MD5SALT:
 
-		pep = Typepepper[job->op]; if (!pep) pep = combo_pepper;
-		if (!pep) 
-		  pep = "\x08@gmail.c\x00\xff";
+		pep = (char *)type_pepper_list(job->op);
 morepep1:
 		if (*pep == eofsalt) 
 		   break;
@@ -30371,7 +31394,8 @@ sha1md5salt:
                 }
 		if (job->op == JOB_SHA1_MD5PEPPER_MD5SALT ||
 		    job->op == JOB_SHA1_MD5CAPPEPPER_MD5SALT ||
-		    job->op == JOB_SHA1_MD5PEPPER_MD5MD5SALT) 
+		    job->op == JOB_SHA1_MD5PEPPER_MD5MD5SALT ||
+		    job->op == JOB_SHA1_PEPPER_MD5SALT)
 		  goto morepep1;
                 break;
 
@@ -30589,7 +31613,7 @@ MD5SALTstart:
                 pcnt = 0;
                 pcnt2 = 0;
                 for (si = 0; si < nsalts_job; si++) {
-                  if (MDXpause) {
+                  if (MDXpause && !Confirm_thread) {
                     __sync_fetch_and_add(&MDXpaused_count, 1);
                     while (MDXpause) sleep(2);
                     __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -30763,7 +31787,7 @@ MD5SALTstart:
 #else
               /* Scalar CPU salt loop (non-NEON ARM) */
               for (si = 0; si < nsalts_job; si++) {
-                if (MDXpause) {
+                if (MDXpause && !Confirm_thread) {
                   __sync_fetch_and_add(&MDXpaused_count, 1);
                   while (MDXpause) sleep(2);
                   __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -30839,7 +31863,7 @@ MD5SALTstart:
                   pcnt = 0;
                   pcnt2 = 0;
                   for (si = 0; si < nsalts_job; si++) {
-                    if (MDXpause) {
+                    if (MDXpause && !Confirm_thread) {
                       __sync_fetch_and_add(&MDXpaused_count, 1);
                       while (MDXpause) sleep(2);
                       __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -33942,7 +34966,7 @@ md5sha256:
                   }
 		  if (currule) {
                   while (*((unsigned short int *)currule)) {
-                    if (MDXpause) {
+                    if (MDXpause && !Confirm_thread) {
                       __sync_fetch_and_add(&MDXpaused_count, 1);
                       while (MDXpause) sleep(2);
                       __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -34036,7 +35060,7 @@ md5sha256:
                   f32 = (uint32_t *) hashes;
 		  if (currule) {
                   while (*((unsigned short int *) currule)) {
-                    if (MDXpause) {
+                    if (MDXpause && !Confirm_thread) {
                       __sync_fetch_and_add(&MDXpaused_count, 1);
                       while (MDXpause) sleep(2);
                       __sync_fetch_and_sub(&MDXpaused_count, 1);
@@ -38579,7 +39603,7 @@ HAV256_5_start:
 
               case JOB_HMAC_WRL:
                 hmac_type = MHASH_WHIRLPOOL;
-                hmac_len = 64;
+                hmac_len = 128;
                 goto HMAC_start;
 
               case JOB_HMAC_SNE128:
@@ -41093,7 +42117,10 @@ HAV256_5_start:
 
               case JOB_CRAMMD5_DOVECOT:
                 /* CRAM-MD5 Dovecot (16400): MD5 intermediate state of (password XOR opad)
-                 * No salt. JudyJ key = 32-hex lowercase hash.
+                 * followed by that of (password XOR ipad). Only the opad half is
+                 * compared, as hashcat does. A hit prints the record as loaded
+                 * (CramDovecot); -z prints both computed halves.
+                 * No salt. JudyJ key = 32-hex lowercase opad state.
                  * Buffer layout:
                  *   tsalt[0..63]    opad block (64 bytes)
                  *   tsalt[64..127]  sph_md5_context (~80 bytes)
@@ -41116,7 +42143,21 @@ HAV256_5_start:
                   Word_t *PV2;
                   JSLG(PV2, JUDYJ(JOB_CRAMMD5_DOVECOT), (unsigned char *)mdbuf);
                   if (Printall || (PV2 && (Contfound || PV_TAKE(PV2)))) {
-                    snprintf(linebuf, MAXLINE, "{CRAM-MD5}%s00000000000000000000000000000000", mdbuf);
+                    Word_t *PV3 = NULL;
+                    if (!Printall) JSLG(PV3, CramDovecot, (unsigned char *)mdbuf);
+                    if (PV3 && *PV3) {
+                      snprintf(linebuf, MAXLINE, "%s", (char *)*PV3);
+                    } else {
+                      /* -z: the ipad state, as Dovecot stores it */
+                      for (x = 0; x < 64; x++)
+                        dc_opad[x] = (x < len ? (unsigned char)cur[x] : 0) ^ 0x36;
+                      sph_md5_init(dc_ctx);
+                      sph_md5(dc_ctx, dc_opad, 64);
+                      memcpy(curin.h, dc_ctx->val, 16);
+                      prmd5_32(curin.h, mdbuf + 32);
+                      mdbuf[64] = 0;
+                      snprintf(linebuf, MAXLINE, "{CRAM-MD5}%s", mdbuf);
+                    }
                     if (!Printall) *PV2 = 1;
                     prfound(job, linebuf);
                   }
@@ -44364,7 +45405,7 @@ HAV256_5_start:
                 break;
 
               case JOB_EMPIRECMS:
-                /* Empire CMS (32300): md5(salt2+"E!m^p-i(r#e.C:M?S"+md5hex(md5(md5hex(pass)+salt1))+"d)i.g^o-d"+salt1)
+                /* Empire CMS (32300): md5(salt2+"E!m^p-i(r#e.C:M?S"+md5hex(md5hex(pass)+salt1)+"d)i.g^o-d"+salt1)
                  * Format: 32hex:salt1:salt2
                  * Typesalt = "salt1:salt2", JudyJ key = lowercase 32-hex
                  * Buffer layout:
@@ -45699,6 +46740,14 @@ gpu_packed_done: ;
 #endif /* OPENCL_GPU || METAL_GPU */
 #endif
     if (job->outlen) { fwrite(job->outbuf,job->outlen,1,stdout); fflush(stdout);}
+    if (job->flags & JOBFLAG_CONFIRM) {
+      /* Its readbuf is the pool's own, its salt count is a filtered one, and
+       * it retires no line: check it, credit its finds, return it. */
+      if (rhash_con) { rhash_free(rhash_con); rhash_con = NULL; }
+      confirm_finish(job, found);
+      lineproc = hashcnt = rulecnt = found = 0;
+      continue;
+    }
     { lock *rl = readbuf_lock(job->readbuf); possess(rl); twist(rl, BY, -1); }
 
     switch (job->op) {

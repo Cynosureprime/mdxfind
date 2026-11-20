@@ -160,6 +160,14 @@ mdxfind.o: mdxfind.c mdxint.h mdxfind.h job_types.h gpujob.h sqlite3.h
 mdxmain.o: mdxmain.c mdxint.h mdxfind.h job_types.h gpujob.h sqlite3.h
 	$(CC) $(CFLAGS) -c mdxmain.c
 
+# These objects include codegen/hx_spec_entry.h, directly or through mdxint.h,
+# and make does not follow includes: without this line a change to that struct
+# relinks objects built against the old layout, and the binary crashes.
+mdxfind.o mdxmain.o userdef.o: codegen/hx_spec_entry.h
+
+# mdxmain.c plans and emits the generic hx walker cores (codegen/Makefile.frag).
+mdxmain.o: codegen/hx_plan.h codegen/hx_gen.h
+
 sqlite3.o: sqlite3.c sqlite3.h
 	$(CC) -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -c sqlite3.c
 

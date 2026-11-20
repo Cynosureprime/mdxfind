@@ -255,6 +255,7 @@ extern int EmailLocal;
  * 5a-eligible MAKE_MD5PASS family JOB enums (e122/e159/e161/e163/
  * e165/e167/e169) alongside JOB_MD5MD5SALT. */
 #include "gpu/gpu_codegen_eligible.h"
+#include "codegen/hx_gen.h"   /* the generic hx walker's dialect */
 
 /* ---- Wire-format invariant: redeclare OCLParams (host-only) ---- */
 
@@ -2191,6 +2192,79 @@ int gpu_metal_set_compact_table(int dev_idx,
     return 0;
 }
 
+/* GPU self-test: bind a private compact table for one dispatch, then put the
+ * real one back.  The dispatch paths read the table, its shape and the dedup
+ * buffer from these statics, and all of them are swapped here.
+ * buf_hashes_shown is left nil so the dispatch allocates and zeroes a fresh
+ * one; the emission audit counter is saved and zeroed, so the audit settled
+ * at the end checks the test's own dedup claims against its own records. */
+static id<MTLBuffer> st_fp, st_idx, st_data, st_off, st_len, st_shown;
+static size_t   st_shown_cap;
+static uint64_t st_mask, st_audit;
+static uint32_t st_count;
+static int      st_overflow, st_on;
+
+void gpu_metal_selftest_begin(int dev_idx,
+    const uint32_t *cfp, const uint32_t *cidx, uint64_t csize, uint64_t cmask,
+    const unsigned char *hbuf, size_t hbuf_size,
+    const size_t *hoff, size_t count, const unsigned short *hlen)
+{
+    uint64_t off64[256];
+    if (dev_idx != 0 || st_on || count == 0 || count > 256)
+        GPU_FATAL("Metal self-test begin: GPU[%d] (on=%d, %zu entries)", dev_idx, st_on, count);
+    for (size_t i = 0; i < count; i++) off64[i] = hoff[i];
+    st_fp = buf_compact_fp;     st_idx = buf_compact_idx;
+    st_data = buf_hash_data;    st_off = buf_hash_data_off;
+    st_len = buf_hash_data_len; st_shown = buf_hashes_shown;
+    st_shown_cap = mtl_buf_kernelb_hashes_shown_cap;
+    st_mask = cache_compact_mask; st_count = cache_hash_data_count;
+    st_overflow = cache_overflow_count;
+    st_audit = mtl_audit_hits_delivered;
+    st_on = 1;
+    @autoreleasepool {
+        size_t pad = hbuf_size < METAL_MIN_BUFFER_BYTES ? METAL_MIN_BUFFER_BYTES : hbuf_size;
+        unsigned char *hb = (unsigned char *)calloc(1, pad);
+        if (!hb) GPU_FATAL("Metal self-test begin: calloc(%zu)", pad);
+        memcpy(hb, hbuf, hbuf_size);
+        buf_compact_fp = [mtl_device newBufferWithBytes:cfp length:csize * sizeof(uint32_t)
+                                                options:MTLResourceStorageModeShared];
+        buf_compact_idx = [mtl_device newBufferWithBytes:cidx length:csize * sizeof(uint32_t)
+                                                 options:MTLResourceStorageModeShared];
+        buf_hash_data = [mtl_device newBufferWithBytes:hb length:pad
+                                               options:MTLResourceStorageModeShared];
+        buf_hash_data_off = [mtl_device newBufferWithBytes:off64 length:count * sizeof(uint64_t)
+                                                   options:MTLResourceStorageModeShared];
+        buf_hash_data_len = [mtl_device newBufferWithBytes:hlen length:count * sizeof(unsigned short)
+                                                   options:MTLResourceStorageModeShared];
+        free(hb);
+        if (buf_compact_fp == nil || buf_compact_idx == nil || buf_hash_data == nil ||
+            buf_hash_data_off == nil || buf_hash_data_len == nil)
+            GPU_FATAL("Metal self-test begin: private table upload failed");
+    }
+    buf_hashes_shown = nil;
+    mtl_buf_kernelb_hashes_shown_cap = 0;
+    mtl_audit_hits_delivered = 0;
+    cache_compact_mask = cmask;
+    cache_hash_data_count = (uint32_t)count;
+    cache_overflow_count = 0;
+}
+
+void gpu_metal_selftest_end(int dev_idx)
+{
+    if (dev_idx != 0 || !st_on)
+        GPU_FATAL("Metal self-test end: GPU[%d] holds no private table", dev_idx);
+    mtl_audit_settle("self-test");
+    buf_compact_fp = st_fp;     buf_compact_idx = st_idx;
+    buf_hash_data = st_data;    buf_hash_data_off = st_off;
+    buf_hash_data_len = st_len; buf_hashes_shown = st_shown;
+    mtl_buf_kernelb_hashes_shown_cap = st_shown_cap;
+    cache_compact_mask = st_mask; cache_hash_data_count = st_count;
+    cache_overflow_count = st_overflow;
+    mtl_audit_hits_delivered = st_audit;
+    st_fp = st_idx = st_data = st_off = st_len = st_shown = nil;
+    st_on = 0;
+}
+
 int gpu_metal_set_overflow(int dev_idx,
     const uint64_t *keys, const unsigned char *hashes,
     const uint32_t *offsets, const uint16_t *lengths, int count)
@@ -2285,7 +2359,10 @@ void gpu_metal_set_max_iter(int dev_idx, int max_iter)
  * only (the carriers' `algo_mode >= 5` gate already covers mode 6).
  * Overflow is loud (register_family prints "family registry full --
  * dropping op=") but drops families, so raise before adding. */
-#define METAL_FAMILY_CAP 96
+/* 2026-11-17: 96 -> 160. The generic hx walker registers one family per
+ * walker type selected in the run (metal_register_builtin_families); a run
+ * that selects more than the headroom is FATAL there, never dropped. */
+#define METAL_FAMILY_CAP 160
 #endif
 
 static struct gpu_metal_family *metal_families[METAL_FAMILY_CAP];
@@ -4815,6 +4892,39 @@ static void metal_register_builtin_families(void)
     gpu_metal_register_family(&metal_family_hmac_sha512_kpass);  /* e797 */
     gpu_metal_register_family(&metal_family_hmac_rmd160_kpass);  /* e798 */
     gpu_metal_register_family(&metal_family_hmac_rmd320_kpass);  /* e799 */
+
+    /* The generic hx walker (stage 1a): one family per walker type in this
+     * run, its core the Metal dialect followed by the type's generated core
+     * (codegen/hx_gen.c), built by the generic loader like any family. */
+    for (int op = 0; op < JOB_DONE; op++) {
+        const char *core = gpu_hx_generic_core(op);
+        const char *dia = hx_gen_dialect(HXG_METAL);
+        struct gpu_metal_family *f;
+        char *src, *nm;
+        if (!core) continue;
+        if (metal_family_count >= METAL_FAMILY_CAP)
+            GPU_FATAL("Metal family registry full (%d) registering generic hx type e%d",
+                      METAL_FAMILY_CAP, op);
+        f = (struct gpu_metal_family *)calloc(1, sizeof *f);
+        src = (char *)malloc(strlen(dia) + strlen(core) + 1);
+        nm = (char *)malloc(16);
+        if (!f || !src || !nm) GPU_FATAL("out of memory for the generic hx core of e%d", op);
+        strcpy(src, dia);
+        strcat(src, core);
+        snprintf(nm, 16, "hx e%d", op);
+        f->op = op;
+        f->name = nm;
+        f->op_category = GPU_CAT_MASK;
+        /* a core with a salt or user channel has only the salted variants */
+        if (gpu_hx_generic_channel(op))
+            f->supported_variants = (uint8_t)(VBIT(V_S) | VBIT(V_S | V_R) | VBIT(V_S | V_M) |
+                                              VBIT(V_S | V_R | V_M));
+        else
+            f->supported_variants = (uint8_t)(VBIT(V_NONE) | VBIT(V_R) | VBIT(V_M) | VBIT(V_R | V_M));
+        f->pso_for_variant_v2 = metal_pso_for_variant_default;
+        f->core_str = src;
+        gpu_metal_register_family(f);
+    }
 
     /* D5b Wave 1 2026-05-16: post-registration walk to populate fam_idx
      * for every registered family. The generic loader / lazy / resolver
@@ -7503,7 +7613,9 @@ uint32_t *gpu_metal_dispatch_md5_rules(int dev_idx,
                              * BCRYPT has its own bespoke 60-char crypt(3)
                              * output format. FINAL Phase 2d sub-phase --
                              * 52nd Metal family. */
-                            || op == JOB_BCRYPT));
+                            || op == JOB_BCRYPT
+                            /* a generic hx walker type with a salt or user */
+                            || gpu_hx_generic_channel(op) != 0));
 
         /* Phase 2d.2.1a: per-family struct + op-keyed resolver. Replaces
          * the Phase 2c 9-arm if/else cascade. variant_bits encodes the

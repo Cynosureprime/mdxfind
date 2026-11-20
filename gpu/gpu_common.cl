@@ -2294,8 +2294,12 @@ __attribute__((noinline)) void wrl_block(ulong *hash, ulong *p_block) {
  * from the CPU donor ahead of the emitter that will use them, so they are
  * gated rather than deleted, and they are still compiled into every program
  * that does NOT set GPU_COMMON_LEAN.
+ *
+ * A lean program that calls tiger_block opts back in with
+ * GPU_COMMON_WANT_TIGER: the generic hx walker does, for a type with a Tiger
+ * body (gpu_hxg_kernel in gpu_opencl.c), and pays these 8 KB alone.
  * -------------------------------------------------------------------- */
-#ifndef GPU_COMMON_LEAN
+#if !defined(GPU_COMMON_LEAN) || defined(GPU_COMMON_WANT_TIGER)
 // Constant memory budget: 4 * 256 * 8 = 8 KB (TIGER_SBOX). Combined
 // with WRL_SBOX (16 KB) and WRL_RC (80 B) post-Tier-2 total is ~24 KB
 // of `__constant`; Pascal GTX 1080 and Apple Silicon M2 Max both
@@ -2663,7 +2667,7 @@ __attribute__((noinline)) void tiger_block(ulong *state, ulong *M) {
     state[1] = b - state[1];
     state[2] = c + state[2];
 }
-#endif  /* !GPU_COMMON_LEAN -- TIGER */
+#endif  /* !GPU_COMMON_LEAN || GPU_COMMON_WANT_TIGER -- TIGER */
 
 // Phase 5b Tier 3 sub-phase 5b.3a.1 (2026-05-27): lift haval3_block from
 // mhash-0.9.9.9/lib/haval.c havalTransform3 lines 113-241. Public-domain
@@ -3358,7 +3362,7 @@ __attribute__((noinline)) void haval5_block(uint *state, const uint *M) {
  * gated rather than deleted, and they are still compiled into every program
  * that does NOT set GPU_COMMON_LEAN.
  * -------------------------------------------------------------------- */
-#ifndef GPU_COMMON_LEAN
+#if !defined(GPU_COMMON_LEAN) || defined(GPU_COMMON_WANT_SNEFRU)
 // Constant memory budget: SNEFRU_SBOX = 4096 * 4 = 16 KB `__constant`.
 // Cumulative post-Tier-3 (~26-27 KB) + 16 KB = ~42-43 KB of the 64 KB
 // Pascal / Apple Silicon CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE budget; fits
@@ -4133,7 +4137,7 @@ __attribute__((noinline)) void snefru_block(uint *state, const uchar *block,
     }
 }
 #undef SNEFRU_BE32
-#endif  /* !GPU_COMMON_LEAN -- SNEFRU */
+#endif  /* !GPU_COMMON_LEAN || GPU_COMMON_WANT_SNEFRU -- SNEFRU */
 
 /* ---- GOST R 34.11-94 block function (legacy, TEST S-box set) ----
 // Phase 5b Tier 4 sub-phase 5b.4b.2 (2026-05-27): lift gost_block from the
@@ -4183,7 +4187,7 @@ __attribute__((noinline)) void snefru_block(uint *state, const uchar *block,
  * gated rather than deleted, and they are still compiled into every program
  * that does NOT set GPU_COMMON_LEAN.
  * -------------------------------------------------------------------- */
-#ifndef GPU_COMMON_LEAN
+#if !defined(GPU_COMMON_LEAN) || defined(GPU_COMMON_WANT_GOST)
 __constant uint GOST_SBOX_1[256] = {
     0x00072000u, 0x00075000u, 0x00074800u, 0x00071000u, 0x00076800u, 0x00074000u,
     0x00070000u, 0x00077000u, 0x00073000u, 0x00075800u, 0x00070800u, 0x00076000u,
@@ -4518,7 +4522,7 @@ __attribute__((noinline)) void gost_block(uint *h, const uint *m) {
 }
 #undef GOST_GE_ROUND
 #undef GOST_GE_ENCRYPT
-#endif  /* !GPU_COMMON_LEAN -- GOST */
+#endif  /* !GPU_COMMON_LEAN || GPU_COMMON_WANT_GOST -- GOST */
 
 /* ---- RIPEMD-160 block function ---- */
 

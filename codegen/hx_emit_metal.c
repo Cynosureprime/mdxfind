@@ -77,8 +77,14 @@
  * explicit kernel args (Metal can't cast through non-atomic pointer
  * to atomic_uint, unlike the OpenCL twin that aliases off payload).
  *
- * $Revision: 1.24 $
+ * $Revision: 1.26 $
  * $Log: hx_emit_metal.c,v $
+ * Revision 1.26  2026/11/18 13:54:07  dlr
+ * Family kernel B outer helpers (SHA-224/256 over hex32||pass, MD2, Whirlpool) build every block from the logical stream hex32 || pass || padding || length, byte by byte by position, with ONE call site for the block function. The previous form inlined a runtime-length copy of the multi-block absorb loop next to the padding block, which a vendor OpenCL compiler crashed on while building. Validated against -G none on words of length 0..100 with rules and masks at two iteration depths, on CUDA-class, Metal and AMD devices.
+ *
+ * Revision 1.25  2026/11/16 21:05:06  dlr
+ * Remove the skeleton and per-opcode emit helpers. Their only caller was the placeholder walk removed from hx_walker.c in the same change.
+ *
  * Revision 1.24  2026/11/15 15:59:03  dlr
  * A GPU kernel, library, function or pipeline that fails to build is fatal on both backends, with file:line, device, host and the build log; every fallback to another kernel, a degraded device or the CPU on a build failure is removed, with the code only those fallbacks reached. The MD5-family codegen kernel decodes masks with a 32-bit-limb mixed-radix peel (no 64-bit runtime divide), drops the mask-total loop, and inlines every outer helper, identical on OpenCL and Metal. hashpipe defines getentropy locally so it runs on glibc 2.19 hosts.
  *
@@ -165,201 +171,6 @@
 #include "hx_spec_entry.h"
 #include "hx_emit_primitives.h"
 
-/* ---- skeleton helpers (2a.1; real implementations as of 2a.4) ---- */
-
-int hx_emit_kernel_attribute_metal(char **out, size_t *out_cap,
-                                   size_t *out_len)
-{
-    /* OpenCL emits "__kernel "; Metal emits "kernel " (no underscore
-     * prefix; an explicit space terminator so the caller can append the
-     * return type next). */
-    return hx_appendf(out, out_cap, out_len, "kernel ");
-}
-
-int hx_emit_address_space_global_metal(char **out, size_t *out_cap,
-                                       size_t *out_len)
-{
-    /* OpenCL __global -> Metal device. */
-    return hx_appendf(out, out_cap, out_len, "device ");
-}
-
-int hx_emit_thread_id_load_metal(char **out, size_t *out_cap,
-                                 size_t *out_len,
-                                 const char *var_name)
-{
-    /* Metal does NOT have a get_global_id() builtin -- the gid is bound
-     * via a kernel-argument attribute [[thread_position_in_grid]]. The
-     * walker's EMIT_HEADER state already declared `gid` in the kernel
-     * signature; here we just emit a no-op annotation comment so the
-     * walker's per-state // hx: state marker is preserved and downstream
-     * code can reference `gid` directly.
-     *
-     * Note: the variable name argument is honored only for OpenCL where
-     * the walker emits `const uint <name> = get_global_id(0)`. On Metal
-     * the binding is in the kernel signature attribute and the walker
-     * always names it `gid`. If a caller asks for a different name we
-     * emit an alias declaration so the rest of the emitted body still
-     * compiles. */
-    if (var_name && strcmp(var_name, "gid") != 0) {
-        return hx_appendf(out, out_cap, out_len,
-                          "  // hx: gid bound via [[thread_position_in_grid]] kernel arg\n"
-                          "  uint %s = gid;\n", var_name);
-    }
-    return hx_appendf(out, out_cap, out_len,
-                      "  // hx: gid bound via [[thread_position_in_grid]] kernel arg\n");
-}
-
-int hx_emit_atomic_inc_metal(char **out, size_t *out_cap, size_t *out_len,
-                             const char *counter_expr)
-{
-    /* OpenCL atomic_inc(&x) -> Metal atomic_fetch_add_explicit(&x, 1u,
-     * memory_order_relaxed). Counter MUST be typed `device atomic_uint *`
-     * by the caller per metal_common.metal Pattern 1. */
-    const char *expr = counter_expr ? counter_expr : "&counter[0]";
-    return hx_appendf(out, out_cap, out_len,
-                      "  atomic_fetch_add_explicit(%s, 1u, memory_order_relaxed);\n",
-                      expr);
-}
-
-int hx_emit_payload_load_metal(char **out, size_t *out_cap, size_t *out_len)
-{
-    /* Skeleton placeholder analogous to the OpenCL twin. Sub-phase 2a.5
-     * may expand this to a real payload-load if the generic walker is
-     * used outside the e347 fast-path. */
-    return hx_appendf(out, out_cap, out_len,
-                      "  // hx: payload-load stub (Metal; deferred to 2a.5+)\n");
-}
-
-/* ---- per-opcode helpers (2a.2; real implementations as of 2a.4) ---- */
-
-/*
- * Mirrors hx_emit_push_var_opencl. Metal-side address-space qualifier is
- * `thread` (default for stack-resident locals; we omit it to match the
- * OpenCL emitter's `uint _v_N` shape). The "_len" suffix disambiguates
- * multi-PUSH-VAR programs (e31, e347).
- */
-int hx_emit_push_var_metal(char **out, size_t *cap, size_t *len,
-                           int slot, const char *varname)
-{
-    return hx_appendf(out, cap, len,
-        "  // hx: OP_PUSH_VAR slot=%d name=\"%s\"\n"
-        "  // hx: (Metal placeholder -- actual variable load deferred to 2a.5)\n"
-        "  uint _v_%zu = (uint)gid;\n",
-        slot, varname ? varname : "?", *len);
-}
-
-/*
- * OP_PUSH_STR: emit a constant array initializer. OpenCL __constant ->
- * Metal `constant` (Metal's `constant` address space is the device-side
- * read-only equivalent). Symbol is suffixed with *len for uniqueness.
- */
-int hx_emit_push_str_metal(char **out, size_t *cap, size_t *len,
-                           int stridx, const char *literal, int literal_len)
-{
-    int rc = hx_appendf(out, cap, len,
-        "  // hx: OP_PUSH_STR stridx=%d len=%d\n",
-        stridx, literal_len);
-    if (rc < 0) return rc;
-    if (literal && literal_len > 0) {
-        /* Metal `constant` storage requires a function-scope locals can
-         * be `thread`; we use `thread const` for the lane-local copy
-         * to mirror OpenCL's __constant scope without escalating to
-         * Metal's device-wide constant address space. */
-        rc = hx_appendf(out, cap, len,
-                        "  thread const uchar _s_%d[%d] = {",
-                        stridx, literal_len);
-        if (rc < 0) return rc;
-        for (int i = 0; i < literal_len; i++) {
-            rc = hx_appendf(out, cap, len, "%s0x%02x",
-                            i ? "," : "",
-                            (unsigned)(unsigned char)literal[i]);
-            if (rc < 0) return rc;
-        }
-        rc = hx_appendf(out, cap, len, "};\n");
-    }
-    return rc;
-}
-
-/* OP_PUSH_INT: declare a long literal (port of OpenCL form verbatim). */
-int hx_emit_push_int_metal(char **out, size_t *cap, size_t *len,
-                           int64_t ival)
-{
-    return hx_appendf(out, cap, len,
-        "  // hx: OP_PUSH_INT %lld\n"
-        "  long _i_%zu = (long)%lldL;\n",
-        (long long)ival, *len, (long long)ival);
-}
-
-/* OP_STORE: comment-only annotation; storage handled by walker. */
-int hx_emit_store_metal(char **out, size_t *cap, size_t *len,
-                        int slot, const char *varname)
-{
-    return hx_appendf(out, cap, len,
-        "  // hx: OP_STORE slot=%d name=\"%s\"\n",
-        slot, varname ? varname : "?");
-}
-
-/*
- * OP_CALL: recognise md5 only (mirror of OpenCL twin). Other CALLs emit
- * an annotation comment and return -1 -- caller treats as fatal per
- * feedback_external_failures_are_fatal.md.
- *
- * The placeholder uint4 form mirrors the OpenCL twin: gid-derived
- * register declaration that the JIT compiler will accept. e347 lands at
- * a higher level via the pattern-recognised fast path, so this generic
- * CALL stub is exercised only for programs the pattern detector does
- * NOT match.
- */
-int hx_emit_call_metal(char **out, size_t *cap, size_t *len,
-                       const char *fn_name, int nargs, uint8_t role)
-{
-    int rc;
-    if (!fn_name) fn_name = "?";
-
-    rc = hx_appendf(out, cap, len,
-        "  // hx: OP_CALL fn=\"%s\" nargs=%d role=%u\n",
-        fn_name, nargs, (unsigned)role);
-    if (rc < 0) return rc;
-
-    if (strcmp(fn_name, "md5") == 0) {
-        return hx_appendf(out, cap, len,
-            "  uint4 _md5_state_%zu = uint4((uint)gid, (uint)gid ^ 0x67452301u, "
-            "(uint)gid ^ 0xefcdab89u, (uint)gid ^ 0x98badcfeu);\n", *len);
-    }
-
-    rc = hx_appendf(out, cap, len,
-        "  // hx: function '%s' not yet supported on Metal generic path "
-        "(use pattern-recognised fast path)\n",
-        fn_name);
-    if (rc < 0) return rc;
-    fprintf(stderr,
-            "hx codegen: Metal CALL '%s' not implemented in sub-phase 2a.4 "
-            "generic dispatch (use pattern fast path)\n", fn_name);
-    return -1;
-}
-
-/* OP_CONCAT: comment-only annotation; semantics deferred. */
-int hx_emit_concat_metal(char **out, size_t *cap, size_t *len)
-{
-    return hx_appendf(out, cap, len,
-        "  // hx: OP_CONCAT (Metal placeholder; semantics deferred to 2a.5+)\n");
-}
-
-/*
- * OP_HALT: terminate. Mirrors OpenCL twin's never-taken atomic_inc dead-
- * write so the JIT can't DCE the body. Counter passed via the trivial
- * kernel signature must be typed `device atomic_uint *` -- the walker's
- * EMIT_HEADER state declares it that way for the Metal backend.
- */
-int hx_emit_halt_metal(char **out, size_t *cap, size_t *len)
-{
-    return hx_appendf(out, cap, len,
-        "  // hx: OP_HALT (terminate program; result on stack top)\n"
-        "  if (gid == 0xffffffffu) {\n"
-        "    atomic_fetch_add_explicit(&counter[0], 1u, memory_order_relaxed);\n"
-        "  }\n");
-}
-
 /* ====================================================================
  * Sub-phase 2a.4 (2026-05-21) -- e347 (MD5MD5SALT) tp0-pattern Metal
  * emitter. Structural mirror of hx_emit_e347_md5md5md5salt_opencl().
@@ -427,6 +238,12 @@ int hx_emit_halt_metal(char **out, size_t *cap, size_t *len)
  * (md5_buf_global_metal, md5_buf_private32_metal, state_to_hex32_bytes_metal,
  * hex32_into_M_metal, md5_outer_hex_combine_metal). 2a.6 renamed two of the
  * five helpers per byte-exact chain fix; see file header $Log: hx_emit_metal.c,v $
+ * five helpers per byte-exact chain fix; see file header Revision 1.26  2026/11/18 13:54:07  dlr
+ * five helpers per byte-exact chain fix; see file header Family kernel B outer helpers (SHA-224/256 over hex32||pass, MD2, Whirlpool) build every block from the logical stream hex32 || pass || padding || length, byte by byte by position, with ONE call site for the block function. The previous form inlined a runtime-length copy of the multi-block absorb loop next to the padding block, which a vendor OpenCL compiler crashed on while building. Validated against -G none on words of length 0..100 with rules and masks at two iteration depths, on CUDA-class, Metal and AMD devices.
+ * five helpers per byte-exact chain fix; see file header
+ * five helpers per byte-exact chain fix; see file header Revision 1.25  2026/11/16 21:05:06  dlr
+ * five helpers per byte-exact chain fix; see file header Remove the skeleton and per-opcode emit helpers. Their only caller was the placeholder walk removed from hx_walker.c in the same change.
+ * five helpers per byte-exact chain fix; see file header
  * five helpers per byte-exact chain fix; see file header Revision 1.24  2026/11/15 15:59:03  dlr
  * five helpers per byte-exact chain fix; see file header A GPU kernel, library, function or pipeline that fails to build is fatal on both backends, with file:line, device, host and the build log; every fallback to another kernel, a degraded device or the CPU on a build failure is removed, with the code only those fallbacks reached. The MD5-family codegen kernel decodes masks with a 32-bit-limb mixed-radix peel (no 64-bit runtime divide), drops the mask-total loop, and inlines every outer helper, identical on OpenCL and Metal. hashpipe defines getentropy locally so it runs on glibc 2.19 hosts.
  * five helpers per byte-exact chain fix; see file header
@@ -1479,39 +1296,25 @@ static int emit_outer_md2_concat_then_hash_metal(char **out,
         "    uchar inner_hex[32];\n"
         "    state_to_hex32_bytes_metal(mma, mmb, mmc, mmd, inner_hex);\n"
         "\n"
+        "    // ONE block-call site: every block is built from the logical stream\n"
+        "    // hex32 || pass || padding || length. Kept identical to the OpenCL\n"
+        "    // twin, where an always_inline helper holding a multi-block loop beside\n"
+        "    // further block calls crashed fglrx inside clBuildProgram.\n"
+        "    // nd data blocks, the last PKCS-padded (1..16 bytes of value 16 - len % 16),\n"
+        "    // then the checksum as a final block with the checksum update off.\n"
         "    uchar block[16];\n"
-        "\n"
-        "    // Process the 2 full 16-byte blocks of inner_hex.\n"
-        "    for (int b = 0; b < 2; b++) {\n"
+        "    int nd = total_len / 16 + 1;\n"
+        "    uint padv = (uint)(16 - (total_len & 15));\n"
+        "    for (int blk = 0; blk <= nd; blk++) {\n"
         "        for (int j = 0; j < 16; j++) {\n"
-        "            block[j] = inner_hex[b * 16 + j];\n"
+        "            int pos = blk * 16 + j;\n"
+        "            uint c = blk == nd ? (uint)checksum[j]\n"
+        "                   : pos < 32 ? (uint)inner_hex[pos]\n"
+        "                   : pos < total_len ? (uint)pass[pos - 32] : padv;\n"
+        "            block[j] = (uchar)c;\n"
         "        }\n"
-        "        md2_block(state, checksum, block, 1);\n"
+        "        md2_block(state, checksum, block, blk < nd ? 1 : 0);\n"
         "    }\n"
-        "\n"
-        "    // Process pass[] in 16-byte chunks while at least 16 bytes left.\n"
-        "    int pass_off = 0;\n"
-        "    while ((plen - pass_off) >= 16) {\n"
-        "        for (int j = 0; j < 16; j++) {\n"
-        "            block[j] = pass[pass_off + j];\n"
-        "        }\n"
-        "        md2_block(state, checksum, block, 1);\n"
-        "        pass_off += 16;\n"
-        "    }\n"
-        "\n"
-        "    // PKCS-pad tail to 16-byte boundary (pad_len in [1..16]).\n"
-        "    int tail_len = plen - pass_off;\n"
-        "    int pad_len = 16 - tail_len;\n"
-        "    for (int j = 0; j < tail_len; j++) {\n"
-        "        block[j] = pass[pass_off + j];\n"
-        "    }\n"
-        "    for (int j = tail_len; j < 16; j++) {\n"
-        "        block[j] = (uchar)pad_len;\n"
-        "    }\n"
-        "    md2_block(state, checksum, block, 1);\n"
-        "\n"
-        "    // Final: checksum block (no checksum update per RFC errata).\n"
-        "    md2_block(state, checksum, checksum, 0);\n"
         "\n"
         "    *h0 = (uint)state[ 0]\n"
         "        | ((uint)state[ 1] <<  8)\n"
@@ -2114,98 +1917,29 @@ static int emit_outer_sha2_32_concat_then_hash_metal(char **out,
         "    uchar inner_hex[32];\n"
         "    state_to_hex32_bytes_metal(mma, mmb, mmc, mmd, inner_hex);\n"
         "\n"
+        "    // ONE block-call site: every block is built from the logical stream\n"
+        "    // hex32 || pass || padding || length. Kept identical to the OpenCL\n"
+        "    // twin, where an always_inline helper holding a multi-block loop beside\n"
+        "    // further block calls crashed fglrx inside clBuildProgram.\n"
         "    uint M[16];\n"
-        "    int byte_pos = 0;\n"
-        "    int pass_consumed = 0;\n"
-        "    int first_has_pad = 0;\n"
-        "\n"
-        "    int p_in_first = plen;\n"
-        "    if (p_in_first > 32) p_in_first = 32;\n"
-        "    {\n"
-        "        for (int w = 0; w < 8; w++) {\n"
-        "            int bo = w * 4;\n"
-        "            M[w] = ((uint)inner_hex[bo]     << 24)\n"
-        "                 | ((uint)inner_hex[bo + 1] << 16)\n"
-        "                 | ((uint)inner_hex[bo + 2] <<  8)\n"
-        "                 |  (uint)inner_hex[bo + 3];\n"
-        "        }\n"
-        "        for (int w = 8; w < 16; w++) M[w] = 0u;\n"
-        "        for (int i = 0; i < p_in_first; i++) {\n"
-        "            int abs_pos = 32 + i;\n"
-        "            uint v = (uint)pass[i];\n"
-        "            int wi = abs_pos >> 2;\n"
-        "            int sh = (3 - (abs_pos & 3)) * 8;\n"
-        "            M[wi] |= v << sh;\n"
-        "        }\n"
-        "        pass_consumed = p_in_first;\n"
-        "        byte_pos = 32 + p_in_first;\n"
-        "    }\n"
-        "\n"
-        "    if (total_len + 1 + 8 <= 64) {\n"
-        "        int pad_pos = byte_pos;\n"
-        "        int wi = pad_pos >> 2;\n"
-        "        int sh = (3 - (pad_pos & 3)) * 8;\n"
-        "        M[wi] |= 0x80u << sh;\n"
-        "        ulong bitlen = (ulong)total_len * 8u;\n"
-        "        M[14] = (uint)(bitlen >> 32);\n"
-        "        M[15] = (uint)(bitlen & 0xffffffffu);\n"
-        "        sha256_block(state, M);\n"
-        "        *h0 = ((state[0] & 0x000000ffu) << 24) | ((state[0] & 0x0000ff00u) << 8) | ((state[0] & 0x00ff0000u) >> 8) | ((state[0] & 0xff000000u) >> 24);\n"
-        "        *h1 = ((state[1] & 0x000000ffu) << 24) | ((state[1] & 0x0000ff00u) << 8) | ((state[1] & 0x00ff0000u) >> 8) | ((state[1] & 0xff000000u) >> 24);\n"
-        "        *h2 = ((state[2] & 0x000000ffu) << 24) | ((state[2] & 0x0000ff00u) << 8) | ((state[2] & 0x00ff0000u) >> 8) | ((state[2] & 0xff000000u) >> 24);\n"
-        "        *h3 = ((state[3] & 0x000000ffu) << 24) | ((state[3] & 0x0000ff00u) << 8) | ((state[3] & 0x00ff0000u) >> 8) | ((state[3] & 0xff000000u) >> 24);\n"
-        "        // Words 4..7 too: the -i rounds hash hex(WHOLE digest).\n"
-        "        for (int w = 4; w < 8; w++) dg[w] = ((state[w] & 0x000000ffu) << 24) | ((state[w] & 0x0000ff00u) << 8) | ((state[w] & 0x00ff0000u) >> 8) | ((state[w] & 0xff000000u) >> 24);\n"
-        "        return;\n"
-        "    }\n"
-        "\n"
-        "    if (p_in_first == plen && byte_pos < 64) {\n"
-        "        int pad_pos = byte_pos;\n"
-        "        int wi = pad_pos >> 2;\n"
-        "        int sh = (3 - (pad_pos & 3)) * 8;\n"
-        "        M[wi] |= 0x80u << sh;\n"
-        "        first_has_pad = 1;\n"
-        "    }\n"
-        "    sha256_block(state, M);\n"
-        "\n"
-        "    int pleft = plen - pass_consumed;\n"
-        "    while (pleft >= 64) {\n"
+        "    ulong bitlen = (ulong)total_len * 8u;\n"
+        "    int nblk = (total_len + 1 + 8 + 63) / 64;\n"
+        "    for (int blk = 0; blk < nblk; blk++) {\n"
         "        for (int w = 0; w < 16; w++) {\n"
-        "            int bo = pass_consumed + w * 4;\n"
-        "            M[w] = ((uint)pass[bo]     << 24)\n"
-        "                 | ((uint)pass[bo + 1] << 16)\n"
-        "                 | ((uint)pass[bo + 2] <<  8)\n"
-        "                 |  (uint)pass[bo + 3];\n"
+        "            uint v = 0u;\n"
+        "            for (int by = 0; by < 4; by++) {\n"
+        "                int pos = blk * 64 + w * 4 + by;\n"
+        "                uint c = pos < 32 ? (uint)inner_hex[pos]\n"
+        "                       : pos < total_len ? (uint)pass[pos - 32]\n"
+        "                       : pos == total_len ? 0x80u : 0u;\n"
+        "                v = (v << 8) | c;   // BE\n"
+        "            }\n"
+        "            M[w] = v;\n"
         "        }\n"
-        "        sha256_block(state, M);\n"
-        "        pass_consumed += 64;\n"
-        "        pleft -= 64;\n"
-        "    }\n"
-        "\n"
-        "    for (int w = 0; w < 16; w++) M[w] = 0u;\n"
-        "    for (int i = 0; i < pleft; i++) {\n"
-        "        uint v = (uint)pass[pass_consumed + i];\n"
-        "        int wi = i >> 2;\n"
-        "        int sh = (3 - (i & 3)) * 8;\n"
-        "        M[wi] |= v << sh;\n"
-        "    }\n"
-        "    if (!first_has_pad) {\n"
-        "        int pad_pos = pleft;\n"
-        "        int wi = pad_pos >> 2;\n"
-        "        int sh = (3 - (pad_pos & 3)) * 8;\n"
-        "        M[wi] |= 0x80u << sh;\n"
-        "    }\n"
-        "    if (pleft + 1 + 8 <= 64 || (first_has_pad && pleft + 8 <= 64)) {\n"
-        "        ulong bitlen = (ulong)total_len * 8u;\n"
-        "        M[14] = (uint)(bitlen >> 32);\n"
-        "        M[15] = (uint)(bitlen & 0xffffffffu);\n"
-        "        sha256_block(state, M);\n"
-        "    } else {\n"
-        "        sha256_block(state, M);\n"
-        "        for (int w = 0; w < 16; w++) M[w] = 0u;\n"
-        "        ulong bitlen = (ulong)total_len * 8u;\n"
-        "        M[14] = (uint)(bitlen >> 32);\n"
-        "        M[15] = (uint)(bitlen & 0xffffffffu);\n"
+        "        if (blk == nblk - 1) {\n"
+        "            M[14] = (uint)(bitlen >> 32);\n"
+        "            M[15] = (uint)(bitlen & 0xffffffffu);\n"
+        "        }\n"
         "        sha256_block(state, M);\n"
         "    }\n"
         "    *h0 = ((state[0] & 0x000000ffu) << 24) | ((state[0] & 0x0000ff00u) << 8) | ((state[0] & 0x00ff0000u) >> 8) | ((state[0] & 0xff000000u) >> 24);\n"
@@ -2463,93 +2197,28 @@ static int emit_outer_wrl_concat_then_hash_metal(char **out,
         "    uchar inner_hex[32];\n"
         "    state_to_hex32_bytes_metal(mma, mmb, mmc, mmd, inner_hex);\n"
         "\n"
+        "    // ONE block-call site: every block is built from the logical stream\n"
+        "    // hex32 || pass || padding || length. Kept identical to the OpenCL\n"
+        "    // twin, where an always_inline helper holding a multi-block loop beside\n"
+        "    // further block calls crashed fglrx inside clBuildProgram.\n"
+        "    // 64-byte blocks of 8 BE ulongs; the 256-bit length ends the last block,\n"
+        "    // of which only M[7] is nonzero for any family input.\n"
         "    ulong M[8];\n"
-        "    int byte_pos = 0;\n"
-        "    int pass_consumed = 0;\n"
-        "    int first_has_pad = 0;\n"
-        "\n"
-        "    int p_in_first = plen;\n"
-        "    if (p_in_first > 32) p_in_first = 32;\n"
-        "    {\n"
-        "        for (int w = 0; w < 4; w++) {\n"
-        "            int bo = w * 8;\n"
-        "            M[w] = ((ulong)inner_hex[bo]     << 56)\n"
-        "                 | ((ulong)inner_hex[bo + 1] << 48)\n"
-        "                 | ((ulong)inner_hex[bo + 2] << 40)\n"
-        "                 | ((ulong)inner_hex[bo + 3] << 32)\n"
-        "                 | ((ulong)inner_hex[bo + 4] << 24)\n"
-        "                 | ((ulong)inner_hex[bo + 5] << 16)\n"
-        "                 | ((ulong)inner_hex[bo + 6] <<  8)\n"
-        "                 |  (ulong)inner_hex[bo + 7];\n"
-        "        }\n"
-        "        for (int w = 4; w < 8; w++) M[w] = 0ul;\n"
-        "        for (int i = 0; i < p_in_first; i++) {\n"
-        "            int abs_pos = 32 + i;\n"
-        "            ulong v = (ulong)pass[i];\n"
-        "            int wi = abs_pos >> 3;\n"
-        "            int sh = (7 - (abs_pos & 7)) * 8;\n"
-        "            M[wi] |= v << sh;\n"
-        "        }\n"
-        "        pass_consumed = p_in_first;\n"
-        "        byte_pos = 32 + p_in_first;\n"
-        "    }\n"
-        "\n"
-        "    if (p_in_first == plen && byte_pos < 64) {\n"
-        "        int pad_pos = byte_pos;\n"
-        "        int wi = pad_pos >> 3;\n"
-        "        int sh = (7 - (pad_pos & 7)) * 8;\n"
-        "        M[wi] |= ((ulong)0x80u) << sh;\n"
-        "        first_has_pad = 1;\n"
-        "    }\n"
-        "    wrl_block(state, M);\n"
-        "\n"
-        "    int pleft = plen - pass_consumed;\n"
-        "    while (pleft >= 64) {\n"
+        "    ulong bitlen = (ulong)total_len * 8ul;\n"
+        "    int nblk = (total_len + 1 + 32 + 63) / 64;\n"
+        "    for (int blk = 0; blk < nblk; blk++) {\n"
         "        for (int w = 0; w < 8; w++) {\n"
-        "            int bo = pass_consumed + w * 8;\n"
-        "            M[w] = ((ulong)pass[bo]     << 56)\n"
-        "                 | ((ulong)pass[bo + 1] << 48)\n"
-        "                 | ((ulong)pass[bo + 2] << 40)\n"
-        "                 | ((ulong)pass[bo + 3] << 32)\n"
-        "                 | ((ulong)pass[bo + 4] << 24)\n"
-        "                 | ((ulong)pass[bo + 5] << 16)\n"
-        "                 | ((ulong)pass[bo + 6] <<  8)\n"
-        "                 |  (ulong)pass[bo + 7];\n"
+        "            ulong v = 0ul;\n"
+        "            for (int by = 0; by < 8; by++) {\n"
+        "                int pos = blk * 64 + w * 8 + by;\n"
+        "                uint c = pos < 32 ? (uint)inner_hex[pos]\n"
+        "                       : pos < total_len ? (uint)pass[pos - 32]\n"
+        "                       : pos == total_len ? 0x80u : 0u;\n"
+        "                v = (v << 8) | (ulong)c;   // BE\n"
+        "            }\n"
+        "            M[w] = v;\n"
         "        }\n"
-        "        wrl_block(state, M);\n"
-        "        pass_consumed += 64;\n"
-        "        pleft -= 64;\n"
-        "    }\n"
-        "\n"
-        "    for (int w = 0; w < 8; w++) M[w] = 0ul;\n"
-        "    for (int i = 0; i < pleft; i++) {\n"
-        "        ulong v = (ulong)pass[pass_consumed + i];\n"
-        "        int wi = i >> 3;\n"
-        "        int sh = (7 - (i & 7)) * 8;\n"
-        "        M[wi] |= v << sh;\n"
-        "    }\n"
-        "    if (!first_has_pad) {\n"
-        "        int pad_pos = pleft;\n"
-        "        int wi = pad_pos >> 3;\n"
-        "        int sh = (7 - (pad_pos & 7)) * 8;\n"
-        "        M[wi] |= ((ulong)0x80u) << sh;\n"
-        "    }\n"
-        "    if ((!first_has_pad && pleft + 1 + 32 <= 64) ||\n"
-        "        ( first_has_pad && pleft     + 32 <= 64)) {\n"
-        "        ulong bitlen = (ulong)total_len * 8ul;\n"
-        "        M[4] = 0ul;\n"
-        "        M[5] = 0ul;\n"
-        "        M[6] = 0ul;\n"
-        "        M[7] = bitlen;\n"
-        "        wrl_block(state, M);\n"
-        "    } else {\n"
-        "        wrl_block(state, M);\n"
-        "        for (int w = 0; w < 8; w++) M[w] = 0ul;\n"
-        "        ulong bitlen = (ulong)total_len * 8ul;\n"
-        "        M[4] = 0ul;\n"
-        "        M[5] = 0ul;\n"
-        "        M[6] = 0ul;\n"
-        "        M[7] = bitlen;\n"
+        "        if (blk == nblk - 1) M[7] = bitlen;\n"
         "        wrl_block(state, M);\n"
         "    }\n"
         "\n"

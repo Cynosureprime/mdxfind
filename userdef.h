@@ -1,8 +1,11 @@
 /*
  * userdef.h - user-defined hash type loader for mdxfind (Milestone 1)
  *
- * $Revision: 1.9 $
+ * $Revision: 1.10 $
  * $Log: userdef.h,v $
+ * Revision 1.10  2026/11/20 05:22:13  dlr
+ * Generic hx walker stage 1c: user-defined types run on the GPU through the generated walker. A user type is served when it takes no salt or user, declares no stored form, and its result is the hex of its final digest; rounds past x01 re-run the whole program on the previous round's hex text, keeping its case, as the userdef CPU arm does. The selected user type's status line says whether it runs on the GPU, or why not, in place of the former not-yet-enabled line. Verified: the C mirror agrees for 529 of 529 cores, including 10 user cores whose later rounds are checked against the hx VM re-running the program, and a planted case defect is caught in exactly the 8 case-sensitive ones; the 519 catalog cores are byte-identical; on dev3 (M2 Max, Metal) and gp1 (Tahiti, OpenCL) 10 user types match -G none at x01 and x02 and deeper with rules, a -n mask and a mixed run with a catalog type, except one type whose kernel the Tahiti compiler crashes on, which is FATAL there as for any such kernel.
+ *
  * Revision 1.9  2026/10/20 12:12:01  dlr
  * Declare userdef_load_file, the explicit-path entry point behind mdindex -C.
  *
@@ -251,34 +254,5 @@ int userdef_form_build(const struct userdef_form *f,
  */
 const char *userdef_skip_reason(const char *idstr);
 
-/*
- * Milestone 2, sub-phase D4 (GPU eligibility status).  Run the codegen
- * shape detectors on a user op's compiled program and return an honest
- * one-line status string suitable for stderr at invoke time.  Enum-
- * agnostic: it inspects only the hx_program shape.  Returns a pointer to
- * a static/per-call buffer owned by userdef.c (do not free).  Returns
- * NULL if op is not a registered user op.
- *
- * Two outcomes (GPU dispatch for user types is phase 2, so a supported
- * shape still runs on CPU in v1):
- *   - shape NOT a codegen shape -> "GPU not available for this
- *     expression shape; running on CPU."
- *   - shape IS a codegen shape  -> "GPU-eligible shape, but GPU dispatch
- *     for user-defined types is not yet enabled; running on CPU."
- *
- * Milestone 3: this function (and the load-time dedup advisory) depend on
- * the codegen catalog hx_specs_data[] + the GPU-shape detector
- * hx_detect_pattern, which are linked into mdxfind ($(CODEGEN_OBJS)) but
- * NOT into hashpipe (which links only $(HX_OBJS) and has no GPU path).  The
- * definition is therefore compiled only when USERDEF_HAVE_CODEGEN is set
- * (mdxfind's userdef.o); it is unavailable in hashpipe's build.  The
- * DECLARATION, however, is left UNGUARDED (always visible): mdxfind.c is not
- * necessarily compiled with -DUSERDEF_HAVE_CODEGEN, and without a visible
- * prototype the call defaults to implicit int and TRUNCATES the returned
- * const char * to 32 bits on a 64-bit target -- a latent crash when the
- * static buffer loads above 4 GB.  hashpipe never calls it, so an
- * always-visible declaration is harmless there (no undefined reference).
- */
-const char *userdef_gpu_status(int op);
 
 #endif /* USERDEF_H */

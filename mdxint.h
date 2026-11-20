@@ -4,8 +4,20 @@
  * statistics).  Definitions live in exactly one .c file; this header carries
  * only includes, macros, types, static inline helpers and extern declarations.
  *
- * $Revision: 1.7 $
+ * $Revision: 1.11 $
  * $Log: mdxint.h,v $
+ * Revision 1.11  2026/11/20 15:45:11  dlr
+ * Generic hx walker stages 3b and 4a. New walker bodies: MySQL 3 OLD_PASSWORD as a byte-wise accumulator in the dialect, BLAKE2b-512 and -256 and BLAKE2s-256 over the common b2b and b2s compress functions, and SHA3 and Keccak at 224, 256, 384 and 512 bits over keccakf1600; a final digest shorter than 16 bytes is compared as four words with the upper ones zero. User-defined types may now name mdxfind own hash functions: sha224, sha384, rmd128, rmd160, tiger, wrl, md2, gost, sne128, sne256, the fifteen HAVAL forms, mysql3, blake2b512, blake2b256, blake2s256, sha3_224 to sha3_512 and keccak224 to keccak512, each the call its catalog type makes. hashpipe registers its BLAKE2 digests as hx functions, which the verify registration had hidden. The drift check reads a NAME-prefixed hex digest and the bare digest as one value. 11 more catalog types run on the GPU: e410 e416 e449 e474 e478 e548 e711 e842 e843 e846 e847. Verified: each new user function agrees with its catalog type at x01 to x03 on the CPU and with hashpipe -X; the C mirror agrees for 567 of 567 cores and every earlier core changed only by the added dialect text; on dev3 (M2 Max, Metal) all new catalog types and 42 user types match -G none, and on gp1 (Tahiti, OpenCL) all do except the md2 user type, whose kernel the Tahiti compiler crashes on, which is FATAL there as for any such kernel.
+ *
+ * Revision 1.10  2026/11/20 02:52:02  dlr
+ * Declarations for generic hx walker stage 2: the per-thread TYPEDONE sink that typedone_ref honours during a CPU confirm, so a one-salt confirm cannot mark the whole type done, and type_pepper_list and type_pepper_mode, the one pepper lookup the CPU arms and the GPU host share.
+ *
+ * Revision 1.9  2026/11/18 04:07:48  dlr
+ * Declarations for the CPU confirm thread: confirm_start, confirm_stop, cpu_confirm_enqueue.
+ *
+ * Revision 1.8  2026/11/17 01:08:32  dlr
+ * Declare CramDovecot, the e932 table of records as loaded.
+ *
  * Revision 1.7  2026/11/15 08:06:24  dlr
  * mdxfind 1.674 / hashpipe 1.235: 7z loaders read the 13-field (Delta filter) record and use its Delta distance in the CRC check; hashcat and John record forms both load. hashpipe verify_7zip moved to work-space slots. An ill-formed UTF-16 conversion (-b candidate, MSCACHE user) now skips the hash instead of hashing the raw bytes. hashpipe output write failures are fatal.
  *
@@ -281,6 +293,8 @@ extern void mysha1(void *cur, int len, unsigned char *dest);
 extern void mysha256(char *cur, int len, unsigned char *dest);
 extern void mysha512(char *cur, int len, unsigned char *dest);
 extern void RIPEMD160(char *cur, int len, unsigned char *dest);
+/* mdxfind's own hash functions into the hx registry, for user types */
+extern void mdx_hx_register(void);
 extern void RIPEMD128(char *cur, int len, unsigned char *dest);
 extern void MD4(char *cur, int len, unsigned char *dest);
 extern void gosthash(char *cur, int len, unsigned char *dest);
@@ -358,6 +372,7 @@ struct LineInfo {
 extern char *Curfile;
 extern unsigned long long int Lowline, LowSkip, TotLines, Fileline;
 extern Pvoid_t JuniperIVE;
+extern Pvoid_t CramDovecot;
 extern Pvoid_t DoUser;
 extern Pvoid_t Dohash, Doload, SaltArray, UserArray, KeyArray, PepperArray;
 extern struct rulestore Rulestore, Rulefile;
@@ -510,6 +525,11 @@ static inline void **typeuser_ref(unsigned op) {
 #define TYPEUSER(op) (*typeuser_ref(op))
 extern Pvoid_t UseridJudy;
 extern char **Typepepper;
+/* type_pepper_list: the pepper list op hashes with (see mdxfind.c).
+ * type_pepper_mode: where op's pepper comes from -- 0 none, 1 that list,
+ * 2 the salt after its first space, 3 the salt after its first colon. */
+const char *type_pepper_list(int op);
+int type_pepper_mode(int op);
 extern int XOR_key_len;
 extern char *XOR_key;
 extern char *Keys, *Readbuf, *Rules, *Peppers;
@@ -748,7 +768,15 @@ extern char UserTypedone[USERDEF_MAX];
  * longer alias each other even if the op ranges were somehow to overlap --
  * they are different objects. This routing is the ONLY place that knows the
  * split; all 2,417 call sites go through the macro. */
+/* A CPU confirm job (mdxfind.c) runs its type's arm over ONE salt or user, so
+ * an arm's "no salts left, the type is done" means only that this key is
+ * exhausted. During the job its op's flag is a per-thread copy, seeded with
+ * the real value: the arm still sees a type that is truly done, but cannot
+ * mark the type done for every other salt and thread. */
+extern __thread char *Typedone_sink;
+extern __thread unsigned Typedone_sink_op;
 static inline char *typedone_ref(unsigned op) {
+    if (Typedone_sink && op == Typedone_sink_op) return Typedone_sink;
     return op_is_user(op) ? &UserTypedone[op_user_id(op)] : &Typedone[op];
 }
 #define TYPEDONE(op) (*typedone_ref(op))
@@ -838,6 +866,13 @@ static inline int mask_expand_into(unsigned long long index,
 extern struct job *FreeHead, **FreeTail;
 extern struct job *WorkHead, **WorkTail;
 extern lock *FreeWaiting, *WorkWaiting, *TestVecWaiting, *Stats;
+/* CPU confirmation of GPU hits (mdxfind.c): the confirm thread and its pool. */
+extern int Confirm_enabled;
+void confirm_start(void);
+void confirm_stop(void);
+void cpu_confirm_enqueue(int op, const char *plain, int plen, int ruleindex,
+                         const unsigned char *key, int keylen, int keykind,
+                         const unsigned char *digest, int dlen, int iter);
 /* Read buffers: a ring of NREADBUF, each READBUFSZ bytes of Readbuf with its
  * own RINDEXSIZE stretch of Readindex.  ReadBufL[i] counts the jobs still
  * using buffer i; the reader reuses a buffer only when it is zero.  Four, not
